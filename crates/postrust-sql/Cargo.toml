@@ -1,0 +1,17 @@
+[package]
+name = "postrust-sql"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Type-safe SQL builder for Postrust"
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+bytes.workspace = true
+chrono.workspace = true
+uuid.workspace = true
+
+[dev-dependencies]
+pretty_assertions.workspace = true

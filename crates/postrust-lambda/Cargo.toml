@@ -1,0 +1,45 @@
+[package]
+name = "postrust-lambda"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "AWS Lambda adapter for Postrust"
+
+[[bin]]
+name = "postrust-lambda"
+path = "src/main.rs"
+
+[dependencies]
+# AWS Lambda
+lambda_http = "0.14"
+lambda_runtime = "0.14"
+
+# Async
+tokio.workspace = true
+async-trait.workspace = true
+
+# Database
+sqlx.workspace = true
+
+# Serialization
+serde.workspace = true
+serde_json.workspace = true
+
+# Error handling
+thiserror.workspace = true
+anyhow.workspace = true
+
+# Utilities
+tracing.workspace = true
+tracing-subscriber.workspace = true
+bytes.workspace = true
+http.workspace = true
+
+# Internal
+postrust-core.workspace = true
+postrust-sql.workspace = true
+postrust-auth.workspace = true
+postrust-response.workspace = true
+
+[dev-dependencies]
+pretty_assertions.workspace = true

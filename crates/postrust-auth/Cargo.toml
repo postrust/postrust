@@ -1,0 +1,20 @@
+[package]
+name = "postrust-auth"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "JWT authentication for Postrust"
+
+[dependencies]
+async-trait.workspace = true
+jsonwebtoken.workspace = true
+base64.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+chrono.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+pretty_assertions.workspace = true
+tokio = { workspace = true, features = ["test-util", "macros"] }

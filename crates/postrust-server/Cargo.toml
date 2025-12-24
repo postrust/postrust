@@ -1,0 +1,48 @@
+[package]
+name = "postrust-server"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "HTTP server for Postrust using Axum"
+
+[[bin]]
+name = "postrust"
+path = "src/main.rs"
+
+[dependencies]
+# Async
+tokio.workspace = true
+async-trait.workspace = true
+
+# Web
+axum.workspace = true
+tower.workspace = true
+tower-http.workspace = true
+hyper.workspace = true
+
+# Database
+sqlx.workspace = true
+
+# Serialization
+serde.workspace = true
+serde_json.workspace = true
+
+# Error handling
+thiserror.workspace = true
+anyhow.workspace = true
+
+# Utilities
+http.workspace = true
+bytes.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+chrono.workspace = true
+
+# Internal
+postrust-core.workspace = true
+postrust-sql.workspace = true
+postrust-auth.workspace = true
+postrust-response.workspace = true
+
+[dev-dependencies]
+pretty_assertions.workspace = true

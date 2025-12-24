@@ -1,0 +1,42 @@
+[package]
+name = "postrust-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Core library for Postrust - PostgREST-compatible REST API for PostgreSQL"
+
+[dependencies]
+# Async
+async-trait.workspace = true
+futures.workspace = true
+tokio.workspace = true
+
+# Database
+sqlx.workspace = true
+
+# Serialization
+serde.workspace = true
+serde_json.workspace = true
+
+# Parsing
+nom.workspace = true
+
+# Error handling
+thiserror.workspace = true
+
+# Utilities
+indexmap.workspace = true
+bytes.workspace = true
+http.workspace = true
+mime.workspace = true
+url.workspace = true
+percent-encoding.workspace = true
+tracing.workspace = true
+chrono.workspace = true
+
+# Internal
+postrust-sql.workspace = true
+
+[dev-dependencies]
+pretty_assertions.workspace = true
+tokio = { workspace = true, features = ["test-util", "macros"] }

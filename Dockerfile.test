@@ -1,0 +1,21 @@
+# Test runner Dockerfile
+FROM rustlang/rust:nightly-bookworm
+
+WORKDIR /app
+
+# Install additional tools for testing
+RUN apt-get update && apt-get install -y \
+    postgresql-client \
+    curl \
+    && rm -rf /var/lib/apt/lists/*
+
+# Pre-compile dependencies for faster test runs
+# This layer will be cached unless Cargo.toml changes
+COPY Cargo.toml Cargo.lock ./
+COPY crates ./crates
+
+# Build dependencies only (this will be cached)
+RUN cargo build --tests --all 2>/dev/null || true
+
+# Default command runs all tests
+CMD ["cargo", "test", "--all"]

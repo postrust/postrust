@@ -1,0 +1,77 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/postrust-core",
+    "crates/postrust-sql",
+    "crates/postrust-auth",
+    "crates/postrust-response",
+    "crates/postrust-server",
+    "crates/postrust-lambda",
+    "crates/postrust-worker",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+repository = "https://github.com/postrust/postrust"
+authors = ["Postrust Contributors"]
+
+[workspace.dependencies]
+# Async runtime
+tokio = { version = "1.43", features = ["full"] }
+async-trait = "0.1"
+futures = "0.3"
+
+# Web framework
+axum = { version = "0.8", features = ["macros"] }
+tower = { version = "0.5", features = ["util"] }
+tower-http = { version = "0.6", features = ["cors", "trace", "compression-gzip"] }
+hyper = { version = "1.5", features = ["full"] }
+
+# Database
+sqlx = { version = "0.8", features = ["runtime-tokio", "postgres", "json", "chrono", "uuid", "bigdecimal"] }
+deadpool-postgres = "0.14"
+tokio-postgres = "0.7"
+
+# Serialization
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
+# Parsing
+nom = "7.1"
+
+# Authentication
+jsonwebtoken = "9.3"
+base64 = "0.22"
+
+# Error handling
+thiserror = "2.0"
+anyhow = "1.0"
+
+# Utilities
+indexmap = { version = "2.7", features = ["serde"] }
+bytes = { version = "1.9", features = ["serde"] }
+http = "1.2"
+mime = "0.3"
+url = "2.5"
+percent-encoding = "2.3"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+chrono = { version = "0.4", features = ["serde"] }
+uuid = { version = "1.11", features = ["v4", "serde"] }
+
+# Testing
+pretty_assertions = "1.4"
+
+# Internal crates
+postrust-core = { path = "crates/postrust-core" }
+postrust-sql = { path = "crates/postrust-sql" }
+postrust-auth = { path = "crates/postrust-auth" }
+postrust-response = { path = "crates/postrust-response" }
+
+[profile.release]
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true

@@ -1,0 +1,33 @@
+[package]
+name = "postrust-worker"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Cloudflare Workers adapter for Postrust"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+# Cloudflare Workers
+worker = "0.4"
+
+# Async
+async-trait.workspace = true
+futures.workspace = true
+
+# Serialization
+serde.workspace = true
+serde_json.workspace = true
+
+# Error handling
+thiserror.workspace = true
+
+# Internal
+postrust-core.workspace = true
+postrust-sql.workspace = true
+postrust-auth.workspace = true
+postrust-response.workspace = true
+
+[dev-dependencies]
+pretty_assertions.workspace = true
