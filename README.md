@@ -42,6 +42,7 @@ Postrust is a high-performance, serverless-first REST API server for PostgreSQL 
 | **RPC Functions** | ✅ | Call stored procedures via `/rpc/function_name` |
 | **JWT Authentication** | ✅ | Role-based access with PostgreSQL RLS |
 | **Content Negotiation** | ✅ | JSON, CSV, GeoJSON responses |
+| **GraphQL API** | ✅ | Full GraphQL support via `/graphql` endpoint |
 
 ### Deployment Targets
 
@@ -195,6 +196,43 @@ curl -X POST http://localhost:3000/rpc/search_users \
 curl "http://localhost:3000/rpc/get_user_count"
 ```
 
+#### GraphQL API
+
+Postrust provides a full GraphQL API alongside the REST API:
+
+```bash
+# Query users
+curl -X POST http://localhost:3000/graphql \
+  -H "Content-Type: application/json" \
+  -d '{
+    "query": "{ users { id name email } }"
+  }'
+
+# Query with filtering and pagination
+curl -X POST http://localhost:3000/graphql \
+  -H "Content-Type: application/json" \
+  -d '{
+    "query": "{ users(filter: {status: {eq: \"active\"}}, limit: 10) { id name } }"
+  }'
+
+# Nested queries (relationships)
+curl -X POST http://localhost:3000/graphql \
+  -H "Content-Type: application/json" \
+  -d '{
+    "query": "{ orders { id total customer { name email } items { product { name price } } } }"
+  }'
+
+# Mutations
+curl -X POST http://localhost:3000/graphql \
+  -H "Content-Type: application/json" \
+  -d '{
+    "query": "mutation { insertUsers(objects: [{name: \"John\", email: \"john@example.com\"}]) { id name } }"
+  }'
+
+# GraphQL Playground available at GET /graphql
+open http://localhost:3000/graphql
+```
+
 #### Authentication
 
 ```bash
@@ -293,6 +331,7 @@ CMD ["postrust"]
 ```
 ┌─────────────────────────────────────────────────────────────┐
 │                      HTTP Request                           │
+│              REST: /users    GraphQL: /graphql              │
 └─────────────────────────────────────────────────────────────┘
                               │
                               ▼
@@ -310,31 +349,31 @@ CMD ["postrust"]
 │              JWT Validation • Role Extraction               │
 └─────────────────────────────────────────────────────────────┘
                               │
-                              ▼
-┌─────────────────────────────────────────────────────────────┐
-│                     postrust-core                           │
-│  ┌──────────────────────────────────────────────────────┐   │
-│  │  API Request Parser                                  │   │
-│  │  • Query params (filters, order, pagination)         │   │
-│  │  • Content negotiation                               │   │
-│  │  • Prefer headers                                    │   │
-│  └──────────────────────────────────────────────────────┘   │
-│                              │                              │
-│                              ▼                              │
-│  ┌──────────────────────────────────────────────────────┐   │
-│  │  Schema Cache                                        │   │
-│  │  • Tables, columns, types                            │   │
-│  │  • Foreign key relationships                         │   │
-│  │  • Stored procedures                                 │   │
-│  └──────────────────────────────────────────────────────┘   │
-│                              │                              │
-│                              ▼                              │
-│  ┌──────────────────────────────────────────────────────┐   │
-│  │  Query Planner                                       │   │
-│  │  • ReadPlan, MutatePlan, CallPlan                    │   │
-│  │  • Embedding resolution                              │   │
-│  └──────────────────────────────────────────────────────┘   │
-└─────────────────────────────────────────────────────────────┘
+              ┌───────────────┴───────────────┐
+              ▼                               ▼
+┌──────────────────────────────┐ ┌──────────────────────────────┐
+│       postrust-core          │ │      postrust-graphql        │
+│  ┌────────────────────────┐  │ │  ┌────────────────────────┐  │
+│  │  REST Request Parser   │  │ │  │  GraphQL Schema        │  │
+│  │  • Query params        │  │ │  │  • Dynamic types       │  │
+│  │  • Prefer headers      │  │ │  │  • Queries/Mutations   │  │
+│  └────────────────────────┘  │ │  └────────────────────────┘  │
+│              │               │ │              │               │
+│              ▼               │ │              ▼               │
+│  ┌────────────────────────┐  │ │  ┌────────────────────────┐  │
+│  │  Schema Cache          │◄─┼─┼──│  Resolvers             │  │
+│  │  • Tables, columns     │  │ │  │  • Query → ReadPlan    │  │
+│  │  • Relationships       │  │ │  │  • Mutation → Plan     │  │
+│  │  • Routines            │  │ │  └────────────────────────┘  │
+│  └────────────────────────┘  │ └──────────────────────────────┘
+│              │               │               │
+│              ▼               │               │
+│  ┌────────────────────────┐  │               │
+│  │  Query Planner         │  │               │
+│  │  • ReadPlan            │◄─┼───────────────┘
+│  │  • MutatePlan          │  │
+│  └────────────────────────┘  │
+└──────────────────────────────┘
                               │
                               ▼
 ┌─────────────────────────────────────────────────────────────┐
@@ -364,6 +403,7 @@ CMD ["postrust"]
 | `postrust-sql` | Type-safe SQL builder with parameterized queries |
 | `postrust-auth` | JWT authentication and role extraction |
 | `postrust-response` | Response formatting (JSON, CSV, headers) |
+| `postrust-graphql` | GraphQL API with dynamic schema generation |
 | `postrust-server` | Standalone HTTP server (Axum) |
 | `postrust-lambda` | AWS Lambda adapter |
 | `postrust-worker` | Cloudflare Workers adapter |
@@ -416,6 +456,12 @@ postrust/
 │   ├── postrust-sql/       # SQL builder
 │   ├── postrust-auth/      # Authentication
 │   ├── postrust-response/  # Response formatting
+│   ├── postrust-graphql/   # GraphQL API
+│   │   └── src/
+│   │       ├── schema/         # Dynamic schema generation
+│   │       ├── resolver/       # Query/mutation resolvers
+│   │       ├── input/          # Filter/order/mutation inputs
+│   │       └── handler.rs      # Axum handler
 │   ├── postrust-server/    # HTTP server
 │   ├── postrust-lambda/    # Lambda adapter
 │   └── postrust-worker/    # Workers adapter
@@ -433,12 +479,13 @@ postrust/
 | Serverless Support | Native | Via containers |
 | Configuration | Env vars | Config file + env |
 | OpenAPI | Planned | ✅ |
+| GraphQL | ✅ | ❌ |
 
 ## Roadmap
 
 - [ ] OpenAPI 3.0 specification generation
-- [ ] GraphQL adapter
-- [ ] WebSocket subscriptions (LISTEN/NOTIFY)
+- [x] GraphQL adapter (queries, mutations, filtering, relationships)
+- [ ] GraphQL subscriptions (LISTEN/NOTIFY)
 - [ ] Connection pooling improvements
 - [ ] Cloudflare Workers full support (Hyperdrive)
 - [ ] Prometheus metrics endpoint

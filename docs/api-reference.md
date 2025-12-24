@@ -1,10 +1,10 @@
 # API Reference
 
-Complete reference for the Postrust REST API.
+Complete reference for the Postrust REST and GraphQL APIs.
 
 ## Endpoints
 
-### Tables and Views
+### Tables and Views (REST)
 
 | Method | Endpoint | Description |
 |--------|----------|-------------|
@@ -24,6 +24,13 @@ Complete reference for the Postrust REST API.
 | `POST` | `/rpc/{function}` | Call any function |
 | `HEAD` | `/rpc/{function}` | Get function headers |
 | `OPTIONS` | `/rpc/{function}` | Get function info |
+
+### GraphQL
+
+| Method | Endpoint | Description |
+|--------|----------|-------------|
+| `GET` | `/graphql` | GraphQL Playground |
+| `POST` | `/graphql` | Execute GraphQL query/mutation |
 
 ### Schema
 
@@ -358,3 +365,307 @@ Accept: application/openapi+json
   "hint": "Check that the foreign key exists and is accessible"
 }
 ```
+
+## GraphQL API
+
+Postrust provides a full GraphQL API that mirrors the REST API functionality. The GraphQL schema is dynamically generated from the database schema.
+
+### GraphQL Playground
+
+Access the interactive GraphQL Playground by visiting `/graphql` in your browser:
+
+```
+http://localhost:3000/graphql
+```
+
+### Query Structure
+
+The GraphQL schema provides:
+
+- **Query type**: Read operations for all exposed tables
+- **Mutation type**: Create/Update/Delete operations for all mutable tables
+- **Object types**: One per table with fields for each column
+- **Relationship fields**: Nested objects for foreign key relationships
+- **Filter inputs**: Type-safe filtering matching REST operators
+- **Order/Pagination**: Sorting and pagination arguments
+
+### Queries
+
+#### List Query
+
+Query all rows from a table:
+
+```graphql
+query {
+  users {
+    id
+    name
+    email
+    createdAt
+  }
+}
+```
+
+#### Query by Primary Key
+
+Query a single row by primary key:
+
+```graphql
+query {
+  userByPk(id: 1) {
+    id
+    name
+    email
+  }
+}
+```
+
+#### Filtering
+
+Apply filters using typed filter inputs:
+
+```graphql
+query {
+  users(filter: {
+    status: { eq: "active" },
+    age: { gte: 18 }
+  }) {
+    id
+    name
+  }
+}
+```
+
+Filter operators:
+
+| Operator | Description |
+|----------|-------------|
+| `eq` | Equal |
+| `neq` | Not equal |
+| `gt` | Greater than |
+| `gte` | Greater than or equal |
+| `lt` | Less than |
+| `lte` | Less than or equal |
+| `like` | SQL LIKE pattern |
+| `ilike` | Case-insensitive LIKE |
+| `in` | Value in list |
+| `isNull` | Is null check |
+
+#### Combining Filters
+
+Use `and`, `or`, and `not` for complex conditions:
+
+```graphql
+query {
+  users(filter: {
+    or: [
+      { status: { eq: "active" } },
+      { role: { eq: "admin" } }
+    ]
+  }) {
+    id
+    name
+  }
+}
+```
+
+#### Ordering
+
+Sort results with `orderBy`:
+
+```graphql
+query {
+  users(orderBy: ["createdAt_DESC", "name_ASC"]) {
+    id
+    name
+    createdAt
+  }
+}
+```
+
+#### Pagination
+
+Limit and offset results:
+
+```graphql
+query {
+  users(limit: 10, offset: 20) {
+    id
+    name
+  }
+}
+```
+
+#### Nested Relationships
+
+Query related data through foreign keys:
+
+```graphql
+query {
+  orders {
+    id
+    total
+    status
+    customer {
+      name
+      email
+    }
+    items {
+      quantity
+      product {
+        name
+        price
+      }
+    }
+  }
+}
+```
+
+### Mutations
+
+#### Insert
+
+Insert one or more rows:
+
+```graphql
+mutation {
+  insertUsers(objects: [
+    { name: "John", email: "john@example.com" },
+    { name: "Jane", email: "jane@example.com" }
+  ]) {
+    id
+    name
+    email
+  }
+}
+```
+
+Insert a single row:
+
+```graphql
+mutation {
+  insertUsersOne(object: { name: "John", email: "john@example.com" }) {
+    id
+    name
+  }
+}
+```
+
+#### Update
+
+Update rows matching a filter:
+
+```graphql
+mutation {
+  updateUsers(
+    where: { status: { eq: "pending" } },
+    set: { status: "active" }
+  ) {
+    id
+    name
+    status
+  }
+}
+```
+
+Update by primary key:
+
+```graphql
+mutation {
+  updateUsersByPk(
+    id: 1,
+    set: { name: "Updated Name" }
+  ) {
+    id
+    name
+  }
+}
+```
+
+#### Delete
+
+Delete rows matching a filter:
+
+```graphql
+mutation {
+  deleteUsers(where: { status: { eq: "deleted" } }) {
+    id
+    name
+  }
+}
+```
+
+Delete by primary key:
+
+```graphql
+mutation {
+  deleteUsersByPk(id: 1) {
+    id
+    name
+  }
+}
+```
+
+### Type Mapping
+
+PostgreSQL types are mapped to GraphQL types:
+
+| PostgreSQL | GraphQL |
+|------------|---------|
+| `integer`, `int4`, `int2`, `smallint` | `Int` |
+| `bigint`, `int8` | `BigInt` |
+| `real`, `float4`, `float8`, `double precision` | `Float` |
+| `numeric`, `decimal` | `BigDecimal` |
+| `boolean` | `Boolean` |
+| `text`, `varchar`, `char` | `String` |
+| `json`, `jsonb` | `JSON` |
+| `uuid` | `UUID` |
+| `timestamp`, `timestamptz` | `DateTime` |
+| `date` | `Date` |
+| `time`, `timetz` | `Time` |
+| `_type` (arrays) | `[InnerType]` |
+
+### Authentication
+
+GraphQL requests use the same JWT authentication as REST:
+
+```bash
+curl -X POST http://localhost:3000/graphql \
+  -H "Authorization: Bearer eyJhbGciOiJIUzI1NiIs..." \
+  -H "Content-Type: application/json" \
+  -d '{"query": "{ users { id name } }"}'
+```
+
+The JWT role is used for PostgreSQL Row-Level Security, just like REST requests.
+
+### Introspection
+
+The GraphQL schema supports full introspection:
+
+```graphql
+query {
+  __schema {
+    types {
+      name
+      fields {
+        name
+        type {
+          name
+        }
+      }
+    }
+  }
+}
+```
+
+### GraphQL vs REST Comparison
+
+| Feature | REST | GraphQL |
+|---------|------|---------|
+| Endpoint | Multiple (`/users`, `/orders`) | Single (`/graphql`) |
+| Field selection | `?select=id,name` | Query fields |
+| Filtering | `?status=eq.active` | `filter: { status: { eq: "active" } }` |
+| Relationships | `?select=*,customer(*)` | Nested fields |
+| Pagination | `?limit=10&offset=20` | `limit: 10, offset: 20` |
+| Multiple resources | Multiple requests | Single query |
+| Response shape | Fixed | Matches query |

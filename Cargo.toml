@@ -8,6 +8,7 @@ members = [
     "crates/postrust-server",
     "crates/postrust-lambda",
     "crates/postrust-worker",
+    "crates/postrust-graphql",
 ]
 
 [workspace.package]
@@ -15,7 +16,7 @@ version = "0.1.0"
 edition = "2021"
 license = "MIT"
 repository = "https://github.com/postrust/postrust"
-authors = ["Postrust Contributors"]
+authors = ["Bhanu Pratap Chaudhary"]
 
 [workspace.dependencies]
 # Async runtime

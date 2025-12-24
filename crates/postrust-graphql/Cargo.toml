@@ -1,0 +1,48 @@
+[package]
+name = "postrust-graphql"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "GraphQL support for Postrust"
+
+[dependencies]
+# GraphQL
+async-graphql = { version = "7", features = ["chrono", "uuid", "bigdecimal", "dynamic-schema"] }
+async-graphql-axum = "7"
+
+# HTTP
+axum.workspace = true
+
+# Base64
+base64 = "0.22"
+
+# Async
+tokio.workspace = true
+futures.workspace = true
+
+# Database
+sqlx.workspace = true
+
+# Serialization
+serde.workspace = true
+serde_json.workspace = true
+indexmap.workspace = true
+bytes.workspace = true
+
+# Error handling
+thiserror.workspace = true
+
+# Logging
+tracing.workspace = true
+
+# Types
+chrono.workspace = true
+
+# Internal
+postrust-core.workspace = true
+postrust-sql.workspace = true
+postrust-auth.workspace = true
+
+[dev-dependencies]
+pretty_assertions.workspace = true
+tokio = { workspace = true, features = ["test-util", "macros"] }
