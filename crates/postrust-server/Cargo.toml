@@ -9,6 +9,10 @@ description = "HTTP server for Postrust using Axum"
 name = "postrust"
 path = "src/main.rs"
 
+[features]
+default = []
+admin-ui = ["utoipa", "postrust-graphql", "async-graphql", "async-graphql-axum"]
+
 [dependencies]
 # Async
 tokio.workspace = true
@@ -43,6 +47,12 @@ postrust-core.workspace = true
 postrust-sql.workspace = true
 postrust-auth.workspace = true
 postrust-response.workspace = true
+
+# Admin UI (optional)
+utoipa = { version = "5", features = ["axum_extras"], optional = true }
+postrust-graphql = { workspace = true, optional = true }
+async-graphql = { version = "7", optional = true }
+async-graphql-axum = { version = "7", optional = true }
 
 [dev-dependencies]
 pretty_assertions.workspace = true

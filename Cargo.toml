@@ -70,6 +70,7 @@ postrust-core = { path = "crates/postrust-core" }
 postrust-sql = { path = "crates/postrust-sql" }
 postrust-auth = { path = "crates/postrust-auth" }
 postrust-response = { path = "crates/postrust-response" }
+postrust-graphql = { path = "crates/postrust-graphql" }
 
 [profile.release]
 lto = true

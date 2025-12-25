@@ -7,8 +7,8 @@ WORKDIR /app
 COPY Cargo.toml Cargo.lock ./
 COPY crates ./crates
 
-# Build release binary (generates fresh Cargo.lock)
-RUN cargo build --release -p postrust-server
+# Build release binary with admin-ui feature
+RUN cargo build --release -p postrust-server --features admin-ui
 
 # Runtime stage
 FROM debian:bookworm-slim
@@ -17,6 +17,7 @@ FROM debian:bookworm-slim
 RUN apt-get update && apt-get install -y \
     libssl3 \
     ca-certificates \
+    curl \
     && rm -rf /var/lib/apt/lists/*
 
 # Copy binary from builder

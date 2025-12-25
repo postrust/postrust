@@ -184,10 +184,37 @@ async fn execute_plan(
             })
         }
         ActionPlan::Info(info_plan) => {
-            // Return metadata
+            use postrust_core::plan::InfoPlan;
+
+            // Return appropriate metadata based on the info type
+            let response_data = match info_plan {
+                InfoPlan::OpenApiSpec => {
+                    // Return basic server info for root endpoint
+                    serde_json::json!({
+                        "name": "postrust",
+                        "version": env!("CARGO_PKG_VERSION"),
+                        "description": "PostgREST-compatible REST API for PostgreSQL"
+                    })
+                }
+                InfoPlan::RelationInfo(qi) => {
+                    serde_json::json!({
+                        "schema": qi.schema,
+                        "name": qi.name,
+                        "type": "relation"
+                    })
+                }
+                InfoPlan::RoutineInfo(qi) => {
+                    serde_json::json!({
+                        "schema": qi.schema,
+                        "name": qi.name,
+                        "type": "routine"
+                    })
+                }
+            };
+
             Ok(QueryResult {
                 status: StatusCode::OK,
-                rows: vec![],
+                rows: vec![response_data],
                 ..Default::default()
             })
         }
@@ -306,13 +333,55 @@ fn build_response(response: PgrstResponse) -> Response {
 }
 
 /// Build an error response.
+///
+/// In production mode (PGRST_DEBUG=false or unset), sensitive error details
+/// are hidden to prevent information leakage.
 fn error_response(error: postrust_core::Error) -> Response {
     let status = error.status_code();
-    let body = serde_json::to_vec(&error.to_json()).unwrap_or_default();
+
+    // Check if debug mode is enabled
+    let debug_mode = std::env::var("PGRST_DEBUG")
+        .map(|v| v == "true" || v == "1")
+        .unwrap_or(false);
+
+    let body = if debug_mode {
+        // Full error details in debug mode
+        serde_json::to_vec(&error.to_json()).unwrap_or_default()
+    } else {
+        // Sanitized error in production
+        let sanitized = serde_json::json!({
+            "code": error.code(),
+            "message": sanitize_error_message(&error),
+            "details": null,
+            "hint": null
+        });
+        serde_json::to_vec(&sanitized).unwrap_or_default()
+    };
 
     Response::builder()
         .status(status)
         .header("content-type", "application/json")
         .body(Body::from(body))
         .unwrap_or_else(|_| Response::new(Body::empty()))
+}
+
+/// Sanitize error messages for production.
+fn sanitize_error_message(error: &postrust_core::Error) -> &'static str {
+    use postrust_core::Error;
+    match error {
+        Error::TableNotFound(_) | Error::NotFound(_) => "Resource not found",
+        Error::FunctionNotFound(_) => "Function not found",
+        Error::ColumnNotFound(_) | Error::UnknownColumn(_) => "Column not found",
+        Error::RelationshipNotFound(_) => "Relationship not found",
+        Error::InvalidPath(_) => "Invalid request path",
+        Error::InvalidBody(_) => "Invalid request body",
+        Error::InvalidJwt(_) | Error::JwtExpired | Error::MissingAuth => "Unauthorized",
+        Error::InsufficientPermissions(_) => "Forbidden",
+        Error::UnacceptableSchema(_) => "Invalid schema",
+        Error::InvalidHeader(_) | Error::InvalidQueryParam(_) => "Invalid request",
+        Error::Database(_) => "Database error",
+        Error::ConnectionPool(_) => "Service temporarily unavailable",
+        Error::Internal(_) => "Internal server error",
+        _ => "An error occurred",
+    }
 }

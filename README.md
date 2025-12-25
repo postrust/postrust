@@ -52,6 +52,16 @@ Postrust is a high-performance, serverless-first REST API server for PostgreSQL 
 | **AWS Lambda** | ✅ | Native Lambda adapter with connection pooling |
 | **Cloudflare Workers** | 🚧 | Stub (requires Hyperdrive for database) |
 
+### Admin & Developer Tools
+
+| Feature | Status | Description |
+|---------|--------|-------------|
+| **Admin UI** | ✅ | Dashboard at `/admin` (requires `admin-ui` feature) |
+| **OpenAPI Spec** | ✅ | OpenAPI 3.0 specification at `/admin/openapi.json` |
+| **Swagger UI** | ✅ | Interactive API docs at `/admin/swagger` |
+| **Scalar** | ✅ | Modern API docs at `/admin/scalar` |
+| **GraphQL Playground** | ✅ | Interactive GraphQL IDE at `/admin/graphql` |
+
 ## Quick Start
 
 ### Prerequisites
@@ -278,6 +288,25 @@ cargo build --release -p postrust-server
 DATABASE_URL="postgres://..." ./target/release/postrust
 ```
 
+### With Admin UI
+
+The Admin UI provides OpenAPI documentation, Swagger UI, Scalar, and GraphQL Playground:
+
+```bash
+# Build with admin-ui feature
+cargo build --release -p postrust-server --features admin-ui
+
+# Run - Admin UI available at /admin
+DATABASE_URL="postgres://..." ./target/release/postrust
+
+# Access admin endpoints:
+# - /admin          - Dashboard with links to all tools
+# - /admin/swagger  - Swagger UI for interactive API testing
+# - /admin/scalar   - Scalar modern API documentation
+# - /admin/graphql  - GraphQL Playground
+# - /admin/openapi.json - Raw OpenAPI 3.0 specification
+```
+
 ### AWS Lambda
 
 ```bash
@@ -478,13 +507,15 @@ postrust/
 | Memory Usage | Lower | Higher |
 | Serverless Support | Native | Via containers |
 | Configuration | Env vars | Config file + env |
-| OpenAPI | Planned | ✅ |
+| OpenAPI | ✅ (admin-ui feature) | ✅ |
 | GraphQL | ✅ | ❌ |
+| Admin UI | ✅ (Swagger, Scalar) | ❌ |
 
 ## Roadmap
 
-- [ ] OpenAPI 3.0 specification generation
+- [x] OpenAPI 3.0 specification generation (via `admin-ui` feature)
 - [x] GraphQL adapter (queries, mutations, filtering, relationships)
+- [x] Admin UI with Swagger, Scalar, and GraphQL Playground
 - [ ] GraphQL subscriptions (LISTEN/NOTIFY)
 - [ ] Connection pooling improvements
 - [ ] Cloudflare Workers full support (Hyperdrive)

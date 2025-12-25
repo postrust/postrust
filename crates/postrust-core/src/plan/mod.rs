@@ -64,6 +64,10 @@ pub fn create_action_plan(
 ) -> Result<ActionPlan> {
     match &request.action {
         Action::Db(db_action) => {
+            // SchemaRead is a special case - it returns OpenAPI spec, not a DB query
+            if matches!(db_action, DbAction::SchemaRead { .. }) {
+                return Ok(ActionPlan::Info(InfoPlan::OpenApiSpec));
+            }
             let plan = create_db_plan(request, db_action, schema_cache)?;
             Ok(ActionPlan::Db(plan))
         }
@@ -121,8 +125,8 @@ fn create_db_plan(
         }
 
         DbAction::SchemaRead { .. } => {
-            // Schema read returns OpenAPI spec
-            Ok(DbActionPlan::Read(ReadPlanTree::empty()))
+            // This case is handled in create_action_plan before calling create_db_plan
+            unreachable!("SchemaRead should be handled in create_action_plan")
         }
     }
 }

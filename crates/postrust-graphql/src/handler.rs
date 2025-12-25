@@ -116,9 +116,12 @@ fn build_dynamic_schema(
 
     // Register scalar types
     builder = builder.register(create_bigint_scalar());
+    builder = builder.register(create_bigdecimal_scalar());
     builder = builder.register(create_json_scalar());
     builder = builder.register(create_uuid_scalar());
+    builder = builder.register(create_date_scalar());
     builder = builder.register(create_datetime_scalar());
+    builder = builder.register(create_time_scalar());
 
     // Register input types
     builder = register_filter_input_types(builder);
@@ -537,6 +540,12 @@ fn create_bigint_scalar() -> Scalar {
         .specified_by_url("https://spec.graphql.org/draft/#sec-Int")
 }
 
+/// Create BigDecimal scalar type.
+fn create_bigdecimal_scalar() -> Scalar {
+    Scalar::new("BigDecimal")
+        .description("Arbitrary precision decimal number")
+}
+
 /// Create JSON scalar type.
 fn create_json_scalar() -> Scalar {
     Scalar::new("JSON")
@@ -549,9 +558,19 @@ fn create_uuid_scalar() -> Scalar {
     Scalar::new("UUID").description("UUID string")
 }
 
+/// Create Date scalar type.
+fn create_date_scalar() -> Scalar {
+    Scalar::new("Date").description("ISO 8601 date string (YYYY-MM-DD)")
+}
+
 /// Create DateTime scalar type.
 fn create_datetime_scalar() -> Scalar {
     Scalar::new("DateTime").description("ISO 8601 datetime string")
+}
+
+/// Create Time scalar type.
+fn create_time_scalar() -> Scalar {
+    Scalar::new("Time").description("ISO 8601 time string (HH:MM:SS)")
 }
 
 /// Register filter input types.

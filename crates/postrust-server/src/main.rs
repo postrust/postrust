@@ -3,24 +3,22 @@
 //! A PostgREST-compatible REST API server for PostgreSQL.
 
 use anyhow::Result;
-use axum::{
-    body::Body,
-    extract::{Request, State},
-    http::{Method, StatusCode},
-    middleware,
-    response::{IntoResponse, Response},
-    routing::any,
-    Router,
-};
+use axum::{http::Method, response::Json, routing::any, Router};
 use sqlx::postgres::PgPoolOptions;
 use std::sync::Arc;
 use tokio::sync::RwLock;
-use tower_http::cors::{Any, CorsLayer};
-use tracing::{error, info};
+use tower_http::cors::{Any as CorsAny, CorsLayer};
+use tracing::info;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
 mod app;
 mod state;
+
+#[cfg(feature = "admin-ui")]
+mod admin;
+
+#[cfg(feature = "admin-ui")]
+use axum::routing::{get, post};
 
 use app::handle_request;
 use state::AppState;
@@ -66,13 +64,77 @@ async fn main() -> Result<()> {
         },
     });
 
-    // Build router
-    let app = Router::new()
+    // Build REST API router (under /api prefix)
+    let api_router: Router<Arc<AppState>> = Router::new()
         .route("/", any(handle_request))
-        .route("/{*path}", any(handle_request))
+        .route("/{*path}", any(handle_request));
+
+    // Build main router
+    let mut app: Router<Arc<AppState>> = Router::new()
+        .nest("/api", api_router);
+
+    // Add admin routes and GraphQL endpoint if feature is enabled
+    #[cfg(feature = "admin-ui")]
+    {
+        use async_graphql_axum::{GraphQLRequest as GqlRequest, GraphQLResponse as GqlResponse};
+        use axum::extract::State as AxumState;
+        use axum::http::HeaderMap;
+        use postrust_graphql::handler::GraphQLState;
+        use postrust_graphql::schema::SchemaConfig;
+
+        info!("Admin UI enabled at /admin");
+        app = app.nest("/admin", admin::admin_router());
+
+        // Create GraphQL state
+        let schema_cache_snapshot = state.schema_cache.read().await.clone();
+        let schema_cache_arc = Arc::new(schema_cache_snapshot);
+        let graphql_state = Arc::new(
+            GraphQLState::new(
+                state.pool.clone(),
+                schema_cache_arc.clone(),
+                SchemaConfig::default(),
+            )
+            .expect("Failed to build GraphQL schema"),
+        );
+
+        info!("GraphQL endpoint enabled at /api/graphql");
+
+        // Wrapper handler that creates context from request
+        async fn handle_graphql(
+            AxumState(gql_state): AxumState<Arc<GraphQLState>>,
+            _headers: HeaderMap,
+            req: GqlRequest,
+        ) -> GqlResponse {
+            // Use anonymous role for now (auth can be added later)
+            let request = req.into_inner().data(gql_state.pool.clone());
+            gql_state.schema.execute(request).await.into()
+        }
+
+        // Add GraphQL routes
+        let graphql_router = Router::new()
+            .route("/", post(handle_graphql))
+            .route("/", get(postrust_graphql::handler::graphql_playground))
+            .with_state(graphql_state);
+
+        app = app.nest("/api/graphql", graphql_router);
+    }
+
+    // Add root info endpoint
+    app = app.route("/", axum::routing::get(|| async {
+        Json(serde_json::json!({
+            "name": "postrust",
+            "version": env!("CARGO_PKG_VERSION"),
+            "api": "/api",
+            "admin": "/admin",
+            "docs": "/admin/swagger"
+        }))
+    }));
+
+    // Apply CORS and state
+    let app = app
         .layer(
             CorsLayer::new()
-                .allow_origin(Any)
+                .allow_origin(CorsAny)
                 .allow_methods([
                     Method::GET,
                     Method::POST,
@@ -82,8 +144,8 @@ async fn main() -> Result<()> {
                     Method::OPTIONS,
                     Method::HEAD,
                 ])
-                .allow_headers(Any)
-                .expose_headers(Any),
+                .allow_headers(CorsAny)
+                .expose_headers(CorsAny),
         )
         .with_state(state);
 

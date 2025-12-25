@@ -34,6 +34,7 @@ services:
       PGRST_SERVER_HOST: 0.0.0.0
       PGRST_SERVER_PORT: 3000
       PGRST_LOG_LEVEL: info
+      PGRST_DEBUG: "true"
       RUST_LOG: info
     ports:
       - "3000:3000"

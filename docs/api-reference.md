@@ -38,6 +38,16 @@ Complete reference for the Postrust REST and GraphQL APIs.
 |--------|----------|-------------|
 | `GET` | `/` | OpenAPI specification |
 
+### Admin UI (requires `admin-ui` feature)
+
+| Method | Endpoint | Description |
+|--------|----------|-------------|
+| `GET` | `/admin` | Admin dashboard |
+| `GET` | `/admin/openapi.json` | OpenAPI 3.0 specification |
+| `GET` | `/admin/swagger` | Swagger UI |
+| `GET` | `/admin/scalar` | Scalar API documentation |
+| `GET` | `/admin/graphql` | GraphQL Playground |
+
 ## Query Parameters
 
 ### select
@@ -669,3 +679,62 @@ query {
 | Pagination | `?limit=10&offset=20` | `limit: 10, offset: 20` |
 | Multiple resources | Multiple requests | Single query |
 | Response shape | Fixed | Matches query |
+
+## Admin UI
+
+The Admin UI is an optional feature that provides development tools and API documentation. To enable it, build with the `admin-ui` feature:
+
+```bash
+cargo build --release -p postrust-server --features admin-ui
+```
+
+### Admin Dashboard
+
+The admin dashboard at `/admin` provides:
+
+- Quick stats: Tables, functions, and relationships in your schema
+- Links to all admin tools
+- Modern dark-themed interface
+
+### OpenAPI Specification
+
+Access the OpenAPI 3.0 specification at `/admin/openapi.json`:
+
+```bash
+curl http://localhost:3000/admin/openapi.json
+```
+
+The spec documents:
+
+- All REST endpoints (tables, RPC, GraphQL)
+- Request/response schemas
+- Filter operators
+- Authentication requirements
+
+### Swagger UI
+
+Interactive API documentation at `/admin/swagger`:
+
+- Test API endpoints directly from the browser
+- View request/response schemas
+- See example payloads
+- Powered by Swagger UI 5.x (CDN)
+
+### Scalar
+
+Modern API documentation at `/admin/scalar`:
+
+- Clean, modern interface
+- Alternative to Swagger UI
+- Same OpenAPI specification
+- Powered by Scalar (CDN)
+
+### GraphQL Playground
+
+Interactive GraphQL IDE at `/admin/graphql`:
+
+- Write and test GraphQL queries
+- Schema explorer with documentation
+- Query history
+- Variable editor
+- Powered by GraphQL Playground
