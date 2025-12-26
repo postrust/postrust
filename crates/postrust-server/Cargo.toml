@@ -3,6 +3,8 @@ name = "postrust-server"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+repository.workspace = true
+authors.workspace = true
 description = "HTTP server for Postrust using Axum"
 
 [[bin]]

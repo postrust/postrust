@@ -3,6 +3,8 @@ name = "postrust-graphql"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+repository.workspace = true
+authors.workspace = true
 description = "GraphQL support for Postrust"
 
 [dependencies]

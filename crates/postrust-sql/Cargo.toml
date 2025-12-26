@@ -3,6 +3,8 @@ name = "postrust-sql"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+repository.workspace = true
+authors.workspace = true
 description = "Type-safe SQL builder for Postrust"
 
 [dependencies]

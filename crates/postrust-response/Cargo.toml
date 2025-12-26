@@ -3,6 +3,8 @@ name = "postrust-response"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+repository.workspace = true
+authors.workspace = true
 description = "Response formatting for Postrust (JSON, CSV, OpenAPI)"
 
 [dependencies]

@@ -3,6 +3,8 @@ name = "postrust-core"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+repository.workspace = true
+authors.workspace = true
 description = "Core library for Postrust - PostgREST-compatible REST API for PostgreSQL"
 
 [dependencies]

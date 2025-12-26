@@ -3,6 +3,8 @@ name = "postrust-lambda"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+repository.workspace = true
+authors.workspace = true
 description = "AWS Lambda adapter for Postrust"
 
 [[bin]]
