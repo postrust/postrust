@@ -1,0 +1,174 @@
+@import "tailwindcss";
+
+/* Enterprise Design System for Postrust */
+@theme {
+  /* Colors - Professional, Clean, Enterprise */
+  --color-primary-50: #fef3e2;
+  --color-primary-100: #fde4be;
+  --color-primary-200: #fbd396;
+  --color-primary-300: #f9c06e;
+  --color-primary-400: #f7a94d;
+  --color-primary-500: #f5912c;
+  --color-primary-600: #e87f1a;
+  --color-primary-700: #d56a10;
+  --color-primary-800: #b35410;
+  --color-primary-900: #8f420d;
+  --color-primary-950: #5c2908;
+
+  /* Neutral - Sophisticated Grays */
+  --color-neutral-50: #fafafa;
+  --color-neutral-100: #f4f4f5;
+  --color-neutral-200: #e4e4e7;
+  --color-neutral-300: #d4d4d8;
+  --color-neutral-400: #a1a1aa;
+  --color-neutral-500: #71717a;
+  --color-neutral-600: #52525b;
+  --color-neutral-700: #3f3f46;
+  --color-neutral-800: #27272a;
+  --color-neutral-900: #18181b;
+  --color-neutral-950: #09090b;
+
+  /* Accent - Trust Blue */
+  --color-accent-50: #eff6ff;
+  --color-accent-100: #dbeafe;
+  --color-accent-200: #bfdbfe;
+  --color-accent-300: #93c5fd;
+  --color-accent-400: #60a5fa;
+  --color-accent-500: #3b82f6;
+  --color-accent-600: #2563eb;
+  --color-accent-700: #1d4ed8;
+  --color-accent-800: #1e40af;
+  --color-accent-900: #1e3a8a;
+
+  /* Success */
+  --color-success-500: #22c55e;
+  --color-success-600: #16a34a;
+
+  /* Warning */
+  --color-warning-500: #eab308;
+  --color-warning-600: #ca8a04;
+
+  /* Error */
+  --color-error-500: #ef4444;
+  --color-error-600: #dc2626;
+
+  /* Typography */
+  --font-sans: "Inter", system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+  --font-mono: "JetBrains Mono", "Fira Code", "SF Mono", Consolas, monospace;
+
+  /* Spacing */
+  --spacing-section: 6rem;
+  --spacing-container: 1.5rem;
+
+  /* Border Radius */
+  --radius-sm: 0.375rem;
+  --radius-md: 0.5rem;
+  --radius-lg: 0.75rem;
+  --radius-xl: 1rem;
+  --radius-2xl: 1.5rem;
+
+  /* Shadows - Subtle and Professional */
+  --shadow-sm: 0 1px 2px 0 rgb(0 0 0 / 0.05);
+  --shadow-md: 0 4px 6px -1px rgb(0 0 0 / 0.1), 0 2px 4px -2px rgb(0 0 0 / 0.1);
+  --shadow-lg: 0 10px 15px -3px rgb(0 0 0 / 0.1), 0 4px 6px -4px rgb(0 0 0 / 0.1);
+  --shadow-xl: 0 20px 25px -5px rgb(0 0 0 / 0.1), 0 8px 10px -6px rgb(0 0 0 / 0.1);
+}
+
+/* Base Styles */
+html {
+  scroll-behavior: smooth;
+}
+
+body {
+  font-family: var(--font-sans);
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+/* Code Block Styling */
+pre, code {
+  font-family: var(--font-mono);
+}
+
+/* Selection */
+::selection {
+  background-color: var(--color-primary-200);
+  color: var(--color-neutral-900);
+}
+
+/* Custom Utilities */
+@utility container-narrow {
+  max-width: 48rem;
+  margin-left: auto;
+  margin-right: auto;
+  padding-left: var(--spacing-container);
+  padding-right: var(--spacing-container);
+}
+
+@utility container-wide {
+  max-width: 80rem;
+  margin-left: auto;
+  margin-right: auto;
+  padding-left: var(--spacing-container);
+  padding-right: var(--spacing-container);
+}
+
+@utility text-gradient {
+  background: linear-gradient(135deg, var(--color-primary-500), var(--color-primary-700));
+  -webkit-background-clip: text;
+  -webkit-text-fill-color: transparent;
+  background-clip: text;
+}
+
+@utility section-padding {
+  padding-top: var(--spacing-section);
+  padding-bottom: var(--spacing-section);
+}
+
+/* Animation Keyframes */
+@keyframes fade-in-up {
+  from {
+    opacity: 0;
+    transform: translateY(20px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+@keyframes pulse-subtle {
+  0%, 100% {
+    opacity: 1;
+  }
+  50% {
+    opacity: 0.8;
+  }
+}
+
+.animate-fade-in-up {
+  animation: fade-in-up 0.6s ease-out forwards;
+}
+
+.animate-pulse-subtle {
+  animation: pulse-subtle 2s ease-in-out infinite;
+}
+
+/* Prose Styles for Documentation */
+.prose {
+  --tw-prose-body: var(--color-neutral-700);
+  --tw-prose-headings: var(--color-neutral-900);
+  --tw-prose-links: var(--color-primary-600);
+  --tw-prose-bold: var(--color-neutral-900);
+  --tw-prose-code: var(--color-primary-700);
+  --tw-prose-pre-bg: var(--color-neutral-900);
+}
+
+/* Dark Mode Support */
+@media (prefers-color-scheme: dark) {
+  .dark-auto {
+    --color-bg: var(--color-neutral-950);
+    --color-text: var(--color-neutral-100);
+    --color-text-muted: var(--color-neutral-400);
+  }
+}

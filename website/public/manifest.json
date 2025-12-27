@@ -1,0 +1,10 @@
+{
+  "$schema": "https://json.schemastore.org/web-manifest-combined.json",
+  "name": "Postrust - PostgreSQL REST & GraphQL API Server",
+  "short_name": "Postrust",
+  "start_url": ".",
+  "display": "standalone",
+  "background_color": "#ffffff",
+  "theme_color": "#f5912c",
+  "description": "High-performance PostgreSQL REST & GraphQL API server written in Rust. Serverless-first with 5-20ms cold starts."
+}
