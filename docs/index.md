@@ -8,8 +8,8 @@ Welcome to the Postrust documentation. Postrust is a high-performance, serverles
 - [Configuration](./configuration.md) - Environment variables and options
 - [API Reference](./api-reference.md) - Complete API documentation
 - [Authentication](./authentication.md) - JWT and role-based access
+- [Custom Routes](./custom-routes.md) - Add webhooks, health checks, and custom endpoints
 - [Deployment](./deployment.md) - Deploy to various platforms
-- [API Examples](./examples.md) - Common use cases
 
 ## What is Postrust?
 

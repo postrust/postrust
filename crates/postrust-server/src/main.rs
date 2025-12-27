@@ -12,6 +12,7 @@ use tracing::info;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
 mod app;
+mod custom;
 mod state;
 
 #[cfg(feature = "admin-ui")]
@@ -73,6 +74,10 @@ async fn main() -> Result<()> {
     let mut app: Router<Arc<AppState>> = Router::new()
         .nest("/api", api_router);
 
+    // Add custom routes (health checks, webhooks, etc.)
+    app = app.nest("/_", custom::custom_router());
+    info!("Custom routes enabled at /_");
+
     // Add admin routes and GraphQL endpoint if feature is enabled
     #[cfg(feature = "admin-ui")]
     {
@@ -125,6 +130,8 @@ async fn main() -> Result<()> {
             "name": "postrust",
             "version": env!("CARGO_PKG_VERSION"),
             "api": "/api",
+            "custom": "/_",
+            "health": "/_/health",
             "admin": "/admin",
             "docs": "/admin/swagger"
         }))

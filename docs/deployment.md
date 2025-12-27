@@ -1,6 +1,34 @@
 # Deployment
 
-Deploy Postrust to various environments.
+Deploy Postrust to various environments. This guide covers deploying both the standard Postrust server and customized versions with custom routes.
+
+## Building with Custom Routes
+
+If you've added [custom routes](./custom-routes.md), build your customized version:
+
+### Standard Build
+
+```bash
+# Build optimized binary with custom routes
+cargo build --release -p postrust-server
+
+# Binary location
+./target/release/postrust
+```
+
+### Build with Admin UI
+
+```bash
+# Include admin dashboard, Swagger UI, and GraphQL
+cargo build --release -p postrust-server --features admin-ui
+```
+
+### Build Features
+
+| Feature | Description |
+|---------|-------------|
+| `default` | Core REST API with custom routes |
+| `admin-ui` | Admin dashboard + Swagger + GraphQL playground |
 
 ## Standalone Server
 
@@ -32,11 +60,15 @@ ExecStart=/opt/postrust/postrust
 Restart=always
 RestartSec=5
 
-# Environment
+# Core Environment
 Environment=DATABASE_URL=postgres://user:pass@localhost:5432/mydb
 Environment=PGRST_DB_ANON_ROLE=web_anon
 Environment=PGRST_JWT_SECRET=your-secret-key
 Environment=PGRST_LOG_LEVEL=info
+
+# Custom Routes Environment (for webhooks, etc.)
+Environment=STRIPE_WEBHOOK_SECRET=whsec_...
+Environment=GITHUB_WEBHOOK_SECRET=...
 
 # Security
 NoNewPrivileges=true
@@ -69,26 +101,85 @@ docker run -d \
   postrust/postrust:latest
 ```
 
-### Building Your Own Image
+### Building Your Own Image (with Custom Routes)
+
+If you've added custom routes in `crates/postrust-server/src/custom.rs`, build your own image:
 
 ```dockerfile
-FROM rust:1.75-bookworm as builder
-WORKDIR /app
-COPY . .
-RUN cargo build --release -p postrust-server
+# Dockerfile
+FROM rust:1.83-bookworm as builder
 
+# Install build dependencies
+RUN apt-get update && apt-get install -y pkg-config libssl-dev
+
+WORKDIR /app
+
+# Copy workspace files
+COPY Cargo.toml Cargo.lock ./
+COPY crates ./crates
+
+# Build with admin-ui feature (optional)
+RUN cargo build --release -p postrust-server --features admin-ui
+
+# Runtime stage
 FROM debian:bookworm-slim
-RUN apt-get update && apt-get install -y libssl3 ca-certificates && rm -rf /var/lib/apt/lists/*
+
+RUN apt-get update && \
+    apt-get install -y libssl3 ca-certificates && \
+    rm -rf /var/lib/apt/lists/*
+
 COPY --from=builder /app/target/release/postrust /usr/local/bin/
+
+# Default environment
+ENV PGRST_SERVER_HOST=0.0.0.0
+ENV PGRST_SERVER_PORT=3000
+ENV PGRST_DB_POOL_SIZE=10
+
 EXPOSE 3000
+
+HEALTHCHECK --interval=30s --timeout=3s --start-period=5s --retries=3 \
+    CMD curl -f http://localhost:3000/_/health || exit 1
+
 CMD ["postrust"]
 ```
 
 Build and run:
 
 ```bash
-docker build -t my-postrust .
-docker run -d -p 3000:3000 --env-file .env my-postrust
+# Build the image
+docker build -t my-postrust:latest .
+
+# Run with environment file
+docker run -d \
+  --name postrust \
+  -p 3000:3000 \
+  --env-file .env \
+  my-postrust:latest
+
+# Or with inline environment variables
+docker run -d \
+  --name postrust \
+  -p 3000:3000 \
+  -e DATABASE_URL="postgres://user:pass@host:5432/db" \
+  -e PGRST_DB_ANON_ROLE="web_anon" \
+  -e PGRST_JWT_SECRET="your-secret-key" \
+  -e STRIPE_WEBHOOK_SECRET="whsec_..." \
+  my-postrust:latest
+```
+
+### Multi-Architecture Build
+
+Build for multiple platforms (useful for deploying to ARM64 servers like AWS Graviton):
+
+```bash
+# Create builder for multi-arch
+docker buildx create --name mybuilder --use
+
+# Build and push for amd64 and arm64
+docker buildx build \
+  --platform linux/amd64,linux/arm64 \
+  -t your-registry/postrust:latest \
+  --push .
 ```
 
 ### Docker Compose
@@ -475,3 +566,370 @@ Output:
 ```json
 {"timestamp":"2024-01-15T10:30:00Z","level":"INFO","message":"Request completed","method":"GET","path":"/users","status":200,"duration_ms":15}
 ```
+
+## Fly.io
+
+Fly.io provides easy deployment for Rust applications with global distribution.
+
+### fly.toml
+
+```toml
+app = "my-postrust-api"
+primary_region = "iad"
+
+[build]
+  dockerfile = "Dockerfile"
+
+[env]
+  PGRST_SERVER_HOST = "0.0.0.0"
+  PGRST_SERVER_PORT = "8080"
+  PGRST_DB_ANON_ROLE = "web_anon"
+  PGRST_DB_SCHEMAS = "public"
+
+[http_service]
+  internal_port = 8080
+  force_https = true
+  auto_stop_machines = true
+  auto_start_machines = true
+  min_machines_running = 1
+
+  [http_service.concurrency]
+    type = "requests"
+    hard_limit = 250
+    soft_limit = 200
+
+[[services]]
+  protocol = "tcp"
+  internal_port = 8080
+
+  [[services.ports]]
+    port = 80
+    handlers = ["http"]
+
+  [[services.ports]]
+    port = 443
+    handlers = ["tls", "http"]
+
+  [[services.http_checks]]
+    interval = "10s"
+    timeout = "2s"
+    path = "/_/health"
+```
+
+### Deploy
+
+```bash
+# Install Fly CLI
+curl -L https://fly.io/install.sh | sh
+
+# Login
+fly auth login
+
+# Launch (first time)
+fly launch
+
+# Set secrets
+fly secrets set DATABASE_URL="postgres://..."
+fly secrets set PGRST_JWT_SECRET="..."
+fly secrets set STRIPE_WEBHOOK_SECRET="whsec_..."
+
+# Deploy
+fly deploy
+
+# Check logs
+fly logs
+
+# Scale
+fly scale count 3
+```
+
+### Connect to Fly Postgres
+
+```bash
+# Create Fly Postgres cluster
+fly postgres create --name my-postrust-db
+
+# Attach to app
+fly postgres attach my-postrust-db
+
+# DATABASE_URL is automatically set
+```
+
+## Railway
+
+Railway provides simple Git-based deployments.
+
+### railway.json
+
+```json
+{
+  "$schema": "https://railway.app/railway.schema.json",
+  "build": {
+    "builder": "DOCKERFILE",
+    "dockerfilePath": "Dockerfile"
+  },
+  "deploy": {
+    "startCommand": "postrust",
+    "healthcheckPath": "/_/health",
+    "healthcheckTimeout": 30,
+    "restartPolicyType": "ON_FAILURE",
+    "restartPolicyMaxRetries": 3
+  }
+}
+```
+
+### Deploy
+
+```bash
+# Install Railway CLI
+npm install -g @railway/cli
+
+# Login
+railway login
+
+# Initialize project
+railway init
+
+# Link to existing project (if any)
+railway link
+
+# Add environment variables
+railway variables set DATABASE_URL="postgres://..."
+railway variables set PGRST_JWT_SECRET="..."
+
+# Deploy
+railway up
+
+# View logs
+railway logs
+```
+
+### Railway with Postgres
+
+```bash
+# Add Postgres plugin
+railway add -p postgresql
+
+# Environment variable is automatically set
+# DATABASE_URL=postgres://...
+```
+
+## Render
+
+### render.yaml (Blueprint)
+
+```yaml
+services:
+  - type: web
+    name: postrust-api
+    env: docker
+    dockerfilePath: ./Dockerfile
+    dockerContext: .
+    healthCheckPath: /_/health
+    envVars:
+      - key: DATABASE_URL
+        fromDatabase:
+          name: postrust-db
+          property: connectionString
+      - key: PGRST_JWT_SECRET
+        sync: false
+      - key: PGRST_DB_ANON_ROLE
+        value: web_anon
+      - key: PGRST_SERVER_PORT
+        value: 10000
+      - key: STRIPE_WEBHOOK_SECRET
+        sync: false
+    autoDeploy: true
+
+databases:
+  - name: postrust-db
+    databaseName: postrust
+    user: postrust
+    plan: starter
+```
+
+### Deploy
+
+1. Push `render.yaml` to your repository
+2. Go to Render Dashboard → Blueprints
+3. Connect your repository
+4. Deploy
+
+## DigitalOcean App Platform
+
+### app.yaml
+
+```yaml
+name: postrust-api
+region: nyc
+services:
+  - name: api
+    dockerfile_path: Dockerfile
+    source_dir: /
+    http_port: 3000
+    instance_count: 1
+    instance_size_slug: basic-xxs
+    health_check:
+      http_path: /_/health
+    envs:
+      - key: DATABASE_URL
+        scope: RUN_TIME
+        value: ${db.DATABASE_URL}
+      - key: PGRST_JWT_SECRET
+        scope: RUN_TIME
+        type: SECRET
+      - key: PGRST_DB_ANON_ROLE
+        value: web_anon
+
+databases:
+  - name: db
+    engine: PG
+    version: "16"
+    size: db-s-dev-database
+```
+
+### Deploy
+
+```bash
+# Install doctl
+brew install doctl
+
+# Authenticate
+doctl auth init
+
+# Create app from spec
+doctl apps create --spec app.yaml
+
+# Update app
+doctl apps update <app-id> --spec app.yaml
+```
+
+## CI/CD Pipelines
+
+### GitHub Actions
+
+```yaml
+# .github/workflows/deploy.yml
+name: Deploy
+
+on:
+  push:
+    branches: [main]
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
+
+jobs:
+  build-and-push:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login to Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          push: true
+          tags: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  deploy:
+    needs: build-and-push
+    runs-on: ubuntu-latest
+    steps:
+      - name: Deploy to Fly.io
+        uses: superfly/flyctl-actions/setup-flyctl@master
+      - run: flyctl deploy --remote-only
+        env:
+          FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }}
+```
+
+### GitLab CI
+
+```yaml
+# .gitlab-ci.yml
+stages:
+  - build
+  - deploy
+
+variables:
+  DOCKER_IMAGE: $CI_REGISTRY_IMAGE:$CI_COMMIT_SHA
+
+build:
+  stage: build
+  image: docker:24
+  services:
+    - docker:24-dind
+  script:
+    - docker login -u $CI_REGISTRY_USER -p $CI_REGISTRY_PASSWORD $CI_REGISTRY
+    - docker build -t $DOCKER_IMAGE .
+    - docker push $DOCKER_IMAGE
+  only:
+    - main
+
+deploy:
+  stage: deploy
+  image: alpine:latest
+  before_script:
+    - apk add --no-cache curl
+    - curl -L https://fly.io/install.sh | sh
+  script:
+    - flyctl deploy --image $DOCKER_IMAGE
+  environment:
+    name: production
+  only:
+    - main
+```
+
+## Production Checklist
+
+### Security
+
+- [ ] Use HTTPS/TLS in production
+- [ ] Set strong `PGRST_JWT_SECRET` (min 32 characters)
+- [ ] Configure proper CORS settings
+- [ ] Enable Row Level Security (RLS) on all tables
+- [ ] Use connection pooling (PgBouncer or built-in)
+- [ ] Set appropriate `PGRST_DB_MAX_ROWS` limit
+- [ ] Validate webhook signatures
+
+### Performance
+
+- [ ] Set appropriate `PGRST_DB_POOL_SIZE` (10-50 typically)
+- [ ] Enable response compression
+- [ ] Configure CDN for static responses
+- [ ] Set up database indexes
+- [ ] Monitor slow queries
+
+### Reliability
+
+- [ ] Configure health checks (`/_/health`, `/_/ready`)
+- [ ] Set up automated restarts
+- [ ] Configure log aggregation
+- [ ] Set up alerts for errors/downtime
+- [ ] Enable database backups
+- [ ] Test disaster recovery
+
+### Monitoring
+
+- [ ] Application logs → CloudWatch/Datadog/Loki
+- [ ] Database metrics → RDS Insights/pganalyze
+- [ ] HTTP metrics → Prometheus/Grafana
+- [ ] Error tracking → Sentry
+- [ ] Uptime monitoring → UptimeRobot/Pingdom
