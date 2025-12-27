@@ -1,5 +1,20 @@
 import { component$, useSignal } from "@builder.io/qwik";
 
+/*
+ * EXAMPLES ROADMAP:
+ * -----------------
+ * TODO: Add more real-world examples:
+ * - [ ] Aggregations (count, sum, avg)
+ * - [ ] Full-text search
+ * - [ ] Bulk insert/upsert
+ * - [ ] Stored procedures (RPC)
+ * - [ ] File uploads with storage
+ * - [ ] Realtime subscriptions (when supported)
+ * - [ ] Custom routes examples
+ * - [ ] Multi-tenant patterns
+ * - [ ] Audit logging setup
+ */
+
 const codeExamples = [
   {
     id: "rest",
@@ -67,6 +82,34 @@ curl "localhost:3000/orders?select=*,customer(name,email),items(product(name,pri
     ],
   },
   {
+    id: "crud",
+    label: "CRUD Operations",
+    examples: [
+      {
+        title: "Create & Update",
+        code: `# Insert a new product
+curl -X POST "localhost:3000/products" \\
+  -H "Content-Type: application/json" \\
+  -d '{"name": "Widget", "price": 29.99, "stock": 100}'
+
+# Update with filters (PATCH)
+curl -X PATCH "localhost:3000/products?id=eq.1" \\
+  -H "Content-Type: application/json" \\
+  -d '{"price": 24.99}'`,
+      },
+      {
+        title: "Upsert & Delete",
+        code: `# Upsert (insert or update on conflict)
+curl -X POST "localhost:3000/products" \\
+  -H "Prefer: resolution=merge-duplicates" \\
+  -d '{"sku": "WDG-001", "name": "Widget Pro", "price": 39.99}'
+
+# Delete with filters
+curl -X DELETE "localhost:3000/products?status=eq.discontinued"`,
+      },
+    ],
+  },
+  {
     id: "auth",
     label: "Authentication",
     examples: [
@@ -92,6 +135,36 @@ CREATE POLICY user_isolation ON orders
 
 -- Users can only see their own orders
 -- Postrust enforces this automatically`,
+      },
+    ],
+  },
+  {
+    id: "advanced",
+    label: "Advanced",
+    examples: [
+      {
+        title: "Aggregations",
+        code: `# Count orders by status
+curl "localhost:3000/orders?select=status,count()&group=status"
+
+# Sum and average
+curl "localhost:3000/order_items?select=product_id,sum(quantity),avg(price)"
+
+# Response
+[
+  {"status": "pending", "count": 42},
+  {"status": "shipped", "count": 156}
+]`,
+      },
+      {
+        title: "Stored Procedures (RPC)",
+        code: `# Call a PostgreSQL function
+curl -X POST "localhost:3000/rpc/calculate_shipping" \\
+  -H "Content-Type: application/json" \\
+  -d '{"order_id": 123, "destination": "US"}'
+
+# Response
+{"shipping_cost": 12.99, "estimated_days": 3}`,
       },
     ],
   },
