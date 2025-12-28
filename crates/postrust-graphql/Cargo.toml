@@ -20,6 +20,7 @@ base64 = "0.22"
 
 # Async
 tokio.workspace = true
+tokio-stream = { version = "0.1", features = ["sync"] }
 futures.workspace = true
 
 # Database

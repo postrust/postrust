@@ -4,13 +4,14 @@ import { component$, useSignal } from "@builder.io/qwik";
  * EXAMPLES ROADMAP:
  * -----------------
  * TODO: Add more real-world examples:
- * - [ ] Aggregations (count, sum, avg)
+ * - [x] Aggregations (count, sum, avg)
  * - [ ] Full-text search
  * - [ ] Bulk insert/upsert
- * - [ ] Stored procedures (RPC)
+ * - [x] Stored procedures (RPC)
  * - [ ] File uploads with storage
- * - [ ] Realtime subscriptions (when supported)
- * - [ ] Custom routes examples
+ * - [x] Realtime subscriptions
+ * - [x] Custom routes examples
+ * - [x] pgvector / vector search
  * - [ ] Multi-tenant patterns
  * - [ ] Audit logging setup
  */
@@ -165,6 +166,119 @@ curl -X POST "localhost:3000/rpc/calculate_shipping" \\
 
 # Response
 {"shipping_cost": 12.99, "estimated_days": 3}`,
+      },
+    ],
+  },
+  {
+    id: "realtime",
+    label: "Realtime",
+    examples: [
+      {
+        title: "GraphQL Subscriptions",
+        code: `subscription {
+  orders(filter: {status: {eq: "pending"}}) {
+    id
+    total
+    status
+    customer { name email }
+  }
+}
+
+# Receive live updates when orders change
+{"data": {"orders": {"id": 42, "status": "shipped", ...}}}`,
+      },
+      {
+        title: "Subscribe to Any View",
+        code: `# Subscribe to a PostgreSQL view for live dashboards
+subscription {
+  salesDashboard {
+    totalRevenue
+    orderCount
+    topProducts { name salesCount }
+  }
+}
+
+# Updates stream in real-time as underlying data changes`,
+      },
+    ],
+  },
+  {
+    id: "vector",
+    label: "pgvector",
+    examples: [
+      {
+        title: "Semantic Search",
+        code: `# Find similar documents using embeddings
+curl "localhost:3000/documents?select=id,title,content&embedding=lt.0.5&order=embedding.asc"
+
+# Or via GraphQL with vector distance
+query {
+  documents(
+    filter: {embedding: {near: {vector: [0.1, 0.2, ...], distance: 0.5}}}
+    order: {embedding: ASC}
+    limit: 10
+  ) {
+    id title content similarity
+  }
+}`,
+      },
+      {
+        title: "RAG Pipeline",
+        code: `-- PostgreSQL: Create embeddings table
+CREATE TABLE documents (
+  id SERIAL PRIMARY KEY,
+  content TEXT,
+  embedding vector(1536)  -- OpenAI ada-002 dimensions
+);
+CREATE INDEX ON documents USING ivfflat (embedding vector_cosine_ops);
+
+# Query similar content for LLM context
+curl "localhost:3000/rpc/search_similar" \\
+  -d '{"query_embedding": [0.1, 0.2, ...], "limit": 5}'`,
+      },
+    ],
+  },
+  {
+    id: "custom",
+    label: "Custom Routes",
+    examples: [
+      {
+        title: "Rust Handler Definition",
+        code: `// crates/postrust-server/src/custom.rs
+use axum::{extract::State, Json, routing::post};
+
+pub fn custom_router() -> Router<Arc<AppState>> {
+    Router::new()
+        .route("/webhooks/stripe", post(handle_stripe))
+        .route("/ai/embed", post(generate_embedding))
+}
+
+async fn handle_stripe(
+    State(state): State<Arc<AppState>>,
+    body: String,
+) -> impl IntoResponse {
+    // Full access to database pool, config, JWT
+    let result = sqlx::query("UPDATE subscriptions...")
+        .execute(&state.pool).await;
+    Json(json!({ "received": true }))
+}`,
+      },
+      {
+        title: "Custom Middleware",
+        code: `// Add rate limiting, logging, or custom auth
+use axum::middleware;
+
+pub fn custom_router() -> Router<Arc<AppState>> {
+    Router::new()
+        .route("/api/expensive", post(expensive_operation))
+        .layer(middleware::from_fn(rate_limit))
+        .layer(middleware::from_fn(custom_auth))
+}
+
+async fn rate_limit<B>(req: Request<B>, next: Next<B>) -> Response {
+    // Check rate limits, return 429 if exceeded
+    next.run(req).await
+}`,
       },
     ],
   },

@@ -8,6 +8,8 @@ Welcome to the Postrust documentation. Postrust is a high-performance, serverles
 - [Configuration](./configuration.md) - Environment variables and options
 - [API Reference](./api-reference.md) - Complete API documentation
 - [Authentication](./authentication.md) - JWT and role-based access
+- [Realtime Subscriptions](./realtime.md) - Live data updates via GraphQL subscriptions
+- [pgvector Integration](./pgvector.md) - Vector similarity search for AI applications
 - [Custom Routes](./custom-routes.md) - Add webhooks, health checks, and custom endpoints
 - [Deployment](./deployment.md) - Deploy to various platforms
 

@@ -90,17 +90,28 @@ async fn main() -> Result<()> {
         info!("Admin UI enabled at /admin");
         app = app.nest("/admin", admin::admin_router());
 
-        // Create GraphQL state
+        // Create GraphQL state with subscriptions enabled
         let schema_cache_snapshot = state.schema_cache.read().await.clone();
         let schema_cache_arc = Arc::new(schema_cache_snapshot);
+        let graphql_config = SchemaConfig {
+            enable_subscriptions: true,
+            ..SchemaConfig::default()
+        };
         let graphql_state = Arc::new(
             GraphQLState::new(
                 state.pool.clone(),
                 schema_cache_arc.clone(),
-                SchemaConfig::default(),
+                graphql_config,
             )
             .expect("Failed to build GraphQL schema"),
         );
+
+        // Initialize subscription broker
+        if let Err(e) = graphql_state.init_subscriptions().await {
+            tracing::warn!("Failed to initialize subscription broker: {}. Subscriptions may not work until triggers are created.", e);
+        } else {
+            info!("GraphQL subscriptions enabled");
+        }
 
         info!("GraphQL endpoint enabled at /api/graphql");
 
@@ -115,10 +126,11 @@ async fn main() -> Result<()> {
             gql_state.schema.execute(request).await.into()
         }
 
-        // Add GraphQL routes
+        // Add GraphQL routes with WebSocket support for subscriptions
         let graphql_router = Router::new()
             .route("/", post(handle_graphql))
             .route("/", get(postrust_graphql::handler::graphql_playground))
+            .route("/ws", get(postrust_graphql::handler::graphql_ws_handler))
             .with_state(graphql_state);
 
         app = app.nest("/api/graphql", graphql_router);

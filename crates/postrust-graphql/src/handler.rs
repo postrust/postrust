@@ -7,15 +7,21 @@ use crate::context::GraphQLContext;
 use crate::error::GraphQLError;
 use crate::schema::object::TableObjectType;
 use crate::schema::{build_schema, GeneratedSchema, MutationType, SchemaConfig};
+use crate::subscription::{
+    generate_subscription_fields, NotifyBroker, SubscriptionField as SubField, TableChangePayload,
+};
 use async_graphql::dynamic::*;
 use async_graphql::Value;
 use async_graphql_axum::{GraphQLRequest, GraphQLResponse};
 use axum::extract::State;
+use axum::response::IntoResponse;
+use futures::stream::StreamExt;
 use postrust_core::schema_cache::SchemaCache;
 use sqlx::PgPool;
 use std::collections::HashMap;
 use std::sync::Arc;
-use tracing::debug;
+use tokio::sync::RwLock;
+use tracing::{debug, info};
 
 /// GraphQL execution state shared across requests.
 pub struct GraphQLState {
@@ -29,6 +35,10 @@ pub struct GraphQLState {
     pub schema: Schema,
     /// Schema configuration
     pub config: SchemaConfig,
+    /// Subscription fields
+    pub subscription_fields: Vec<SubField>,
+    /// Notification broker for subscriptions
+    pub broker: Arc<RwLock<Option<NotifyBroker>>>,
 }
 
 impl GraphQLState {
@@ -39,22 +49,95 @@ impl GraphQLState {
         config: SchemaConfig,
     ) -> Result<Self, GraphQLError> {
         let generated_schema = build_schema(&schema_cache, &config);
-        let schema = build_dynamic_schema(&generated_schema, &schema_cache)?;
+        let subscription_fields = if config.enable_subscriptions {
+            generate_subscription_fields(&schema_cache, &generated_schema)
+        } else {
+            Vec::new()
+        };
+        let schema = build_dynamic_schema(
+            &generated_schema,
+            &schema_cache,
+            if config.enable_subscriptions {
+                Some(subscription_fields.as_slice())
+            } else {
+                None
+            },
+        )?;
 
         Ok(Self {
-            pool,
+            pool: pool.clone(),
             schema_cache,
             generated_schema,
             schema,
             config,
+            subscription_fields,
+            broker: Arc::new(RwLock::new(None)),
         })
     }
 
     /// Rebuild the schema (e.g., after schema cache refresh).
     pub fn rebuild(&mut self) -> Result<(), GraphQLError> {
         self.generated_schema = build_schema(&self.schema_cache, &self.config);
-        self.schema = build_dynamic_schema(&self.generated_schema, &self.schema_cache)?;
+        self.subscription_fields = if self.config.enable_subscriptions {
+            generate_subscription_fields(&self.schema_cache, &self.generated_schema)
+        } else {
+            Vec::new()
+        };
+        self.schema = build_dynamic_schema(
+            &self.generated_schema,
+            &self.schema_cache,
+            if self.config.enable_subscriptions {
+                Some(self.subscription_fields.as_slice())
+            } else {
+                None
+            },
+        )?;
         Ok(())
+    }
+
+    /// Initialize the subscription broker.
+    ///
+    /// This should be called after creating the state to enable subscriptions.
+    pub async fn init_subscriptions(&self) -> Result<(), crate::subscription::BrokerError> {
+        if !self.config.enable_subscriptions {
+            return Ok(());
+        }
+
+        let broker = NotifyBroker::new(self.pool.clone());
+
+        // Collect all channels to listen on
+        let channels: Vec<String> = self
+            .subscription_fields
+            .iter()
+            .map(|f| f.channel_name())
+            .collect();
+
+        if !channels.is_empty() {
+            broker.start(channels).await?;
+            info!(
+                "Subscription broker started with {} channels",
+                self.subscription_fields.len()
+            );
+        }
+
+        // Store the broker
+        let mut broker_guard = self.broker.write().await;
+        *broker_guard = Some(broker);
+
+        Ok(())
+    }
+
+    /// Stop the subscription broker.
+    pub async fn stop_subscriptions(&self) {
+        let broker_guard = self.broker.read().await;
+        if let Some(broker) = broker_guard.as_ref() {
+            broker.stop().await;
+        }
+    }
+
+    /// Get the notification broker.
+    pub async fn get_broker(&self) -> Option<Arc<RwLock<Option<NotifyBroker>>>> {
+        Some(Arc::clone(&self.broker))
     }
 }
 
@@ -64,14 +147,45 @@ pub async fn graphql_handler(
     ctx: GraphQLContext,
     req: GraphQLRequest,
 ) -> GraphQLResponse {
-    let request = req.into_inner().data(ctx).data(state.pool.clone());
+    let request = req
+        .into_inner()
+        .data(ctx)
+        .data(state.pool.clone())
+        .data(Arc::clone(&state.broker));
     state.schema.execute(request).await.into()
+}
+
+/// Handle GraphQL WebSocket subscription upgrade.
+///
+/// This should be called with a WebSocket upgrade request to enable
+/// GraphQL subscriptions over WebSocket.
+pub async fn graphql_ws_handler(
+    State(state): State<Arc<GraphQLState>>,
+    protocol: async_graphql_axum::GraphQLProtocol,
+    ws: axum::extract::WebSocketUpgrade,
+) -> impl IntoResponse {
+    let schema = state.schema.clone();
+    let pool = state.pool.clone();
+    let broker = Arc::clone(&state.broker);
+
+    ws.protocols(["graphql-transport-ws", "graphql-ws"])
+        .on_upgrade(move |socket| async move {
+            let mut data = async_graphql::Data::default();
+            data.insert(pool);
+            data.insert(broker);
+
+            async_graphql_axum::GraphQLWebSocket::new(socket, schema, protocol)
+                .with_data(data)
+                .serve()
+                .await
+        })
 }
 
 /// Handle GraphQL playground request.
 pub async fn graphql_playground() -> impl axum::response::IntoResponse {
     axum::response::Html(async_graphql::http::playground_source(
-        async_graphql::http::GraphQLPlaygroundConfig::new("/graphql"),
+        async_graphql::http::GraphQLPlaygroundConfig::new("/graphql")
+            .subscription_endpoint("/graphql/ws"),
     ))
 }
 
@@ -79,6 +193,7 @@ pub async fn graphql_playground() -> impl axum::response::IntoResponse {
 fn build_dynamic_schema(
     generated: &GeneratedSchema,
     _schema_cache: &SchemaCache,
+    subscription_fields: Option<&[SubField]>,
 ) -> Result<Schema, GraphQLError> {
     // Create object types for each table
     let mut object_types: HashMap<String, Object> = HashMap::new();
@@ -98,8 +213,15 @@ fn build_dynamic_schema(
         None
     };
 
+    // Create subscription type if enabled
+    let subscription = subscription_fields.map(create_subscription_type);
+
     // Build schema
-    let mut builder = Schema::build("Query", mutation.as_ref().map(|_| "Mutation"), None);
+    let mut builder = Schema::build(
+        "Query",
+        mutation.as_ref().map(|_| "Mutation"),
+        subscription.as_ref().map(|_| "Subscription"),
+    );
 
     // Register all object types
     for (_, obj) in object_types {
@@ -112,6 +234,11 @@ fn build_dynamic_schema(
     // Register mutation type if present
     if let Some(mutation) = mutation {
         builder = builder.register(mutation);
+    }
+
+    // Register subscription type if present
+    if let Some(subscription) = subscription {
+        builder = builder.register(subscription);
     }
 
     // Register scalar types
@@ -243,6 +370,64 @@ fn create_mutation_type(generated: &GeneratedSchema) -> Object {
     }
 
     mutation
+}
+
+/// Create the Subscription type with all subscription fields.
+fn create_subscription_type(fields: &[SubField]) -> Subscription {
+    let mut subscription = Subscription::new("Subscription");
+
+    for field in fields {
+        let channel_name = field.channel_name();
+        let return_type = TypeRef::named(&field.return_type);
+        let field_name = field.name.clone();
+        let description = field.description.clone();
+
+        let gql_field = SubscriptionField::new(&field_name, return_type, move |ctx| {
+            let channel_name = channel_name.clone();
+            SubscriptionFieldFuture::new(async move {
+                let broker_arc = ctx.data::<Arc<RwLock<Option<NotifyBroker>>>>()?;
+                let broker_guard = broker_arc.read().await;
+
+                let broker = broker_guard
+                    .as_ref()
+                    .ok_or_else(|| async_graphql::Error::new("Subscription broker not initialized"))?;
+
+                let stream = broker
+                    .subscribe(&channel_name)
+                    .await
+                    .map_err(|e| async_graphql::Error::new(format!("Subscription error: {}", e)))?;
+
+                // Transform notification stream to GraphQL values
+                let value_stream = stream.filter_map(|notification| async move {
+                    match TableChangePayload::from_payload(&notification.payload) {
+                        Ok(payload) => {
+                            if let Some(data) = payload.data() {
+                                Some(Ok(FieldValue::value(json_to_value(data.clone()))))
+                            } else {
+                                None
+                            }
+                        }
+                        Err(e) => {
+                            debug!("Failed to parse notification payload: {}", e);
+                            None
+                        }
+                    }
+                });
+
+                Ok(value_stream)
+            })
+        });
+
+        let gql_field = if let Some(desc) = description {
+            gql_field.description(desc)
+        } else {
+            gql_field
+        };
+
+        subscription = subscription.field(gql_field);
+    }
+
+    subscription
 }
 
 /// Resolve a query field.
@@ -784,7 +969,7 @@ mod tests {
         let config = SchemaConfig::default();
         let generated = build_schema(&cache, &config);
 
-        let result = build_dynamic_schema(&generated, &cache);
+        let result = build_dynamic_schema(&generated, &cache, None);
         if let Err(ref e) = result {
             eprintln!("Schema build error: {:?}", e);
         }
@@ -851,5 +1036,55 @@ mod tests {
 
         let result = builder.finish();
         assert!(result.is_ok());
+    }
+
+    // ============================================================================
+    // Subscription Tests
+    // ============================================================================
+
+    #[test]
+    fn test_build_schema_with_subscriptions() {
+        let cache = create_test_schema_cache();
+        let config = SchemaConfig {
+            enable_subscriptions: true,
+            ..SchemaConfig::default()
+        };
+        let generated = build_schema(&cache, &config);
+
+        // Generate subscription fields
+        let sub_fields = generate_subscription_fields(&cache, &generated);
+        assert!(!sub_fields.is_empty(), "Should have subscription fields");
+
+        // Build schema with subscriptions
+        let result = build_dynamic_schema(&generated, &cache, Some(&sub_fields));
+        assert!(result.is_ok(), "Schema with subscriptions should build");
+    }
+
+    #[test]
+    fn test_subscription_field_generation() {
+        let cache = create_test_schema_cache();
+        let config = SchemaConfig::default();
+        let generated = build_schema(&cache, &config);
+
+        let fields = generate_subscription_fields(&cache, &generated);
+
+        // Should have one subscription field for the users table
+        assert_eq!(fields.len(), 1);
+        assert_eq!(fields[0].name, "users");
+        assert_eq!(fields[0].table_name, "users");
+        assert_eq!(fields[0].channel_name(), "postrust_public_users");
+    }
+
+    #[test]
+    fn test_create_subscription_type() {
+        use crate::subscription::SubscriptionField as SubField;
+
+        let fields = vec![
+            SubField::for_table("public", "users", "Users"),
+            SubField::for_table("public", "orders", "Orders"),
+        ];
+
+        let _subscription = create_subscription_type(&fields);
+        // Just test that it doesn't panic
     }
 }

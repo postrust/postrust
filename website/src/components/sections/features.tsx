@@ -17,6 +17,21 @@ const features = [
     description: "Full GraphQL API alongside REST. Queries, mutations, filtering, and nested relationships out of the box.",
   },
   {
+    icon: "realtime",
+    title: "Realtime Subscriptions",
+    description: "Live updates via GraphQL subscriptions. Subscribe to any query or view changes with PostgreSQL LISTEN/NOTIFY.",
+  },
+  {
+    icon: "vector",
+    title: "pgvector Integration",
+    description: "Native vector similarity search. Build AI-powered apps with embeddings, semantic search, and RAG pipelines.",
+  },
+  {
+    icon: "routes",
+    title: "Custom Routes in Rust",
+    description: "Define custom endpoints in pure Rust. Full access to Axum handlers, middleware, and the database pool.",
+  },
+  {
     icon: "shield",
     title: "Secure by Design",
     description: "PostgreSQL Row-Level Security (RLS) enforcement. JWT authentication with customizable role claims.",
@@ -25,11 +40,6 @@ const features = [
     icon: "code",
     title: "PostgREST Compatible",
     description: "Drop-in replacement for PostgREST in most use cases. Same query syntax, same filtering operators.",
-  },
-  {
-    icon: "puzzle",
-    title: "Extensible",
-    description: "Add custom routes in Rust for webhooks, background jobs, and custom business logic.",
   },
   {
     icon: "api",
@@ -47,9 +57,11 @@ const iconPaths: Record<string, string> = {
   bolt: "M13 2L3 14h9l-1 8 10-12h-9l1-8z",
   cloud: "M3 15a4 4 0 004 4h9a5 5 0 10-.1-9.999 5.002 5.002 0 10-9.78 2.096A4.001 4.001 0 003 15z",
   graphql: "M12 2L2 7l10 5 10-5-10-5zM2 17l10 5 10-5M2 12l10 5 10-5",
+  realtime: "M13 10V3L4 14h7v7l9-11h-7z",
+  vector: "M9 3v2m6-2v2M9 19v2m6-2v2M5 9H3m2 6H3m18-6h-2m2 6h-2M7 19h10a2 2 0 002-2V7a2 2 0 00-2-2H7a2 2 0 00-2 2v10a2 2 0 002 2zM9 9h6v6H9V9z",
+  routes: "M13 7h8m0 0v8m0-8l-8 8-4-4-6 6",
   shield: "M9 12l2 2 4-4m5.618-4.016A11.955 11.955 0 0112 2.944a11.955 11.955 0 01-8.618 3.04A12.02 12.02 0 003 9c0 5.591 3.824 10.29 9 11.622 5.176-1.332 9-6.03 9-11.622 0-1.042-.133-2.052-.382-3.016z",
   code: "M10 20l4-16m4 4l4 4-4 4M6 16l-4-4 4-4",
-  puzzle: "M11 4a2 2 0 114 0v1a1 1 0 001 1h3a1 1 0 011 1v3a1 1 0 01-1 1h-1a2 2 0 100 4h1a1 1 0 011 1v3a1 1 0 01-1 1h-3a1 1 0 01-1-1v-1a2 2 0 10-4 0v1a1 1 0 01-1 1H7a1 1 0 01-1-1v-3a1 1 0 00-1-1H4a2 2 0 110-4h1a1 1 0 001-1V7a1 1 0 011-1h3a1 1 0 001-1V4z",
   api: "M8 9l3 3-3 3m5 0h3M5 20h14a2 2 0 002-2V6a2 2 0 00-2-2H5a2 2 0 00-2 2v12a2 2 0 002 2z",
   package: "M20 7l-8-4-8 4m16 0l-8 4m8-4v10l-8 4m0-10L4 7m8 4v10M4 7v10l8 4",
 };
