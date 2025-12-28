@@ -120,6 +120,7 @@ async fn execute_plan(
 
             let (sql, params) = query.build_main();
             debug!("Executing SQL: {}", sql);
+            debug!("With {} parameters", params.len());
 
             // Execute query
             let mut conn = state.pool.acquire().await
@@ -158,8 +159,8 @@ async fn execute_plan(
                     .ok(); // Ignore errors for individual claims
             }
 
-            // Execute main query
-            let rows = sqlx::query(&sql)
+            // Execute main query with bound parameters
+            let rows = bind_params(sqlx::query(&sql), &params)
                 .fetch_all(&mut *conn)
                 .await
                 .map_err(|e| {
@@ -293,6 +294,43 @@ fn row_to_json(row: &sqlx::postgres::PgRow) -> serde_json::Value {
     }
 
     serde_json::Value::Object(map)
+}
+
+/// Bind SqlParam values to a sqlx query.
+fn bind_params<'q>(
+    mut query: sqlx::query::Query<'q, sqlx::Postgres, sqlx::postgres::PgArguments>,
+    params: &'q [postrust_sql::SqlParam],
+) -> sqlx::query::Query<'q, sqlx::Postgres, sqlx::postgres::PgArguments> {
+    use postrust_sql::SqlParam;
+
+    for param in params {
+        query = match param {
+            SqlParam::Null => query.bind(None::<String>),
+            SqlParam::Bool(b) => query.bind(b),
+            SqlParam::Int(n) => query.bind(n),
+            SqlParam::Float(f) => query.bind(f),
+            SqlParam::Text(s) => query.bind(s),
+            SqlParam::Bytes(b) => query.bind(b),
+            SqlParam::Json(j) => query.bind(j),
+            SqlParam::Uuid(u) => query.bind(u),
+            SqlParam::Timestamp(t) => query.bind(t),
+            SqlParam::Array(arr) => {
+                // Convert array to Vec<String> for text arrays
+                let strings: Vec<String> = arr
+                    .iter()
+                    .map(|p| match p {
+                        SqlParam::Text(s) => s.clone(),
+                        SqlParam::Int(n) => n.to_string(),
+                        SqlParam::Bool(b) => b.to_string(),
+                        other => format!("{:?}", other),
+                    })
+                    .collect();
+                query.bind(strings)
+            }
+        };
+    }
+
+    query
 }
 
 /// Map sqlx error to our error type.

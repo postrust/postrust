@@ -73,7 +73,15 @@ fn extract_call_params(request: &ApiRequest, _routine: &Routine) -> Result<CallP
                         // Named parameters from JSON object
                         let params: Vec<(String, String)> = map
                             .into_iter()
-                            .map(|(k, v)| (k, v.to_string()))
+                            .map(|(k, v)| {
+                                // Extract string values without JSON quotes
+                                let value = match v {
+                                    serde_json::Value::String(s) => s,
+                                    serde_json::Value::Null => String::new(),
+                                    other => other.to_string(),
+                                };
+                                (k, value)
+                            })
                             .collect();
                         return Ok(CallParams::Named(params));
                     }
