@@ -135,6 +135,11 @@ impl SchemaCacheRef {
         Self(Arc::new(tokio::sync::RwLock::new(None)))
     }
 
+    /// Create a schema cache reference from a static cache.
+    pub fn from_static(cache: SchemaCache) -> Self {
+        Self(Arc::new(tokio::sync::RwLock::new(Some(cache))))
+    }
+
     /// Load or reload the schema cache.
     pub async fn load(&self, pool: &PgPool, schemas: &[String]) -> Result<()> {
         let cache = SchemaCache::load(pool, schemas).await?;

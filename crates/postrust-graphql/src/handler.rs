@@ -21,7 +21,7 @@ use sqlx::PgPool;
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::RwLock;
-use tracing::{debug, info};
+use tracing::{debug, info, trace};
 
 /// GraphQL execution state shared across requests.
 pub struct GraphQLState {
@@ -267,14 +267,34 @@ fn create_object_type(obj: &TableObjectType) -> Object {
     }
 
     for field in &obj.fields {
+        let field_name = field.name.clone();
         let field_type = graphql_type_ref(&field.type_string());
-        let mut gql_field = Field::new(&field.name, field_type, |_| {
-            FieldFuture::new(async move { Ok(None::<FieldValue>) })
+
+        // Create field with resolver that extracts from parent async_graphql::Value
+        // The query resolver stores rows as FieldValue::value(Value::Object)
+        // so we use as_value() to get the Value and extract fields from the Object
+        let gql_field = Field::new(&field.name, field_type, move |ctx| {
+            let field_name = field_name.clone();
+            FieldFuture::new(async move {
+                // Get the parent value as async_graphql::Value using as_value()
+                if let Some(Value::Object(map)) = ctx.parent_value.as_value() {
+                    // Convert field name to async_graphql::Name for lookup
+                    let key = async_graphql::Name::new(&field_name);
+                    if let Some(val) = map.get(&key) {
+                        return Ok(Some(FieldValue::value(val.clone())));
+                    }
+                }
+
+                // Field not found or parent not a Value::Object
+                Ok(None)
+            })
         });
 
-        if let Some(desc) = &field.description {
-            gql_field = gql_field.description(desc);
-        }
+        let gql_field = if let Some(desc) = &field.description {
+            gql_field.description(desc)
+        } else {
+            gql_field
+        };
 
         object = object.field(gql_field);
     }
@@ -288,13 +308,15 @@ fn create_query_type(generated: &GeneratedSchema) -> Object {
 
     for field in &generated.query_fields {
         let table_name = field.table_name.clone();
+        let type_name = field.type_name.clone();
         let is_by_pk = field.is_by_pk;
         let return_type = graphql_type_ref(&field.return_type);
 
         let mut gql_field = Field::new(&field.name, return_type, move |ctx| {
             let table_name = table_name.clone();
+            let type_name = type_name.clone();
             FieldFuture::new(async move {
-                resolve_query(&ctx, &table_name, is_by_pk).await
+                resolve_query(&ctx, &table_name, &type_name, is_by_pk).await
             })
         });
 
@@ -398,10 +420,12 @@ fn create_subscription_type(fields: &[SubField]) -> Subscription {
                     .map_err(|e| async_graphql::Error::new(format!("Subscription error: {}", e)))?;
 
                 // Transform notification stream to GraphQL values
+                // Use FieldValue::value() so field resolvers can use as_value()
                 let value_stream = stream.filter_map(|notification| async move {
                     match TableChangePayload::from_payload(&notification.payload) {
                         Ok(payload) => {
                             if let Some(data) = payload.data() {
+                                // Convert to async_graphql::Value so field resolvers can extract fields
                                 Some(Ok(FieldValue::value(json_to_value(data.clone()))))
                             } else {
                                 None
@@ -431,11 +455,12 @@ fn create_subscription_type(fields: &[SubField]) -> Subscription {
 }
 
 /// Resolve a query field.
-async fn resolve_query(
-    ctx: &ResolverContext<'_>,
+async fn resolve_query<'a>(
+    ctx: &ResolverContext<'a>,
     table_name: &str,
+    _type_name: &str,
     is_by_pk: bool,
-) -> Result<Option<Value>, async_graphql::Error> {
+) -> Result<Option<FieldValue<'a>>, async_graphql::Error> {
     let pool = ctx.data::<PgPool>()?;
     let gql_ctx = ctx.data::<GraphQLContext>()?;
 
@@ -468,22 +493,29 @@ async fn resolve_query(
         sql.push_str(&format!(" OFFSET {}", offset));
     }
 
-    // Execute query
+    // Execute query - returns Vec<serde_json::Value>
     let result = execute_query(pool, &sql, gql_ctx.role()).await?;
 
     if is_by_pk {
-        Ok(result.first().cloned())
+        // Return single item as Value::Object
+        // json_to_value converts serde_json to async_graphql Value
+        Ok(result.into_iter().next().map(|v| FieldValue::value(json_to_value(v))))
     } else {
-        Ok(Some(Value::List(result)))
+        // Return list with each item as Value::Object
+        let items: Vec<FieldValue> = result
+            .into_iter()
+            .map(|v| FieldValue::value(json_to_value(v)))
+            .collect();
+        Ok(Some(FieldValue::list(items)))
     }
 }
 
 /// Resolve a mutation field.
-async fn resolve_mutation(
-    ctx: &ResolverContext<'_>,
+async fn resolve_mutation<'a>(
+    ctx: &ResolverContext<'a>,
     table_name: &str,
     mutation_type: MutationType,
-) -> Result<Option<Value>, async_graphql::Error> {
+) -> Result<Option<FieldValue<'a>>, async_graphql::Error> {
     let pool = ctx.data::<PgPool>()?;
     let gql_ctx = ctx.data::<GraphQLContext>()?;
 
@@ -498,7 +530,7 @@ async fn resolve_mutation(
                 .map(|v| accessor_to_json(&v))
                 .unwrap_or_else(|| serde_json::Value::Array(vec![]));
 
-            execute_insert(pool, table_name, gql_ctx.role(), objects).await?
+            execute_insert(pool, table_name, gql_ctx.role(), objects, mutation_type).await?
         }
         MutationType::Update | MutationType::UpdateByPk => {
             let set_value = ctx
@@ -508,25 +540,38 @@ async fn resolve_mutation(
                 .map(|v| accessor_to_json(&v))
                 .unwrap_or_else(|| serde_json::json!({}));
 
-            execute_update(pool, table_name, gql_ctx.role(), set_value).await?
+            let where_clause = ctx
+                .args
+                .try_get("where")
+                .ok()
+                .map(|v| accessor_to_json(&v));
+
+            execute_update(pool, table_name, gql_ctx.role(), set_value, where_clause, mutation_type).await?
         }
         MutationType::Delete | MutationType::DeleteByPk => {
-            execute_delete(pool, table_name, gql_ctx.role()).await?
+            let where_clause = ctx
+                .args
+                .try_get("where")
+                .ok()
+                .map(|v| accessor_to_json(&v));
+
+            execute_delete(pool, table_name, gql_ctx.role(), where_clause, mutation_type).await?
         }
     };
 
-    Ok(Some(result))
+    Ok(result)
 }
 
-/// Execute a SQL query and return results.
+/// Execute a SQL query and return results as serde_json::Value.
+/// We keep data as serde_json::Value so field resolvers can use try_downcast_ref.
 async fn execute_query(
     pool: &PgPool,
     sql: &str,
     role: &str,
-) -> Result<Vec<Value>, async_graphql::Error> {
+) -> Result<Vec<serde_json::Value>, async_graphql::Error> {
     use sqlx::Row;
 
-    debug!("Executing SQL: {}", sql);
+    trace!("Executing SQL: {}", sql);
 
     let mut conn = pool.acquire().await?;
 
@@ -538,52 +583,314 @@ async fn execute_query(
     // Execute query
     let rows = sqlx::query(sql).fetch_all(&mut *conn).await?;
 
-    // Convert to GraphQL values
-    let results: Vec<Value> = rows
+    // Return raw JSON values - don't convert to async_graphql::Value
+    // This allows field resolvers to use try_downcast_ref::<serde_json::Value>()
+    let results: Vec<serde_json::Value> = rows
         .iter()
-        .filter_map(|row| {
-            row.try_get::<serde_json::Value, _>(0)
-                .ok()
-                .map(json_to_value)
-        })
+        .filter_map(|row| row.try_get::<serde_json::Value, _>(0).ok())
         .collect();
 
     Ok(results)
 }
 
 /// Execute an insert mutation.
-async fn execute_insert(
-    _pool: &PgPool,
+async fn execute_insert<'a>(
+    pool: &PgPool,
     table_name: &str,
-    _role: &str,
+    role: &str,
     objects: serde_json::Value,
-) -> Result<Value, async_graphql::Error> {
-    // For now, return empty array - full implementation would execute INSERT
-    debug!("Insert mutation for {}: {:?}", table_name, objects);
-    Ok(Value::List(vec![]))
+    mutation_type: MutationType,
+) -> Result<Option<FieldValue<'a>>, async_graphql::Error> {
+    use sqlx::Row;
+
+    trace!("Insert mutation for {}: {:?}", table_name, objects);
+
+    // Handle both array and single object
+    let objects_array = match objects {
+        serde_json::Value::Array(arr) => arr,
+        serde_json::Value::Object(obj) => vec![serde_json::Value::Object(obj)],
+        _ => return Err(async_graphql::Error::new("objects must be an array or object")),
+    };
+
+    if objects_array.is_empty() {
+        return Err(async_graphql::Error::new("objects cannot be empty"));
+    }
+
+    let mut conn = pool.acquire().await?;
+
+    // Set role
+    sqlx::query(&format!("SET LOCAL ROLE {}", postrust_sql::escape_ident(role)))
+        .execute(&mut *conn)
+        .await?;
+
+    let mut inserted: Vec<FieldValue> = Vec::new();
+
+    for obj in objects_array {
+        if let serde_json::Value::Object(map) = obj {
+            // Build INSERT query
+            let columns: Vec<&str> = map.keys().map(|k| k.as_str()).collect();
+            let placeholders: Vec<String> = (1..=columns.len()).map(|i| format!("${}", i)).collect();
+
+            let sql = format!(
+                "INSERT INTO public.{} ({}) VALUES ({}) RETURNING row_to_json(public.{}.*)",
+                postrust_sql::escape_ident(table_name),
+                columns.iter().map(|c| postrust_sql::escape_ident(c)).collect::<Vec<_>>().join(", "),
+                placeholders.join(", "),
+                postrust_sql::escape_ident(table_name)
+            );
+
+            trace!("Executing INSERT SQL: {}", sql);
+
+            // Build query with parameters
+            let mut query = sqlx::query(&sql);
+            for col in &columns {
+                if let Some(val) = map.get(*col) {
+                    query = bind_json_value(query, val);
+                }
+            }
+
+            let row = query.fetch_one(&mut *conn).await?;
+            if let Ok(json_val) = row.try_get::<serde_json::Value, _>(0) {
+                inserted.push(FieldValue::value(json_to_value(json_val)));
+            }
+        }
+    }
+
+    // Return based on mutation type
+    match mutation_type {
+        MutationType::InsertOne => {
+            // Return single item
+            Ok(inserted.into_iter().next())
+        }
+        _ => {
+            // Return list
+            Ok(Some(FieldValue::list(inserted)))
+        }
+    }
+}
+
+/// Bind a JSON value to a sqlx query.
+fn bind_json_value<'q>(
+    query: sqlx::query::Query<'q, sqlx::Postgres, sqlx::postgres::PgArguments>,
+    value: &serde_json::Value,
+) -> sqlx::query::Query<'q, sqlx::Postgres, sqlx::postgres::PgArguments> {
+    match value {
+        serde_json::Value::Null => query.bind(None::<String>),
+        serde_json::Value::Bool(b) => query.bind(*b),
+        serde_json::Value::Number(n) => {
+            if let Some(i) = n.as_i64() {
+                query.bind(i)
+            } else if let Some(f) = n.as_f64() {
+                query.bind(f)
+            } else {
+                query.bind(n.to_string())
+            }
+        }
+        serde_json::Value::String(s) => query.bind(s.clone()),
+        _ => query.bind(value.to_string()),
+    }
 }
 
 /// Execute an update mutation.
-async fn execute_update(
-    _pool: &PgPool,
+async fn execute_update<'a>(
+    pool: &PgPool,
     table_name: &str,
-    _role: &str,
+    role: &str,
     set_value: serde_json::Value,
-) -> Result<Value, async_graphql::Error> {
-    // For now, return empty array - full implementation would execute UPDATE
-    debug!("Update mutation for {}: {:?}", table_name, set_value);
-    Ok(Value::List(vec![]))
+    where_clause: Option<serde_json::Value>,
+    mutation_type: MutationType,
+) -> Result<Option<FieldValue<'a>>, async_graphql::Error> {
+    use sqlx::Row;
+
+    trace!("Update mutation for {}: {:?}", table_name, set_value);
+
+    let set_map = match set_value {
+        serde_json::Value::Object(map) => map,
+        _ => return Err(async_graphql::Error::new("set must be an object")),
+    };
+
+    if set_map.is_empty() {
+        return Err(async_graphql::Error::new("set cannot be empty"));
+    }
+
+    let mut conn = pool.acquire().await?;
+
+    // Set role
+    sqlx::query(&format!("SET LOCAL ROLE {}", postrust_sql::escape_ident(role)))
+        .execute(&mut *conn)
+        .await?;
+
+    // Build SET clause
+    let mut set_parts: Vec<String> = Vec::new();
+    let mut param_idx = 1;
+    for key in set_map.keys() {
+        set_parts.push(format!("{} = ${}", postrust_sql::escape_ident(key), param_idx));
+        param_idx += 1;
+    }
+
+    // Build WHERE clause
+    let (where_sql, where_values) = build_where_clause(where_clause.as_ref(), param_idx)?;
+
+    let sql = format!(
+        "UPDATE public.{} SET {} {} RETURNING row_to_json(public.{}.*)",
+        postrust_sql::escape_ident(table_name),
+        set_parts.join(", "),
+        where_sql,
+        postrust_sql::escape_ident(table_name)
+    );
+
+    trace!("Executing UPDATE SQL: {}", sql);
+
+    // Build query with parameters
+    let mut query = sqlx::query(&sql);
+
+    // Bind SET values
+    for val in set_map.values() {
+        query = bind_json_value(query, val);
+    }
+
+    // Bind WHERE values
+    for val in &where_values {
+        query = bind_json_value(query, val);
+    }
+
+    let rows = query.fetch_all(&mut *conn).await?;
+
+    let updated: Vec<FieldValue> = rows
+        .iter()
+        .filter_map(|row| row.try_get::<serde_json::Value, _>(0).ok())
+        .map(|v| FieldValue::value(json_to_value(v)))
+        .collect();
+
+    // Return based on mutation type
+    match mutation_type {
+        MutationType::UpdateByPk => {
+            Ok(updated.into_iter().next())
+        }
+        _ => {
+            Ok(Some(FieldValue::list(updated)))
+        }
+    }
 }
 
 /// Execute a delete mutation.
-async fn execute_delete(
-    _pool: &PgPool,
+async fn execute_delete<'a>(
+    pool: &PgPool,
     table_name: &str,
-    _role: &str,
-) -> Result<Value, async_graphql::Error> {
-    // For now, return empty array - full implementation would execute DELETE
-    debug!("Delete mutation for {}", table_name);
-    Ok(Value::List(vec![]))
+    role: &str,
+    where_clause: Option<serde_json::Value>,
+    mutation_type: MutationType,
+) -> Result<Option<FieldValue<'a>>, async_graphql::Error> {
+    use sqlx::Row;
+
+    trace!("Delete mutation for {}", table_name);
+
+    let mut conn = pool.acquire().await?;
+
+    // Set role
+    sqlx::query(&format!("SET LOCAL ROLE {}", postrust_sql::escape_ident(role)))
+        .execute(&mut *conn)
+        .await?;
+
+    // Build WHERE clause
+    let (where_sql, where_values) = build_where_clause(where_clause.as_ref(), 1)?;
+
+    let sql = format!(
+        "DELETE FROM public.{} {} RETURNING row_to_json(public.{}.*)",
+        postrust_sql::escape_ident(table_name),
+        where_sql,
+        postrust_sql::escape_ident(table_name)
+    );
+
+    trace!("Executing DELETE SQL: {}", sql);
+
+    // Build query with parameters
+    let mut query = sqlx::query(&sql);
+
+    // Bind WHERE values
+    for val in &where_values {
+        query = bind_json_value(query, val);
+    }
+
+    let rows = query.fetch_all(&mut *conn).await?;
+
+    let deleted: Vec<FieldValue> = rows
+        .iter()
+        .filter_map(|row| row.try_get::<serde_json::Value, _>(0).ok())
+        .map(|v| FieldValue::value(json_to_value(v)))
+        .collect();
+
+    // Return based on mutation type
+    match mutation_type {
+        MutationType::DeleteByPk => {
+            Ok(deleted.into_iter().next())
+        }
+        _ => {
+            Ok(Some(FieldValue::list(deleted)))
+        }
+    }
+}
+
+/// Build a WHERE clause from a JSON filter object.
+fn build_where_clause(
+    where_value: Option<&serde_json::Value>,
+    start_param_idx: usize,
+) -> Result<(String, Vec<serde_json::Value>), async_graphql::Error> {
+    let mut conditions: Vec<String> = Vec::new();
+    let mut values: Vec<serde_json::Value> = Vec::new();
+    let mut param_idx = start_param_idx;
+
+    if let Some(serde_json::Value::Object(map)) = where_value {
+        for (key, val) in map {
+            match val {
+                serde_json::Value::Object(op_map) => {
+                    // Handle operators like {eq: value}, {gt: value}, etc.
+                    for (op, op_val) in op_map {
+                        let condition = match op.as_str() {
+                            "eq" | "_eq" => format!("{} = ${}", postrust_sql::escape_ident(key), param_idx),
+                            "neq" | "_neq" => format!("{} != ${}", postrust_sql::escape_ident(key), param_idx),
+                            "gt" | "_gt" => format!("{} > ${}", postrust_sql::escape_ident(key), param_idx),
+                            "gte" | "_gte" => format!("{} >= ${}", postrust_sql::escape_ident(key), param_idx),
+                            "lt" | "_lt" => format!("{} < ${}", postrust_sql::escape_ident(key), param_idx),
+                            "lte" | "_lte" => format!("{} <= ${}", postrust_sql::escape_ident(key), param_idx),
+                            "like" | "_like" => format!("{} LIKE ${}", postrust_sql::escape_ident(key), param_idx),
+                            "ilike" | "_ilike" => format!("{} ILIKE ${}", postrust_sql::escape_ident(key), param_idx),
+                            "is_null" | "_is_null" => {
+                                if op_val.as_bool().unwrap_or(false) {
+                                    format!("{} IS NULL", postrust_sql::escape_ident(key))
+                                } else {
+                                    format!("{} IS NOT NULL", postrust_sql::escape_ident(key))
+                                }
+                            }
+                            _ => continue,
+                        };
+
+                        if !op.contains("is_null") {
+                            conditions.push(condition);
+                            values.push(op_val.clone());
+                            param_idx += 1;
+                        } else {
+                            conditions.push(condition);
+                        }
+                    }
+                }
+                _ => {
+                    // Direct equality: {field: value}
+                    conditions.push(format!("{} = ${}", postrust_sql::escape_ident(key), param_idx));
+                    values.push(val.clone());
+                    param_idx += 1;
+                }
+            }
+        }
+    }
+
+    let where_sql = if conditions.is_empty() {
+        String::new()
+    } else {
+        format!("WHERE {}", conditions.join(" AND "))
+    };
+
+    Ok((where_sql, values))
 }
 
 /// Convert a GraphQL type string to a TypeRef.
@@ -658,6 +965,7 @@ fn accessor_to_json(accessor: &ValueAccessor<'_>) -> serde_json::Value {
 }
 
 /// Convert async-graphql Value to JSON.
+#[allow(dead_code)]
 fn value_to_json(value: &Value) -> serde_json::Value {
     match value {
         Value::Null => serde_json::Value::Null,

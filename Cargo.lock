@@ -1737,7 +1737,7 @@ checksum = "7edddbd0b52d732b21ad9a5fab5c704c14cd949e5e9a1ec5929a24fded1b904c"
 
 [[package]]
 name = "postrust-auth"
-version = "0.2.0"
+version = "0.2.2"
 dependencies = [
  "async-trait",
  "base64",
@@ -1753,7 +1753,7 @@ dependencies = [
 
 [[package]]
 name = "postrust-core"
-version = "0.2.0"
+version = "0.2.2"
 dependencies = [
  "async-trait",
  "bytes",
@@ -1777,7 +1777,7 @@ dependencies = [
 
 [[package]]
 name = "postrust-graphql"
-version = "0.2.0"
+version = "0.2.2"
 dependencies = [
  "async-graphql",
  "async-graphql-axum",
@@ -1802,7 +1802,7 @@ dependencies = [
 
 [[package]]
 name = "postrust-lambda"
-version = "0.2.0"
+version = "0.2.2"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1826,7 +1826,7 @@ dependencies = [
 
 [[package]]
 name = "postrust-response"
-version = "0.2.0"
+version = "0.2.2"
 dependencies = [
  "bytes",
  "http",
@@ -1841,7 +1841,7 @@ dependencies = [
 
 [[package]]
 name = "postrust-server"
-version = "0.2.0"
+version = "0.2.2"
 dependencies = [
  "anyhow",
  "async-graphql",
@@ -1872,7 +1872,7 @@ dependencies = [
 
 [[package]]
 name = "postrust-sql"
-version = "0.2.0"
+version = "0.2.2"
 dependencies = [
  "bytes",
  "chrono",
@@ -1885,7 +1885,7 @@ dependencies = [
 
 [[package]]
 name = "postrust-worker"
-version = "0.2.0"
+version = "0.2.2"
 dependencies = [
  "async-trait",
  "futures",

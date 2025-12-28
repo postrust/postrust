@@ -127,6 +127,8 @@ pub struct QueryField {
     pub name: String,
     /// Table name
     pub table_name: String,
+    /// GraphQL object type name (e.g., "Users")
+    pub type_name: String,
     /// GraphQL return type
     pub return_type: String,
     /// Whether this returns a list
@@ -159,6 +161,7 @@ impl QueryField {
         Self {
             name,
             table_name: table.name.clone(),
+            type_name: type_name.clone(),
             return_type: format!("[{}!]!", type_name),
             is_list: true,
             is_by_pk: false,
@@ -183,6 +186,7 @@ impl QueryField {
         Some(Self {
             name: field_name,
             table_name: table.name.clone(),
+            type_name: type_name.clone(),
             return_type: type_name,
             is_list: false,
             is_by_pk: true,

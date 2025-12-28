@@ -115,25 +115,73 @@ async fn main() -> Result<()> {
 
         info!("GraphQL endpoint enabled at /api/graphql");
 
-        // Wrapper handler that creates context from request
+        // Combined state for GraphQL routes (includes JWT config for auth)
+        #[derive(Clone)]
+        struct GraphQLAppState {
+            gql_state: Arc<GraphQLState>,
+            jwt_config: postrust_auth::JwtConfig,
+        }
+
+        let graphql_app_state = GraphQLAppState {
+            gql_state: graphql_state.clone(),
+            jwt_config: state.jwt_config.clone(),
+        };
+
+        // Wrapper handler that creates context from request with proper auth
         async fn handle_graphql(
-            AxumState(gql_state): AxumState<Arc<GraphQLState>>,
-            _headers: HeaderMap,
+            AxumState(app_state): AxumState<GraphQLAppState>,
+            headers: HeaderMap,
             req: GqlRequest,
         ) -> GqlResponse {
-            // Use anonymous role for now (auth can be added later)
-            let request = req.into_inner().data(gql_state.pool.clone());
-            gql_state.schema.execute(request).await.into()
+            // Extract auth header and authenticate
+            let auth_header = headers
+                .get("authorization")
+                .and_then(|v| v.to_str().ok());
+
+            let auth_result = match postrust_auth::authenticate(auth_header, &app_state.jwt_config) {
+                Ok(auth) => auth,
+                Err(e) => {
+                    tracing::debug!("GraphQL auth failed: {}, using anon role", e);
+                    postrust_auth::AuthResult {
+                        role: app_state.jwt_config.anon_role.clone().unwrap_or_else(|| "anon".to_string()),
+                        claims: std::collections::HashMap::new(),
+                    }
+                }
+            };
+
+            tracing::debug!("GraphQL request authenticated as role: {}", auth_result.role);
+
+            // Create SchemaCacheRef from the static Arc<SchemaCache>
+            let schema_cache_ref = postrust_core::schema_cache::SchemaCacheRef::from_static(
+                (*app_state.gql_state.schema_cache).clone()
+            );
+
+            let gql_ctx = postrust_graphql::context::GraphQLContext::new(
+                app_state.gql_state.pool.clone(),
+                schema_cache_ref,
+                auth_result,
+            );
+
+            let request = req
+                .into_inner()
+                .data(gql_ctx)
+                .data(app_state.gql_state.pool.clone())
+                .data(Arc::clone(&app_state.gql_state.broker));
+            app_state.gql_state.schema.execute(request).await.into()
         }
 
         // Add GraphQL routes with WebSocket support for subscriptions
         let graphql_router = Router::new()
             .route("/", post(handle_graphql))
             .route("/", get(postrust_graphql::handler::graphql_playground))
+            .with_state(graphql_app_state);
+
+        // WebSocket handler needs separate state (just the GraphQL state)
+        let ws_router = Router::new()
             .route("/ws", get(postrust_graphql::handler::graphql_ws_handler))
             .with_state(graphql_state);
 
-        app = app.nest("/api/graphql", graphql_router);
+        app = app.nest("/api/graphql", graphql_router.merge(ws_router));
     }
 
     // Add root info endpoint
