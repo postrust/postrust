@@ -17,7 +17,7 @@ const docSections = [
   },
   {
     title: "GraphQL",
-    description: "Full GraphQL API with queries, mutations, and filtering",
+    description: "Full GraphQL API with queries, mutations, subscriptions, and filtering",
     href: "/docs/graphql",
     icon: "graphql",
   },

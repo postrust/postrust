@@ -16,7 +16,7 @@ export default component$(() => {
           </div>
           <h1 class="text-4xl font-bold text-neutral-900 mb-4">GraphQL API</h1>
           <p class="text-lg text-neutral-600 max-w-2xl">
-            Full GraphQL support with automatic schema generation from your PostgreSQL database.
+            Full GraphQL support with queries, mutations, and real-time subscriptions. Schema automatically generated from your PostgreSQL database.
           </p>
         </div>
       </div>
@@ -28,16 +28,16 @@ export default component$(() => {
             <h2 class="text-2xl font-bold text-neutral-900 mb-4">Endpoints</h2>
             <div class="space-y-3">
               <div class="p-4 bg-neutral-50 rounded-lg">
-                <code class="font-mono text-primary-600">POST /graphql</code>
+                <code class="font-mono text-primary-600">POST /api/graphql</code>
                 <p class="text-neutral-600 text-sm mt-1">Execute GraphQL queries and mutations</p>
               </div>
               <div class="p-4 bg-neutral-50 rounded-lg">
-                <code class="font-mono text-primary-600">GET /graphql</code>
+                <code class="font-mono text-primary-600">GET /api/graphql</code>
                 <p class="text-neutral-600 text-sm mt-1">GraphQL Playground (interactive IDE)</p>
               </div>
               <div class="p-4 bg-neutral-50 rounded-lg">
-                <code class="font-mono text-primary-600">GET /admin/graphql</code>
-                <p class="text-neutral-600 text-sm mt-1">GraphQL Playground (admin UI)</p>
+                <code class="font-mono text-primary-600">WS /api/graphql/ws</code>
+                <p class="text-neutral-600 text-sm mt-1">WebSocket endpoint for real-time subscriptions</p>
               </div>
             </div>
           </section>
@@ -104,21 +104,33 @@ query {
                 <span class="text-sm text-neutral-400">GraphQL</span>
               </div>
               <pre class="p-4 text-sm overflow-x-auto">
-                <code class="text-neutral-100">{`# Insert
+                <code class="text-neutral-100">{`# Insert single record
 mutation {
-  insertUsers(objects: [
-    { name: "Alice", email: "alice@example.com" }
-  ]) {
+  insertUserOne(objects: {
+    name: "Alice",
+    email: "alice@example.com"
+  }) {
     id
     name
-    createdAt
+    email
   }
 }
 
-# Update
+# Insert multiple records
+mutation {
+  insertUsers(objects: [
+    { name: "Alice", email: "alice@example.com" },
+    { name: "Bob", email: "bob@example.com" }
+  ]) {
+    id
+    name
+  }
+}
+
+# Update with where clause
 mutation {
   updateUsers(
-    filter: { id: { eq: 1 } }
+    where: { email: { eq: "alice@example.com" } }
     set: { name: "Alice Smith" }
   ) {
     id
@@ -126,14 +138,59 @@ mutation {
   }
 }
 
-# Delete
+# Delete with where clause
 mutation {
-  deleteUsers(filter: { id: { eq: 1 } }) {
+  deleteUsers(where: { id: { eq: "uuid-here" } }) {
     id
+    email
   }
 }`}</code>
               </pre>
             </div>
+          </section>
+
+          {/* Subscriptions */}
+          <section class="mb-12">
+            <h2 class="text-2xl font-bold text-neutral-900 mb-4">Subscriptions</h2>
+            <p class="text-neutral-600 mb-4">
+              Real-time updates via WebSocket. Connect to <code class="font-mono text-primary-600">ws://localhost:3000/api/graphql/ws</code> using the graphql-transport-ws protocol.
+            </p>
+            <div class="bg-neutral-900 rounded-xl overflow-hidden">
+              <div class="px-4 py-2 bg-neutral-800 border-b border-neutral-700">
+                <span class="text-sm text-neutral-400">GraphQL</span>
+              </div>
+              <pre class="p-4 text-sm overflow-x-auto">
+                <code class="text-neutral-100">{`# Subscribe to table changes
+subscription {
+  users {
+    id
+    name
+    email
+  }
+}
+
+# Subscribe to team changes
+subscription {
+  teams {
+    id
+    name
+    slug
+  }
+}
+
+# Subscribe to projects
+subscription {
+  projects {
+    id
+    name
+    status
+  }
+}`}</code>
+              </pre>
+            </div>
+            <p class="text-neutral-600 mt-4 text-sm">
+              Subscriptions are powered by PostgreSQL LISTEN/NOTIFY. Changes trigger automatically when data is inserted, updated, or deleted.
+            </p>
           </section>
 
           {/* Filtering */}
@@ -175,7 +232,7 @@ mutation {
                 <span class="text-sm text-neutral-400">cURL</span>
               </div>
               <pre class="p-4 text-sm overflow-x-auto">
-                <code class="text-neutral-100">{`curl -X POST http://localhost:3000/graphql \\
+                <code class="text-neutral-100">{`curl -X POST http://localhost:3000/api/graphql \\
   -H "Content-Type: application/json" \\
   -H "Authorization: Bearer eyJhbGci..." \\
   -d '{
@@ -217,7 +274,7 @@ export const head: DocumentHead = {
   meta: [
     {
       name: "description",
-      content: "Full GraphQL API with automatic schema generation, queries, mutations, and filtering.",
+      content: "Full GraphQL API with automatic schema generation, queries, mutations, real-time subscriptions, and filtering.",
     },
   ],
 };

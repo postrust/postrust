@@ -58,10 +58,10 @@ export default component$(() => {
           <section class="mb-12">
             <h2 class="text-2xl font-bold text-neutral-900 mb-4">Connecting</h2>
             <p class="text-neutral-600 mb-4">
-              Connect via WebSocket to the GraphQL endpoint:
+              Connect via WebSocket to the GraphQL subscription endpoint using the <code class="font-mono text-sm">graphql-transport-ws</code> protocol:
             </p>
             <div class="p-4 bg-neutral-50 rounded-lg">
-              <code class="font-mono text-primary-600">ws://localhost:3000/graphql</code>
+              <code class="font-mono text-primary-600">ws://localhost:3000/api/graphql/ws</code>
             </div>
           </section>
 
@@ -136,21 +136,21 @@ subscription {
                 <code class="text-neutral-100">{`import { createClient } from 'graphql-ws';
 
 const client = createClient({
-  url: 'ws://localhost:3000/graphql',
+  url: 'ws://localhost:3000/api/graphql/ws',
   connectionParams: {
     authorization: \`Bearer \${token}\`,
   },
 });
 
-// Subscribe to orders
+// Subscribe to user changes
 const unsubscribe = client.subscribe(
   {
     query: \`
       subscription {
-        orders(filter: { status: { eq: "pending" } }) {
+        users {
           id
-          total
-          status
+          name
+          email
         }
       }
     \`,

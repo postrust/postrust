@@ -43,11 +43,11 @@ const featureCategories = [
       },
       {
         name: "Queries & Mutations",
-        description: "Read and write operations with full filtering support",
+        description: "Full CRUD with insertOne, insert, update, delete operations",
       },
       {
-        name: "Nested Relationships",
-        description: "Query related data in a single request",
+        name: "Real-time Subscriptions",
+        description: "WebSocket subscriptions for live data updates",
       },
       {
         name: "Introspection",
@@ -55,11 +55,41 @@ const featureCategories = [
       },
       {
         name: "GraphQL Playground",
-        description: "Built-in interactive IDE at /admin/graphql",
+        description: "Built-in interactive IDE at /api/graphql",
       },
       {
         name: "Same RLS",
         description: "Same Row-Level Security enforcement as REST",
+      },
+    ],
+  },
+  {
+    title: "Real-time",
+    description: "Live data synchronization powered by PostgreSQL LISTEN/NOTIFY",
+    features: [
+      {
+        name: "GraphQL Subscriptions",
+        description: "Subscribe to any table changes via WebSocket",
+      },
+      {
+        name: "PostgreSQL LISTEN/NOTIFY",
+        description: "Native PostgreSQL pub/sub for efficient updates",
+      },
+      {
+        name: "Automatic Triggers",
+        description: "Changes broadcast automatically on INSERT/UPDATE/DELETE",
+      },
+      {
+        name: "WebSocket Protocol",
+        description: "Uses graphql-transport-ws standard protocol",
+      },
+      {
+        name: "Connection Management",
+        description: "Automatic reconnection and subscription recovery",
+      },
+      {
+        name: "Low Latency",
+        description: "Sub-millisecond notification delivery",
       },
     ],
   },

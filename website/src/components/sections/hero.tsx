@@ -17,7 +17,7 @@ export const HeroSection = component$(() => {
           <div class="inline-flex items-center gap-2 px-4 py-2 bg-primary-50 border border-primary-200 rounded-full mb-8">
             <span class="w-2 h-2 bg-primary-500 rounded-full animate-pulse-subtle"></span>
             <span class="text-sm font-medium text-primary-700">
-              Now with GraphQL support
+              Now with GraphQL & Real-time Subscriptions
             </span>
           </div>
 
