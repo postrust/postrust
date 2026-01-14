@@ -1,0 +1,98 @@
+[package]
+name = "postrust-proxy"
+description = "High-performance reverse proxy module for Postrust with load balancing and automatic TLS"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[features]
+default = ["acme"]
+acme = ["rustls-acme"]
+sticky-cookie = []
+
+[dependencies]
+# Async runtime
+tokio.workspace = true
+tokio-util = "0.7"
+async-trait.workspace = true
+futures.workspace = true
+
+# Web/HTTP
+axum.workspace = true
+tower.workspace = true
+tower-http.workspace = true
+hyper.workspace = true
+hyper-util.workspace = true
+http-body-util.workspace = true
+http.workspace = true
+
+# TLS
+tokio-rustls.workspace = true
+rustls.workspace = true
+rustls-pemfile.workspace = true
+
+# ACME (optional)
+rustls-acme = { workspace = true, optional = true }
+
+# Database
+sqlx.workspace = true
+
+# Serialization
+serde.workspace = true
+serde_json.workspace = true
+toml.workspace = true
+
+# Error handling
+thiserror.workspace = true
+anyhow.workspace = true
+
+# Utilities
+bytes.workspace = true
+tracing.workspace = true
+uuid.workspace = true
+url.workspace = true
+
+# Hot-reload and concurrency
+notify.workspace = true
+dashmap.workspace = true
+parking_lot.workspace = true
+
+# Builder pattern (from rpxy)
+derive_builder = "0.20"
+
+# Fast hashing (from rpxy)
+ahash = "0.8"
+
+# Pin projections (from rpxy)
+pin-project-lite = "0.2"
+
+# Random for load balancing
+rand = "0.9"
+
+# DNS resolution for domain verification
+hickory-resolver = "0.24"
+
+# Hashing for API keys
+sha2 = "0.10"
+hex = "0.4"
+
+# Base64 for JWT decoding
+base64 = "0.22"
+
+# Certificate reloading
+hot_reload = "0.3"
+
+# HTTP client for health checks
+reqwest = { workspace = true }
+
+# Timestamps
+chrono.workspace = true
+
+# Internal crates
+postrust-core.workspace = true
+
+[dev-dependencies]
+pretty_assertions.workspace = true
+tokio = { workspace = true, features = ["test-util", "macros"] }

@@ -9,6 +9,7 @@ members = [
     "crates/postrust-lambda",
     "crates/postrust-worker",
     "crates/postrust-graphql",
+    "crates/postrust-proxy",
 ]
 
 [workspace.package]
@@ -65,12 +66,34 @@ uuid = { version = "1.11", features = ["v4", "serde"] }
 # Testing
 pretty_assertions = "1.4"
 
+# TLS/Crypto
+tokio-rustls = "0.26"
+rustls = { version = "0.23", default-features = false, features = ["std", "aws_lc_rs"] }
+rustls-pemfile = "2"
+rustls-acme = { version = "0.11", default-features = false, features = ["aws-lc-rs"] }
+
+# HTTP client
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
+hyper-util = { version = "0.1", features = ["full"] }
+http-body-util = "0.1"
+
+# Hot-reload
+notify = "7"
+
+# Concurrent data structures
+dashmap = "6"
+parking_lot = "0.12"
+
+# Config
+toml = "0.8"
+
 # Internal crates
 postrust-core = { version = "0.2.0", path = "crates/postrust-core" }
 postrust-sql = { version = "0.2.0", path = "crates/postrust-sql" }
 postrust-auth = { version = "0.2.0", path = "crates/postrust-auth" }
 postrust-response = { version = "0.2.0", path = "crates/postrust-response" }
 postrust-graphql = { version = "0.2.0", path = "crates/postrust-graphql" }
+postrust-proxy = { version = "0.2.0", path = "crates/postrust-proxy" }
 
 [profile.release]
 lto = true
