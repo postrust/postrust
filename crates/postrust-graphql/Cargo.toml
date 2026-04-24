@@ -40,6 +40,7 @@ tracing.workspace = true
 
 # Types
 chrono.workspace = true
+uuid.workspace = true
 
 # Internal
 postrust-core.workspace = true

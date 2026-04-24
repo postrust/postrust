@@ -32,7 +32,7 @@ tower-http = { version = "0.6", features = ["cors", "trace", "compression-gzip"]
 hyper = { version = "1.5", features = ["full"] }
 
 # Database
-sqlx = { version = "0.8", features = ["runtime-tokio", "postgres", "json", "chrono", "uuid", "bigdecimal"] }
+sqlx = { version = "0.8", features = ["runtime-tokio", "tls-rustls-ring-native-roots", "postgres", "json", "chrono", "uuid", "bigdecimal"] }
 deadpool-postgres = "0.14"
 tokio-postgres = "0.7"
 

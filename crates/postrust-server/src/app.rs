@@ -8,7 +8,7 @@ use axum::{
     response::{IntoResponse, Response},
 };
 use bytes::Bytes;
-use postrust_auth::authenticate;
+use postrust_auth::{authenticate, JwtError};
 use postrust_core::{create_action_plan, parse_request, ActionPlan, ApiRequest};
 use postrust_response::{format_response, QueryResult, Response as PgrstResponse};
 use sqlx::Row;
@@ -44,7 +44,7 @@ async fn process_request(
 
     // Authenticate
     let auth_result = authenticate(auth_header, &state.jwt_config)
-        .map_err(|e| postrust_core::Error::InvalidJwt(e.to_string()))?;
+        .map_err(map_auth_error)?;
 
     debug!("Authenticated as role: {}", auth_result.role);
 
@@ -421,5 +421,18 @@ fn sanitize_error_message(error: &postrust_core::Error) -> &'static str {
         Error::ConnectionPool(_) => "Service temporarily unavailable",
         Error::Internal(_) => "Internal server error",
         _ => "An error occurred",
+    }
+}
+
+fn map_auth_error(error: JwtError) -> postrust_core::Error {
+    match error {
+        JwtError::MissingHeader => postrust_core::Error::MissingAuth,
+        JwtError::Expired => postrust_core::Error::JwtExpired,
+        JwtError::InvalidHeaderFormat
+        | JwtError::NotYetValid
+        | JwtError::InvalidSignature
+        | JwtError::InvalidToken(_)
+        | JwtError::MissingRole
+        | JwtError::InvalidAudience => postrust_core::Error::InvalidJwt(error.to_string()),
     }
 }

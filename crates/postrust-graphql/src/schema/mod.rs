@@ -9,7 +9,7 @@ pub mod relationship;
 use crate::input::mutation::{is_deletable, is_insertable, is_updatable};
 use crate::schema::object::{to_camel_case, to_pascal_case, TableObjectType};
 use crate::schema::relationship::RelationshipField;
-use postrust_core::schema_cache::{SchemaCache, Table};
+use postrust_core::schema_cache::{Column, SchemaCache, Table};
 use std::collections::HashMap;
 
 /// Configuration for schema generation.
@@ -135,6 +135,10 @@ pub struct QueryField {
     pub is_list: bool,
     /// Whether this is a "by PK" query
     pub is_by_pk: bool,
+    /// For `*ByPk` only: `id` argument type (`Int`, `UUID`, `String`, …) from the first PK column.
+    pub by_pk_id_type: Option<String>,
+    /// For `*ByPk` only: first primary-key column name in SQL.
+    pub by_pk_column: Option<String>,
     /// Field description
     pub description: Option<String>,
 }
@@ -165,16 +169,15 @@ impl QueryField {
             return_type: format!("[{}!]!", type_name),
             is_list: true,
             is_by_pk: false,
+            by_pk_id_type: None,
+            by_pk_column: None,
             description: Some(format!("Query {} records", table.name)),
         }
     }
 
     /// Create a by-PK query field (e.g., userByPk).
     pub fn by_pk(table: &Table, config: &SchemaConfig) -> Option<Self> {
-        if table.pk_cols.is_empty() {
-            return None;
-        }
-
+        let first_pk = table.pk_cols.first()?;
         let type_name = to_pascal_case(&table.name);
         let singular = singularize(&table.name);
         let field_name = if config.use_camel_case {
@@ -182,6 +185,15 @@ impl QueryField {
         } else {
             format!("{}_by_pk", singular)
         };
+        let (id_gql, col_name) = table
+            .get_column(first_pk)
+            .map(|c| {
+                (
+                    graphql_id_scalar_for_column(c).to_string(),
+                    first_pk.clone(),
+                )
+            })
+            .unwrap_or_else(|| ("String".to_string(), first_pk.clone()));
 
         Some(Self {
             name: field_name,
@@ -190,8 +202,31 @@ impl QueryField {
             return_type: type_name,
             is_list: false,
             is_by_pk: true,
+            by_pk_id_type: Some(id_gql),
+            by_pk_column: Some(col_name),
             description: Some(format!("Get a single {} by primary key", singular)),
         })
+    }
+}
+
+/// GraphQL scalar for the by-PK `id` field argument (first PK column, single-column PKs only).
+fn graphql_id_scalar_for_column(col: &Column) -> &'static str {
+    let t = col.data_type.to_lowercase();
+    let n = col.nominal_type.to_lowercase();
+    if t == "integer" || t == "int4" || t == "smallint" || t == "int2" {
+        "Int"
+    } else if t == "uuid" || n == "uuid" {
+        "UUID"
+    } else if t == "bigint" || t == "int8" {
+        "String"
+    } else if t == "text"
+        || t == "character varying"
+        || t == "bpchar"
+        || t == "name"
+    {
+        "String"
+    } else {
+        "String"
     }
 }
 
@@ -584,6 +619,70 @@ mod tests {
         assert_eq!(field.return_type, "Users");
         assert!(!field.is_list);
         assert!(field.is_by_pk);
+        assert_eq!(field.by_pk_id_type.as_deref(), Some("Int"));
+        assert_eq!(field.by_pk_column.as_deref(), Some("id"));
+    }
+
+    #[test]
+    fn test_query_field_by_pk_uuid() {
+        let mut table = create_test_table("sessions", true, true, true);
+        // Replace the integer PK with a UUID PK
+        table.pk_cols = vec!["session_id".into()];
+        table.columns.insert(
+            "session_id".into(),
+            Column {
+                name: "session_id".into(),
+                description: None,
+                nullable: false,
+                data_type: "uuid".into(),
+                nominal_type: "uuid".into(),
+                max_len: None,
+                default: Some("gen_random_uuid()".into()),
+                enum_values: vec![],
+                is_pk: true,
+                position: 0,
+            },
+        );
+        let config = SchemaConfig::default();
+        let field = QueryField::by_pk(&table, &config).unwrap();
+
+        assert_eq!(field.name, "sessionByPk");
+        assert_eq!(field.return_type, "Sessions");
+        assert!(!field.is_list);
+        assert!(field.is_by_pk);
+        assert_eq!(field.by_pk_id_type.as_deref(), Some("UUID"));
+        assert_eq!(field.by_pk_column.as_deref(), Some("session_id"));
+    }
+
+    #[test]
+    fn test_query_field_by_pk_string() {
+        let mut table = create_test_table("slugs", true, true, true);
+        // Replace the integer PK with a text PK
+        table.pk_cols = vec!["slug".into()];
+        table.columns.insert(
+            "slug".into(),
+            Column {
+                name: "slug".into(),
+                description: None,
+                nullable: false,
+                data_type: "text".into(),
+                nominal_type: "text".into(),
+                max_len: None,
+                default: None,
+                enum_values: vec![],
+                is_pk: true,
+                position: 0,
+            },
+        );
+        let config = SchemaConfig::default();
+        let field = QueryField::by_pk(&table, &config).unwrap();
+
+        assert_eq!(field.name, "slugByPk");
+        assert_eq!(field.return_type, "Slugs");
+        assert!(!field.is_list);
+        assert!(field.is_by_pk);
+        assert_eq!(field.by_pk_id_type.as_deref(), Some("String"));
+        assert_eq!(field.by_pk_column.as_deref(), Some("slug"));
     }
 
     #[test]
