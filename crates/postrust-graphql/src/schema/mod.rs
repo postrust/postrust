@@ -120,7 +120,7 @@ impl GeneratedSchema {
     }
 }
 
-/// A query field for a table (e.g., users, userByPk).
+/// A query field for a table (e.g., users, userByPk, usersCount).
 #[derive(Debug, Clone)]
 pub struct QueryField {
     /// Field name (e.g., "users")
@@ -135,6 +135,8 @@ pub struct QueryField {
     pub is_list: bool,
     /// Whether this is a "by PK" query
     pub is_by_pk: bool,
+    /// Whether this is a count query
+    pub is_count: bool,
     /// For `*ByPk` only: `id` argument type (`Int`, `UUID`, `String`, …) from the first PK column.
     pub by_pk_id_type: Option<String>,
     /// For `*ByPk` only: first primary-key column name in SQL.
@@ -169,6 +171,7 @@ impl QueryField {
             return_type: format!("[{}!]!", type_name),
             is_list: true,
             is_by_pk: false,
+            is_count: false,
             by_pk_id_type: None,
             by_pk_column: None,
             description: Some(format!("Query {} records", table.name)),
@@ -202,10 +205,33 @@ impl QueryField {
             return_type: type_name,
             is_list: false,
             is_by_pk: true,
+            is_count: false,
             by_pk_id_type: Some(id_gql),
             by_pk_column: Some(col_name),
             description: Some(format!("Get a single {} by primary key", singular)),
         })
+    }
+
+    /// Create a count query field (e.g., usersCount).
+    pub fn count(table: &Table, config: &SchemaConfig) -> Self {
+        let field_name = if config.use_camel_case {
+            format!("{}Count", to_camel_case(&table.name))
+        } else {
+            format!("{}_count", table.name)
+        };
+
+        Self {
+            name: field_name,
+            table_name: table.name.clone(),
+            type_name: to_pascal_case(&table.name),
+            return_type: "Int!".to_string(),
+            is_list: false,
+            is_by_pk: false,
+            is_count: true,
+            by_pk_id_type: None,
+            by_pk_column: None,
+            description: Some(format!("Count {} records", table.name)),
+        }
     }
 }
 
@@ -417,6 +443,7 @@ pub fn build_schema(schema_cache: &SchemaCache, config: &SchemaConfig) -> Genera
         if let Some(by_pk) = QueryField::by_pk(table, config) {
             query_fields.push(by_pk);
         }
+        query_fields.push(QueryField::count(table, config));
 
         // Add mutation fields if enabled
         if config.enable_mutations {
@@ -801,13 +828,18 @@ mod tests {
         let config = SchemaConfig::default();
         let schema = build_schema(&cache, &config);
 
-        // 3 tables * 2 (list + byPk) = 6 query fields
-        assert_eq!(schema.query_fields.len(), 6);
+        // 3 tables * 3 (list + byPk + count) = 9 query fields
+        assert_eq!(schema.query_fields.len(), 9);
 
         // Check users query fields
         let users_field = schema.get_query_field("users").unwrap();
         assert_eq!(users_field.name, "users");
         assert!(users_field.is_list);
+
+        // Check count field
+        let count_field = schema.query_fields.iter().find(|f| f.name == "usersCount").unwrap();
+        assert!(count_field.is_count);
+        assert_eq!(count_field.return_type, "Int!");
     }
 
     #[test]

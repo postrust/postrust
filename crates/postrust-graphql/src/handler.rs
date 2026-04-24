@@ -311,30 +311,48 @@ fn create_query_type(generated: &GeneratedSchema) -> Object {
         let table_name = field.table_name.clone();
         let type_name = field.type_name.clone();
         let is_by_pk = field.is_by_pk;
+        let is_count = field.is_count;
         let by_pk_id_type = field.by_pk_id_type.clone();
         let by_pk_column = field.by_pk_column.clone();
         let return_type = graphql_type_ref(&field.return_type);
 
-        let mut gql_field = Field::new(&field.name, return_type, move |ctx| {
-            let table_name = table_name.clone();
-            let type_name = type_name.clone();
-            let by_pk_id_type = by_pk_id_type.clone();
-            let by_pk_column = by_pk_column.clone();
-            FieldFuture::new(async move {
-                resolve_query(
-                    &ctx,
-                    &table_name,
-                    &type_name,
-                    is_by_pk,
-                    by_pk_id_type,
-                    by_pk_column,
-                )
-                .await
+        let mut gql_field = if is_count {
+            let table_name_c = table_name.clone();
+            Field::new(&field.name, return_type, move |ctx| {
+                let table_name = table_name_c.clone();
+                FieldFuture::new(async move {
+                    resolve_count(&ctx, &table_name).await
+                })
             })
-        });
+        } else {
+            let table_name_q = table_name.clone();
+            let type_name_q = type_name.clone();
+            let by_pk_id_type_q = by_pk_id_type.clone();
+            let by_pk_column_q = by_pk_column.clone();
+            Field::new(&field.name, return_type, move |ctx| {
+                let table_name = table_name_q.clone();
+                let type_name = type_name_q.clone();
+                let by_pk_id_type = by_pk_id_type_q.clone();
+                let by_pk_column = by_pk_column_q.clone();
+                FieldFuture::new(async move {
+                    resolve_query(
+                        &ctx,
+                        &table_name,
+                        &type_name,
+                        is_by_pk,
+                        by_pk_id_type,
+                        by_pk_column,
+                    )
+                    .await
+                })
+            })
+        };
 
-        // Add standard query arguments
-        if !is_by_pk {
+        // Add arguments
+        if is_count {
+            gql_field = gql_field
+                .argument(InputValue::new("filter", TypeRef::named("JSON")));
+        } else if !is_by_pk {
             gql_field = gql_field
                 .argument(InputValue::new("filter", TypeRef::named("JSON")))
                 .argument(InputValue::new("orderBy", TypeRef::named_list("String")))
@@ -623,6 +641,51 @@ async fn resolve_query<'a>(
         .collect();
     Ok(Some(FieldValue::list(items)))
 }
+/// Resolve a count query field (e.g., usersCount).
+async fn resolve_count<'a>(
+    ctx: &ResolverContext<'a>,
+    table_name: &str,
+) -> Result<Option<FieldValue<'a>>, async_graphql::Error> {
+    use sqlx::Row;
+
+    let pool = ctx.data::<PgPool>()?;
+    let gql_ctx = ctx.data::<GraphQLContext>()?;
+
+    debug!("Resolving count for table: {}", table_name);
+
+    let filter_value = ctx
+        .args
+        .try_get("filter")
+        .ok()
+        .map(|v| accessor_to_json(&v));
+
+    let (where_sql, where_values) = build_where_clause(filter_value.as_ref(), 1)?;
+
+    let sql = format!(
+        "SELECT COUNT(*) AS cnt FROM public.{} {}",
+        postrust_sql::escape_ident(table_name),
+        where_sql,
+    );
+
+    trace!("Executing COUNT SQL: {}", sql);
+
+    let mut conn = pool.acquire().await?;
+
+    sqlx::query(&format!("SET LOCAL ROLE {}", postrust_sql::escape_ident(gql_ctx.role())))
+        .execute(&mut *conn)
+        .await?;
+
+    let mut query = sqlx::query(&sql);
+    for val in &where_values {
+        query = bind_json_value(query, val);
+    }
+
+    let row = query.fetch_one(&mut *conn).await?;
+    let count: i64 = row.try_get("cnt")?;
+
+    Ok(Some(FieldValue::value(Value::Number(count.into()))))
+}
+
 /// Resolve a mutation field.
 async fn resolve_mutation<'a>(
     ctx: &ResolverContext<'a>,
