@@ -300,24 +300,6 @@ fn create_object_type(obj: &TableObjectType) -> Object {
         object = object.field(gql_field);
     }
 
-    if !obj.has_field("op") {
-        object = object.field(
-            Field::new("op", TypeRef::named("String"), |ctx| {
-                FieldFuture::new(async move {
-                    if let Some(Value::Object(map)) = ctx.parent_value.as_value() {
-                        let key = async_graphql::Name::new("op");
-                        if let Some(val) = map.get(&key) {
-                            return Ok(Some(FieldValue::value(val.clone())));
-                        }
-                    }
-
-                    Ok(None)
-                })
-            })
-            .description("Operation type for subscription events"),
-        );
-    }
-
     object
 }
 
@@ -817,7 +799,15 @@ fn bind_json_value<'q>(
                 query.bind(n.to_string())
             }
         }
-        serde_json::Value::String(s) => query.bind(s.clone()),
+        serde_json::Value::String(s) => {
+            // Try to bind as UUID if the string looks like one, so Postgres
+            // doesn't reject `uuid = text` comparisons.
+            if let Ok(u) = uuid::Uuid::parse_str(s) {
+                query.bind(u)
+            } else {
+                query.bind(s.clone())
+            }
+        }
         _ => query.bind(value.to_string()),
     }
 }
@@ -977,31 +967,50 @@ fn build_where_clause(
                 serde_json::Value::Object(op_map) => {
                     // Handle operators like {eq: value}, {gt: value}, etc.
                     for (op, op_val) in op_map {
-                        let condition = match op.as_str() {
-                            "eq" | "_eq" => format!("{} = ${}", postrust_sql::escape_ident(key), param_idx),
-                            "neq" | "_neq" => format!("{} != ${}", postrust_sql::escape_ident(key), param_idx),
-                            "gt" | "_gt" => format!("{} > ${}", postrust_sql::escape_ident(key), param_idx),
-                            "gte" | "_gte" => format!("{} >= ${}", postrust_sql::escape_ident(key), param_idx),
-                            "lt" | "_lt" => format!("{} < ${}", postrust_sql::escape_ident(key), param_idx),
-                            "lte" | "_lte" => format!("{} <= ${}", postrust_sql::escape_ident(key), param_idx),
-                            "like" | "_like" => format!("{} LIKE ${}", postrust_sql::escape_ident(key), param_idx),
-                            "ilike" | "_ilike" => format!("{} ILIKE ${}", postrust_sql::escape_ident(key), param_idx),
-                            "is_null" | "_is_null" => {
-                                if op_val.as_bool().unwrap_or(false) {
-                                    format!("{} IS NULL", postrust_sql::escape_ident(key))
-                                } else {
-                                    format!("{} IS NOT NULL", postrust_sql::escape_ident(key))
+                        match op.as_str() {
+                            "in" | "_in" => {
+                                if let serde_json::Value::Array(arr) = op_val {
+                                    if arr.is_empty() {
+                                        conditions.push("FALSE".to_string());
+                                    } else {
+                                        let col = postrust_sql::escape_ident(key);
+                                        let parts: Vec<String> = arr.iter().map(|v| {
+                                            let placeholder = format!("${}", param_idx);
+                                            values.push(v.clone());
+                                            param_idx += 1;
+                                            format!("{} = {}", col, placeholder)
+                                        }).collect();
+                                        if parts.len() == 1 {
+                                            conditions.push(parts.into_iter().next().unwrap());
+                                        } else {
+                                            conditions.push(format!("({})", parts.join(" OR ")));
+                                        }
+                                    }
                                 }
                             }
-                            _ => continue,
-                        };
-
-                        if !op.contains("is_null") {
-                            conditions.push(condition);
-                            values.push(op_val.clone());
-                            param_idx += 1;
-                        } else {
-                            conditions.push(condition);
+                            "is_null" | "_is_null" => {
+                                if op_val.as_bool().unwrap_or(false) {
+                                    conditions.push(format!("{} IS NULL", postrust_sql::escape_ident(key)));
+                                } else {
+                                    conditions.push(format!("{} IS NOT NULL", postrust_sql::escape_ident(key)));
+                                }
+                            }
+                            _ => {
+                                let condition = match op.as_str() {
+                                    "eq" | "_eq" => format!("{} = ${}", postrust_sql::escape_ident(key), param_idx),
+                                    "neq" | "_neq" => format!("{} != ${}", postrust_sql::escape_ident(key), param_idx),
+                                    "gt" | "_gt" => format!("{} > ${}", postrust_sql::escape_ident(key), param_idx),
+                                    "gte" | "_gte" => format!("{} >= ${}", postrust_sql::escape_ident(key), param_idx),
+                                    "lt" | "_lt" => format!("{} < ${}", postrust_sql::escape_ident(key), param_idx),
+                                    "lte" | "_lte" => format!("{} <= ${}", postrust_sql::escape_ident(key), param_idx),
+                                    "like" | "_like" => format!("{} LIKE ${}", postrust_sql::escape_ident(key), param_idx),
+                                    "ilike" | "_ilike" => format!("{} ILIKE ${}", postrust_sql::escape_ident(key), param_idx),
+                                    _ => continue,
+                                };
+                                conditions.push(condition);
+                                values.push(op_val.clone());
+                                param_idx += 1;
+                            }
                         }
                     }
                 }
@@ -1159,18 +1168,7 @@ fn json_to_value(json: serde_json::Value) -> Value {
 
 fn subscription_event_value(payload: &TableChangePayload) -> Option<serde_json::Value> {
     match payload.data() {
-        Some(serde_json::Value::Object(map)) => {
-            let mut event = map.clone();
-            event.insert(
-                "op".to_string(),
-                serde_json::Value::String(payload.operation.clone()),
-            );
-            Some(serde_json::Value::Object(event))
-        }
-        Some(other) => Some(serde_json::json!({
-            "op": payload.operation,
-            "data": other
-        })),
+        Some(value) => Some(value.clone()),
         None => None,
     }
 }
@@ -1417,7 +1415,7 @@ mod tests {
     }
 
     #[test]
-    fn test_subscription_event_value_includes_op() {
+    fn test_subscription_event_value_returns_data() {
         let payload = TableChangePayload {
             operation: "DELETE".to_string(),
             table: "users".to_string(),
@@ -1430,7 +1428,6 @@ mod tests {
         };
 
         let value = subscription_event_value(&payload).unwrap();
-        assert_eq!(value["op"], "DELETE");
         assert_eq!(value["id"], 6);
         assert_eq!(value["name"], "Alice2");
     }
