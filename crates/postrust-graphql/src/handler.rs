@@ -623,24 +623,97 @@ async fn resolve_query<'a>(
         .ok()
         .and_then(|v| v.i64().ok());
 
-    let mut s = format!(
-        "SELECT row_to_json(t) FROM (SELECT * FROM public.{}) t",
-        table_name
-    );
-    if let Some(limit) = limit {
-        s.push_str(&format!(" LIMIT {limit}"));
-    }
-    if let Some(offset) = offset {
-        s.push_str(&format!(" OFFSET {offset}"));
+    let filter_value = ctx
+        .args
+        .try_get("filter")
+        .ok()
+        .map(|v| accessor_to_json(&v));
+
+    let order_by: Option<Vec<String>> = ctx
+        .args
+        .try_get("orderBy")
+        .ok()
+        .and_then(|v| v.list().ok())
+        .map(|list| {
+            list.iter()
+                .filter_map(|v| v.string().ok().map(|s| s.to_string()))
+                .collect()
+        });
+
+    let (sql, where_values) = build_list_sql(table_name, filter_value.as_ref(), order_by.as_deref(), limit, offset)?;
+
+    let mut conn = pool.acquire().await?;
+    sqlx::query(&format!("SET LOCAL ROLE {}", postrust_sql::escape_ident(gql_ctx.role())))
+        .execute(&mut *conn)
+        .await?;
+
+    let mut query = sqlx::query(&sql);
+    for val in &where_values {
+        query = bind_json_value(query, val);
     }
 
-    let result = execute_query(pool, &s, gql_ctx.role()).await?;
+    let result: Vec<serde_json::Value> = {
+        use sqlx::Row;
+        let rows = query.fetch_all(&mut *conn).await?;
+        rows.iter()
+            .filter_map(|row| row.try_get::<serde_json::Value, _>(0).ok())
+            .collect()
+    };
     let items: Vec<FieldValue> = result
         .into_iter()
         .map(|v| FieldValue::value(json_to_value(v)))
         .collect();
     Ok(Some(FieldValue::list(items)))
 }
+/// Build the SQL for a list query with optional filter, ordering, limit, and offset.
+fn build_list_sql(
+    table_name: &str,
+    filter_value: Option<&serde_json::Value>,
+    order_by: Option<&[String]>,
+    limit: Option<i64>,
+    offset: Option<i64>,
+) -> Result<(String, Vec<serde_json::Value>), async_graphql::Error> {
+    let t = postrust_sql::escape_ident(table_name);
+    let (where_sql, where_values) = build_where_clause(filter_value, 1)?;
+
+    let order_sql = match order_by {
+        Some(fields) if !fields.is_empty() => {
+            let clauses: Vec<String> = fields
+                .iter()
+                .filter_map(|s| {
+                    // Parse "field_ASC" or "field_DESC"
+                    if let Some(field) = s.strip_suffix("_ASC") {
+                        Some(format!("{} ASC", postrust_sql::escape_ident(field)))
+                    } else if let Some(field) = s.strip_suffix("_DESC") {
+                        Some(format!("{} DESC", postrust_sql::escape_ident(field)))
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+            if clauses.is_empty() {
+                String::new()
+            } else {
+                format!(" ORDER BY {}", clauses.join(", "))
+            }
+        }
+        _ => String::new(),
+    };
+
+    let mut sql = format!(
+        "SELECT row_to_json(t) FROM (SELECT * FROM public.{t} {where_sql}{order_sql}) t",
+    );
+
+    if let Some(limit) = limit {
+        sql.push_str(&format!(" LIMIT {limit}"));
+    }
+    if let Some(offset) = offset {
+        sql.push_str(&format!(" OFFSET {offset}"));
+    }
+
+    Ok((sql, where_values))
+}
+
 /// Resolve a count query field (e.g., usersCount).
 async fn resolve_count<'a>(
     ctx: &ResolverContext<'a>,
@@ -738,36 +811,6 @@ async fn resolve_mutation<'a>(
     Ok(result)
 }
 
-/// Execute a SQL query and return results as serde_json::Value.
-/// We keep data as serde_json::Value so field resolvers can use try_downcast_ref.
-async fn execute_query(
-    pool: &PgPool,
-    sql: &str,
-    role: &str,
-) -> Result<Vec<serde_json::Value>, async_graphql::Error> {
-    use sqlx::Row;
-
-    trace!("Executing SQL: {}", sql);
-
-    let mut conn = pool.acquire().await?;
-
-    // Set role
-    sqlx::query(&format!("SET LOCAL ROLE {}", postrust_sql::escape_ident(role)))
-        .execute(&mut *conn)
-        .await?;
-
-    // Execute query
-    let rows = sqlx::query(sql).fetch_all(&mut *conn).await?;
-
-    // Return raw JSON values - don't convert to async_graphql::Value
-    // This allows field resolvers to use try_downcast_ref::<serde_json::Value>()
-    let results: Vec<serde_json::Value> = rows
-        .iter()
-        .filter_map(|row| row.try_get::<serde_json::Value, _>(0).ok())
-        .collect();
-
-    Ok(results)
-}
 
 /// Execute an insert mutation.
 async fn execute_insert<'a>(
@@ -1622,5 +1665,219 @@ mod tests {
 
         let _subscription = create_subscription_type(&fields);
         // Just test that it doesn't panic
+    }
+
+    // ============================================================================
+    // build_list_sql Tests
+    // ============================================================================
+
+    #[test]
+    fn test_build_list_sql_no_args() {
+        let (sql, values) = build_list_sql("users", None, None, None, None).unwrap();
+        assert_eq!(
+            sql,
+            r#"SELECT row_to_json(t) FROM (SELECT * FROM public."users" ) t"#
+        );
+        assert!(values.is_empty());
+    }
+
+    #[test]
+    fn test_build_list_sql_with_limit_and_offset() {
+        let (sql, values) = build_list_sql("users", None, None, Some(10), Some(20)).unwrap();
+        assert!(sql.contains("LIMIT 10"));
+        assert!(sql.contains("OFFSET 20"));
+        assert!(values.is_empty());
+    }
+
+    #[test]
+    fn test_build_list_sql_with_order_by_asc() {
+        let order = vec!["name_ASC".to_string()];
+        let (sql, _) = build_list_sql("users", None, Some(&order), None, None).unwrap();
+        assert!(
+            sql.contains(r#"ORDER BY "name" ASC"#),
+            "Expected ORDER BY clause in SQL: {}",
+            sql
+        );
+    }
+
+    #[test]
+    fn test_build_list_sql_with_order_by_desc() {
+        let order = vec!["createdAt_DESC".to_string()];
+        let (sql, _) = build_list_sql("users", None, Some(&order), None, None).unwrap();
+        assert!(
+            sql.contains(r#"ORDER BY "createdAt" DESC"#),
+            "Expected ORDER BY clause in SQL: {}",
+            sql
+        );
+    }
+
+    #[test]
+    fn test_build_list_sql_with_multiple_order_by() {
+        let order = vec!["name_ASC".to_string(), "id_DESC".to_string()];
+        let (sql, _) = build_list_sql("users", None, Some(&order), None, None).unwrap();
+        assert!(
+            sql.contains(r#"ORDER BY "name" ASC, "id" DESC"#),
+            "Expected multi-column ORDER BY in SQL: {}",
+            sql
+        );
+    }
+
+    #[test]
+    fn test_build_list_sql_with_filter_eq() {
+        let filter = serde_json::json!({ "status": { "eq": "active" } });
+        let (sql, values) = build_list_sql("users", Some(&filter), None, None, None).unwrap();
+        assert!(
+            sql.contains("WHERE"),
+            "Expected WHERE clause in SQL: {}",
+            sql
+        );
+        assert!(
+            sql.contains(r#""status" = $1"#),
+            "Expected parameterized equality in SQL: {}",
+            sql
+        );
+        assert_eq!(values.len(), 1);
+        assert_eq!(values[0], serde_json::json!("active"));
+    }
+
+    #[test]
+    fn test_build_list_sql_with_filter_in() {
+        let filter = serde_json::json!({ "role": { "in": ["admin", "editor"] } });
+        let (sql, values) = build_list_sql("users", Some(&filter), None, None, None).unwrap();
+        assert!(
+            sql.contains("WHERE"),
+            "Expected WHERE clause in SQL: {}",
+            sql
+        );
+        assert_eq!(values.len(), 2);
+        assert_eq!(values[0], serde_json::json!("admin"));
+        assert_eq!(values[1], serde_json::json!("editor"));
+    }
+
+    #[test]
+    fn test_build_list_sql_with_filter_and_order_and_paging() {
+        let filter = serde_json::json!({ "status": { "eq": "active" } });
+        let order = vec!["name_ASC".to_string()];
+        let (sql, values) = build_list_sql(
+            "users",
+            Some(&filter),
+            Some(&order),
+            Some(25),
+            Some(50),
+        )
+        .unwrap();
+        assert!(sql.contains("WHERE"), "Missing WHERE: {}", sql);
+        assert!(sql.contains(r#"ORDER BY "name" ASC"#), "Missing ORDER BY: {}", sql);
+        assert!(sql.contains("LIMIT 25"), "Missing LIMIT: {}", sql);
+        assert!(sql.contains("OFFSET 50"), "Missing OFFSET: {}", sql);
+        assert_eq!(values.len(), 1);
+    }
+
+    #[test]
+    fn test_build_list_sql_escapes_table_name() {
+        let (sql, _) = build_list_sql("user accounts", None, None, None, None).unwrap();
+        assert!(
+            sql.contains(r#"public."user accounts""#),
+            "Table name not escaped: {}",
+            sql
+        );
+    }
+
+    // ============================================================================
+    // build_where_clause Tests
+    // ============================================================================
+
+    #[test]
+    fn test_build_where_clause_none() {
+        let (sql, values) = build_where_clause(None, 1).unwrap();
+        assert_eq!(sql, "");
+        assert!(values.is_empty());
+    }
+
+    #[test]
+    fn test_build_where_clause_eq() {
+        let filter = serde_json::json!({ "name": { "eq": "Alice" } });
+        let (sql, values) = build_where_clause(Some(&filter), 1).unwrap();
+        assert_eq!(sql, r#"WHERE "name" = $1"#);
+        assert_eq!(values, vec![serde_json::json!("Alice")]);
+    }
+
+    #[test]
+    fn test_build_where_clause_neq() {
+        let filter = serde_json::json!({ "status": { "neq": "inactive" } });
+        let (sql, values) = build_where_clause(Some(&filter), 1).unwrap();
+        assert_eq!(sql, r#"WHERE "status" != $1"#);
+        assert_eq!(values, vec![serde_json::json!("inactive")]);
+    }
+
+    #[test]
+    fn test_build_where_clause_gt_lt() {
+        let filter = serde_json::json!({ "age": { "gt": 18, "lt": 65 } });
+        let (sql, values) = build_where_clause(Some(&filter), 1).unwrap();
+        assert!(sql.contains("WHERE"));
+        assert_eq!(values.len(), 2);
+    }
+
+    #[test]
+    fn test_build_where_clause_in_single() {
+        let filter = serde_json::json!({ "id": { "in": [42] } });
+        let (sql, values) = build_where_clause(Some(&filter), 1).unwrap();
+        assert_eq!(sql, r#"WHERE "id" = $1"#);
+        assert_eq!(values, vec![serde_json::json!(42)]);
+    }
+
+    #[test]
+    fn test_build_where_clause_in_multiple() {
+        let filter = serde_json::json!({ "id": { "in": [1, 2, 3] } });
+        let (sql, values) = build_where_clause(Some(&filter), 1).unwrap();
+        assert_eq!(sql, r#"WHERE ("id" = $1 OR "id" = $2 OR "id" = $3)"#);
+        assert_eq!(values.len(), 3);
+    }
+
+    #[test]
+    fn test_build_where_clause_in_empty() {
+        let filter = serde_json::json!({ "id": { "in": [] } });
+        let (sql, values) = build_where_clause(Some(&filter), 1).unwrap();
+        assert_eq!(sql, "WHERE FALSE");
+        assert!(values.is_empty());
+    }
+
+    #[test]
+    fn test_build_where_clause_is_null() {
+        let filter = serde_json::json!({ "email": { "is_null": true } });
+        let (sql, values) = build_where_clause(Some(&filter), 1).unwrap();
+        assert_eq!(sql, r#"WHERE "email" IS NULL"#);
+        assert!(values.is_empty());
+    }
+
+    #[test]
+    fn test_build_where_clause_direct_equality() {
+        let filter = serde_json::json!({ "name": "Bob" });
+        let (sql, values) = build_where_clause(Some(&filter), 1).unwrap();
+        assert_eq!(sql, r#"WHERE "name" = $1"#);
+        assert_eq!(values, vec![serde_json::json!("Bob")]);
+    }
+
+    #[test]
+    fn test_build_where_clause_param_idx_offset() {
+        let filter = serde_json::json!({ "name": { "eq": "Alice" } });
+        let (sql, _) = build_where_clause(Some(&filter), 5).unwrap();
+        assert_eq!(sql, r#"WHERE "name" = $5"#);
+    }
+
+    #[test]
+    fn test_build_where_clause_like() {
+        let filter = serde_json::json!({ "name": { "like": "%test%" } });
+        let (sql, values) = build_where_clause(Some(&filter), 1).unwrap();
+        assert_eq!(sql, r#"WHERE "name" LIKE $1"#);
+        assert_eq!(values, vec![serde_json::json!("%test%")]);
+    }
+
+    #[test]
+    fn test_build_where_clause_ilike() {
+        let filter = serde_json::json!({ "name": { "ilike": "%TEST%" } });
+        let (sql, values) = build_where_clause(Some(&filter), 1).unwrap();
+        assert_eq!(sql, r#"WHERE "name" ILIKE $1"#);
+        assert_eq!(values, vec![serde_json::json!("%TEST%")]);
     }
 }
