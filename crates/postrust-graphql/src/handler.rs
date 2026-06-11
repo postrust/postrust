@@ -496,13 +496,52 @@ enum ByPkParam {
     String(String),
 }
 
+/// Begin a per-request transaction with the caller's role and JWT claims applied
+/// as transaction-local settings.
+///
+/// `SET LOCAL ROLE` and the `request.jwt.claims.*` GUCs only persist for the
+/// lifetime of a transaction, so the role switch, the claims, and the actual
+/// query must all share one transaction. Committing resets them automatically,
+/// leaving the pooled connection clean for the next request. (Mirrors the REST
+/// path in `postrust-server`.)
+async fn begin_request_tx(
+    pool: &PgPool,
+    ctx: &GraphQLContext,
+) -> Result<sqlx::Transaction<'static, sqlx::Postgres>, async_graphql::Error> {
+    let mut tx = pool.begin().await?;
+
+    sqlx::query(&format!(
+        "SET LOCAL ROLE {}",
+        postrust_sql::escape_ident(ctx.role())
+    ))
+    .execute(&mut *tx)
+    .await?;
+
+    // Expose JWT claims as transaction-local GUCs so RLS policies can read them
+    // via current_setting('request.jwt.claims.<name>', true).
+    for (key, value) in &ctx.auth.claims {
+        let guc_key = format!("request.jwt.claims.{}", key);
+        let guc_value = match value {
+            serde_json::Value::String(s) => s.clone(),
+            other => other.to_string(),
+        };
+        let _ = sqlx::query("SELECT set_config($1, $2, true)")
+            .bind(&guc_key)
+            .bind(&guc_value)
+            .execute(&mut *tx)
+            .await;
+    }
+
+    Ok(tx)
+}
+
 /// `SELECT * … WHERE <pk> = $1` with a typed parameter (Int / UUID / String scalars in the schema).
 async fn execute_by_pk_one(
     pool: &PgPool,
     table_name: &str,
     pk_col: &str,
     value: ByPkParam,
-    role: &str,
+    ctx: &GraphQLContext,
 ) -> Result<Vec<serde_json::Value>, async_graphql::Error> {
     use sqlx::Row;
 
@@ -514,25 +553,17 @@ async fn execute_by_pk_one(
         c = c,
     );
 
-    trace!("Executing by-PK SQL: {}, role={}", sql, role);
+    trace!("Executing by-PK SQL: {}, role={}", sql, ctx.role());
 
-    let mut conn = pool
-        .acquire()
-        .await
-        .map_err(|e| async_graphql::Error::new(e.to_string()))?;
-
-    sqlx::query(&format!("SET LOCAL ROLE {}", postrust_sql::escape_ident(role)))
-        .execute(&mut *conn)
-        .await
-        .map_err(|e| async_graphql::Error::new(e.to_string()))?;
+    let mut tx = begin_request_tx(pool, ctx).await?;
 
     let rows = match value {
-        ByPkParam::I64(n) => sqlx::query(&sql).bind(n).fetch_all(&mut *conn).await,
-        ByPkParam::Uuid(u) => sqlx::query(&sql).bind(u).fetch_all(&mut *conn).await,
+        ByPkParam::I64(n) => sqlx::query(&sql).bind(n).fetch_all(&mut *tx).await,
+        ByPkParam::Uuid(u) => sqlx::query(&sql).bind(u).fetch_all(&mut *tx).await,
         ByPkParam::String(ref s) => {
             sqlx::query(&sql)
                 .bind(s)
-                .fetch_all(&mut *conn)
+                .fetch_all(&mut *tx)
                 .await
         }
     }
@@ -542,6 +573,10 @@ async fn execute_by_pk_one(
         .iter()
         .filter_map(|row| row.try_get::<serde_json::Value, _>(0).ok())
         .collect();
+
+    tx.commit()
+        .await
+        .map_err(|e| async_graphql::Error::new(e.to_string()))?;
 
     Ok(results)
 }
@@ -604,7 +639,11 @@ async fn resolve_query<'a>(
                 ByPkParam::String(s)
             }
         };
+<<<<<<< Updated upstream
         let result = execute_by_pk_one(pool, table_name, pk_col, param, gql_ctx.role()).await?;
+=======
+        let result = execute_by_pk_one(pool, schema_name, table_name, pk_col, param, gql_ctx).await?;
+>>>>>>> Stashed changes
         return Ok(result
             .into_iter()
             .next()
@@ -642,10 +681,7 @@ async fn resolve_query<'a>(
 
     let (sql, where_values) = build_list_sql(table_name, filter_value.as_ref(), order_by.as_deref(), limit, offset)?;
 
-    let mut conn = pool.acquire().await?;
-    sqlx::query(&format!("SET LOCAL ROLE {}", postrust_sql::escape_ident(gql_ctx.role())))
-        .execute(&mut *conn)
-        .await?;
+    let mut tx = begin_request_tx(pool, gql_ctx).await?;
 
     let mut query = sqlx::query(&sql);
     for val in &where_values {
@@ -654,11 +690,14 @@ async fn resolve_query<'a>(
 
     let result: Vec<serde_json::Value> = {
         use sqlx::Row;
-        let rows = query.fetch_all(&mut *conn).await?;
+        let rows = query.fetch_all(&mut *tx).await?;
         rows.iter()
             .filter_map(|row| row.try_get::<serde_json::Value, _>(0).ok())
             .collect()
     };
+
+    tx.commit().await?;
+
     let items: Vec<FieldValue> = result
         .into_iter()
         .map(|v| FieldValue::value(json_to_value(v)))
@@ -742,19 +781,17 @@ async fn resolve_count<'a>(
 
     trace!("Executing COUNT SQL: {}", sql);
 
-    let mut conn = pool.acquire().await?;
-
-    sqlx::query(&format!("SET LOCAL ROLE {}", postrust_sql::escape_ident(gql_ctx.role())))
-        .execute(&mut *conn)
-        .await?;
+    let mut tx = begin_request_tx(pool, gql_ctx).await?;
 
     let mut query = sqlx::query(&sql);
     for val in &where_values {
         query = bind_json_value(query, val);
     }
 
-    let row = query.fetch_one(&mut *conn).await?;
+    let row = query.fetch_one(&mut *tx).await?;
     let count: i64 = row.try_get("cnt")?;
+
+    tx.commit().await?;
 
     Ok(Some(FieldValue::value(Value::Number(count.into()))))
 }
@@ -779,7 +816,11 @@ async fn resolve_mutation<'a>(
                 .map(|v| accessor_to_json(&v))
                 .unwrap_or_else(|| serde_json::Value::Array(vec![]));
 
+<<<<<<< Updated upstream
             execute_insert(pool, table_name, gql_ctx.role(), objects, mutation_type).await?
+=======
+            execute_insert(pool, schema_name, table_name, gql_ctx, objects, mutation_type).await?
+>>>>>>> Stashed changes
         }
         MutationType::Update | MutationType::UpdateByPk => {
             let set_value = ctx
@@ -795,7 +836,11 @@ async fn resolve_mutation<'a>(
                 .ok()
                 .map(|v| accessor_to_json(&v));
 
+<<<<<<< Updated upstream
             execute_update(pool, table_name, gql_ctx.role(), set_value, where_clause, mutation_type).await?
+=======
+            execute_update(pool, schema_name, table_name, gql_ctx, set_value, where_clause, mutation_type).await?
+>>>>>>> Stashed changes
         }
         MutationType::Delete | MutationType::DeleteByPk => {
             let where_clause = ctx
@@ -804,7 +849,11 @@ async fn resolve_mutation<'a>(
                 .ok()
                 .map(|v| accessor_to_json(&v));
 
+<<<<<<< Updated upstream
             execute_delete(pool, table_name, gql_ctx.role(), where_clause, mutation_type).await?
+=======
+            execute_delete(pool, schema_name, table_name, gql_ctx, where_clause, mutation_type).await?
+>>>>>>> Stashed changes
         }
     };
 
@@ -816,7 +865,7 @@ async fn resolve_mutation<'a>(
 async fn execute_insert<'a>(
     pool: &PgPool,
     table_name: &str,
-    role: &str,
+    ctx: &GraphQLContext,
     objects: serde_json::Value,
     mutation_type: MutationType,
 ) -> Result<Option<FieldValue<'a>>, async_graphql::Error> {
@@ -835,12 +884,7 @@ async fn execute_insert<'a>(
         return Err(async_graphql::Error::new("objects cannot be empty"));
     }
 
-    let mut conn = pool.acquire().await?;
-
-    // Set role
-    sqlx::query(&format!("SET LOCAL ROLE {}", postrust_sql::escape_ident(role)))
-        .execute(&mut *conn)
-        .await?;
+    let mut tx = begin_request_tx(pool, ctx).await?;
 
     let mut inserted: Vec<FieldValue> = Vec::new();
 
@@ -868,12 +912,14 @@ async fn execute_insert<'a>(
                 }
             }
 
-            let row = query.fetch_one(&mut *conn).await?;
+            let row = query.fetch_one(&mut *tx).await?;
             if let Ok(json_val) = row.try_get::<serde_json::Value, _>(0) {
                 inserted.push(FieldValue::value(json_to_value(json_val)));
             }
         }
     }
+
+    tx.commit().await?;
 
     // Return based on mutation type
     match mutation_type {
@@ -922,7 +968,7 @@ fn bind_json_value<'q>(
 async fn execute_update<'a>(
     pool: &PgPool,
     table_name: &str,
-    role: &str,
+    ctx: &GraphQLContext,
     set_value: serde_json::Value,
     where_clause: Option<serde_json::Value>,
     mutation_type: MutationType,
@@ -940,12 +986,7 @@ async fn execute_update<'a>(
         return Err(async_graphql::Error::new("set cannot be empty"));
     }
 
-    let mut conn = pool.acquire().await?;
-
-    // Set role
-    sqlx::query(&format!("SET LOCAL ROLE {}", postrust_sql::escape_ident(role)))
-        .execute(&mut *conn)
-        .await?;
+    let mut tx = begin_request_tx(pool, ctx).await?;
 
     // Build SET clause
     let mut set_parts: Vec<String> = Vec::new();
@@ -981,13 +1022,15 @@ async fn execute_update<'a>(
         query = bind_json_value(query, val);
     }
 
-    let rows = query.fetch_all(&mut *conn).await?;
+    let rows = query.fetch_all(&mut *tx).await?;
 
     let updated: Vec<FieldValue> = rows
         .iter()
         .filter_map(|row| row.try_get::<serde_json::Value, _>(0).ok())
         .map(|v| FieldValue::value(json_to_value(v)))
         .collect();
+
+    tx.commit().await?;
 
     // Return based on mutation type
     match mutation_type {
@@ -1004,7 +1047,7 @@ async fn execute_update<'a>(
 async fn execute_delete<'a>(
     pool: &PgPool,
     table_name: &str,
-    role: &str,
+    ctx: &GraphQLContext,
     where_clause: Option<serde_json::Value>,
     mutation_type: MutationType,
 ) -> Result<Option<FieldValue<'a>>, async_graphql::Error> {
@@ -1012,12 +1055,7 @@ async fn execute_delete<'a>(
 
     trace!("Delete mutation for {}", table_name);
 
-    let mut conn = pool.acquire().await?;
-
-    // Set role
-    sqlx::query(&format!("SET LOCAL ROLE {}", postrust_sql::escape_ident(role)))
-        .execute(&mut *conn)
-        .await?;
+    let mut tx = begin_request_tx(pool, ctx).await?;
 
     // Build WHERE clause
     let (where_sql, where_values) = build_where_clause(where_clause.as_ref(), 1)?;
@@ -1039,13 +1077,15 @@ async fn execute_delete<'a>(
         query = bind_json_value(query, val);
     }
 
-    let rows = query.fetch_all(&mut *conn).await?;
+    let rows = query.fetch_all(&mut *tx).await?;
 
     let deleted: Vec<FieldValue> = rows
         .iter()
         .filter_map(|row| row.try_get::<serde_json::Value, _>(0).ok())
         .map(|v| FieldValue::value(json_to_value(v)))
         .collect();
+
+    tx.commit().await?;
 
     // Return based on mutation type
     match mutation_type {

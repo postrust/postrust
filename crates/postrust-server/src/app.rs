@@ -122,8 +122,10 @@ async fn execute_plan(
             debug!("Executing SQL: {}", sql);
             debug!("With {} parameters", params.len());
 
-            // Execute query
-            let mut conn = state.pool.acquire().await
+            // Execute query inside a single transaction so SET LOCAL ROLE and the
+            // request.jwt.claims.* GUCs stay in force for the query and reset on
+            // COMMIT (keeping the pooled connection clean for the next request).
+            let mut tx = state.pool.begin().await
                 .map_err(|e| postrust_core::Error::ConnectionPool(e.to_string()))?;
 
             // Set role
@@ -131,7 +133,7 @@ async fn execute_plan(
                 "SET LOCAL ROLE {}",
                 postrust_sql::escape_ident(&auth.role)
             ))
-            .execute(&mut *conn)
+            .execute(&mut *tx)
             .await
             .map_err(|e| postrust_core::Error::Database(postrust_core::error::DatabaseError {
                 code: "42501".into(),
@@ -154,19 +156,21 @@ async fn execute_plan(
                 sqlx::query("SELECT set_config($1, $2, true)")
                     .bind(&guc_key)
                     .bind(&guc_value)
-                    .execute(&mut *conn)
+                    .execute(&mut *tx)
                     .await
                     .ok(); // Ignore errors for individual claims
             }
 
             // Execute main query with bound parameters
             let rows = bind_params(sqlx::query(&sql), &params)
-                .fetch_all(&mut *conn)
+                .fetch_all(&mut *tx)
                 .await
                 .map_err(|e| {
                     error!("Query error: {}", e);
                     map_sqlx_error(e)
                 })?;
+
+            tx.commit().await.map_err(map_sqlx_error)?;
 
             // Convert rows to JSON
             let json_rows: Vec<serde_json::Value> = rows
