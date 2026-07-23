@@ -230,20 +230,27 @@ async fn execute_plan(
 /// Reshape RPC rows for PostgREST-compatibility mode.
 ///
 /// `SELECT * FROM func(...)` names its single output column after the function
-/// (for scalar/`json`/single-composite returns), which serializes to rows like
+/// (for scalar/`json` returns), which serializes to rows like
 /// `[{"func": <value>}]`. PostgREST instead returns the bare value. This
-/// un-nests any single-key row whose key matches the function name, and reports
-/// whether the result should be rendered as a single (un-arrayed) value — i.e.
-/// when the function is not set-returning.
+/// un-nests that wrapper column and reports whether the result should be
+/// rendered as a single (un-arrayed) value — i.e. when the function is not
+/// set-returning.
 ///
-/// Multi-column rows (set-returning functions, `RETURNS TABLE`, single
-/// composite returns) are left untouched.
+/// The decision is driven by the plan's return-type metadata: composite and
+/// `record` returns (`RETURNS TABLE`, row types) have real output columns and
+/// are never un-nested, even when a single column happens to share the
+/// function's name (e.g. `CREATE FUNCTION foo() RETURNS TABLE(foo int)`).
 fn unwrap_rpc_rows(
     rows: Vec<serde_json::Value>,
     call: &CallPlan,
 ) -> (Vec<serde_json::Value>, bool) {
-    let fname = call.function.name.as_str();
+    let singular = !call.returns_set;
 
+    if call.returns_composite {
+        return (rows, singular);
+    }
+
+    let fname = call.function.name.as_str();
     let unwrapped = rows
         .into_iter()
         .map(|row| match row {
@@ -254,7 +261,7 @@ fn unwrap_rpc_rows(
         })
         .collect();
 
-    (unwrapped, !call.returns_set)
+    (unwrapped, singular)
 }
 
 /// Convert a sqlx row to JSON.
@@ -477,12 +484,21 @@ mod tests {
             params: CallParams::None,
             returns_scalar: !returns_set,
             returns_set,
+            returns_composite: false,
             volatility: "Volatile".into(),
         }
     }
 
+    fn composite_call_plan(name: &str, returns_set: bool) -> CallPlan {
+        CallPlan {
+            returns_composite: true,
+            returns_scalar: false,
+            ..call_plan(name, returns_set)
+        }
+    }
+
     #[test]
-    fn unwraps_single_composite_return_to_bare_object() {
+    fn unwraps_json_return_to_bare_object() {
         // `SELECT * FROM sync(...)` on a json-returning function yields a single
         // column named after the function.
         let rows = vec![json!({"sync": {"ok": true, "count": 3}})];
@@ -512,8 +528,32 @@ mod tests {
         // `RETURNS TABLE(...)` / composite set: rows already have real columns
         // and must not be un-nested.
         let rows = vec![json!({"id": 1, "name": "a"}), json!({"id": 2, "name": "b"})];
-        let (out, singular) = unwrap_rpc_rows(rows.clone(), &call_plan("list_users", true));
+        let (out, singular) =
+            unwrap_rpc_rows(rows.clone(), &composite_call_plan("list_users", true));
         assert!(!singular);
+        assert_eq!(out, rows);
+    }
+
+    #[test]
+    fn leaves_table_column_named_like_function_untouched() {
+        // `CREATE FUNCTION foo() RETURNS TABLE(foo int)`: the single output
+        // column legitimately shares the function's name. The composite
+        // return-type metadata must prevent it from being mistaken for the
+        // function-name wrapper.
+        let rows = vec![json!({"foo": 1}), json!({"foo": 2})];
+        let (out, singular) = unwrap_rpc_rows(rows.clone(), &composite_call_plan("foo", true));
+        assert!(!singular);
+        assert_eq!(out, rows);
+    }
+
+    #[test]
+    fn single_composite_return_is_singular_but_not_unwrapped() {
+        // A non-set function returning a row type expands to its columns;
+        // nothing to un-nest, but the result still renders as a bare object.
+        let rows = vec![json!({"id": 1, "name": "a"})];
+        let (out, singular) =
+            unwrap_rpc_rows(rows.clone(), &composite_call_plan("get_user", false));
+        assert!(singular);
         assert_eq!(out, rows);
     }
 

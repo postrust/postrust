@@ -312,7 +312,9 @@ pub async fn load_routines(pool: &PgPool, schemas: &[String]) -> Result<RoutineM
                 WHEN p.proretset THEN 'SETOF ' || pg_catalog.format_type(p.prorettype, NULL)
                 ELSE pg_catalog.format_type(p.prorettype, NULL)
             END as return_type,
-            p.proretset as returns_set
+            p.proretset as returns_set,
+            (SELECT t.typtype::text FROM pg_catalog.pg_type t WHERE t.oid = p.prorettype)
+                as ret_typtype
         FROM pg_proc p
         JOIN pg_namespace n ON n.oid = p.pronamespace
         WHERE n.nspname = ANY($1)
@@ -342,12 +344,22 @@ pub async fn load_routines(pool: &PgPool, schemas: &[String]) -> Result<RoutineM
             RetType::Single(return_type_str)
         };
 
+        // Composite ('c') and pseudo ('p', e.g. `record` from RETURNS TABLE)
+        // return types expand to their own columns in `SELECT * FROM fn()`;
+        // scalar returns yield a single column named after the function. Void
+        // is pseudo too but renders as a function-named null column, so it
+        // counts as non-composite.
+        let ret_typtype: Option<String> = row.get("ret_typtype");
+        let returns_composite = !matches!(return_type, RetType::Void)
+            && matches!(ret_typtype.as_deref(), Some("c") | Some("p"));
+
         let routine = Routine {
             schema,
             name,
             description: row.get("description"),
             params: vec![], // Simplified - full implementation would parse args
             return_type,
+            returns_composite,
             volatility: FuncVolatility::from_char(volatility.chars().next().unwrap_or('v')),
             has_variadic: row.get("has_variadic"),
             isolation_level: None,

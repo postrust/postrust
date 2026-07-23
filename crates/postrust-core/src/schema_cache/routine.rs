@@ -17,6 +17,11 @@ pub struct Routine {
     pub params: Vec<RoutineParam>,
     /// Return type
     pub return_type: RetType,
+    /// Whether the return type is composite (a row type or `record`), meaning
+    /// `SELECT * FROM fn()` expands to the type's own columns rather than a
+    /// single column named after the function.
+    #[serde(default)]
+    pub returns_composite: bool,
     /// Function volatility
     pub volatility: FuncVolatility,
     /// Whether the function has VARIADIC parameters
@@ -135,6 +140,7 @@ mod tests {
             description: None,
             params: vec![],
             return_type: RetType::SetOf("users".into()),
+            returns_composite: true,
             volatility: FuncVolatility::Stable,
             has_variadic: false,
             isolation_level: None,
