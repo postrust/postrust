@@ -75,8 +75,11 @@ jobs:
 
       - name: Load database schema
         run: |
+          set -euo pipefail
           for f in scripts/init-db.sql scripts/test-fixtures.sql; do
-            [ -f "$f" ] && PGPASSWORD=postgres psql -h localhost -U postgres -d postrust_test -v ON_ERROR_STOP=1 -f "$f" || true
+            if [ -f "$f" ]; then
+              PGPASSWORD=postgres psql -h localhost -U postgres -d postrust_test -v ON_ERROR_STOP=1 -f "$f"
+            fi
           done
 
       - name: Integration tests (database-backed)
