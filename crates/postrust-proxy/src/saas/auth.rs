@@ -128,7 +128,6 @@ async fn validate_jwt(token: &str, auth_layer: &SaasAuthLayer) -> Result<AuthCon
         .as_ref()
         .ok_or(AuthError::JwtNotConfigured)?;
 
-    // Decode JWT (simplified - in production use a proper JWT library)
     let claims = decode_jwt(token, secret)?;
 
     // Get tenant ID from claims
@@ -189,18 +188,27 @@ struct JwtClaims {
     exp: Option<i64>,
 }
 
-/// Decode and validate a JWT token.
-fn decode_jwt(token: &str, _secret: &str) -> Result<JwtClaims, AuthError> {
-    // Split the JWT into parts
-    let parts: Vec<&str> = token.split('.').collect();
-    if parts.len() != 3 {
-        return Err(AuthError::InvalidToken("Invalid JWT format".into()));
-    }
+/// Decode and validate a JWT token (HMAC-SHA256 signature, then expiry).
+fn decode_jwt(token: &str, secret: &str) -> Result<JwtClaims, AuthError> {
+    use jsonwebtoken::{decode, Algorithm, DecodingKey, Validation};
 
-    // Decode the payload (middle part)
-    let payload = base64_decode(parts[1])?;
-    let claims: JwtClaims =
-        serde_json::from_slice(&payload).map_err(|e| AuthError::InvalidToken(e.to_string()))?;
+    let mut validation = Validation::new(Algorithm::HS256);
+    // `exp` is optional for these tokens: don't require it, and check it
+    // manually below when present so absence isn't an error.
+    validation.required_spec_claims.clear();
+    validation.validate_exp = false;
+
+    let token_data = decode::<JwtClaims>(
+        token,
+        &DecodingKey::from_secret(secret.as_bytes()),
+        &validation,
+    )
+    .map_err(|e| match e.kind() {
+        jsonwebtoken::errors::ErrorKind::ExpiredSignature => AuthError::TokenExpired,
+        _ => AuthError::InvalidToken(e.to_string()),
+    })?;
+
+    let claims = token_data.claims;
 
     // Check expiration
     if let Some(exp) = claims.exp {
@@ -210,29 +218,7 @@ fn decode_jwt(token: &str, _secret: &str) -> Result<JwtClaims, AuthError> {
         }
     }
 
-    // In a production implementation, you would verify the signature here
-    // using HMAC-SHA256 with the secret
-    // For now, we trust the token format
-
     Ok(claims)
-}
-
-/// Base64 URL-safe decode.
-fn base64_decode(input: &str) -> Result<Vec<u8>, AuthError> {
-    // Add padding if necessary
-    let padded = match input.len() % 4 {
-        2 => format!("{}==", input),
-        3 => format!("{}=", input),
-        _ => input.to_string(),
-    };
-
-    // Replace URL-safe characters
-    let standard = padded.replace('-', "+").replace('_', "/");
-
-    use base64::Engine;
-    base64::engine::general_purpose::STANDARD
-        .decode(&standard)
-        .map_err(|e| AuthError::InvalidToken(format!("Base64 decode error: {}", e)))
 }
 
 /// Authentication errors.
@@ -340,5 +326,120 @@ where
             .cloned()
             .map(Auth)
             .ok_or(AuthError::MissingHeader)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use base64::Engine;
+    use jsonwebtoken::{encode, EncodingKey, Header};
+
+    const SECRET: &str = "test-secret";
+    const TENANT_ID: &str = "6ba7b810-9dad-11d1-80b4-00c04fd430c8";
+
+    fn sign(claims: &serde_json::Value, secret: &str) -> String {
+        encode(
+            &Header::default(),
+            claims,
+            &EncodingKey::from_secret(secret.as_bytes()),
+        )
+        .unwrap()
+    }
+
+    fn valid_claims() -> serde_json::Value {
+        serde_json::json!({
+            "sub": "user-1",
+            "tenant_id": TENANT_ID,
+            "role": "admin",
+            "scopes": ["domains:read"],
+            "exp": chrono::Utc::now().timestamp() + 3600,
+        })
+    }
+
+    fn b64url(data: &[u8]) -> String {
+        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(data)
+    }
+
+    #[test]
+    fn valid_token_decodes() {
+        let token = sign(&valid_claims(), SECRET);
+        let claims = decode_jwt(&token, SECRET).unwrap();
+        assert_eq!(claims.sub, "user-1");
+        assert_eq!(claims.tenant_id, Some(TENANT_ID.parse().unwrap()));
+        assert_eq!(claims.role.as_deref(), Some("admin"));
+        assert_eq!(claims.scopes, Some(vec!["domains:read".to_string()]));
+    }
+
+    #[test]
+    fn token_without_exp_is_accepted() {
+        let mut claims = valid_claims();
+        claims.as_object_mut().unwrap().remove("exp");
+        let token = sign(&claims, SECRET);
+        assert!(decode_jwt(&token, SECRET).is_ok());
+    }
+
+    #[test]
+    fn token_signed_with_wrong_secret_is_rejected() {
+        let token = sign(&valid_claims(), "some-other-secret");
+        assert!(matches!(
+            decode_jwt(&token, SECRET),
+            Err(AuthError::InvalidToken(_))
+        ));
+    }
+
+    #[test]
+    fn tampered_payload_is_rejected() {
+        // Re-encode the payload with an escalated tenant_id while keeping the
+        // original (now mismatched) signature.
+        let token = sign(&valid_claims(), SECRET);
+        let parts: Vec<&str> = token.split('.').collect();
+
+        let mut claims = valid_claims();
+        claims["tenant_id"] = serde_json::json!("00000000-0000-0000-0000-000000000001");
+        let forged_payload = b64url(serde_json::to_vec(&claims).unwrap().as_slice());
+
+        let forged = format!("{}.{}.{}", parts[0], forged_payload, parts[2]);
+        assert!(matches!(
+            decode_jwt(&forged, SECRET),
+            Err(AuthError::InvalidToken(_))
+        ));
+    }
+
+    #[test]
+    fn unsigned_alg_none_token_is_rejected() {
+        // A classic "alg": "none" forgery must not pass HS256 validation,
+        // with or without a trailing signature segment.
+        let header = b64url(br#"{"alg":"none","typ":"JWT"}"#);
+        let payload = b64url(serde_json::to_vec(&valid_claims()).unwrap().as_slice());
+
+        for token in [
+            format!("{header}.{payload}."),
+            format!("{header}.{payload}"),
+        ] {
+            assert!(
+                matches!(decode_jwt(&token, SECRET), Err(AuthError::InvalidToken(_))),
+                "token {token:?} should be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn expired_token_is_rejected() {
+        let mut claims = valid_claims();
+        claims["exp"] = serde_json::json!(chrono::Utc::now().timestamp() - 60);
+        let token = sign(&claims, SECRET);
+        assert!(matches!(
+            decode_jwt(&token, SECRET),
+            Err(AuthError::TokenExpired)
+        ));
+    }
+
+    #[test]
+    fn malformed_token_is_rejected() {
+        assert!(matches!(
+            decode_jwt("not-a-jwt", SECRET),
+            Err(AuthError::InvalidToken(_))
+        ));
     }
 }

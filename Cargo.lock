@@ -2447,6 +2447,7 @@ dependencies = [
  "http-body-util",
  "hyper",
  "hyper-util",
+ "jsonwebtoken",
  "notify",
  "parking_lot",
  "pin-project-lite",
