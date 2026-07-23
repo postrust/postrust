@@ -1,11 +1,10 @@
 //! Certificate storage with database metadata and file caching.
 
-use crate::error::{ProxyError, ProxyResult};
+use crate::error::ProxyResult;
 use sqlx::PgPool;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use tokio::sync::RwLock;
-use tracing::{debug, info, warn};
+use tracing::{debug, info};
 
 /// Certificate and key pair.
 #[derive(Clone)]
@@ -138,8 +137,8 @@ impl CertificateStore {
     }
 
     async fn save_to_file(&self, cert: &Certificate) -> ProxyResult<()> {
-        let cert_path = self.cache_dir.join(format!("{}.crt", &cert.domain));
-        let key_path = self.cache_dir.join(format!("{}.key", &cert.domain));
+        let cert_path = self.cache_dir.join(format!("{}.crt", cert.domain));
+        let key_path = self.cache_dir.join(format!("{}.key", cert.domain));
 
         tokio::fs::write(&cert_path, &cert.cert_pem).await?;
         tokio::fs::write(&key_path, &cert.key_pem).await?;
@@ -157,12 +156,14 @@ impl CertificateStore {
             .fetch_optional(&self.pool)
             .await?;
 
-        Ok(row.map(|(domain, cert_pem, key_pem, expires_at)| Certificate {
-            domain,
-            cert_pem,
-            key_pem,
-            expires_at,
-        }))
+        Ok(
+            row.map(|(domain, cert_pem, key_pem, expires_at)| Certificate {
+                domain,
+                cert_pem,
+                key_pem,
+                expires_at,
+            }),
+        )
     }
 
     async fn save_to_database(&self, cert: &Certificate) -> ProxyResult<()> {

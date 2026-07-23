@@ -37,7 +37,10 @@ impl Routine {
 
     /// Check if this function is safe for GET requests.
     pub fn is_safe_for_get(&self) -> bool {
-        matches!(self.volatility, FuncVolatility::Immutable | FuncVolatility::Stable)
+        matches!(
+            self.volatility,
+            FuncVolatility::Immutable | FuncVolatility::Stable
+        )
     }
 
     /// Get required parameters (no default).

@@ -5,7 +5,7 @@ use std::collections::HashMap;
 use uuid::Uuid;
 
 /// Main proxy configuration.
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize, Default)]
 pub struct ProxyConfig {
     /// Server settings
     #[serde(default)]
@@ -26,18 +26,6 @@ pub struct ProxyConfig {
     /// Upstreams (for file-based config)
     #[serde(default)]
     pub upstreams: Vec<Upstream>,
-}
-
-impl Default for ProxyConfig {
-    fn default() -> Self {
-        Self {
-            server: ServerConfig::default(),
-            tls: TlsConfig::default(),
-            rate_limit: RateLimitDefaults::default(),
-            routes: Vec::new(),
-            upstreams: Vec::new(),
-        }
-    }
 }
 
 /// Server configuration.
@@ -430,7 +418,7 @@ fn default_unhealthy_threshold() -> u32 {
 }
 
 /// ACME configuration for automatic certificate management.
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize, Default)]
 pub struct AcmeConfig {
     /// ACME enabled
     #[serde(default)]
@@ -446,15 +434,4 @@ pub struct AcmeConfig {
     /// Domains to request certificates for
     #[serde(default)]
     pub domains: Vec<String>,
-}
-
-impl Default for AcmeConfig {
-    fn default() -> Self {
-        Self {
-            enabled: false,
-            email: None,
-            staging: false,
-            domains: Vec::new(),
-        }
-    }
 }

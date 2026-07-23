@@ -62,9 +62,8 @@ pub fn pg_type_to_graphql(pg_type: &str) -> GraphQLType {
     let normalized = pg_type.to_lowercase().trim().to_string();
 
     // Check for array types first
-    if normalized.starts_with('_') {
+    if let Some(inner_type) = normalized.strip_prefix('_') {
         // PostgreSQL array types start with underscore (e.g., _int4)
-        let inner_type = &normalized[1..];
         return GraphQLType::List(Box::new(pg_type_to_graphql(inner_type)));
     }
 
@@ -102,12 +101,12 @@ pub fn pg_type_to_graphql(pg_type: &str) -> GraphQLType {
         "uuid" => GraphQLType::Uuid,
 
         // Date/Time types
-        "timestamp" | "timestamp without time zone" | "timestamptz"
+        "timestamp"
+        | "timestamp without time zone"
+        | "timestamptz"
         | "timestamp with time zone" => GraphQLType::DateTime,
         "date" => GraphQLType::Date,
-        "time" | "time without time zone" | "timetz" | "time with time zone" => {
-            GraphQLType::Time
-        }
+        "time" | "time without time zone" | "timetz" | "time with time zone" => GraphQLType::Time,
 
         // Default to String for unknown types
         _ => GraphQLType::String,
@@ -206,10 +205,7 @@ mod tests {
     fn test_pg_to_graphql_time() {
         assert_eq!(pg_type_to_graphql("time"), GraphQLType::Time);
         assert_eq!(pg_type_to_graphql("timetz"), GraphQLType::Time);
-        assert_eq!(
-            pg_type_to_graphql("time with time zone"),
-            GraphQLType::Time
-        );
+        assert_eq!(pg_type_to_graphql("time with time zone"), GraphQLType::Time);
     }
 
     #[test]

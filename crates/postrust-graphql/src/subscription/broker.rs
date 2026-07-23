@@ -125,7 +125,7 @@ impl NotifyBroker {
                         let pg_notification = PgNotification {
                             channel: notification.channel().to_string(),
                             payload: notification.payload().to_string(),
-                            process_id: notification.process_id() as u32,
+                            process_id: notification.process_id(),
                         };
 
                         debug!(
@@ -180,9 +180,8 @@ impl NotifyBroker {
         let receiver = sender.subscribe();
 
         // Convert broadcast receiver to stream
-        let stream = tokio_stream::wrappers::BroadcastStream::new(receiver).filter_map(|result| {
-            futures::future::ready(result.ok())
-        });
+        let stream = tokio_stream::wrappers::BroadcastStream::new(receiver)
+            .filter_map(|result| futures::future::ready(result.ok()));
 
         Ok(Box::pin(stream))
     }
@@ -267,7 +266,7 @@ impl NotifyBroker {
                         let pg_notification = PgNotification {
                             channel: notification.channel().to_string(),
                             payload: notification.payload().to_string(),
-                            process_id: notification.process_id() as u32,
+                            process_id: notification.process_id(),
                         };
 
                         let channels_read = channels.read().await;
@@ -406,10 +405,7 @@ mod tests {
             table_channel_name("public", "users"),
             "postrust_public_users"
         );
-        assert_eq!(
-            table_channel_name("api", "orders"),
-            "postrust_api_orders"
-        );
+        assert_eq!(table_channel_name("api", "orders"), "postrust_api_orders");
     }
 
     #[test]

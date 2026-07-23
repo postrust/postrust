@@ -2,22 +2,19 @@
 //!
 //! Provides order by direction and pagination types for limiting and offsetting results.
 
-use postrust_core::api_request::{Field, OrderDirection as CoreOrderDirection, OrderNulls, OrderTerm};
+use postrust_core::api_request::{
+    Field, OrderDirection as CoreOrderDirection, OrderNulls, OrderTerm,
+};
 use serde::{Deserialize, Serialize};
 
 /// Sort direction for ordering.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub enum OrderDirection {
     /// Ascending order (smallest first)
+    #[default]
     Asc,
     /// Descending order (largest first)
     Desc,
-}
-
-impl Default for OrderDirection {
-    fn default() -> Self {
-        Self::Asc
-    }
 }
 
 impl From<OrderDirection> for CoreOrderDirection {
@@ -334,10 +331,7 @@ mod tests {
     #[test]
     fn test_order_and_pagination_to_order_terms() {
         let oap = OrderAndPagination::new(
-            vec![
-                OrderByField::desc("created_at"),
-                OrderByField::asc("name"),
-            ],
+            vec![OrderByField::desc("created_at"), OrderByField::asc("name")],
             PaginationInput::default(),
         );
 

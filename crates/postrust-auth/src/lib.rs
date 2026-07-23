@@ -2,11 +2,11 @@
 //!
 //! Provides JWT token validation and role extraction for PostgreSQL RLS.
 
-mod jwt;
 mod claims;
+mod jwt;
 
-pub use jwt::validate_token;
 pub use claims::Claims;
+pub use jwt::validate_token;
 
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -96,10 +96,7 @@ pub enum JwtError {
 }
 
 /// Extract and validate JWT from Authorization header.
-pub fn authenticate(
-    auth_header: Option<&str>,
-    config: &JwtConfig,
-) -> Result<AuthResult, JwtError> {
+pub fn authenticate(auth_header: Option<&str>, config: &JwtConfig) -> Result<AuthResult, JwtError> {
     // If no auth header, use anonymous role if configured
     let token = match auth_header {
         Some(header) => extract_bearer_token(header)?,
@@ -134,14 +131,8 @@ mod tests {
 
     #[test]
     fn test_extract_bearer_token() {
-        assert_eq!(
-            extract_bearer_token("Bearer abc123").unwrap(),
-            "abc123"
-        );
-        assert_eq!(
-            extract_bearer_token("bearer abc123").unwrap(),
-            "abc123"
-        );
+        assert_eq!(extract_bearer_token("Bearer abc123").unwrap(), "abc123");
+        assert_eq!(extract_bearer_token("bearer abc123").unwrap(), "abc123");
         assert!(extract_bearer_token("Basic abc123").is_err());
     }
 

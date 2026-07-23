@@ -2,12 +2,12 @@
 
 use crate::error::Result;
 use crate::plan::{
-    CallPlan, CallParams, CoercibleFilter, CoercibleLogicTree, CoercibleOrderTerm,
+    CallParams, CallPlan, CoercibleFilter, CoercibleLogicTree, CoercibleOrderTerm,
     CoercibleSelectField, MutatePlan, ReadPlan, ReadPlanTree,
 };
 use postrust_sql::{
-    escape_ident, from_qi, DeleteBuilder, InsertBuilder, OrderExpr, SelectBuilder,
-    SqlFragment, SqlParam, UpdateBuilder,
+    escape_ident, from_qi, DeleteBuilder, InsertBuilder, OrderExpr, SelectBuilder, SqlFragment,
+    SqlParam, UpdateBuilder,
 };
 
 /// Query builder for converting plans to SQL.
@@ -31,9 +31,9 @@ impl QueryBuilder {
                 alias,
             );
         } else {
-            builder = builder.from_table(
-                &postrust_sql::identifier::QualifiedIdentifier::new(&qi.schema, &qi.name),
-            );
+            builder = builder.from_table(&postrust_sql::identifier::QualifiedIdentifier::new(
+                &qi.schema, &qi.name,
+            ));
         }
 
         // SELECT columns
@@ -101,16 +101,18 @@ impl QueryBuilder {
     /// Build a logic tree.
     fn build_logic_tree(tree: &CoercibleLogicTree) -> Result<SqlFragment> {
         match tree {
-            CoercibleLogicTree::Expr { negated, op, children } => {
+            CoercibleLogicTree::Expr {
+                negated,
+                op,
+                children,
+            } => {
                 let sep = match op {
                     crate::api_request::LogicOperator::And => " AND ",
                     crate::api_request::LogicOperator::Or => " OR ",
                 };
 
-                let child_frags: Result<Vec<_>> = children
-                    .iter()
-                    .map(|c| Self::build_logic_tree(c))
-                    .collect();
+                let child_frags: Result<Vec<_>> =
+                    children.iter().map(Self::build_logic_tree).collect();
 
                 let mut combined = SqlFragment::join(sep, child_frags?).parens();
 
@@ -123,7 +125,10 @@ impl QueryBuilder {
                 Ok(combined)
             }
             CoercibleLogicTree::Stmt(filter) => Self::build_filter(filter),
-            CoercibleLogicTree::NullEmbed { negated, field_name } => {
+            CoercibleLogicTree::NullEmbed {
+                negated,
+                field_name,
+            } => {
                 let mut frag = SqlFragment::new();
                 frag.push(&escape_ident(field_name));
                 if *negated {
@@ -156,7 +161,11 @@ impl QueryBuilder {
                 frag.push(" ");
                 frag.push_param(value.clone());
             }
-            crate::api_request::Operation::Quant { op, quantifier, value } => {
+            crate::api_request::Operation::Quant {
+                op,
+                quantifier,
+                value,
+            } => {
                 frag.push(" ");
                 frag.push(op.to_sql());
                 frag.push(" ");
@@ -189,7 +198,11 @@ impl QueryBuilder {
                 frag.push(" IS DISTINCT FROM ");
                 frag.push_param(value.clone());
             }
-            crate::api_request::Operation::Fts { op, language, value } => {
+            crate::api_request::Operation::Fts {
+                op,
+                language,
+                value,
+            } => {
                 frag.push(" @@ ");
                 frag.push(op.to_function());
                 frag.push("(");
@@ -278,7 +291,8 @@ impl QueryBuilder {
                                     (c.name.clone(), frag)
                                 })
                                 .collect();
-                            builder = builder.on_conflict_do_update(conflict_cols.clone(), set_cols);
+                            builder =
+                                builder.on_conflict_do_update(conflict_cols.clone(), set_cols);
                         }
                     }
                 }

@@ -2,17 +2,15 @@
 //!
 //! Supports both JWT and API key authentication.
 
-use crate::error::ProxyError;
-use crate::saas::api_keys::{hash_api_key, ValidatedApiKey};
+use crate::saas::api_keys::hash_api_key;
 use crate::saas::db;
 use axum::{
-    body::Body,
     extract::{Request, State},
     http::{header, StatusCode},
     middleware::Next,
     response::{IntoResponse, Response},
 };
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 use sqlx::PgPool;
 use std::sync::Arc;
 use uuid::Uuid;
@@ -192,7 +190,7 @@ struct JwtClaims {
 }
 
 /// Decode and validate a JWT token.
-fn decode_jwt(token: &str, secret: &str) -> Result<JwtClaims, AuthError> {
+fn decode_jwt(token: &str, _secret: &str) -> Result<JwtClaims, AuthError> {
     // Split the JWT into parts
     let parts: Vec<&str> = token.split('.').collect();
     if parts.len() != 3 {
@@ -280,16 +278,25 @@ impl IntoResponse for AuthError {
                 StatusCode::UNAUTHORIZED,
                 "Invalid Authorization header format".to_string(),
             ),
-            AuthError::InvalidToken(msg) => (StatusCode::UNAUTHORIZED, format!("Invalid token: {}", msg)),
+            AuthError::InvalidToken(msg) => {
+                (StatusCode::UNAUTHORIZED, format!("Invalid token: {}", msg))
+            }
             AuthError::TokenExpired => (StatusCode::UNAUTHORIZED, "Token has expired".to_string()),
             AuthError::MissingClaim(claim) => (
                 StatusCode::UNAUTHORIZED,
                 format!("Missing required claim: {}", claim),
             ),
             AuthError::InvalidApiKey => (StatusCode::UNAUTHORIZED, "Invalid API key".to_string()),
-            AuthError::ApiKeyDisabled => (StatusCode::UNAUTHORIZED, "API key is disabled".to_string()),
-            AuthError::ApiKeyExpired => (StatusCode::UNAUTHORIZED, "API key has expired".to_string()),
-            AuthError::TenantSuspended => (StatusCode::FORBIDDEN, "Tenant account is suspended".to_string()),
+            AuthError::ApiKeyDisabled => {
+                (StatusCode::UNAUTHORIZED, "API key is disabled".to_string())
+            }
+            AuthError::ApiKeyExpired => {
+                (StatusCode::UNAUTHORIZED, "API key has expired".to_string())
+            }
+            AuthError::TenantSuspended => (
+                StatusCode::FORBIDDEN,
+                "Tenant account is suspended".to_string(),
+            ),
             AuthError::JwtNotConfigured => (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "JWT authentication not configured".to_string(),

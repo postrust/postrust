@@ -41,7 +41,11 @@ impl CallPlan {
         let params = extract_call_params(request, routine)?;
 
         let returns_scalar = !routine.return_type.is_set_returning()
-            && routine.return_type.type_name().map(|t| !t.contains("record")).unwrap_or(true);
+            && routine
+                .return_type
+                .type_name()
+                .map(|t| !t.contains("record"))
+                .unwrap_or(true);
 
         Ok(Self {
             function: qi,
@@ -65,8 +69,8 @@ fn extract_call_params(request: &ApiRequest, _routine: &Routine) -> Result<CallP
         match payload {
             Payload::ProcessedJson { raw, .. } => {
                 // Check if it's an object or array
-                let value: serde_json::Value = serde_json::from_slice(raw)
-                    .map_err(|e| Error::InvalidBody(e.to_string()))?;
+                let value: serde_json::Value =
+                    serde_json::from_slice(raw).map_err(|e| Error::InvalidBody(e.to_string()))?;
 
                 match value {
                     serde_json::Value::Object(map) => {

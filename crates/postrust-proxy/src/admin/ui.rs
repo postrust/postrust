@@ -1,12 +1,7 @@
 //! HTML admin UI for proxy management.
 
 use crate::ProxyState;
-use axum::{
-    extract::State,
-    response::Html,
-    routing::get,
-    Router,
-};
+use axum::{extract::State, response::Html, routing::get, Router};
 use std::sync::Arc;
 
 /// Create the admin UI router.
@@ -19,14 +14,13 @@ pub fn admin_ui_router() -> Router<Arc<ProxyState>> {
         .route("/certificates", get(certificates_page))
 }
 
-async fn proxy_dashboard(
-    State(state): State<Arc<ProxyState>>,
-) -> Html<String> {
+async fn proxy_dashboard(State(state): State<Arc<ProxyState>>) -> Html<String> {
     let config = state.config.read().await;
 
     let backends_count: usize = config.upstreams.iter().map(|u| u.backends.len()).sum();
 
-    let html = format!(r#"<!DOCTYPE html>
+    let html = format!(
+        r#"<!DOCTYPE html>
 <html>
 <head>
     <title>Proxy Dashboard - Postrust</title>
@@ -79,29 +73,32 @@ async fn proxy_dashboard(
     Html(html)
 }
 
-async fn routes_page(
-    State(state): State<Arc<ProxyState>>,
-) -> Html<String> {
+async fn routes_page(State(state): State<Arc<ProxyState>>) -> Html<String> {
     let config = state.config.read().await;
 
-    let routes_html: String = config.routes.iter()
-        .map(|r| format!(
-            r#"<tr>
+    let routes_html: String = config
+        .routes
+        .iter()
+        .map(|r| {
+            format!(
+                r#"<tr>
                 <td>{}</td>
                 <td>{}</td>
                 <td>{}</td>
                 <td>{}</td>
                 <td>{}</td>
             </tr>"#,
-            r.id.map(|id| id.to_string()).unwrap_or_default(),
-            r.name,
-            r.match_.host.as_deref().unwrap_or("*"),
-            r.match_.path.as_deref().unwrap_or("/"),
-            r.priority,
-        ))
+                r.id.map(|id| id.to_string()).unwrap_or_default(),
+                r.name,
+                r.match_.host.as_deref().unwrap_or("*"),
+                r.match_.path.as_deref().unwrap_or("/"),
+                r.priority,
+            )
+        })
         .collect();
 
-    let html = format!(r#"<!DOCTYPE html>
+    let html = format!(
+        r#"<!DOCTYPE html>
 <html>
 <head>
     <title>Routes - Postrust Proxy</title>
@@ -141,32 +138,37 @@ async fn routes_page(
         </table>
     </div>
 </body>
-</html>"#, routes_html);
+</html>"#,
+        routes_html
+    );
 
     Html(html)
 }
 
-async fn upstreams_page(
-    State(state): State<Arc<ProxyState>>,
-) -> Html<String> {
+async fn upstreams_page(State(state): State<Arc<ProxyState>>) -> Html<String> {
     let config = state.config.read().await;
 
-    let upstreams_html: String = config.upstreams.iter()
-        .map(|u| format!(
-            r#"<tr>
+    let upstreams_html: String = config
+        .upstreams
+        .iter()
+        .map(|u| {
+            format!(
+                r#"<tr>
                 <td>{}</td>
                 <td>{}</td>
                 <td>{:?}</td>
                 <td>{}</td>
             </tr>"#,
-            u.id.map(|id| id.to_string()).unwrap_or_default(),
-            u.name,
-            u.lb_strategy,
-            u.backends.len(),
-        ))
+                u.id.map(|id| id.to_string()).unwrap_or_default(),
+                u.name,
+                u.lb_strategy,
+                u.backends.len(),
+            )
+        })
         .collect();
 
-    let html = format!(r#"<!DOCTYPE html>
+    let html = format!(
+        r#"<!DOCTYPE html>
 <html>
 <head>
     <title>Upstreams - Postrust Proxy</title>
@@ -205,14 +207,14 @@ async fn upstreams_page(
         </table>
     </div>
 </body>
-</html>"#, upstreams_html);
+</html>"#,
+        upstreams_html
+    );
 
     Html(html)
 }
 
-async fn health_page(
-    State(state): State<Arc<ProxyState>>,
-) -> Html<String> {
+async fn health_page(State(state): State<Arc<ProxyState>>) -> Html<String> {
     let config = state.config.read().await;
 
     let mut health_html = String::new();
@@ -235,16 +237,13 @@ async fn health_page(
                     <td>{}</td>
                     <td class="{}">{}</td>
                 </tr>"#,
-                upstream.name,
-                backend.address,
-                backend.scheme,
-                status_class,
-                status,
+                upstream.name, backend.address, backend.scheme, status_class, status,
             ));
         }
     }
 
-    let html = format!(r#"<!DOCTYPE html>
+    let html = format!(
+        r#"<!DOCTYPE html>
 <html>
 <head>
     <title>Health Status - Postrust Proxy</title>
@@ -286,14 +285,14 @@ async fn health_page(
         </table>
     </div>
 </body>
-</html>"#, health_html);
+</html>"#,
+        health_html
+    );
 
     Html(html)
 }
 
-async fn certificates_page(
-    State(_state): State<Arc<ProxyState>>,
-) -> Html<String> {
+async fn certificates_page(State(_state): State<Arc<ProxyState>>) -> Html<String> {
     // TODO: Integrate with CertificateStore
     let html = r#"<!DOCTYPE html>
 <html>

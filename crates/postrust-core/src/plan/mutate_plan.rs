@@ -1,9 +1,7 @@
 //! Mutation (INSERT/UPDATE/DELETE) query planning.
 
 use super::types::*;
-use crate::api_request::{
-    ApiRequest, Mutation, Payload, PreferResolution, QualifiedIdentifier,
-};
+use crate::api_request::{ApiRequest, Mutation, Payload, PreferResolution, QualifiedIdentifier};
 use crate::error::{Error, Result};
 use crate::schema_cache::Table;
 use serde::{Deserialize, Serialize};
@@ -58,11 +56,7 @@ pub enum MutatePlan {
 
 impl MutatePlan {
     /// Create a mutation plan from an API request.
-    pub fn from_request(
-        request: &ApiRequest,
-        table: &Table,
-        mutation: &Mutation,
-    ) -> Result<Self> {
+    pub fn from_request(request: &ApiRequest, table: &Table, mutation: &Mutation) -> Result<Self> {
         let qi = table.qualified_identifier();
 
         match mutation {
@@ -74,15 +68,12 @@ impl MutatePlan {
     }
 
     /// Create an INSERT plan.
-    fn create_insert(
-        request: &ApiRequest,
-        table: &Table,
-        qi: QualifiedIdentifier,
-    ) -> Result<Self> {
+    fn create_insert(request: &ApiRequest, table: &Table, qi: QualifiedIdentifier) -> Result<Self> {
         let columns = get_payload_columns(request, table)?;
         let body = get_body_bytes(request)?;
         let returning = get_returning_columns(request, table);
-        let apply_defaults = request.preferences.missing == crate::api_request::PreferMissing::ApplyDefaults;
+        let apply_defaults =
+            request.preferences.missing == crate::api_request::PreferMissing::ApplyDefaults;
 
         let on_conflict = request.query_params.on_conflict.as_ref().map(|cols| {
             let resolution = request
@@ -106,16 +97,13 @@ impl MutatePlan {
     }
 
     /// Create an UPDATE plan.
-    fn create_update(
-        request: &ApiRequest,
-        table: &Table,
-        qi: QualifiedIdentifier,
-    ) -> Result<Self> {
+    fn create_update(request: &ApiRequest, table: &Table, qi: QualifiedIdentifier) -> Result<Self> {
         let columns = get_payload_columns(request, table)?;
         let body = get_body_bytes(request)?;
         let where_clauses = build_mutation_where(request, table)?;
         let returning = get_returning_columns(request, table);
-        let apply_defaults = request.preferences.missing == crate::api_request::PreferMissing::ApplyDefaults;
+        let apply_defaults =
+            request.preferences.missing == crate::api_request::PreferMissing::ApplyDefaults;
 
         Ok(Self::Update {
             target: qi,
@@ -128,11 +116,7 @@ impl MutatePlan {
     }
 
     /// Create a DELETE plan.
-    fn create_delete(
-        request: &ApiRequest,
-        table: &Table,
-        qi: QualifiedIdentifier,
-    ) -> Result<Self> {
+    fn create_delete(request: &ApiRequest, table: &Table, qi: QualifiedIdentifier) -> Result<Self> {
         let where_clauses = build_mutation_where(request, table)?;
         let returning = get_returning_columns(request, table);
 
@@ -144,20 +128,13 @@ impl MutatePlan {
     }
 
     /// Create a PUT (upsert) plan.
-    fn create_upsert(
-        request: &ApiRequest,
-        table: &Table,
-        qi: QualifiedIdentifier,
-    ) -> Result<Self> {
+    fn create_upsert(request: &ApiRequest, table: &Table, qi: QualifiedIdentifier) -> Result<Self> {
         let columns = get_payload_columns(request, table)?;
         let body = get_body_bytes(request)?;
         let returning = get_returning_columns(request, table);
 
         // Upsert uses PK for conflict
-        let on_conflict = Some((
-            PreferResolution::MergeDuplicates,
-            table.pk_cols.clone(),
-        ));
+        let on_conflict = Some((PreferResolution::MergeDuplicates, table.pk_cols.clone()));
 
         Ok(Self::Insert {
             target: qi,
@@ -191,10 +168,7 @@ impl MutatePlan {
 }
 
 /// Get columns from payload.
-fn get_payload_columns(
-    request: &ApiRequest,
-    table: &Table,
-) -> Result<Vec<CoercibleField>> {
+fn get_payload_columns(request: &ApiRequest, table: &Table) -> Result<Vec<CoercibleField>> {
     let keys = match &request.payload {
         Some(Payload::ProcessedJson { keys, .. }) => keys,
         Some(Payload::ProcessedUrlEncoded { keys, .. }) => keys,
@@ -223,8 +197,12 @@ fn get_body_bytes(request: &ApiRequest) -> Result<Option<bytes::Bytes>> {
         Some(Payload::ProcessedUrlEncoded { data, .. }) => {
             // Convert to JSON
             let json = serde_json::to_vec(
-                &data.iter().cloned().collect::<std::collections::HashMap<_, _>>()
-            ).map_err(|e| Error::InvalidBody(e.to_string()))?;
+                &data
+                    .iter()
+                    .cloned()
+                    .collect::<std::collections::HashMap<_, _>>(),
+            )
+            .map_err(|e| Error::InvalidBody(e.to_string()))?;
             Ok(Some(bytes::Bytes::from(json)))
         }
         None => Ok(None),
@@ -242,10 +220,7 @@ fn get_returning_columns(request: &ApiRequest, table: &Table) -> Vec<String> {
 }
 
 /// Build WHERE clauses for mutations.
-fn build_mutation_where(
-    request: &ApiRequest,
-    table: &Table,
-) -> Result<Vec<CoercibleLogicTree>> {
+fn build_mutation_where(request: &ApiRequest, table: &Table) -> Result<Vec<CoercibleLogicTree>> {
     let type_resolver = |name: &str| -> String {
         table
             .get_column(name)

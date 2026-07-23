@@ -17,8 +17,8 @@ mod hyper_ext;
 mod proxy;
 mod types;
 
-pub use backend::{BackendAppManager, LoadBalance, LoadBalanceRoundRobin, LoadBalanceRandom};
+pub use backend::{BackendAppManager, LoadBalance, LoadBalanceRandom, LoadBalanceRoundRobin};
 pub use forwarder::ForwarderClient;
 pub use handler::MessageHandler;
 pub use proxy::ProxyService;
-pub use types::{ProxyError as VendoredError, ServerName, PathName};
+pub use types::{PathName, ProxyError as VendoredError, ServerName};

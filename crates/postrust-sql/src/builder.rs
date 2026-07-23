@@ -244,11 +244,14 @@ mod tests {
             SqlFragment::raw("c = $1").push_param(3i64).clone(),
         ];
 
-        let joined = SqlFragment::join(" AND ", frags.into_iter().map(|mut f| {
-            f.params.clear();
-            f.push_param(1i64);
-            f
-        }));
+        let _joined = SqlFragment::join(
+            " AND ",
+            frags.into_iter().map(|mut f| {
+                f.params.clear();
+                f.push_param(1i64);
+                f
+            }),
+        );
 
         // Note: This test shows the renumbering behavior
     }

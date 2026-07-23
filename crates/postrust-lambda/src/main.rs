@@ -109,11 +109,8 @@ async fn process_lambda_request(
         .map_err(|e: http::Error| postrust_core::Error::Internal(e.to_string()))?;
 
     // Parse API request
-    let mut api_request = postrust_core::parse_request(
-        &http_request,
-        config.default_schema(),
-        &config.db_schemas,
-    )?;
+    let mut api_request =
+        postrust_core::parse_request(&http_request, config.default_schema(), &config.db_schemas)?;
 
     // Parse payload
     if !body_bytes.is_empty() {

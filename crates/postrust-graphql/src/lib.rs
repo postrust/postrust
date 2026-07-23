@@ -3,13 +3,13 @@
 //! This crate provides GraphQL API generation from PostgreSQL schema,
 //! including queries, mutations, and subscriptions.
 
-pub mod types;
-pub mod scalar;
 pub mod error;
+pub mod scalar;
+pub mod types;
 
-pub mod schema;
 pub mod input;
 pub mod resolver;
+pub mod schema;
 pub mod subscription;
 
 pub mod context;

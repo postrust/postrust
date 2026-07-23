@@ -3,14 +3,14 @@
 //! This module provides functionality to discover and cache database schema
 //! metadata including tables, columns, relationships, and functions.
 
-mod table;
+mod queries;
 mod relationship;
 mod routine;
-mod queries;
+mod table;
 
-pub use table::{Table, Column, ColumnMap, TablesMap};
-pub use relationship::{Relationship, Cardinality, Junction, RelationshipsMap};
-pub use routine::{Routine, RoutineParam, RetType, FuncVolatility, RoutineMap};
+pub use relationship::{Cardinality, Junction, Relationship, RelationshipsMap};
+pub use routine::{FuncVolatility, RetType, Routine, RoutineMap, RoutineParam};
+pub use table::{Column, ColumnMap, Table, TablesMap};
 
 use crate::api_request::QualifiedIdentifier;
 use crate::error::{Error, Result};
@@ -80,7 +80,11 @@ impl SchemaCache {
     }
 
     /// Get relationships for a table.
-    pub fn get_relationships(&self, qi: &QualifiedIdentifier, schema: &str) -> Option<&Vec<Relationship>> {
+    pub fn get_relationships(
+        &self,
+        qi: &QualifiedIdentifier,
+        schema: &str,
+    ) -> Option<&Vec<Relationship>> {
         self.relationships.get(&(qi.clone(), schema.to_string()))
     }
 
@@ -115,12 +119,8 @@ impl SchemaCache {
         self.get_relationships(from, schema)?
             .iter()
             .find(|r| match r {
-                Relationship::ForeignKey { foreign_table, .. } => {
-                    foreign_table.name == to_name
-                }
-                Relationship::Computed { foreign_table, .. } => {
-                    foreign_table.name == to_name
-                }
+                Relationship::ForeignKey { foreign_table, .. } => foreign_table.name == to_name,
+                Relationship::Computed { foreign_table, .. } => foreign_table.name == to_name,
             })
     }
 }

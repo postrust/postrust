@@ -9,7 +9,7 @@ use std::path::Path;
 use std::sync::Arc;
 use tokio_rustls::rustls::ServerConfig;
 use tokio_util::sync::CancellationToken;
-use tracing::{error, info, warn};
+use tracing::{error, info};
 
 /// ACME certificate manager.
 pub struct AcmeManager {
@@ -112,10 +112,7 @@ impl AcmeManager {
     }
 
     /// Start background certificate renewal task.
-    pub async fn start_renewal_task(
-        self: Arc<Self>,
-        cancel_token: CancellationToken,
-    ) {
+    pub async fn start_renewal_task(self: Arc<Self>, cancel_token: CancellationToken) {
         let check_interval = std::time::Duration::from_secs(86400); // Daily
 
         info!("ACME certificate renewal task started");
@@ -145,7 +142,10 @@ impl AcmeManager {
             if let Some(cert) = self.cert_store.get(&domain).await {
                 if let Some(expires_at) = cert.expires_at {
                     if expires_at < now + renewal_threshold {
-                        info!("Certificate for {} needs renewal (expires {})", domain, expires_at);
+                        info!(
+                            "Certificate for {} needs renewal (expires {})",
+                            domain, expires_at
+                        );
                         // Note: With rustls-acme, renewal happens automatically via the resolver
                         // This is just for monitoring/alerting purposes
                     }

@@ -73,7 +73,6 @@ pub enum ProxyError {
     Internal(String),
 
     // SaaS Domain Management Errors
-
     /// Domain verification error
     #[error("Domain verification error: {0}")]
     Verification(String),

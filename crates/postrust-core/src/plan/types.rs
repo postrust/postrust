@@ -4,8 +4,8 @@
 //! proper SQL generation with type coercion.
 
 use crate::api_request::{
-    AggregateFunction, Field, Filter, JoinType, JsonPath, LogicOperator,
-    LogicTree, OpExpr, OrderDirection, OrderNulls, OrderTerm, QualifiedIdentifier,
+    AggregateFunction, Field, Filter, JoinType, JsonPath, LogicOperator, LogicTree, OpExpr,
+    OrderDirection, OrderNulls, OrderTerm, QualifiedIdentifier,
 };
 use serde::{Deserialize, Serialize};
 
@@ -135,10 +135,7 @@ pub enum CoercibleLogicTree {
     /// Leaf filter
     Stmt(CoercibleFilter),
     /// NULL check for embedding
-    NullEmbed {
-        negated: bool,
-        field_name: String,
-    },
+    NullEmbed { negated: bool, field_name: String },
 }
 
 impl CoercibleLogicTree {
@@ -148,7 +145,11 @@ impl CoercibleLogicTree {
         F: Fn(&str) -> String + Copy,
     {
         match tree {
-            LogicTree::Expr { negated, op, children } => Self::Expr {
+            LogicTree::Expr {
+                negated,
+                op,
+                children,
+            } => Self::Expr {
                 negated: *negated,
                 op: op.clone(),
                 children: children
@@ -181,13 +182,22 @@ impl CoercibleOrderTerm {
     /// Create from an order term with type info.
     pub fn from_order_term(term: &OrderTerm, pg_type: &str) -> Self {
         match term {
-            OrderTerm::Field { field, direction, nulls } => Self {
+            OrderTerm::Field {
+                field,
+                direction,
+                nulls,
+            } => Self {
                 field: CoercibleField::from_field(field, pg_type),
                 direction: direction.clone(),
                 nulls: nulls.clone(),
                 relation: None,
             },
-            OrderTerm::Relation { relation, field, direction, nulls } => Self {
+            OrderTerm::Relation {
+                relation,
+                field,
+                direction,
+                nulls,
+            } => Self {
                 field: CoercibleField::from_field(field, pg_type),
                 direction: direction.clone(),
                 nulls: nulls.clone(),

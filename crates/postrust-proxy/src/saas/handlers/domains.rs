@@ -13,10 +13,7 @@ use axum::{
 use uuid::Uuid;
 
 /// List all domains for the authenticated tenant.
-pub async fn list_domains(
-    State(state): State<SaasState>,
-    Auth(auth): Auth,
-) -> impl IntoResponse {
+pub async fn list_domains(State(state): State<SaasState>, Auth(auth): Auth) -> impl IntoResponse {
     match state.domain_manager.list_domains(auth.tenant_id).await {
         Ok(domains) => Json(ApiResponse::success(domains)).into_response(),
         Err(e) => error_response(e).into_response(),
@@ -37,8 +34,16 @@ pub async fn create_domain(
             .into_response();
     }
 
-    match state.domain_manager.create_domain(auth.tenant_id, req).await {
-        Ok(domain_response) => (StatusCode::CREATED, Json(ApiResponse::success(domain_response))).into_response(),
+    match state
+        .domain_manager
+        .create_domain(auth.tenant_id, req)
+        .await
+    {
+        Ok(domain_response) => (
+            StatusCode::CREATED,
+            Json(ApiResponse::success(domain_response)),
+        )
+            .into_response(),
         Err(e) => error_response(e).into_response(),
     }
 }
@@ -123,7 +128,9 @@ pub async fn enable_domain(
         Ok(true) => Json(ApiResponse::success(())).into_response(),
         Ok(false) => (
             StatusCode::BAD_REQUEST,
-            Json(ApiResponse::<()>::error("Could not enable domain. Is it verified?")),
+            Json(ApiResponse::<()>::error(
+                "Could not enable domain. Is it verified?",
+            )),
         )
             .into_response(),
         Err(e) => error_response(e).into_response(),
@@ -144,7 +151,11 @@ pub async fn disable_domain(
             .into_response();
     }
 
-    match state.domain_manager.disable_domain(id, auth.tenant_id).await {
+    match state
+        .domain_manager
+        .disable_domain(id, auth.tenant_id)
+        .await
+    {
         Ok(true) => Json(ApiResponse::success(())).into_response(),
         Ok(false) => (
             StatusCode::NOT_FOUND,

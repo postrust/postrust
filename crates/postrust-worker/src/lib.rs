@@ -39,10 +39,7 @@ async fn main(req: Request, env: Env, _ctx: Context) -> Result<Response> {
 ///
 /// This is a placeholder for the full implementation.
 #[allow(dead_code)]
-async fn process_request(
-    _req: Request,
-    _env: &Env,
-) -> Result<Response> {
+async fn process_request(_req: Request, _env: &Env) -> Result<Response> {
     // In a full implementation:
     // 1. Get Hyperdrive binding: env.hyperdrive("DB")?
     // 2. Parse request using postrust-core

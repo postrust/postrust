@@ -7,9 +7,10 @@ use std::collections::HashMap;
 
 /// Validate a JWT token and extract claims.
 pub fn validate_token(token: &str, config: &JwtConfig) -> Result<AuthResult, JwtError> {
-    let secret = config.secret.as_ref().ok_or_else(|| {
-        JwtError::InvalidToken("No JWT secret configured".into())
-    })?;
+    let secret = config
+        .secret
+        .as_ref()
+        .ok_or_else(|| JwtError::InvalidToken("No JWT secret configured".into()))?;
 
     // Decode secret
     let key_bytes = if config.secret_is_base64 {
@@ -32,8 +33,7 @@ pub fn validate_token(token: &str, config: &JwtConfig) -> Result<AuthResult, Jwt
     }
 
     // Decode and validate
-    let token_data = decode::<Claims>(token, &key, &validation)
-        .map_err(|e| map_jwt_error(e))?;
+    let token_data = decode::<Claims>(token, &key, &validation).map_err(map_jwt_error)?;
 
     let claims = token_data.claims;
 

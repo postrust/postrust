@@ -1,8 +1,8 @@
 //! SQL queries for schema introspection.
 
-use super::table::{Column, ColumnMap, Table, TablesMap};
 use super::relationship::{Cardinality, Relationship, RelationshipsMap};
 use super::routine::{FuncVolatility, RetType, Routine, RoutineMap};
+use super::table::{Column, ColumnMap, Table, TablesMap};
 use crate::api_request::QualifiedIdentifier;
 use crate::error::{Error, Result};
 use indexmap::IndexMap;
@@ -222,10 +222,8 @@ pub async fn load_relationships(pool: &PgPool, schemas: &[String]) -> Result<Rel
         let table_qi = QualifiedIdentifier::new(&table_schema, &table_name);
         let foreign_qi = QualifiedIdentifier::new(&foreign_schema, &foreign_name);
 
-        let column_pairs: Vec<(String, String)> = columns
-            .into_iter()
-            .zip(foreign_columns.into_iter())
-            .collect();
+        let column_pairs: Vec<(String, String)> =
+            columns.into_iter().zip(foreign_columns).collect();
 
         let is_self = table_qi == foreign_qi;
 

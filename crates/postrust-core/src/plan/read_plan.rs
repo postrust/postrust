@@ -1,9 +1,7 @@
 //! Read (SELECT) query planning.
 
 use super::types::*;
-use crate::api_request::{
-    ApiRequest, JoinType, QualifiedIdentifier, Range, SelectItem,
-};
+use crate::api_request::{ApiRequest, JoinType, QualifiedIdentifier, Range, SelectItem};
 use crate::error::{Error, Result};
 use crate::schema_cache::{Relationship, SchemaCache, Table};
 use serde::{Deserialize, Serialize};
@@ -103,10 +101,7 @@ impl ReadPlan {
 }
 
 /// Build select fields from select items.
-fn build_select_fields(
-    items: &[SelectItem],
-    table: &Table,
-) -> Result<Vec<CoercibleSelectField>> {
+fn build_select_fields(items: &[SelectItem], table: &Table) -> Result<Vec<CoercibleSelectField>> {
     if items.is_empty() {
         // Default: select all columns
         return Ok(table
@@ -148,10 +143,7 @@ fn build_select_fields(
 }
 
 /// Build where clauses from request filters.
-fn build_where_clauses(
-    request: &ApiRequest,
-    table: &Table,
-) -> Result<Vec<CoercibleLogicTree>> {
+fn build_where_clauses(request: &ApiRequest, table: &Table) -> Result<Vec<CoercibleLogicTree>> {
     let type_resolver = |name: &str| -> String {
         table
             .get_column(name)
@@ -180,10 +172,7 @@ fn build_where_clauses(
 }
 
 /// Build order terms from request.
-fn build_order_terms(
-    request: &ApiRequest,
-    table: &Table,
-) -> Result<Vec<CoercibleOrderTerm>> {
+fn build_order_terms(request: &ApiRequest, table: &Table) -> Result<Vec<CoercibleOrderTerm>> {
     let mut terms = Vec::new();
 
     for (path, order_terms) in &request.query_params.order {
@@ -230,7 +219,9 @@ fn build_relation_selects(
 
                 rel_selects.push(RelSelectField {
                     name: relation.clone(),
-                    agg_alias: alias.clone().unwrap_or_else(|| format!("pgrst_{}", relation)),
+                    agg_alias: alias
+                        .clone()
+                        .unwrap_or_else(|| format!("pgrst_{}", relation)),
                     join_type: join_type.clone().unwrap_or_default(),
                     is_spread: false,
                 });

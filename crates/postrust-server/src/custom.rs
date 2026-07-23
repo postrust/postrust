@@ -7,7 +7,7 @@ use axum::{
     extract::State,
     http::StatusCode,
     response::{IntoResponse, Json},
-    routing::{get, post},
+    routing::get,
     Router,
 };
 use serde::{Deserialize, Serialize};
@@ -20,9 +20,9 @@ pub fn custom_router() -> Router<Arc<AppState>> {
     Router::new()
         .route("/health", get(health_check))
         .route("/ready", get(readiness_check))
-        // Add your custom routes here:
-        // .route("/webhooks/stripe", post(handle_stripe_webhook))
-        // .route("/email/send", post(send_email))
+    // Add your custom routes here:
+    // .route("/webhooks/stripe", post(handle_stripe_webhook))
+    // .route("/email/send", post(send_email))
 }
 
 // =============================================================================
@@ -99,7 +99,10 @@ async fn handle_webhook(
 
     // Your custom logic here...
 
-    (StatusCode::OK, Json(serde_json::json!({ "received": true })))
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({ "received": true })),
+    )
 }
 
 // =============================================================================
