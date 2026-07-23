@@ -22,7 +22,7 @@ Postrust is a high-performance, serverless-first REST API server for PostgreSQL 
 
 - **Serverless-first**: Native support for AWS Lambda and Cloudflare Workers
 - **Fast**: Written in Rust for maximum performance and minimal cold starts
-- **Compatible**: Drop-in replacement for PostgREST in most use cases
+- **Compatible**: Familiar PostgREST-style API; near drop-in with an opt-in [compatibility mode](#postgrest-compatibility) (see [Differences from PostgREST](#differences-from-postgrest))
 - **Type-safe**: Parameterized queries prevent SQL injection by design
 - **Lightweight**: Single binary with no runtime dependencies
 
@@ -39,10 +39,10 @@ Postrust is a high-performance, serverless-first REST API server for PostgreSQL 
 | **Pagination** | ✅ | `limit`, `offset`, Range headers |
 | **Column Selection** | ✅ | `select=col1,col2,relation(nested)` |
 | **Resource Embedding** | ✅ | Nested resources via foreign keys |
-| **RPC Functions** | ✅ | Call stored procedures via `/rpc/function_name` |
+| **RPC Functions** | ✅ | Call stored procedures via `/api/rpc/function_name` (`/rpc/...` in [compatibility mode](#postgrest-compatibility)) |
 | **JWT Authentication** | ✅ | Role-based access with PostgreSQL RLS |
 | **Content Negotiation** | ✅ | JSON, CSV, GeoJSON responses |
-| **GraphQL API** | ✅ | Full GraphQL support via `/graphql` endpoint |
+| **GraphQL API** | ✅ | Full GraphQL support via `/api/graphql` endpoint |
 
 ### Deployment Targets
 
@@ -108,11 +108,19 @@ PGRST_JWT_SECRET_IS_BASE64=false     # Set true if secret is base64 encoded
 PGRST_SERVER_PORT=3000               # Server port (default: 3000)
 PGRST_SERVER_HOST=0.0.0.0            # Server host (default: 127.0.0.1)
 PGRST_LOG_LEVEL=info                 # Log level: error, warn, info, debug
+PGRST_COMPAT_MODE=false              # PostgREST compatibility mode (default: false)
 ```
 
 ## Documentation
 
 ### API Examples
+
+> **Note on paths.** By default the REST API is served under `/api` (e.g.
+> `GET /api/users`, `POST /api/rpc/my_func`) and GraphQL under `/api/graphql`,
+> alongside the admin UI at `/admin`. The examples below use root-level paths
+> (`/users`, `/rpc/my_func`) — these work as-is when
+> [compatibility mode](#postgrest-compatibility) is enabled; otherwise prefix
+> them with `/api`. See [Differences from PostgREST](#differences-from-postgrest).
 
 #### Basic CRUD
 
@@ -510,6 +518,49 @@ postrust/
 | OpenAPI | ✅ (admin-ui feature) | ✅ |
 | GraphQL | ✅ | ❌ |
 | Admin UI | ✅ (Swagger, Scalar) | ❌ |
+
+## Differences from PostgREST
+
+Postrust aims to be familiar to PostgREST users, but a few things differ by
+default. Most are addressed by [compatibility mode](#postgrest-compatibility);
+the rest are documented here so you don't assume bit-for-bit compatibility.
+
+| Area | PostgREST | Postrust (default) | Compatibility mode |
+|------|-----------|--------------------|--------------------|
+| REST base path | `/` (e.g. `POST /rpc/foo`) | Nested under `/api` (e.g. `POST /api/rpc/foo`) — leaves room for `/api/graphql`, `/admin` on the same server | Also served at `/` |
+| RPC response shape | Bare result: `{...}` for a single/scalar return, a top-level array for set-returning functions | Array-wrapped, function-name-keyed: `[{"foo": {...}}]` | Un-wrapped to match PostgREST |
+| Config source | Config file **and** env vars | Environment variables only | — |
+| Root endpoint `/` | OpenAPI spec | Small JSON server-info document | Unchanged |
+
+Other known gaps (contributions welcome): the OpenAPI spec lives under
+`/admin` (behind the `admin-ui` feature) rather than at `/`, and not every
+PostgREST config knob is implemented yet.
+
+### PostgREST compatibility
+
+Set `PGRST_COMPAT_MODE=true` (alias: `POSTRUST_COMPAT_MODE=true`) to make the
+API behave more like PostgREST:
+
+- **Canonical paths at the root.** The full REST surface is also served at `/`,
+  so `POST /rpc/<name>`, `GET /<table>`, etc. work in addition to the
+  `/api`-prefixed paths. Explicit routes (`/`, `/_`, `/admin`, `/api`) still take
+  precedence.
+- **PostgREST-shaped RPC responses.** Results from `POST /rpc/<name>` are
+  un-wrapped: a non-set-returning function returns its bare object/scalar
+  (`{...}` / `42`) and a set-returning function returns a top-level array
+  (`[{...}, {...}]`), instead of the default `[{"<name>": ...}]` shape.
+
+```bash
+# Default mode
+curl -X POST http://localhost:3000/api/rpc/get_statistics
+# -> [{"get_statistics": {"users": 10}}]
+
+# Compatibility mode (PGRST_COMPAT_MODE=true)
+curl -X POST http://localhost:3000/rpc/get_statistics
+# -> {"users": 10}
+```
+
+This is opt-in so existing Postrust deployments keep their current behavior.
 
 ## Roadmap
 

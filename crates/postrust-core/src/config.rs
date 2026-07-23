@@ -125,6 +125,20 @@ pub struct AppConfig {
     /// App-level settings to expose via GUC
     #[serde(default)]
     pub app_settings: HashMap<String, String>,
+
+    // ========================================================================
+    // Compatibility Settings
+    // ========================================================================
+    /// PostgREST compatibility mode.
+    ///
+    /// When enabled, the REST surface is also served at the root (so canonical
+    /// PostgREST paths like `/rpc/<name>` and `/<table>` work in addition to
+    /// the `/api`-prefixed paths), and RPC responses are un-wrapped to match
+    /// PostgREST's shape (bare object/scalar for non-set-returning functions,
+    /// a top-level array for set-returning ones) instead of the array-wrapped,
+    /// function-name-keyed default.
+    #[serde(default)]
+    pub compat_mode: bool,
 }
 
 impl Default for AppConfig {
@@ -157,6 +171,7 @@ impl Default for AppConfig {
             log_level: LogLevel::Error,
             role_settings: HashMap::new(),
             app_settings: HashMap::new(),
+            compat_mode: false,
         }
     }
 }
@@ -202,13 +217,26 @@ impl AppConfig {
                 config.server_port = p;
             }
         }
+        // Accept either the PGRST_-prefixed name (for parity with other options)
+        // or a POSTRUST_-prefixed alias.
+        for var in ["PGRST_COMPAT_MODE", "POSTRUST_COMPAT_MODE"] {
+            if let Ok(v) = std::env::var(var) {
+                config.compat_mode = matches!(
+                    v.trim().to_ascii_lowercase().as_str(),
+                    "true" | "1" | "yes" | "on"
+                );
+            }
+        }
 
         config
     }
 
     /// Get the default schema (first in the list).
     pub fn default_schema(&self) -> &str {
-        self.db_schemas.first().map(|s| s.as_str()).unwrap_or("public")
+        self.db_schemas
+            .first()
+            .map(|s| s.as_str())
+            .unwrap_or("public")
     }
 }
 
