@@ -93,7 +93,9 @@ impl GeneratedSchema {
 
     /// Get query fields for a table.
     pub fn get_query_field(&self, table_name: &str) -> Option<&QueryField> {
-        self.query_fields.iter().find(|f| f.table_name == table_name)
+        self.query_fields
+            .iter()
+            .find(|f| f.table_name == table_name)
     }
 
     /// Get mutation fields for a table.
@@ -111,7 +113,10 @@ impl GeneratedSchema {
 
     /// Get all table names.
     pub fn table_names(&self) -> Vec<&str> {
-        self.object_types.values().map(|t| t.table.name.as_str()).collect()
+        self.object_types
+            .values()
+            .map(|t| t.table.name.as_str())
+            .collect()
     }
 
     /// Get all type names.
@@ -396,7 +401,7 @@ pub fn build_schema(schema_cache: &SchemaCache, config: &SchemaConfig) -> Genera
             .map(|relationships| {
                 relationships
                     .iter()
-                    .map(|r| RelationshipField::from_relationship(r))
+                    .map(RelationshipField::from_relationship)
                     .collect()
             })
             .unwrap_or_default();
@@ -418,14 +423,13 @@ pub fn build_schema(schema_cache: &SchemaCache, config: &SchemaConfig) -> Genera
 
 /// Simple singularization for field names.
 fn singularize(s: &str) -> String {
-    if s.ends_with("ies") {
-        format!("{}y", &s[..s.len() - 3])
-    } else if s.ends_with("es")
-        && (s.ends_with("ses") || s.ends_with("xes") || s.ends_with("ches") || s.ends_with("shes"))
+    if let Some(stem) = s.strip_suffix("ies") {
+        format!("{}y", stem)
+    } else if s.ends_with("ses") || s.ends_with("xes") || s.ends_with("ches") || s.ends_with("shes")
     {
-        s[..s.len() - 2].to_string()
+        s.strip_suffix("es").unwrap_or(s).to_string()
     } else if s.ends_with('s') && !s.ends_with("ss") {
-        s[..s.len() - 1].to_string()
+        s.strip_suffix('s').unwrap_or(s).to_string()
     } else {
         s.to_string()
     }
@@ -521,8 +525,8 @@ mod tests {
 
     #[test]
     fn test_schema_config_with_schemas() {
-        let config = SchemaConfig::new()
-            .with_schemas(vec!["api".to_string(), "public".to_string()]);
+        let config =
+            SchemaConfig::new().with_schemas(vec!["api".to_string(), "public".to_string()]);
         assert!(config.is_schema_exposed("api"));
         assert!(config.is_schema_exposed("public"));
         assert!(!config.is_schema_exposed("private"));
@@ -778,7 +782,9 @@ mod tests {
             pk_cols: vec!["id".into()],
             columns: indexmap::IndexMap::new(),
         };
-        cache.tables.insert(private_table.qualified_identifier(), private_table);
+        cache
+            .tables
+            .insert(private_table.qualified_identifier(), private_table);
 
         let config = SchemaConfig::default(); // Only exposes "public"
         let schema = build_schema(&cache, &config);

@@ -7,6 +7,11 @@
 //! - `/admin/scalar` - Scalar API documentation UI
 //! - `/admin/graphql` - GraphQL Playground
 
+// Many items here exist solely to feed the OpenAPI generator: `#[utoipa::path]`
+// handler stubs and `ToSchema` request-body structs whose fields are read by the
+// derive macro, not by Rust code. `dead_code` is therefore expected in this module.
+#![allow(dead_code)]
+
 use axum::{
     extract::State,
     response::{Html, IntoResponse},
@@ -602,10 +607,7 @@ mod tests {
         // Serialize to JSON and check tag names
         let json = serde_json::to_value(&spec).unwrap();
         let tags = json["tags"].as_array().unwrap();
-        let tag_names: Vec<&str> = tags
-            .iter()
-            .map(|t| t["name"].as_str().unwrap())
-            .collect();
+        let tag_names: Vec<&str> = tags.iter().map(|t| t["name"].as_str().unwrap()).collect();
         assert!(tag_names.contains(&"tables"));
         assert!(tag_names.contains(&"rpc"));
         assert!(tag_names.contains(&"graphql"));

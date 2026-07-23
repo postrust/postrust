@@ -28,6 +28,13 @@
 //! let (sql, params) = build_query(&plan)?;
 //! ```
 
+// The `Error` enum carries a rich `DatabaseError` payload (PostgREST-style error
+// bodies), which makes it larger than clippy's `Result`/enum size thresholds.
+// Boxing it would ripple through every construction site for little benefit, so
+// the size lints are allowed crate-wide instead.
+#![allow(clippy::result_large_err)]
+#![allow(clippy::large_enum_variant)]
+
 pub mod api_request;
 pub mod config;
 pub mod error;
@@ -37,9 +44,9 @@ pub mod schema_cache;
 
 // Re-export main types
 pub use api_request::{
-    parse_request, Action, ApiRequest, DbAction, Filter, LogicTree, MediaType,
-    Mutation, Operation, Payload, Preferences, PreferRepresentation, QualifiedIdentifier,
-    QueryParams, Range, Resource, SelectItem,
+    parse_request, Action, ApiRequest, DbAction, Filter, LogicTree, MediaType, Mutation, Operation,
+    Payload, PreferRepresentation, Preferences, QualifiedIdentifier, QueryParams, Range, Resource,
+    SelectItem,
 };
 pub use config::{AppConfig, IsolationLevel, LogLevel};
 pub use error::{Error, Result};
@@ -49,8 +56,8 @@ pub use schema_cache::{Column, Relationship, Routine, SchemaCache, SchemaCacheRe
 /// Prelude for common imports.
 pub mod prelude {
     pub use super::api_request::{
-        parse_request, Action, ApiRequest, Filter, MediaType, Preferences,
-        QualifiedIdentifier, QueryParams, Range, SelectItem,
+        parse_request, Action, ApiRequest, Filter, MediaType, Preferences, QualifiedIdentifier,
+        QueryParams, Range, SelectItem,
     };
     pub use super::config::AppConfig;
     pub use super::error::{Error, Result};

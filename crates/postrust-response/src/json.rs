@@ -10,22 +10,23 @@ pub fn format_json_response(rows: &[serde_json::Value]) -> Result<Bytes, FormatE
 }
 
 /// Format a single row as JSON object.
+#[allow(dead_code)] // Reserved for singular-object responses; kept for the test suite.
 pub fn format_json_object(row: &serde_json::Value) -> Result<Bytes, FormatError> {
     let json = serde_json::to_vec(row)?;
     Ok(Bytes::from(json))
 }
 
 /// Format rows with nulls stripped (for vnd.pgrst.array+json).
+#[allow(dead_code)] // Reserved for the `application/vnd.pgrst.array+json` media type (not yet wired).
 pub fn format_json_strip_nulls(rows: &[serde_json::Value]) -> Result<Bytes, FormatError> {
-    let stripped: Vec<serde_json::Value> = rows
-        .iter()
-        .map(|row| strip_nulls(row.clone()))
-        .collect();
+    let stripped: Vec<serde_json::Value> =
+        rows.iter().map(|row| strip_nulls(row.clone())).collect();
     let json = serde_json::to_vec(&stripped)?;
     Ok(Bytes::from(json))
 }
 
 /// Recursively strip null values from a JSON value.
+#[allow(dead_code)] // Helper for `format_json_strip_nulls`; see note there.
 fn strip_nulls(value: serde_json::Value) -> serde_json::Value {
     match value {
         serde_json::Value::Object(map) => {
@@ -37,10 +38,7 @@ fn strip_nulls(value: serde_json::Value) -> serde_json::Value {
             serde_json::Value::Object(filtered)
         }
         serde_json::Value::Array(arr) => {
-            let filtered: Vec<serde_json::Value> = arr
-                .into_iter()
-                .map(strip_nulls)
-                .collect();
+            let filtered: Vec<serde_json::Value> = arr.into_iter().map(strip_nulls).collect();
             serde_json::Value::Array(filtered)
         }
         other => other,

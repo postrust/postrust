@@ -211,9 +211,11 @@ mod tests {
 
     #[test]
     fn test_preference_applied() {
-        let mut prefs = Preferences::default();
-        prefs.representation = PreferRepresentation::Full;
-        prefs.count = Some(PreferCount::Exact);
+        let prefs = Preferences {
+            representation: PreferRepresentation::Full,
+            count: Some(PreferCount::Exact),
+            ..Default::default()
+        };
 
         let applied = preference_applied(&prefs).unwrap();
         assert!(applied.contains("return=representation"));

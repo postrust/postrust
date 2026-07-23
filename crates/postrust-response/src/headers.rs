@@ -29,7 +29,12 @@ impl ContentRange {
     }
 
     /// Create from offset, limit, and total.
-    pub fn from_pagination(offset: i64, limit: Option<i64>, count: i64, total: Option<i64>) -> Self {
+    pub fn from_pagination(
+        offset: i64,
+        limit: Option<i64>,
+        count: i64,
+        total: Option<i64>,
+    ) -> Self {
         let end = match limit {
             Some(l) => (offset + l - 1).min(offset + count - 1).max(offset),
             None => offset + count - 1,
@@ -79,15 +84,14 @@ pub fn build_response_headers(
     // Content-Profile
     if request.negotiated_by_profile {
         if let Ok(v) = HeaderValue::from_str(&request.schema) {
-            headers.insert(
-                http::header::HeaderName::from_static("content-profile"),
-                v,
-            );
+            headers.insert(http::header::HeaderName::from_static("content-profile"), v);
         }
     }
 
     // Preference-Applied
-    if let Some(applied) = postrust_core::api_request::preferences::preference_applied(&request.preferences) {
+    if let Some(applied) =
+        postrust_core::api_request::preferences::preference_applied(&request.preferences)
+    {
         if let Ok(v) = HeaderValue::from_str(&applied) {
             headers.insert(
                 http::header::HeaderName::from_static("preference-applied"),
@@ -100,6 +104,7 @@ pub fn build_response_headers(
 }
 
 /// Parse GUC headers from database response.
+#[allow(dead_code)] // Reserved for GUC-driven response headers (`response.headers`); not yet wired.
 pub fn parse_guc_headers(guc_headers: &str) -> Vec<(String, String)> {
     // Format: "header1: value1\nheader2: value2"
     guc_headers

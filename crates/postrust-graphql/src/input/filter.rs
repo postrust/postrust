@@ -94,9 +94,7 @@ impl StringFilterInput {
         }
 
         if let Some(is_null) = self.is_null {
-            let op_expr = OpExpr::new(Operation::Is(
-                postrust_core::api_request::IsValue::Null,
-            ));
+            let op_expr = OpExpr::new(Operation::Is(postrust_core::api_request::IsValue::Null));
             filters.push(Filter::new(
                 field.clone(),
                 if is_null {
@@ -263,9 +261,7 @@ impl IntFilterInput {
         }
 
         if let Some(is_null) = self.is_null {
-            let op_expr = OpExpr::new(Operation::Is(
-                postrust_core::api_request::IsValue::Null,
-            ));
+            let op_expr = OpExpr::new(Operation::Is(postrust_core::api_request::IsValue::Null));
             filters.push(Filter::new(
                 field.clone(),
                 if is_null {
@@ -386,9 +382,7 @@ impl FloatFilterInput {
         }
 
         if let Some(is_null) = self.is_null {
-            let op_expr = OpExpr::new(Operation::Is(
-                postrust_core::api_request::IsValue::Null,
-            ));
+            let op_expr = OpExpr::new(Operation::Is(postrust_core::api_request::IsValue::Null));
             filters.push(Filter::new(
                 field.clone(),
                 if is_null {
@@ -442,9 +436,7 @@ impl BooleanFilterInput {
         }
 
         if let Some(is_null) = self.is_null {
-            let op_expr = OpExpr::new(Operation::Is(
-                postrust_core::api_request::IsValue::Null,
-            ));
+            let op_expr = OpExpr::new(Operation::Is(postrust_core::api_request::IsValue::Null));
             filters.push(Filter::new(
                 field.clone(),
                 if is_null {
@@ -516,9 +508,7 @@ impl UuidFilterInput {
         }
 
         if let Some(is_null) = self.is_null {
-            let op_expr = OpExpr::new(Operation::Is(
-                postrust_core::api_request::IsValue::Null,
-            ));
+            let op_expr = OpExpr::new(Operation::Is(postrust_core::api_request::IsValue::Null));
             filters.push(Filter::new(
                 field.clone(),
                 if is_null {
@@ -534,10 +524,7 @@ impl UuidFilterInput {
 
     /// Check if any filter is set.
     pub fn is_empty(&self) -> bool {
-        self.eq.is_none()
-            && self.neq.is_none()
-            && self.in_list.is_none()
-            && self.is_null.is_none()
+        self.eq.is_none() && self.neq.is_none() && self.in_list.is_none() && self.is_null.is_none()
     }
 }
 
@@ -1061,7 +1048,7 @@ mod tests {
     #[test]
     fn test_float_filter_eq() {
         let filter = FloatFilterInput {
-            eq: Some(3.14),
+            eq: Some(1.5),
             ..Default::default()
         };
 
@@ -1071,7 +1058,7 @@ mod tests {
         match &filters[0].op_expr.operation {
             Operation::Quant { op, value, .. } => {
                 assert_eq!(*op, QuantOperator::Equal);
-                assert_eq!(value, "3.14");
+                assert_eq!(value, "1.5");
             }
             _ => panic!("Expected Quant operation"),
         }

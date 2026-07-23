@@ -6,7 +6,9 @@ use postrust_core::schema_cache::Relationship;
 /// Extract constraint name from a Relationship.
 fn get_constraint_name(rel: &Relationship) -> &str {
     match rel {
-        Relationship::ForeignKey { constraint_name, .. } => constraint_name,
+        Relationship::ForeignKey {
+            constraint_name, ..
+        } => constraint_name,
         Relationship::Computed { function, .. } => &function.name,
     }
 }
@@ -91,12 +93,13 @@ fn pluralize(s: &str) -> String {
 
 /// Simple singularization (removes trailing 's').
 fn singularize(s: &str) -> String {
-    if s.ends_with("ies") {
-        format!("{}y", &s[..s.len() - 3])
-    } else if s.ends_with("es") && (s.ends_with("ses") || s.ends_with("xes") || s.ends_with("ches") || s.ends_with("shes")) {
-        s[..s.len() - 2].to_string()
+    if let Some(stem) = s.strip_suffix("ies") {
+        format!("{}y", stem)
+    } else if s.ends_with("ses") || s.ends_with("xes") || s.ends_with("ches") || s.ends_with("shes")
+    {
+        s.strip_suffix("es").unwrap_or(s).to_string()
     } else if s.ends_with('s') && !s.ends_with("ss") {
-        s[..s.len() - 1].to_string()
+        s.strip_suffix('s').unwrap_or(s).to_string()
     } else {
         s.to_string()
     }
@@ -242,7 +245,11 @@ mod tests {
         let field = RelationshipField::from_relationship(&rel);
 
         assert!(field.description.is_some());
-        assert!(field.description.as_ref().unwrap().contains("orders_user_id_fkey"));
+        assert!(field
+            .description
+            .as_ref()
+            .unwrap()
+            .contains("orders_user_id_fkey"));
     }
 
     #[test]
