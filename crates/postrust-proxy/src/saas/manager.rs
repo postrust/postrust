@@ -57,7 +57,8 @@ impl DomainManager {
         let verification_token = generate_verification_token();
 
         // Create domain
-        let domain = db::create_domain(&self.pool, tenant_id, req.clone(), &verification_token).await?;
+        let domain =
+            db::create_domain(&self.pool, tenant_id, req.clone(), &verification_token).await?;
 
         // Create verification challenge
         let expected_value = format!("postrust-verify={}", verification_token);
@@ -76,8 +77,12 @@ impl DomainManager {
 
         // Generate verification instructions
         let instructions = match domain.verification_method {
-            VerificationMethod::Dns => VerificationInstructions::dns(&domain.domain, &verification_token),
-            VerificationMethod::Http => VerificationInstructions::http(&domain.domain, &verification_token),
+            VerificationMethod::Dns => {
+                VerificationInstructions::dns(&domain.domain, &verification_token)
+            }
+            VerificationMethod::Http => {
+                VerificationInstructions::http(&domain.domain, &verification_token)
+            }
         };
 
         Ok(DomainResponse {
@@ -121,7 +126,11 @@ impl DomainManager {
     }
 
     /// Verify a domain.
-    pub async fn verify_domain(&self, id: Uuid, tenant_id: Uuid) -> ProxyResult<VerificationResult> {
+    pub async fn verify_domain(
+        &self,
+        id: Uuid,
+        tenant_id: Uuid,
+    ) -> ProxyResult<VerificationResult> {
         let domain = db::get_domain_for_tenant(&self.pool, id, tenant_id)
             .await?
             .ok_or_else(|| ProxyError::NotFound("Domain not found".into()))?;
@@ -146,7 +155,8 @@ impl DomainManager {
         match &result {
             VerificationResult::Verified => {
                 // Update domain status
-                db::update_verification_status(&self.pool, id, VerificationStatus::Verified).await?;
+                db::update_verification_status(&self.pool, id, VerificationStatus::Verified)
+                    .await?;
 
                 // If ACME is enabled, trigger SSL provisioning
                 if domain.ssl_provider == SslProvider::Acme {
@@ -203,7 +213,7 @@ impl DomainManager {
         req: CreateDomainRouteRequest,
     ) -> ProxyResult<DomainRoute> {
         // Verify domain belongs to tenant
-        let domain = db::get_domain_for_tenant(&self.pool, domain_id, tenant_id)
+        let _domain = db::get_domain_for_tenant(&self.pool, domain_id, tenant_id)
             .await?
             .ok_or_else(|| ProxyError::NotFound("Domain not found".into()))?;
 
@@ -345,7 +355,9 @@ impl DomainManager {
 
         // Must have at least one dot
         if !domain.contains('.') {
-            return Err(ProxyError::Validation("Domain must have at least one dot".into()));
+            return Err(ProxyError::Validation(
+                "Domain must have at least one dot".into(),
+            ));
         }
 
         // Check each label
@@ -356,8 +368,8 @@ impl DomainManager {
 
             // Check first and last characters
             let chars: Vec<char> = label.chars().collect();
-            if chars.first().map_or(true, |c| !c.is_alphanumeric())
-                || chars.last().map_or(true, |c| !c.is_alphanumeric())
+            if chars.first().is_none_or(|c| !c.is_alphanumeric())
+                || chars.last().is_none_or(|c| !c.is_alphanumeric())
             {
                 return Err(ProxyError::Validation(
                     "Domain labels must start and end with alphanumeric characters".into(),
@@ -395,19 +407,10 @@ fn generate_verification_token() -> String {
 mod tests {
     use super::*;
 
-    // Helper to create a test manager would require a mock pool
-    // For now, just test the validation logic
-
-    #[test]
-    fn test_validate_domain_format_valid() {
-        let manager = DomainManager {
-            pool: unsafe { std::mem::zeroed() }, // Not used in validation
-            verification_service: Arc::new(unsafe { std::mem::zeroed() }),
-        };
-
-        // These would panic with zeroed pool, so we can't actually run them
-        // In a real test, you'd use a mock pool
-    }
+    // Note: `validate_domain_format` is exercised via integration tests that
+    // build a real `DomainManager` (it needs a live pool). A previous unit test
+    // here constructed the manager from `std::mem::zeroed()`, which is undefined
+    // behavior and crashed on drop, so it was removed.
 
     #[test]
     fn test_generate_verification_token() {

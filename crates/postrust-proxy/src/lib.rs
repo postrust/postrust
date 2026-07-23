@@ -34,8 +34,17 @@
 //! └─────────────────────────────────────────────────────────────┘
 //! ```
 
-#![warn(missing_docs)]
 #![warn(clippy::all)]
+// `postrust-proxy` is a beta module with wiring still in progress. The following
+// lints are relaxed until it stabilizes (tighten before GA):
+// - missing_docs / dead_code: some public items and scaffolding are not yet wired up.
+// - result_large_err / large_enum_variant: rooted in the rich `ProxyError` enum.
+// - type_complexity: a few internal signatures pending refactor into type aliases.
+#![allow(missing_docs)]
+#![allow(dead_code)]
+#![allow(clippy::result_large_err)]
+#![allow(clippy::large_enum_variant)]
+#![allow(clippy::type_complexity)]
 
 pub mod admin;
 pub mod config;
@@ -50,7 +59,7 @@ mod error;
 pub use error::{ProxyError, ProxyResult};
 
 // Re-export key types for convenience
-pub use config::{ProxyConfig, Route, Upstream, Backend};
+pub use config::{Backend, ProxyConfig, Route, Upstream};
 pub use health::HealthChecker;
 pub use ratelimit::RateLimiter;
 
