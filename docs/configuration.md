@@ -101,6 +101,37 @@ PGRST_SERVER_CORS_ORIGINS="https://example.com,https://app.example.com"
 PGRST_SERVER_CORS_ORIGINS="*"
 ```
 
+## Compatibility Settings
+
+| Variable | Description | Default |
+|----------|-------------|---------|
+| `PGRST_COMPAT_MODE` | PostgREST compatibility mode (alias: `POSTRUST_COMPAT_MODE`) | `false` |
+
+Setting `PGRST_COMPAT_MODE=true` makes the API behave more like PostgREST:
+
+- **Canonical paths at the root.** The full REST surface is also served at `/`,
+  so `POST /rpc/<name>`, `GET /<table>`, etc. work in addition to the
+  `/api`-prefixed paths. Explicit routes (`/`, `/_`, `/admin`, `/api`) still
+  take precedence, and GraphQL stays at `/api/graphql`.
+- **PostgREST-shaped RPC responses.** Results from `POST /rpc/<name>` are
+  un-wrapped: a non-set-returning function returns its bare object/scalar
+  (`{...}` / `42`) and a set-returning function returns a top-level array,
+  instead of the default `[{"<name>": ...}]` shape.
+
+```bash
+# Default mode
+curl -X POST http://localhost:3000/api/rpc/get_statistics
+# -> [{"get_statistics": {"users": 10}}]
+
+# Compatibility mode (PGRST_COMPAT_MODE=true)
+curl -X POST http://localhost:3000/rpc/get_statistics
+# -> {"users": 10}
+```
+
+This is opt-in so existing deployments keep their current behavior. See
+"Differences from PostgREST" in the README for the remaining intentional
+differences.
+
 ## Logging Settings
 
 | Variable | Description | Default |

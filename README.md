@@ -220,35 +220,35 @@ Postrust provides a full GraphQL API alongside the REST API:
 
 ```bash
 # Query users
-curl -X POST http://localhost:3000/graphql \
+curl -X POST http://localhost:3000/api/graphql \
   -H "Content-Type: application/json" \
   -d '{
     "query": "{ users { id name email } }"
   }'
 
 # Query with filtering and pagination
-curl -X POST http://localhost:3000/graphql \
+curl -X POST http://localhost:3000/api/graphql \
   -H "Content-Type: application/json" \
   -d '{
     "query": "{ users(filter: {status: {eq: \"active\"}}, limit: 10) { id name } }"
   }'
 
 # Nested queries (relationships)
-curl -X POST http://localhost:3000/graphql \
+curl -X POST http://localhost:3000/api/graphql \
   -H "Content-Type: application/json" \
   -d '{
     "query": "{ orders { id total customer { name email } items { product { name price } } } }"
   }'
 
 # Mutations
-curl -X POST http://localhost:3000/graphql \
+curl -X POST http://localhost:3000/api/graphql \
   -H "Content-Type: application/json" \
   -d '{
     "query": "mutation { insertUsers(objects: [{name: \"John\", email: \"john@example.com\"}]) { id name } }"
   }'
 
 # GraphQL Playground available at GET /graphql
-open http://localhost:3000/graphql
+open http://localhost:3000/api/graphql
 ```
 
 #### Authentication

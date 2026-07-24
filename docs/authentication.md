@@ -2,6 +2,10 @@
 
 Postrust uses JWT (JSON Web Tokens) for authentication and PostgreSQL's Row-Level Security (RLS) for authorization.
 
+> Examples below use root-level paths (e.g. `/users`), which require
+> [compatibility mode](configuration.md#compatibility-settings); by default,
+> prefix them with `/api`.
+
 ## Overview
 
 ```
