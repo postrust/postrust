@@ -83,4 +83,7 @@ jobs:
           done
 
       - name: Integration tests (database-backed)
-        run: cargo test --workspace -- --ignored
+        # --lib/--bins/--tests keeps doctests out of this pass: `-- --ignored`
+        # would otherwise also run doc examples marked `ignore`, which are
+        # sketches that don't compile.
+        run: cargo test --workspace --lib --bins --tests -- --ignored

@@ -15,7 +15,7 @@
 //!
 //! # Example
 //!
-//! ```ignore
+//! ```text
 //! use postrust_core::{ApiRequest, SchemaCache, create_action_plan};
 //!
 //! // Parse HTTP request
