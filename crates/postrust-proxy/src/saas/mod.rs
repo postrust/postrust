@@ -10,16 +10,16 @@
 //! - Automatic SSL certificate provisioning via ACME
 //! - Manual certificate upload support
 
-pub mod types;
-pub mod db;
 pub mod api_keys;
 pub mod auth;
-pub mod verification;
-pub mod manager;
+pub mod db;
 pub mod handlers;
+pub mod manager;
+pub mod types;
+pub mod verification;
 
-pub use types::*;
-pub use manager::DomainManager;
-pub use verification::DomainVerificationService;
 pub use api_keys::ApiKeyService;
 pub use auth::{AuthContext, AuthType, SaasAuthLayer};
+pub use manager::DomainManager;
+pub use types::*;
+pub use verification::DomainVerificationService;

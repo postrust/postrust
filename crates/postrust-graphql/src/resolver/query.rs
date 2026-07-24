@@ -794,7 +794,11 @@ mod tests {
             );
 
         let args = QueryArgs::new()
-            .with_select(vec!["id".to_string(), "name".to_string(), "email".to_string()])
+            .with_select(vec![
+                "id".to_string(),
+                "name".to_string(),
+                "email".to_string(),
+            ])
             .with_filter(filter)
             .with_order_by(vec![OrderByField::asc("name")])
             .with_limit(50)

@@ -315,9 +315,9 @@ fn create_query_type(generated: &GeneratedSchema) -> Object {
         let mut gql_field = Field::new(&field.name, return_type, move |ctx| {
             let table_name = table_name.clone();
             let type_name = type_name.clone();
-            FieldFuture::new(async move {
-                resolve_query(&ctx, &table_name, &type_name, is_by_pk).await
-            })
+            FieldFuture::new(
+                async move { resolve_query(&ctx, &table_name, &type_name, is_by_pk).await },
+            )
         });
 
         // Add standard query arguments
@@ -363,16 +363,16 @@ fn create_mutation_type(generated: &GeneratedSchema) -> Object {
 
         let mut gql_field = Field::new(&field.name, return_type, move |ctx| {
             let table_name = table_name.clone();
-            FieldFuture::new(async move {
-                resolve_mutation(&ctx, &table_name, mutation_type).await
-            })
+            FieldFuture::new(
+                async move { resolve_mutation(&ctx, &table_name, mutation_type).await },
+            )
         });
 
         // Add mutation-specific arguments
         match mutation_type {
             MutationType::Insert | MutationType::InsertOne => {
-                gql_field = gql_field
-                    .argument(InputValue::new("objects", TypeRef::named_nn_list("JSON")));
+                gql_field =
+                    gql_field.argument(InputValue::new("objects", TypeRef::named_nn_list("JSON")));
             }
             MutationType::Update | MutationType::UpdateByPk => {
                 gql_field = gql_field
@@ -410,9 +410,9 @@ fn create_subscription_type(fields: &[SubField]) -> Subscription {
                 let broker_arc = ctx.data::<Arc<RwLock<Option<NotifyBroker>>>>()?;
                 let broker_guard = broker_arc.read().await;
 
-                let broker = broker_guard
-                    .as_ref()
-                    .ok_or_else(|| async_graphql::Error::new("Subscription broker not initialized"))?;
+                let broker = broker_guard.as_ref().ok_or_else(|| {
+                    async_graphql::Error::new("Subscription broker not initialized")
+                })?;
 
                 let stream = broker
                     .subscribe(&channel_name)
@@ -423,14 +423,9 @@ fn create_subscription_type(fields: &[SubField]) -> Subscription {
                 // Use FieldValue::value() so field resolvers can use as_value()
                 let value_stream = stream.filter_map(|notification| async move {
                     match TableChangePayload::from_payload(&notification.payload) {
-                        Ok(payload) => {
-                            if let Some(data) = payload.data() {
-                                // Convert to async_graphql::Value so field resolvers can extract fields
-                                Some(Ok(FieldValue::value(json_to_value(data.clone()))))
-                            } else {
-                                None
-                            }
-                        }
+                        Ok(payload) => payload
+                            .data()
+                            .map(|data| Ok(FieldValue::value(json_to_value(data.clone())))),
                         Err(e) => {
                             debug!("Failed to parse notification payload: {}", e);
                             None
@@ -467,17 +462,9 @@ async fn resolve_query<'a>(
     debug!("Resolving query for table: {}", table_name);
 
     // Extract pagination arguments
-    let limit: Option<i64> = ctx
-        .args
-        .try_get("limit")
-        .ok()
-        .and_then(|v| v.i64().ok());
+    let limit: Option<i64> = ctx.args.try_get("limit").ok().and_then(|v| v.i64().ok());
 
-    let offset: Option<i64> = ctx
-        .args
-        .try_get("offset")
-        .ok()
-        .and_then(|v| v.i64().ok());
+    let offset: Option<i64> = ctx.args.try_get("offset").ok().and_then(|v| v.i64().ok());
 
     // Build simple query
     let mut sql = format!(
@@ -499,7 +486,10 @@ async fn resolve_query<'a>(
     if is_by_pk {
         // Return single item as Value::Object
         // json_to_value converts serde_json to async_graphql Value
-        Ok(result.into_iter().next().map(|v| FieldValue::value(json_to_value(v))))
+        Ok(result
+            .into_iter()
+            .next()
+            .map(|v| FieldValue::value(json_to_value(v))))
     } else {
         // Return list with each item as Value::Object
         let items: Vec<FieldValue> = result
@@ -519,7 +509,10 @@ async fn resolve_mutation<'a>(
     let pool = ctx.data::<PgPool>()?;
     let gql_ctx = ctx.data::<GraphQLContext>()?;
 
-    debug!("Resolving mutation for table: {} type: {:?}", table_name, mutation_type);
+    debug!(
+        "Resolving mutation for table: {} type: {:?}",
+        table_name, mutation_type
+    );
 
     let result = match mutation_type {
         MutationType::Insert | MutationType::InsertOne => {
@@ -540,22 +533,29 @@ async fn resolve_mutation<'a>(
                 .map(|v| accessor_to_json(&v))
                 .unwrap_or_else(|| serde_json::json!({}));
 
-            let where_clause = ctx
-                .args
-                .try_get("where")
-                .ok()
-                .map(|v| accessor_to_json(&v));
+            let where_clause = ctx.args.try_get("where").ok().map(|v| accessor_to_json(&v));
 
-            execute_update(pool, table_name, gql_ctx.role(), set_value, where_clause, mutation_type).await?
+            execute_update(
+                pool,
+                table_name,
+                gql_ctx.role(),
+                set_value,
+                where_clause,
+                mutation_type,
+            )
+            .await?
         }
         MutationType::Delete | MutationType::DeleteByPk => {
-            let where_clause = ctx
-                .args
-                .try_get("where")
-                .ok()
-                .map(|v| accessor_to_json(&v));
+            let where_clause = ctx.args.try_get("where").ok().map(|v| accessor_to_json(&v));
 
-            execute_delete(pool, table_name, gql_ctx.role(), where_clause, mutation_type).await?
+            execute_delete(
+                pool,
+                table_name,
+                gql_ctx.role(),
+                where_clause,
+                mutation_type,
+            )
+            .await?
         }
     };
 
@@ -576,9 +576,12 @@ async fn execute_query(
     let mut conn = pool.acquire().await?;
 
     // Set role
-    sqlx::query(&format!("SET LOCAL ROLE {}", postrust_sql::escape_ident(role)))
-        .execute(&mut *conn)
-        .await?;
+    sqlx::query(&format!(
+        "SET LOCAL ROLE {}",
+        postrust_sql::escape_ident(role)
+    ))
+    .execute(&mut *conn)
+    .await?;
 
     // Execute query
     let rows = sqlx::query(sql).fetch_all(&mut *conn).await?;
@@ -609,7 +612,11 @@ async fn execute_insert<'a>(
     let objects_array = match objects {
         serde_json::Value::Array(arr) => arr,
         serde_json::Value::Object(obj) => vec![serde_json::Value::Object(obj)],
-        _ => return Err(async_graphql::Error::new("objects must be an array or object")),
+        _ => {
+            return Err(async_graphql::Error::new(
+                "objects must be an array or object",
+            ))
+        }
     };
 
     if objects_array.is_empty() {
@@ -619,9 +626,12 @@ async fn execute_insert<'a>(
     let mut conn = pool.acquire().await?;
 
     // Set role
-    sqlx::query(&format!("SET LOCAL ROLE {}", postrust_sql::escape_ident(role)))
-        .execute(&mut *conn)
-        .await?;
+    sqlx::query(&format!(
+        "SET LOCAL ROLE {}",
+        postrust_sql::escape_ident(role)
+    ))
+    .execute(&mut *conn)
+    .await?;
 
     let mut inserted: Vec<FieldValue> = Vec::new();
 
@@ -629,12 +639,17 @@ async fn execute_insert<'a>(
         if let serde_json::Value::Object(map) = obj {
             // Build INSERT query
             let columns: Vec<&str> = map.keys().map(|k| k.as_str()).collect();
-            let placeholders: Vec<String> = (1..=columns.len()).map(|i| format!("${}", i)).collect();
+            let placeholders: Vec<String> =
+                (1..=columns.len()).map(|i| format!("${}", i)).collect();
 
             let sql = format!(
                 "INSERT INTO public.{} ({}) VALUES ({}) RETURNING row_to_json(public.{}.*)",
                 postrust_sql::escape_ident(table_name),
-                columns.iter().map(|c| postrust_sql::escape_ident(c)).collect::<Vec<_>>().join(", "),
+                columns
+                    .iter()
+                    .map(|c| postrust_sql::escape_ident(c))
+                    .collect::<Vec<_>>()
+                    .join(", "),
                 placeholders.join(", "),
                 postrust_sql::escape_ident(table_name)
             );
@@ -716,15 +731,22 @@ async fn execute_update<'a>(
     let mut conn = pool.acquire().await?;
 
     // Set role
-    sqlx::query(&format!("SET LOCAL ROLE {}", postrust_sql::escape_ident(role)))
-        .execute(&mut *conn)
-        .await?;
+    sqlx::query(&format!(
+        "SET LOCAL ROLE {}",
+        postrust_sql::escape_ident(role)
+    ))
+    .execute(&mut *conn)
+    .await?;
 
     // Build SET clause
     let mut set_parts: Vec<String> = Vec::new();
     let mut param_idx = 1;
     for key in set_map.keys() {
-        set_parts.push(format!("{} = ${}", postrust_sql::escape_ident(key), param_idx));
+        set_parts.push(format!(
+            "{} = ${}",
+            postrust_sql::escape_ident(key),
+            param_idx
+        ));
         param_idx += 1;
     }
 
@@ -764,12 +786,8 @@ async fn execute_update<'a>(
 
     // Return based on mutation type
     match mutation_type {
-        MutationType::UpdateByPk => {
-            Ok(updated.into_iter().next())
-        }
-        _ => {
-            Ok(Some(FieldValue::list(updated)))
-        }
+        MutationType::UpdateByPk => Ok(updated.into_iter().next()),
+        _ => Ok(Some(FieldValue::list(updated))),
     }
 }
 
@@ -788,9 +806,12 @@ async fn execute_delete<'a>(
     let mut conn = pool.acquire().await?;
 
     // Set role
-    sqlx::query(&format!("SET LOCAL ROLE {}", postrust_sql::escape_ident(role)))
-        .execute(&mut *conn)
-        .await?;
+    sqlx::query(&format!(
+        "SET LOCAL ROLE {}",
+        postrust_sql::escape_ident(role)
+    ))
+    .execute(&mut *conn)
+    .await?;
 
     // Build WHERE clause
     let (where_sql, where_values) = build_where_clause(where_clause.as_ref(), 1)?;
@@ -822,12 +843,8 @@ async fn execute_delete<'a>(
 
     // Return based on mutation type
     match mutation_type {
-        MutationType::DeleteByPk => {
-            Ok(deleted.into_iter().next())
-        }
-        _ => {
-            Ok(Some(FieldValue::list(deleted)))
-        }
+        MutationType::DeleteByPk => Ok(deleted.into_iter().next()),
+        _ => Ok(Some(FieldValue::list(deleted))),
     }
 }
 
@@ -847,14 +864,30 @@ fn build_where_clause(
                     // Handle operators like {eq: value}, {gt: value}, etc.
                     for (op, op_val) in op_map {
                         let condition = match op.as_str() {
-                            "eq" | "_eq" => format!("{} = ${}", postrust_sql::escape_ident(key), param_idx),
-                            "neq" | "_neq" => format!("{} != ${}", postrust_sql::escape_ident(key), param_idx),
-                            "gt" | "_gt" => format!("{} > ${}", postrust_sql::escape_ident(key), param_idx),
-                            "gte" | "_gte" => format!("{} >= ${}", postrust_sql::escape_ident(key), param_idx),
-                            "lt" | "_lt" => format!("{} < ${}", postrust_sql::escape_ident(key), param_idx),
-                            "lte" | "_lte" => format!("{} <= ${}", postrust_sql::escape_ident(key), param_idx),
-                            "like" | "_like" => format!("{} LIKE ${}", postrust_sql::escape_ident(key), param_idx),
-                            "ilike" | "_ilike" => format!("{} ILIKE ${}", postrust_sql::escape_ident(key), param_idx),
+                            "eq" | "_eq" => {
+                                format!("{} = ${}", postrust_sql::escape_ident(key), param_idx)
+                            }
+                            "neq" | "_neq" => {
+                                format!("{} != ${}", postrust_sql::escape_ident(key), param_idx)
+                            }
+                            "gt" | "_gt" => {
+                                format!("{} > ${}", postrust_sql::escape_ident(key), param_idx)
+                            }
+                            "gte" | "_gte" => {
+                                format!("{} >= ${}", postrust_sql::escape_ident(key), param_idx)
+                            }
+                            "lt" | "_lt" => {
+                                format!("{} < ${}", postrust_sql::escape_ident(key), param_idx)
+                            }
+                            "lte" | "_lte" => {
+                                format!("{} <= ${}", postrust_sql::escape_ident(key), param_idx)
+                            }
+                            "like" | "_like" => {
+                                format!("{} LIKE ${}", postrust_sql::escape_ident(key), param_idx)
+                            }
+                            "ilike" | "_ilike" => {
+                                format!("{} ILIKE ${}", postrust_sql::escape_ident(key), param_idx)
+                            }
                             "is_null" | "_is_null" => {
                                 if op_val.as_bool().unwrap_or(false) {
                                     format!("{} IS NULL", postrust_sql::escape_ident(key))
@@ -876,7 +909,11 @@ fn build_where_clause(
                 }
                 _ => {
                     // Direct equality: {field: value}
-                    conditions.push(format!("{} = ${}", postrust_sql::escape_ident(key), param_idx));
+                    conditions.push(format!(
+                        "{} = ${}",
+                        postrust_sql::escape_ident(key),
+                        param_idx
+                    ));
                     values.push(val.clone());
                     param_idx += 1;
                 }
@@ -902,9 +939,9 @@ fn graphql_type_ref(type_str: &str) -> TypeRef {
     // Strip outer modifiers: first the trailing !, then the brackets
     let inner = if is_list {
         let stripped = type_str
-            .trim_end_matches('!')  // Remove outer !
-            .trim_start_matches('[')  // Remove [
-            .trim_end_matches(']');   // Remove ]
+            .trim_end_matches('!') // Remove outer !
+            .trim_start_matches('[') // Remove [
+            .trim_end_matches(']'); // Remove ]
         stripped
     } else {
         type_str.trim_end_matches('!')
@@ -948,11 +985,7 @@ fn accessor_to_json(accessor: &ValueAccessor<'_>) -> serde_json::Value {
     } else if let Ok(s) = accessor.string() {
         serde_json::Value::String(s.to_string())
     } else if let Ok(list) = accessor.list() {
-        serde_json::Value::Array(
-            list.iter()
-                .map(|v| accessor_to_json(&v))
-                .collect()
-        )
+        serde_json::Value::Array(list.iter().map(|v| accessor_to_json(&v)).collect())
     } else if let Ok(obj) = accessor.object() {
         let map: serde_json::Map<String, serde_json::Value> = obj
             .iter()
@@ -980,9 +1013,7 @@ fn value_to_json(value: &Value) -> serde_json::Value {
             }
         }
         Value::String(s) => serde_json::Value::String(s.clone()),
-        Value::List(arr) => {
-            serde_json::Value::Array(arr.iter().map(value_to_json).collect())
-        }
+        Value::List(arr) => serde_json::Value::Array(arr.iter().map(value_to_json).collect()),
         Value::Object(obj) => {
             let map: serde_json::Map<String, serde_json::Value> = obj
                 .iter()
@@ -1013,9 +1044,7 @@ fn json_to_value(json: serde_json::Value) -> Value {
             }
         }
         serde_json::Value::String(s) => Value::String(s),
-        serde_json::Value::Array(arr) => {
-            Value::List(arr.into_iter().map(json_to_value).collect())
-        }
+        serde_json::Value::Array(arr) => Value::List(arr.into_iter().map(json_to_value).collect()),
         serde_json::Value::Object(obj) => {
             let map: indexmap::IndexMap<async_graphql::Name, Value> = obj
                 .into_iter()
@@ -1035,8 +1064,7 @@ fn create_bigint_scalar() -> Scalar {
 
 /// Create BigDecimal scalar type.
 fn create_bigdecimal_scalar() -> Scalar {
-    Scalar::new("BigDecimal")
-        .description("Arbitrary precision decimal number")
+    Scalar::new("BigDecimal").description("Arbitrary precision decimal number")
 }
 
 /// Create JSON scalar type.
@@ -1332,11 +1360,10 @@ mod tests {
         let _generated = build_schema(&cache, &config);
 
         // Build a minimal schema with filter types
-        let query = Object::new("Query").field(Field::new(
-            "test",
-            TypeRef::named("String"),
-            |_| FieldFuture::new(async { Ok(None::<FieldValue>) }),
-        ));
+        let query =
+            Object::new("Query").field(Field::new("test", TypeRef::named("String"), |_| {
+                FieldFuture::new(async { Ok(None::<FieldValue>) })
+            }));
 
         let mut builder = Schema::build("Query", None::<&str>, None);
         builder = builder.register(query);

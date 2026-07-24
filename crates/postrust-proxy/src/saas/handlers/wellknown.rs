@@ -1,6 +1,5 @@
 //! Well-known endpoint handlers for domain verification.
 
-use crate::saas::db;
 use crate::saas::handlers::SaasState;
 use axum::{
     extract::{Path, State},
@@ -14,7 +13,7 @@ use axum::{
 /// It responds at `/.well-known/postrust-verification/{token}` with the expected
 /// verification content.
 pub async fn handle_verification_challenge(
-    State(state): State<SaasState>,
+    State(_state): State<SaasState>,
     Path(token): Path<String>,
 ) -> impl IntoResponse {
     // Note: We need direct pool access, which isn't available through domain_manager
@@ -36,8 +35,8 @@ pub async fn handle_verification_challenge(
 /// This endpoint serves ACME HTTP-01 challenges for automatic certificate provisioning.
 /// It responds at `/.well-known/acme-challenge/{token}`.
 pub async fn handle_acme_challenge(
-    State(state): State<SaasState>,
-    Path(token): Path<String>,
+    State(_state): State<SaasState>,
+    Path(_token): Path<String>,
 ) -> impl IntoResponse {
     // ACME challenges would be handled by the ACME module
     // This is a placeholder for integration

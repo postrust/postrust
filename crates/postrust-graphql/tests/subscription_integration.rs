@@ -42,7 +42,11 @@ fn unique_table_name() -> String {
 async fn setup_test_table(pool: &sqlx::PgPool, table_name: &str) -> Result<(), sqlx::Error> {
     // Drop existing table if exists
     pool.execute(
-        format!("DROP TABLE IF EXISTS {}.{} CASCADE", TEST_SCHEMA, table_name).as_str(),
+        format!(
+            "DROP TABLE IF EXISTS {}.{} CASCADE",
+            TEST_SCHEMA, table_name
+        )
+        .as_str(),
     )
     .await?;
 
@@ -76,7 +80,11 @@ async fn cleanup_test_table(pool: &sqlx::PgPool, table_name: &str) -> Result<(),
     pool.execute(drop_trigger_sql.as_str()).await?;
 
     pool.execute(
-        format!("DROP TABLE IF EXISTS {}.{} CASCADE", TEST_SCHEMA, table_name).as_str(),
+        format!(
+            "DROP TABLE IF EXISTS {}.{} CASCADE",
+            TEST_SCHEMA, table_name
+        )
+        .as_str(),
     )
     .await?;
 
@@ -95,7 +103,9 @@ async fn test_notify_broker_receives_insert() {
     let test_table = unique_table_name();
 
     // Setup
-    setup_test_table(&pool, &test_table).await.expect("Failed to setup test table");
+    setup_test_table(&pool, &test_table)
+        .await
+        .expect("Failed to setup test table");
 
     // Create and start broker
     let broker = NotifyBroker::new(pool.clone());
@@ -135,8 +145,8 @@ async fn test_notify_broker_receives_insert() {
     // Verify notification
     assert_eq!(notification.channel, channel);
 
-    let payload = TableChangePayload::from_payload(&notification.payload)
-        .expect("Failed to parse payload");
+    let payload =
+        TableChangePayload::from_payload(&notification.payload).expect("Failed to parse payload");
 
     assert_eq!(payload.operation, "INSERT");
     assert_eq!(payload.table, test_table);
@@ -150,7 +160,9 @@ async fn test_notify_broker_receives_insert() {
 
     // Cleanup
     broker.stop().await;
-    cleanup_test_table(&pool, &test_table).await.expect("Failed to cleanup");
+    cleanup_test_table(&pool, &test_table)
+        .await
+        .expect("Failed to cleanup");
 }
 
 #[tokio::test]
@@ -163,7 +175,9 @@ async fn test_notify_broker_receives_update() {
         .expect("Failed to connect to database");
 
     let test_table = unique_table_name();
-    setup_test_table(&pool, &test_table).await.expect("Failed to setup test table");
+    setup_test_table(&pool, &test_table)
+        .await
+        .expect("Failed to setup test table");
 
     let broker = NotifyBroker::new(pool.clone());
     let channel = table_channel_name(TEST_SCHEMA, &test_table);
@@ -219,8 +233,8 @@ async fn test_notify_broker_receives_update() {
         .expect("Timeout waiting for notification")
         .expect("Stream ended unexpectedly");
 
-    let payload = TableChangePayload::from_payload(&notification.payload)
-        .expect("Failed to parse payload");
+    let payload =
+        TableChangePayload::from_payload(&notification.payload).expect("Failed to parse payload");
 
     assert_eq!(payload.operation, "UPDATE");
     assert!(payload.old.is_some());
@@ -233,7 +247,9 @@ async fn test_notify_broker_receives_update() {
     assert_eq!(new_data["value"], 100);
 
     broker.stop().await;
-    cleanup_test_table(&pool, &test_table).await.expect("Failed to cleanup");
+    cleanup_test_table(&pool, &test_table)
+        .await
+        .expect("Failed to cleanup");
 }
 
 #[tokio::test]
@@ -246,7 +262,9 @@ async fn test_notify_broker_receives_delete() {
         .expect("Failed to connect to database");
 
     let test_table = unique_table_name();
-    setup_test_table(&pool, &test_table).await.expect("Failed to setup test table");
+    setup_test_table(&pool, &test_table)
+        .await
+        .expect("Failed to setup test table");
 
     let broker = NotifyBroker::new(pool.clone());
     let channel = table_channel_name(TEST_SCHEMA, &test_table);
@@ -301,8 +319,8 @@ async fn test_notify_broker_receives_delete() {
         .expect("Timeout waiting for notification")
         .expect("Stream ended unexpectedly");
 
-    let payload = TableChangePayload::from_payload(&notification.payload)
-        .expect("Failed to parse payload");
+    let payload =
+        TableChangePayload::from_payload(&notification.payload).expect("Failed to parse payload");
 
     assert_eq!(payload.operation, "DELETE");
     assert!(payload.old.is_some());
@@ -314,7 +332,9 @@ async fn test_notify_broker_receives_delete() {
     assert_eq!(data["value"], 999);
 
     broker.stop().await;
-    cleanup_test_table(&pool, &test_table).await.expect("Failed to cleanup");
+    cleanup_test_table(&pool, &test_table)
+        .await
+        .expect("Failed to cleanup");
 }
 
 #[tokio::test]
@@ -327,7 +347,9 @@ async fn test_notify_broker_multiple_subscribers() {
         .expect("Failed to connect to database");
 
     let test_table = unique_table_name();
-    setup_test_table(&pool, &test_table).await.expect("Failed to setup test table");
+    setup_test_table(&pool, &test_table)
+        .await
+        .expect("Failed to setup test table");
 
     let broker = NotifyBroker::new(pool.clone());
     let channel = table_channel_name(TEST_SCHEMA, &test_table);
@@ -379,7 +401,9 @@ async fn test_notify_broker_multiple_subscribers() {
     assert_eq!(payload.new.unwrap()["name"], "multi_sub_test");
 
     broker.stop().await;
-    cleanup_test_table(&pool, &test_table).await.expect("Failed to cleanup");
+    cleanup_test_table(&pool, &test_table)
+        .await
+        .expect("Failed to cleanup");
 }
 
 #[tokio::test]
@@ -392,7 +416,9 @@ async fn test_notify_broker_dynamic_channel() {
         .expect("Failed to connect to database");
 
     let test_table = unique_table_name();
-    setup_test_table(&pool, &test_table).await.expect("Failed to setup test table");
+    setup_test_table(&pool, &test_table)
+        .await
+        .expect("Failed to setup test table");
 
     let broker = NotifyBroker::new(pool.clone());
     let channel = table_channel_name(TEST_SCHEMA, &test_table);
@@ -432,7 +458,9 @@ async fn test_notify_broker_dynamic_channel() {
     assert_eq!(payload.new.unwrap()["name"], "dynamic_test");
 
     broker.stop().await;
-    cleanup_test_table(&pool, &test_table).await.expect("Failed to cleanup");
+    cleanup_test_table(&pool, &test_table)
+        .await
+        .expect("Failed to cleanup");
 }
 
 #[tokio::test]
@@ -445,11 +473,9 @@ async fn test_trigger_sql_is_valid() {
         .expect("Failed to connect to database");
 
     // Create a simple test table
-    pool.execute(
-        format!("DROP TABLE IF EXISTS {}.trigger_test CASCADE", TEST_SCHEMA).as_str(),
-    )
-    .await
-    .expect("Failed to drop table");
+    pool.execute(format!("DROP TABLE IF EXISTS {}.trigger_test CASCADE", TEST_SCHEMA).as_str())
+        .await
+        .expect("Failed to drop table");
 
     pool.execute(
         format!(

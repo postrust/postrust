@@ -13,10 +13,7 @@ use axum::{
 use uuid::Uuid;
 
 /// List upstreams for the authenticated tenant.
-pub async fn list_upstreams(
-    State(state): State<SaasState>,
-    Auth(auth): Auth,
-) -> impl IntoResponse {
+pub async fn list_upstreams(State(state): State<SaasState>, Auth(auth): Auth) -> impl IntoResponse {
     match state.domain_manager.list_upstreams(auth.tenant_id).await {
         Ok(upstreams) => Json(ApiResponse::success(upstreams)).into_response(),
         Err(e) => error_response(e).into_response(),

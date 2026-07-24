@@ -26,6 +26,14 @@ export default component$(() => {
           {/* Endpoints */}
           <section class="mb-12">
             <h2 class="text-2xl font-bold text-neutral-900 mb-6">Endpoints</h2>
+            <div class="mb-6 p-4 bg-neutral-50 border border-neutral-200 rounded-lg text-sm text-neutral-600">
+              <strong class="text-neutral-900">Note on paths.</strong> By default the REST API
+              is served under <code class="font-mono">/api</code> (e.g.{" "}
+              <code class="font-mono">GET /api/users</code>). The root-level paths below work
+              as-is when <Link href="/docs/configuration" class="text-primary-600 hover:underline">
+              compatibility mode</Link> (<code class="font-mono">PGRST_COMPAT_MODE=true</code>) is
+              enabled; otherwise prefix them with <code class="font-mono">/api</code>.
+            </div>
             <div class="overflow-x-auto">
               <table class="w-full text-sm">
                 <thead>

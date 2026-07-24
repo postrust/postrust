@@ -65,8 +65,7 @@ impl UpdateBuilder {
 
     /// Add RETURNING clause.
     pub fn returning(mut self, column: &str) -> Self {
-        self.returning
-            .push(SqlFragment::raw(escape_ident(column)));
+        self.returning.push(SqlFragment::raw(escape_ident(column)));
         self
     }
 

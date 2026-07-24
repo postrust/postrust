@@ -1,7 +1,7 @@
 //! File-based configuration loading.
 
-use crate::error::ProxyResult;
 use crate::config::ProxyConfig;
+use crate::error::ProxyResult;
 use std::path::Path;
 
 /// Load proxy configuration from a TOML file.

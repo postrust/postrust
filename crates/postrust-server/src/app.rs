@@ -7,19 +7,16 @@ use axum::{
     http::StatusCode,
     response::{IntoResponse, Response},
 };
-use bytes::Bytes;
 use postrust_auth::authenticate;
-use postrust_core::{create_action_plan, parse_request, ActionPlan, ApiRequest};
+use postrust_core::{
+    create_action_plan, parse_request, ActionPlan, ApiRequest, CallPlan, DbActionPlan,
+};
 use postrust_response::{format_response, QueryResult, Response as PgrstResponse};
-use sqlx::Row;
 use std::sync::Arc;
-use tracing::{debug, error, info, warn};
+use tracing::{debug, error};
 
 /// Main request handler.
-pub async fn handle_request(
-    State(state): State<Arc<AppState>>,
-    request: Request,
-) -> Response {
+pub async fn handle_request(State(state): State<Arc<AppState>>, request: Request) -> Response {
     let method = request.method().clone();
     let path = request.uri().path().to_string();
 
@@ -68,11 +65,7 @@ async fn process_request(
         .map_err(|e| postrust_core::Error::Internal(e.to_string()))?;
 
     // Parse API request
-    let mut api_request = parse_request(
-        &http_request,
-        state.default_schema(),
-        state.schemas(),
-    )?;
+    let mut api_request = parse_request(&http_request, state.default_schema(), state.schemas())?;
 
     // Parse payload
     if !body_bytes.is_empty() {
@@ -102,7 +95,7 @@ async fn process_request(
 /// Execute an action plan.
 async fn execute_plan(
     state: &AppState,
-    request: &ApiRequest,
+    _request: &ApiRequest,
     plan: &ActionPlan,
     auth: &postrust_auth::AuthResult,
 ) -> Result<QueryResult, postrust_core::Error> {
@@ -123,7 +116,10 @@ async fn execute_plan(
             debug!("With {} parameters", params.len());
 
             // Execute query
-            let mut conn = state.pool.acquire().await
+            let mut conn = state
+                .pool
+                .acquire()
+                .await
                 .map_err(|e| postrust_core::Error::ConnectionPool(e.to_string()))?;
 
             // Set role
@@ -133,15 +129,17 @@ async fn execute_plan(
             ))
             .execute(&mut *conn)
             .await
-            .map_err(|e| postrust_core::Error::Database(postrust_core::error::DatabaseError {
-                code: "42501".into(),
-                message: e.to_string(),
-                details: None,
-                hint: None,
-                constraint: None,
-                table: None,
-                column: None,
-            }))?;
+            .map_err(|e| {
+                postrust_core::Error::Database(postrust_core::error::DatabaseError {
+                    code: "42501".into(),
+                    message: e.to_string(),
+                    details: None,
+                    hint: None,
+                    constraint: None,
+                    table: None,
+                    column: None,
+                })
+            })?;
 
             // Set claims as GUC
             for (key, value) in &auth.claims {
@@ -169,19 +167,26 @@ async fn execute_plan(
                 })?;
 
             // Convert rows to JSON
-            let json_rows: Vec<serde_json::Value> = rows
-                .iter()
-                .map(|row| row_to_json(row))
-                .collect();
+            let json_rows: Vec<serde_json::Value> = rows.iter().map(row_to_json).collect();
+
+            // In PostgREST-compatibility mode, reshape RPC responses to match
+            // PostgREST: un-nest the function-name-keyed column and return a
+            // bare value for non-set-returning functions.
+            let (json_rows, singular) = if state.config.compat_mode {
+                if let ActionPlan::Db(DbActionPlan::Call { call, .. }) = plan {
+                    unwrap_rpc_rows(json_rows, call)
+                } else {
+                    (json_rows, false)
+                }
+            } else {
+                (json_rows, false)
+            };
 
             Ok(QueryResult {
                 status: StatusCode::OK,
                 rows: json_rows,
-                total_count: None,
-                content_range: None,
-                location: None,
-                guc_headers: None,
-                guc_status: None,
+                singular,
+                ..Default::default()
             })
         }
         ActionPlan::Info(info_plan) => {
@@ -222,6 +227,43 @@ async fn execute_plan(
     }
 }
 
+/// Reshape RPC rows for PostgREST-compatibility mode.
+///
+/// `SELECT * FROM func(...)` names its single output column after the function
+/// (for scalar/`json` returns), which serializes to rows like
+/// `[{"func": <value>}]`. PostgREST instead returns the bare value. This
+/// un-nests that wrapper column and reports whether the result should be
+/// rendered as a single (un-arrayed) value — i.e. when the function is not
+/// set-returning.
+///
+/// The decision is driven by the plan's return-type metadata: composite and
+/// `record` returns (`RETURNS TABLE`, row types) have real output columns and
+/// are never un-nested, even when a single column happens to share the
+/// function's name (e.g. `CREATE FUNCTION foo() RETURNS TABLE(foo int)`).
+fn unwrap_rpc_rows(
+    rows: Vec<serde_json::Value>,
+    call: &CallPlan,
+) -> (Vec<serde_json::Value>, bool) {
+    let singular = !call.returns_set;
+
+    if call.returns_composite {
+        return (rows, singular);
+    }
+
+    let fname = call.function.name.as_str();
+    let unwrapped = rows
+        .into_iter()
+        .map(|row| match row {
+            serde_json::Value::Object(ref map) if map.len() == 1 && map.contains_key(fname) => {
+                map.get(fname).cloned().unwrap_or(serde_json::Value::Null)
+            }
+            other => other,
+        })
+        .collect();
+
+    (unwrapped, singular)
+}
+
 /// Convert a sqlx row to JSON.
 fn row_to_json(row: &sqlx::postgres::PgRow) -> serde_json::Value {
     use sqlx::{Column, Row, TypeInfo};
@@ -253,7 +295,7 @@ fn row_to_json(row: &sqlx::postgres::PgRow) -> serde_json::Value {
             "FLOAT8" | "DOUBLE PRECISION" => row
                 .try_get::<f64, _>(name)
                 .ok()
-                .and_then(|v| serde_json::Number::from_f64(v))
+                .and_then(serde_json::Number::from_f64)
                 .map(serde_json::Value::Number),
             "NUMERIC" | "DECIMAL" => row
                 .try_get::<sqlx::types::BigDecimal, _>(name)
@@ -340,7 +382,12 @@ fn map_sqlx_error(e: sqlx::Error) -> postrust_core::Error {
             // Try to downcast to Postgres-specific error for additional details
             let (details, hint) = db_err
                 .try_downcast_ref::<sqlx::postgres::PgDatabaseError>()
-                .map(|pg_err| (pg_err.detail().map(String::from), pg_err.hint().map(String::from)))
+                .map(|pg_err| {
+                    (
+                        pg_err.detail().map(String::from),
+                        pg_err.hint().map(String::from),
+                    )
+                })
                 .unwrap_or((None, None));
 
             postrust_core::Error::Database(postrust_core::error::DatabaseError {
@@ -421,5 +468,101 @@ fn sanitize_error_message(error: &postrust_core::Error) -> &'static str {
         Error::ConnectionPool(_) => "Service temporarily unavailable",
         Error::Internal(_) => "Internal server error",
         _ => "An error occurred",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use postrust_core::plan::CallParams;
+    use postrust_core::QualifiedIdentifier;
+    use serde_json::json;
+
+    fn call_plan(name: &str, returns_set: bool) -> CallPlan {
+        CallPlan {
+            function: QualifiedIdentifier::new("public", name),
+            params: CallParams::None,
+            returns_scalar: !returns_set,
+            returns_set,
+            returns_composite: false,
+            volatility: "Volatile".into(),
+        }
+    }
+
+    fn composite_call_plan(name: &str, returns_set: bool) -> CallPlan {
+        CallPlan {
+            returns_composite: true,
+            returns_scalar: false,
+            ..call_plan(name, returns_set)
+        }
+    }
+
+    #[test]
+    fn unwraps_json_return_to_bare_object() {
+        // `SELECT * FROM sync(...)` on a json-returning function yields a single
+        // column named after the function.
+        let rows = vec![json!({"sync": {"ok": true, "count": 3}})];
+        let (rows, singular) = unwrap_rpc_rows(rows, &call_plan("sync", false));
+        assert!(singular, "non-set-returning function should be singular");
+        assert_eq!(rows, vec![json!({"ok": true, "count": 3})]);
+    }
+
+    #[test]
+    fn unwraps_scalar_return() {
+        let rows = vec![json!({"add": 42})];
+        let (rows, singular) = unwrap_rpc_rows(rows, &call_plan("add", false));
+        assert!(singular);
+        assert_eq!(rows, vec![json!(42)]);
+    }
+
+    #[test]
+    fn unwraps_setof_scalar_to_array() {
+        let rows = vec![json!({"gen": 1}), json!({"gen": 2})];
+        let (rows, singular) = unwrap_rpc_rows(rows, &call_plan("gen", true));
+        assert!(!singular, "set-returning function should not be singular");
+        assert_eq!(rows, vec![json!(1), json!(2)]);
+    }
+
+    #[test]
+    fn leaves_multi_column_rows_untouched() {
+        // `RETURNS TABLE(...)` / composite set: rows already have real columns
+        // and must not be un-nested.
+        let rows = vec![json!({"id": 1, "name": "a"}), json!({"id": 2, "name": "b"})];
+        let (out, singular) =
+            unwrap_rpc_rows(rows.clone(), &composite_call_plan("list_users", true));
+        assert!(!singular);
+        assert_eq!(out, rows);
+    }
+
+    #[test]
+    fn leaves_table_column_named_like_function_untouched() {
+        // `CREATE FUNCTION foo() RETURNS TABLE(foo int)`: the single output
+        // column legitimately shares the function's name. The composite
+        // return-type metadata must prevent it from being mistaken for the
+        // function-name wrapper.
+        let rows = vec![json!({"foo": 1}), json!({"foo": 2})];
+        let (out, singular) = unwrap_rpc_rows(rows.clone(), &composite_call_plan("foo", true));
+        assert!(!singular);
+        assert_eq!(out, rows);
+    }
+
+    #[test]
+    fn single_composite_return_is_singular_but_not_unwrapped() {
+        // A non-set function returning a row type expands to its columns;
+        // nothing to un-nest, but the result still renders as a bare object.
+        let rows = vec![json!({"id": 1, "name": "a"})];
+        let (out, singular) =
+            unwrap_rpc_rows(rows.clone(), &composite_call_plan("get_user", false));
+        assert!(singular);
+        assert_eq!(out, rows);
+    }
+
+    #[test]
+    fn leaves_single_key_row_untouched_when_key_is_not_function_name() {
+        // A single real column that happens to be the only column should not be
+        // mistaken for the function-name wrapper.
+        let rows = vec![json!({"id": 7})];
+        let (out, _) = unwrap_rpc_rows(rows.clone(), &call_plan("get_thing", false));
+        assert_eq!(out, rows);
     }
 }

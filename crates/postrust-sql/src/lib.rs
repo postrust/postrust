@@ -4,29 +4,27 @@
 //! using parameterized queries to prevent SQL injection.
 
 mod builder;
+mod delete;
 mod expr;
 pub mod identifier;
+mod insert;
 mod param;
 mod select;
-mod insert;
 mod update;
-mod delete;
 
 pub use builder::{SqlBuilder, SqlFragment};
+pub use delete::DeleteBuilder;
 pub use expr::{Expr, OrderExpr};
-pub use identifier::{escape_ident, quote_literal, from_qi, QualifiedIdentifier};
+pub use identifier::{escape_ident, from_qi, quote_literal, QualifiedIdentifier};
+pub use insert::InsertBuilder;
 pub use param::SqlParam;
 pub use select::SelectBuilder;
-pub use insert::InsertBuilder;
 pub use update::UpdateBuilder;
-pub use delete::DeleteBuilder;
 
 /// Prelude for common imports.
 pub mod prelude {
     pub use super::{
-        SqlBuilder, SqlFragment, SqlParam,
-        SelectBuilder, InsertBuilder, UpdateBuilder, DeleteBuilder,
-        Expr, OrderExpr,
-        escape_ident, quote_literal, from_qi,
+        escape_ident, from_qi, quote_literal, DeleteBuilder, Expr, InsertBuilder, OrderExpr,
+        SelectBuilder, SqlBuilder, SqlFragment, SqlParam, UpdateBuilder,
     };
 }

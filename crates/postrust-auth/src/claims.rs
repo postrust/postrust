@@ -104,7 +104,10 @@ mod tests {
     fn test_claims_prefixed_entries() {
         let mut claims = Claims::new();
         claims.set("role", serde_json::Value::String("admin".into()));
-        claims.set("email", serde_json::Value::String("test@example.com".into()));
+        claims.set(
+            "email",
+            serde_json::Value::String("test@example.com".into()),
+        );
 
         let entries = claims.prefixed_entries("request.jwt.claims.");
         assert_eq!(entries.len(), 2);

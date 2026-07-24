@@ -4,8 +4,6 @@
 
 use bytes::Bytes;
 use http_body_util::{combinators::BoxBody, BodyExt, Empty, Full};
-use hyper::body::Body;
-use std::convert::Infallible;
 
 /// Boxed body type used throughout the proxy.
 pub type ProxyBody = BoxBody<Bytes, hyper::Error>;
@@ -43,12 +41,12 @@ impl IncomingBodyExt for hyper::body::Incoming {
 
 /// Timer utilities for request timeouts.
 pub mod timer {
+    use pin_project_lite::pin_project;
     use std::future::Future;
     use std::pin::Pin;
     use std::task::{Context, Poll};
     use std::time::Duration;
     use tokio::time::{sleep, Sleep};
-    use pin_project_lite::pin_project;
 
     pin_project! {
         /// A future that resolves after a timeout or when the inner future completes.

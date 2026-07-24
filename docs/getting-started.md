@@ -25,6 +25,12 @@ docker-compose up -d
 curl http://localhost:3000/
 ```
 
+> **Note on paths.** By default the REST API is served under `/api` (e.g.
+> `GET /api/products`). The examples in this guide use root-level paths like
+> `/products` — these work as-is with
+> [compatibility mode](configuration.md#compatibility-settings)
+> (`PGRST_COMPAT_MODE=true`) enabled; otherwise prefix them with `/api`.
+
 ### Option 2: Building from Source
 
 ```bash

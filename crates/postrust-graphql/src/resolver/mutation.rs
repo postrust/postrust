@@ -239,11 +239,9 @@ fn input_value_to_json(value: &InputValue) -> serde_json::Value {
         InputValue::Null => serde_json::Value::Null,
         InputValue::Bool(b) => serde_json::Value::Bool(*b),
         InputValue::Int(i) => serde_json::Value::Number((*i).into()),
-        InputValue::Float(f) => {
-            serde_json::Number::from_f64(*f)
-                .map(serde_json::Value::Number)
-                .unwrap_or(serde_json::Value::Null)
-        }
+        InputValue::Float(f) => serde_json::Number::from_f64(*f)
+            .map(serde_json::Value::Number)
+            .unwrap_or(serde_json::Value::Null),
         InputValue::String(s) => serde_json::Value::String(s.clone()),
         InputValue::Object(obj) => {
             let map: serde_json::Map<String, serde_json::Value> = obj
@@ -441,7 +439,10 @@ mod tests {
     fn test_insert_args_with_object() {
         let mut object = HashMap::new();
         object.insert("name".to_string(), InputValue::String("Alice".to_string()));
-        object.insert("email".to_string(), InputValue::String("alice@example.com".to_string()));
+        object.insert(
+            "email".to_string(),
+            InputValue::String("alice@example.com".to_string()),
+        );
 
         let args = InsertArgs::new().with_object(object);
         assert!(args.has_objects());
@@ -450,12 +451,14 @@ mod tests {
 
     #[test]
     fn test_insert_args_with_multiple_objects() {
-        let obj1: HashMap<String, InputValue> = [
-            ("name".to_string(), InputValue::String("Alice".to_string())),
-        ].into_iter().collect();
-        let obj2: HashMap<String, InputValue> = [
-            ("name".to_string(), InputValue::String("Bob".to_string())),
-        ].into_iter().collect();
+        let obj1: HashMap<String, InputValue> =
+            [("name".to_string(), InputValue::String("Alice".to_string()))]
+                .into_iter()
+                .collect();
+        let obj2: HashMap<String, InputValue> =
+            [("name".to_string(), InputValue::String("Bob".to_string()))]
+                .into_iter()
+                .collect();
 
         let args = InsertArgs::new().with_objects(vec![obj1, obj2]);
         assert_eq!(args.object_count(), 2);
@@ -465,8 +468,13 @@ mod tests {
     fn test_insert_args_column_names() {
         let object: HashMap<String, InputValue> = [
             ("name".to_string(), InputValue::String("Alice".to_string())),
-            ("email".to_string(), InputValue::String("alice@example.com".to_string())),
-        ].into_iter().collect();
+            (
+                "email".to_string(),
+                InputValue::String("alice@example.com".to_string()),
+            ),
+        ]
+        .into_iter()
+        .collect();
 
         let args = InsertArgs::new().with_object(object);
         let columns = args.column_names();
@@ -477,9 +485,10 @@ mod tests {
 
     #[test]
     fn test_insert_args_to_json_bytes() {
-        let object: HashMap<String, InputValue> = [
-            ("name".to_string(), InputValue::String("Alice".to_string())),
-        ].into_iter().collect();
+        let object: HashMap<String, InputValue> =
+            [("name".to_string(), InputValue::String("Alice".to_string()))]
+                .into_iter()
+                .collect();
 
         let args = InsertArgs::new().with_object(object);
         let bytes = args.to_json_bytes().unwrap();
@@ -489,8 +498,7 @@ mod tests {
 
     #[test]
     fn test_insert_args_with_returning() {
-        let args = InsertArgs::new()
-            .with_returning(vec!["id".to_string(), "name".to_string()]);
+        let args = InsertArgs::new().with_returning(vec!["id".to_string(), "name".to_string()]);
         assert_eq!(args.returning.len(), 2);
     }
 
@@ -529,9 +537,12 @@ mod tests {
 
     #[test]
     fn test_update_args_with_set() {
-        let set: HashMap<String, InputValue> = [
-            ("name".to_string(), InputValue::String("Updated".to_string())),
-        ].into_iter().collect();
+        let set: HashMap<String, InputValue> = [(
+            "name".to_string(),
+            InputValue::String("Updated".to_string()),
+        )]
+        .into_iter()
+        .collect();
 
         let args = UpdateArgs::new().with_set(set);
         assert!(args.has_set());
@@ -555,9 +566,14 @@ mod tests {
     #[test]
     fn test_update_args_to_json_bytes() {
         let set: HashMap<String, InputValue> = [
-            ("name".to_string(), InputValue::String("Updated".to_string())),
+            (
+                "name".to_string(),
+                InputValue::String("Updated".to_string()),
+            ),
             ("active".to_string(), InputValue::Bool(true)),
-        ].into_iter().collect();
+        ]
+        .into_iter()
+        .collect();
 
         let args = UpdateArgs::new().with_set(set);
         let bytes = args.to_json_bytes().unwrap();
@@ -592,8 +608,7 @@ mod tests {
 
     #[test]
     fn test_delete_args_with_returning() {
-        let args = DeleteArgs::new()
-            .with_returning(vec!["id".to_string(), "name".to_string()]);
+        let args = DeleteArgs::new().with_returning(vec!["id".to_string(), "name".to_string()]);
         assert_eq!(args.returning.len(), 2);
     }
 
@@ -621,8 +636,8 @@ mod tests {
 
     #[test]
     fn test_input_value_to_json_float() {
-        let json = input_value_to_json(&InputValue::Float(3.14));
-        assert_eq!(json, serde_json::json!(3.14));
+        let json = input_value_to_json(&InputValue::Float(1.5));
+        assert_eq!(json, serde_json::json!(1.5));
     }
 
     #[test]
@@ -633,11 +648,7 @@ mod tests {
 
     #[test]
     fn test_input_value_to_json_array() {
-        let arr = vec![
-            InputValue::Int(1),
-            InputValue::Int(2),
-            InputValue::Int(3),
-        ];
+        let arr = vec![InputValue::Int(1), InputValue::Int(2), InputValue::Int(3)];
         let json = input_value_to_json(&InputValue::Array(arr));
         assert_eq!(json, serde_json::json!([1, 2, 3]));
     }
@@ -647,7 +658,9 @@ mod tests {
         let obj: HashMap<String, InputValue> = [
             ("name".to_string(), InputValue::String("test".to_string())),
             ("count".to_string(), InputValue::Int(5)),
-        ].into_iter().collect();
+        ]
+        .into_iter()
+        .collect();
         let json = input_value_to_json(&InputValue::Object(obj));
         assert_eq!(json["name"], "test");
         assert_eq!(json["count"], 5);
@@ -660,15 +673,21 @@ mod tests {
     #[test]
     fn test_build_insert_plan_basic() {
         let table = create_test_table();
-        let object: HashMap<String, InputValue> = [
-            ("name".to_string(), InputValue::String("Alice".to_string())),
-        ].into_iter().collect();
+        let object: HashMap<String, InputValue> =
+            [("name".to_string(), InputValue::String("Alice".to_string()))]
+                .into_iter()
+                .collect();
 
         let args = InsertArgs::new().with_object(object);
         let plan = build_insert_plan(&args, &table);
 
         match plan {
-            MutatePlan::Insert { target, body, returning, .. } => {
+            MutatePlan::Insert {
+                target,
+                body,
+                returning,
+                ..
+            } => {
                 assert_eq!(target.name, "users");
                 assert!(body.is_some());
                 assert_eq!(returning, vec!["id".to_string()]);
@@ -680,9 +699,10 @@ mod tests {
     #[test]
     fn test_build_insert_plan_with_returning() {
         let table = create_test_table();
-        let object: HashMap<String, InputValue> = [
-            ("name".to_string(), InputValue::String("Alice".to_string())),
-        ].into_iter().collect();
+        let object: HashMap<String, InputValue> =
+            [("name".to_string(), InputValue::String("Alice".to_string()))]
+                .into_iter()
+                .collect();
 
         let args = InsertArgs::new()
             .with_object(object)
@@ -700,9 +720,10 @@ mod tests {
     #[test]
     fn test_build_insert_plan_with_on_conflict() {
         let table = create_test_table();
-        let object: HashMap<String, InputValue> = [
-            ("name".to_string(), InputValue::String("Alice".to_string())),
-        ].into_iter().collect();
+        let object: HashMap<String, InputValue> =
+            [("name".to_string(), InputValue::String("Alice".to_string()))]
+                .into_iter()
+                .collect();
 
         let on_conflict = OnConflictArgs::new(vec!["id".to_string()]);
         let args = InsertArgs::new()
@@ -723,9 +744,12 @@ mod tests {
     #[test]
     fn test_build_update_plan_basic() {
         let table = create_test_table();
-        let set: HashMap<String, InputValue> = [
-            ("name".to_string(), InputValue::String("Updated".to_string())),
-        ].into_iter().collect();
+        let set: HashMap<String, InputValue> = [(
+            "name".to_string(),
+            InputValue::String("Updated".to_string()),
+        )]
+        .into_iter()
+        .collect();
 
         let filter = TableFilter::new().with_field(
             "id",
@@ -735,13 +759,16 @@ mod tests {
             }),
         );
 
-        let args = UpdateArgs::new()
-            .with_set(set)
-            .with_filter(filter);
+        let args = UpdateArgs::new().with_set(set).with_filter(filter);
         let plan = build_update_plan(&args, &table);
 
         match plan {
-            MutatePlan::Update { target, body, where_clauses, .. } => {
+            MutatePlan::Update {
+                target,
+                body,
+                where_clauses,
+                ..
+            } => {
                 assert_eq!(target.name, "users");
                 assert!(body.is_some());
                 assert!(!where_clauses.is_empty());
@@ -753,9 +780,12 @@ mod tests {
     #[test]
     fn test_build_update_plan_with_returning() {
         let table = create_test_table();
-        let set: HashMap<String, InputValue> = [
-            ("name".to_string(), InputValue::String("Updated".to_string())),
-        ].into_iter().collect();
+        let set: HashMap<String, InputValue> = [(
+            "name".to_string(),
+            InputValue::String("Updated".to_string()),
+        )]
+        .into_iter()
+        .collect();
 
         let args = UpdateArgs::new()
             .with_set(set)
@@ -785,7 +815,11 @@ mod tests {
         let plan = build_delete_plan(&args, &table);
 
         match plan {
-            MutatePlan::Delete { target, where_clauses, returning } => {
+            MutatePlan::Delete {
+                target,
+                where_clauses,
+                returning,
+            } => {
                 assert_eq!(target.name, "users");
                 assert!(!where_clauses.is_empty());
                 assert_eq!(returning, vec!["id".to_string()]);
@@ -797,8 +831,11 @@ mod tests {
     #[test]
     fn test_build_delete_plan_with_returning() {
         let table = create_test_table();
-        let args = DeleteArgs::new()
-            .with_returning(vec!["id".to_string(), "name".to_string(), "email".to_string()]);
+        let args = DeleteArgs::new().with_returning(vec![
+            "id".to_string(),
+            "name".to_string(),
+            "email".to_string(),
+        ]);
         let plan = build_delete_plan(&args, &table);
 
         match plan {

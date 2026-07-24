@@ -86,8 +86,7 @@ impl InsertBuilder {
 
     /// Add RETURNING clause.
     pub fn returning(mut self, column: &str) -> Self {
-        self.returning
-            .push(SqlFragment::raw(escape_ident(column)));
+        self.returning.push(SqlFragment::raw(escape_ident(column)));
         self
     }
 
@@ -199,7 +198,10 @@ mod tests {
         let sql = InsertBuilder::new()
             .into_table(&qi)
             .columns(vec!["name".into(), "email".into()])
-            .values(vec![SqlParam::text("John"), SqlParam::text("john@example.com")])
+            .values(vec![
+                SqlParam::text("John"),
+                SqlParam::text("john@example.com"),
+            ])
             .build();
 
         assert!(sql.sql().contains("INSERT INTO"));

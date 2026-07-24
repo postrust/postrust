@@ -2,13 +2,13 @@
 //!
 //! This module provides the main proxy service that handles incoming connections.
 
-use crate::config::{ProxyConfig, Route};
+use crate::config::ProxyConfig;
 use crate::health::HealthChecker;
 use crate::ratelimit::{RateLimitKey, RateLimiter};
-use crate::vendored::backend::{BackendAppManager, LoadBalanceContext};
+use crate::vendored::backend::BackendAppManager;
 use crate::vendored::forwarder::ForwarderClient;
 use crate::vendored::handler::MessageHandler;
-use crate::vendored::hyper_ext::{ProxyBody, IncomingBodyExt, TokioExecutor};
+use crate::vendored::hyper_ext::{IncomingBodyExt, ProxyBody};
 use crate::vendored::types::PathName;
 use hyper::body::Incoming;
 use hyper::server::conn::http1;
@@ -41,9 +41,8 @@ impl ProxyService {
         health_checker: Arc<HealthChecker>,
         rate_limiter: Arc<RateLimiter>,
     ) -> Self {
-        let backend_manager = Arc::new(
-            BackendAppManager::new().with_health_checker(health_checker)
-        );
+        let backend_manager =
+            Arc::new(BackendAppManager::new().with_health_checker(health_checker));
         let forwarder = Arc::new(ForwarderClient::default());
 
         Self {
@@ -66,9 +65,7 @@ impl ProxyService {
         // Register routes
         for route in &config.routes {
             // Find upstream by name
-            if let Some(upstream) = config.upstreams.iter()
-                .find(|u| u.name == route.upstream)
-            {
+            if let Some(upstream) = config.upstreams.iter().find(|u| u.name == route.upstream) {
                 if let Some(upstream_id) = upstream.id {
                     use crate::vendored::types::ServerName;
                     let host = route.match_.host.as_deref().unwrap_or("*");
@@ -80,7 +77,11 @@ impl ProxyService {
             }
         }
 
-        info!("Loaded {} routes and {} upstreams", config.routes.len(), config.upstreams.len());
+        info!(
+            "Loaded {} routes and {} upstreams",
+            config.routes.len(),
+            config.upstreams.len()
+        );
     }
 
     /// Start the HTTP proxy server.
@@ -154,7 +155,9 @@ impl ProxyService {
         // Find matching route and upstream
         let (route, upstream_id) = {
             let config = self.config.read().await;
-            let matched = config.routes.iter()
+            let matched = config
+                .routes
+                .iter()
                 .filter(|r| r.enabled)
                 .filter(|r| {
                     let route_host = r.match_.host.as_deref().unwrap_or("*");
@@ -173,12 +176,14 @@ impl ProxyService {
             match matched {
                 Some(r) => {
                     // Find upstream ID
-                    let upstream_id = config.upstreams.iter()
+                    let upstream_id = config
+                        .upstreams
+                        .iter()
                         .find(|u| u.name == r.upstream)
                         .and_then(|u| u.id);
                     (Some(r), upstream_id)
                 }
-                None => (None, None)
+                None => (None, None),
             }
         };
 
@@ -193,7 +198,10 @@ impl ProxyService {
         let upstream_id = match upstream_id {
             Some(id) => id,
             None => {
-                warn!("Upstream '{}' not found for route {}", route.upstream, route.name);
+                warn!(
+                    "Upstream '{}' not found for route {}",
+                    route.upstream, route.name
+                );
                 return Ok(MessageHandler::service_unavailable("Upstream not found"));
             }
         };
@@ -202,12 +210,14 @@ impl ProxyService {
         if let Some(ref rate_limit) = route.rate_limit {
             let key = RateLimitKey::Ip(client_addr.ip());
             // Convert requests/window to rps
-            let rps = if rate_limit.window_secs > 0 {
-                rate_limit.requests / rate_limit.window_secs
-            } else {
-                rate_limit.requests
-            };
-            if !self.rate_limiter.check_with_config(key, rps, rate_limit.requests) {
+            let rps = rate_limit
+                .requests
+                .checked_div(rate_limit.window_secs)
+                .unwrap_or(rate_limit.requests);
+            if !self
+                .rate_limiter
+                .check_with_config(key, rps, rate_limit.requests)
+            {
                 return Ok(MessageHandler::too_many_requests());
             }
         }
@@ -217,7 +227,9 @@ impl ProxyService {
             Some(b) => b,
             None => {
                 warn!("No healthy backends for route {}", route.name);
-                return Ok(MessageHandler::service_unavailable("No healthy backends available"));
+                return Ok(MessageHandler::service_unavailable(
+                    "No healthy backends available",
+                ));
             }
         };
 
@@ -249,7 +261,10 @@ impl ProxyService {
             }
             Err(e) => {
                 error!("Forward error to {}: {}", backend.address, e);
-                Ok(MessageHandler::bad_gateway(&format!("Backend error: {}", e)))
+                Ok(MessageHandler::bad_gateway(&format!(
+                    "Backend error: {}",
+                    e
+                )))
             }
         }
     }

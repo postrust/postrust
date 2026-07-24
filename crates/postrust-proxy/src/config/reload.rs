@@ -1,11 +1,8 @@
 //! Configuration hot-reload via file watching and database LISTEN/NOTIFY.
 
 use crate::config::ProxyConfig;
-use crate::error::ProxyResult;
-use std::path::Path;
 use std::sync::Arc;
 use tokio::sync::RwLock;
-use tracing::{info, warn, error};
 
 /// Configuration change event.
 #[derive(Debug, Clone)]

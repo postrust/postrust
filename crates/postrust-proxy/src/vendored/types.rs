@@ -1,6 +1,5 @@
 //! Vendored types from rpxy-lib: globals.rs, error.rs, name_exp.rs
 
-use std::sync::Arc;
 use thiserror::Error;
 
 /// Vendored error type (adapted from rpxy error.rs).
@@ -52,17 +51,19 @@ impl ServerName {
             return true;
         }
 
-        // Wildcard match (e.g., *.example.com matches sub.example.com)
+        // Wildcard match: `*.example.com` matches exactly one label
+        // (e.g. `sub.example.com`) but not `example.com` or the multi-level
+        // `sub.sub.example.com`, per RFC 6125 wildcard semantics.
         if self.0.starts_with("*.") {
             let suffix = &self.0[2..];
             if host.ends_with(suffix) {
-                // Ensure it's a subdomain match, not just suffix match
                 let prefix_len = host.len() - suffix.len();
-                if prefix_len > 0 && host.chars().nth(prefix_len - 1) == Some('.') {
-                    return true;
-                }
-                // Single subdomain level (e.g., sub.example.com for *.example.com)
-                if prefix_len > 0 && !host[..prefix_len - 1].contains('.') {
+                // The prefix must be a single non-empty label followed by a dot,
+                // with no interior dots of its own.
+                if prefix_len > 0
+                    && host.chars().nth(prefix_len - 1) == Some('.')
+                    && !host[..prefix_len - 1].contains('.')
+                {
                     return true;
                 }
             }
@@ -106,6 +107,11 @@ impl PathName {
     /// Get the length of this path (for longest-prefix matching).
     pub fn len(&self) -> usize {
         self.0.len()
+    }
+
+    /// Whether the underlying path string is empty.
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
     }
 
     /// Check if the path is empty (just "/").

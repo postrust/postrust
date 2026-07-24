@@ -276,8 +276,8 @@ pub struct DomainRouteRow {
 
 impl From<DomainRouteRow> for DomainRoute {
     fn from(row: DomainRouteRow) -> Self {
-        let add_headers: HashMap<String, String> = serde_json::from_value(row.add_headers)
-            .unwrap_or_default();
+        let add_headers: HashMap<String, String> =
+            serde_json::from_value(row.add_headers).unwrap_or_default();
 
         Self {
             id: row.id,

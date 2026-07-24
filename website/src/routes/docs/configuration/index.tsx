@@ -37,6 +37,12 @@ const configVars = [
     ],
   },
   {
+    category: "Compatibility",
+    vars: [
+      { name: "PGRST_COMPAT_MODE", required: false, default: "false", desc: "PostgREST compatibility mode: serves the REST API at the root (/rpc/fn, /table) in addition to /api, and un-wraps RPC responses to PostgREST's shape. Alias: POSTRUST_COMPAT_MODE" },
+    ],
+  },
+  {
     category: "Logging",
     vars: [
       { name: "PGRST_LOG_LEVEL", required: false, default: "info", desc: "Log level (error, warn, info, debug)" },

@@ -68,10 +68,7 @@ fn parse_urlencoded_payload(body: Bytes) -> Result<Option<Payload>> {
 }
 
 /// Check if payload keys match the expected columns.
-pub fn validate_payload_columns(
-    payload: &Payload,
-    expected: &HashSet<String>,
-) -> Result<()> {
+pub fn validate_payload_columns(payload: &Payload, expected: &HashSet<String>) -> Result<()> {
     let keys = match payload {
         Payload::ProcessedJson { keys, .. } => keys,
         Payload::ProcessedUrlEncoded { keys, .. } => keys,

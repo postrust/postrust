@@ -2,6 +2,12 @@
 
 Complete reference for the Postrust REST and GraphQL APIs.
 
+> **Note on paths.** By default the REST API is served under `/api` (e.g.
+> `GET /api/users`, `POST /api/rpc/my_func`) and GraphQL under `/api/graphql`.
+> The endpoints below are shown as root-level paths — these work as-is when
+> [compatibility mode](configuration.md#compatibility-settings)
+> (`PGRST_COMPAT_MODE=true`) is enabled; otherwise prefix them with `/api`.
+
 ## Endpoints
 
 ### Tables and Views (REST)
@@ -25,18 +31,25 @@ Complete reference for the Postrust REST and GraphQL APIs.
 | `HEAD` | `/rpc/{function}` | Get function headers |
 | `OPTIONS` | `/rpc/{function}` | Get function info |
 
+By default, RPC results are array-wrapped and keyed by function name
+(`[{"my_func": ...}]`). In [compatibility mode](configuration.md#compatibility-settings)
+they match PostgREST: a bare object/scalar for non-set-returning functions and a
+top-level array for set-returning ones.
+
 ### GraphQL
 
 | Method | Endpoint | Description |
 |--------|----------|-------------|
-| `GET` | `/graphql` | GraphQL Playground |
-| `POST` | `/graphql` | Execute GraphQL query/mutation |
+| `GET` | `/api/graphql` | GraphQL Playground |
+| `POST` | `/api/graphql` | Execute GraphQL query/mutation |
+
+GraphQL is always served under `/api/graphql`, including in compatibility mode.
 
 ### Schema
 
 | Method | Endpoint | Description |
 |--------|----------|-------------|
-| `GET` | `/` | OpenAPI specification |
+| `GET` | `/` | Server info document (the OpenAPI spec is served under `/admin` with the `admin-ui` feature) |
 
 ### Admin UI (requires `admin-ui` feature)
 
@@ -385,7 +398,7 @@ Postrust provides a full GraphQL API that mirrors the REST API functionality. Th
 Access the interactive GraphQL Playground by visiting `/graphql` in your browser:
 
 ```
-http://localhost:3000/graphql
+http://localhost:3000/api/graphql
 ```
 
 ### Query Structure
@@ -640,7 +653,7 @@ PostgreSQL types are mapped to GraphQL types:
 GraphQL requests use the same JWT authentication as REST:
 
 ```bash
-curl -X POST http://localhost:3000/graphql \
+curl -X POST http://localhost:3000/api/graphql \
   -H "Authorization: Bearer eyJhbGciOiJIUzI1NiIs..." \
   -H "Content-Type: application/json" \
   -d '{"query": "{ users { id name } }"}'

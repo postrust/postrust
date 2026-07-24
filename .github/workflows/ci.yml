@@ -1,0 +1,89 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  lint:
+    name: fmt + clippy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust (stable)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+      - name: Clippy (workspace, default features)
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: Clippy (server, admin-ui feature)
+        run: cargo clippy -p postrust-server --features admin-ui --all-targets -- -D warnings
+
+  test:
+    name: build + test
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: postrust_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres -d postrust_test"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      DATABASE_URL: postgres://postgres:postgres@localhost:5432/postrust_test
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust (stable)
+        uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build (default features)
+        run: cargo build --workspace --all-targets
+
+      - name: Build (server, admin-ui feature)
+        run: cargo build -p postrust-server --features admin-ui
+
+      - name: Test (unit + doc, no database required)
+        run: cargo test --workspace
+
+      - name: Load database schema
+        run: |
+          set -euo pipefail
+          for f in scripts/init-db.sql scripts/test-fixtures.sql; do
+            if [ -f "$f" ]; then
+              PGPASSWORD=postgres psql -h localhost -U postgres -d postrust_test -v ON_ERROR_STOP=1 -f "$f"
+            fi
+          done
+
+      - name: Integration tests (database-backed)
+        # --lib/--bins/--tests keeps doctests out of this pass: `-- --ignored`
+        # would otherwise also run doc examples marked `ignore`, which are
+        # sketches that don't compile.
+        run: cargo test --workspace --lib --bins --tests -- --ignored

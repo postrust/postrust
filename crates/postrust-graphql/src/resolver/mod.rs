@@ -1,7 +1,7 @@
 //! GraphQL resolvers for queries, mutations, and field resolution.
 
-pub mod query;
-pub mod mutation;
 pub mod field;
+pub mod mutation;
+pub mod query;
 
 // TODO: Implement resolvers

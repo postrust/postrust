@@ -3,14 +3,14 @@
 //! This module handles parsing HTTP requests into the domain-specific
 //! `ApiRequest` type that can be used for query planning.
 
-pub mod types;
-pub mod query_params;
 pub mod payload;
 pub mod preferences;
+pub mod query_params;
+pub mod types;
 
-pub use types::*;
-pub use query_params::parse_query_params;
 pub use preferences::parse_preferences;
+pub use query_params::parse_query_params;
+pub use types::*;
 
 use crate::error::{Error, Result};
 use http::{Method, Request};
@@ -108,7 +108,9 @@ fn parse_schema<B>(
 ) -> Result<(String, bool)> {
     // Check Accept-Profile header first (for reads)
     if let Some(profile) = req.headers().get("accept-profile") {
-        let schema = profile.to_str().map_err(|_| Error::InvalidHeader("Accept-Profile"))?;
+        let schema = profile
+            .to_str()
+            .map_err(|_| Error::InvalidHeader("Accept-Profile"))?;
         if !schemas.contains(&schema.to_string()) {
             return Err(Error::UnacceptableSchema(schema.into()));
         }
@@ -117,7 +119,9 @@ fn parse_schema<B>(
 
     // Check Content-Profile header (for writes)
     if let Some(profile) = req.headers().get("content-profile") {
-        let schema = profile.to_str().map_err(|_| Error::InvalidHeader("Content-Profile"))?;
+        let schema = profile
+            .to_str()
+            .map_err(|_| Error::InvalidHeader("Content-Profile"))?;
         if !schemas.contains(&schema.to_string()) {
             return Err(Error::UnacceptableSchema(schema.into()));
         }
@@ -173,7 +177,9 @@ fn parse_action(method: &Method, resource: &Resource, schema: &str) -> Result<Ac
         // RPC endpoints
         (&Method::GET, Resource::Routine(name)) => Ok(Action::Db(DbAction::Routine {
             qi: QualifiedIdentifier::new(schema, name),
-            invoke_method: InvokeMethod::InvRead { headers_only: false },
+            invoke_method: InvokeMethod::InvRead {
+                headers_only: false,
+            },
         })),
         (&Method::HEAD, Resource::Routine(name)) => Ok(Action::Db(DbAction::Routine {
             qi: QualifiedIdentifier::new(schema, name),
@@ -196,7 +202,9 @@ fn parse_action(method: &Method, resource: &Resource, schema: &str) -> Result<Ac
 /// Parse Accept header for content negotiation.
 fn parse_accept(headers: &http::HeaderMap) -> Result<Vec<MediaType>> {
     if let Some(accept) = headers.get(http::header::ACCEPT) {
-        let accept_str = accept.to_str().map_err(|_| Error::InvalidHeader("Accept"))?;
+        let accept_str = accept
+            .to_str()
+            .map_err(|_| Error::InvalidHeader("Accept"))?;
         // Simple parsing - full implementation would handle quality factors
         let types: Vec<MediaType> = accept_str
             .split(',')
@@ -224,9 +232,9 @@ fn parse_media_type(s: &str) -> MediaType {
         "application/x-www-form-urlencoded" => MediaType::UrlEncoded,
         "application/octet-stream" => MediaType::OctetStream,
         "*/*" => MediaType::Any,
-        s if s.starts_with("application/vnd.pgrst.object") => {
-            MediaType::SingularJson { nullable: s.contains("nulls=null") }
-        }
+        s if s.starts_with("application/vnd.pgrst.object") => MediaType::SingularJson {
+            nullable: s.contains("nulls=null"),
+        },
         s if s.starts_with("application/vnd.pgrst.array") => MediaType::ArrayJsonStrip,
         other => MediaType::Other(other.to_string()),
     }
@@ -235,7 +243,9 @@ fn parse_media_type(s: &str) -> MediaType {
 /// Parse Content-Type header.
 fn parse_content_type(headers: &http::HeaderMap) -> Result<MediaType> {
     if let Some(ct) = headers.get(http::header::CONTENT_TYPE) {
-        let ct_str = ct.to_str().map_err(|_| Error::InvalidHeader("Content-Type"))?;
+        let ct_str = ct
+            .to_str()
+            .map_err(|_| Error::InvalidHeader("Content-Type"))?;
         let media_type = ct_str.split(';').next().unwrap_or(ct_str).trim();
         return Ok(parse_media_type(media_type));
     }
@@ -264,9 +274,7 @@ fn parse_range(headers: &http::HeaderMap) -> Result<Range> {
 fn extract_headers(headers: &http::HeaderMap) -> indexmap::IndexMap<String, String> {
     headers
         .iter()
-        .filter_map(|(k, v)| {
-            v.to_str().ok().map(|v| (k.to_string(), v.to_string()))
-        })
+        .filter_map(|(k, v)| v.to_str().ok().map(|v| (k.to_string(), v.to_string())))
         .collect()
 }
 
@@ -278,9 +286,8 @@ fn extract_cookies(headers: &http::HeaderMap) -> indexmap::IndexMap<String, Stri
         .map(|s| {
             s.split(';')
                 .filter_map(|cookie| {
-                    let mut parts = cookie.trim().splitn(2, '=');
-                    let key = parts.next()?;
-                    let value = parts.next()?;
+                    let (key, value) = cookie.trim().split_once('=')?;
+
                     Some((key.to_string(), value.to_string()))
                 })
                 .collect()
@@ -307,7 +314,10 @@ mod tests {
 
     #[test]
     fn test_parse_media_type() {
-        assert_eq!(parse_media_type("application/json"), MediaType::ApplicationJson);
+        assert_eq!(
+            parse_media_type("application/json"),
+            MediaType::ApplicationJson
+        );
         assert_eq!(parse_media_type("text/csv"), MediaType::TextCsv);
         assert_eq!(parse_media_type("*/*"), MediaType::Any);
     }

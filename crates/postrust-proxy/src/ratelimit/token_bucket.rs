@@ -1,7 +1,6 @@
 //! Token bucket algorithm for rate limiting.
 
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::Instant;
 
 /// Token bucket rate limiter.
 ///

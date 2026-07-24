@@ -255,7 +255,10 @@ fn parse_filter_key(key: &str) -> Result<(EmbedPath, String)> {
         return Ok((vec![], parts[0].to_string()));
     }
 
-    let path: Vec<String> = parts[..parts.len() - 1].iter().map(|s| s.to_string()).collect();
+    let path: Vec<String> = parts[..parts.len() - 1]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
     let field = parts.last().unwrap().to_string();
     Ok((path, field))
 }
@@ -560,9 +563,7 @@ fn parse_json_path(input: &str) -> IResult<&str, JsonPath> {
 fn parse_arrow(input: &str) -> IResult<&str, JsonOperation> {
     let (input, _) = tag("->")(input)?;
     let (input, operand) = alt((
-        map(digit1, |s: &str| {
-            JsonOperand::Idx(s.parse().unwrap_or(0))
-        }),
+        map(digit1, |s: &str| JsonOperand::Idx(s.parse().unwrap_or(0))),
         map(parse_identifier, |s| JsonOperand::Key(s.to_string())),
     ))(input)?;
     Ok((input, JsonOperation::Arrow(operand)))
@@ -571,9 +572,7 @@ fn parse_arrow(input: &str) -> IResult<&str, JsonOperation> {
 fn parse_double_arrow(input: &str) -> IResult<&str, JsonOperation> {
     let (input, _) = tag("->>")(input)?;
     let (input, operand) = alt((
-        map(digit1, |s: &str| {
-            JsonOperand::Idx(s.parse().unwrap_or(0))
-        }),
+        map(digit1, |s: &str| JsonOperand::Idx(s.parse().unwrap_or(0))),
         map(parse_identifier, |s| JsonOperand::Key(s.to_string())),
     ))(input)?;
     Ok((input, JsonOperation::DoubleArrow(operand)))
@@ -642,7 +641,11 @@ mod tests {
     fn test_parse_fts() {
         let params = parse_query_params("content=fts(english).search+term").unwrap();
         match &params.filters_root[0].op_expr.operation {
-            Operation::Fts { op, language, value } => {
+            Operation::Fts {
+                op,
+                language,
+                value,
+            } => {
                 assert_eq!(*op, FtsOperator::Fts);
                 assert_eq!(language.as_deref(), Some("english"));
                 assert_eq!(value, "search+term");

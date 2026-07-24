@@ -2,14 +2,14 @@
 //!
 //! Handles content negotiation and response formatting for JSON, CSV, and other formats.
 
-mod json;
 mod headers;
+mod json;
 
-pub use json::format_json_response;
 pub use headers::{build_response_headers, ContentRange};
+pub use json::format_json_response;
 
 use http::{HeaderMap, HeaderValue, StatusCode};
-use postrust_core::{ActionPlan, ApiRequest, MediaType, PreferRepresentation};
+use postrust_core::{ApiRequest, MediaType};
 use serde::Serialize;
 
 /// A formatted HTTP response.
@@ -85,7 +85,11 @@ pub fn format_response(
 
     match &media_type {
         MediaType::ApplicationJson => {
-            let body = format_json_response(&result.rows)?;
+            let body = if result.singular {
+                format_singular_or_null(&result.rows)?
+            } else {
+                format_json_response(&result.rows)?
+            };
             let mut response = Response::new(result.status, body);
             response.set_content_type("application/json; charset=utf-8");
             add_common_headers(&mut response, request, result);
@@ -107,8 +111,12 @@ pub fn format_response(
             Ok(response)
         }
         _ => {
-            // Default to JSON
-            let body = format_json_response(&result.rows)?;
+            // Default to JSON (covers `*/*`, e.g. a default curl request).
+            let body = if result.singular {
+                format_singular_or_null(&result.rows)?
+            } else {
+                format_json_response(&result.rows)?
+            };
             let mut response = Response::new(result.status, body);
             response.set_content_type("application/json; charset=utf-8");
             add_common_headers(&mut response, request, result);
@@ -130,7 +138,9 @@ fn add_common_headers(response: &mut Response, request: &ApiRequest, result: &Qu
     }
 
     // Preference-Applied
-    if let Some(applied) = postrust_core::api_request::preferences::preference_applied(&request.preferences) {
+    if let Some(applied) =
+        postrust_core::api_request::preferences::preference_applied(&request.preferences)
+    {
         response.set_header("preference-applied", &applied);
     }
 
@@ -140,8 +150,24 @@ fn add_common_headers(response: &mut Response, request: &ApiRequest, result: &Qu
     }
 }
 
+/// Format a result as a single value (PostgREST-compatibility RPC responses).
+///
+/// A single row is emitted bare (not array-wrapped), no rows becomes `null`,
+/// and the (unexpected) multi-row case falls back to a JSON array so no data
+/// is silently dropped.
+fn format_singular_or_null(rows: &[serde_json::Value]) -> Result<bytes::Bytes, FormatError> {
+    match rows.len() {
+        0 => Ok(bytes::Bytes::from_static(b"null")),
+        1 => Ok(bytes::Bytes::from(serde_json::to_vec(&rows[0])?)),
+        _ => format_json_response(rows),
+    }
+}
+
 /// Format singular JSON (single object or null).
-fn format_singular_json(rows: &[serde_json::Value], nullable: bool) -> Result<bytes::Bytes, FormatError> {
+fn format_singular_json(
+    rows: &[serde_json::Value],
+    nullable: bool,
+) -> Result<bytes::Bytes, FormatError> {
     match rows.len() {
         0 if nullable => Ok(bytes::Bytes::from_static(b"null")),
         0 => Err(FormatError::NotFound),
@@ -159,27 +185,20 @@ fn format_csv_response(rows: &[serde_json::Value]) -> Result<bytes::Bytes, Forma
     let mut output = Vec::new();
 
     // Get headers from first row
-    if let Some(first) = rows.first() {
-        if let serde_json::Value::Object(map) = first {
-            let headers: Vec<&str> = map.keys().map(|s| s.as_str()).collect();
-            output.extend_from_slice(headers.join(",").as_bytes());
-            output.push(b'\n');
+    if let Some(serde_json::Value::Object(map)) = rows.first() {
+        let headers: Vec<&str> = map.keys().map(|s| s.as_str()).collect();
+        output.extend_from_slice(headers.join(",").as_bytes());
+        output.push(b'\n');
 
-            // Write rows
-            for row in rows {
-                if let serde_json::Value::Object(row_map) = row {
-                    let values: Vec<String> = headers
-                        .iter()
-                        .map(|h| {
-                            row_map
-                                .get(*h)
-                                .map(|v| csv_escape(v))
-                                .unwrap_or_default()
-                        })
-                        .collect();
-                    output.extend_from_slice(values.join(",").as_bytes());
-                    output.push(b'\n');
-                }
+        // Write rows
+        for row in rows {
+            if let serde_json::Value::Object(row_map) = row {
+                let values: Vec<String> = headers
+                    .iter()
+                    .map(|h| row_map.get(*h).map(csv_escape).unwrap_or_default())
+                    .collect();
+                output.extend_from_slice(values.join(",").as_bytes());
+                output.push(b'\n');
             }
         }
     }
@@ -219,6 +238,12 @@ pub struct QueryResult {
     pub guc_headers: Option<String>,
     /// Custom status from GUC
     pub guc_status: Option<String>,
+    /// Whether the result should be rendered as a single (un-arrayed) value.
+    ///
+    /// Set for PostgREST-compatibility RPC responses where the underlying
+    /// function is not set-returning: the bare object/scalar is returned
+    /// instead of a one-element array.
+    pub singular: bool,
 }
 
 /// Response formatting error.
@@ -241,5 +266,41 @@ impl FormatError {
             Self::NotFound => StatusCode::NOT_FOUND,
             Self::MultipleRows => StatusCode::NOT_ACCEPTABLE,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    fn result(rows: Vec<serde_json::Value>, singular: bool) -> QueryResult {
+        QueryResult {
+            status: StatusCode::OK,
+            rows,
+            singular,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn singular_result_renders_bare_object() {
+        let req = ApiRequest::default();
+        let resp = format_response(&req, &result(vec![json!({"ok": true})], true)).unwrap();
+        assert_eq!(&resp.body[..], br#"{"ok":true}"#);
+    }
+
+    #[test]
+    fn singular_empty_result_renders_null() {
+        let req = ApiRequest::default();
+        let resp = format_response(&req, &result(vec![], true)).unwrap();
+        assert_eq!(&resp.body[..], b"null");
+    }
+
+    #[test]
+    fn non_singular_result_renders_array() {
+        let req = ApiRequest::default();
+        let resp = format_response(&req, &result(vec![json!(1), json!(2)], false)).unwrap();
+        assert_eq!(&resp.body[..], b"[1,2]");
     }
 }

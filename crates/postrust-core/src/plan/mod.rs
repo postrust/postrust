@@ -3,20 +3,17 @@
 //! Converts parsed API requests into execution plans that can be
 //! translated to SQL queries.
 
-mod read_plan;
-mod mutate_plan;
 mod call_plan;
+mod mutate_plan;
+mod read_plan;
 mod types;
 
-pub use read_plan::{ReadPlan, ReadPlanTree};
+pub use call_plan::{CallParams, CallPlan};
 pub use mutate_plan::MutatePlan;
-pub use call_plan::{CallPlan, CallParams};
+pub use read_plan::{ReadPlan, ReadPlanTree};
 pub use types::*;
 
-use crate::api_request::{
-    Action, ApiRequest, DbAction,
-    QualifiedIdentifier,
-};
+use crate::api_request::{Action, ApiRequest, DbAction, QualifiedIdentifier};
 use crate::error::{Error, Result};
 use crate::schema_cache::SchemaCache;
 
@@ -58,10 +55,7 @@ pub enum InfoPlan {
 }
 
 /// Create an action plan from an API request.
-pub fn create_action_plan(
-    request: &ApiRequest,
-    schema_cache: &SchemaCache,
-) -> Result<ActionPlan> {
+pub fn create_action_plan(request: &ApiRequest, schema_cache: &SchemaCache) -> Result<ActionPlan> {
     match &request.action {
         Action::Db(db_action) => {
             // SchemaRead is a special case - it returns OpenAPI spec, not a DB query
@@ -107,7 +101,10 @@ fn create_db_plan(
             })
         }
 
-        DbAction::Routine { qi, invoke_method: _ } => {
+        DbAction::Routine {
+            qi,
+            invoke_method: _,
+        } => {
             let routines = schema_cache
                 .get_routines(qi)
                 .ok_or_else(|| Error::FunctionNotFound(qi.to_string()))?;
@@ -141,7 +138,6 @@ impl crate::api_request::PreferRepresentation {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::api_request::Action;
 
     #[test]
     fn test_info_plan() {

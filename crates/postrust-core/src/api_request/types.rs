@@ -638,9 +638,10 @@ pub enum Payload {
 // ============================================================================
 
 /// Supported media types for content negotiation.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub enum MediaType {
     /// application/json
+    #[default]
     ApplicationJson,
     /// application/geo+json
     GeoJson,
@@ -670,12 +671,6 @@ pub enum MediaType {
         format: PlanFormat,
         options: Vec<PlanOption>,
     },
-}
-
-impl Default for MediaType {
-    fn default() -> Self {
-        Self::ApplicationJson
-    }
 }
 
 impl MediaType {

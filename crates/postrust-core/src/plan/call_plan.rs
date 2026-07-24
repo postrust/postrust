@@ -16,6 +16,10 @@ pub struct CallPlan {
     pub returns_scalar: bool,
     /// Whether the function is set-returning
     pub returns_set: bool,
+    /// Whether the return type is composite (row type or `record`): its
+    /// columns are real output columns, never the function-name wrapper.
+    #[serde(default)]
+    pub returns_composite: bool,
     /// Function volatility (for transaction handling)
     pub volatility: String,
 }
@@ -41,13 +45,18 @@ impl CallPlan {
         let params = extract_call_params(request, routine)?;
 
         let returns_scalar = !routine.return_type.is_set_returning()
-            && routine.return_type.type_name().map(|t| !t.contains("record")).unwrap_or(true);
+            && routine
+                .return_type
+                .type_name()
+                .map(|t| !t.contains("record"))
+                .unwrap_or(true);
 
         Ok(Self {
             function: qi,
             params,
             returns_scalar,
             returns_set: routine.return_type.is_set_returning(),
+            returns_composite: routine.returns_composite,
             volatility: format!("{:?}", routine.volatility),
         })
     }
@@ -65,8 +74,8 @@ fn extract_call_params(request: &ApiRequest, _routine: &Routine) -> Result<CallP
         match payload {
             Payload::ProcessedJson { raw, .. } => {
                 // Check if it's an object or array
-                let value: serde_json::Value = serde_json::from_slice(raw)
-                    .map_err(|e| Error::InvalidBody(e.to_string()))?;
+                let value: serde_json::Value =
+                    serde_json::from_slice(raw).map_err(|e| Error::InvalidBody(e.to_string()))?;
 
                 match value {
                     serde_json::Value::Object(map) => {
@@ -126,6 +135,7 @@ mod tests {
             description: None,
             params: vec![],
             return_type: RetType::SetOf("users".into()),
+            returns_composite: true,
             volatility: FuncVolatility::Stable,
             has_variadic: false,
             isolation_level: None,
@@ -144,6 +154,23 @@ mod tests {
         assert_eq!(plan.function.name, "get_users");
         assert!(plan.returns_set);
         assert!(!plan.returns_scalar);
+        assert!(plan.returns_composite);
+    }
+
+    #[test]
+    fn test_call_plan_scalar_is_not_composite() {
+        let request = ApiRequest::default();
+        let routine = Routine {
+            return_type: RetType::Single("integer".into()),
+            returns_composite: false,
+            ..make_routine()
+        };
+
+        let plan = CallPlan::from_request(&request, &routine).unwrap();
+
+        assert!(plan.returns_scalar);
+        assert!(!plan.returns_set);
+        assert!(!plan.returns_composite);
     }
 
     #[test]

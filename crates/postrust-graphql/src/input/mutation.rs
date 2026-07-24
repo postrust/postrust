@@ -29,9 +29,10 @@ impl InsertField {
         // 1. It's not nullable AND
         // 2. It has no default value AND
         // 3. It's not a primary key with serial/auto-increment default
-        let has_auto_default = column.default.as_ref().map_or(false, |d| {
-            d.contains("nextval") || d.contains("gen_random_uuid")
-        });
+        let has_auto_default = column
+            .default
+            .as_ref()
+            .is_some_and(|d| d.contains("nextval") || d.contains("gen_random_uuid"));
 
         let required = !column.nullable && column.default.is_none() && !has_auto_default;
 
@@ -541,9 +542,9 @@ mod tests {
 
     #[test]
     fn test_input_value_float() {
-        let value = InputValue::Float(3.14);
-        assert_eq!(value.as_float(), Some(3.14));
-        assert_eq!(value.to_sql_string(), "3.14");
+        let value = InputValue::Float(1.5);
+        assert_eq!(value.as_float(), Some(1.5));
+        assert_eq!(value.to_sql_string(), "1.5");
     }
 
     #[test]

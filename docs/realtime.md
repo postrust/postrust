@@ -28,7 +28,7 @@ Realtime subscriptions allow your application to:
 Subscriptions are enabled by default when using the GraphQL endpoint. Connect via WebSocket to start subscribing:
 
 ```
-ws://localhost:3000/graphql
+ws://localhost:3000/api/graphql/ws
 ```
 
 ## GraphQL Subscriptions
@@ -94,7 +94,7 @@ Using `graphql-ws`:
 import { createClient } from 'graphql-ws';
 
 const client = createClient({
-  url: 'ws://localhost:3000/graphql',
+  url: 'ws://localhost:3000/api/graphql/ws',
   connectionParams: {
     authorization: `Bearer ${token}`,
   },
@@ -332,7 +332,7 @@ Subscriptions respect the same JWT authentication as queries:
 
 ```typescript
 const client = createClient({
-  url: 'ws://localhost:3000/graphql',
+  url: 'ws://localhost:3000/api/graphql/ws',
   connectionParams: () => ({
     authorization: `Bearer ${getToken()}`,
   }),
@@ -402,7 +402,7 @@ $$ LANGUAGE plpgsql;
 
 ```typescript
 const client = createClient({
-  url: 'ws://localhost:3000/graphql',
+  url: 'ws://localhost:3000/api/graphql/ws',
   retryAttempts: 5,
   retryWait: async (retries) => {
     await new Promise(r => setTimeout(r, retries * 1000));

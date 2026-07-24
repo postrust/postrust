@@ -3,7 +3,7 @@
 //! This module handles forwarding requests to upstream backends.
 
 use crate::config::Backend;
-use crate::vendored::hyper_ext::{ProxyBody, TokioExecutor};
+use crate::vendored::hyper_ext::ProxyBody;
 use crate::vendored::types::ProxyError;
 use hyper::body::Incoming;
 use hyper::{Request, Response};
@@ -45,15 +45,9 @@ impl ForwarderClient {
     ) -> Result<Response<Incoming>, ProxyError> {
         // Build the upstream URL
         let uri = request.uri();
-        let path_and_query = uri
-            .path_and_query()
-            .map(|pq| pq.as_str())
-            .unwrap_or("/");
+        let path_and_query = uri.path_and_query().map(|pq| pq.as_str()).unwrap_or("/");
 
-        let upstream_uri = format!(
-            "{}://{}{}",
-            backend.scheme, backend.address, path_and_query
-        );
+        let upstream_uri = format!("{}://{}{}", backend.scheme, backend.address, path_and_query);
 
         // Update request URI
         *request.uri_mut() = upstream_uri

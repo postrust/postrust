@@ -39,7 +39,7 @@ const features = [
   {
     icon: "code",
     title: "PostgREST Compatible",
-    description: "Drop-in replacement for PostgREST in most use cases. Same query syntax, same filtering operators.",
+    description: "Same query syntax and filtering operators. An opt-in compatibility mode serves canonical PostgREST paths and response shapes for drop-in migrations.",
   },
   {
     icon: "api",

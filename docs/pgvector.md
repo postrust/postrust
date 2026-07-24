@@ -2,6 +2,10 @@
 
 Postrust provides native support for [pgvector](https://github.com/pgvector/pgvector), enabling vector similarity search directly through your REST and GraphQL APIs. Build AI-powered applications with semantic search, recommendations, and RAG (Retrieval Augmented Generation) pipelines.
 
+> Examples below use root-level paths (e.g. `/documents`, `/rpc/search_similar`),
+> which require [compatibility mode](configuration.md#compatibility-settings);
+> by default, prefix them with `/api`.
+
 ## Prerequisites
 
 1. Install pgvector extension in your PostgreSQL database:

@@ -121,7 +121,7 @@ impl DomainVerificationService {
                 let content_trimmed = content.trim();
                 if content_trimmed == expected_content {
                     tracing::info!(domain = %domain, "HTTP verification successful");
-                    return VerificationResult::Verified;
+                    VerificationResult::Verified
                 } else {
                     tracing::warn!(
                         domain = %domain,
@@ -129,12 +129,12 @@ impl DomainVerificationService {
                         actual = %content_trimmed,
                         "HTTP content mismatch"
                     );
-                    return VerificationResult::Failed {
+                    VerificationResult::Failed {
                         reason: format!(
                             "Content mismatch. Expected '{}' but got '{}'",
                             expected_content, content_trimmed
                         ),
-                    };
+                    }
                 }
             }
             Err(e) => {
@@ -157,14 +157,14 @@ impl DomainVerificationService {
                                 domain = %domain,
                                 "HTTP verification successful (via HTTP fallback)"
                             );
-                            return VerificationResult::Verified;
+                            VerificationResult::Verified
                         } else {
-                            return VerificationResult::Failed {
+                            VerificationResult::Failed {
                                 reason: format!(
                                     "Content mismatch. Expected '{}' but got '{}'",
                                     expected_content, content_trimmed
                                 ),
-                            };
+                            }
                         }
                     }
                     Err(http_err) => {
@@ -246,9 +246,7 @@ mod tests {
         let service = DomainVerificationService::new();
 
         // Use a domain that won't have our verification file
-        let result = service
-            .verify_http("example.com", "testtoken123")
-            .await;
+        let result = service.verify_http("example.com", "testtoken123").await;
 
         match result {
             VerificationResult::Failed { .. } => {

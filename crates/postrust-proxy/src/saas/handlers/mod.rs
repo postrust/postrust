@@ -1,9 +1,9 @@
 //! API handlers for SaaS domain management.
 
+pub mod auth;
 pub mod domains;
 pub mod routes;
 pub mod upstreams;
-pub mod auth;
 pub mod wellknown;
 
 use crate::admin::api::ApiResponse;
@@ -49,11 +49,10 @@ pub fn saas_router(state: SaasState) -> Router {
     let auth_layer = state.auth_layer.clone();
 
     // Public routes (no auth required)
-    let public_routes = Router::new()
-        .route(
-            "/.well-known/postrust-verification/:token",
-            get(wellknown::handle_verification_challenge),
-        );
+    let public_routes = Router::new().route(
+        "/.well-known/postrust-verification/:token",
+        get(wellknown::handle_verification_challenge),
+    );
 
     // Protected routes (require authentication)
     let protected_routes = Router::new()
@@ -77,7 +76,10 @@ pub fn saas_router(state: SaasState) -> Router {
         .route("/domains/:domain_id/routes", post(routes::create_route))
         .route("/domains/:domain_id/routes/:id", get(routes::get_route))
         .route("/domains/:domain_id/routes/:id", put(routes::update_route))
-        .route("/domains/:domain_id/routes/:id", delete(routes::delete_route))
+        .route(
+            "/domains/:domain_id/routes/:id",
+            delete(routes::delete_route),
+        )
         // Upstreams
         .route("/upstreams", get(upstreams::list_upstreams))
         .route("/upstreams", post(upstreams::create_upstream))

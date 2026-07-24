@@ -53,11 +53,11 @@ impl RateLimiter {
     /// Returns `true` if the request is allowed, `false` if rate limited.
     pub fn check(&self, key: RateLimitKey) -> bool {
         // Convert requests per window to requests per second
-        let rps = if self.defaults.window_secs > 0 {
-            self.defaults.requests / self.defaults.window_secs
-        } else {
-            self.defaults.requests
-        };
+        let rps = self
+            .defaults
+            .requests
+            .checked_div(self.defaults.window_secs)
+            .unwrap_or(self.defaults.requests);
         self.check_with_config(key, rps, self.defaults.burst)
     }
 
@@ -101,9 +101,8 @@ impl RateLimiter {
         let now = Instant::now();
         let before = self.buckets.len();
 
-        self.buckets.retain(|_, entry| {
-            now.duration_since(entry.last_access) < self.entry_ttl
-        });
+        self.buckets
+            .retain(|_, entry| now.duration_since(entry.last_access) < self.entry_ttl);
 
         let removed = before - self.buckets.len();
         if removed > 0 {
@@ -126,7 +125,7 @@ mod tests {
     #[test]
     fn test_rate_limiter_by_ip() {
         let limiter = RateLimiter::new(RateLimitDefaults {
-            requests: 600,  // 10 per second
+            requests: 600, // 10 per second
             window_secs: 60,
             burst: 5,
         });
@@ -148,7 +147,7 @@ mod tests {
     #[test]
     fn test_rate_limiter_remaining() {
         let limiter = RateLimiter::new(RateLimitDefaults {
-            requests: 600,  // 10 per second
+            requests: 600, // 10 per second
             window_secs: 60,
             burst: 10,
         });

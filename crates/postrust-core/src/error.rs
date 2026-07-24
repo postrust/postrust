@@ -226,7 +226,9 @@ impl Error {
     /// Get a hint for resolving the error.
     fn hint(&self) -> Option<String> {
         match self {
-            Self::InvalidJwt(_) => Some("Check that the JWT is properly signed and not expired".into()),
+            Self::InvalidJwt(_) => {
+                Some("Check that the JWT is properly signed and not expired".into())
+            }
             Self::MissingAuth => Some("Provide a valid JWT in the Authorization header".into()),
             Self::TableNotFound(_) => Some("Check the table name and schema".into()),
             Self::UnknownColumn(_) => Some("Check column names against the table schema".into()),
@@ -279,7 +281,7 @@ impl DatabaseError {
             c if c.starts_with("23") => "PGRST503", // Constraint violation
             c if c.starts_with("42") => "PGRST504", // SQL error
             c if c.starts_with("28") => "PGRST505", // Auth error
-            _ => "PGRST500", // Generic database error
+            _ => "PGRST500",                        // Generic database error
         }
     }
 }

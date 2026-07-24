@@ -3,7 +3,6 @@
 use postrust_auth::JwtConfig;
 use postrust_core::{AppConfig, SchemaCache};
 use sqlx::PgPool;
-use std::sync::Arc;
 use tokio::sync::RwLock;
 
 /// Shared application state.
@@ -25,6 +24,7 @@ impl AppState {
     }
 
     /// Reload the schema cache.
+    #[allow(dead_code)] // Public API for schema reload; wired up by the (optional) NOTIFY listener.
     pub async fn reload_schema(&self) -> Result<(), postrust_core::Error> {
         let new_cache = SchemaCache::load(&self.pool, &self.config.db_schemas).await?;
         let mut guard = self.schema_cache.write().await;
