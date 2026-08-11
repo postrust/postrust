@@ -109,8 +109,12 @@ async fn process_lambda_request(
         .map_err(|e: http::Error| postrust_core::Error::Internal(e.to_string()))?;
 
     // Parse API request
-    let mut api_request =
-        postrust_core::parse_request(&http_request, config.default_schema(), &config.db_schemas)?;
+    let mut api_request = postrust_core::parse_request(
+        &http_request,
+        config.default_schema(),
+        &config.db_schemas,
+        config.db_max_rows,
+    )?;
 
     // Parse payload
     if !body_bytes.is_empty() {
@@ -146,21 +150,15 @@ async fn process_lambda_request(
         .await
         .map_err(|e| postrust_core::Error::Internal(e.to_string()))?;
 
-    // Convert to JSON
+    // Convert to JSON using the shared typed conversion. Reading every column
+    // as a `serde_json::Value` here (as this used to) only decodes json/jsonb
+    // and silently turns integers, text and timestamps into null.
+    //
+    // `into_iter` frees each row as it is converted rather than holding every
+    // row alongside every JSON value.
     let json_rows: Vec<serde_json::Value> = rows
-        .iter()
-        .map(|row| {
-            use sqlx::{Column, Row};
-            let mut map = serde_json::Map::new();
-            for column in row.columns() {
-                let value: Option<serde_json::Value> = row.try_get(column.name()).ok();
-                map.insert(
-                    column.name().to_string(),
-                    value.unwrap_or(serde_json::Value::Null),
-                );
-            }
-            serde_json::Value::Object(map)
-        })
+        .into_iter()
+        .map(|row| postrust_core::row_json::row_to_json(&row))
         .collect();
 
     let body = serde_json::to_string(&json_rows).unwrap_or_else(|_| "[]".to_string());

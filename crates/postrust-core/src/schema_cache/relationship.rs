@@ -95,7 +95,11 @@ pub enum Cardinality {
 }
 
 impl Cardinality {
-    /// Get the join columns.
+    /// Get the join columns as `(local column, foreign column)` pairs.
+    ///
+    /// "Local" is the table the relationship is stored under, so a pair can be
+    /// used directly to join from the local table to the foreign one without
+    /// having to know the cardinality.
     pub fn columns(&self) -> Vec<(String, String)> {
         match self {
             Self::O2M { columns, .. } => columns.clone(),

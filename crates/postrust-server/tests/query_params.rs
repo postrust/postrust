@@ -33,6 +33,15 @@ fn database_url() -> String {
 
 /// Build the REST router, mirroring how `main.rs` mounts it under `/api`.
 async fn test_app() -> Router {
+    build_app(None).await
+}
+
+/// Build the REST router with a server-side row ceiling (`PGRST_MAX_ROWS`).
+async fn test_app_with_max_rows(max_rows: i64) -> Router {
+    build_app(Some(max_rows)).await
+}
+
+async fn build_app(max_rows: Option<i64>) -> Router {
     let db_uri = database_url();
 
     let pool = PgPoolOptions::new()
@@ -45,6 +54,7 @@ async fn test_app() -> Router {
         db_uri,
         db_schemas: vec!["public".to_string()],
         db_anon_role: Some(ANON_ROLE.to_string()),
+        db_max_rows: max_rows,
         ..AppConfig::default()
     };
 
@@ -420,6 +430,77 @@ async fn filter_value_is_not_interpreted_as_sql() {
 }
 
 // ===========================================================================
+// max_rows ceiling
+//
+// Regression coverage: `db_max_rows` was declared in the config, never read
+// from the environment and never enforced, so a request with no `limit`
+// returned the entire table -- documented as capped at 1000 rows.
+// ===========================================================================
+
+/// Issue a GET against an app configured with a row ceiling.
+async fn get_rows_capped(uri: &str, max_rows: i64) -> Vec<Value> {
+    let app = test_app_with_max_rows(max_rows).await;
+    let request = Request::builder()
+        .method("GET")
+        .uri(uri)
+        .body(Body::empty())
+        .expect("failed to build request");
+
+    let response = app.oneshot(request).await.expect("request failed");
+    let status = response.status();
+    let bytes = axum::body::to_bytes(response.into_body(), 16 * 1024 * 1024)
+        .await
+        .expect("failed to read response body");
+    let body: Value = serde_json::from_slice(&bytes).expect("response was not valid JSON");
+
+    rows(uri, status, body)
+}
+
+#[tokio::test]
+#[ignore = "requires PostgreSQL"]
+async fn max_rows_caps_a_request_with_no_limit() {
+    let rows = get_rows_capped("/api/products?order=id.asc", 4).await;
+
+    assert_eq!(
+        ids(&rows, "id"),
+        vec![1, 2, 3, 4],
+        "an unbounded request must be capped by max_rows"
+    );
+}
+
+#[tokio::test]
+#[ignore = "requires PostgreSQL"]
+async fn max_rows_caps_a_larger_requested_limit() {
+    let rows = get_rows_capped("/api/products?order=id.asc&limit=1000", 3).await;
+
+    assert_eq!(rows.len(), 3, "max_rows must bound a larger explicit limit");
+}
+
+#[tokio::test]
+#[ignore = "requires PostgreSQL"]
+async fn max_rows_leaves_a_smaller_requested_limit_alone() {
+    let rows = get_rows_capped("/api/products?order=id.asc&limit=2", 100).await;
+
+    assert_eq!(
+        ids(&rows, "id"),
+        vec![1, 2],
+        "a limit below the ceiling should be honoured as-is"
+    );
+}
+
+#[tokio::test]
+#[ignore = "requires PostgreSQL"]
+async fn max_rows_applies_with_offset() {
+    let rows = get_rows_capped("/api/products?order=id.asc&offset=8", 5).await;
+
+    assert_eq!(
+        ids(&rows, "id"),
+        vec![9, 10],
+        "the ceiling applies to the page, not the whole table"
+    );
+}
+
+// ===========================================================================
 // order
 // ===========================================================================
 
@@ -440,4 +521,104 @@ async fn order_on_numeric_column() {
     let rows = get_rows("/api/products?order=price.asc&select=id,price&limit=1").await;
 
     assert_eq!(ids(&rows, "id"), vec![4], "9.99 is the lowest price");
+}
+
+// ===========================================================================
+// Resource embedding
+//
+// Regression: `select=id,posts(id)` parsed the nested selection and threw it
+// away, so the request returned 200 with the embed silently missing.
+// ===========================================================================
+
+#[tokio::test]
+#[ignore = "requires PostgreSQL"]
+async fn embeds_a_to_many_relation() {
+    let rows = get_rows("/api/users?select=id,name,posts(id,title)&order=id.asc&limit=2").await;
+
+    let posts = rows[0]["posts"]
+        .as_array()
+        .expect("posts must be embedded as an array");
+    assert!(!posts.is_empty(), "user 1 has posts in the fixtures");
+
+    // Only the requested columns of the relation come back.
+    let post = posts[0].as_object().expect("post should be an object");
+    let mut keys: Vec<&str> = post.keys().map(|k| k.as_str()).collect();
+    keys.sort();
+    assert_eq!(keys, vec!["id", "title"]);
+}
+
+#[tokio::test]
+#[ignore = "requires PostgreSQL"]
+async fn embeds_a_to_one_relation() {
+    let rows = get_rows("/api/posts?select=id,title,users(name)&order=id.asc&limit=1").await;
+
+    assert_eq!(
+        rows[0]["users"]["name"].as_str(),
+        Some("Alice Johnson"),
+        "a to-one embed resolves to an object, not a list"
+    );
+}
+
+#[tokio::test]
+#[ignore = "requires PostgreSQL"]
+async fn embeds_nested_relations_two_levels_deep() {
+    let rows = get_rows("/api/users?select=id,posts(id,comments(id))&order=id.asc&limit=1").await;
+
+    let posts = rows[0]["posts"].as_array().expect("posts array");
+    let with_comments = posts
+        .iter()
+        .find(|p| {
+            p["comments"]
+                .as_array()
+                .map(|c| !c.is_empty())
+                .unwrap_or(false)
+        })
+        .expect("at least one post has comments");
+
+    assert!(with_comments["comments"][0]["id"].is_number());
+}
+
+#[tokio::test]
+#[ignore = "requires PostgreSQL"]
+async fn embed_join_column_is_not_leaked_into_the_response() {
+    // `posts` joins on users.id, which has to be selected to do the join even
+    // though the client only asked for the name.
+    let rows = get_rows("/api/users?select=name,posts(id)&order=id.asc&limit=1").await;
+
+    let row = rows[0].as_object().expect("row object");
+    let mut keys: Vec<&str> = row.keys().map(|k| k.as_str()).collect();
+    keys.sort();
+    assert_eq!(
+        keys,
+        vec!["name", "posts"],
+        "the join column must not appear in the response"
+    );
+}
+
+#[tokio::test]
+#[ignore = "requires PostgreSQL"]
+async fn embed_yields_an_empty_list_when_there_are_no_children() {
+    let rows = get_rows("/api/users?select=id,posts(id)&order=id.desc&limit=10").await;
+
+    let childless = rows
+        .iter()
+        .find(|r| r["posts"].as_array().map(|p| p.is_empty()).unwrap_or(false));
+
+    assert!(
+        childless.is_some(),
+        "some fixture user has no posts; the embed should still be an empty array"
+    );
+}
+
+#[tokio::test]
+#[ignore = "requires PostgreSQL"]
+async fn unknown_relation_is_rejected() {
+    let (status, body) = get("/api/users?select=id,not_a_relation(id)").await;
+
+    assert!(
+        status.is_client_error(),
+        "expected a 4xx for an unknown relation, got {} -- body: {}",
+        status,
+        body
+    );
 }

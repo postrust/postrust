@@ -37,9 +37,11 @@
 
 pub mod api_request;
 pub mod config;
+pub mod embed;
 pub mod error;
 pub mod plan;
 pub mod query;
+pub mod row_json;
 pub mod schema_cache;
 
 // Re-export main types

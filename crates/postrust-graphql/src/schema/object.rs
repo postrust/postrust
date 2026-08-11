@@ -57,8 +57,17 @@ pub struct TableObjectType {
 
 impl TableObjectType {
     /// Create a GraphQL ObjectType from a database table.
+    ///
+    /// The type is named after the table. Use [`Self::from_table_named`] when
+    /// the name must be disambiguated (for example when the same table name
+    /// appears in more than one exposed schema).
     pub fn from_table(table: &Table) -> Self {
-        let name = to_pascal_case(&table.name);
+        Self::from_table_named(table, &table.name)
+    }
+
+    /// Create a GraphQL ObjectType using an explicit base name.
+    pub fn from_table_named(table: &Table, base_name: &str) -> Self {
+        let name = to_pascal_case(base_name);
         let fields = table
             .columns
             .values()

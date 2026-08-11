@@ -265,13 +265,17 @@ pub async fn load_relationships(pool: &PgPool, schemas: &[String]) -> Result<Rel
         let reverse_cardinality = if is_unique {
             Cardinality::O2O {
                 constraint: constraint_name.clone(),
-                columns: reverse_columns,
+                columns: reverse_columns.clone(),
                 is_parent: true,
             }
         } else {
+            // Reversed, like the O2O case above: column pairs are always
+            // (local column, foreign column) relative to the table the
+            // relationship is stored under. For this direction the local table
+            // is the referenced one, so the pair must be swapped.
             Cardinality::O2M {
                 constraint: constraint_name.clone(),
-                columns: column_pairs,
+                columns: reverse_columns,
             }
         };
 
