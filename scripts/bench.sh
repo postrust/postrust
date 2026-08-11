@@ -11,8 +11,8 @@
 #   KEEP=1 scripts/bench.sh             # leave the database and server running
 #   SKIP_BUILD=1 scripts/bench.sh       # reuse an existing release build
 #
-# Requirements: docker, cargo, curl, and one of oha / hey / ab as the load
-# generator (oha gives the most accurate percentiles; ab ships with macOS).
+# Requirements: docker, cargo, curl, and a load generator -- either oha
+# (preferred; also needs jq) or ab, which ships with macOS.
 
 set -euo pipefail
 
@@ -114,13 +114,17 @@ human_kb() {
 }
 
 pick_load_generator() {
-    for tool in oha hey ab; do
+    # oha first: it reports percentiles as machine-readable JSON. `hey` is not
+    # supported -- its text output was parsed from memory once and produced
+    # silently wrong numbers, so it is better to require a tool whose output
+    # this script has actually been checked against.
+    for tool in oha ab; do
         if command -v "$tool" >/dev/null 2>&1; then
             echo "$tool"
             return 0
         fi
     done
-    die "no load generator found -- install one of: oha (cargo install oha), hey, ab"
+    die "no load generator found -- install oha (brew install oha) or use ab"
 }
 
 # ---------------------------------------------------------------------------
@@ -131,30 +135,32 @@ pick_load_generator() {
 
 run_oha() {
     local url="$1" header="$2"
-    local args=(-n "$REQUESTS" -c "$CONCURRENCY" --no-tui --json)
+    # `--output-format json`, not `--json`: the latter is not an oha flag and
+    # makes it exit with a usage error.
+    local args=(-n "$REQUESTS" -c "$CONCURRENCY" --no-tui --output-format json)
     [[ -n "$header" ]] && args+=(-H "$header")
 
-    oha "${args[@]}" "$url" | awk '
-        /"requestsPerSec"/ { gsub(/[^0-9.]/, "", $2); rps = $2 }
-        /"p50"/            { gsub(/[^0-9.]/, "", $2); p50 = $2 * 1000 }
-        /"p95"/            { gsub(/[^0-9.]/, "", $2); p95 = $2 * 1000 }
-        /"p99"/            { gsub(/[^0-9.]/, "", $2); p99 = $2 * 1000 }
-        END { printf "%.0f %.1f %.1f %.1f\n", rps, p50, p95, p99 }
-    '
-}
+    local output
+    if ! output="$(oha "${args[@]}" "$url" 2>&1)"; then
+        echo "ERROR oha-failed"
+        return 0
+    fi
 
-run_hey() {
-    local url="$1" header="$2"
-    local args=(-n "$REQUESTS" -c "$CONCURRENCY")
-    [[ -n "$header" ]] && args+=(-H "$header")
-
-    hey "${args[@]}" "$url" | awk '
-        /Requests\/sec:/ { rps = $2 }
-        /^  0.500/       { p50 = $2 * 1000 }
-        /^  0.950/       { p95 = $2 * 1000 }
-        /^  0.990/       { p99 = $2 * 1000 }
-        END { printf "%.0f %.1f %.1f %.1f\n", rps, p50, p95, p99 }
-    '
+    # Percentiles are reported in seconds. Any non-2xx response is surfaced
+    # rather than averaged into a throughput figure.
+    jq -r '
+        (.statusCodeDistribution // {}) as $codes
+        | ([$codes | to_entries[] | select(.key | startswith("2") | not) | .value]
+           | add // 0) as $bad
+        | if $bad > 0 then
+              "ERROR non-2xx=\($bad)"
+          else
+              "\(.summary.requestsPerSec | floor) " +
+              "\(((.latencyPercentiles.p50 * 10000) | floor) / 10) " +
+              "\(((.latencyPercentiles.p95 * 10000) | floor) / 10) " +
+              "\(((.latencyPercentiles.p99 * 10000) | floor) / 10)"
+          end
+    ' <<<"$output" 2>/dev/null || echo "ERROR oha-parse-failed"
 }
 
 run_ab() {
@@ -186,7 +192,6 @@ run_ab() {
 run_load() {
     case "$LOAD_TOOL" in
         oha) run_oha "$1" "$2" ;;
-        hey) run_hey "$1" "$2" ;;
         ab)  run_ab  "$1" "$2" ;;
     esac
 }
@@ -199,6 +204,7 @@ require docker
 require cargo
 require curl
 LOAD_TOOL="$(pick_load_generator)"
+[[ "$LOAD_TOOL" == "oha" ]] && require jq
 
 log "load generator: $LOAD_TOOL ($REQUESTS requests, concurrency $CONCURRENCY)"
 log "results directory: $RESULTS_DIR"
@@ -239,7 +245,12 @@ docker run -d --rm \
     -p "$PG_PORT:5432" \
     "$PG_IMAGE" >/dev/null
 
-if ! wait_until 90 docker exec "$PG_CONTAINER" pg_isready -U postgres -d "$PG_DB"; then
+# `-h 127.0.0.1` forces the check over TCP. The official image runs a
+# temporary socket-only server while it initialises the data directory, so a
+# socket-based pg_isready can report ready and then the connection fails with
+# "the database system is shutting down" as that server is replaced.
+if ! wait_until 90 docker exec "$PG_CONTAINER" \
+    pg_isready -h 127.0.0.1 -U postgres -d "$PG_DB"; then
     docker logs "$PG_CONTAINER" 2>&1 | tail -20 >&2
     die "PostgreSQL did not become ready within 90s"
 fi

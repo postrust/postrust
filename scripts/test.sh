@@ -8,7 +8,10 @@ echo "==> Starting PostgreSQL..."
 docker-compose up -d postgres
 
 echo "==> Waiting for PostgreSQL to be ready..."
-until docker-compose exec -T postgres pg_isready -U postgres -d postrust_test; do
+# `-h 127.0.0.1` forces a TCP check: the official image's temporary
+# initialisation server listens on the unix socket only, so a socket-based
+# check can pass before the real server is up.
+until docker-compose exec -T postgres pg_isready -h 127.0.0.1 -U postgres -d postrust_test; do
     echo "Waiting for database..."
     sleep 2
 done
