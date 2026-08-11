@@ -314,3 +314,57 @@ export function measuredFor(
 ): MeasuredRow[] {
   return measured[slug]?.[surface] ?? [];
 }
+
+/** The benchmark target each comparison page is measured against. */
+export const targetForSlug: Record<string, string> = {
+  postgrest: "postgrest",
+  hasura: "hasura",
+  postgraphile: "postgraphile",
+};
+
+export interface FootprintRow {
+  label: string;
+  postrust: string;
+  other: string | null;
+}
+
+const KB = 1024;
+const mb = (kb: number) => `${(kb / KB).toFixed(1)} MB`;
+
+/**
+ * Image size and memory for Postrust against one other tool, from the variant
+ * the published throughput figures come from.
+ */
+export function footprintFor(slug: string): FootprintRow[] {
+  const variant = variantImages[benchMeta.variant];
+  const target = targetForSlug[slug];
+  if (!variant) return [];
+
+  const ours = variant.images.postrust;
+  const theirs = target ? variant.images[target] : undefined;
+  if (!ours) return [];
+
+  return [
+    {
+      label: "Container image, on disk",
+      postrust: ours.onDisk,
+      other: theirs?.onDisk ?? null,
+    },
+    {
+      label: "Memory, before serving a request",
+      postrust: mb(ours.rssIdleKb),
+      other: theirs ? mb(theirs.rssIdleKb) : null,
+    },
+    {
+      label: "Memory, after the benchmark",
+      postrust: mb(ours.rssAfterKb),
+      other: theirs ? mb(theirs.rssAfterKb) : null,
+    },
+  ];
+}
+
+/** Every variant's Postrust image size, for the note under the table. */
+export const postrustImages: Record<string, string> = {
+  debian: "168MB",
+  alpine: "31.7MB",
+};

@@ -2,7 +2,12 @@ import { component$ } from "@builder.io/qwik";
 import { Link } from "@builder.io/qwik-city";
 import type { Comparison } from "~/data/comparisons";
 import { perfCaveats } from "~/data/comparisons";
-import { measuredFor, benchMeta } from "~/data/measured";
+import {
+  measuredFor,
+  benchMeta,
+  footprintFor,
+  postrustImages,
+} from "~/data/measured";
 import type { MeasuredRow } from "~/data/measured";
 
 interface Props {
@@ -12,6 +17,7 @@ interface Props {
 export const ComparisonPage = component$<Props>(({ comparison: c }) => {
   const rest = measuredFor(c.slug, "rest");
   const graphql = measuredFor(c.slug, "graphql");
+  const footprint = footprintFor(c.slug);
   const hasNumbers = rest.length > 0 || graphql.length > 0;
 
   // FAQ structured data. The questions on the page and the questions in the
@@ -159,6 +165,50 @@ export const ComparisonPage = component$<Props>(({ comparison: c }) => {
                     GraphQL
                   </h3>
                   <MeasuredTable rows={graphql} otherName={c.name} />
+                </div>
+              )}
+
+              {footprint.length > 0 && (
+                <div class="mb-10">
+                  <h3 class="mb-3 text-lg font-semibold text-neutral-900">
+                    Image size and memory
+                  </h3>
+                  <div class="overflow-x-auto rounded-xl border border-neutral-200 bg-white">
+                    <table class="w-full text-sm">
+                      <thead class="bg-neutral-50">
+                        <tr>
+                          <th class="px-6 py-3 text-left font-medium text-neutral-900"></th>
+                          <th class="text-primary-600 px-6 py-3 text-right font-medium">
+                            Postrust
+                          </th>
+                          <th class="px-6 py-3 text-right font-medium text-neutral-900">
+                            {c.name}
+                          </th>
+                        </tr>
+                      </thead>
+                      <tbody class="divide-y divide-neutral-200">
+                        {footprint.map((row) => (
+                          <tr key={row.label}>
+                            <td class="px-6 py-3 font-medium text-neutral-900">
+                              {row.label}
+                            </td>
+                            <td class="px-6 py-3 text-right text-neutral-700 tabular-nums">
+                              {row.postrust}
+                            </td>
+                            <td class="px-6 py-3 text-right text-neutral-700 tabular-nums">
+                              {row.other ?? "\u2014"}
+                            </td>
+                          </tr>
+                        ))}
+                      </tbody>
+                    </table>
+                  </div>
+                  <p class="mt-3 text-sm text-neutral-500">
+                    Memory is resident set size, read the same way for every
+                    tool. Image sizes are for the Debian-based build these
+                    figures come from. The Alpine build of the same code is{" "}
+                    {postrustImages.alpine ?? "smaller"}.
+                  </p>
                 </div>
               )}
 
