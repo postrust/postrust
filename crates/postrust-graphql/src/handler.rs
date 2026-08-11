@@ -663,6 +663,41 @@ async fn resolve_query<'a>(
         inner.push_str(&format!(" OFFSET {}", offset));
     }
 
+    // Embed the requested relationships in this same query, as correlated
+    // subselects in the SELECT list, so the whole selection is one round trip.
+    let embed_expressions = {
+        let guard = gql_ctx
+            .schema_cache
+            .get()
+            .await
+            .map_err(|e| async_graphql::Error::new(e.to_string()))?;
+        match guard.as_ref() {
+            Some(cache) => build_embed_expressions(
+                cache,
+                relationships,
+                type_name,
+                "src",
+                ctx.field(),
+                max_rows,
+                &mut 0,
+            )?,
+            None => Vec::new(),
+        }
+    };
+
+    let inner = if embed_expressions.is_empty() {
+        inner
+    } else {
+        let mut projection = String::from("src.*");
+        for (field_name, expression) in &embed_expressions {
+            projection.push_str(", ");
+            projection.push_str(expression);
+            projection.push_str(" AS ");
+            projection.push_str(&postrust_sql::escape_ident(field_name));
+        }
+        format!("SELECT {} FROM ({}) AS src", projection, inner)
+    };
+
     let sql = format!("SELECT row_to_json(t) FROM ({}) t", inner);
 
     // One transaction for the query and any embeds hanging off it, so the role
@@ -673,8 +708,8 @@ async fn resolve_query<'a>(
     // Execute query - returns Vec<serde_json::Value>
     let mut result = execute_query_on(&mut tx, &sql, &bound_values).await?;
 
-    // Embed any related resources the selection asked for.
-    {
+    // Anything the single-query form did not cover.
+    if embed_expressions.is_empty() {
         let guard = gql_ctx
             .schema_cache
             .get()
@@ -1298,6 +1333,81 @@ async fn build_order_by_clause(
     Ok(format!(" ORDER BY {}", terms.join(", ")))
 }
 
+/// Build the SELECT-list expressions that embed relationships in one query.
+///
+/// The GraphQL mirror of the REST builder: each requested relationship becomes a
+/// correlated subselect yielding JSON, so the whole selection comes back from
+/// the parent query instead of one query per relationship per level.
+fn build_embed_expressions(
+    schema_cache: &SchemaCache,
+    relationships: &HashMap<String, Vec<RelationshipField>>,
+    type_name: &str,
+    parent_alias: &str,
+    selection: async_graphql::SelectionField<'_>,
+    max_rows: Option<i64>,
+    alias_counter: &mut usize,
+) -> Result<Vec<(String, String)>, async_graphql::Error> {
+    let Some(available) = relationships.get(type_name) else {
+        return Ok(Vec::new());
+    };
+
+    let mut expressions = Vec::new();
+
+    for field in selection.selection_set() {
+        let Some(rel) = available.iter().find(|r| r.name == field.name()) else {
+            continue;
+        };
+
+        let plan = postrust_core::embed::EmbedPlan::resolve(&rel.relationship, schema_cache)
+            .map_err(|e| async_graphql::Error::new(e.to_string()))?;
+
+        *alias_counter += 1;
+        let child_alias = format!("e{}", alias_counter);
+
+        let nested = build_embed_expressions(
+            schema_cache,
+            relationships,
+            &rel.target_type,
+            &child_alias,
+            field,
+            max_rows,
+            alias_counter,
+        )?;
+
+        // Leaf fields are columns; anything that resolved to a relationship is
+        // an expression instead.
+        let child_relationships = relationships.get(&rel.target_type);
+        let mut parts: Vec<String> = Vec::new();
+        for sub in field.selection_set() {
+            let name = sub.name();
+            let is_relationship = child_relationships
+                .map(|rels| rels.iter().any(|r| r.name == name))
+                .unwrap_or(false);
+            if !is_relationship {
+                parts.push(postrust_sql::escape_ident(name));
+            }
+        }
+        if parts.is_empty() && nested.is_empty() {
+            parts.push(format!("{}.*", postrust_sql::escape_ident(&child_alias)));
+        }
+        for (field_name, expression) in nested {
+            parts.push(format!(
+                "{} AS {}",
+                expression,
+                postrust_sql::escape_ident(&field_name)
+            ));
+        }
+
+        let expression = plan
+            .embed_expression(parent_alias, &child_alias, &parts.join(", "), max_rows)
+            .map_err(|e| async_graphql::Error::new(e.to_string()))?;
+
+        expressions.push((rel.name.clone(), expression));
+    }
+
+    Ok(expressions)
+}
+
 /// What embedding a relationship needs, independent of the rows involved.
 ///
 /// The connection is passed alongside rather than held here: embedding runs on
@@ -1341,28 +1451,93 @@ fn embed_relationships<'f>(
 
             let keys = postrust_core::embed::parent_keys(rows, &plan.local_column);
 
-            let mut children: Vec<serde_json::Value> = if keys.is_empty() {
-                Vec::new()
+            // Project only what the selection asked for. A GraphQL selection
+            // names its leaf fields, so the columns are known before the query
+            // and an unrequested column need not be read, serialised, sent and
+            // parsed just to be dropped.
+            //
+            // A nested relationship joins on a column of the child row, so that
+            // column is added even when it was not selected; it is removed again
+            // when the response is shaped. A selection whose sub-fields cannot
+            // all be resolved to columns falls back to every column.
+            let mut child_columns: Vec<String> = Vec::new();
+            let mut project_everything = false;
+            let child_relationships = ctx.relationships.get(&rel.target_type);
+            for field in requested.selection_set() {
+                let name = field.name();
+                match child_relationships.and_then(|rels| rels.iter().find(|r| r.name == name)) {
+                    Some(nested_rel) => {
+                        match postrust_core::embed::EmbedPlan::resolve(
+                            &nested_rel.relationship,
+                            ctx.schema_cache,
+                        ) {
+                            Ok(nested_plan) => child_columns.push(nested_plan.local_column),
+                            Err(_) => project_everything = true,
+                        }
+                    }
+                    None => child_columns.push(name.to_string()),
+                }
+            }
+            if project_everything || child_columns.is_empty() {
+                child_columns.clear();
+            }
+
+            let mut grouped = if keys.is_empty() {
+                std::collections::HashMap::new()
             } else {
                 let sql = plan
-                    .children_sql(ctx.max_rows)
+                    .children_grouped_sql(ctx.max_rows, &child_columns)
                     .map_err(|e| async_graphql::Error::new(e.to_string()))?;
 
                 let fetched = sqlx::query(&sql).bind(&keys).fetch_all(&mut *conn).await?;
 
+                // The query returns the join key and a JSON array of that key's
+                // children, grouped by PostgreSQL rather than row by row here.
                 use sqlx::Row;
-                fetched
+                let pairs: Vec<(serde_json::Value, serde_json::Value)> = fetched
                     .into_iter()
-                    .filter_map(|row| row.try_get::<serde_json::Value, _>(0).ok())
-                    .collect()
+                    .filter_map(|row| {
+                        Some((
+                            row.try_get::<serde_json::Value, _>(0).ok()?,
+                            row.try_get::<serde_json::Value, _>(1).ok()?,
+                        ))
+                    })
+                    .collect();
+
+                postrust_core::embed::group_from_aggregated(pairs)
             };
 
             // Recurse before attaching, so nested embeds land in the values
-            // that get copied onto the parents.
-            embed_relationships(&mut *conn, ctx, &rel.target_type, requested, &mut children)
-                .await?;
+            // copied onto the parents. One query serves every child row at this
+            // level, so the rows are flattened for the call and put back
+            // afterwards; skipped when the selection asks for nothing deeper.
+            let has_deeper_embed = ctx
+                .relationships
+                .get(&rel.target_type)
+                .map(|rels| {
+                    requested
+                        .selection_set()
+                        .any(|field| rels.iter().any(|r| r.name == field.name()))
+                })
+                .unwrap_or(false);
 
-            let grouped = postrust_core::embed::group_by_key(children, &plan.foreign_column);
+            if has_deeper_embed {
+                let mut order: Vec<(String, usize)> = Vec::with_capacity(grouped.len());
+                let mut flat: Vec<serde_json::Value> = Vec::new();
+                for (key, children) in grouped.drain() {
+                    order.push((key, children.len()));
+                    flat.extend(children);
+                }
+
+                embed_relationships(&mut *conn, ctx, &rel.target_type, requested, &mut flat)
+                    .await?;
+
+                let mut rest = flat.into_iter();
+                for (key, count) in order {
+                    grouped.insert(key, rest.by_ref().take(count).collect());
+                }
+            }
+
             for row in rows.iter_mut() {
                 postrust_core::embed::attach_to_parent(row, &rel.name, &plan, &grouped);
             }

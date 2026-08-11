@@ -129,7 +129,52 @@ async fn execute_plan(
                 return Ok(QueryResult::default());
             }
 
-            let (sql, params) = query.build_main();
+            let (mut sql, params) = query.build_main();
+
+            // Embed related resources in the same query.
+            //
+            // Each relation becomes a correlated subselect in the SELECT list,
+            // so PostgreSQL builds the nested JSON while it already has the
+            // parent row -- one round trip for the whole tree instead of one per
+            // relation per level, and no grouping or attaching in this process.
+            //
+            // Parent columns stay ordinary typed columns, so they are converted
+            // to JSON by the same code as a request without embeds and a NUMERIC
+            // or timestamp renders identically either way.
+            let embed_expressions = match read_target(api_request) {
+                Some(parent_qi)
+                    if api_request.query_params.select.iter().any(|item| {
+                        matches!(
+                            item,
+                            postrust_core::api_request::SelectItem::Relation { .. }
+                        )
+                    }) =>
+                {
+                    let schema_cache = state.schema_cache().await;
+                    let mut counter = 0;
+                    build_embed_expressions(
+                        &schema_cache,
+                        &parent_qi,
+                        "src",
+                        &api_request.query_params.select,
+                        api_request.max_rows,
+                        &mut counter,
+                    )?
+                }
+                _ => Vec::new(),
+            };
+
+            if !embed_expressions.is_empty() {
+                let mut projection = String::from("src.*");
+                for (field_name, expression) in &embed_expressions {
+                    projection.push_str(", ");
+                    projection.push_str(expression);
+                    projection.push_str(" AS ");
+                    projection.push_str(&postrust_sql::escape_ident(field_name));
+                }
+                sql = format!("SELECT {} FROM ({}) AS src", projection, sql);
+            }
+
             debug!("Executing SQL: {}", sql);
             debug!("With {} parameters", params.len());
 
@@ -206,14 +251,12 @@ async fn execute_plan(
                 .map(|row| postrust_core::row_json::row_to_json(&row))
                 .collect();
 
-            // Embed related resources requested with `select=...,relation(...)`.
-            //
-            // On the request's own transaction rather than a fresh connection.
-            // Acquiring a second connection here while still holding this one
-            // deadlocked the pool: every in-flight embed needed two connections
-            // at once, so once each connection was held by a request waiting
-            // for a second, none could proceed.
-            if let Some(parent_qi) = read_target(api_request) {
+            // Embeds already came back with the parent query when the SELECT
+            // list carried relations. This path remains for anything the
+            // single-query form did not handle.
+            if let Some(parent_qi) =
+                read_target(api_request).filter(|_| embed_expressions.is_empty())
+            {
                 let schema_cache = state.schema_cache().await;
                 embed_relations(
                     &mut tx,
@@ -405,6 +448,107 @@ fn add_embed_join_columns(
     Ok(added)
 }
 
+/// Build the SELECT-list expressions that embed relations in one query.
+///
+/// Returns one `(field_name, expression)` per requested relation. Each
+/// expression is a correlated subselect yielding JSON, so the whole tree comes
+/// back from the parent query rather than from a query per relation per level.
+///
+/// `alias_counter` hands out a distinct alias per level, so a self-referential
+/// relationship stays unambiguous.
+#[allow(clippy::result_large_err)] // consistent with the crate's error type
+fn build_embed_expressions(
+    schema_cache: &postrust_core::SchemaCache,
+    parent_qi: &postrust_core::api_request::QualifiedIdentifier,
+    parent_alias: &str,
+    select: &[postrust_core::api_request::SelectItem],
+    max_rows: Option<i64>,
+    alias_counter: &mut usize,
+) -> Result<Vec<(String, String)>, postrust_core::Error> {
+    use postrust_core::api_request::SelectItem;
+
+    let mut expressions = Vec::new();
+
+    for item in select {
+        let SelectItem::Relation {
+            relation,
+            alias,
+            select: nested,
+            ..
+        } = item
+        else {
+            continue;
+        };
+
+        let rel = schema_cache
+            .find_relationship(parent_qi, relation, &parent_qi.schema)
+            .ok_or_else(|| postrust_core::Error::RelationshipNotFound(relation.clone()))?;
+        let plan = postrust_core::embed::EmbedPlan::resolve(rel, schema_cache)?;
+
+        *alias_counter += 1;
+        let child_alias = format!("e{}", alias_counter);
+        let child_qi = postrust_core::api_request::QualifiedIdentifier::new(
+            &plan.foreign_schema,
+            &plan.foreign_table,
+        );
+
+        // Deeper relations first: they become part of this level's SELECT list.
+        let nested_expressions = build_embed_expressions(
+            schema_cache,
+            &child_qi,
+            &child_alias,
+            nested,
+            max_rows,
+            alias_counter,
+        )?;
+
+        // The child's own columns. Empty means every column, which is what a
+        // relation with no explicit selection asks for.
+        let mut parts: Vec<String> = Vec::new();
+        let mut project_everything = nested.is_empty();
+        for nested_item in nested {
+            match nested_item {
+                SelectItem::Field { field, alias, .. } => {
+                    let column = postrust_sql::escape_ident(&field.name);
+                    match alias {
+                        Some(alias) => parts.push(format!(
+                            "{} AS {}",
+                            column,
+                            postrust_sql::escape_ident(alias)
+                        )),
+                        None => parts.push(column),
+                    }
+                }
+                // Handled as an expression, not a column.
+                SelectItem::Relation { .. } => {}
+                SelectItem::SpreadRelation { .. } => project_everything = true,
+            }
+        }
+        if project_everything {
+            parts.clear();
+            parts.push(format!("{}.*", postrust_sql::escape_ident(&child_alias)));
+        }
+        for (field_name, expression) in nested_expressions {
+            parts.push(format!(
+                "{} AS {}",
+                expression,
+                postrust_sql::escape_ident(&field_name)
+            ));
+        }
+
+        let inner_select = parts.join(", ");
+        let expression =
+            plan.embed_expression(parent_alias, &child_alias, &inner_select, max_rows)?;
+
+        expressions.push((
+            alias.clone().unwrap_or_else(|| relation.clone()),
+            expression,
+        ));
+    }
+
+    Ok(expressions)
+}
+
 type EmbedFuture<'f> = std::pin::Pin<
     Box<dyn std::future::Future<Output = Result<(), postrust_core::Error>> + Send + 'f>,
 >;
@@ -447,10 +591,54 @@ fn embed_relations<'f>(
             let plan = postrust_core::embed::EmbedPlan::resolve(rel, schema_cache)?;
             let keys = postrust_core::embed::parent_keys(rows, &plan.local_column);
 
-            let mut children: Vec<serde_json::Value> = if keys.is_empty() {
-                Vec::new()
+            // Which of the child's columns the query needs to return.
+            //
+            // A column that was not asked for still costs a heap read, JSON
+            // serialisation in PostgreSQL, socket bytes and a parse before
+            // being discarded, so the projection is worked out before the query
+            // rather than filtered afterwards.
+            //
+            // A nested embed joins on a column of the child row, so that column
+            // has to survive the projection even when the client did not ask
+            // for it. A spread relation falls back to every column: its shape
+            // is decided further down and is not a plain projection.
+            let child_qi = postrust_core::api_request::QualifiedIdentifier::new(
+                &plan.foreign_schema,
+                &plan.foreign_table,
+            );
+
+            let mut child_columns: Vec<String> = Vec::new();
+            let mut project_everything = nested.is_empty();
+            for nested_item in nested {
+                match nested_item {
+                    SelectItem::Field { field, .. } => child_columns.push(field.name.clone()),
+                    SelectItem::Relation { relation, .. } => {
+                        match schema_cache.find_relationship(&child_qi, relation, &child_qi.schema)
+                        {
+                            Some(nested_rel) => {
+                                let nested_plan = postrust_core::embed::EmbedPlan::resolve(
+                                    nested_rel,
+                                    schema_cache,
+                                )?;
+                                child_columns.push(nested_plan.local_column);
+                            }
+                            // Leave it to the recursive call to report the
+                            // unknown relation, rather than failing here with
+                            // less context.
+                            None => project_everything = true,
+                        }
+                    }
+                    SelectItem::SpreadRelation { .. } => project_everything = true,
+                }
+            }
+            if project_everything {
+                child_columns.clear();
+            }
+
+            let mut grouped = if keys.is_empty() {
+                std::collections::HashMap::new()
             } else {
-                let sql = plan.children_sql(max_rows)?;
+                let sql = plan.children_grouped_sql(max_rows, &child_columns)?;
 
                 let fetched = sqlx::query(&sql)
                     .bind(&keys)
@@ -458,34 +646,68 @@ fn embed_relations<'f>(
                     .await
                     .map_err(map_sqlx_error)?;
 
-                // The query already returns one JSON column per row, so the
-                // value is read straight out of it -- running it through the
-                // typed row converter would wrap it as {"row_to_json": {..}}.
+                // The query returns the join key and a JSON array of that
+                // key's children, so the values are read straight out of the
+                // columns -- the typed row converter would wrap them under the
+                // expression name.
                 use sqlx::Row;
-                fetched
+                let pairs: Vec<(serde_json::Value, serde_json::Value)> = fetched
                     .into_iter()
-                    .filter_map(|row| row.try_get::<serde_json::Value, _>(0).ok())
-                    .collect()
+                    .filter_map(|row| {
+                        Some((
+                            row.try_get::<serde_json::Value, _>(0).ok()?,
+                            row.try_get::<serde_json::Value, _>(1).ok()?,
+                        ))
+                    })
+                    .collect();
+
+                postrust_core::embed::group_from_aggregated(pairs)
             };
 
-            // Deeper embeds first, so they are present in the values copied
-            // onto the parents.
-            let child_qi = postrust_core::api_request::QualifiedIdentifier::new(
-                &plan.foreign_schema,
-                &plan.foreign_table,
-            );
-            embed_relations(
-                &mut *conn,
-                schema_cache,
-                &child_qi,
-                nested,
-                &mut children,
-                max_rows,
-            )
-            .await?;
+            // Deeper embeds, if any were asked for.
+            //
+            // A nested embed issues one query for every child row at this
+            // level, so the rows have to be contiguous for it. They arrive
+            // grouped, so they are flattened for the recursive call and put
+            // back afterwards. When nothing deeper was requested this is all
+            // skipped, which is the common case.
+            let has_deeper_embed = nested.iter().any(|item| {
+                matches!(
+                    item,
+                    SelectItem::Relation { .. } | SelectItem::SpreadRelation { .. }
+                )
+            });
+
+            if has_deeper_embed {
+                let mut order: Vec<(String, usize)> = Vec::with_capacity(grouped.len());
+                let mut flat: Vec<serde_json::Value> = Vec::new();
+                for (key, children) in grouped.drain() {
+                    order.push((key, children.len()));
+                    flat.extend(children);
+                }
+
+                embed_relations(
+                    &mut *conn,
+                    schema_cache,
+                    &child_qi,
+                    nested,
+                    &mut flat,
+                    max_rows,
+                )
+                .await?;
+
+                let mut rest = flat.into_iter();
+                for (key, count) in order {
+                    grouped.insert(key, rest.by_ref().take(count).collect());
+                }
+            }
 
             // Return only the requested columns of the related resource. An
             // empty nested select means every column.
+            //
+            // The projection in the query covers the columns; this covers what
+            // is left over, which is the join column when the client did not
+            // ask for it.
             let requested: Option<std::collections::HashSet<String>> = if nested.is_empty() {
                 None
             } else {
@@ -504,10 +726,6 @@ fn embed_relations<'f>(
                         .collect(),
                 )
             };
-
-            // Group before projecting: the join column is what the grouping
-            // keys off, so removing it first would leave nothing to match on.
-            let mut grouped = postrust_core::embed::group_by_key(children, &plan.foreign_column);
 
             if let Some(requested) = requested {
                 for group in grouped.values_mut() {
