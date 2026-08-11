@@ -3,6 +3,7 @@ import type { DocumentHead } from "@builder.io/qwik-city";
 import { HeroSection } from "~/components/sections/hero";
 import { FeaturesSection } from "~/components/sections/features";
 import { PerformanceSection } from "~/components/sections/performance";
+import { ComparisonSection } from "~/components/sections/comparison";
 import { CodeExamplesSection } from "~/components/sections/code-examples";
 import { SaasStarterSection } from "~/components/sections/saas-starter";
 import { DeploymentSection } from "~/components/sections/deployment";
@@ -14,6 +15,7 @@ export default component$(() => {
       <HeroSection />
       <FeaturesSection />
       <PerformanceSection />
+      <ComparisonSection />
       <CodeExamplesSection />
       <SaasStarterSection />
       <DeploymentSection />
@@ -27,11 +29,13 @@ export const head: DocumentHead = {
   meta: [
     {
       name: "description",
-      content: "High-performance PostgreSQL REST & GraphQL API server written in Rust. Native AWS Lambda support with ~50ms cold starts. Drop-in PostgREST replacement.",
+      content:
+        "High-performance PostgreSQL REST & GraphQL API server written in Rust. Native AWS Lambda support with ~50ms cold starts. Drop-in PostgREST replacement.",
     },
     {
       name: "keywords",
-      content: "PostgreSQL, REST API, GraphQL, Rust, serverless, PostgREST, Lambda, database API",
+      content:
+        "PostgreSQL, REST API, GraphQL, Rust, serverless, PostgREST, Lambda, database API",
     },
     {
       property: "og:title",
@@ -39,7 +43,8 @@ export const head: DocumentHead = {
     },
     {
       property: "og:description",
-      content: "High-performance PostgreSQL REST & GraphQL API server written in Rust. Native AWS Lambda support with ~50ms cold starts.",
+      content:
+        "High-performance PostgreSQL REST & GraphQL API server written in Rust. Native AWS Lambda support with ~50ms cold starts.",
     },
     {
       property: "og:type",
@@ -59,7 +64,8 @@ export const head: DocumentHead = {
     },
     {
       name: "twitter:description",
-      content: "High-performance PostgreSQL REST & GraphQL API server written in Rust. Native AWS Lambda support with ~50ms cold starts.",
+      content:
+        "High-performance PostgreSQL REST & GraphQL API server written in Rust. Native AWS Lambda support with ~50ms cold starts.",
     },
   ],
 };
