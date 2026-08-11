@@ -82,7 +82,9 @@ async fn get_with_headers(uri: &str, headers: &[(&str, &str)]) -> (StatusCode, H
     for (name, value) in headers {
         builder = builder.header(*name, *value);
     }
-    let request = builder.body(Body::empty()).expect("failed to build request");
+    let request = builder
+        .body(Body::empty())
+        .expect("failed to build request");
 
     let response = app.oneshot(request).await.expect("request failed");
     let status = response.status();
@@ -256,7 +258,8 @@ async fn non_numeric_limit_is_rejected() {
 #[tokio::test]
 #[ignore = "requires PostgreSQL"]
 async fn range_header_limits_rows() {
-    let (status, _, body) = get_with_headers("/api/products?order=id.asc", &[("Range", "0-2")]).await;
+    let (status, _, body) =
+        get_with_headers("/api/products?order=id.asc", &[("Range", "0-2")]).await;
     let rows = rows("/api/products (Range: 0-2)", status, body);
 
     assert_eq!(ids(&rows, "id"), vec![1, 2, 3]);
