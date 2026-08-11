@@ -39,7 +39,9 @@ tokio-postgres = "0.7"
 
 # Serialization
 serde = { version = "1.0", features = ["derive"] }
-serde_json = "1.0"
+# arbitrary_precision keeps NUMERIC values as the digits PostgreSQL sent,
+# rather than routing them through f64 on the way to JSON.
+serde_json = { version = "1.0", features = ["arbitrary_precision"] }
 
 # Parsing
 nom = "7.1"

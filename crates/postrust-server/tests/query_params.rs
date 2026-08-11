@@ -622,3 +622,58 @@ async fn unknown_relation_is_rejected() {
         body
     );
 }
+
+/// Concurrent embeds must not exhaust the connection pool.
+///
+/// Embedding acquires a connection per relationship. While the request's own
+/// connection was still held during that, each in-flight embed needed two
+/// connections at once, so once every connection was held by a request waiting
+/// for a second one, none could proceed and the pool deadlocked until acquire
+/// timeouts fired.
+///
+/// The test pool holds two connections, so more concurrent embeds than that is
+/// enough to reproduce it. Every sequential embed test passed throughout: only
+/// concurrency above the pool size shows the problem, which is why this asserts
+/// on a deadline rather than only on the response bodies.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires PostgreSQL"]
+async fn concurrent_embeds_do_not_exhaust_the_pool() {
+    const CONCURRENT: usize = 8;
+
+    let app = build_app(None).await;
+
+    let mut handles = Vec::with_capacity(CONCURRENT);
+    for _ in 0..CONCURRENT {
+        let app = app.clone();
+        handles.push(tokio::spawn(async move {
+            let request = Request::builder()
+                .method("GET")
+                .uri("/api/users?select=id,name,posts(id,title)&order=id.asc&limit=5")
+                .body(Body::empty())
+                .expect("failed to build request");
+
+            let response = app.oneshot(request).await.expect("request failed");
+            response.status()
+        }));
+    }
+
+    // Comfortably above what these queries need, and far below the 30s acquire
+    // timeout that the deadlock used to wait on.
+    let statuses = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        let mut statuses = Vec::with_capacity(CONCURRENT);
+        for handle in handles {
+            statuses.push(handle.await.expect("task panicked"));
+        }
+        statuses
+    })
+    .await
+    .expect("concurrent embeds did not finish in time -- the connection pool deadlocked");
+
+    for status in statuses {
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "every concurrent embed should succeed"
+        );
+    }
+}

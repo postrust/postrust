@@ -194,6 +194,18 @@ async fn execute_plan(
                 .map(|row| postrust_core::row_json::row_to_json(&row))
                 .collect();
 
+            // Release the connection before embedding.
+            //
+            // Embedding acquires its own connection per relationship. Holding
+            // this one while doing so means each in-flight request needs two
+            // connections at once, and once every connection in the pool is
+            // held by a request waiting for a second one, none of them can
+            // proceed -- the pool deadlocks until acquire timeouts fire. A
+            // single request never shows it; concurrency above the pool size
+            // shows it immediately. The rows are already materialised into
+            // `json_rows`, so nothing below needs this connection.
+            drop(conn);
+
             // Embed related resources requested with `select=...,relation(...)`.
             if let Some(parent_qi) = read_target(api_request) {
                 let schema_cache = state.schema_cache().await;
