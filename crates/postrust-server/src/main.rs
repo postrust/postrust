@@ -24,6 +24,14 @@ use axum::routing::{get, post};
 use app::handle_request;
 use state::AppState;
 
+// musl's built-in allocator contends badly across threads, which shows up on
+// exactly the paths that allocate per row. Building the Alpine image with it
+// cost roughly 4-6x on the paged and embedded scenarios compared with the same
+// code on glibc. glibc builds keep their own allocator, which performs fine.
+#[cfg(target_env = "musl")]
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 #[tokio::main]
 async fn main() -> Result<()> {
     // Initialize tracing
