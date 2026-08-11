@@ -48,6 +48,8 @@ export const perfCaveats = [
   "Every server runs as a container on one docker network against the same PostgreSQL instance and the same dataset. No tool gets to skip container overhead.",
   "Each tool keeps its own default connection pool and worker settings. Tuning one and not the others measures the tuning, not the tool.",
   "Requests are expressed in each tool's own dialect, because the dialects differ. The work asked of PostgreSQL is the same.",
+  "Every target is warmed before any of them is measured, and the database cache is populated first, so no tool pays to warm the cache for the ones measured after it.",
+  "Each figure is the median of several runs rather than the best of them, because a best-of-N reports whichever tool got the quietest moment on the machine.",
   "These are single-machine numbers from a laptop. They are useful for comparing the tools against each other, not for capacity planning.",
 ];
 

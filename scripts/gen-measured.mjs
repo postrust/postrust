@@ -123,6 +123,8 @@ export const benchMeta = {
   dataset: ${JSON.stringify(primary.dataset)},
   requests: ${primary.requests},
   concurrency: ${primary.concurrency},
+  repeats: ${primary.repeats ?? 1},
+  warmup: ${primary.warmup ?? 0},
   variant: ${JSON.stringify(primary.variant ?? "unknown")},
 } as const;
 

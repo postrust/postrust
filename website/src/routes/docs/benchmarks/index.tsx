@@ -1,6 +1,7 @@
 import { component$ } from "@builder.io/qwik";
 import type { DocumentHead } from "@builder.io/qwik-city";
 import { Link } from "@builder.io/qwik-city";
+import { measuredFor, benchMeta } from "~/data/measured";
 
 const scenarios = [
   {
@@ -186,6 +187,101 @@ ONLY=postrust,postgrest ./scripts/bench-compare.sh`}</code>
               , and the figures published on the comparison pages are copied
               from that file rather than retyped.
             </p>
+            <h3 class="mt-8 mb-3 text-lg font-semibold text-neutral-900">
+              REST, requests per second
+            </h3>
+            <div class="mb-6 overflow-x-auto rounded-lg border border-neutral-200">
+              <table class="w-full text-sm">
+                <thead class="bg-neutral-50">
+                  <tr>
+                    <th class="px-4 py-3 text-left font-medium text-neutral-900">
+                      Scenario
+                    </th>
+                    <th class="text-primary-600 px-4 py-3 text-right font-medium">
+                      Postrust
+                    </th>
+                    <th class="px-4 py-3 text-right font-medium text-neutral-900">
+                      PostgREST
+                    </th>
+                  </tr>
+                </thead>
+                <tbody class="divide-y divide-neutral-200">
+                  {measuredFor("postgrest", "rest").map((row) => (
+                    <tr key={row.scenario}>
+                      <td class="px-4 py-3 text-neutral-900">{row.scenario}</td>
+                      <td class="px-4 py-3 text-right text-neutral-700 tabular-nums">
+                        {row.postrust
+                          ? row.postrust.rps.toLocaleString()
+                          : "n/a"}
+                      </td>
+                      <td class="px-4 py-3 text-right text-neutral-700 tabular-nums">
+                        {row.other ? row.other.rps.toLocaleString() : "n/a"}
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+
+            <h3 class="mb-3 text-lg font-semibold text-neutral-900">
+              GraphQL, requests per second
+            </h3>
+            <div class="mb-6 overflow-x-auto rounded-lg border border-neutral-200">
+              <table class="w-full text-sm">
+                <thead class="bg-neutral-50">
+                  <tr>
+                    <th class="px-4 py-3 text-left font-medium text-neutral-900">
+                      Scenario
+                    </th>
+                    <th class="text-primary-600 px-4 py-3 text-right font-medium">
+                      Postrust
+                    </th>
+                    <th class="px-4 py-3 text-right font-medium text-neutral-900">
+                      Hasura
+                    </th>
+                    <th class="px-4 py-3 text-right font-medium text-neutral-900">
+                      PostGraphile
+                    </th>
+                  </tr>
+                </thead>
+                <tbody class="divide-y divide-neutral-200">
+                  {measuredFor("hasura", "graphql").map((row, index) => {
+                    const pg = measuredFor("postgraphile", "graphql")[index];
+                    return (
+                      <tr key={row.scenario}>
+                        <td class="px-4 py-3 text-neutral-900">
+                          {row.scenario}
+                        </td>
+                        <td class="px-4 py-3 text-right text-neutral-700 tabular-nums">
+                          {row.postrust
+                            ? row.postrust.rps.toLocaleString()
+                            : "n/a"}
+                        </td>
+                        <td class="px-4 py-3 text-right text-neutral-700 tabular-nums">
+                          {row.other ? row.other.rps.toLocaleString() : "n/a"}
+                        </td>
+                        <td class="px-4 py-3 text-right text-neutral-700 tabular-nums">
+                          {pg?.other ? pg.other.rps.toLocaleString() : "n/a"}
+                        </td>
+                      </tr>
+                    );
+                  })}
+                </tbody>
+              </table>
+            </div>
+
+            <p class="mb-6 text-sm text-neutral-500">
+              PostgREST appears only in the REST table and the two GraphQL
+              engines only in the GraphQL one, because neither exposes the other
+              surface. {benchMeta.requests} requests at concurrency{" "}
+              {benchMeta.concurrency}, median of {benchMeta.repeats} runs after{" "}
+              {benchMeta.warmup} warm-up requests, on {benchMeta.host} against{" "}
+              {benchMeta.postgres}. Figures from one run are comparable with
+              each other; figures from different runs on a busy machine are not,
+              which is why comparing two versions of the same code means running
+              both side by side rather than one after the other.
+            </p>
+
             <p class="text-neutral-600">
               Per-tool numbers, including the scenarios where another tool is
               faster, are on the{" "}

@@ -224,7 +224,9 @@ export const ComparisonPage = component$<Props>(({ comparison: c }) => {
                 <p class="mt-4 text-sm text-neutral-500">
                   {benchMeta.host} · PostgreSQL {benchMeta.postgres} ·{" "}
                   {benchMeta.dataset} · {benchMeta.requests} requests at
-                  concurrency {benchMeta.concurrency}.{" "}
+                  concurrency {benchMeta.concurrency}, median of{" "}
+                  {benchMeta.repeats} runs after {benchMeta.warmup} warm-up
+                  requests.{" "}
                   <Link
                     href="/docs/benchmarks"
                     class="text-primary-600 hover:text-primary-700"
