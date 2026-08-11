@@ -709,3 +709,58 @@ async fn row_level_security_applies_to_the_anonymous_role() {
         leaked
     );
 }
+
+/// Response key order depends on how the crate was built.
+///
+/// `serde_json::Map` is a BTreeMap by default, which sorts its keys, so
+/// responses come back alphabetically. The `compat-key-order` feature swaps it
+/// for an IndexMap so keys follow the select list, as PostgREST returns them.
+///
+/// That is a build-time choice, so this asserts whichever behaviour was
+/// compiled: both are supported and both should be covered.
+///
+/// The columns are asked for in two different orders, because one ordering
+/// could agree with the alphabet by accident.
+#[tokio::test]
+#[ignore = "requires PostgreSQL"]
+async fn response_key_order_matches_the_build() {
+    for query in ["status,name,id", "id,name,status"] {
+        let rows = get_rows(&format!("/api/users?select={}&limit=1", query)).await;
+        let keys: Vec<&str> = rows[0]
+            .as_object()
+            .expect("row should be an object")
+            .keys()
+            .map(String::as_str)
+            .collect();
+
+        if cfg!(feature = "compat-key-order") {
+            let expected: Vec<&str> = query.split(',').collect();
+            assert_eq!(keys, expected, "keys should follow the select list");
+        } else {
+            let mut sorted = keys.clone();
+            sorted.sort_unstable();
+            assert_eq!(keys, sorted, "keys should be sorted without the feature");
+        }
+    }
+}
+
+/// Embedded rows order their keys the same way the parents do.
+#[tokio::test]
+#[ignore = "requires PostgreSQL"]
+async fn embedded_key_order_matches_the_build() {
+    let rows = get_rows("/api/users?select=name,id,posts(title,id)&order=id.asc&limit=1").await;
+
+    let posts = rows[0]["posts"].as_array().expect("posts should embed");
+    let keys: Vec<&str> = posts[0]
+        .as_object()
+        .expect("post should be an object")
+        .keys()
+        .map(String::as_str)
+        .collect();
+
+    if cfg!(feature = "compat-key-order") {
+        assert_eq!(keys, vec!["title", "id"]);
+    } else {
+        assert_eq!(keys, vec!["id", "title"]);
+    }
+}

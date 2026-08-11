@@ -2357,7 +2357,7 @@ dependencies = [
 
 [[package]]
 name = "postrust-auth"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "async-trait",
  "base64",
@@ -2373,7 +2373,7 @@ dependencies = [
 
 [[package]]
 name = "postrust-core"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "async-trait",
  "bytes",
@@ -2397,7 +2397,7 @@ dependencies = [
 
 [[package]]
 name = "postrust-graphql"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "async-graphql",
  "async-graphql-axum",
@@ -2422,7 +2422,7 @@ dependencies = [
 
 [[package]]
 name = "postrust-lambda"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -2446,7 +2446,7 @@ dependencies = [
 
 [[package]]
 name = "postrust-proxy"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "ahash",
  "anyhow",
@@ -2494,7 +2494,7 @@ dependencies = [
 
 [[package]]
 name = "postrust-response"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "bytes",
  "http",
@@ -2509,7 +2509,7 @@ dependencies = [
 
 [[package]]
 name = "postrust-server"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "anyhow",
  "async-graphql",
@@ -2541,7 +2541,7 @@ dependencies = [
 
 [[package]]
 name = "postrust-sql"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "bytes",
  "chrono",
@@ -2554,7 +2554,7 @@ dependencies = [
 
 [[package]]
 name = "postrust-worker"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "async-trait",
  "futures",
@@ -3085,6 +3085,7 @@ version = "1.0.147"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6af14725505314343e673e9ecb7cd7e8a36aa9791eb936235a3567cc31447ae4"
 dependencies = [
+ "indexmap",
  "itoa",
  "memchr",
  "serde",

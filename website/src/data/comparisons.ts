@@ -127,7 +127,7 @@ export const comparisons: Comparison[] = [
       "Configuration uses the same `PGRST_*` environment variable names, including `PGRST_DB_ANON_ROLE` and `PGRST_JWT_SECRET`.",
       "Tables are mounted under `/api` by default rather than at the root. Check your base URL before assuming a 404 is something worse.",
       "NUMERIC columns come back as JSON numbers, as they do from PostgREST, though the scale can differ: 4.2000 where PostgREST gives 4.20. Both parse to the same value.",
-      "Object keys are ordered alphabetically rather than by column position. Harmless unless something downstream depends on key order, which nothing should.",
+      "Object keys come back alphabetically rather than in select order. Build with the compat-key-order feature to match PostgREST; it is off by default because it costs up to 15% on wide rows.",
       "Verify the specific PostgREST features you depend on against Postrust's test suite before switching anything that matters.",
     ],
     faq: [
