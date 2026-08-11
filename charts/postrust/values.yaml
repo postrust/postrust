@@ -1,0 +1,50 @@
+# Default values for the postrust chart.
+
+replicas: 1
+
+image:
+  repository: postrust/postrust
+  # Defaults to the chart's appVersion.
+  tag: ""
+  pullPolicy: IfNotPresent
+
+database:
+  # Required. postgres://user:password@host:5432/database
+  #
+  # Stored in a Secret created by this chart. To keep it out of your values
+  # entirely, leave this empty and set existingSecret instead.
+  url: ""
+  # Name of a Secret you manage yourself. It must hold DATABASE_URL, and
+  # PGRST_JWT_SECRET when auth.jwtSecret is not set here.
+  existingSecret: ""
+
+auth:
+  # Optional. Enables JWT verification when set.
+  jwtSecret: ""
+  # Role used for requests that arrive without a token.
+  anonRole: web_anon
+
+server:
+  port: 3000
+  logLevel: info
+  schemas: public
+  # Serve the REST surface at the root as well as under /api.
+  compatMode: false
+  # Cap on rows returned by one request. Empty means no cap.
+  maxRows: ""
+
+service:
+  type: ClusterIP
+  port: 80
+
+resources:
+  requests:
+    cpu: 100m
+    memory: 64Mi
+  limits:
+    memory: 256Mi
+
+podAnnotations: {}
+nodeSelector: {}
+tolerations: []
+affinity: {}
