@@ -3,16 +3,26 @@ import { Link } from "@builder.io/qwik-city";
 import { comparisons } from "~/data/comparisons";
 import { measuredFor, benchMeta } from "~/data/measured";
 
+interface Entry {
+  name: string;
+  ours: boolean;
+  rps: number;
+  p95: number;
+}
+
+interface Group {
+  surface: string;
+  entries: Entry[];
+}
+
 /**
- * Links to the per-tool comparison pages.
+ * Links to the per-tool comparison pages, over one measured scenario.
  *
- * Each card leads with what the other tool is good at, because someone landing
- * here is choosing between options and a page that only flatters itself is not
- * useful to them.
+ * Grouped by surface rather than ranked together: a REST figure and a GraphQL
+ * figure are not the same measurement, and one combined list invites a
+ * comparison that is not being made.
  */
 export const ComparisonSection = component$(() => {
-  // The embed scenario across every tool that supports the surface, read out of
-  // the generated measurements rather than written down here.
   const restEmbed = measuredFor("postgrest", "rest").find((r) =>
     r.scenario.includes("embed"),
   );
@@ -23,54 +33,55 @@ export const ComparisonSection = component$(() => {
     r.scenario.includes("embed"),
   );
 
-  const headline = [
-    restEmbed?.postrust && {
-      name: "Postrust",
-      surface: "REST",
-      ours: true,
-      rps: restEmbed.postrust.rps,
-      p95: restEmbed.postrust.p95_ms,
-    },
-    hasuraEmbed?.postrust && {
-      name: "Postrust",
-      surface: "GraphQL",
-      ours: true,
-      rps: hasuraEmbed.postrust.rps,
-      p95: hasuraEmbed.postrust.p95_ms,
-    },
-    restEmbed?.other && {
-      name: "PostgREST",
-      surface: "REST",
-      ours: false,
-      rps: restEmbed.other.rps,
-      p95: restEmbed.other.p95_ms,
-    },
-    hasuraEmbed?.other && {
-      name: "Hasura",
-      surface: "GraphQL",
-      ours: false,
-      rps: hasuraEmbed.other.rps,
-      p95: hasuraEmbed.other.p95_ms,
-    },
-    graphileEmbed?.other && {
-      name: "PostGraphile",
-      surface: "GraphQL",
-      ours: false,
-      rps: graphileEmbed.other.rps,
-      p95: graphileEmbed.other.p95_ms,
-    },
-  ].filter(Boolean) as Array<{
-    name: string;
-    surface: string;
-    ours: boolean;
-    rps: number;
-    p95: number;
-  }>;
+  const groups: Group[] = (
+    [
+      {
+        surface: "REST",
+        entries: [
+          restEmbed?.postrust && {
+            name: "Postrust",
+            ours: true,
+            rps: restEmbed.postrust.rps,
+            p95: restEmbed.postrust.p95_ms,
+          },
+          restEmbed?.other && {
+            name: "PostgREST",
+            ours: false,
+            rps: restEmbed.other.rps,
+            p95: restEmbed.other.p95_ms,
+          },
+        ].filter(Boolean) as Entry[],
+      },
+      {
+        surface: "GraphQL",
+        entries: [
+          hasuraEmbed?.postrust && {
+            name: "Postrust",
+            ours: true,
+            rps: hasuraEmbed.postrust.rps,
+            p95: hasuraEmbed.postrust.p95_ms,
+          },
+          hasuraEmbed?.other && {
+            name: "Hasura",
+            ours: false,
+            rps: hasuraEmbed.other.rps,
+            p95: hasuraEmbed.other.p95_ms,
+          },
+          graphileEmbed?.other && {
+            name: "PostGraphile",
+            ours: false,
+            rps: graphileEmbed.other.rps,
+            p95: graphileEmbed.other.p95_ms,
+          },
+        ].filter(Boolean) as Entry[],
+      },
+    ] as Group[]
+  ).filter((group) => group.entries.length > 1);
 
   return (
     <section class="section-padding bg-neutral-50">
       <div class="container-wide">
-        <div class="mb-12 max-w-3xl">
+        <div class="mb-10 max-w-3xl">
           <h2 class="mb-4 text-3xl font-bold text-neutral-900 md:text-4xl">
             How it compares
           </h2>
@@ -82,51 +93,114 @@ export const ComparisonSection = component$(() => {
           </p>
         </div>
 
-        {/* One measured scenario, rather than a wall of them: the embed is the
-            interesting case, since it is where these tools differ most. */}
-        <div class="mb-10 overflow-x-auto rounded-xl border border-neutral-200 bg-white">
-          <table class="w-full text-sm">
-            <thead class="bg-neutral-50">
-              <tr>
-                <th class="px-6 py-3 text-left font-medium text-neutral-900">
-                  A page of 25 rows with a related collection embedded
-                </th>
-                <th class="px-6 py-3 text-right font-medium text-neutral-900">
-                  req/s
-                </th>
-                <th class="px-6 py-3 text-right font-medium text-neutral-900">
-                  p95
-                </th>
-              </tr>
-            </thead>
-            <tbody class="divide-y divide-neutral-200">
-              {headline.map((row) => (
-                <tr key={row.name} class={row.ours ? "bg-primary-50/40" : ""}>
-                  <td
-                    class={`px-6 py-3 ${row.ours ? "text-primary-700 font-semibold" : "text-neutral-700"}`}
-                  >
-                    {row.name}
-                    <span class="ml-2 text-xs text-neutral-500">
-                      {row.surface}
-                    </span>
-                  </td>
-                  <td
-                    class={`px-6 py-3 text-right tabular-nums ${row.ours ? "text-primary-700 font-semibold" : "text-neutral-700"}`}
-                  >
-                    {row.rps.toLocaleString()}
-                  </td>
-                  <td class="px-6 py-3 text-right text-neutral-600 tabular-nums">
-                    {row.p95} ms
-                  </td>
-                </tr>
-              ))}
-            </tbody>
-          </table>
+        <div class="mb-10 overflow-hidden rounded-xl border border-neutral-200 bg-white">
+          <div class="border-b border-neutral-200 px-6 py-4">
+            <h3 class="font-semibold text-neutral-900">
+              A page of 25 rows with a related collection embedded
+            </h3>
+            <p class="mt-1 text-sm text-neutral-500">
+              Requests per second, higher is better. Each surface is compared
+              only against the tools that expose it.
+            </p>
+          </div>
+
+          {groups.map((group) => {
+            const fastest = Math.max(...group.entries.map((e) => e.rps));
+            const ourRps = group.entries.find((e) => e.ours)?.rps ?? fastest;
+
+            return (
+              <div
+                key={group.surface}
+                class="border-b border-neutral-200 last:border-b-0"
+              >
+                <div class="bg-neutral-50/60 px-6 py-2">
+                  <span class="text-xs font-semibold tracking-wide text-neutral-500 uppercase">
+                    {group.surface}
+                  </span>
+                </div>
+
+                {group.entries.map((entry) => {
+                  // Against Postrust: at or above 1 means they are that many
+                  // times slower, below 1 means they are faster.
+                  const ratio = ourRps / entry.rps;
+                  const label = entry.ours
+                    ? null
+                    : ratio >= 1
+                      ? `${ratio.toFixed(1)}× slower`
+                      : `${(1 / ratio).toFixed(1)}× faster`;
+
+                  return (
+                    <div
+                      key={entry.name}
+                      class={`flex items-center gap-4 px-6 py-3 ${
+                        entry.ours ? "bg-primary-50/40" : ""
+                      }`}
+                    >
+                      <div class="w-28 shrink-0 sm:w-32">
+                        <span
+                          class={
+                            entry.ours
+                              ? "text-primary-700 font-semibold"
+                              : "text-neutral-800"
+                          }
+                        >
+                          {entry.name}
+                        </span>
+                      </div>
+
+                      <div class="hidden h-2.5 flex-1 overflow-hidden rounded-full bg-neutral-100 sm:block">
+                        <div
+                          class={`h-full rounded-full ${
+                            entry.ours ? "bg-primary-500" : "bg-neutral-400"
+                          }`}
+                          style={{ width: `${(entry.rps / fastest) * 100}%` }}
+                        />
+                      </div>
+
+                      <div class="w-20 shrink-0 text-right">
+                        <span
+                          class={`tabular-nums ${
+                            entry.ours
+                              ? "text-primary-700 font-semibold"
+                              : "text-neutral-700"
+                          }`}
+                        >
+                          {entry.rps.toLocaleString()}
+                        </span>
+                      </div>
+
+                      <div class="w-16 shrink-0 text-right text-sm text-neutral-500 tabular-nums">
+                        {entry.p95} ms
+                      </div>
+
+                      <div class="w-24 shrink-0 text-right text-sm">
+                        {label ? (
+                          <span
+                            class={
+                              ratio >= 1
+                                ? "text-neutral-500"
+                                : "font-medium text-neutral-900"
+                            }
+                          >
+                            {label}
+                          </span>
+                        ) : (
+                          <span class="text-neutral-400">baseline</span>
+                        )}
+                      </div>
+                    </div>
+                  );
+                })}
+              </div>
+            );
+          })}
+
           <div class="border-t border-neutral-200 bg-neutral-50 px-6 py-3">
             <p class="text-xs text-neutral-500">
-              Same database, same dataset, every server in a container, each
-              tool on its own defaults. Median of {benchMeta.repeats} runs on{" "}
-              {benchMeta.host}.{" "}
+              Columns: requests per second, p95 latency, and the difference
+              against Postrust. Same database, same dataset, every server in a
+              container, each tool on its own defaults. Median of{" "}
+              {benchMeta.repeats} runs on {benchMeta.host}.{" "}
               <Link
                 href="/docs/benchmarks"
                 class="text-primary-600 hover:text-primary-700"
@@ -147,9 +221,7 @@ export const ComparisonSection = component$(() => {
               <h3 class="mb-2 text-lg font-semibold text-neutral-900">
                 vs {c.name}
               </h3>
-              <p class="mb-4 text-sm text-neutral-600">
-                {c.description ?? c.language}
-              </p>
+              <p class="mb-4 text-sm text-neutral-600">{c.description}</p>
               <span class="text-primary-600 group-hover:text-primary-700 text-sm font-medium">
                 Read the comparison →
               </span>

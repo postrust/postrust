@@ -353,6 +353,20 @@ interface TableProps {
   otherName: string;
 }
 
+/**
+ * How the two throughput figures relate, as a multiple.
+ *
+ * Stated in whichever direction is true, so a scenario the other tool wins says
+ * so rather than being left for the reader to divide.
+ */
+function ratioLabel(row: MeasuredRow) {
+  if (!row.postrust || !row.other) return "—";
+
+  const ratio = row.postrust.rps / row.other.rps;
+  if (ratio >= 1) return `${ratio.toFixed(1)}× faster`;
+  return `${(1 / ratio).toFixed(1)}× slower`;
+}
+
 const MeasuredTable = component$<TableProps>(({ rows, otherName }) => (
   <div class="overflow-x-auto rounded-xl border border-neutral-200 bg-white">
     <table class="w-full text-sm">
@@ -372,6 +386,9 @@ const MeasuredTable = component$<TableProps>(({ rows, otherName }) => (
           </th>
           <th class="px-6 py-3 text-right font-medium text-neutral-900">
             {otherName} p95
+          </th>
+          <th class="px-6 py-3 text-right font-medium text-neutral-900">
+            Difference
           </th>
         </tr>
       </thead>
@@ -394,6 +411,9 @@ const MeasuredTable = component$<TableProps>(({ rows, otherName }) => (
             </td>
             <td class="px-6 py-3 text-right text-neutral-700 tabular-nums">
               {row.other ? `${row.other.p95_ms} ms` : "—"}
+            </td>
+            <td class="px-6 py-3 text-right text-sm tabular-nums">
+              {ratioLabel(row)}
             </td>
           </tr>
         ))}
