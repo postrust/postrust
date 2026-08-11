@@ -665,8 +665,13 @@ async fn resolve_query<'a>(
 
     let sql = format!("SELECT row_to_json(t) FROM ({}) t", inner);
 
+    // One transaction for the query and any embeds hanging off it, so the role
+    // applies to all of them and the parent and child rows come from a single
+    // snapshot.
+    let mut tx = begin_with_role(pool, gql_ctx.role()).await?;
+
     // Execute query - returns Vec<serde_json::Value>
-    let mut result = execute_query(pool, &sql, gql_ctx.role(), &bound_values).await?;
+    let mut result = execute_query_on(&mut tx, &sql, &bound_values).await?;
 
     // Embed any related resources the selection asked for.
     {
@@ -680,15 +685,15 @@ async fn resolve_query<'a>(
             .ok_or_else(|| async_graphql::Error::new("schema cache is not loaded"))?;
 
         let embed_ctx = EmbedContext {
-            pool,
-            role: gql_ctx.role(),
             schema_cache: cache,
             relationships,
             max_rows,
         };
 
-        embed_relationships(&embed_ctx, type_name, ctx.field(), &mut result).await?;
+        embed_relationships(&mut tx, &embed_ctx, type_name, ctx.field(), &mut result).await?;
     }
+
+    tx.commit().await?;
 
     if is_by_pk {
         // Return single item as Value::Object
@@ -789,27 +794,38 @@ async fn resolve_mutation<'a>(
     Ok(result)
 }
 
+/// Begin a transaction with the request's role applied.
+///
+/// The role has to be set inside a transaction. `SET LOCAL` sent on a bare
+/// pooled connection applies to its own implicit single-statement transaction
+/// and is discarded before the next statement runs, so the query would execute
+/// as the pool's login role -- row-level security and role grants bypassed.
+/// PostgreSQL logs "SET LOCAL can only be used in transaction blocks" every
+/// time it happens.
+async fn begin_with_role(
+    pool: &PgPool,
+    role: &str,
+) -> Result<sqlx::Transaction<'static, sqlx::Postgres>, async_graphql::Error> {
+    let mut tx = pool.begin().await?;
+    sqlx::query(&format!(
+        "SET LOCAL ROLE {}",
+        postrust_sql::escape_ident(role)
+    ))
+    .execute(&mut *tx)
+    .await?;
+    Ok(tx)
+}
+
 /// Execute a SQL query and return results as serde_json::Value.
 /// We keep data as serde_json::Value so field resolvers can use try_downcast_ref.
-async fn execute_query(
-    pool: &PgPool,
+async fn execute_query_on(
+    conn: &mut sqlx::PgConnection,
     sql: &str,
-    role: &str,
     params: &[serde_json::Value],
 ) -> Result<Vec<serde_json::Value>, async_graphql::Error> {
     use sqlx::Row;
 
     trace!("Executing SQL: {}", sql);
-
-    let mut conn = pool.acquire().await?;
-
-    // Set role
-    sqlx::query(&format!(
-        "SET LOCAL ROLE {}",
-        postrust_sql::escape_ident(role)
-    ))
-    .execute(&mut *conn)
-    .await?;
 
     // Execute query
     let mut query = sqlx::query(sql);
@@ -856,15 +872,7 @@ async fn execute_insert<'a>(
         return Err(async_graphql::Error::new("objects cannot be empty"));
     }
 
-    let mut conn = pool.acquire().await?;
-
-    // Set role
-    sqlx::query(&format!(
-        "SET LOCAL ROLE {}",
-        postrust_sql::escape_ident(role)
-    ))
-    .execute(&mut *conn)
-    .await?;
+    let mut conn = begin_with_role(pool, role).await?;
 
     let mut inserted: Vec<FieldValue> = Vec::new();
 
@@ -900,11 +908,16 @@ async fn execute_insert<'a>(
             }
 
             let row = query.fetch_one(&mut *conn).await?;
+
             if let Ok(json_val) = row.try_get::<serde_json::Value, _>(0) {
                 inserted.push(FieldValue::value(json_to_value(json_val)));
             }
         }
     }
+
+    // Commit once every object has been inserted: committing inside the loop
+    // would end the transaction, and the role set on it, after the first row.
+    conn.commit().await?;
 
     // Return based on mutation type
     match mutation_type {
@@ -964,15 +977,7 @@ async fn execute_update<'a>(
         return Err(async_graphql::Error::new("set cannot be empty"));
     }
 
-    let mut conn = pool.acquire().await?;
-
-    // Set role
-    sqlx::query(&format!(
-        "SET LOCAL ROLE {}",
-        postrust_sql::escape_ident(role)
-    ))
-    .execute(&mut *conn)
-    .await?;
+    let mut conn = begin_with_role(pool, role).await?;
 
     // Build SET clause
     let mut set_parts: Vec<String> = Vec::new();
@@ -1033,6 +1038,8 @@ async fn execute_update<'a>(
         .collect();
 
     // Return based on mutation type
+    conn.commit().await?;
+
     match mutation_type {
         MutationType::UpdateByPk => Ok(updated.into_iter().next()),
         _ => Ok(Some(FieldValue::list(updated))),
@@ -1052,15 +1059,7 @@ async fn execute_delete<'a>(
 
     trace!("Delete mutation for {}", table_name);
 
-    let mut conn = pool.acquire().await?;
-
-    // Set role
-    sqlx::query(&format!(
-        "SET LOCAL ROLE {}",
-        postrust_sql::escape_ident(role)
-    ))
-    .execute(&mut *conn)
-    .await?;
+    let mut conn = begin_with_role(pool, role).await?;
 
     // Build WHERE clause
     let (where_sql, where_values) = build_where_clause(where_clause.as_ref(), 1)?;
@@ -1103,6 +1102,8 @@ async fn execute_delete<'a>(
         .collect();
 
     // Return based on mutation type
+    conn.commit().await?;
+
     match mutation_type {
         MutationType::DeleteByPk => Ok(deleted.into_iter().next()),
         _ => Ok(Some(FieldValue::list(deleted))),
@@ -1298,9 +1299,11 @@ async fn build_order_by_clause(
 }
 
 /// What embedding a relationship needs, independent of the rows involved.
+///
+/// The connection is passed alongside rather than held here: embedding runs on
+/// the request's transaction, and a shared reference to this struct could not
+/// hand out the mutable borrow the queries need.
 struct EmbedContext<'c> {
-    pool: &'c PgPool,
-    role: &'c str,
     schema_cache: &'c SchemaCache,
     relationships: &'c HashMap<String, Vec<RelationshipField>>,
     max_rows: Option<i64>,
@@ -1312,6 +1315,7 @@ struct EmbedContext<'c> {
 /// keys are collected and passed as a single array. Recurses so a nested
 /// selection costs one further query per relationship at each depth.
 fn embed_relationships<'f>(
+    conn: &'f mut sqlx::PgConnection,
     ctx: &'f EmbedContext<'f>,
     type_name: &'f str,
     selection: async_graphql::SelectionField<'f>,
@@ -1344,14 +1348,6 @@ fn embed_relationships<'f>(
                     .children_sql(ctx.max_rows)
                     .map_err(|e| async_graphql::Error::new(e.to_string()))?;
 
-                let mut conn = ctx.pool.acquire().await?;
-                sqlx::query(&format!(
-                    "SET LOCAL ROLE {}",
-                    postrust_sql::escape_ident(ctx.role)
-                ))
-                .execute(&mut *conn)
-                .await?;
-
                 let fetched = sqlx::query(&sql).bind(&keys).fetch_all(&mut *conn).await?;
 
                 use sqlx::Row;
@@ -1363,7 +1359,8 @@ fn embed_relationships<'f>(
 
             // Recurse before attaching, so nested embeds land in the values
             // that get copied onto the parents.
-            embed_relationships(ctx, &rel.target_type, requested, &mut children).await?;
+            embed_relationships(&mut *conn, ctx, &rel.target_type, requested, &mut children)
+                .await?;
 
             let grouped = postrust_core::embed::group_by_key(children, &plan.foreign_column);
             for row in rows.iter_mut() {

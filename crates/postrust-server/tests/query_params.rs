@@ -677,3 +677,35 @@ async fn concurrent_embeds_do_not_exhaust_the_pool() {
         );
     }
 }
+
+/// Row-level security must actually apply to the anonymous role.
+///
+/// `SET LOCAL ROLE` is scoped to a transaction. Sent on a bare pooled
+/// connection it applied to its own implicit single-statement transaction and
+/// was discarded before the query ran, so every request executed as the pool's
+/// login role. That role is the database owner here, which bypasses RLS
+/// entirely, so an anonymous request saw every row.
+///
+/// `users` has RLS enabled with a policy restricting `web_anon` to
+/// `status = 'active'`, and the fixtures contain rows that are not active. If
+/// the role is being applied, those rows cannot come back.
+#[tokio::test]
+#[ignore = "requires PostgreSQL"]
+async fn row_level_security_applies_to_the_anonymous_role() {
+    let rows = get_rows("/api/users?select=id,status").await;
+
+    assert!(!rows.is_empty(), "the anonymous role can see active users");
+
+    let leaked: Vec<&str> = rows
+        .iter()
+        .filter_map(|row| row["status"].as_str())
+        .filter(|status| *status != "active")
+        .collect();
+
+    assert!(
+        leaked.is_empty(),
+        "RLS is not being applied: the anonymous role should only see active users, \
+         but these statuses came back: {:?}",
+        leaked
+    );
+}

@@ -133,10 +133,22 @@ async fn execute_plan(
             debug!("Executing SQL: {}", sql);
             debug!("With {} parameters", params.len());
 
-            // Execute query
-            let mut conn = state
+            // Everything for this request runs in one transaction.
+            //
+            // `SET LOCAL ROLE` and `set_config(..., true)` are scoped to a
+            // transaction. Sent on a bare pooled connection they apply to their
+            // own implicit single-statement transaction and are gone before the
+            // next statement runs, so the query executed as the pool's login
+            // role with no JWT claims set -- row-level security and role grants
+            // were not being applied at all. PostgreSQL says so in its log:
+            // "SET LOCAL can only be used in transaction blocks".
+            //
+            // Embedding runs on this same transaction, which also means a
+            // parent row and its children come from one snapshot rather than
+            // from two separate reads.
+            let mut tx = state
                 .pool
-                .acquire()
+                .begin()
                 .await
                 .map_err(|e| postrust_core::Error::ConnectionPool(e.to_string()))?;
 
@@ -145,7 +157,7 @@ async fn execute_plan(
                 "SET LOCAL ROLE {}",
                 postrust_sql::escape_ident(&auth.role)
             ))
-            .execute(&mut *conn)
+            .execute(&mut *tx)
             .await
             .map_err(|e| {
                 postrust_core::Error::Database(postrust_core::error::DatabaseError {
@@ -170,14 +182,14 @@ async fn execute_plan(
                 sqlx::query("SELECT set_config($1, $2, true)")
                     .bind(&guc_key)
                     .bind(&guc_value)
-                    .execute(&mut *conn)
+                    .execute(&mut *tx)
                     .await
                     .ok(); // Ignore errors for individual claims
             }
 
             // Execute main query with bound parameters
             let rows = bind_params(sqlx::query(&sql), &params)
-                .fetch_all(&mut *conn)
+                .fetch_all(&mut *tx)
                 .await
                 .map_err(|e| {
                     error!("Query error: {}", e);
@@ -194,24 +206,17 @@ async fn execute_plan(
                 .map(|row| postrust_core::row_json::row_to_json(&row))
                 .collect();
 
-            // Release the connection before embedding.
-            //
-            // Embedding acquires its own connection per relationship. Holding
-            // this one while doing so means each in-flight request needs two
-            // connections at once, and once every connection in the pool is
-            // held by a request waiting for a second one, none of them can
-            // proceed -- the pool deadlocks until acquire timeouts fire. A
-            // single request never shows it; concurrency above the pool size
-            // shows it immediately. The rows are already materialised into
-            // `json_rows`, so nothing below needs this connection.
-            drop(conn);
-
             // Embed related resources requested with `select=...,relation(...)`.
+            //
+            // On the request's own transaction rather than a fresh connection.
+            // Acquiring a second connection here while still holding this one
+            // deadlocked the pool: every in-flight embed needed two connections
+            // at once, so once each connection was held by a request waiting
+            // for a second, none could proceed.
             if let Some(parent_qi) = read_target(api_request) {
                 let schema_cache = state.schema_cache().await;
                 embed_relations(
-                    &state.pool,
-                    &auth.role,
+                    &mut tx,
                     &schema_cache,
                     &parent_qi,
                     &api_request.query_params.select,
@@ -220,6 +225,12 @@ async fn execute_plan(
                 )
                 .await?;
             }
+
+            // Reads take no locks worth holding and write plans commit their
+            // work, so the transaction is committed either way.
+            tx.commit()
+                .await
+                .map_err(|e| postrust_core::Error::ConnectionPool(e.to_string()))?;
 
             // Drop columns that were only selected to join the embeds.
             for column in added_join_columns {
@@ -404,8 +415,7 @@ type EmbedFuture<'f> = std::pin::Pin<
 /// passed as a single array, so embedding across a page of parents does not
 /// become a query per row. Recurses for nested embeds.
 fn embed_relations<'f>(
-    pool: &'f sqlx::PgPool,
-    role: &'f str,
+    conn: &'f mut sqlx::PgConnection,
     schema_cache: &'f postrust_core::SchemaCache,
     parent_qi: &'f postrust_core::api_request::QualifiedIdentifier,
     select: &'f [postrust_core::api_request::SelectItem],
@@ -442,19 +452,6 @@ fn embed_relations<'f>(
             } else {
                 let sql = plan.children_sql(max_rows)?;
 
-                let mut conn = pool
-                    .acquire()
-                    .await
-                    .map_err(|e| postrust_core::Error::ConnectionPool(e.to_string()))?;
-
-                sqlx::query(&format!(
-                    "SET LOCAL ROLE {}",
-                    postrust_sql::escape_ident(role)
-                ))
-                .execute(&mut *conn)
-                .await
-                .map_err(map_sqlx_error)?;
-
                 let fetched = sqlx::query(&sql)
                     .bind(&keys)
                     .fetch_all(&mut *conn)
@@ -478,8 +475,7 @@ fn embed_relations<'f>(
                 &plan.foreign_table,
             );
             embed_relations(
-                pool,
-                role,
+                &mut *conn,
                 schema_cache,
                 &child_qi,
                 nested,
