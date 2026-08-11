@@ -1,6 +1,9 @@
 [package]
 name = "postrust-proxy"
-description = "High-performance reverse proxy module for Postrust with load balancing and automatic TLS"
+description = "Reverse proxy for Postrust with load balancing and automatic TLS certificates"
+homepage.workspace = true
+readme = "README.md"
+keywords = ["proxy", "load-balancer", "tls", "acme", "http"]
 version.workspace = true
 edition.workspace = true
 license.workspace = true

@@ -5,7 +5,10 @@ edition.workspace = true
 license.workspace = true
 repository.workspace = true
 authors.workspace = true
-description = "GraphQL support for Postrust"
+description = "GraphQL API and realtime subscriptions generated from a PostgreSQL schema"
+homepage.workspace = true
+readme = "README.md"
+keywords = ["graphql", "postgres", "subscriptions", "api", "realtime"]
 
 [dependencies]
 # GraphQL

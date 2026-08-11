@@ -5,7 +5,10 @@ edition.workspace = true
 license.workspace = true
 repository.workspace = true
 authors.workspace = true
-description = "AWS Lambda adapter for Postrust"
+description = "AWS Lambda adapter for Postrust, for serverless REST APIs over PostgreSQL"
+homepage.workspace = true
+readme = "README.md"
+keywords = ["lambda", "serverless", "aws", "postgres", "api"]
 
 [[bin]]
 name = "postrust-lambda"

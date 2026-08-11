@@ -5,7 +5,10 @@ edition.workspace = true
 license.workspace = true
 repository.workspace = true
 authors.workspace = true
-description = "Type-safe SQL builder for Postrust"
+description = "Type-safe SQL fragment and statement builder used by Postrust"
+homepage.workspace = true
+readme = "README.md"
+keywords = ["sql", "postgres", "query-builder", "sql-builder"]
 
 [dependencies]
 serde.workspace = true

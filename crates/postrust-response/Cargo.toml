@@ -5,7 +5,10 @@ edition.workspace = true
 license.workspace = true
 repository.workspace = true
 authors.workspace = true
-description = "Response formatting for Postrust (JSON, CSV, OpenAPI)"
+description = "Response formatting for Postrust: JSON, CSV, and OpenAPI output"
+homepage.workspace = true
+readme = "README.md"
+keywords = ["json", "csv", "openapi", "http", "postgres"]
 
 [dependencies]
 serde.workspace = true

@@ -7,6 +7,7 @@ export const Header = component$(() => {
   const navLinks = [
     { href: "/features", label: "Features" },
     { href: "/docs", label: "Documentation" },
+    { href: "/packages", label: "Packages" },
     { href: "/pricing", label: "Pricing" },
     { href: "/compare", label: "Compare" },
     { href: "/community", label: "Community" },

@@ -49,7 +49,7 @@ const features = [
   {
     icon: "package",
     title: "Single Binary",
-    description: "~3.5MB binary with no runtime dependencies. Deploy anywhere - Docker, Lambda, bare metal.",
+    description: "~5MB binary with no runtime dependencies. Deploy anywhere - Docker, Lambda, bare metal.",
   },
 ];
 
