@@ -5,7 +5,10 @@ edition.workspace = true
 license.workspace = true
 repository.workspace = true
 authors.workspace = true
-description = "Core library for Postrust - PostgREST-compatible REST API for PostgreSQL"
+description = "Request parsing, query planning and schema introspection for Postrust"
+homepage.workspace = true
+readme = "README.md"
+keywords = ["postgres", "rest", "api", "query-planner", "postgrest"]
 
 [dependencies]
 # Async

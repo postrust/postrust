@@ -17,6 +17,7 @@ version = "0.2.4"
 edition = "2021"
 license = "MIT"
 repository = "https://github.com/postrust/postrust"
+homepage = "https://postrust.org/"
 authors = ["Bhanu Pratap Chaudhary"]
 
 [workspace.dependencies]

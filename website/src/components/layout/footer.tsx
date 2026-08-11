@@ -15,6 +15,8 @@ export const Footer = component$(() => {
       { href: "/docs", label: "Documentation" },
       { href: "/docs/getting-started", label: "Getting Started" },
       { href: "/docs/api-reference", label: "API Reference" },
+      { href: "/packages", label: "Packages" },
+      { href: "/docs/benchmarks", label: "Benchmarks" },
       { href: "/docs/deployment", label: "Deployment" },
     ],
     community: [

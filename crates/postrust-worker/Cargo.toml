@@ -5,7 +5,10 @@ edition.workspace = true
 license.workspace = true
 repository.workspace = true
 authors.workspace = true
-description = "Cloudflare Workers adapter for Postrust"
+description = "Cloudflare Workers adapter for Postrust, for edge REST APIs over PostgreSQL"
+homepage.workspace = true
+readme = "README.md"
+keywords = ["cloudflare", "workers", "edge", "postgres", "wasm"]
 
 [lib]
 crate-type = ["cdylib"]

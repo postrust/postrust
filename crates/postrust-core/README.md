@@ -1,0 +1,43 @@
+# postrust-core
+
+Request parsing, query planning and schema introspection for Postrust.
+
+The engine every other crate is built on.
+
+- Parses PostgREST-style requests: `select`, `limit`, `offset`, `order`, filters, embedding.
+- Introspects the database into a schema cache and plans reads, mutations and RPC calls.
+- Builds the final SQL, with filter values bound as parameters and cast to their column types.
+
+## Install
+
+```bash
+cargo add postrust-core
+```
+
+## Part of Postrust
+
+[Postrust](https://github.com/postrust/postrust) turns a PostgreSQL database into a REST and GraphQL API. It is
+published as a set of crates so you can depend on only the part you need:
+
+| Crate | Role | Docs |
+|-------|------|------|
+| [`postrust-server`](https://crates.io/crates/postrust-server) | HTTP server | [docs.rs](https://docs.rs/postrust-server) |
+| **`postrust-core`** (this crate) | Engine | [docs.rs](https://docs.rs/postrust-core) |
+| [`postrust-sql`](https://crates.io/crates/postrust-sql) | SQL builder | [docs.rs](https://docs.rs/postrust-sql) |
+| [`postrust-auth`](https://crates.io/crates/postrust-auth) | Authentication | [docs.rs](https://docs.rs/postrust-auth) |
+| [`postrust-response`](https://crates.io/crates/postrust-response) | Response formatting | [docs.rs](https://docs.rs/postrust-response) |
+| [`postrust-graphql`](https://crates.io/crates/postrust-graphql) | GraphQL | [docs.rs](https://docs.rs/postrust-graphql) |
+| [`postrust-lambda`](https://crates.io/crates/postrust-lambda) | AWS Lambda | [docs.rs](https://docs.rs/postrust-lambda) |
+| [`postrust-worker`](https://crates.io/crates/postrust-worker) | Cloudflare Workers | [docs.rs](https://docs.rs/postrust-worker) |
+| [`postrust-proxy`](https://crates.io/crates/postrust-proxy) | Reverse proxy | [docs.rs](https://docs.rs/postrust-proxy) |
+
+## Links
+
+- Website: https://postrust.org/
+- Documentation: https://postrust.org/docs
+- Repository: https://github.com/postrust/postrust
+- API docs for this crate: https://docs.rs/postrust-core
+
+## License
+
+MIT -- see [LICENSE](https://github.com/postrust/postrust/blob/main/LICENSE).

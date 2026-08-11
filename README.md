@@ -434,16 +434,21 @@ CMD ["postrust"]
 
 ## Crate Overview
 
-| Crate | Description |
-|-------|-------------|
-| `postrust-core` | Core library: request parsing, schema cache, query planning |
-| `postrust-sql` | Type-safe SQL builder with parameterized queries |
-| `postrust-auth` | JWT authentication and role extraction |
-| `postrust-response` | Response formatting (JSON, CSV, headers) |
-| `postrust-graphql` | GraphQL API with dynamic schema generation |
-| `postrust-server` | Standalone HTTP server (Axum) |
-| `postrust-lambda` | AWS Lambda adapter |
-| `postrust-worker` | Cloudflare Workers adapter |
+All crates share the workspace version and are published together, so any two
+Postrust crates at the same version work together. Browse them at
+[postrust.org/packages](https://postrust.org/packages).
+
+| Crate | Description | Links |
+|-------|-------------|-------|
+| `postrust-server` | Standalone HTTP server (Axum), ships the `postrust` binary | [crates.io](https://crates.io/crates/postrust-server) · [docs](https://docs.rs/postrust-server) |
+| `postrust-core` | Request parsing, schema cache, query planning | [crates.io](https://crates.io/crates/postrust-core) · [docs](https://docs.rs/postrust-core) |
+| `postrust-sql` | Type-safe SQL builder with parameterized queries | [crates.io](https://crates.io/crates/postrust-sql) · [docs](https://docs.rs/postrust-sql) |
+| `postrust-auth` | JWT authentication and role extraction | [crates.io](https://crates.io/crates/postrust-auth) · [docs](https://docs.rs/postrust-auth) |
+| `postrust-response` | Response formatting (JSON, CSV, OpenAPI) | [crates.io](https://crates.io/crates/postrust-response) · [docs](https://docs.rs/postrust-response) |
+| `postrust-graphql` | GraphQL API with dynamic schema generation | [crates.io](https://crates.io/crates/postrust-graphql) · [docs](https://docs.rs/postrust-graphql) |
+| `postrust-lambda` | AWS Lambda adapter | [crates.io](https://crates.io/crates/postrust-lambda) · [docs](https://docs.rs/postrust-lambda) |
+| `postrust-worker` | Cloudflare Workers adapter | [crates.io](https://crates.io/crates/postrust-worker) · [docs](https://docs.rs/postrust-worker) |
+| `postrust-proxy` | Reverse proxy with load balancing and automatic TLS | [crates.io](https://crates.io/crates/postrust-proxy) · [docs](https://docs.rs/postrust-proxy) |
 
 ## Development
 
