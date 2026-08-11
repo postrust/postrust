@@ -97,7 +97,14 @@ impl EmbedPlan {
     /// column's type, so the column itself is never wrapped in a cast and an
     /// index on it remains usable. `limit` bounds the rows per query, not per
     /// parent.
-    pub fn children_sql(&self, limit: Option<i64>) -> Result<String> {
+    ///
+    /// `columns` is the set of columns the client asked for. An empty set means
+    /// every column. Projecting here rather than discarding columns after the
+    /// fact matters: an unprojected column is read from the heap, serialised to
+    /// JSON by PostgreSQL, sent over the socket and parsed, before being thrown
+    /// away. The join column is always included even when it was not requested,
+    /// because grouping needs it; the caller strips it afterwards.
+    pub fn children_sql(&self, limit: Option<i64>, columns: &[String]) -> Result<String> {
         let type_name = castable_type_name(&self.foreign_column_type).ok_or_else(|| {
             Error::EmbeddingError(format!(
                 "cannot embed \"{}\": join column type \"{}\" is not a plain type name",
@@ -105,8 +112,11 @@ impl EmbedPlan {
             ))
         })?;
 
+        let projection = self.projection(columns);
+
         let mut inner = format!(
-            "SELECT * FROM {}.{} WHERE {} = ANY($1::{}[])",
+            "SELECT {} FROM {}.{} WHERE {} = ANY($1::{}[])",
+            projection,
             postrust_sql::escape_ident(&self.foreign_schema),
             postrust_sql::escape_ident(&self.foreign_table),
             postrust_sql::escape_ident(&self.foreign_column),
@@ -118,6 +128,146 @@ impl EmbedPlan {
         }
 
         Ok(format!("SELECT row_to_json(t) FROM ({}) t", inner))
+    }
+
+    /// SQL that fetches related rows already grouped by their join key.
+    ///
+    /// One row comes back per distinct key: the key itself and a JSON array of
+    /// that key's children. Grouping in PostgreSQL rather than in this process
+    /// removes a per-child-row JSON parse, the per-row hash insert, and the
+    /// clone of each group onto its parent.
+    ///
+    /// The key is returned as JSON rather than cast to text, so it is rendered
+    /// by the same code that renders the parents' keys. Casting to text in SQL
+    /// would agree for integers and uuids and disagree for a NUMERIC join
+    /// column, where PostgreSQL and serde_json format differently.
+    ///
+    /// `limit` still bounds the rows scanned, not the rows per parent, so it is
+    /// applied to the inner select exactly as the ungrouped form does.
+    pub fn children_grouped_sql(&self, limit: Option<i64>, columns: &[String]) -> Result<String> {
+        let type_name = castable_type_name(&self.foreign_column_type).ok_or_else(|| {
+            Error::EmbeddingError(format!(
+                "cannot embed \"{}\": join column type \"{}\" is not a plain type name",
+                self.foreign_table, self.foreign_column_type
+            ))
+        })?;
+
+        let key = postrust_sql::escape_ident(&self.foreign_column);
+
+        let mut inner = format!(
+            "SELECT {} FROM {}.{} WHERE {} = ANY($1::{}[])",
+            self.projection(columns),
+            postrust_sql::escape_ident(&self.foreign_schema),
+            postrust_sql::escape_ident(&self.foreign_table),
+            key,
+            type_name
+        );
+
+        if let Some(limit) = limit {
+            inner.push_str(&format!(" LIMIT {}", limit));
+        }
+
+        Ok(format!(
+            "SELECT to_jsonb(c.{key}) AS k, json_agg(row_to_json(c)) AS v \
+             FROM ({inner}) c GROUP BY c.{key}",
+            key = key,
+            inner = inner
+        ))
+    }
+
+    /// A correlated subselect that yields this relationship as one JSON column.
+    ///
+    /// This is the single-query form of embedding: instead of fetching parents,
+    /// collecting their keys and issuing a second query, the relationship is
+    /// attached to the parent query as an expression, so PostgreSQL builds the
+    /// array while it already has the parent row.
+    ///
+    /// `inner_select` is the child's SELECT list, which the caller assembles --
+    /// its columns, plus any deeper relationship expressions built by calling
+    /// this again. Only the caller knows the shape of its own selection tree, so
+    /// the recursion lives there and the SQL assembly lives here.
+    ///
+    /// Parent columns are deliberately left alone: they stay ordinary typed
+    /// columns and are converted to JSON by the same code as an unembedded
+    /// request, so embedding does not change how a NUMERIC or a timestamp is
+    /// rendered. Only the relationship column arrives as JSON, which is what
+    /// the separate child query already returned.
+    pub fn embed_expression(
+        &self,
+        parent_alias: &str,
+        child_alias: &str,
+        inner_select: &str,
+        limit: Option<i64>,
+    ) -> Result<String> {
+        // The child table is aliased rather than referred to by name. A
+        // self-referential relationship would otherwise make the correlation
+        // ambiguous, since the parent and the child are the same table.
+        let mut inner = format!(
+            "SELECT {} FROM {}.{} AS {} WHERE {}.{} = {}.{}",
+            inner_select,
+            postrust_sql::escape_ident(&self.foreign_schema),
+            postrust_sql::escape_ident(&self.foreign_table),
+            postrust_sql::escape_ident(child_alias),
+            postrust_sql::escape_ident(child_alias),
+            postrust_sql::escape_ident(&self.foreign_column),
+            postrust_sql::escape_ident(parent_alias),
+            postrust_sql::escape_ident(&self.local_column),
+        );
+
+        // A to-one relationship takes the first row; a to-many takes them all.
+        // The limit bounds rows per parent here, which is what a client asking
+        // for a page of children means, and is stricter than the row cap the
+        // two-query form could apply.
+        if let Some(limit) = limit {
+            inner.push_str(&format!(" LIMIT {}", limit));
+        } else if !self.is_list {
+            inner.push_str(" LIMIT 1");
+        }
+
+        let alias = postrust_sql::escape_ident(&format!("{}_j", child_alias));
+
+        Ok(if self.is_list {
+            // An empty array rather than null, so the shape does not depend on
+            // whether the parent happens to have children.
+            format!(
+                "COALESCE((SELECT json_agg(row_to_json({alias})) FROM ({inner}) {alias}), '[]'::json)",
+                alias = alias,
+                inner = inner
+            )
+        } else {
+            format!(
+                "(SELECT row_to_json({alias}) FROM ({inner}) {alias})",
+                alias = alias,
+                inner = inner
+            )
+        })
+    }
+
+    /// The child projection list: the requested columns plus the join column.
+    ///
+    /// Column names come from the client, so each is escaped rather than
+    /// interpolated bare. Anything that is not a plain column reference -- a
+    /// nested relation, say -- is not a column and is skipped.
+    fn projection(&self, columns: &[String]) -> String {
+        if columns.is_empty() {
+            return "*".to_string();
+        }
+
+        let mut wanted: Vec<&str> = Vec::with_capacity(columns.len() + 1);
+        for column in columns {
+            if !wanted.contains(&column.as_str()) {
+                wanted.push(column);
+            }
+        }
+        if !wanted.contains(&self.foreign_column.as_str()) {
+            wanted.push(&self.foreign_column);
+        }
+
+        wanted
+            .into_iter()
+            .map(postrust_sql::escape_ident)
+            .collect::<Vec<_>>()
+            .join(", ")
     }
 }
 
@@ -149,6 +299,29 @@ pub fn key_to_text(value: &serde_json::Value) -> Option<String> {
 }
 
 /// Group related rows by the value of their join column.
+/// Build the grouping from rows PostgreSQL has already grouped.
+///
+/// Each row is the join key as JSON and a JSON array of that key's children.
+/// The key goes through `key_to_text`, the same rendering the parent side uses,
+/// so the two agree for every column type.
+pub fn group_from_aggregated(
+    rows: Vec<(serde_json::Value, serde_json::Value)>,
+) -> HashMap<String, Vec<serde_json::Value>> {
+    let mut grouped: HashMap<String, Vec<serde_json::Value>> = HashMap::with_capacity(rows.len());
+
+    for (key, children) in rows {
+        let key = key_to_text(&key).unwrap_or_default();
+        let children = match children {
+            serde_json::Value::Array(items) => items,
+            // json_agg only ever yields an array or null.
+            _ => Vec::new(),
+        };
+        grouped.entry(key).or_default().extend(children);
+    }
+
+    grouped
+}
+
 pub fn group_by_key(
     children: Vec<serde_json::Value>,
     foreign_column: &str,
@@ -232,7 +405,7 @@ mod tests {
 
     #[test]
     fn children_sql_binds_keys_as_a_cast_array() {
-        let sql = plan(true).children_sql(None).unwrap();
+        let sql = plan(true).children_sql(None, &[]).unwrap();
         assert_eq!(
             sql,
             "SELECT row_to_json(t) FROM (SELECT * FROM \"public\".\"posts\" \
@@ -241,8 +414,107 @@ mod tests {
     }
 
     #[test]
+    fn embed_expression_aggregates_a_to_many_relation() {
+        let sql = plan(true)
+            .embed_expression("p", "posts", r#""id", "title""#, None)
+            .unwrap();
+
+        assert!(sql.starts_with("COALESCE((SELECT json_agg("), "{}", sql);
+        // Correlated on the parent, so there is no second query and no bound
+        // array of keys.
+        assert!(sql.contains(r#""posts"."user_id" = "p"."id""#), "{}", sql);
+        assert!(
+            sql.contains(r#"AS "posts""#),
+            "the child table is aliased: {}",
+            sql
+        );
+        assert!(!sql.contains("ANY("), "{}", sql);
+        // An absent relation is an empty array, not null.
+        assert!(sql.contains("'[]'::json"), "{}", sql);
+    }
+
+    #[test]
+    fn embed_expression_takes_one_row_for_a_to_one_relation() {
+        let sql = plan(false)
+            .embed_expression("p", "author", r#""id""#, None)
+            .unwrap();
+
+        assert!(sql.contains("row_to_json"), "{}", sql);
+        assert!(!sql.contains("json_agg"), "{}", sql);
+        assert!(
+            sql.contains("LIMIT 1"),
+            "a to-one relation yields one row: {}",
+            sql
+        );
+    }
+
+    #[test]
+    fn embed_expression_limits_rows_per_parent() {
+        let sql = plan(true)
+            .embed_expression("p", "posts", r#""id""#, Some(25))
+            .unwrap();
+        assert!(sql.contains("LIMIT 25"), "{}", sql);
+    }
+
+    #[test]
+    fn children_sql_projects_only_the_requested_columns() {
+        let sql = plan(true)
+            .children_sql(None, &["title".to_string(), "body".to_string()])
+            .unwrap();
+
+        assert!(
+            sql.contains(r#"SELECT "title", "body", "user_id" FROM"#),
+            "{}",
+            sql
+        );
+        assert!(
+            !sql.contains("SELECT *"),
+            "an unrequested column should not be read at all: {}",
+            sql
+        );
+    }
+
+    #[test]
+    fn children_sql_always_includes_the_join_column() {
+        // The grouping keys off the join column, so it has to come back even
+        // when the client did not ask for it.
+        let sql = plan(true)
+            .children_sql(None, &["title".to_string()])
+            .unwrap();
+        assert!(sql.contains(r#""user_id""#), "{}", sql);
+    }
+
+    #[test]
+    fn children_sql_does_not_repeat_the_join_column() {
+        let sql = plan(true)
+            .children_sql(None, &["user_id".to_string(), "title".to_string()])
+            .unwrap();
+        assert_eq!(
+            sql.matches(r#""user_id""#).count(),
+            2,
+            "expected the column once in the projection and once in the WHERE: {}",
+            sql
+        );
+    }
+
+    #[test]
+    fn children_sql_escapes_column_names() {
+        // Column names reach here from the client.
+        let sql = plan(true)
+            .children_sql(None, &[r#"ev"il"#.to_string()])
+            .unwrap();
+        assert!(sql.contains(r#""ev""il""#), "{}", sql);
+    }
+
+    #[test]
+    fn children_sql_falls_back_to_every_column() {
+        let sql = plan(true).children_sql(None, &[]).unwrap();
+        assert!(sql.contains("SELECT * FROM"), "{}", sql);
+    }
+
+    #[test]
     fn children_sql_applies_a_limit() {
-        let sql = plan(true).children_sql(Some(25)).unwrap();
+        let sql = plan(true).children_sql(Some(25), &[]).unwrap();
         assert!(sql.contains("LIMIT 25"), "{}", sql);
     }
 
@@ -250,7 +522,7 @@ mod tests {
     fn children_sql_rejects_a_non_plain_type_name() {
         let mut p = plan(true);
         p.foreign_column_type = "int4; DROP TABLE users".into();
-        assert!(p.children_sql(None).is_err());
+        assert!(p.children_sql(None, &[]).is_err());
     }
 
     #[test]

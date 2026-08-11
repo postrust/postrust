@@ -13,7 +13,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.3.0"
+version = "0.4.0"
 edition = "2021"
 license = "MIT"
 repository = "https://github.com/postrust/postrust"
@@ -39,7 +39,15 @@ tokio-postgres = "0.7"
 
 # Serialization
 serde = { version = "1.0", features = ["derive"] }
-serde_json = "1.0"
+# arbitrary_precision keeps NUMERIC values as the digits PostgreSQL sent,
+# rather than routing them through f64 on the way to JSON.
+# arbitrary_precision keeps NUMERIC values as the digits PostgreSQL sent, rather
+# than routing them through f64 on the way to JSON.
+#
+# Key ordering is a build-time choice, not a runtime one: it depends on whether
+# serde_json's Map is a BTreeMap or an IndexMap. See the `compat-key-order`
+# feature on postrust-server.
+serde_json = { version = "1.0", features = ["arbitrary_precision"] }
 
 # Parsing
 nom = "7.1"
@@ -89,12 +97,12 @@ parking_lot = "0.12"
 toml = "0.8"
 
 # Internal crates
-postrust-core = { version = "0.3.0", path = "crates/postrust-core" }
-postrust-sql = { version = "0.3.0", path = "crates/postrust-sql" }
-postrust-auth = { version = "0.3.0", path = "crates/postrust-auth" }
-postrust-response = { version = "0.3.0", path = "crates/postrust-response" }
-postrust-graphql = { version = "0.3.0", path = "crates/postrust-graphql" }
-postrust-proxy = { version = "0.3.0", path = "crates/postrust-proxy" }
+postrust-core = { version = "0.4.0", path = "crates/postrust-core" }
+postrust-sql = { version = "0.4.0", path = "crates/postrust-sql" }
+postrust-auth = { version = "0.4.0", path = "crates/postrust-auth" }
+postrust-response = { version = "0.4.0", path = "crates/postrust-response" }
+postrust-graphql = { version = "0.4.0", path = "crates/postrust-graphql" }
+postrust-proxy = { version = "0.4.0", path = "crates/postrust-proxy" }
 
 [profile.release]
 lto = true

@@ -622,3 +622,145 @@ async fn unknown_relation_is_rejected() {
         body
     );
 }
+
+/// Concurrent embeds must not exhaust the connection pool.
+///
+/// Embedding acquires a connection per relationship. While the request's own
+/// connection was still held during that, each in-flight embed needed two
+/// connections at once, so once every connection was held by a request waiting
+/// for a second one, none could proceed and the pool deadlocked until acquire
+/// timeouts fired.
+///
+/// The test pool holds two connections, so more concurrent embeds than that is
+/// enough to reproduce it. Every sequential embed test passed throughout: only
+/// concurrency above the pool size shows the problem, which is why this asserts
+/// on a deadline rather than only on the response bodies.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires PostgreSQL"]
+async fn concurrent_embeds_do_not_exhaust_the_pool() {
+    const CONCURRENT: usize = 8;
+
+    let app = build_app(None).await;
+
+    let mut handles = Vec::with_capacity(CONCURRENT);
+    for _ in 0..CONCURRENT {
+        let app = app.clone();
+        handles.push(tokio::spawn(async move {
+            let request = Request::builder()
+                .method("GET")
+                .uri("/api/users?select=id,name,posts(id,title)&order=id.asc&limit=5")
+                .body(Body::empty())
+                .expect("failed to build request");
+
+            let response = app.oneshot(request).await.expect("request failed");
+            response.status()
+        }));
+    }
+
+    // Comfortably above what these queries need, and far below the 30s acquire
+    // timeout that the deadlock used to wait on.
+    let statuses = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        let mut statuses = Vec::with_capacity(CONCURRENT);
+        for handle in handles {
+            statuses.push(handle.await.expect("task panicked"));
+        }
+        statuses
+    })
+    .await
+    .expect("concurrent embeds did not finish in time -- the connection pool deadlocked");
+
+    for status in statuses {
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "every concurrent embed should succeed"
+        );
+    }
+}
+
+/// Row-level security must actually apply to the anonymous role.
+///
+/// `SET LOCAL ROLE` is scoped to a transaction. Sent on a bare pooled
+/// connection it applied to its own implicit single-statement transaction and
+/// was discarded before the query ran, so every request executed as the pool's
+/// login role. That role is the database owner here, which bypasses RLS
+/// entirely, so an anonymous request saw every row.
+///
+/// `users` has RLS enabled with a policy restricting `web_anon` to
+/// `status = 'active'`, and the fixtures contain rows that are not active. If
+/// the role is being applied, those rows cannot come back.
+#[tokio::test]
+#[ignore = "requires PostgreSQL"]
+async fn row_level_security_applies_to_the_anonymous_role() {
+    let rows = get_rows("/api/users?select=id,status").await;
+
+    assert!(!rows.is_empty(), "the anonymous role can see active users");
+
+    let leaked: Vec<&str> = rows
+        .iter()
+        .filter_map(|row| row["status"].as_str())
+        .filter(|status| *status != "active")
+        .collect();
+
+    assert!(
+        leaked.is_empty(),
+        "RLS is not being applied: the anonymous role should only see active users, \
+         but these statuses came back: {:?}",
+        leaked
+    );
+}
+
+/// Response key order depends on how the crate was built.
+///
+/// `serde_json::Map` is a BTreeMap by default, which sorts its keys, so
+/// responses come back alphabetically. The `compat-key-order` feature swaps it
+/// for an IndexMap so keys follow the select list, as PostgREST returns them.
+///
+/// That is a build-time choice, so this asserts whichever behaviour was
+/// compiled: both are supported and both should be covered.
+///
+/// The columns are asked for in two different orders, because one ordering
+/// could agree with the alphabet by accident.
+#[tokio::test]
+#[ignore = "requires PostgreSQL"]
+async fn response_key_order_matches_the_build() {
+    for query in ["status,name,id", "id,name,status"] {
+        let rows = get_rows(&format!("/api/users?select={}&limit=1", query)).await;
+        let keys: Vec<&str> = rows[0]
+            .as_object()
+            .expect("row should be an object")
+            .keys()
+            .map(String::as_str)
+            .collect();
+
+        if cfg!(feature = "compat-key-order") {
+            let expected: Vec<&str> = query.split(',').collect();
+            assert_eq!(keys, expected, "keys should follow the select list");
+        } else {
+            let mut sorted = keys.clone();
+            sorted.sort_unstable();
+            assert_eq!(keys, sorted, "keys should be sorted without the feature");
+        }
+    }
+}
+
+/// Embedded rows order their keys the same way the parents do.
+#[tokio::test]
+#[ignore = "requires PostgreSQL"]
+async fn embedded_key_order_matches_the_build() {
+    let rows = get_rows("/api/users?select=name,id,posts(title,id)&order=id.asc&limit=1").await;
+
+    let posts = rows[0]["posts"].as_array().expect("posts should embed");
+    let keys: Vec<&str> = posts[0]
+        .as_object()
+        .expect("post should be an object")
+        .keys()
+        .map(String::as_str)
+        .collect();
+
+    if cfg!(feature = "compat-key-order") {
+        assert_eq!(keys, vec!["title", "id"]);
+    } else {
+        assert_eq!(keys, vec!["id", "title"]);
+    }
+}

@@ -24,6 +24,14 @@ use axum::routing::{get, post};
 use app::handle_request;
 use state::AppState;
 
+// musl's built-in allocator contends badly across threads, which shows up on
+// exactly the paths that allocate per row. Building the Alpine image with it
+// cost roughly 4-6x on the paged and embedded scenarios compared with the same
+// code on glibc. glibc builds keep their own allocator, which performs fine.
+#[cfg(target_env = "musl")]
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 #[tokio::main]
 async fn main() -> Result<()> {
     // Initialize tracing
@@ -193,6 +201,18 @@ async fn main() -> Result<()> {
     if config.compat_mode {
         app = app.fallback(handle_request);
         info!("PostgREST compatibility mode enabled: REST surface also served at /");
+
+        // Key ordering is fixed when the binary is compiled, so asking for
+        // compatibility at runtime cannot turn it on. Say so, rather than
+        // leaving someone to discover the difference by diffing responses.
+        if !cfg!(feature = "compat-key-order") {
+            tracing::warn!(
+                "compatibility mode: object keys will be returned in alphabetical order, \
+                 not in select order as PostgREST returns them. Build with \
+                 --features compat-key-order to match, at a cost of up to 15% throughput \
+                 on wide rows."
+            );
+        }
     }
 
     // Add root info endpoint

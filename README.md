@@ -304,6 +304,12 @@ The Admin UI provides OpenAPI documentation, Swagger UI, Scalar, and GraphQL Pla
 # Build with admin-ui feature
 cargo build --release -p postrust-server --features admin-ui
 
+# Return object keys in select order, as PostgREST does, rather than
+# alphabetically. Off by default: it costs 1% on a three-column response and
+# 15% on an eight-column one, because for objects this small a few string
+# comparisons beat hashing every key. See docs/configuration.md.
+cargo build --release -p postrust-server --features compat-key-order
+
 # Run - Admin UI available at /admin
 DATABASE_URL="postgres://..." ./target/release/postrust
 
@@ -556,6 +562,7 @@ compare Postrust against itself across changes, not for capacity planning. See
 | OpenAPI | ✅ (admin-ui feature) | ✅ |
 | GraphQL | ✅ | ❌ |
 | Admin UI | ✅ (Swagger, Scalar) | ❌ |
+| Object key order | Alphabetical, or select order with `compat-key-order` | Select order |
 
 Every Postrust number above is measured by `scripts/bench.sh` — see
 [Benchmarking](docs/benchmarking.md) for the methodology and how to reproduce

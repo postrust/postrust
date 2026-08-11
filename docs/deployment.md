@@ -451,6 +451,12 @@ spec:
 
 ### Helm Chart
 
+The chart lives in this repository at `charts/postrust`. It creates a Deployment,
+a Service and a Secret for the connection string, sets `PGRST_SERVER_HOST` so the
+Service can reach the container, and points the readiness probe at `/_/ready`,
+which checks the database rather than only the process. See
+`charts/postrust/README.md` for the full list of values.
+
 ```bash
 # Install
 helm install postrust ./charts/postrust \

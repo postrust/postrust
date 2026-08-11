@@ -43,10 +43,25 @@ pub fn row_to_json(row: &sqlx::postgres::PgRow) -> serde_json::Value {
                 .ok()
                 .and_then(serde_json::Number::from_f64)
                 .map(serde_json::Value::Number),
-            "NUMERIC" | "DECIMAL" => row
-                .try_get::<sqlx::types::BigDecimal, _>(name)
-                .ok()
-                .map(|v| serde_json::Value::String(v.to_string())),
+            // PostgreSQL's own row_to_json emits NUMERIC as a JSON number, and so
+            // does PostgREST, so returning a string here made every numeric column
+            // arrive at the client quoted.
+            //
+            // The value is parsed from its exact decimal text rather than through
+            // f64, so a NUMERIC(20, 6) keeps the digits it was stored with. NUMERIC
+            // also permits NaN, which JSON has no number for; that falls back to a
+            // string, which is what row_to_json does as well.
+            "NUMERIC" | "DECIMAL" => {
+                row.try_get::<sqlx::types::BigDecimal, _>(name)
+                    .ok()
+                    .map(|v| {
+                        let text = v.to_string();
+                        serde_json::from_str::<serde_json::Value>(&text)
+                            .ok()
+                            .filter(serde_json::Value::is_number)
+                            .unwrap_or(serde_json::Value::String(text))
+                    })
+            }
             "BOOL" | "BOOLEAN" => row
                 .try_get::<bool, _>(name)
                 .ok()

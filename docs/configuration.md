@@ -128,6 +128,39 @@ curl -X POST http://localhost:3000/rpc/get_statistics
 # -> {"users": 10}
 ```
 
+### Key ordering: a build-time choice
+
+One difference `PGRST_COMPAT_MODE` cannot switch on is the order of keys within
+each object. Postrust returns them alphabetically; PostgREST returns them in the
+order of the `select` list.
+
+That is decided when the binary is compiled rather than at run time, because it
+depends on the map type used to hold a JSON object, so it is a Cargo feature:
+
+```bash
+cargo build --release -p postrust-server --features compat-key-order
+```
+
+```bash
+# Default build
+curl 'http://localhost:3000/api/users?select=status,name,id&limit=1'
+# -> [{"id":1,"name":"Alice","status":"active"}]
+
+# Built with --features compat-key-order
+curl 'http://localhost:3000/api/users?select=status,name,id&limit=1'
+# -> [{"status":"active","name":"Alice","id":1}]
+```
+
+It is off by default because it is not free. Measured by running both builds as
+containers against the same database and alternating between them, a three-column
+response cost 1% and an eight-column response 15%: for small objects a few short
+string comparisons beat hashing every key, so the sorted map is genuinely the
+faster one. Enable it when byte-level compatibility matters more than that.
+
+Running with `PGRST_COMPAT_MODE=true` on a binary built without the feature logs
+a warning at startup, so the difference is not left to be discovered by diffing
+responses.
+
 This is opt-in so existing deployments keep their current behavior. See
 "Differences from PostgREST" in the README for the remaining intentional
 differences.

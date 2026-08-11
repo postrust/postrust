@@ -1,0 +1,42 @@
+# Alpine/musl build of the Postrust server.
+#
+# Produces a much smaller image than the Debian variant in ./Dockerfile. Both
+# are measured by scripts/bench-compare.sh (VARIANT=alpine|debian) so the size
+# and throughput difference between them is a measurement rather than an
+# assumption.
+#
+# Build stage
+FROM rust:alpine AS builder
+
+# musl-dev and build-base for the C toolchain; cmake and perl are needed by
+# aws-lc-rs, which rustls pulls in as its crypto provider.
+RUN apk add --no-cache musl-dev build-base cmake perl
+
+WORKDIR /app
+
+COPY Cargo.toml Cargo.lock ./
+COPY crates ./crates
+
+RUN cargo build --release -p postrust-server --features admin-ui
+
+# Runtime stage
+FROM alpine:3.22
+
+RUN apk add --no-cache ca-certificates curl
+
+COPY --from=builder /app/target/release/postrust /usr/local/bin/postrust
+
+RUN adduser -D -u 1000 postrust
+USER postrust
+
+EXPOSE 3000
+
+# Without this the server binds 127.0.0.1 inside the container, so a published
+# port reaches nothing. The container looks healthy from the inside and is
+# unreachable from the outside.
+ENV PGRST_SERVER_HOST=0.0.0.0
+
+HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
+    CMD curl -f http://localhost:3000/_/health || exit 1
+
+CMD ["postrust"]

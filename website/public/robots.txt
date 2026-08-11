@@ -1,0 +1,5 @@
+# https://postrust.org/
+User-agent: *
+Allow: /
+
+Sitemap: https://postrust.org/sitemap.xml

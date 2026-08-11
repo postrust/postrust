@@ -1,0 +1,16 @@
+apiVersion: v2
+name: postrust
+description: PostgREST-compatible REST and GraphQL API server for PostgreSQL
+type: application
+
+# The chart's own version, bumped when the chart changes.
+version: 0.1.0
+
+# The default image tag, which tracks the workspace version.
+appVersion: "0.4.0"
+
+home: https://postrust.org/
+sources:
+  - https://github.com/postrust/postrust
+maintainers:
+  - name: Bhanu Pratap Chaudhary

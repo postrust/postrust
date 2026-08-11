@@ -14,9 +14,32 @@ keywords = ["postgres", "rest", "api", "graphql", "server"]
 name = "postrust"
 path = "src/main.rs"
 
+# musl's allocator serialises heavily under multithreaded load. Measured on the
+# Alpine image: the GraphQL embed scenario ran at 636 req/s against 4,379 for
+# the same code built with glibc, with the database image held constant to rule
+# it out. mimalloc closes that gap and is only pulled in for musl targets.
+[target.'cfg(target_env = "musl")'.dependencies]
+mimalloc = "0.1"
+
 [features]
 default = []
 admin-ui = ["utoipa", "postrust-graphql", "async-graphql", "async-graphql-axum"]
+
+# Return object keys in the order the columns were selected, as PostgREST does,
+# rather than alphabetically.
+#
+# This cannot be a runtime setting. Key order follows from whether
+# `serde_json::Map` is a BTreeMap or an IndexMap, which is fixed when the crate
+# is compiled, so it is a feature rather than a flag in the config.
+#
+# Off by default because it is not free. Measured by running both builds as
+# containers against one database and alternating between them: a 3-column
+# response cost 1%, an 8-column response 15%. For small objects a handful of
+# short string comparisons beats hashing every key, so the sorted map is
+# genuinely the faster one here.
+#
+# Turn it on when byte-level PostgREST compatibility matters more than that.
+compat-key-order = ["serde_json/preserve_order"]
 
 [dependencies]
 # Async
