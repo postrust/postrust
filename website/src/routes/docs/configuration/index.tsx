@@ -6,47 +6,127 @@ const configVars = [
   {
     category: "Database",
     vars: [
-      { name: "DATABASE_URL", required: true, default: "-", desc: "PostgreSQL connection string" },
-      { name: "PGRST_DB_SCHEMAS", required: false, default: "public", desc: "Schemas to expose (comma-separated)" },
-      { name: "PGRST_DB_ANON_ROLE", required: false, default: "-", desc: "Role for unauthenticated requests" },
-      { name: "PGRST_DB_POOL_SIZE", required: false, default: "10", desc: "Connection pool size" },
+      {
+        name: "DATABASE_URL",
+        required: true,
+        default: "-",
+        desc: "PostgreSQL connection string",
+      },
+      {
+        name: "PGRST_DB_SCHEMAS",
+        required: false,
+        default: "public",
+        desc: "Schemas to expose (comma-separated)",
+      },
+      {
+        name: "PGRST_DB_ANON_ROLE",
+        required: false,
+        default: "-",
+        desc: "Role for unauthenticated requests",
+      },
+      {
+        name: "PGRST_DB_POOL_SIZE",
+        required: false,
+        default: "10",
+        desc: "Connection pool size",
+      },
     ],
   },
   {
     category: "Authentication",
     vars: [
-      { name: "PGRST_JWT_SECRET", required: false, default: "-", desc: "JWT signing secret" },
-      { name: "PGRST_JWT_SECRET_IS_BASE64", required: false, default: "false", desc: "If secret is base64 encoded" },
-      { name: "PGRST_JWT_AUD", required: false, default: "-", desc: "Required JWT audience claim" },
-      { name: "PGRST_JWT_ROLE_CLAIM_KEY", required: false, default: "role", desc: "Claim key for role" },
+      {
+        name: "PGRST_JWT_SECRET",
+        required: false,
+        default: "-",
+        desc: "JWT signing secret",
+      },
+      {
+        name: "PGRST_JWT_SECRET_IS_BASE64",
+        required: false,
+        default: "false",
+        desc: "If secret is base64 encoded",
+      },
+      {
+        name: "PGRST_JWT_AUD",
+        required: false,
+        default: "-",
+        desc: "Required JWT audience claim",
+      },
+      {
+        name: "PGRST_JWT_ROLE_CLAIM_KEY",
+        required: false,
+        default: "role",
+        desc: "Claim key for role",
+      },
     ],
   },
   {
     category: "Server",
     vars: [
-      { name: "PGRST_SERVER_HOST", required: false, default: "127.0.0.1", desc: "Bind address" },
-      { name: "PGRST_SERVER_PORT", required: false, default: "3000", desc: "Port to listen on" },
-      { name: "PGRST_SERVER_CORS_ORIGINS", required: false, default: "*", desc: "CORS allowed origins" },
+      {
+        name: "PGRST_SERVER_HOST",
+        required: false,
+        default: "127.0.0.1",
+        desc: "Bind address",
+      },
+      {
+        name: "PGRST_SERVER_PORT",
+        required: false,
+        default: "3000",
+        desc: "Port to listen on",
+      },
+      {
+        name: "PGRST_SERVER_CORS_ORIGINS",
+        required: false,
+        default: "*",
+        desc: "CORS allowed origins",
+      },
     ],
   },
   {
     category: "Limits",
     vars: [
-      { name: "PGRST_MAX_ROWS", required: false, default: "unlimited", desc: "Maximum rows returned by one request; caps requests with no limit" },
-      { name: "PGRST_MAX_BODY_SIZE", required: false, default: "10485760", desc: "Max request body in bytes" },
+      {
+        name: "PGRST_MAX_ROWS",
+        required: false,
+        default: "unlimited",
+        desc: "Maximum rows returned by one request; caps requests with no limit",
+      },
+      {
+        name: "PGRST_MAX_BODY_SIZE",
+        required: false,
+        default: "10485760",
+        desc: "Max request body in bytes",
+      },
     ],
   },
   {
     category: "Compatibility",
     vars: [
-      { name: "PGRST_COMPAT_MODE", required: false, default: "false", desc: "PostgREST compatibility mode: serves the REST API at the root (/rpc/fn, /table) in addition to /api, and un-wraps RPC responses to PostgREST's shape. Alias: POSTRUST_COMPAT_MODE" },
+      {
+        name: "PGRST_COMPAT_MODE",
+        required: false,
+        default: "false",
+        desc: "PostgREST compatibility mode: serves the REST API at the root (/rpc/fn, /table) in addition to /api, and un-wraps RPC responses to PostgREST's shape. Object key order is a build-time choice, not covered by this setting - see below. Alias: POSTRUST_COMPAT_MODE",
+      },
     ],
   },
   {
     category: "Logging",
     vars: [
-      { name: "PGRST_LOG_LEVEL", required: false, default: "info", desc: "Log level (error, warn, info, debug)" },
-      { name: "RUST_LOG", required: false, default: "-", desc: "Detailed tracing configuration" },
+      {
+        name: "PGRST_LOG_LEVEL",
+        required: false,
+        default: "info",
+        desc: "Log level (error, warn, info, debug)",
+      },
+      {
+        name: "RUST_LOG",
+        required: false,
+        default: "-",
+        desc: "Detailed tracing configuration",
+      },
     ],
   },
 ];
@@ -54,17 +134,31 @@ const configVars = [
 export default component$(() => {
   return (
     <div class="min-h-screen bg-white">
-      <div class="bg-gradient-to-b from-neutral-50 to-white border-b border-neutral-200">
+      <div class="border-b border-neutral-200 bg-gradient-to-b from-neutral-50 to-white">
         <div class="container-wide py-12">
-          <div class="flex items-center gap-2 text-sm text-neutral-500 mb-4">
-            <Link href="/docs" class="hover:text-primary-600">Docs</Link>
-            <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-              <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 5l7 7-7 7"/>
+          <div class="mb-4 flex items-center gap-2 text-sm text-neutral-500">
+            <Link href="/docs" class="hover:text-primary-600">
+              Docs
+            </Link>
+            <svg
+              class="h-4 w-4"
+              fill="none"
+              stroke="currentColor"
+              viewBox="0 0 24 24"
+            >
+              <path
+                stroke-linecap="round"
+                stroke-linejoin="round"
+                stroke-width="2"
+                d="M9 5l7 7-7 7"
+              />
             </svg>
             <span class="text-neutral-900">Configuration</span>
           </div>
-          <h1 class="text-4xl font-bold text-neutral-900 mb-4">Configuration</h1>
-          <p class="text-lg text-neutral-600 max-w-2xl">
+          <h1 class="mb-4 text-4xl font-bold text-neutral-900">
+            Configuration
+          </h1>
+          <p class="max-w-2xl text-lg text-neutral-600">
             All environment variables and configuration options for Postrust.
           </p>
         </div>
@@ -74,30 +168,44 @@ export default component$(() => {
         <div class="max-w-4xl">
           {configVars.map((category) => (
             <section key={category.category} class="mb-12">
-              <h2 class="text-2xl font-bold text-neutral-900 mb-6">{category.category}</h2>
+              <h2 class="mb-6 text-2xl font-bold text-neutral-900">
+                {category.category}
+              </h2>
               <div class="overflow-x-auto">
                 <table class="w-full text-sm">
                   <thead>
                     <tr class="border-b border-neutral-200">
-                      <th class="text-left py-3 px-4 font-semibold text-neutral-900">Variable</th>
-                      <th class="text-left py-3 px-4 font-semibold text-neutral-900">Required</th>
-                      <th class="text-left py-3 px-4 font-semibold text-neutral-900">Default</th>
-                      <th class="text-left py-3 px-4 font-semibold text-neutral-900">Description</th>
+                      <th class="px-4 py-3 text-left font-semibold text-neutral-900">
+                        Variable
+                      </th>
+                      <th class="px-4 py-3 text-left font-semibold text-neutral-900">
+                        Required
+                      </th>
+                      <th class="px-4 py-3 text-left font-semibold text-neutral-900">
+                        Default
+                      </th>
+                      <th class="px-4 py-3 text-left font-semibold text-neutral-900">
+                        Description
+                      </th>
                     </tr>
                   </thead>
                   <tbody class="divide-y divide-neutral-100">
                     {category.vars.map((v) => (
                       <tr key={v.name}>
-                        <td class="py-3 px-4 font-mono text-primary-600 text-xs">{v.name}</td>
-                        <td class="py-3 px-4">
+                        <td class="text-primary-600 px-4 py-3 font-mono text-xs">
+                          {v.name}
+                        </td>
+                        <td class="px-4 py-3">
                           {v.required ? (
                             <span class="text-red-600">Yes</span>
                           ) : (
                             <span class="text-neutral-400">No</span>
                           )}
                         </td>
-                        <td class="py-3 px-4 font-mono text-neutral-500 text-xs">{v.default}</td>
-                        <td class="py-3 px-4 text-neutral-600">{v.desc}</td>
+                        <td class="px-4 py-3 font-mono text-xs text-neutral-500">
+                          {v.default}
+                        </td>
+                        <td class="px-4 py-3 text-neutral-600">{v.desc}</td>
                       </tr>
                     ))}
                   </tbody>
@@ -108,12 +216,67 @@ export default component$(() => {
 
           {/* Example */}
           <section class="mb-12">
-            <h2 class="text-2xl font-bold text-neutral-900 mb-4">Example Configuration</h2>
-            <div class="bg-neutral-900 rounded-xl overflow-hidden">
-              <div class="px-4 py-2 bg-neutral-800 border-b border-neutral-700">
+            <h2 class="mb-4 text-2xl font-bold text-neutral-900">
+              Key ordering is a build-time choice
+            </h2>
+            <p class="mb-4 text-neutral-600">
+              Postrust returns the keys within each object alphabetically.
+              PostgREST returns them in the order of the{" "}
+              <code class="rounded bg-neutral-100 px-1 py-0.5 text-sm">
+                select
+              </code>{" "}
+              list. That difference is decided when the binary is compiled
+              rather than at run time, because it depends on the map type
+              holding a JSON object, so{" "}
+              <code class="rounded bg-neutral-100 px-1 py-0.5 text-sm">
+                PGRST_COMPAT_MODE
+              </code>{" "}
+              cannot switch it on. It is a Cargo feature:
+            </p>
+            <div class="mb-4 overflow-hidden rounded-xl bg-neutral-900">
+              <div class="border-b border-neutral-700 bg-neutral-800 px-4 py-2">
+                <span class="text-sm text-neutral-400">Terminal</span>
+              </div>
+              <pre class="overflow-x-auto p-4 text-sm">
+                <code class="text-neutral-100">{`cargo build --release -p postrust-server --features compat-key-order
+
+# Default build
+curl 'localhost:3000/api/users?select=status,name,id&limit=1'
+# -> [{"id":1,"name":"Alice","status":"active"}]
+
+# With compat-key-order
+curl 'localhost:3000/api/users?select=status,name,id&limit=1'
+# -> [{"status":"active","name":"Alice","id":1}]`}</code>
+              </pre>
+            </div>
+            <p class="mb-4 text-neutral-600">
+              It is off by default because it is not free. Measured by running
+              both builds as containers against the same database and
+              alternating between them, a three-column response cost 1% and an
+              eight-column response 15%: for objects this small a few short
+              string comparisons beat hashing every key, so the sorted map is
+              genuinely the faster one. Turn it on when byte-level compatibility
+              matters more.
+            </p>
+            <p class="text-neutral-600">
+              Running with{" "}
+              <code class="rounded bg-neutral-100 px-1 py-0.5 text-sm">
+                PGRST_COMPAT_MODE=true
+              </code>{" "}
+              on a binary built without the feature logs a warning at startup,
+              so the difference is not left to be found by diffing responses.
+            </p>
+          </section>
+
+          <section class="mb-12">
+            <h2 class="mb-4 text-2xl font-bold text-neutral-900">
+              Example Configuration
+            </h2>
+            <div class="overflow-hidden rounded-xl bg-neutral-900">
+              <div class="border-b border-neutral-700 bg-neutral-800 px-4 py-2">
                 <span class="text-sm text-neutral-400">.env</span>
               </div>
-              <pre class="p-4 text-sm overflow-x-auto">
+              <pre class="overflow-x-auto p-4 text-sm">
                 <code class="text-neutral-100">{`# Required
 DATABASE_URL=postgres://user:password@localhost:5432/mydb
 
@@ -134,23 +297,43 @@ PGRST_LOG_LEVEL=info`}</code>
           </section>
 
           {/* Next */}
-          <div class="flex items-center justify-between pt-8 border-t border-neutral-200">
+          <div class="flex items-center justify-between border-t border-neutral-200 pt-8">
             <Link
               href="/docs/authentication"
-              class="flex items-center gap-2 text-neutral-600 hover:text-primary-600"
+              class="hover:text-primary-600 flex items-center gap-2 text-neutral-600"
             >
-              <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15 19l-7-7 7-7"/>
+              <svg
+                class="h-4 w-4"
+                fill="none"
+                stroke="currentColor"
+                viewBox="0 0 24 24"
+              >
+                <path
+                  stroke-linecap="round"
+                  stroke-linejoin="round"
+                  stroke-width="2"
+                  d="M15 19l-7-7 7-7"
+                />
               </svg>
               Authentication
             </Link>
             <Link
               href="/docs/deployment"
-              class="flex items-center gap-2 text-neutral-600 hover:text-primary-600"
+              class="hover:text-primary-600 flex items-center gap-2 text-neutral-600"
             >
               Deployment
-              <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 5l7 7-7 7"/>
+              <svg
+                class="h-4 w-4"
+                fill="none"
+                stroke="currentColor"
+                viewBox="0 0 24 24"
+              >
+                <path
+                  stroke-linecap="round"
+                  stroke-linejoin="round"
+                  stroke-width="2"
+                  d="M9 5l7 7-7 7"
+                />
               </svg>
             </Link>
           </div>
@@ -165,7 +348,8 @@ export const head: DocumentHead = {
   meta: [
     {
       name: "description",
-      content: "All configuration options and environment variables for Postrust.",
+      content:
+        "All configuration options and environment variables for Postrust.",
     },
   ],
 };
