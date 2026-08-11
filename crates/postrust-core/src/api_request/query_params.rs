@@ -7,7 +7,7 @@ use super::types::*;
 use crate::error::{Error, Result};
 use nom::{
     branch::alt,
-    bytes::complete::{tag, take_until, take_while1},
+    bytes::complete::{tag, take_while1},
     character::complete::{char, digit1},
     combinator::{map, opt, value},
     multi::{many0, separated_list0},
@@ -150,14 +150,55 @@ fn parse_spread_relation(input: &str) -> IResult<&str, SelectItem> {
     ))
 }
 
+/// Parse the contents of a relation's parentheses.
+///
+/// Scans to the parenthesis that closes the group -- tracking nesting, so
+/// `books(chapters(id))` is not truncated at the first `)` -- then parses the
+/// contents as a select list.
+fn parse_nested_select(input: &str) -> IResult<&str, Vec<SelectItem>> {
+    let mut depth = 0usize;
+    let mut end = input.len();
+
+    for (idx, ch) in input.char_indices() {
+        match ch {
+            '(' => depth += 1,
+            ')' => {
+                if depth == 0 {
+                    end = idx;
+                    break;
+                }
+                depth -= 1;
+            }
+            _ => {}
+        }
+    }
+
+    let (body, rest) = input.split_at(end);
+
+    if body.is_empty() {
+        return Ok((rest, Vec::new()));
+    }
+
+    match parse_select_items(body) {
+        Ok(("", items)) => Ok((rest, items)),
+        _ => Err(nom::Err::Error(nom::error::Error::new(
+            input,
+            nom::error::ErrorKind::Verify,
+        ))),
+    }
+}
+
 /// Parse relation with embedded select: `relation(select_items)`
 fn parse_relation_select(input: &str) -> IResult<&str, SelectItem> {
     let (input, name) = parse_identifier(input)?;
     let (input, alias) = opt(preceded(char(':'), parse_identifier))(input)?;
     let (input, hint) = opt(preceded(char('!'), parse_identifier))(input)?;
     let (input, join_type) = opt(preceded(char('!'), parse_join_type))(input)?;
+    // The nested selection is parsed rather than skipped: it says which
+    // columns of the related resource to return, and may embed further
+    // relations of its own.
     let (input, _) = char('(')(input)?;
-    let (input, _nested) = take_until(")")(input)?;
+    let (input, nested) = parse_nested_select(input)?;
     let (input, _) = char(')')(input)?;
 
     Ok((
@@ -167,6 +208,7 @@ fn parse_relation_select(input: &str) -> IResult<&str, SelectItem> {
             alias: alias.map(|s| s.to_string()),
             hint: hint.map(|s| s.to_string()),
             join_type,
+            select: nested,
         },
     ))
 }

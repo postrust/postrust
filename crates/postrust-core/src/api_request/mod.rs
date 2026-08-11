@@ -17,10 +17,15 @@ use http::{Method, Request};
 use std::collections::{HashMap, HashSet};
 
 /// Parse an HTTP request into an ApiRequest.
+///
+/// `max_rows` is the server-configured ceiling on returned rows
+/// (`PGRST_MAX_ROWS`); pass `None` for no ceiling. It is applied when the read
+/// plan resolves its range, so it caps requests that specify no `limit`.
 pub fn parse_request<B>(
     req: &Request<B>,
     default_schema: &str,
     schemas: &[String],
+    max_rows: Option<i64>,
 ) -> Result<ApiRequest>
 where
     B: AsRef<[u8]>,
@@ -68,6 +73,7 @@ where
         columns: HashSet::new(),
         top_level_range,
         range_map: HashMap::new(),
+        max_rows,
         negotiated_by_profile,
         method: method.to_string(),
         path: path.to_string(),

@@ -27,6 +27,11 @@ pub struct SchemaConfig {
     pub query_suffix: Option<String>,
     /// Whether to use camelCase for field names
     pub use_camel_case: bool,
+    /// Ceiling on rows a single query may return (`PGRST_MAX_ROWS`).
+    ///
+    /// Applied when a query supplies no `limit` of its own, and as an upper
+    /// bound when it supplies a larger one. `None` leaves queries unbounded.
+    pub max_rows: Option<i64>,
 }
 
 impl Default for SchemaConfig {
@@ -38,6 +43,7 @@ impl Default for SchemaConfig {
             query_prefix: None,
             query_suffix: None,
             use_camel_case: true,
+            max_rows: None,
         }
     }
 }
@@ -69,6 +75,50 @@ impl SchemaConfig {
     /// Check if a schema is exposed.
     pub fn is_schema_exposed(&self, schema: &str) -> bool {
         self.exposed_schemas.iter().any(|s| s == schema)
+    }
+
+    /// The schema whose tables get unqualified GraphQL names.
+    ///
+    /// This is the first exposed schema, mirroring how the REST surface treats
+    /// the first entry of `PGRST_DB_SCHEMAS` as the default.
+    pub fn default_schema(&self) -> &str {
+        self.exposed_schemas
+            .first()
+            .map(|s| s.as_str())
+            .unwrap_or("public")
+    }
+}
+
+/// Primary key columns of a table, as `(column name, PostgreSQL type)`.
+///
+/// `nominal_type` (the underlying `udt_name`) is used because it is always a
+/// castable type name.
+fn pk_columns_of(table: &Table) -> Vec<(String, String)> {
+    table
+        .pk_cols
+        .iter()
+        .map(|col_name| {
+            let pg_type = table
+                .get_column(col_name)
+                .map(|c| c.nominal_type.clone())
+                .unwrap_or_else(|| "text".to_string());
+            (col_name.clone(), pg_type)
+        })
+        .collect()
+}
+
+/// Base name used to derive a table's GraphQL type and field names.
+///
+/// Tables in the default schema keep their bare name, so a single-schema
+/// deployment is unaffected. Tables in any other exposed schema are prefixed
+/// with the schema, because GraphQL has one flat namespace: without this, a
+/// `users` table in both `public` and `api` would generate the same type and
+/// field names and one would silently replace the other.
+fn base_name_for(table: &Table, config: &SchemaConfig) -> String {
+    if table.schema == config.default_schema() {
+        table.name.clone()
+    } else {
+        format!("{}_{}", table.schema, table.name)
     }
 }
 
@@ -132,6 +182,8 @@ pub struct QueryField {
     pub name: String,
     /// Table name
     pub table_name: String,
+    /// Schema the table lives in
+    pub schema_name: String,
     /// GraphQL object type name (e.g., "Users")
     pub type_name: String,
     /// GraphQL return type
@@ -140,18 +192,29 @@ pub struct QueryField {
     pub is_list: bool,
     /// Whether this is a "by PK" query
     pub is_by_pk: bool,
+    /// Primary key columns, as `(column name, PostgreSQL type)`.
+    ///
+    /// Populated for by-PK queries so the resolver can filter on the table's
+    /// actual key rather than assuming a column called `id`. Empty for list
+    /// queries.
+    pub pk_columns: Vec<(String, String)>,
     /// Field description
     pub description: Option<String>,
 }
 
 impl QueryField {
-    /// Create a list query field (e.g., users).
+    /// Create a list query field (e.g., users), named after the table.
     pub fn list(table: &Table, config: &SchemaConfig) -> Self {
-        let type_name = to_pascal_case(&table.name);
+        Self::list_named(table, config, &table.name)
+    }
+
+    /// Create a list query field using an explicit base name.
+    pub fn list_named(table: &Table, config: &SchemaConfig, base_name: &str) -> Self {
+        let type_name = to_pascal_case(base_name);
         let field_name = if config.use_camel_case {
-            to_camel_case(&table.name)
+            to_camel_case(base_name)
         } else {
-            table.name.clone()
+            base_name.to_string()
         };
 
         let name = match (&config.query_prefix, &config.query_suffix) {
@@ -166,35 +229,48 @@ impl QueryField {
         Self {
             name,
             table_name: table.name.clone(),
+            schema_name: table.schema.clone(),
             type_name: type_name.clone(),
             return_type: format!("[{}!]!", type_name),
             is_list: true,
             is_by_pk: false,
+            pk_columns: Vec::new(),
             description: Some(format!("Query {} records", table.name)),
         }
     }
 
-    /// Create a by-PK query field (e.g., userByPk).
+    /// Create a by-PK query field (e.g., userByPk), named after the table.
     pub fn by_pk(table: &Table, config: &SchemaConfig) -> Option<Self> {
+        Self::by_pk_named(table, config, &table.name)
+    }
+
+    /// Create a by-PK query field using an explicit base name.
+    pub fn by_pk_named(table: &Table, config: &SchemaConfig, base_name: &str) -> Option<Self> {
         if table.pk_cols.is_empty() {
             return None;
         }
 
-        let type_name = to_pascal_case(&table.name);
-        let singular = singularize(&table.name);
+        let type_name = to_pascal_case(base_name);
+        let singular = singularize(base_name);
         let field_name = if config.use_camel_case {
             format!("{}ByPk", to_camel_case(&singular))
         } else {
             format!("{}_by_pk", singular)
         };
 
+        // Carry the key columns and their types so the resolver can filter on
+        // the real primary key.
+        let pk_columns = pk_columns_of(table);
+
         Some(Self {
             name: field_name,
             table_name: table.name.clone(),
+            schema_name: table.schema.clone(),
             type_name: type_name.clone(),
             return_type: type_name,
             is_list: false,
             is_by_pk: true,
+            pk_columns,
             description: Some(format!("Get a single {} by primary key", singular)),
         })
     }
@@ -207,8 +283,15 @@ pub struct MutationField {
     pub name: String,
     /// Table name
     pub table_name: String,
+    /// Schema the table lives in
+    pub schema_name: String,
     /// Mutation type
     pub mutation_type: MutationType,
+    /// Primary key columns, as `(column name, PostgreSQL type)`.
+    ///
+    /// Populated for by-PK mutations so the resolver can target the row by its
+    /// key. Empty for bulk mutations.
+    pub pk_columns: Vec<(String, String)>,
     /// GraphQL return type
     pub return_type: String,
     /// Field description
@@ -235,25 +318,33 @@ pub enum MutationType {
 impl MutationField {
     /// Create insert mutation fields for a table.
     pub fn insert_fields(table: &Table, config: &SchemaConfig) -> Vec<Self> {
+        Self::insert_fields_named(table, config, &table.name)
+    }
+
+    /// As [`Self::insert_fields`], with an explicit base name for the generated
+    /// field and type names.
+    pub fn insert_fields_named(table: &Table, config: &SchemaConfig, base_name: &str) -> Vec<Self> {
         if !is_insertable(table) {
             return vec![];
         }
 
-        let type_name = to_pascal_case(&table.name);
-        let singular = singularize(&table.name);
+        let type_name = to_pascal_case(base_name);
+        let singular = singularize(base_name);
 
         let mut fields = vec![];
 
         // insert_users (batch insert)
         let name = if config.use_camel_case {
-            format!("insert{}", to_pascal_case(&table.name))
+            format!("insert{}", to_pascal_case(base_name))
         } else {
-            format!("insert_{}", table.name)
+            format!("insert_{}", base_name)
         };
         fields.push(Self {
             name,
             table_name: table.name.clone(),
+            schema_name: table.schema.clone(),
             mutation_type: MutationType::Insert,
+            pk_columns: Vec::new(),
             return_type: format!("[{}!]!", type_name),
             description: Some(format!("Insert multiple {} records", table.name)),
         });
@@ -267,7 +358,9 @@ impl MutationField {
         fields.push(Self {
             name,
             table_name: table.name.clone(),
+            schema_name: table.schema.clone(),
             mutation_type: MutationType::InsertOne,
+            pk_columns: Vec::new(),
             return_type: type_name.clone(),
             description: Some(format!("Insert a single {} record", singular)),
         });
@@ -277,25 +370,33 @@ impl MutationField {
 
     /// Create update mutation fields for a table.
     pub fn update_fields(table: &Table, config: &SchemaConfig) -> Vec<Self> {
+        Self::update_fields_named(table, config, &table.name)
+    }
+
+    /// As [`Self::update_fields`], with an explicit base name for the generated
+    /// field and type names.
+    pub fn update_fields_named(table: &Table, config: &SchemaConfig, base_name: &str) -> Vec<Self> {
         if !is_updatable(table) {
             return vec![];
         }
 
-        let type_name = to_pascal_case(&table.name);
-        let singular = singularize(&table.name);
+        let type_name = to_pascal_case(base_name);
+        let singular = singularize(base_name);
 
         let mut fields = vec![];
 
         // update_users (batch update)
         let name = if config.use_camel_case {
-            format!("update{}", to_pascal_case(&table.name))
+            format!("update{}", to_pascal_case(base_name))
         } else {
-            format!("update_{}", table.name)
+            format!("update_{}", base_name)
         };
         fields.push(Self {
             name,
             table_name: table.name.clone(),
+            schema_name: table.schema.clone(),
             mutation_type: MutationType::Update,
+            pk_columns: Vec::new(),
             return_type: format!("[{}!]!", type_name),
             description: Some(format!("Update {} records", table.name)),
         });
@@ -310,7 +411,9 @@ impl MutationField {
             fields.push(Self {
                 name,
                 table_name: table.name.clone(),
+                schema_name: table.schema.clone(),
                 mutation_type: MutationType::UpdateByPk,
+                pk_columns: pk_columns_of(table),
                 return_type: type_name,
                 description: Some(format!("Update a single {} by primary key", singular)),
             });
@@ -321,25 +424,33 @@ impl MutationField {
 
     /// Create delete mutation fields for a table.
     pub fn delete_fields(table: &Table, config: &SchemaConfig) -> Vec<Self> {
+        Self::delete_fields_named(table, config, &table.name)
+    }
+
+    /// As [`Self::delete_fields`], with an explicit base name for the generated
+    /// field and type names.
+    pub fn delete_fields_named(table: &Table, config: &SchemaConfig, base_name: &str) -> Vec<Self> {
         if !is_deletable(table) {
             return vec![];
         }
 
-        let type_name = to_pascal_case(&table.name);
-        let singular = singularize(&table.name);
+        let type_name = to_pascal_case(base_name);
+        let singular = singularize(base_name);
 
         let mut fields = vec![];
 
         // delete_users (batch delete)
         let name = if config.use_camel_case {
-            format!("delete{}", to_pascal_case(&table.name))
+            format!("delete{}", to_pascal_case(base_name))
         } else {
-            format!("delete_{}", table.name)
+            format!("delete_{}", base_name)
         };
         fields.push(Self {
             name,
             table_name: table.name.clone(),
+            schema_name: table.schema.clone(),
             mutation_type: MutationType::Delete,
+            pk_columns: Vec::new(),
             return_type: format!("[{}!]!", type_name),
             description: Some(format!("Delete {} records", table.name)),
         });
@@ -354,7 +465,9 @@ impl MutationField {
             fields.push(Self {
                 name,
                 table_name: table.name.clone(),
+                schema_name: table.schema.clone(),
                 mutation_type: MutationType::DeleteByPk,
+                pk_columns: pk_columns_of(table),
                 return_type: type_name,
                 description: Some(format!("Delete a single {} by primary key", singular)),
             });
@@ -371,28 +484,78 @@ pub fn build_schema(schema_cache: &SchemaCache, config: &SchemaConfig) -> Genera
     let mut mutation_fields = Vec::new();
     let mut relationship_fields = HashMap::new();
 
-    // Process each table in the schema cache
-    for table in schema_cache.tables.values() {
-        // Skip tables not in exposed schemas
-        if !config.is_schema_exposed(&table.schema) {
-            continue;
-        }
+    // Tables are visited in a stable order: the cache is a hash map, and any
+    // name disambiguation below must not shift between restarts.
+    let mut tables: Vec<&Table> = schema_cache
+        .tables
+        .values()
+        .filter(|table| config.is_schema_exposed(&table.schema))
+        .collect();
+    tables.sort_by(|a, b| (&a.schema, &a.name).cmp(&(&b.schema, &b.name)));
+
+    // Base names already carry the schema for non-default schemas, so a clash
+    // here needs contrived naming (a `public.api_users` table alongside
+    // `api.users`). Resolve it with a numeric suffix rather than letting one
+    // table overwrite the other.
+    let mut used_base_names: HashMap<String, u32> = HashMap::new();
+    // (schema, table) -> resolved base name, needed when naming relationship
+    // targets.
+    let mut base_names: HashMap<(String, String), String> = HashMap::new();
+
+    for table in &tables {
+        let preferred = base_name_for(table, config);
+        let base_name = match used_base_names.get_mut(&preferred) {
+            None => {
+                used_base_names.insert(preferred.clone(), 1);
+                preferred
+            }
+            Some(count) => {
+                *count += 1;
+                let disambiguated = format!("{}_{}", preferred, count);
+                tracing::warn!(
+                    "GraphQL name collision: {}.{} would generate the same names as \
+                     an earlier table; exposing it as \"{}\" instead",
+                    table.schema,
+                    table.name,
+                    disambiguated
+                );
+                disambiguated
+            }
+        };
+
+        base_names.insert(
+            (table.schema.clone(), table.name.clone()),
+            base_name.clone(),
+        );
+    }
+
+    for table in tables {
+        let base_name = base_names
+            .get(&(table.schema.clone(), table.name.clone()))
+            .expect("every visited table has a resolved base name")
+            .clone();
 
         // Create object type
-        let obj_type = TableObjectType::from_table(table);
+        let obj_type = TableObjectType::from_table_named(table, &base_name);
         let type_name = obj_type.name.clone();
 
         // Add query fields
-        query_fields.push(QueryField::list(table, config));
-        if let Some(by_pk) = QueryField::by_pk(table, config) {
+        query_fields.push(QueryField::list_named(table, config, &base_name));
+        if let Some(by_pk) = QueryField::by_pk_named(table, config, &base_name) {
             query_fields.push(by_pk);
         }
 
         // Add mutation fields if enabled
         if config.enable_mutations {
-            mutation_fields.extend(MutationField::insert_fields(table, config));
-            mutation_fields.extend(MutationField::update_fields(table, config));
-            mutation_fields.extend(MutationField::delete_fields(table, config));
+            mutation_fields.extend(MutationField::insert_fields_named(
+                table, config, &base_name,
+            ));
+            mutation_fields.extend(MutationField::update_fields_named(
+                table, config, &base_name,
+            ));
+            mutation_fields.extend(MutationField::delete_fields_named(
+                table, config, &base_name,
+            ));
         }
 
         // Add relationship fields
@@ -401,7 +564,14 @@ pub fn build_schema(schema_cache: &SchemaCache, config: &SchemaConfig) -> Genera
             .map(|relationships| {
                 relationships
                     .iter()
-                    .map(RelationshipField::from_relationship)
+                    .filter_map(|rel| {
+                        // A relationship whose target is not exposed would
+                        // reference a GraphQL type that was never registered.
+                        let foreign = rel.foreign_table();
+                        let target_base =
+                            base_names.get(&(foreign.schema.clone(), foreign.name.clone()))?;
+                        Some(RelationshipField::from_relationship_named(rel, target_base))
+                    })
                     .collect()
             })
             .unwrap_or_default();

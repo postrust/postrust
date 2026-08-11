@@ -198,6 +198,22 @@ impl AppConfig {
                 config.db_pool_size = n;
             }
         }
+        // `PGRST_MAX_ROWS` is the name used in our own documentation;
+        // `PGRST_DB_MAX_ROWS` mirrors PostgREST's `db-max-rows`. Accept both.
+        for var in ["PGRST_DB_MAX_ROWS", "PGRST_MAX_ROWS"] {
+            if let Ok(max_rows) = std::env::var(var) {
+                match max_rows.parse::<i64>() {
+                    Ok(n) if n >= 0 => config.db_max_rows = Some(n),
+                    _ => {
+                        tracing::warn!(
+                            "Ignoring {}={:?}: expected a non-negative integer",
+                            var,
+                            max_rows
+                        );
+                    }
+                }
+            }
+        }
         if let Ok(secret) = std::env::var("PGRST_JWT_SECRET") {
             config.jwt_secret = Some(secret);
         }

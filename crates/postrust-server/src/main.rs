@@ -94,6 +94,7 @@ async fn main() -> Result<()> {
         let schema_cache_arc = Arc::new(schema_cache_snapshot);
         let graphql_config = SchemaConfig {
             enable_subscriptions: true,
+            max_rows: config.db_max_rows,
             ..SchemaConfig::default()
         };
         let graphql_state = Arc::new(

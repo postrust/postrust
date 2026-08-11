@@ -65,7 +65,12 @@ async fn process_request(
         .map_err(|e| postrust_core::Error::Internal(e.to_string()))?;
 
     // Parse API request
-    let mut api_request = parse_request(&http_request, state.default_schema(), state.schemas())?;
+    let mut api_request = parse_request(
+        &http_request,
+        state.default_schema(),
+        state.schemas(),
+        state.config.db_max_rows,
+    )?;
 
     // Parse payload
     if !body_bytes.is_empty() {
@@ -79,11 +84,23 @@ async fn process_request(
     // Get schema cache
     let schema_cache = state.schema_cache().await;
 
+    // Embedding joins on a column of the parent row, so that column has to be
+    // selected even when the client did not ask for it. Any column added this
+    // way is removed from the response once the embed is attached.
+    let added_join_columns = add_embed_join_columns(&mut api_request, &schema_cache)?;
+
     // Create execution plan
     let plan = create_action_plan(&api_request, &schema_cache)?;
 
     // Execute plan
-    let result = execute_plan(&state, &api_request, &plan, &auth_result).await?;
+    let result = execute_plan(
+        &state,
+        &api_request,
+        &plan,
+        &auth_result,
+        &added_join_columns,
+    )
+    .await?;
 
     // Format response
     let response = format_response(&api_request, &result)
@@ -95,9 +112,10 @@ async fn process_request(
 /// Execute an action plan.
 async fn execute_plan(
     state: &AppState,
-    _request: &ApiRequest,
+    api_request: &ApiRequest,
     plan: &ActionPlan,
     auth: &postrust_auth::AuthResult,
+    added_join_columns: &[String],
 ) -> Result<QueryResult, postrust_core::Error> {
     match plan {
         ActionPlan::Db(db_plan) => {
@@ -166,8 +184,39 @@ async fn execute_plan(
                     map_sqlx_error(e)
                 })?;
 
-            // Convert rows to JSON
-            let json_rows: Vec<serde_json::Value> = rows.iter().map(row_to_json).collect();
+            // Convert rows to JSON.
+            //
+            // `into_iter` matters for large result sets: each row's buffers are
+            // freed as soon as it has been converted, rather than the whole
+            // `Vec<PgRow>` staying alive alongside the whole `Vec<Value>`.
+            let mut json_rows: Vec<serde_json::Value> = rows
+                .into_iter()
+                .map(|row| postrust_core::row_json::row_to_json(&row))
+                .collect();
+
+            // Embed related resources requested with `select=...,relation(...)`.
+            if let Some(parent_qi) = read_target(api_request) {
+                let schema_cache = state.schema_cache().await;
+                embed_relations(
+                    &state.pool,
+                    &auth.role,
+                    &schema_cache,
+                    &parent_qi,
+                    &api_request.query_params.select,
+                    &mut json_rows,
+                    api_request.max_rows,
+                )
+                .await?;
+            }
+
+            // Drop columns that were only selected to join the embeds.
+            for column in added_join_columns {
+                for row in json_rows.iter_mut() {
+                    if let Some(object) = row.as_object_mut() {
+                        object.remove(column);
+                    }
+                }
+            }
 
             // In PostgREST-compatibility mode, reshape RPC responses to match
             // PostgREST: un-nest the function-name-keyed column and return a
@@ -264,78 +313,211 @@ fn unwrap_rpc_rows(
     (unwrapped, singular)
 }
 
-/// Convert a sqlx row to JSON.
-fn row_to_json(row: &sqlx::postgres::PgRow) -> serde_json::Value {
-    use sqlx::{Column, Row, TypeInfo};
+/// The table a read targets, if the request is a read.
+fn read_target(
+    api_request: &postrust_core::api_request::ApiRequest,
+) -> Option<postrust_core::api_request::QualifiedIdentifier> {
+    use postrust_core::api_request::{Action, DbAction};
 
-    let mut map = serde_json::Map::new();
+    match &api_request.action {
+        Action::Db(DbAction::RelationRead { qi, .. }) => Some(qi.clone()),
+        _ => None,
+    }
+}
 
-    for column in row.columns() {
-        let name = column.name();
-        let type_name = column.type_info().name();
+/// Ensure every embedded relation's join column is selected on the parent.
+///
+/// Returns the columns that were added purely to make the join possible, so
+/// they can be removed from the response afterwards. An empty select list means
+/// "all columns", in which case nothing needs adding.
+#[allow(clippy::result_large_err)] // consistent with the crate's error type
+fn add_embed_join_columns(
+    api_request: &mut postrust_core::api_request::ApiRequest,
+    schema_cache: &postrust_core::SchemaCache,
+) -> Result<Vec<String>, postrust_core::Error> {
+    use postrust_core::api_request::{Field, SelectItem};
 
-        let value = match type_name {
-            "INT2" | "SMALLINT" => row
-                .try_get::<i16, _>(name)
-                .ok()
-                .map(|v| serde_json::Value::Number(v.into())),
-            "INT4" | "INT" | "INTEGER" => row
-                .try_get::<i32, _>(name)
-                .ok()
-                .map(|v| serde_json::Value::Number(v.into())),
-            "INT8" | "BIGINT" => row
-                .try_get::<i64, _>(name)
-                .ok()
-                .map(|v| serde_json::Value::Number(v.into())),
-            "FLOAT4" | "REAL" => row
-                .try_get::<f32, _>(name)
-                .ok()
-                .and_then(|v| serde_json::Number::from_f64(v as f64))
-                .map(serde_json::Value::Number),
-            "FLOAT8" | "DOUBLE PRECISION" => row
-                .try_get::<f64, _>(name)
-                .ok()
-                .and_then(serde_json::Number::from_f64)
-                .map(serde_json::Value::Number),
-            "NUMERIC" | "DECIMAL" => row
-                .try_get::<sqlx::types::BigDecimal, _>(name)
-                .ok()
-                .map(|v| serde_json::Value::String(v.to_string())),
-            "BOOL" | "BOOLEAN" => row
-                .try_get::<bool, _>(name)
-                .ok()
-                .map(serde_json::Value::Bool),
-            "JSON" | "JSONB" => row.try_get::<serde_json::Value, _>(name).ok(),
-            "UUID" => row
-                .try_get::<sqlx::types::Uuid, _>(name)
-                .ok()
-                .map(|v| serde_json::Value::String(v.to_string())),
-            "TIMESTAMPTZ" | "TIMESTAMP WITH TIME ZONE" => row
-                .try_get::<chrono::DateTime<chrono::Utc>, _>(name)
-                .ok()
-                .map(|v| serde_json::Value::String(v.to_rfc3339())),
-            "TIMESTAMP" | "TIMESTAMP WITHOUT TIME ZONE" => row
-                .try_get::<chrono::NaiveDateTime, _>(name)
-                .ok()
-                .map(|v| serde_json::Value::String(v.to_string())),
-            "DATE" => row
-                .try_get::<chrono::NaiveDate, _>(name)
-                .ok()
-                .map(|v| serde_json::Value::String(v.to_string())),
-            "TIME" | "TIME WITHOUT TIME ZONE" => row
-                .try_get::<chrono::NaiveTime, _>(name)
-                .ok()
-                .map(|v| serde_json::Value::String(v.to_string())),
-            _ => row
-                .try_get::<String, _>(name)
-                .ok()
-                .map(serde_json::Value::String),
-        };
+    let Some(parent_qi) = read_target(api_request) else {
+        return Ok(Vec::new());
+    };
 
-        map.insert(name.to_string(), value.unwrap_or(serde_json::Value::Null));
+    let select = &api_request.query_params.select;
+    if select.is_empty() {
+        return Ok(Vec::new());
     }
 
-    serde_json::Value::Object(map)
+    let selected: std::collections::HashSet<String> = select
+        .iter()
+        .filter_map(|item| match item {
+            SelectItem::Field { field, .. } => Some(field.name.clone()),
+            _ => None,
+        })
+        .collect();
+
+    let mut added = Vec::new();
+
+    for item in select.clone() {
+        let SelectItem::Relation { relation, .. } = &item else {
+            continue;
+        };
+
+        let rel = schema_cache
+            .find_relationship(&parent_qi, relation, &parent_qi.schema)
+            .ok_or_else(|| postrust_core::Error::RelationshipNotFound(relation.clone()))?;
+
+        let plan = postrust_core::embed::EmbedPlan::resolve(rel, schema_cache)?;
+
+        if !selected.contains(&plan.local_column) && !added.contains(&plan.local_column) {
+            api_request.query_params.select.push(SelectItem::Field {
+                field: Field::simple(&plan.local_column),
+                aggregate: None,
+                aggregate_cast: None,
+                cast: None,
+                alias: None,
+            });
+            added.push(plan.local_column.clone());
+        }
+    }
+
+    Ok(added)
+}
+
+type EmbedFuture<'f> = std::pin::Pin<
+    Box<dyn std::future::Future<Output = Result<(), postrust_core::Error>> + Send + 'f>,
+>;
+
+/// Attach the relations requested in `select` onto `rows`.
+///
+/// One query per relation per level: the parents' join keys are collected and
+/// passed as a single array, so embedding across a page of parents does not
+/// become a query per row. Recurses for nested embeds.
+fn embed_relations<'f>(
+    pool: &'f sqlx::PgPool,
+    role: &'f str,
+    schema_cache: &'f postrust_core::SchemaCache,
+    parent_qi: &'f postrust_core::api_request::QualifiedIdentifier,
+    select: &'f [postrust_core::api_request::SelectItem],
+    rows: &'f mut [serde_json::Value],
+    max_rows: Option<i64>,
+) -> EmbedFuture<'f> {
+    use postrust_core::api_request::SelectItem;
+
+    Box::pin(async move {
+        if rows.is_empty() {
+            return Ok(());
+        }
+
+        for item in select {
+            let SelectItem::Relation {
+                relation,
+                alias,
+                select: nested,
+                ..
+            } = item
+            else {
+                continue;
+            };
+
+            let rel = schema_cache
+                .find_relationship(parent_qi, relation, &parent_qi.schema)
+                .ok_or_else(|| postrust_core::Error::RelationshipNotFound(relation.clone()))?;
+
+            let plan = postrust_core::embed::EmbedPlan::resolve(rel, schema_cache)?;
+            let keys = postrust_core::embed::parent_keys(rows, &plan.local_column);
+
+            let mut children: Vec<serde_json::Value> = if keys.is_empty() {
+                Vec::new()
+            } else {
+                let sql = plan.children_sql(max_rows)?;
+
+                let mut conn = pool
+                    .acquire()
+                    .await
+                    .map_err(|e| postrust_core::Error::ConnectionPool(e.to_string()))?;
+
+                sqlx::query(&format!(
+                    "SET LOCAL ROLE {}",
+                    postrust_sql::escape_ident(role)
+                ))
+                .execute(&mut *conn)
+                .await
+                .map_err(map_sqlx_error)?;
+
+                let fetched = sqlx::query(&sql)
+                    .bind(&keys)
+                    .fetch_all(&mut *conn)
+                    .await
+                    .map_err(map_sqlx_error)?;
+
+                // The query already returns one JSON column per row, so the
+                // value is read straight out of it -- running it through the
+                // typed row converter would wrap it as {"row_to_json": {..}}.
+                use sqlx::Row;
+                fetched
+                    .into_iter()
+                    .filter_map(|row| row.try_get::<serde_json::Value, _>(0).ok())
+                    .collect()
+            };
+
+            // Deeper embeds first, so they are present in the values copied
+            // onto the parents.
+            let child_qi = postrust_core::api_request::QualifiedIdentifier::new(
+                &plan.foreign_schema,
+                &plan.foreign_table,
+            );
+            embed_relations(
+                pool,
+                role,
+                schema_cache,
+                &child_qi,
+                nested,
+                &mut children,
+                max_rows,
+            )
+            .await?;
+
+            // Return only the requested columns of the related resource. An
+            // empty nested select means every column.
+            let requested: Option<std::collections::HashSet<String>> = if nested.is_empty() {
+                None
+            } else {
+                Some(
+                    nested
+                        .iter()
+                        .filter_map(|nested_item| match nested_item {
+                            SelectItem::Field { field, alias, .. } => {
+                                Some(alias.clone().unwrap_or_else(|| field.name.clone()))
+                            }
+                            SelectItem::Relation {
+                                relation, alias, ..
+                            } => Some(alias.clone().unwrap_or_else(|| relation.clone())),
+                            SelectItem::SpreadRelation { .. } => None,
+                        })
+                        .collect(),
+                )
+            };
+
+            // Group before projecting: the join column is what the grouping
+            // keys off, so removing it first would leave nothing to match on.
+            let mut grouped = postrust_core::embed::group_by_key(children, &plan.foreign_column);
+
+            if let Some(requested) = requested {
+                for group in grouped.values_mut() {
+                    for child in group.iter_mut() {
+                        if let Some(object) = child.as_object_mut() {
+                            object.retain(|key, _| requested.contains(key));
+                        }
+                    }
+                }
+            }
+            let field_name = alias.clone().unwrap_or_else(|| relation.clone());
+            for row in rows.iter_mut() {
+                postrust_core::embed::attach_to_parent(row, &field_name, &plan, &grouped);
+            }
+        }
+
+        Ok(())
+    })
 }
 
 /// Bind SqlParam values to a sqlx query.

@@ -475,6 +475,10 @@ pub enum SelectItem {
         alias: Option<Alias>,
         hint: Option<Hint>,
         join_type: Option<JoinType>,
+        /// Columns and further embeds selected on the related resource.
+        ///
+        /// Empty means every column, matching a bare `relation()`.
+        select: Vec<SelectItem>,
     },
     /// Spread a related resource's columns (horizontal embedding)
     SpreadRelation {
@@ -503,6 +507,7 @@ impl SelectItem {
             alias: None,
             hint: None,
             join_type: None,
+            select: Vec::new(),
         }
     }
 }
@@ -847,6 +852,11 @@ pub struct ApiRequest {
     pub top_level_range: Range,
     /// Ranges for embedded resources
     pub range_map: HashMap<String, Range>,
+    /// Server-configured ceiling on returned rows (`PGRST_MAX_ROWS`).
+    ///
+    /// Applied on top of whatever the request asked for, so a request with no
+    /// `limit` cannot pull an entire table into memory.
+    pub max_rows: Option<i64>,
     /// Whether schema was negotiated from Accept-Profile header
     pub negotiated_by_profile: bool,
     /// Raw HTTP method
@@ -872,6 +882,7 @@ impl Default for ApiRequest {
             columns: HashSet::new(),
             top_level_range: Range::default(),
             range_map: HashMap::new(),
+            max_rows: None,
             negotiated_by_profile: false,
             method: String::new(),
             path: String::new(),

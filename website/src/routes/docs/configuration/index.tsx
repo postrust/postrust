@@ -32,7 +32,7 @@ const configVars = [
   {
     category: "Limits",
     vars: [
-      { name: "PGRST_MAX_ROWS", required: false, default: "1000", desc: "Maximum rows returned" },
+      { name: "PGRST_MAX_ROWS", required: false, default: "unlimited", desc: "Maximum rows returned by one request; caps requests with no limit" },
       { name: "PGRST_MAX_BODY_SIZE", required: false, default: "10485760", desc: "Max request body in bytes" },
     ],
   },

@@ -6,6 +6,7 @@
 use crate::context::GraphQLContext;
 use crate::error::GraphQLError;
 use crate::schema::object::TableObjectType;
+use crate::schema::relationship::RelationshipField;
 use crate::schema::{build_schema, GeneratedSchema, MutationType, SchemaConfig};
 use crate::subscription::{
     generate_subscription_fields, NotifyBroker, SubscriptionField as SubField, TableChangePayload,
@@ -62,6 +63,7 @@ impl GraphQLState {
             } else {
                 None
             },
+            config.max_rows,
         )?;
 
         Ok(Self {
@@ -91,6 +93,7 @@ impl GraphQLState {
             } else {
                 None
             },
+            self.config.max_rows,
         )?;
         Ok(())
     }
@@ -194,17 +197,25 @@ fn build_dynamic_schema(
     generated: &GeneratedSchema,
     _schema_cache: &SchemaCache,
     subscription_fields: Option<&[SubField]>,
+    max_rows: Option<i64>,
 ) -> Result<Schema, GraphQLError> {
     // Create object types for each table
     let mut object_types: HashMap<String, Object> = HashMap::new();
 
     for (type_name, obj) in &generated.object_types {
-        let table_obj = create_object_type(obj);
+        let relationships = generated
+            .relationship_fields
+            .get(type_name)
+            .map(|r| r.as_slice())
+            .unwrap_or(&[]);
+        let table_obj = create_object_type(obj, relationships);
         object_types.insert(type_name.clone(), table_obj);
     }
 
-    // Create query type
-    let query = create_query_type(generated);
+    // Create query type. Resolvers need the relationship map to embed related
+    // rows, so it is shared into each closure.
+    let relationships = Arc::new(generated.relationship_fields.clone());
+    let query = create_query_type(generated, max_rows, Arc::clone(&relationships));
 
     // Create mutation type
     let mutation = if !generated.mutation_fields.is_empty() {
@@ -259,7 +270,7 @@ fn build_dynamic_schema(
 }
 
 /// Create an object type from a TableObjectType.
-fn create_object_type(obj: &TableObjectType) -> Object {
+fn create_object_type(obj: &TableObjectType, relationships: &[RelationshipField]) -> Object {
     let mut object = Object::new(&obj.name);
 
     if let Some(desc) = obj.description() {
@@ -299,25 +310,71 @@ fn create_object_type(obj: &TableObjectType) -> Object {
         object = object.field(gql_field);
     }
 
+    // Relationship fields. The query resolver embeds related rows into the
+    // parent JSON before returning it, so these read from the parent value the
+    // same way column fields do.
+    for rel in relationships {
+        let field_name = rel.name.clone();
+        let field_type = if rel.is_list {
+            TypeRef::named_nn_list_nn(&rel.target_type)
+        } else {
+            TypeRef::named(&rel.target_type)
+        };
+
+        let gql_field = Field::new(&rel.name, field_type, move |ctx| {
+            let field_name = field_name.clone();
+            FieldFuture::new(async move {
+                if let Some(Value::Object(map)) = ctx.parent_value.as_value() {
+                    let key = async_graphql::Name::new(&field_name);
+                    if let Some(val) = map.get(&key) {
+                        return Ok(Some(FieldValue::value(val.clone())));
+                    }
+                }
+                Ok(None)
+            })
+        });
+
+        let gql_field = if let Some(desc) = &rel.description {
+            gql_field.description(desc)
+        } else {
+            gql_field
+        };
+
+        object = object.field(gql_field);
+    }
+
     object
 }
 
 /// Create the Query type with all table query fields.
-fn create_query_type(generated: &GeneratedSchema) -> Object {
+fn create_query_type(
+    generated: &GeneratedSchema,
+    max_rows: Option<i64>,
+    relationships: Arc<HashMap<String, Vec<RelationshipField>>>,
+) -> Object {
     let mut query = Object::new("Query");
 
     for field in &generated.query_fields {
         let table_name = field.table_name.clone();
+        let schema_name = field.schema_name.clone();
         let type_name = field.type_name.clone();
         let is_by_pk = field.is_by_pk;
+        let pk_columns = field.pk_columns.clone();
         let return_type = graphql_type_ref(&field.return_type);
 
+        let spec = Arc::new(QueryFieldSpec {
+            schema_name,
+            table_name,
+            type_name,
+            is_by_pk,
+            pk_columns: pk_columns.clone(),
+            max_rows,
+            relationships: Arc::clone(&relationships),
+        });
+
         let mut gql_field = Field::new(&field.name, return_type, move |ctx| {
-            let table_name = table_name.clone();
-            let type_name = type_name.clone();
-            FieldFuture::new(
-                async move { resolve_query(&ctx, &table_name, &type_name, is_by_pk).await },
-            )
+            let spec = Arc::clone(&spec);
+            FieldFuture::new(async move { resolve_query(&ctx, &spec).await })
         });
 
         // Add standard query arguments
@@ -328,8 +385,14 @@ fn create_query_type(generated: &GeneratedSchema) -> Object {
                 .argument(InputValue::new("limit", TypeRef::named("Int")))
                 .argument(InputValue::new("offset", TypeRef::named("Int")));
         } else {
-            // Add PK arguments
-            gql_field = gql_field.argument(InputValue::new("id", TypeRef::named_nn("Int")));
+            // One required argument per primary key column, named and typed
+            // after the column itself rather than assuming an integer `id`.
+            for (col_name, pg_type) in &pk_columns {
+                gql_field = gql_field.argument(InputValue::new(
+                    col_name,
+                    TypeRef::named_nn(pk_argument_type(pg_type)),
+                ));
+            }
         }
 
         if let Some(desc) = &field.description {
@@ -358,28 +421,54 @@ fn create_mutation_type(generated: &GeneratedSchema) -> Object {
 
     for field in &generated.mutation_fields {
         let table_name = field.table_name.clone();
+        let schema_name = field.schema_name.clone();
         let mutation_type = field.mutation_type;
+        let pk_columns = field.pk_columns.clone();
         let return_type = graphql_type_ref(&field.return_type);
 
+        let resolver_pk_columns = pk_columns.clone();
         let mut gql_field = Field::new(&field.name, return_type, move |ctx| {
             let table_name = table_name.clone();
-            FieldFuture::new(
-                async move { resolve_mutation(&ctx, &table_name, mutation_type).await },
-            )
+            let schema_name = schema_name.clone();
+            let pk_columns = resolver_pk_columns.clone();
+            FieldFuture::new(async move {
+                resolve_mutation(&ctx, &schema_name, &table_name, mutation_type, &pk_columns).await
+            })
         });
 
-        // Add mutation-specific arguments
+        // Add mutation-specific arguments.
+        //
+        // A by-PK mutation takes the key columns rather than a `where` object:
+        // it is meant to address exactly one row, and accepting `where` made it
+        // an ordinary bulk mutation that happened to return the first result.
         match mutation_type {
             MutationType::Insert | MutationType::InsertOne => {
                 gql_field =
                     gql_field.argument(InputValue::new("objects", TypeRef::named_nn_list("JSON")));
             }
-            MutationType::Update | MutationType::UpdateByPk => {
+            MutationType::UpdateByPk => {
+                gql_field = gql_field.argument(InputValue::new("set", TypeRef::named_nn("JSON")));
+                for (col_name, pg_type) in &pk_columns {
+                    gql_field = gql_field.argument(InputValue::new(
+                        col_name,
+                        TypeRef::named_nn(pk_argument_type(pg_type)),
+                    ));
+                }
+            }
+            MutationType::Update => {
                 gql_field = gql_field
                     .argument(InputValue::new("where", TypeRef::named("JSON")))
                     .argument(InputValue::new("set", TypeRef::named_nn("JSON")));
             }
-            MutationType::Delete | MutationType::DeleteByPk => {
+            MutationType::DeleteByPk => {
+                for (col_name, pg_type) in &pk_columns {
+                    gql_field = gql_field.argument(InputValue::new(
+                        col_name,
+                        TypeRef::named_nn(pk_argument_type(pg_type)),
+                    ));
+                }
+            }
+            MutationType::Delete => {
                 gql_field = gql_field.argument(InputValue::new("where", TypeRef::named("JSON")));
             }
         }
@@ -449,39 +538,157 @@ fn create_subscription_type(fields: &[SubField]) -> Subscription {
     subscription
 }
 
+/// Everything a query field's resolver needs about the field it serves.
+struct QueryFieldSpec {
+    schema_name: String,
+    table_name: String,
+    type_name: String,
+    is_by_pk: bool,
+    pk_columns: Vec<(String, String)>,
+    max_rows: Option<i64>,
+    relationships: Arc<HashMap<String, Vec<RelationshipField>>>,
+}
+
 /// Resolve a query field.
 async fn resolve_query<'a>(
     ctx: &ResolverContext<'a>,
-    table_name: &str,
-    _type_name: &str,
-    is_by_pk: bool,
+    spec: &QueryFieldSpec,
 ) -> Result<Option<FieldValue<'a>>, async_graphql::Error> {
+    let schema_name = spec.schema_name.as_str();
+    let table_name = spec.table_name.as_str();
+    let type_name = spec.type_name.as_str();
+    let is_by_pk = spec.is_by_pk;
+    let pk_columns = spec.pk_columns.as_slice();
+    let max_rows = spec.max_rows;
+    let relationships = spec.relationships.as_ref();
+
     let pool = ctx.data::<PgPool>()?;
     let gql_ctx = ctx.data::<GraphQLContext>()?;
 
     debug!("Resolving query for table: {}", table_name);
 
     // Extract pagination arguments
-    let limit: Option<i64> = ctx.args.try_get("limit").ok().and_then(|v| v.i64().ok());
+    let requested_limit: Option<i64> = ctx.args.try_get("limit").ok().and_then(|v| v.i64().ok());
 
     let offset: Option<i64> = ctx.args.try_get("offset").ok().and_then(|v| v.i64().ok());
 
-    // Build simple query
-    let mut sql = format!(
-        "SELECT row_to_json(t) FROM (SELECT * FROM public.{}) t",
-        table_name
+    // A query that names no limit would otherwise select the whole table, so
+    // the configured ceiling is applied as the limit in that case, and as an
+    // upper bound when the query asks for more than it. A by-PK query resolves
+    // to at most one row.
+    let limit: Option<i64> = if is_by_pk {
+        Some(1)
+    } else {
+        match (requested_limit, max_rows) {
+            (Some(requested), Some(ceiling)) => Some(requested.min(ceiling)),
+            (Some(requested), None) => Some(requested),
+            (None, ceiling) => ceiling,
+        }
+    };
+
+    // Build the WHERE clause.
+    //
+    // A by-PK query filters on the table's key columns; each value is bound as
+    // a parameter and cast to the column's type, since GraphQL scalars and
+    // PostgreSQL types do not line up (a `uuid` key arrives as a String). A
+    // list query filters on the `filter` argument, which takes the same shape
+    // as a mutation's `where`.
+    let mut where_sql = String::new();
+    let mut bound_values: Vec<serde_json::Value> = Vec::new();
+
+    if is_by_pk {
+        if pk_columns.is_empty() {
+            return Err(async_graphql::Error::new(format!(
+                "\"{}\" has no primary key, so it cannot be queried by key",
+                table_name
+            )));
+        }
+
+        let mut conditions = Vec::with_capacity(pk_columns.len());
+        for (idx, (col_name, pg_type)) in pk_columns.iter().enumerate() {
+            let value = ctx.args.try_get(col_name).map_err(|_| {
+                async_graphql::Error::new(format!(
+                    "missing required primary key argument \"{}\"",
+                    col_name
+                ))
+            })?;
+
+            conditions.push(format!(
+                "{} = ${}::{}",
+                postrust_sql::escape_ident(col_name),
+                idx + 1,
+                pg_type
+            ));
+            bound_values.push(accessor_to_json(&value));
+        }
+        where_sql = format!(" WHERE {}", conditions.join(" AND "));
+    } else if let Some(filter) = ctx
+        .args
+        .try_get("filter")
+        .ok()
+        .map(|v| accessor_to_json(&v))
+    {
+        let (filter_sql, filter_values) = build_where_clause(Some(&filter), 1)?;
+        if !filter_sql.is_empty() {
+            where_sql = format!(" {}", filter_sql);
+            bound_values = filter_values;
+        }
+    }
+
+    // Build the ORDER BY clause from the `orderBy` argument. Entries are
+    // `column`, `column.asc` or `column.desc`; the column is validated against
+    // the table so an unknown or crafted name cannot reach the SQL.
+    let order_sql = if is_by_pk {
+        String::new()
+    } else {
+        build_order_by_clause(ctx, &gql_ctx.schema_cache, schema_name, table_name).await?
+    };
+
+    // ORDER BY, LIMIT and OFFSET belong inside the subquery: applying them to
+    // the outer `row_to_json` projection would leave the ordering of the rows
+    // that survive the limit unspecified.
+    let mut inner = format!(
+        "SELECT * FROM {}.{}{}{}",
+        postrust_sql::escape_ident(schema_name),
+        postrust_sql::escape_ident(table_name),
+        where_sql,
+        order_sql
     );
 
     if let Some(limit) = limit {
-        sql.push_str(&format!(" LIMIT {}", limit));
+        inner.push_str(&format!(" LIMIT {}", limit));
     }
 
     if let Some(offset) = offset {
-        sql.push_str(&format!(" OFFSET {}", offset));
+        inner.push_str(&format!(" OFFSET {}", offset));
     }
 
+    let sql = format!("SELECT row_to_json(t) FROM ({}) t", inner);
+
     // Execute query - returns Vec<serde_json::Value>
-    let result = execute_query(pool, &sql, gql_ctx.role()).await?;
+    let mut result = execute_query(pool, &sql, gql_ctx.role(), &bound_values).await?;
+
+    // Embed any related resources the selection asked for.
+    {
+        let guard = gql_ctx
+            .schema_cache
+            .get()
+            .await
+            .map_err(|e| async_graphql::Error::new(e.to_string()))?;
+        let cache = guard
+            .as_ref()
+            .ok_or_else(|| async_graphql::Error::new("schema cache is not loaded"))?;
+
+        let embed_ctx = EmbedContext {
+            pool,
+            role: gql_ctx.role(),
+            schema_cache: cache,
+            relationships,
+            max_rows,
+        };
+
+        embed_relationships(&embed_ctx, type_name, ctx.field(), &mut result).await?;
+    }
 
     if is_by_pk {
         // Return single item as Value::Object
@@ -503,8 +710,10 @@ async fn resolve_query<'a>(
 /// Resolve a mutation field.
 async fn resolve_mutation<'a>(
     ctx: &ResolverContext<'a>,
+    schema_name: &str,
     table_name: &str,
     mutation_type: MutationType,
+    pk_columns: &[(String, String)],
 ) -> Result<Option<FieldValue<'a>>, async_graphql::Error> {
     let pool = ctx.data::<PgPool>()?;
     let gql_ctx = ctx.data::<GraphQLContext>()?;
@@ -523,7 +732,15 @@ async fn resolve_mutation<'a>(
                 .map(|v| accessor_to_json(&v))
                 .unwrap_or_else(|| serde_json::Value::Array(vec![]));
 
-            execute_insert(pool, table_name, gql_ctx.role(), objects, mutation_type).await?
+            execute_insert(
+                pool,
+                schema_name,
+                table_name,
+                gql_ctx.role(),
+                objects,
+                mutation_type,
+            )
+            .await?
         }
         MutationType::Update | MutationType::UpdateByPk => {
             let set_value = ctx
@@ -533,10 +750,15 @@ async fn resolve_mutation<'a>(
                 .map(|v| accessor_to_json(&v))
                 .unwrap_or_else(|| serde_json::json!({}));
 
-            let where_clause = ctx.args.try_get("where").ok().map(|v| accessor_to_json(&v));
+            let where_clause = if mutation_type == MutationType::UpdateByPk {
+                Some(pk_where_from_args(ctx, table_name, pk_columns)?)
+            } else {
+                ctx.args.try_get("where").ok().map(|v| accessor_to_json(&v))
+            };
 
             execute_update(
                 pool,
+                schema_name,
                 table_name,
                 gql_ctx.role(),
                 set_value,
@@ -546,10 +768,15 @@ async fn resolve_mutation<'a>(
             .await?
         }
         MutationType::Delete | MutationType::DeleteByPk => {
-            let where_clause = ctx.args.try_get("where").ok().map(|v| accessor_to_json(&v));
+            let where_clause = if mutation_type == MutationType::DeleteByPk {
+                Some(pk_where_from_args(ctx, table_name, pk_columns)?)
+            } else {
+                ctx.args.try_get("where").ok().map(|v| accessor_to_json(&v))
+            };
 
             execute_delete(
                 pool,
+                schema_name,
                 table_name,
                 gql_ctx.role(),
                 where_clause,
@@ -568,6 +795,7 @@ async fn execute_query(
     pool: &PgPool,
     sql: &str,
     role: &str,
+    params: &[serde_json::Value],
 ) -> Result<Vec<serde_json::Value>, async_graphql::Error> {
     use sqlx::Row;
 
@@ -584,12 +812,16 @@ async fn execute_query(
     .await?;
 
     // Execute query
-    let rows = sqlx::query(sql).fetch_all(&mut *conn).await?;
+    let mut query = sqlx::query(sql);
+    for param in params {
+        query = bind_json_value(query, param);
+    }
+    let rows = query.fetch_all(&mut *conn).await?;
 
     // Return raw JSON values - don't convert to async_graphql::Value
     // This allows field resolvers to use try_downcast_ref::<serde_json::Value>()
     let results: Vec<serde_json::Value> = rows
-        .iter()
+        .into_iter()
         .filter_map(|row| row.try_get::<serde_json::Value, _>(0).ok())
         .collect();
 
@@ -599,6 +831,7 @@ async fn execute_query(
 /// Execute an insert mutation.
 async fn execute_insert<'a>(
     pool: &PgPool,
+    schema_name: &str,
     table_name: &str,
     role: &str,
     objects: serde_json::Value,
@@ -643,7 +876,8 @@ async fn execute_insert<'a>(
                 (1..=columns.len()).map(|i| format!("${}", i)).collect();
 
             let sql = format!(
-                "INSERT INTO public.{} ({}) VALUES ({}) RETURNING row_to_json(public.{}.*)",
+                "INSERT INTO {}.{} ({}) VALUES ({}) RETURNING row_to_json({}.{}.*)",
+                postrust_sql::escape_ident(schema_name),
                 postrust_sql::escape_ident(table_name),
                 columns
                     .iter()
@@ -651,6 +885,7 @@ async fn execute_insert<'a>(
                     .collect::<Vec<_>>()
                     .join(", "),
                 placeholders.join(", "),
+                postrust_sql::escape_ident(schema_name),
                 postrust_sql::escape_ident(table_name)
             );
 
@@ -709,6 +944,7 @@ fn bind_json_value<'q>(
 /// Execute an update mutation.
 async fn execute_update<'a>(
     pool: &PgPool,
+    schema_name: &str,
     table_name: &str,
     role: &str,
     set_value: serde_json::Value,
@@ -753,11 +989,23 @@ async fn execute_update<'a>(
     // Build WHERE clause
     let (where_sql, where_values) = build_where_clause(where_clause.as_ref(), param_idx)?;
 
+    // An absent or unrecognised `where` argument yields an empty clause, which
+    // would update every row in the table. Refuse instead.
+    if where_sql.is_empty() {
+        return Err(async_graphql::Error::new(format!(
+            "update on \"{}\" requires a `where` argument with at least one \
+             recognised condition; refusing to update every row",
+            table_name
+        )));
+    }
+
     let sql = format!(
-        "UPDATE public.{} SET {} {} RETURNING row_to_json(public.{}.*)",
+        "UPDATE {}.{} SET {} {} RETURNING row_to_json({}.{}.*)",
+        postrust_sql::escape_ident(schema_name),
         postrust_sql::escape_ident(table_name),
         set_parts.join(", "),
         where_sql,
+        postrust_sql::escape_ident(schema_name),
         postrust_sql::escape_ident(table_name)
     );
 
@@ -794,6 +1042,7 @@ async fn execute_update<'a>(
 /// Execute a delete mutation.
 async fn execute_delete<'a>(
     pool: &PgPool,
+    schema_name: &str,
     table_name: &str,
     role: &str,
     where_clause: Option<serde_json::Value>,
@@ -816,10 +1065,22 @@ async fn execute_delete<'a>(
     // Build WHERE clause
     let (where_sql, where_values) = build_where_clause(where_clause.as_ref(), 1)?;
 
+    // An absent or unrecognised `where` argument yields an empty clause, which
+    // would delete every row in the table. Refuse instead.
+    if where_sql.is_empty() {
+        return Err(async_graphql::Error::new(format!(
+            "delete on \"{}\" requires a `where` argument with at least one \
+             recognised condition; refusing to delete every row",
+            table_name
+        )));
+    }
+
     let sql = format!(
-        "DELETE FROM public.{} {} RETURNING row_to_json(public.{}.*)",
+        "DELETE FROM {}.{} {} RETURNING row_to_json({}.{}.*)",
+        postrust_sql::escape_ident(schema_name),
         postrust_sql::escape_ident(table_name),
         where_sql,
+        postrust_sql::escape_ident(schema_name),
         postrust_sql::escape_ident(table_name)
     );
 
@@ -859,61 +1120,82 @@ fn build_where_clause(
 
     if let Some(serde_json::Value::Object(map)) = where_value {
         for (key, val) in map {
+            let column = postrust_sql::escape_ident(key);
+
             match val {
                 serde_json::Value::Object(op_map) => {
-                    // Handle operators like {eq: value}, {gt: value}, etc.
                     for (op, op_val) in op_map {
-                        let condition = match op.as_str() {
-                            "eq" | "_eq" => {
-                                format!("{} = ${}", postrust_sql::escape_ident(key), param_idx)
-                            }
-                            "neq" | "_neq" => {
-                                format!("{} != ${}", postrust_sql::escape_ident(key), param_idx)
-                            }
-                            "gt" | "_gt" => {
-                                format!("{} > ${}", postrust_sql::escape_ident(key), param_idx)
-                            }
-                            "gte" | "_gte" => {
-                                format!("{} >= ${}", postrust_sql::escape_ident(key), param_idx)
-                            }
-                            "lt" | "_lt" => {
-                                format!("{} < ${}", postrust_sql::escape_ident(key), param_idx)
-                            }
-                            "lte" | "_lte" => {
-                                format!("{} <= ${}", postrust_sql::escape_ident(key), param_idx)
-                            }
-                            "like" | "_like" => {
-                                format!("{} LIKE ${}", postrust_sql::escape_ident(key), param_idx)
-                            }
-                            "ilike" | "_ilike" => {
-                                format!("{} ILIKE ${}", postrust_sql::escape_ident(key), param_idx)
-                            }
-                            "is_null" | "_is_null" => {
-                                if op_val.as_bool().unwrap_or(false) {
-                                    format!("{} IS NULL", postrust_sql::escape_ident(key))
-                                } else {
-                                    format!("{} IS NOT NULL", postrust_sql::escape_ident(key))
-                                }
-                            }
-                            _ => continue,
+                        // Binary comparisons all bind exactly one parameter.
+                        let binary_operator = match op.as_str() {
+                            "eq" | "_eq" => Some("="),
+                            "neq" | "_neq" => Some("!="),
+                            "gt" | "_gt" => Some(">"),
+                            "gte" | "_gte" => Some(">="),
+                            "lt" | "_lt" => Some("<"),
+                            "lte" | "_lte" => Some("<="),
+                            "like" | "_like" => Some("LIKE"),
+                            "ilike" | "_ilike" => Some("ILIKE"),
+                            _ => None,
                         };
 
-                        if !op.contains("is_null") {
-                            conditions.push(condition);
+                        if let Some(sql_operator) = binary_operator {
+                            conditions.push(format!("{} {} ${}", column, sql_operator, param_idx));
                             values.push(op_val.clone());
                             param_idx += 1;
-                        } else {
-                            conditions.push(condition);
+                            continue;
+                        }
+
+                        match op.as_str() {
+                            "is_null" | "_is_null" | "isNull" => {
+                                if op_val.as_bool().unwrap_or(false) {
+                                    conditions.push(format!("{} IS NULL", column));
+                                } else {
+                                    conditions.push(format!("{} IS NOT NULL", column));
+                                }
+                            }
+                            "in" | "_in" => {
+                                let items = op_val.as_array().ok_or_else(|| {
+                                    async_graphql::Error::new(format!(
+                                        "the `in` filter on \"{}\" requires a list of values",
+                                        key
+                                    ))
+                                })?;
+
+                                if items.is_empty() {
+                                    // `IN ()` is not valid SQL, and an empty set
+                                    // matches nothing.
+                                    conditions.push("false".to_string());
+                                    continue;
+                                }
+
+                                let mut placeholders = Vec::with_capacity(items.len());
+                                for item in items {
+                                    placeholders.push(format!("${}", param_idx));
+                                    values.push(item.clone());
+                                    param_idx += 1;
+                                }
+                                conditions.push(format!(
+                                    "{} IN ({})",
+                                    column,
+                                    placeholders.join(", ")
+                                ));
+                            }
+                            other => {
+                                // Dropping an unrecognised operator would widen
+                                // the result set -- returning every row for a
+                                // query, or matching every row for a mutation.
+                                // Fail loudly instead.
+                                return Err(async_graphql::Error::new(format!(
+                                    "unsupported filter operator \"{}\" on \"{}\"",
+                                    other, key
+                                )));
+                            }
                         }
                     }
                 }
                 _ => {
                     // Direct equality: {field: value}
-                    conditions.push(format!(
-                        "{} = ${}",
-                        postrust_sql::escape_ident(key),
-                        param_idx
-                    ));
+                    conditions.push(format!("{} = ${}", column, param_idx));
                     values.push(val.clone());
                     param_idx += 1;
                 }
@@ -928,6 +1210,217 @@ fn build_where_clause(
     };
 
     Ok((where_sql, values))
+}
+
+/// Build an `ORDER BY` clause from the `orderBy` argument.
+///
+/// Entries are `column`, `column.asc` or `column.desc`. Column names are
+/// checked against the table in the schema cache and then quoted, so a name
+/// that is unknown -- or crafted to inject SQL -- is rejected rather than
+/// interpolated. Returns an empty string when no ordering was requested.
+async fn build_order_by_clause(
+    ctx: &ResolverContext<'_>,
+    schema_cache: &postrust_core::schema_cache::SchemaCacheRef,
+    schema_name: &str,
+    table_name: &str,
+) -> Result<String, async_graphql::Error> {
+    let Ok(order_arg) = ctx.args.try_get("orderBy") else {
+        return Ok(String::new());
+    };
+
+    let entries = match order_arg.list() {
+        Ok(list) => list
+            .iter()
+            .map(|item| item.string().map(|s| s.to_string()))
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|_| async_graphql::Error::new("orderBy entries must be strings"))?,
+        // A bare string is accepted as a single-column ordering.
+        Err(_) => match order_arg.string() {
+            Ok(single) => vec![single.to_string()],
+            Err(_) => {
+                return Err(async_graphql::Error::new(
+                    "orderBy must be a string or a list of strings",
+                ))
+            }
+        },
+    };
+
+    if entries.is_empty() {
+        return Ok(String::new());
+    }
+
+    let guard = schema_cache
+        .get()
+        .await
+        .map_err(|e| async_graphql::Error::new(e.to_string()))?;
+    let cache = guard
+        .as_ref()
+        .ok_or_else(|| async_graphql::Error::new("schema cache is not loaded"))?;
+    let qi = postrust_core::api_request::QualifiedIdentifier::new(schema_name, table_name);
+    let table = cache
+        .get_table(&qi)
+        .ok_or_else(|| async_graphql::Error::new(format!("unknown table \"{}\"", table_name)))?;
+
+    let mut terms = Vec::with_capacity(entries.len());
+    for entry in entries {
+        let (column, direction) = match entry.split_once('.') {
+            Some((column, direction)) => (column, Some(direction)),
+            None => (entry.as_str(), None),
+        };
+
+        if table.get_column(column).is_none() {
+            return Err(async_graphql::Error::new(format!(
+                "cannot order by unknown column \"{}\" on \"{}\"",
+                column, table_name
+            )));
+        }
+
+        let direction_sql = match direction.map(|d| d.to_ascii_lowercase()) {
+            None => "",
+            Some(d) if d == "asc" => " ASC",
+            Some(d) if d == "desc" => " DESC",
+            Some(other) => {
+                return Err(async_graphql::Error::new(format!(
+                    "invalid order direction \"{}\"; expected \"asc\" or \"desc\"",
+                    other
+                )))
+            }
+        };
+
+        terms.push(format!(
+            "{}{}",
+            postrust_sql::escape_ident(column),
+            direction_sql
+        ));
+    }
+
+    Ok(format!(" ORDER BY {}", terms.join(", ")))
+}
+
+/// What embedding a relationship needs, independent of the rows involved.
+struct EmbedContext<'c> {
+    pool: &'c PgPool,
+    role: &'c str,
+    schema_cache: &'c SchemaCache,
+    relationships: &'c HashMap<String, Vec<RelationshipField>>,
+    max_rows: Option<i64>,
+}
+
+/// Embed the relationship fields requested on `rows`.
+///
+/// One query per relationship per level, not one per row: the parents' join
+/// keys are collected and passed as a single array. Recurses so a nested
+/// selection costs one further query per relationship at each depth.
+fn embed_relationships<'f>(
+    ctx: &'f EmbedContext<'f>,
+    type_name: &'f str,
+    selection: async_graphql::SelectionField<'f>,
+    rows: &'f mut [serde_json::Value],
+) -> futures::future::BoxFuture<'f, Result<(), async_graphql::Error>> {
+    Box::pin(async move {
+        if rows.is_empty() {
+            return Ok(());
+        }
+
+        let Some(available) = ctx.relationships.get(type_name) else {
+            return Ok(());
+        };
+
+        for requested in selection.selection_set() {
+            let Some(rel) = available.iter().find(|r| r.name == requested.name()) else {
+                continue;
+            };
+
+            let plan =
+                postrust_core::embed::EmbedPlan::resolve(&rel.relationship, ctx.schema_cache)
+                    .map_err(|e| async_graphql::Error::new(e.to_string()))?;
+
+            let keys = postrust_core::embed::parent_keys(rows, &plan.local_column);
+
+            let mut children: Vec<serde_json::Value> = if keys.is_empty() {
+                Vec::new()
+            } else {
+                let sql = plan
+                    .children_sql(ctx.max_rows)
+                    .map_err(|e| async_graphql::Error::new(e.to_string()))?;
+
+                let mut conn = ctx.pool.acquire().await?;
+                sqlx::query(&format!(
+                    "SET LOCAL ROLE {}",
+                    postrust_sql::escape_ident(ctx.role)
+                ))
+                .execute(&mut *conn)
+                .await?;
+
+                let fetched = sqlx::query(&sql).bind(&keys).fetch_all(&mut *conn).await?;
+
+                use sqlx::Row;
+                fetched
+                    .into_iter()
+                    .filter_map(|row| row.try_get::<serde_json::Value, _>(0).ok())
+                    .collect()
+            };
+
+            // Recurse before attaching, so nested embeds land in the values
+            // that get copied onto the parents.
+            embed_relationships(ctx, &rel.target_type, requested, &mut children).await?;
+
+            let grouped = postrust_core::embed::group_by_key(children, &plan.foreign_column);
+            for row in rows.iter_mut() {
+                postrust_core::embed::attach_to_parent(row, &rel.name, &plan, &grouped);
+            }
+        }
+
+        Ok(())
+    })
+}
+
+/// Build a `where` document that addresses exactly one row by primary key.
+///
+/// Used by the by-PK mutations, which take the key columns as arguments instead
+/// of a free-form `where`.
+fn pk_where_from_args(
+    ctx: &ResolverContext<'_>,
+    table_name: &str,
+    pk_columns: &[(String, String)],
+) -> Result<serde_json::Value, async_graphql::Error> {
+    if pk_columns.is_empty() {
+        return Err(async_graphql::Error::new(format!(
+            "\"{}\" has no primary key, so it cannot be mutated by key",
+            table_name
+        )));
+    }
+
+    let mut conditions = serde_json::Map::new();
+    for (col_name, _) in pk_columns {
+        let value = ctx.args.try_get(col_name).map_err(|_| {
+            async_graphql::Error::new(format!(
+                "missing required primary key argument \"{}\"",
+                col_name
+            ))
+        })?;
+        conditions.insert(
+            col_name.clone(),
+            serde_json::json!({ "eq": accessor_to_json(&value) }),
+        );
+    }
+
+    Ok(serde_json::Value::Object(conditions))
+}
+
+/// GraphQL scalar name to use for a primary key argument of the given
+/// PostgreSQL type.
+///
+/// Falls back to `String` for anything that does not map to a plain scalar --
+/// a composite or array key cannot be expressed as a single named argument, and
+/// the value is cast to the column's type in SQL anyway.
+fn pk_argument_type(pg_type: &str) -> String {
+    let rendered = crate::types::pg_type_to_graphql(pg_type).to_string();
+    if rendered.starts_with('[') {
+        "String".to_string()
+    } else {
+        rendered
+    }
 }
 
 /// Convert a GraphQL type string to a TypeRef.
@@ -1095,6 +1588,14 @@ fn create_time_scalar() -> Scalar {
 }
 
 /// Register filter input types.
+///
+/// These are currently unreachable: the `filter` and `where` arguments are
+/// declared as the `JSON` scalar, so no field references these input objects
+/// and async-graphql prunes them from the published schema (introspecting
+/// `IntFilterInput` returns null). They are kept as the shape to move to if
+/// filters become typed per column; until then the operators a filter actually
+/// supports are the ones `build_where_clause` implements, and it rejects
+/// anything else rather than ignoring it.
 fn register_filter_input_types(builder: SchemaBuilder) -> SchemaBuilder {
     let string_filter = InputObject::new("StringFilterInput")
         .field(InputValue::new("eq", TypeRef::named("String")))
@@ -1305,7 +1806,7 @@ mod tests {
         let config = SchemaConfig::default();
         let generated = build_schema(&cache, &config);
 
-        let result = build_dynamic_schema(&generated, &cache, None);
+        let result = build_dynamic_schema(&generated, &cache, None, None);
         if let Err(ref e) = result {
             eprintln!("Schema build error: {:?}", e);
         }
@@ -1316,7 +1817,7 @@ mod tests {
     fn test_create_object_type() {
         let table = create_test_table("users");
         let obj = TableObjectType::from_table(&table);
-        let _gql_obj = create_object_type(&obj);
+        let _gql_obj = create_object_type(&obj, &[]);
     }
 
     #[test]
@@ -1325,7 +1826,7 @@ mod tests {
         let config = SchemaConfig::default();
         let generated = build_schema(&cache, &config);
 
-        let _query = create_query_type(&generated);
+        let _query = create_query_type(&generated, None, Arc::new(HashMap::new()));
     }
 
     #[test]
@@ -1391,7 +1892,7 @@ mod tests {
         assert!(!sub_fields.is_empty(), "Should have subscription fields");
 
         // Build schema with subscriptions
-        let result = build_dynamic_schema(&generated, &cache, Some(&sub_fields));
+        let result = build_dynamic_schema(&generated, &cache, Some(&sub_fields), None);
         assert!(result.is_ok(), "Schema with subscriptions should build");
     }
 

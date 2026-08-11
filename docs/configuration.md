@@ -160,7 +160,7 @@ RUST_LOG="postrust=debug,sqlx=info"
 
 | Variable | Description | Default |
 |----------|-------------|---------|
-| `PGRST_MAX_ROWS` | Maximum rows returned | `1000` |
+| `PGRST_MAX_ROWS` | Maximum rows returned by a single request. Caps requests that specify no `limit`, and bounds larger ones. Alias: `PGRST_DB_MAX_ROWS` | unset (unlimited) |
 | `PGRST_MAX_BODY_SIZE` | Maximum request body (bytes) | `10485760` |
 
 ## Example Configurations

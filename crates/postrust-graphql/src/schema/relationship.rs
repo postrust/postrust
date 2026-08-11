@@ -31,19 +31,27 @@ pub struct RelationshipField {
 impl RelationshipField {
     /// Create a GraphQL field from a database relationship.
     pub fn from_relationship(rel: &Relationship) -> Self {
-        let foreign_table = rel.foreign_table();
+        let base_name = rel.foreign_table().name.clone();
+        Self::from_relationship_named(rel, &base_name)
+    }
+
+    /// Create a GraphQL field using an explicit base name for the target.
+    ///
+    /// The base name must match the one the target table's object type was
+    /// generated with, otherwise the field would reference a type that was
+    /// never registered.
+    pub fn from_relationship_named(rel: &Relationship, target_base_name: &str) -> Self {
         let is_list = !rel.is_to_one();
 
-        // Generate field name from foreign table
+        // Generate field name from the target's base name, so a relationship
+        // into a non-default schema is named consistently with its type.
         let name = if is_list {
-            // Plural for lists (simple pluralization)
-            pluralize(&foreign_table.name)
+            pluralize(target_base_name)
         } else {
-            // Singular for single objects
-            singularize(&foreign_table.name)
+            singularize(target_base_name)
         };
 
-        let target_type = to_pascal_case(&foreign_table.name);
+        let target_type = to_pascal_case(target_base_name);
 
         let description = Some(format!(
             "Related {} via {}",

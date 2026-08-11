@@ -145,7 +145,10 @@ fn build_select_fields(items: &[SelectItem], table: &Table) -> Result<Vec<Coerci
 /// Resolve the effective top-level range.
 ///
 /// The `Range` header supplies the base range; the `limit` and `offset` query
-/// parameters take precedence over it when present, matching PostgREST.
+/// parameters take precedence over it when present, matching PostgREST. The
+/// server-configured `max_rows` is then applied as a ceiling, so a request that
+/// asks for no limit -- or for more rows than the server permits -- cannot pull
+/// an unbounded result set into memory.
 fn resolve_top_level_range(request: &ApiRequest) -> Range {
     let mut range = request.top_level_range.clone();
 
@@ -156,6 +159,13 @@ fn resolve_top_level_range(request: &ApiRequest) -> Range {
         if from_params.offset != 0 {
             range.offset = from_params.offset;
         }
+    }
+
+    if let Some(max_rows) = request.max_rows {
+        range.limit = Some(match range.limit {
+            Some(requested) => requested.min(max_rows),
+            None => max_rows,
+        });
     }
 
     range
@@ -233,6 +243,7 @@ fn build_relation_selects(
                 alias,
                 hint: _,
                 join_type,
+                select: _,
             } => {
                 // Verify relationship exists
                 let _rel = schema_cache
