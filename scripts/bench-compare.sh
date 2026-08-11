@@ -99,7 +99,16 @@ PORT_POSTGRAPHILE="${PORT_POSTGRAPHILE:-3994}"
 
 REQUESTS="${REQUESTS:-3000}"
 CONCURRENCY="${CONCURRENCY:-50}"
-WARMUP="${WARMUP:-200}"
+# Requests issued against every target before anything is measured. This is a
+# real number of requests, not a token few: a cold connection pool, an unplanned
+# statement and an empty buffer cache all show up as a slow first scenario
+# otherwise.
+WARMUP="${WARMUP:-500}"
+
+# Each measurement is repeated and the median taken. A single run cannot tell a
+# 20% change from the noise of a laptop, which is enough to draw a wrong
+# conclusion from.
+REPEATS="${REPEATS:-3}"
 
 KEEP="${KEEP:-0}"
 SKIP_BUILD="${SKIP_BUILD:-0}"
@@ -343,6 +352,18 @@ log "loading fixtures (100k items, 300k reviews)..."
 docker exec -i "$PG_CONTAINER" psql -q -v ON_ERROR_STOP=1 -U postgres -d "$PG_DB" \
     < "$REPO_ROOT/scripts/bench-fixtures.sql" >/dev/null
 
+# Pull both tables and their indexes into the buffer cache before any tool is
+# measured. Without this the first target to run each scenario pays to populate
+# the cache and every later one reads it warm, which is a difference between
+# tools that has nothing to do with the tools.
+log "warming the database cache..."
+docker exec "$PG_CONTAINER" psql -q -U postgres -d "$PG_DB" -c "
+    SELECT count(*) FROM public.bench_items;
+    SELECT count(*) FROM public.bench_reviews;
+    SELECT count(*) FROM public.bench_items WHERE category = 'cat-5';
+    SELECT count(*) FROM public.bench_reviews WHERE item_id < 1000;
+" >/dev/null 2>&1 || warn "database cache warm-up query failed"
+
 if wants hasura; then
     # Hasura writes its own catalog into whatever database it is pointed at.
     # Giving it a separate metadata database keeps hdb_catalog out of the
@@ -488,11 +509,43 @@ record() {
     printf '%s\t%s\t%s\t%s\t%s\n' "$1" "$2" "$3" "$4" "$5" >> "$RESULTS_TSV"
 }
 
+# Run one measurement REPEATS times and print the median by throughput.
+#
+# The median rather than the best: a best-of-N flatters whichever tool got the
+# quietest moment on the machine.
+measure_median() {
+    local url="$1" header="$2" body="${3:-}"
+    local results=() line
+    local i
+
+    for ((i = 0; i < REPEATS; i++)); do
+        line="$(run_load "$url" "$header" "$body")"
+        # Errors are not averaged with successes -- report the first one.
+        case "$line" in
+            ERROR*) echo "$line"; return 0 ;;
+        esac
+        results+=("$line")
+    done
+
+    printf '%s\n' "${results[@]}" | sort -k1,1n | awk -v n="${#results[@]}" 'NR == int((n + 1) / 2)'
+}
+
+# Issue WARMUP requests without recording anything.
+warm_target() {
+    local url="$1" header="$2" body="${3:-}"
+    local saved="$REQUESTS"
+    REQUESTS="$WARMUP"
+    run_load "$url" "$header" "$body" >/dev/null 2>&1 || true
+    REQUESTS="$saved"
+}
+
 bench_rest() {
     local scenario name postrust_path postgrest_path target path url reason measured
 
+    local urls=() entry
     for scenario in "${REST_SCENARIOS[@]}"; do
         IFS='|' read -r name postrust_path postgrest_path <<<"$scenario"
+        urls=()
 
         for target in postrust postgrest; do
             wants "$target" || continue
@@ -508,20 +561,33 @@ bench_rest() {
                 continue
             fi
 
-            log "rest: $name -- $target"
-            for _ in $(seq 1 "$((WARMUP / 50 + 1))"); do curl -s -o /dev/null "$url" || true; done
+            urls+=("$target|$url")
+        done
 
-            measured="$(run_load "$url" "")"
+        # Warm every target for this scenario before measuring any of them.
+        # Measuring one tool while the cache is still cold and the next once it
+        # is warm compares the cache, not the tools.
+        for entry in "${urls[@]}"; do
+            warm_target "${entry#*|}" ""
+        done
+
+        for entry in "${urls[@]}"; do
+            target="${entry%%|*}"
+            url="${entry#*|}"
+            log "rest: $name -- $target"
+            measured="$(measure_median "$url" "")"
             record rest "$name" "$target" "$measured" ok
         done
     done
 }
 
 bench_gql() {
-    local entry key label target url query body reason measured header
+    local gql_entry entry key label target url query body reason measured header
 
-    for entry in "${GQL_SCENARIOS[@]}"; do
-        IFS='|' read -r key label <<<"$entry"
+    local posts=() _t _u _b
+    for gql_entry in "${GQL_SCENARIOS[@]}"; do
+        IFS='|' read -r key label <<<"$gql_entry"
+        posts=()
 
         for target in postrust hasura postgraphile; do
             wants "$target" || continue
@@ -537,12 +603,19 @@ bench_gql() {
                 continue
             fi
 
-            log "graphql: $label -- $target"
-            for _ in $(seq 1 "$((WARMUP / 50 + 1))"); do
-                curl -s -o /dev/null -H 'Content-Type: application/json' -d "$body" "$url" || true
-            done
+            # The body differs per target, so it travels with the endpoint.
+            posts+=("$target|$url|$body")
+        done
 
-            measured="$(run_load "$url" "" "$body")"
+        for entry in "${posts[@]}"; do
+            IFS='|' read -r _t _u _b <<<"$entry"
+            warm_target "$_u" "" "$_b"
+        done
+
+        for entry in "${posts[@]}"; do
+            IFS='|' read -r target url body <<<"$entry"
+            log "graphql: $label -- $target"
+            measured="$(measure_median "$url" "" "$body")"
             record graphql "$label" "$target" "$measured" ok
         done
     done
@@ -568,6 +641,7 @@ printf ' host           : %s\n' "$(uname -srm)"
 printf ' variant        : %s\n' "$VARIANT"
 printf ' postgres       : %s\n' "$PG_IMAGE"
 printf ' load generator : %s (n=%s, c=%s)\n' "$LOAD_TOOL" "$REQUESTS" "$CONCURRENCY"
+printf ' per measurement: median of %s runs, after %s warm-up requests\n' "$REPEATS" "$WARMUP"
 printf ' dataset        : bench_items 100000 rows, bench_reviews 300000 rows\n'
 printf ' all servers    : containers on %s, default settings\n' "$NETWORK"
 echo
@@ -618,6 +692,8 @@ echo
     printf '  "postgres": %s,\n' "$(jq -Rn --arg v "$PG_IMAGE" '$v')"
     printf '  "requests": %s,\n' "$REQUESTS"
     printf '  "concurrency": %s,\n' "$CONCURRENCY"
+    printf '  "repeats": %s,\n' "$REPEATS"
+    printf '  "warmup": %s,\n' "$WARMUP"
     printf '  "dataset": "bench_items 100000 rows, bench_reviews 300000 rows",\n'
     printf '  "images": {\n'
     first=1
