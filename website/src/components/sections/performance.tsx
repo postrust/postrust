@@ -1,6 +1,7 @@
 import { component$ } from "@builder.io/qwik";
+import { Link } from "@builder.io/qwik-city";
 
-// Data sourced from project README and actual builds
+// Data measured by scripts/bench.sh -- see docs/benchmarking.md
 const comparisons = [
   {
     metric: "Cold Start (Lambda)",
@@ -11,7 +12,7 @@ const comparisons = [
   },
   {
     metric: "Binary Size",
-    postrust: "~3.5 MB",
+    postrust: "~5 MB",
     postgrest: "~20 MB",
     hasura: "Container",
     highlight: false,
@@ -93,10 +94,11 @@ export const PerformanceSection = component$(() => {
                   <svg class="w-5 h-5 text-primary-600" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                     <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M5 13l4 4L19 7"/>
                   </svg>
-                  <span class="font-medium text-neutral-900">3.5 MB Binary</span>
+                  <span class="font-medium text-neutral-900">5 MB Binary</span>
                 </div>
                 <p class="text-sm text-neutral-600 ml-8">
-                  LTO-optimized release build, no runtime dependencies
+                  LTO-optimized release build with admin UI, no runtime
+                  dependencies (~3 MB without)
                 </p>
               </div>
               {/* No Container Needed */}
@@ -113,7 +115,13 @@ export const PerformanceSection = component$(() => {
               </div>
             </div>
             <p class="mt-6 text-sm text-neutral-500">
-              Benchmarks from project README. Run your own tests for production decisions.
+              Every number here is measured by{" "}
+              <code class="px-1 py-0.5 bg-neutral-100 rounded">scripts/bench.sh</code> in
+              the repository. See{" "}
+              <Link href="/docs/benchmarks" class="text-primary-600 hover:underline">
+                Benchmarks
+              </Link>{" "}
+              for the methodology, caveats, and how to reproduce them on your own hardware.
             </p>
           </div>
 
@@ -124,8 +132,8 @@ export const PerformanceSection = component$(() => {
               <div class="text-sm text-neutral-600">Lambda cold start</div>
             </div>
             <div class="bg-white rounded-xl p-6 shadow-sm border border-neutral-200 text-center">
-              <div class="text-4xl font-bold text-primary-600 mb-2">3.5 MB</div>
-              <div class="text-sm text-neutral-600">Binary size</div>
+              <div class="text-4xl font-bold text-primary-600 mb-2">5 MB</div>
+              <div class="text-sm text-neutral-600">Binary size (with admin UI)</div>
             </div>
             <div class="bg-white rounded-xl p-6 shadow-sm border border-neutral-200 text-center">
               <div class="text-4xl font-bold text-primary-600 mb-2">REST+</div>

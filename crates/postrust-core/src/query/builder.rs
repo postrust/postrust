@@ -145,13 +145,34 @@ impl QueryBuilder {
     fn build_filter(filter: &CoercibleFilter) -> Result<SqlFragment> {
         let mut frag = SqlFragment::new();
 
+        // Negation wraps the whole comparison. Placing `NOT` between the column
+        // and the operator only parses for a few operators -- `col NOT LIKE $1`
+        // is valid but `col NOT = $1` is a syntax error -- so the comparison is
+        // parenthesised instead, which is correct for every operator.
+        if filter.op_expr.negated {
+            frag.push("NOT (");
+        }
+
         // Column name
         frag.push(&escape_ident(&filter.field.name));
 
-        // Handle negation
-        if filter.op_expr.negated {
-            frag.push(" NOT");
-        }
+        // Filter values are always bound as text, so a comparison against a
+        // non-text column needs an explicit cast on the placeholder -- without
+        // it PostgreSQL rejects the query with `operator does not exist:
+        // integer = text`. A JSON path already yields text, so it is left as-is.
+        let cast = if filter.field.json_path.is_empty() {
+            castable_type(&filter.field.ir_type)
+        } else {
+            None
+        };
+        let push_value = |frag: &mut SqlFragment, value: String| match cast {
+            Some(pg_type) => {
+                frag.push_typed_param(value, pg_type);
+            }
+            None => {
+                frag.push_param(value);
+            }
+        };
 
         // Operation
         match &filter.op_expr.operation {
@@ -159,7 +180,7 @@ impl QueryBuilder {
                 frag.push(" ");
                 frag.push(op.to_sql());
                 frag.push(" ");
-                frag.push_param(value.clone());
+                push_value(&mut frag, value.clone());
             }
             crate::api_request::Operation::Quant {
                 op,
@@ -174,10 +195,20 @@ impl QueryBuilder {
                         crate::api_request::OpQuantifier::Any => frag.push("ANY("),
                         crate::api_request::OpQuantifier::All => frag.push("ALL("),
                     };
-                    frag.push_param(value.clone());
+                    // A quantified comparison takes an array of the column's
+                    // type. Array-typed columns are already handled by the
+                    // element cast, so they are left alone.
+                    match cast.filter(|t| !t.starts_with('_')) {
+                        Some(pg_type) => {
+                            frag.push_typed_param(value.clone(), &format!("{}[]", pg_type));
+                        }
+                        None => {
+                            frag.push_param(value.clone());
+                        }
+                    }
                     frag.push(")");
                 } else {
-                    frag.push_param(value.clone());
+                    push_value(&mut frag, value.clone());
                 }
             }
             crate::api_request::Operation::In(values) => {
@@ -186,7 +217,7 @@ impl QueryBuilder {
                     if i > 0 {
                         frag.push(", ");
                     }
-                    frag.push_param(v.clone());
+                    push_value(&mut frag, v.clone());
                 }
                 frag.push(")");
             }
@@ -196,7 +227,7 @@ impl QueryBuilder {
             }
             crate::api_request::Operation::IsDistinctFrom(value) => {
                 frag.push(" IS DISTINCT FROM ");
-                frag.push_param(value.clone());
+                push_value(&mut frag, value.clone());
             }
             crate::api_request::Operation::Fts {
                 op,
@@ -213,6 +244,10 @@ impl QueryBuilder {
                 frag.push_param(value.clone());
                 frag.push(")");
             }
+        }
+
+        if filter.op_expr.negated {
+            frag.push(")");
         }
 
         Ok(frag)
@@ -439,5 +474,48 @@ impl QueryBuilder {
         frag.push(")");
 
         Ok(frag)
+    }
+}
+
+/// Return the type to cast a bound filter value to, if it is safe to do so.
+///
+/// The type name is interpolated into SQL, so only bare type names are
+/// accepted: anything else (an empty type, a parameterised type such as
+/// `character varying(255)`, or the `ARRAY`/`USER-DEFINED` placeholders that
+/// `information_schema` reports) yields `None` and the value is bound
+/// uncast, preserving the previous behaviour.
+fn castable_type(pg_type: &str) -> Option<&str> {
+    if pg_type.is_empty() {
+        return None;
+    }
+
+    let is_bare_name = pg_type
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '_');
+
+    if is_bare_name {
+        Some(pg_type)
+    } else {
+        None
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn castable_type_accepts_bare_type_names() {
+        assert_eq!(castable_type("int4"), Some("int4"));
+        assert_eq!(castable_type("timestamptz"), Some("timestamptz"));
+        assert_eq!(castable_type("_text"), Some("_text"));
+    }
+
+    #[test]
+    fn castable_type_rejects_unsafe_names() {
+        assert_eq!(castable_type(""), None);
+        assert_eq!(castable_type("character varying"), None);
+        assert_eq!(castable_type("USER-DEFINED"), None);
+        assert_eq!(castable_type("int4; DROP TABLE users"), None);
     }
 }

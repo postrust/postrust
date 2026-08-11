@@ -62,7 +62,7 @@ impl ReadPlan {
             from_alias: None,
             where_clauses,
             order,
-            range: request.top_level_range.clone(),
+            range: resolve_top_level_range(request),
             rel_name: table.name.clone(),
             rel_to_parent: None,
             rel_join_conds: vec![],
@@ -142,12 +142,34 @@ fn build_select_fields(items: &[SelectItem], table: &Table) -> Result<Vec<Coerci
     Ok(fields)
 }
 
+/// Resolve the effective top-level range.
+///
+/// The `Range` header supplies the base range; the `limit` and `offset` query
+/// parameters take precedence over it when present, matching PostgREST.
+fn resolve_top_level_range(request: &ApiRequest) -> Range {
+    let mut range = request.top_level_range.clone();
+
+    if let Some(from_params) = request.query_params.ranges.get("") {
+        if from_params.limit.is_some() {
+            range.limit = from_params.limit;
+        }
+        if from_params.offset != 0 {
+            range.offset = from_params.offset;
+        }
+    }
+
+    range
+}
+
 /// Build where clauses from request filters.
 fn build_where_clauses(request: &ApiRequest, table: &Table) -> Result<Vec<CoercibleLogicTree>> {
+    // `nominal_type` (the underlying `udt_name`) is used rather than `data_type`
+    // because it is always castable: `information_schema` reports arrays as
+    // `ARRAY` and enums as `USER-DEFINED`, neither valid in a `::type` cast.
     let type_resolver = |name: &str| -> String {
         table
             .get_column(name)
-            .map(|c| c.data_type.clone())
+            .map(|c| c.nominal_type.clone())
             .unwrap_or_else(|| "text".to_string())
     };
 

@@ -505,19 +505,57 @@ postrust/
 └── docs/                   # Documentation
 ```
 
+## Benchmarks
+
+Measured by [`scripts/bench.sh`](scripts/bench.sh) against a 100,000-row table,
+3,000 requests per scenario at concurrency 50:
+
+| Scenario | Request | req/s | p50 | p95 | p99 |
+|----------|---------|------:|----:|----:|----:|
+| Point lookup | `?id=eq.42` | 6,065 | 8 ms | 10 ms | 22 ms |
+| 25-row page | `?select=id,name,price&limit=25` | 6,065 | 8 ms | 11 ms | 13 ms |
+| Filtered + ordered page | `?category=eq.cat-5&order=id.desc&limit=25` | 5,025 | 9 ms | 14 ms | 23 ms |
+| Page with exact count | `Prefer: count=exact` | 6,373 | 7 ms | 11 ms | 19 ms |
+| Range filter on numeric | `?price=gt.50&limit=25` | 6,468 | 7 ms | 10 ms | 14 ms |
+
+| Resource | Measured |
+|----------|----------|
+| Binary size (`--features admin-ui`, as shipped) | 5,220,864 bytes (4.98 MiB) |
+| Binary size (default features) | 3,070,080 bytes (2.93 MiB) |
+| Memory, idle | 10.0 MB RSS |
+| Memory, after 15,000 requests | 13.3 MB RSS |
+
+Reproduce on your own hardware:
+
+```bash
+./scripts/bench.sh                              # defaults
+REQUESTS=20000 CONCURRENCY=100 ./scripts/bench.sh
+```
+
+These figures come from an Apple M-series laptop with PostgreSQL 18 in Docker,
+`ab` as the load generator, everything over loopback — so the database, the
+server and the load generator all compete for the same cores. Use them to
+compare Postrust against itself across changes, not for capacity planning. See
+[Benchmarking](docs/benchmarking.md) for the methodology and full caveats.
+
 ## Comparison with PostgREST
 
 | Feature | Postrust | PostgREST |
 |---------|----------|-----------|
 | Language | Rust | Haskell |
-| Binary Size | ~5 MB | ~20 MB |
+| Binary Size | ~5 MB (~3 MB without `admin-ui`) | ~20 MB |
 | Cold Start (Lambda) | ~50ms | N/A |
-| Memory Usage | Lower | Higher |
+| Memory Usage | ~10 MB idle | Higher |
 | Serverless Support | Native | Via containers |
 | Configuration | Env vars | Config file + env |
 | OpenAPI | ✅ (admin-ui feature) | ✅ |
 | GraphQL | ✅ | ❌ |
 | Admin UI | ✅ (Swagger, Scalar) | ❌ |
+
+Every Postrust number above is measured by `scripts/bench.sh` — see
+[Benchmarking](docs/benchmarking.md) for the methodology and how to reproduce
+them on your own hardware. The PostgREST column is not measured by this
+harness.
 
 ## Differences from PostgREST
 

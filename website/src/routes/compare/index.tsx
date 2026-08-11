@@ -29,7 +29,7 @@ const comparisons = [
 const detailedComparison = [
   { feature: "Language", postrust: "Rust", postgrest: "Haskell", hasura: "Haskell", supabase: "Elixir + PostgREST" },
   { feature: "Cold Start (Lambda)", postrust: "~50ms", postgrest: "N/A*", hasura: "N/A*", supabase: "N/A (managed)" },
-  { feature: "Binary Size", postrust: "~3.5 MB", postgrest: "~20 MB", hasura: "Container", supabase: "N/A (managed)" },
+  { feature: "Binary Size", postrust: "~5 MB", postgrest: "~20 MB", hasura: "Container", supabase: "N/A (managed)" },
   { feature: "REST API", postrust: "Yes", postgrest: "Yes", hasura: "Yes", supabase: "Yes" },
   { feature: "GraphQL", postrust: "Built-in", postgrest: "No", hasura: "Built-in", supabase: "via pg_graphql" },
   { feature: "Realtime Subscriptions", postrust: "Built-in", postgrest: "No", hasura: "Built-in", supabase: "Via Realtime" },
