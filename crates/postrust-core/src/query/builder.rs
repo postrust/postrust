@@ -96,6 +96,28 @@ impl QueryBuilder {
             return Ok(frag);
         }
 
+        // A type this process cannot decode is rendered by PostgreSQL instead.
+        //
+        // The row converter maps a fixed set of built-in types and falls back
+        // to reading a column as text, which fails outright for a type like a
+        // PostGIS geometry -- the column came back as null. `to_jsonb` gives
+        // the database's own rendering, which for a geometry is the GeoJSON
+        // PostgREST returns. PostgREST gets it for free by building its whole
+        // response in SQL; this is the same rendering, asked for by name.
+        let render_as_json = field.aggregate.is_none()
+            && field.cast.is_none()
+            && field.field.json_path.is_empty()
+            && field.field.ir_type == "USER-DEFINED";
+        if render_as_json {
+            frag.push("to_jsonb(");
+            frag.push(&escape_ident(&field.field.name));
+            frag.push(") AS ");
+            frag.push(&escape_ident(
+                field.alias.as_deref().unwrap_or(&field.field.name),
+            ));
+            return Ok(frag);
+        }
+
         // Column name with JSON path.
         //
         // `::` binds tighter than `->>`, so a cast over a JSON path has to be
