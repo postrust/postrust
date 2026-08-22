@@ -1524,6 +1524,9 @@ fn sanitize_error_message(error: &postrust_core::Error) -> String {
         Error::UnacceptableSchema { requested, .. } => {
             return format!("Invalid schema: {}", requested)
         }
+        // The candidate list is the whole point of the message: it names the
+        // signatures that could not be told apart.
+        Error::AmbiguousFunction { .. } => return error.to_string(),
         _ => {}
     }
 

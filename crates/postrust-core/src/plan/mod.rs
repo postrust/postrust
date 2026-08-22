@@ -72,6 +72,39 @@ pub fn create_action_plan(request: &ApiRequest, schema_cache: &SchemaCache) -> R
     }
 }
 
+/// The arguments a request supplies to a function.
+///
+/// On a function call every query parameter is a candidate argument, but a
+/// value carrying an operator -- `id=gt.1` -- is a filter over the result
+/// instead. That is what lets `/rpc/getallprojects?id=gt.1` call a function
+/// taking nothing at all, while `/rpc/add_them?a=1&b=2&smthelse=x` is a call
+/// with an argument no signature declares.
+fn supplied_arguments(request: &ApiRequest) -> Vec<String> {
+    // A filter on an embedded resource is keyed by its path -- `clients.id`
+    // -- and is no more an argument than a filter on the result itself.
+    let embedded: HashSet<String> = request
+        .query_params
+        .filters
+        .iter()
+        .map(|(path, filter)| {
+            let mut key = path.join(".");
+            key.push('.');
+            key.push_str(&filter.field.name);
+            key
+        })
+        .collect();
+
+    request
+        .query_params
+        .params
+        .iter()
+        .map(|(name, _)| name.clone())
+        .filter(|name| {
+            !request.query_params.filter_fields.contains(name) && !embedded.contains(name)
+        })
+        .collect()
+}
+
 /// Choose which signature of a function the supplied arguments call.
 ///
 /// A name may carry several, and taking whichever happened to be loaded first
@@ -79,45 +112,82 @@ pub fn create_action_plan(request: &ApiRequest, schema_cache: &SchemaCache) -> R
 /// PostgreSQL then rejects with a message about a function that does not
 /// exist, where the truth is that none of them matched.
 ///
-/// A signature fits when every parameter it requires is supplied. A key that
-/// names no parameter is not disqualifying: on a function call an unrecognised
-/// key filters the result rather than arguing with the signature, which is why
-/// `/rpc/getallprojects?id=gt.1` calls a function taking nothing at all.
-///
-/// Among those that fit, the one matching most of its parameters wins, and the
-/// shorter signature breaks a tie -- it leaves least to defaults the caller
-/// did not ask for.
-fn select_overload<'a>(routines: &'a [Routine], request: &ApiRequest) -> Option<&'a Routine> {
+/// A signature fits when every argument names one of its parameters and every
+/// parameter it requires is supplied. Among those that fit, the one matching
+/// most of its parameters wins; where several match equally the call is
+/// ambiguous and saying so is more use than picking one.
+fn select_overload<'a>(
+    routines: &'a [Routine],
+    request: &ApiRequest,
+) -> Result<Option<&'a Routine>> {
     // Arguments in a body are not inspected here. The payload is parsed
     // further down, and a mismatch there is PostgreSQL's to report.
     if request.payload.is_some() {
-        return routines.first();
+        return Ok(routines.first());
     }
 
-    let supplied: HashSet<&str> = request
-        .query_params
-        .params
-        .iter()
-        .map(|(name, _)| name.as_str())
-        .collect();
+    let supplied = supplied_arguments(request);
 
-    routines
+    let mut fitting: Vec<&Routine> = routines
         .iter()
         .filter(|routine| {
+            supplied
+                .iter()
+                .all(|name| routine.params.iter().any(|p| &p.name == name))
+                && routine
+                    .params
+                    .iter()
+                    .filter(|p| p.required)
+                    .all(|p| supplied.contains(&p.name))
+        })
+        .collect();
+
+    let best = fitting
+        .iter()
+        .map(|routine| {
             routine
                 .params
                 .iter()
-                .filter(|p| p.required)
-                .all(|p| supplied.contains(p.name.as_str()))
+                .filter(|p| supplied.contains(&p.name))
+                .count()
         })
-        .max_by_key(|routine| {
-            let matched = routine
-                .params
-                .iter()
-                .filter(|p| supplied.contains(p.name.as_str()))
-                .count();
-            (matched, std::cmp::Reverse(routine.params.len()))
-        })
+        .max();
+
+    let Some(best) = best else {
+        return Ok(None);
+    };
+
+    fitting.retain(|routine| {
+        routine
+            .params
+            .iter()
+            .filter(|p| supplied.contains(&p.name))
+            .count()
+            == best
+    });
+
+    if fitting.len() > 1 {
+        return Err(Error::AmbiguousFunction {
+            candidates: fitting.iter().map(|r| signature_of(r)).collect(),
+        });
+    }
+
+    Ok(fitting.first().copied())
+}
+
+/// A function's signature as PostgREST prints it when naming candidates.
+fn signature_of(routine: &Routine) -> String {
+    format!(
+        "{}.{}({})",
+        routine.schema,
+        routine.name,
+        routine
+            .params
+            .iter()
+            .map(|p| format!("{} => {}", p.name, p.param_type))
+            .collect::<Vec<_>>()
+            .join(", ")
+    )
 }
 
 /// Create a database action plan.
@@ -154,12 +224,7 @@ fn create_db_plan(
             qi,
             invoke_method: _,
         } => {
-            let supplied: Vec<String> = request
-                .query_params
-                .params
-                .iter()
-                .map(|(name, _)| name.clone())
-                .collect();
+            let supplied = supplied_arguments(request);
 
             // The name is reported as it was called, arguments and all, so the
             // client can see which signature was looked for.
@@ -173,7 +238,7 @@ fn create_db_plan(
                 .get_routines(qi)
                 .ok_or_else(|| not_found(None))?;
 
-            let routine = select_overload(routines, request).ok_or_else(|| {
+            let routine = select_overload(routines, request)?.ok_or_else(|| {
                 // The name exists but nothing takes these arguments, so an
                 // overload that does exist is worth naming.
                 let candidate = routines.first().map(|r| {

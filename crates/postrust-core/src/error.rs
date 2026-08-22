@@ -62,6 +62,10 @@ pub enum Error {
     #[error("Ambiguous request: {0}")]
     AmbiguousRequest(String),
 
+    /// Several signatures of a function fit the arguments equally well.
+    #[error("Could not choose the best candidate function between: {}", .candidates.join(", "))]
+    AmbiguousFunction { candidates: Vec<String> },
+
     // ========================================================================
     // Authentication/Authorization Errors (401/403)
     // ========================================================================
@@ -162,6 +166,9 @@ impl Error {
             | Self::EmbeddingError(_)
             | Self::AggregatesNotAllowed => StatusCode::BAD_REQUEST,
 
+            // The request names something real, but not which one of it.
+            Self::AmbiguousFunction { .. } => StatusCode::MULTIPLE_CHOICES,
+
             // 401 Unauthorized
             Self::InvalidJwt(_) | Self::JwtExpired | Self::MissingAuth => StatusCode::UNAUTHORIZED,
 
@@ -211,6 +218,7 @@ impl Error {
             Self::InvalidMediaType(_) => "PGRST108",
             Self::MissingParameter(_) => "PGRST109",
             Self::AmbiguousRequest(_) => "PGRST110",
+            Self::AmbiguousFunction { .. } => "PGRST203",
 
             Self::InvalidJwt(_) => "PGRST303",
             Self::JwtExpired => "PGRST301",
@@ -267,6 +275,11 @@ impl Error {
                 Some("Check that the JWT is properly signed and not expired".into())
             }
             Self::MissingAuth => Some("Provide a valid JWT in the Authorization header".into()),
+            Self::AmbiguousFunction { .. } => Some(
+                "Try renaming the parameters or the function itself in the database so function \
+                 overloading can be resolved"
+                    .into(),
+            ),
             Self::FunctionNotFound { candidate, .. } => candidate
                 .as_ref()
                 .map(|c| format!("Perhaps you meant to call the function {}", c)),
