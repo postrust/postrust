@@ -255,7 +255,9 @@ async fn main() -> Result<()> {
     let listener = tokio::net::TcpListener::bind(&addr).await?;
     info!("Listening on http://{}", addr);
 
-    axum::serve(listener, app).await?;
+    // Wrapped so that a request target carrying a raw `>` or `"` reaches the
+    // router instead of being refused by the URI parser. See `lenient_uri`.
+    axum::serve(postrust_server::lenient_uri::LenientListener(listener), app).await?;
 
     Ok(())
 }

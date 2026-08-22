@@ -8,6 +8,7 @@
 //!   Swagger UI, Scalar, and GraphQL Playground at `/admin`.
 
 pub mod app;
+pub mod lenient_uri;
 pub mod state;
 
 #[cfg(feature = "admin-ui")]
