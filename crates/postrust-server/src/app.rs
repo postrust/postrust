@@ -191,6 +191,16 @@ fn requested_plan(api_request: &ApiRequest) -> Option<String> {
     }
 }
 
+/// Which kind of mutation this request is, if it is one.
+fn mutation_kind(api_request: &ApiRequest) -> Option<postrust_core::api_request::Mutation> {
+    use postrust_core::api_request::{Action, DbAction};
+
+    match &api_request.action {
+        Action::Db(DbAction::RelationMut { mutation, .. }) => Some(mutation.clone()),
+        _ => None,
+    }
+}
+
 /// The prefix given to primary key columns added only to build `Location`.
 const LOCATION_KEY_PREFIX: &str = "pgrst_location_";
 
@@ -951,13 +961,6 @@ async fn execute_plan(
                 db_plan,
                 DbActionPlan::Call { call, .. } if call.return_type.as_deref() == Some("void")
             );
-            if returns_void {
-                return Ok(QueryResult {
-                    status: StatusCode::NO_CONTENT,
-                    omit_body: true,
-                    ..Default::default()
-                });
-            }
 
             // `Prefer: max-affected` guards against a filter that turned out
             // to match more than the client meant. Nothing has been committed
@@ -999,15 +1002,40 @@ async fn execute_plan(
                 .filter(|offset| *offset != 0)
                 .unwrap_or(api_request.top_level_range.offset);
 
-            let content_range =
-                postrust_response::ContentRange::from_pagination(offset, rows.len() as i64, total);
+            // What a mutation reports is not a window on a result set. An
+            // insert or a delete reports no window at all -- `*` -- because
+            // the rows it wrote are not a page of anything; an update reports
+            // how many it changed; and an upsert reports nothing, the client
+            // having named the row itself. PostgREST draws exactly these
+            // lines, and a client reading the header expects them.
+            use postrust_core::api_request::Mutation;
+            let content_range = match mutation_kind(api_request) {
+                Some(Mutation::SingleUpsert) => None,
+                Some(Mutation::Create) | Some(Mutation::Delete) => {
+                    Some(postrust_response::ContentRange::new(1, 0, total))
+                }
+                Some(Mutation::Update) => Some(postrust_response::ContentRange::new(
+                    0,
+                    rows.len() as i64 - 1,
+                    total,
+                )),
+                None => Some(postrust_response::ContentRange::from_pagination(
+                    offset,
+                    rows.len() as i64,
+                    total,
+                )),
+            };
 
             // An offset past the end of the result is a range the server
             // cannot satisfy, and saying how many rows there actually are is
             // what lets the client correct it. Only reachable with a count
             // preference: without one the total is unknown and there is
             // nothing to be past the end of.
-            if content_range.status() == StatusCode::RANGE_NOT_SATISFIABLE {
+            if content_range
+                .as_ref()
+                .is_some_and(|range| range.status() == StatusCode::RANGE_NOT_SATISFIABLE)
+                && mutation_kind(api_request).is_none()
+            {
                 return Err(postrust_core::Error::InvalidRange(format!(
                     "An offset of {} was requested, but there are only {} rows.",
                     offset,
@@ -1016,13 +1044,20 @@ async fn execute_plan(
             }
 
             Ok(QueryResult {
-                status: mutation_status(db_plan, api_request)
-                    .unwrap_or_else(|| content_range.status()),
+                status: match returns_void {
+                    true => StatusCode::NO_CONTENT,
+                    false => mutation_status(db_plan, api_request).unwrap_or_else(|| {
+                        content_range
+                            .as_ref()
+                            .map(postrust_response::ContentRange::status)
+                            .unwrap_or(StatusCode::OK)
+                    }),
+                },
                 rows,
                 singular,
-                omit_body,
+                omit_body: omit_body || returns_void,
                 location,
-                content_range: Some(content_range),
+                content_range,
                 ..Default::default()
             })
         }

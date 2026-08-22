@@ -146,7 +146,7 @@ pub fn format_response(
             add_common_headers(&mut response, request, result);
             Ok(response)
         }
-        _ => {
+        other => {
             // Default to JSON (covers `*/*`, e.g. a default curl request).
             let body = if result.singular {
                 format_singular_or_null(&result.rows)?
@@ -154,7 +154,15 @@ pub fn format_response(
                 format_json_response(&result.rows)?
             };
             let mut response = Response::new(result.status, body);
-            response.set_content_type("application/json; charset=utf-8");
+            // The body is JSON either way, but a client that asked for one of
+            // PostgREST's own JSON media types is told it got that: the type
+            // is how it knows the shape it negotiated was honoured.
+            let content_type = match other {
+                MediaType::ArrayJson { .. } => "application/vnd.pgrst.array+json; charset=utf-8",
+                MediaType::OpenApi => "application/openapi+json; charset=utf-8",
+                _ => "application/json; charset=utf-8",
+            };
+            response.set_content_type(content_type);
             add_common_headers(&mut response, request, result);
             Ok(response)
         }

@@ -809,6 +809,14 @@ pub struct Preferences {
     pub timezone: Option<String>,
     pub max_affected: Option<i64>,
     pub invalid: Vec<String>,
+    /// Every preference the server understood, in the order it was sent.
+    ///
+    /// Reported back as `Preference-Applied`. Kept as written rather than
+    /// rebuilt from the fields above, because a field cannot say whether its
+    /// value was asked for or is merely its default -- and `handling=lenient`
+    /// is worth echoing exactly when it was asked for.
+    #[serde(default)]
+    pub applied: Vec<String>,
 }
 
 // ============================================================================

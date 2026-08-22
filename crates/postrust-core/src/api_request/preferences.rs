@@ -43,6 +43,9 @@ fn parse_preference(prefs: &mut Preferences, pref: &str) {
                     "ignore-duplicates" => Some(PreferResolution::IgnoreDuplicates),
                     _ => None,
                 };
+                if prefs.resolution.is_some() {
+                    prefs.applied.push(format!("resolution={}", value));
+                }
             }
             "return" => {
                 prefs.representation = match value {
@@ -51,6 +54,7 @@ fn parse_preference(prefs: &mut Preferences, pref: &str) {
                     "minimal" => PreferRepresentation::None,
                     _ => PreferRepresentation::None,
                 };
+                prefs.applied.push(format!("return={}", value));
             }
             "count" => {
                 prefs.count = match value {
@@ -59,6 +63,9 @@ fn parse_preference(prefs: &mut Preferences, pref: &str) {
                     "estimated" => Some(PreferCount::Estimated),
                     _ => None,
                 };
+                if prefs.count.is_some() {
+                    prefs.applied.push(format!("count={}", value));
+                }
             }
             "tx" => {
                 prefs.transaction = match value {
@@ -66,6 +73,7 @@ fn parse_preference(prefs: &mut Preferences, pref: &str) {
                     "rollback" => PreferTransaction::Rollback,
                     _ => PreferTransaction::Commit,
                 };
+                prefs.applied.push(format!("tx={}", value));
             }
             "missing" => {
                 prefs.missing = match value {
@@ -73,6 +81,7 @@ fn parse_preference(prefs: &mut Preferences, pref: &str) {
                     "null" => PreferMissing::ApplyNulls,
                     _ => PreferMissing::ApplyDefaults,
                 };
+                prefs.applied.push(format!("missing={}", value));
             }
             "handling" => {
                 prefs.handling = match value {
@@ -80,15 +89,18 @@ fn parse_preference(prefs: &mut Preferences, pref: &str) {
                     "lenient" => PreferHandling::Lenient,
                     _ => PreferHandling::Strict,
                 };
+                prefs.applied.push(format!("handling={}", value));
             }
             "timezone" => {
                 prefs.timezone = Some(value.to_string());
+                prefs.applied.push(format!("timezone={}", value));
             }
             // Understood, and applied where the RPC path reads the body.
             "params" => {}
             "max-affected" => {
                 if let Ok(n) = value.parse::<i64>() {
                     prefs.max_affected = Some(n);
+                    prefs.applied.push(format!("max-affected={}", n));
                 }
             }
             _ => {
@@ -120,58 +132,15 @@ fn parse_preference(prefs: &mut Preferences, pref: &str) {
     }
 }
 
-/// Build Preference-Applied header from applied preferences.
+/// Build the `Preference-Applied` header.
+///
+/// Every preference the server understood, in the order it was sent. A client
+/// reads it to find out which of what it asked for was honoured, so a
+/// preference the server merely defaulted to has no business appearing.
 pub fn preference_applied(prefs: &Preferences) -> Option<String> {
-    let mut applied = Vec::new();
-
-    if prefs.resolution.is_some() {
-        let val = match prefs.resolution {
-            Some(PreferResolution::MergeDuplicates) => "resolution=merge-duplicates",
-            Some(PreferResolution::IgnoreDuplicates) => "resolution=ignore-duplicates",
-            None => "",
-        };
-        if !val.is_empty() {
-            applied.push(val);
-        }
-    }
-
-    match prefs.representation {
-        PreferRepresentation::Full => applied.push("return=representation"),
-        PreferRepresentation::HeadersOnly => applied.push("return=headers-only"),
-        PreferRepresentation::None => {}
-    }
-
-    if let Some(count) = &prefs.count {
-        let val = match count {
-            PreferCount::Exact => "count=exact",
-            PreferCount::Planned => "count=planned",
-            PreferCount::Estimated => "count=estimated",
-        };
-        applied.push(val);
-    }
-
-    match prefs.transaction {
-        PreferTransaction::Rollback => applied.push("tx=rollback"),
-        PreferTransaction::Commit => {}
-    }
-
-    // Strict handling and a timezone are both applied rather than merely
-    // understood, so both are reported back. The timezone is owned rather than
-    // borrowed, which is why the list is built as strings from here on.
-    let mut applied: Vec<String> = applied.into_iter().map(String::from).collect();
-
-    if prefs.handling == PreferHandling::Strict {
-        applied.insert(0, "handling=strict".to_string());
-    }
-
-    if let Some(timezone) = &prefs.timezone {
-        applied.push(format!("timezone={}", timezone));
-    }
-
-    if applied.is_empty() {
-        None
-    } else {
-        Some(applied.join(", "))
+    match prefs.applied.is_empty() {
+        true => None,
+        false => Some(prefs.applied.join(", ")),
     }
 }
 
@@ -232,14 +201,24 @@ mod tests {
 
     #[test]
     fn test_preference_applied() {
-        let prefs = Preferences {
-            representation: PreferRepresentation::Full,
-            count: Some(PreferCount::Exact),
-            ..Default::default()
-        };
+        let headers = headers_with_prefer("return=representation, count=exact");
+        let prefs = parse_preferences(&headers).unwrap();
 
         let applied = preference_applied(&prefs).unwrap();
         assert!(applied.contains("return=representation"));
         assert!(applied.contains("count=exact"));
+    }
+
+    /// A preference the server merely defaulted to is not one it applied.
+    #[test]
+    fn preference_applied_reports_only_what_was_asked_for() {
+        let headers = headers_with_prefer("handling=lenient");
+        let prefs = parse_preferences(&headers).unwrap();
+
+        assert_eq!(
+            preference_applied(&prefs).as_deref(),
+            Some("handling=lenient")
+        );
+        assert_eq!(preference_applied(&Preferences::default()), None);
     }
 }
