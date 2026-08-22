@@ -66,7 +66,7 @@ pub enum Error {
     #[error("Requested range not satisfiable")]
     InvalidRange(String),
 
-    #[error("Invalid media type: {0}")]
+    #[error("None of these media types are available: {0}")]
     InvalidMediaType(String),
 
     #[error("Missing required parameter: {0}")]
@@ -268,7 +268,6 @@ impl Error {
             | Self::InvalidQueryParam(_)
             | Self::InvalidHeader(_)
             | Self::InvalidBody(_)
-            | Self::InvalidMediaType(_)
             | Self::MissingParameter(_)
             | Self::AmbiguousRequest(_)
             | Self::UnknownColumn { .. }
@@ -306,9 +305,9 @@ impl Error {
             }
 
             // 406 Not Acceptable
-            Self::UnacceptableSchema { .. } | Self::NotSingular { .. } => {
-                StatusCode::NOT_ACCEPTABLE
-            }
+            Self::UnacceptableSchema { .. }
+            | Self::NotSingular { .. }
+            | Self::InvalidMediaType(_) => StatusCode::NOT_ACCEPTABLE,
 
             Self::InvalidResourcePath => StatusCode::NOT_FOUND,
 

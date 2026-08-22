@@ -103,6 +103,14 @@ async fn process_request(
         api_request.payload = payload;
     }
 
+    // `application/vnd.pgrst.plan` asks for the query plan instead of the
+    // result. It is off unless a server turns it on -- it says a great deal
+    // about the schema and the data -- and a server that has not is required
+    // to say so rather than answer with something else.
+    if let Some(plan) = requested_plan(&api_request) {
+        return Err(postrust_core::Error::InvalidMediaType(plan));
+    }
+
     // A body that names different columns row by row cannot be written by one
     // statement. Skipped when `?columns=` says which columns to write, since
     // then the rows are free to differ.
@@ -160,6 +168,27 @@ async fn process_request(
     })?;
 
     Ok(build_response(response))
+}
+
+/// The plan media type a request asked for, when that is all it will accept.
+///
+/// A request that would also take JSON gets JSON; one that will take only the
+/// plan is refused, and the message names what it asked for.
+fn requested_plan(api_request: &ApiRequest) -> Option<String> {
+    let accepted: Vec<&str> = api_request
+        .accept_media_types
+        .iter()
+        .map(|media| media.content_type())
+        .collect();
+
+    match accepted
+        .iter()
+        .all(|media| media.starts_with("application/vnd.pgrst.plan"))
+        && !accepted.is_empty()
+    {
+        true => Some(accepted.join(", ")),
+        false => None,
+    }
 }
 
 /// The prefix given to primary key columns added only to build `Location`.
@@ -2560,6 +2589,7 @@ fn sanitize_error_message(error: &postrust_core::Error) -> String {
         | Error::PutLimitNotAllowed
         | Error::PutMatchingPk
         | Error::MaxAffectedExceeded(_)
+        | Error::InvalidMediaType(_)
         | Error::InvalidResourcePath => return error.to_string(),
         Error::InvalidPath(_) => "Invalid request path",
         // What the token failed on is the client's own token, so naming it
