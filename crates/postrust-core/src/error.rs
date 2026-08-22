@@ -209,6 +209,13 @@ pub enum Error {
     #[error("Payload values do not match URL in primary key column(s)")]
     PutMatchingPk,
 
+    /// A mutation touched more rows than `Prefer: max-affected` allowed.
+    ///
+    /// The preference is a guard against a filter that turned out to match
+    /// more than the client meant; nothing is committed when it trips.
+    #[error("Query result exceeds max-affected preference constraint")]
+    MaxAffectedExceeded(i64),
+
     /// Preferences the server does not know, sent with `handling=strict`.
     ///
     /// Strict handling is a request to be told rather than have them ignored.
@@ -270,6 +277,7 @@ impl Error {
             | Self::InvalidPreferences(_)
             | Self::PutLimitNotAllowed
             | Self::PutMatchingPk
+            | Self::MaxAffectedExceeded(_)
             | Self::InvalidPlan(_)
             | Self::EmbeddingError(_)
             | Self::AggregatesNotAllowed => StatusCode::BAD_REQUEST,
@@ -361,6 +369,7 @@ impl Error {
             Self::InvalidPutFilters => "PGRST105",
             Self::PutLimitNotAllowed => "PGRST114",
             Self::PutMatchingPk => "PGRST115",
+            Self::MaxAffectedExceeded(_) => "PGRST124",
             Self::RelatedOrderNotPossible { .. } => "PGRST118",
             Self::InvalidPreferences(_) => "PGRST122",
 
@@ -434,6 +443,10 @@ impl Error {
                 )))
             }
             Self::InvalidRange(reason) => Some(serde_json::Value::String(reason.clone())),
+            Self::MaxAffectedExceeded(affected) => Some(serde_json::Value::String(format!(
+                "The query affects {} rows",
+                affected
+            ))),
             Self::NotSingular { rows } => Some(serde_json::Value::String(format!(
                 "The result contains {} rows",
                 rows

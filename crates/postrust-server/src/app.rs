@@ -930,6 +930,20 @@ async fn execute_plan(
                 });
             }
 
+            // `Prefer: max-affected` guards against a filter that turned out
+            // to match more than the client meant. Nothing has been committed
+            // yet, so refusing here undoes the whole statement.
+            if let (Some(limit), postrust_core::api_request::PreferHandling::Strict) = (
+                api_request.preferences.max_affected,
+                &api_request.preferences.handling,
+            ) {
+                let affected = json_rows.len() as i64;
+                let writes = is_mutation(db_plan) || matches!(db_plan, DbActionPlan::Call { .. });
+                if writes && affected > limit {
+                    return Err(postrust_core::Error::MaxAffectedExceeded(affected));
+                }
+            }
+
             // The created row's own address, taken from its key and then
             // removed from the body -- the client asked for a `?select=`, not
             // for the key.
@@ -2545,6 +2559,7 @@ fn sanitize_error_message(error: &postrust_core::Error) -> String {
         | Error::InvalidPutFilters
         | Error::PutLimitNotAllowed
         | Error::PutMatchingPk
+        | Error::MaxAffectedExceeded(_)
         | Error::InvalidResourcePath => return error.to_string(),
         Error::InvalidPath(_) => "Invalid request path",
         // What the token failed on is the client's own token, so naming it
