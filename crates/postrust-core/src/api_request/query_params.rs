@@ -425,75 +425,66 @@ fn parse_filter_value(value: &str) -> Result<OpExpr> {
     Ok(OpExpr { negated, operation })
 }
 
+/// Map an operator name to its comparison operator, if it is one.
+///
+/// These are exactly the operators that accept an `any`/`all` quantifier.
+fn quant_operator(name: &str) -> Option<QuantOperator> {
+    Some(match name {
+        "eq" => QuantOperator::Equal,
+        "gt" => QuantOperator::GreaterThan,
+        "gte" => QuantOperator::GreaterThanEqual,
+        "lt" => QuantOperator::LessThan,
+        "lte" => QuantOperator::LessThanEqual,
+        "like" => QuantOperator::Like,
+        "ilike" => QuantOperator::ILike,
+        "match" => QuantOperator::Match,
+        "imatch" => QuantOperator::IMatch,
+        _ => return None,
+    })
+}
+
+/// Parse the parenthesised modifier of a quantified comparison.
+fn parse_quantifier(modifier: &str) -> Option<OpQuantifier> {
+    match modifier {
+        "any" => Some(OpQuantifier::Any),
+        "all" => Some(OpQuantifier::All),
+        _ => None,
+    }
+}
+
 /// Parse an operation: `eq.value`, `in.(a,b,c)`, `is.null`, etc.
 fn parse_operation(value: &str) -> Result<Operation> {
-    // Try each operator pattern
-    if let Some(rest) = value.strip_prefix("eq.") {
-        return Ok(Operation::Quant {
-            op: QuantOperator::Equal,
-            quantifier: None,
-            value: rest.to_string(),
-        });
+    // A quantified comparison spells the quantifier in parentheses after the
+    // operator name: `col=like(any).{foo,bar}`. Full-text search borrows the
+    // same shape for its language, so the operator name decides the reading.
+    if let Some((name, rest)) = value.split_once('(') {
+        if let Some((modifier, operand)) = rest.split_once(").") {
+            if let (Some(op), Some(quantifier)) = (quant_operator(name), parse_quantifier(modifier))
+            {
+                return Ok(Operation::Quant {
+                    op,
+                    quantifier: Some(quantifier),
+                    value: operand.to_string(),
+                });
+            }
+        }
     }
+
+    // Comparison operators. Every one of these accepts a quantifier, so they
+    // share the lookup above rather than repeating the name-to-operator map.
+    if let Some((name, rest)) = value.split_once('.') {
+        if let Some(op) = quant_operator(name) {
+            return Ok(Operation::Quant {
+                op,
+                quantifier: None,
+                value: rest.to_string(),
+            });
+        }
+    }
+
     if let Some(rest) = value.strip_prefix("neq.") {
         return Ok(Operation::Simple {
             op: SimpleOperator::NotEqual,
-            value: rest.to_string(),
-        });
-    }
-    if let Some(rest) = value.strip_prefix("gt.") {
-        return Ok(Operation::Quant {
-            op: QuantOperator::GreaterThan,
-            quantifier: None,
-            value: rest.to_string(),
-        });
-    }
-    if let Some(rest) = value.strip_prefix("gte.") {
-        return Ok(Operation::Quant {
-            op: QuantOperator::GreaterThanEqual,
-            quantifier: None,
-            value: rest.to_string(),
-        });
-    }
-    if let Some(rest) = value.strip_prefix("lt.") {
-        return Ok(Operation::Quant {
-            op: QuantOperator::LessThan,
-            quantifier: None,
-            value: rest.to_string(),
-        });
-    }
-    if let Some(rest) = value.strip_prefix("lte.") {
-        return Ok(Operation::Quant {
-            op: QuantOperator::LessThanEqual,
-            quantifier: None,
-            value: rest.to_string(),
-        });
-    }
-    if let Some(rest) = value.strip_prefix("like.") {
-        return Ok(Operation::Quant {
-            op: QuantOperator::Like,
-            quantifier: None,
-            value: rest.to_string(),
-        });
-    }
-    if let Some(rest) = value.strip_prefix("ilike.") {
-        return Ok(Operation::Quant {
-            op: QuantOperator::ILike,
-            quantifier: None,
-            value: rest.to_string(),
-        });
-    }
-    if let Some(rest) = value.strip_prefix("match.") {
-        return Ok(Operation::Quant {
-            op: QuantOperator::Match,
-            quantifier: None,
-            value: rest.to_string(),
-        });
-    }
-    if let Some(rest) = value.strip_prefix("imatch.") {
-        return Ok(Operation::Quant {
-            op: QuantOperator::IMatch,
-            quantifier: None,
             value: rest.to_string(),
         });
     }
@@ -590,12 +581,36 @@ fn parse_operation(value: &str) -> Result<Operation> {
 
 /// Parse IN list: `(a,b,c)` -> vec!["a", "b", "c"]
 fn parse_in_list(value: &str) -> Result<Vec<String>> {
-    let value = value
+    let inner = value
         .strip_prefix('(')
         .and_then(|s| s.strip_suffix(')'))
         .ok_or_else(|| Error::InvalidQueryParam(format!("in.{}", value)))?;
 
-    Ok(value.split(',').map(|s| s.trim().to_string()).collect())
+    let mut values = Vec::new();
+    let mut current = String::new();
+    let mut quoted = false;
+    let mut chars = inner.chars();
+
+    while let Some(c) = chars.next() {
+        match c {
+            // A value may be double-quoted so that it can contain a comma.
+            // Inside the quotes a backslash escapes the next character, which
+            // is the only way to write a literal `"` or `\`.
+            '"' => quoted = !quoted,
+            '\\' if quoted => {
+                if let Some(escaped) = chars.next() {
+                    current.push(escaped);
+                }
+            }
+            ',' if !quoted => {
+                values.push(std::mem::take(&mut current));
+            }
+            _ => current.push(c),
+        }
+    }
+    values.push(current);
+
+    Ok(values)
 }
 
 /// Parse FTS operation: `(language).query` or `.query`
@@ -754,6 +769,95 @@ mod tests {
                 assert_eq!(values, &vec!["1", "2", "3"]);
             }
             _ => panic!("Expected In operation"),
+        }
+    }
+
+    #[test]
+    fn test_parse_in_filter_with_quoted_commas() {
+        let params = parse_query_params(r#"name=in.("hi,there","yes,you")"#, false).unwrap();
+        match &params.filters_root[0].op_expr.operation {
+            Operation::In(values) => {
+                assert_eq!(values, &vec!["hi,there".to_string(), "yes,you".to_string()]);
+            }
+            other => panic!("expected an In operation, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_parse_in_filter_with_escapes() {
+        let params = parse_query_params(r#"name=in.("a\"b","c\\d")"#, false).unwrap();
+        match &params.filters_root[0].op_expr.operation {
+            Operation::In(values) => {
+                assert_eq!(values, &vec![r#"a"b"#.to_string(), r#"c\d"#.to_string()]);
+            }
+            other => panic!("expected an In operation, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_parse_quantified_filter() {
+        for (query, expected) in [
+            ("id=eq(any).{1,2,3}", OpQuantifier::Any),
+            ("id=eq(all).{1,2,3}", OpQuantifier::All),
+        ] {
+            let params = parse_query_params(query, false).unwrap();
+            match &params.filters_root[0].op_expr.operation {
+                Operation::Quant {
+                    op,
+                    quantifier,
+                    value,
+                } => {
+                    assert_eq!(op, &QuantOperator::Equal);
+                    assert_eq!(quantifier.as_ref(), Some(&expected));
+                    assert_eq!(value, "{1,2,3}");
+                }
+                other => panic!("expected a quantified operation, got {:?}", other),
+            }
+        }
+    }
+
+    #[test]
+    fn test_parse_quantified_like_keeps_array_literal() {
+        let params = parse_query_params("name=like(any).{foo*,bar*}", false).unwrap();
+        match &params.filters_root[0].op_expr.operation {
+            Operation::Quant {
+                op,
+                quantifier,
+                value,
+            } => {
+                assert_eq!(op, &QuantOperator::Like);
+                assert_eq!(quantifier.as_ref(), Some(&OpQuantifier::Any));
+                // The `*`-to-`%` mapping belongs to SQL generation, so the
+                // parsed operand is still the literal the client sent.
+                assert_eq!(value, "{foo*,bar*}");
+            }
+            other => panic!("expected a quantified operation, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_parse_negated_quantified_filter() {
+        let params = parse_query_params("id=not.eq(any).{1,2}", false).unwrap();
+        assert!(params.filters_root[0].op_expr.negated);
+        assert!(matches!(
+            params.filters_root[0].op_expr.operation,
+            Operation::Quant {
+                quantifier: Some(OpQuantifier::Any),
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn test_quantifier_form_does_not_capture_fts_language() {
+        // `fts(english).x` has the same shape but is not a quantified
+        // comparison; the operator name is what tells the two apart.
+        let params = parse_query_params("body=fts(english).cat", false).unwrap();
+        match &params.filters_root[0].op_expr.operation {
+            Operation::Fts { language, .. } => {
+                assert_eq!(language.as_deref(), Some("english"));
+            }
+            other => panic!("expected an fts operation, got {:?}", other),
         }
     }
 

@@ -682,4 +682,46 @@ mod tests {
         assert_eq!(castable_type("USER-DEFINED"), None);
         assert_eq!(castable_type("int4; DROP TABLE users"), None);
     }
+
+    /// Build the SQL for the single root filter in `query`.
+    fn filter_sql_for(query: &str, pg_type: &str) -> (String, Vec<String>) {
+        let params = crate::api_request::parse_query_params(query, false).unwrap();
+        let frag = QueryBuilder::filter_sql(&params.filters_root[0], pg_type).unwrap();
+        let bound = frag
+            .params()
+            .iter()
+            .map(|p| format!("{:?}", p))
+            .collect::<Vec<_>>();
+        (frag.sql().to_string(), bound)
+    }
+
+    #[test]
+    fn quantified_comparison_binds_an_array() {
+        let (sql, params) = filter_sql_for("id=eq(any).{1,2,3}", "int4");
+        assert!(sql.contains("= ANY("), "got {sql}");
+        assert!(sql.contains("int4[]"), "got {sql}");
+        assert_eq!(params.len(), 1);
+        assert!(params[0].contains("{1,2,3}"), "got {:?}", params[0]);
+    }
+
+    #[test]
+    fn quantified_all_renders_all() {
+        let (sql, _) = filter_sql_for("id=lt(all).{4,5}", "int4");
+        assert!(sql.contains("< ALL("), "got {sql}");
+    }
+
+    #[test]
+    fn quantified_like_maps_the_wildcard_inside_the_array() {
+        let (_, params) = filter_sql_for("name=like(any).{foo*,*bar}", "text");
+        assert!(params[0].contains("{foo%,%bar}"), "got {:?}", params[0]);
+    }
+
+    #[test]
+    fn array_column_is_not_double_arrayed() {
+        // An array-typed column already compares element-wise, so the cast is
+        // left alone rather than becoming `_text[]`.
+        let (sql, _) = filter_sql_for("tags=eq(any).{a,b}", "_text");
+        assert!(sql.contains("= ANY("), "got {sql}");
+        assert!(!sql.contains("_text[]"), "got {sql}");
+    }
 }
