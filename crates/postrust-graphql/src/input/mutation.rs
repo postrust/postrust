@@ -353,6 +353,7 @@ mod tests {
             deletable: true,
             pk_cols: vec!["id".into()],
             columns,
+            computed_columns: Default::default(),
         }
     }
 

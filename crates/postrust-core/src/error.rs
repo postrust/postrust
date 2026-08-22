@@ -50,7 +50,7 @@ pub enum Error {
     #[error("Unknown column: {0}")]
     UnknownColumn(String),
 
-    #[error("Invalid range: {0}")]
+    #[error("Requested range not satisfiable")]
     InvalidRange(String),
 
     #[error("Invalid media type: {0}")]
@@ -78,13 +78,18 @@ pub enum Error {
     // ========================================================================
     // Authentication/Authorization Errors (401/403)
     // ========================================================================
-    #[error("Invalid JWT: {0}")]
+    /// The token could not be decoded or its signature did not verify.
+    ///
+    /// Distinct from a claims error: nothing about the token was readable, so
+    /// there is nothing to say about what it claimed.
+    #[error("{0}")]
     InvalidJwt(String),
 
-    #[error("JWT expired")]
-    JwtExpired,
+    /// The token decoded, but a claim was missing, malformed or unsatisfied.
+    #[error("{0}")]
+    JwtClaim(String),
 
-    #[error("Missing authentication")]
+    #[error("Anonymous access is disabled")]
     MissingAuth,
 
     #[error("Insufficient permissions: {0}")]
@@ -96,8 +101,13 @@ pub enum Error {
     #[error("Resource not found: {0}")]
     NotFound(String),
 
-    #[error("Table not found: {0}")]
-    TableNotFound(String),
+    #[error("Table not found: {name}")]
+    TableNotFound {
+        /// The name the request asked for, schema-qualified.
+        name: String,
+        /// A table of a very similar name, where the schema has one.
+        suggestion: Option<String>,
+    },
 
     /// No function of that name accepts the arguments supplied.
     ///
@@ -117,8 +127,59 @@ pub enum Error {
     #[error("Column not found: {0}")]
     ColumnNotFound(String),
 
-    #[error("Relationship not found: {0}")]
-    RelationshipNotFound(String),
+    #[error("Could not find a relationship between '{origin}' and '{target}' in the schema cache")]
+    RelationshipNotFound {
+        /// The table the embedding started from.
+        origin: String,
+        /// The resource the request asked to embed.
+        target: String,
+        /// The `!hint` that was meant to identify it, if any.
+        hint: Option<String>,
+        /// The schema that was searched.
+        schema: String,
+        /// A relationship of a very similar name, where there is one.
+        suggestion: Option<String>,
+    },
+
+    /// A filter or order names something the request never embedded.
+    ///
+    /// `?non_existent.name=like.*x*` is not a column with a dot in it, and
+    /// answering it as though the prefix were meaningless would silently
+    /// return the unfiltered table.
+    #[error("'{0}' is not an embedded resource in this request")]
+    NotAnEmbeddedResource(String),
+
+    /// Ordering by a column of a resource that yields many rows per parent.
+    ///
+    /// There is no single value to order on: the parent has a list.
+    #[error("A related order on '{relation}' is not possible")]
+    RelatedOrderNotPossible {
+        /// The table the request started from.
+        origin: String,
+        /// The embedded resource the order named.
+        relation: String,
+    },
+
+    /// A single object was asked for and the result is not one.
+    ///
+    /// `Accept: application/vnd.pgrst.object+json` says the client will accept
+    /// exactly one row; anything else is a negotiation failure rather than a
+    /// missing resource, which is why it is 406 and not 404.
+    #[error("Cannot coerce the result to a single JSON object")]
+    NotSingular {
+        /// How many rows the query actually returned.
+        rows: usize,
+    },
+
+    /// A path with more segments than any resource has.
+    #[error("Invalid path specified in request URL")]
+    InvalidResourcePath,
+
+    /// Preferences the server does not know, sent with `handling=strict`.
+    ///
+    /// Strict handling is a request to be told rather than have them ignored.
+    #[error("Invalid preferences given with handling=strict")]
+    InvalidPreferences(Vec<String>),
 
     // ========================================================================
     // Schema Cache Errors
@@ -166,11 +227,13 @@ impl Error {
             | Self::InvalidQueryParam(_)
             | Self::InvalidHeader(_)
             | Self::InvalidBody(_)
-            | Self::InvalidRange(_)
             | Self::InvalidMediaType(_)
             | Self::MissingParameter(_)
             | Self::AmbiguousRequest(_)
             | Self::UnknownColumn(_)
+            | Self::NotAnEmbeddedResource(_)
+            | Self::RelatedOrderNotPossible { .. }
+            | Self::InvalidPreferences(_)
             | Self::InvalidPlan(_)
             | Self::EmbeddingError(_)
             | Self::AggregatesNotAllowed => StatusCode::BAD_REQUEST,
@@ -181,23 +244,32 @@ impl Error {
             }
 
             // 401 Unauthorized
-            Self::InvalidJwt(_) | Self::JwtExpired | Self::MissingAuth => StatusCode::UNAUTHORIZED,
+            Self::InvalidJwt(_) | Self::JwtClaim(_) | Self::MissingAuth => StatusCode::UNAUTHORIZED,
 
             // 403 Forbidden
             Self::InsufficientPermissions(_) => StatusCode::FORBIDDEN,
 
             // 404 Not Found
             Self::NotFound(_)
-            | Self::TableNotFound(_)
+            | Self::TableNotFound { .. }
             | Self::FunctionNotFound { .. }
             | Self::ColumnNotFound(_)
-            | Self::RelationshipNotFound(_) => StatusCode::NOT_FOUND,
+            | Self::RelationshipNotFound { .. } => StatusCode::NOT_FOUND,
 
             // 405 Method Not Allowed
             Self::UnsupportedMethod(_) => StatusCode::METHOD_NOT_ALLOWED,
 
             // 406 Not Acceptable
-            Self::UnacceptableSchema { .. } => StatusCode::NOT_ACCEPTABLE,
+            Self::UnacceptableSchema { .. } | Self::NotSingular { .. } => {
+                StatusCode::NOT_ACCEPTABLE
+            }
+
+            Self::InvalidResourcePath => StatusCode::NOT_FOUND,
+
+            // A range the server cannot satisfy, which is what 416 is for --
+            // a negative limit asks for a window that does not exist rather
+            // than for one the server merely declines.
+            Self::InvalidRange(_) => StatusCode::RANGE_NOT_SATISFIABLE,
 
             // 500 Internal Server Error
             Self::SchemaCacheNotLoaded
@@ -225,23 +297,28 @@ impl Error {
             Self::UnsupportedMethod(_) => "PGRST104",
             Self::UnacceptableSchema { .. } => "PGRST106",
             Self::UnknownColumn(_) => "PGRST204",
-            Self::InvalidRange(_) => "PGRST107",
+            Self::InvalidRange(_) => "PGRST103",
             Self::InvalidMediaType(_) => "PGRST108",
             Self::MissingParameter(_) => "PGRST109",
             Self::AmbiguousRequest(_) => "PGRST110",
             Self::AmbiguousFunction { .. } => "PGRST203",
             Self::AmbiguousRelationship { .. } => "PGRST201",
 
-            Self::InvalidJwt(_) => "PGRST303",
-            Self::JwtExpired => "PGRST301",
+            Self::InvalidJwt(_) => "PGRST301",
+            Self::JwtClaim(_) => "PGRST303",
             Self::MissingAuth => "PGRST302",
             Self::InsufficientPermissions(_) => "PGRST203",
 
             Self::NotFound(_) => "PGRST205",
-            Self::TableNotFound(_) => "PGRST205",
+            Self::TableNotFound { .. } => "PGRST205",
             Self::FunctionNotFound { .. } => "PGRST202",
             Self::ColumnNotFound(_) => "PGRST204",
-            Self::RelationshipNotFound(_) => "PGRST200",
+            Self::RelationshipNotFound { .. } => "PGRST200",
+            Self::NotAnEmbeddedResource(_) => "PGRST108",
+            Self::NotSingular { .. } => "PGRST116",
+            Self::InvalidResourcePath => "PGRST125",
+            Self::RelatedOrderNotPossible { .. } => "PGRST118",
+            Self::InvalidPreferences(_) => "PGRST122",
 
             Self::SchemaCacheNotLoaded => "PGRST400",
             Self::SchemaCacheLoadFailed(_) => "PGRST401",
@@ -289,6 +366,38 @@ impl Error {
                     })
                     .collect(),
             )),
+            Self::RelationshipNotFound {
+                origin,
+                target,
+                hint,
+                schema,
+                ..
+            } => Some(serde_json::Value::String(format!(
+                "Searched for a foreign key relationship between '{}' and '{}'{} in the schema \
+                 '{}', but no matches were found.",
+                origin,
+                target,
+                match hint {
+                    Some(hint) => format!(" using the hint '{}'", hint),
+                    None => String::new(),
+                },
+                schema
+            ))),
+            Self::RelatedOrderNotPossible { origin, relation } => {
+                Some(serde_json::Value::String(format!(
+                    "'{}' and '{}' do not form a many-to-one or one-to-one relationship",
+                    origin, relation
+                )))
+            }
+            Self::InvalidRange(reason) => Some(serde_json::Value::String(reason.clone())),
+            Self::NotSingular { rows } => Some(serde_json::Value::String(format!(
+                "The result contains {} rows",
+                rows
+            ))),
+            Self::InvalidPreferences(invalid) => Some(serde_json::Value::String(format!(
+                "Invalid preferences: {}",
+                invalid.join(", ")
+            ))),
             Self::FunctionNotFound { name, params, .. } => Some(serde_json::Value::String(
                 format!(
                     "Searched for the function {} {}, but no matches were found in the schema cache.",
@@ -303,10 +412,18 @@ impl Error {
     /// Get a hint for resolving the error.
     pub fn hint(&self) -> Option<String> {
         match self {
-            Self::InvalidJwt(_) => {
-                Some("Check that the JWT is properly signed and not expired".into())
-            }
-            Self::MissingAuth => Some("Provide a valid JWT in the Authorization header".into()),
+            Self::NotAnEmbeddedResource(name) => Some(format!(
+                "Verify that '{}' is included in the 'select' query parameter.",
+                name
+            )),
+            Self::TableNotFound { suggestion, .. } => suggestion
+                .as_ref()
+                .map(|name| format!("Perhaps you meant the table '{}'", name)),
+            Self::RelationshipNotFound {
+                target, suggestion, ..
+            } => suggestion
+                .as_ref()
+                .map(|name| format!("Perhaps you meant '{}' instead of '{}'.", name, target)),
             Self::AmbiguousFunction { .. } => Some(
                 "Try renaming the parameters or the function itself in the database so function \
                  overloading can be resolved"
@@ -360,30 +477,138 @@ pub struct DatabaseError {
     pub column: Option<String>,
 }
 
+/// A response a database function asked for outright.
+#[derive(Clone, Debug)]
+pub struct RaisedResponse {
+    /// The HTTP status to answer with.
+    pub status: u16,
+    /// Headers to add to the response.
+    pub headers: Vec<(String, String)>,
+    /// The response body, verbatim.
+    pub body: serde_json::Value,
+}
+
 impl DatabaseError {
-    /// Get HTTP status code based on PostgreSQL error code.
+    /// The response a `RAISE sqlstate 'PGRST'` asked for.
+    ///
+    /// A function can take over the whole response by raising that SQLSTATE:
+    /// the message is the body, and the detail carries the status, an optional
+    /// status text and any headers. It is how a schema returns a 402 with its
+    /// own payload without the API layer knowing anything about billing.
+    ///
+    /// `None` when this is not that error, or when either JSON does not parse
+    /// -- the latter is a fault in the schema, and reporting it as such is
+    /// more use than a half-applied response.
+    pub fn raised_response(&self) -> Option<RaisedResponse> {
+        if self.code != "PGRST" {
+            return None;
+        }
+
+        let body: serde_json::Value = serde_json::from_str(&self.message).ok()?;
+        let control: serde_json::Value =
+            serde_json::from_str(self.details.as_deref().unwrap_or("{}")).ok()?;
+
+        Some(RaisedResponse {
+            status: control.get("status").and_then(serde_json::Value::as_u64)? as u16,
+            headers: control
+                .get("headers")
+                .and_then(serde_json::Value::as_object)
+                .map(|headers| {
+                    headers
+                        .iter()
+                        .filter_map(|(name, value)| {
+                            Some((name.clone(), value.as_str()?.to_string()))
+                        })
+                        .collect()
+                })
+                .unwrap_or_default(),
+            body,
+        })
+    }
+
+    /// The HTTP status a PostgreSQL error code maps to.
+    ///
+    /// PostgREST's table (`mapSQLtoHTTP` in `Error.hs`), which is part of its
+    /// contract rather than an implementation detail: a client distinguishes a
+    /// missing function from a bad argument by the status.
+    ///
+    /// The default is 400, not 500: the great majority of SQLSTATEs a request
+    /// can provoke are provoked by the request. Reporting them as server
+    /// errors tells the client to retry something that will never succeed.
     pub fn status_code(&self) -> StatusCode {
-        // PostgreSQL error codes: https://www.postgresql.org/docs/current/errcodes-appendix.html
-        match self.code.as_str() {
+        let code = self.code.as_str();
+        let message = self.message.as_str();
+
+        if let Some(raised) = self.raised_response() {
+            if let Ok(status) = StatusCode::from_u16(raised.status) {
+                return status;
+            }
+        }
+
+        // `PT<nnn>` is a status code raised by the schema itself: a function
+        // says `RAISE sqlstate 'PT402'` to answer 402, with the message as the
+        // status text.
+        if let Some(digits) = code.strip_prefix("PT") {
+            if let Ok(status) = digits.parse::<u16>() {
+                if let Ok(status) = StatusCode::from_u16(status) {
+                    return status;
+                }
+            }
+            return StatusCode::INTERNAL_SERVER_ERROR;
+        }
+
+        match code {
+            "23503" | "23505" => StatusCode::CONFLICT,
             // A write attempted inside the read-only transaction a read
             // request runs in. The request was not wrong, the method was.
             "25006" => StatusCode::METHOD_NOT_ALLOWED,
-            // Class 23 - Integrity Constraint Violation
-            c if c.starts_with("23") => StatusCode::CONFLICT,
-            // Class 42 - Syntax Error or Access Rule Violation
-            c if c.starts_with("42") => StatusCode::BAD_REQUEST,
-            // Class 28 - Invalid Authorization Specification
-            c if c.starts_with("28") => StatusCode::FORBIDDEN,
-            // Class 40 - Transaction Rollback
-            c if c.starts_with("40") => StatusCode::CONFLICT,
-            // Class 53 - Insufficient Resources
-            c if c.starts_with("53") => StatusCode::SERVICE_UNAVAILABLE,
-            // Class 54 - Program Limit Exceeded
-            c if c.starts_with("54") => StatusCode::PAYLOAD_TOO_LARGE,
-            // Class P0 - PL/pgSQL Errors (custom raised errors)
-            "P0001" => StatusCode::BAD_REQUEST, // RAISE EXCEPTION
-            // Default to internal server error
-            _ => StatusCode::INTERNAL_SERVER_ERROR,
+            // Cardinality violation. `pg-safeupdate` raises it for an
+            // unqualified UPDATE or DELETE, which is the client's doing;
+            // anything else is a function or view misbehaving.
+            "21000" => match message.ends_with("requires a WHERE clause") {
+                true => StatusCode::BAD_REQUEST,
+                false => StatusCode::INTERNAL_SERVER_ERROR,
+            },
+            // Invalid parameter value, which is also how PostgreSQL reports a
+            // `SET ROLE` to a role that does not exist.
+            "22023" => match message.starts_with("role") && message.ends_with("does not exist") {
+                true => StatusCode::UNAUTHORIZED,
+                false => StatusCode::BAD_REQUEST,
+            },
+            "53400" => StatusCode::INTERNAL_SERVER_ERROR,
+            "57P01" => StatusCode::SERVICE_UNAVAILABLE,
+            "P0001" => StatusCode::BAD_REQUEST,
+            // `xmlagg` is missing only when the request asked for XML the
+            // server cannot produce, which is a negotiation failure.
+            "42883" => match message.starts_with("function xmlagg(") {
+                true => StatusCode::NOT_ACCEPTABLE,
+                false => StatusCode::NOT_FOUND,
+            },
+            "42P01" => StatusCode::NOT_FOUND,
+            "42P17" => StatusCode::INTERNAL_SERVER_ERROR,
+            // Without authentication the client may simply not have said who
+            // it is; with it, it has and is still not permitted.
+            "42501" => StatusCode::UNAUTHORIZED,
+            _ => match code.as_bytes() {
+                [b'0', b'8', ..] => StatusCode::SERVICE_UNAVAILABLE,
+                [b'0', b'9', ..] => StatusCode::INTERNAL_SERVER_ERROR,
+                [b'0', b'L', ..] | [b'0', b'P', ..] => StatusCode::FORBIDDEN,
+                [b'2', b'5', ..] => StatusCode::INTERNAL_SERVER_ERROR,
+                [b'2', b'8', ..] => StatusCode::FORBIDDEN,
+                [b'2', b'D', ..] => StatusCode::INTERNAL_SERVER_ERROR,
+                [b'3', b'8', ..] | [b'3', b'9', ..] | [b'3', b'B', ..] => {
+                    StatusCode::INTERNAL_SERVER_ERROR
+                }
+                [b'4', b'0', ..] => StatusCode::INTERNAL_SERVER_ERROR,
+                [b'5', b'3', ..] => StatusCode::SERVICE_UNAVAILABLE,
+                [b'5', b'4', ..] | [b'5', b'5', ..] | [b'5', b'7', ..] | [b'5', b'8', ..] => {
+                    StatusCode::INTERNAL_SERVER_ERROR
+                }
+                [b'F', b'0', ..] | [b'H', b'V', ..] => StatusCode::INTERNAL_SERVER_ERROR,
+                [b'P', b'0', ..] => StatusCode::INTERNAL_SERVER_ERROR,
+                [b'X', b'X', ..] => StatusCode::INTERNAL_SERVER_ERROR,
+                _ => StatusCode::BAD_REQUEST,
+            },
         }
     }
 
@@ -410,7 +635,11 @@ mod tests {
         );
         assert_eq!(Error::MissingAuth.status_code(), StatusCode::UNAUTHORIZED);
         assert_eq!(
-            Error::TableNotFound("users".into()).status_code(),
+            Error::TableNotFound {
+                name: "users".into(),
+                suggestion: None
+            }
+            .status_code(),
             StatusCode::NOT_FOUND
         );
         assert_eq!(
@@ -425,7 +654,14 @@ mod tests {
         // code as a malformed path. PGRST101 means something else entirely.
         assert_eq!(Error::InvalidQueryParam("test".into()).code(), "PGRST100");
         assert_eq!(Error::MissingAuth.code(), "PGRST302");
-        assert_eq!(Error::TableNotFound("users".into()).code(), "PGRST205");
+        assert_eq!(
+            Error::TableNotFound {
+                name: "users".into(),
+                suggestion: None
+            }
+            .code(),
+            "PGRST205"
+        );
     }
 
     #[test]

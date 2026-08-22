@@ -1407,6 +1407,7 @@ fn build_embed_expressions(
                 &child_alias,
                 &parts.join(", "),
                 max_rows,
+                0,
                 None,
                 None,
             )
@@ -1855,6 +1856,7 @@ mod tests {
             deletable: true,
             pk_cols: vec!["id".into()],
             columns,
+            computed_columns: Default::default(),
         }
     }
 
@@ -1870,6 +1872,7 @@ mod tests {
             timezones: HashSet::new(),
             media_handlers: HashMap::new(),
             pg_version: 150000,
+            representations: Default::default(),
         }
     }
 

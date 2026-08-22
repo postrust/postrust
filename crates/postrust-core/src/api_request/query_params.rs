@@ -74,6 +74,14 @@ pub fn parse_query_params(query: &str, is_rpc: bool) -> Result<QueryParams> {
                     let limit: i64 = decoded_value
                         .parse()
                         .map_err(|_| Error::InvalidQueryParam("limit".into()))?;
+                    // Caught here rather than left to `LIMIT -1`, which
+                    // PostgreSQL rejects with a message about SQL syntax for
+                    // what is a plainly out-of-range request.
+                    if limit < 0 {
+                        return Err(Error::InvalidRange(
+                            "Limit should be greater than or equal to zero.".into(),
+                        ));
+                    }
                     params.ranges.entry(path.join(".")).or_default().limit = Some(limit);
                 }
                 Modifier::Offset => {
@@ -231,7 +239,7 @@ fn parse_aggregate_suffix(input: &str) -> IResult<&str, AggregateFunction> {
 /// Parse spread relation: `...relation(cols)`
 fn parse_spread_relation(input: &str) -> IResult<&str, SelectItem> {
     let (input, _) = tag("...")(input)?;
-    let (input, relation) = parse_identifier(input)?;
+    let (input, relation) = parse_field_name(input)?;
     let (input, (hint, join_type)) = parse_relation_modifiers(input)?;
     // The parentheses are as much a part of the syntax here as they are for a
     // plain embed. Leaving them for the caller to trip over meant the column
@@ -243,7 +251,7 @@ fn parse_spread_relation(input: &str) -> IResult<&str, SelectItem> {
     Ok((
         input,
         SelectItem::SpreadRelation {
-            relation: relation.to_string(),
+            relation,
             hint,
             join_type,
             select: nested,
@@ -293,7 +301,7 @@ fn parse_nested_select(input: &str) -> IResult<&str, Vec<SelectItem>> {
 fn parse_relation_select(input: &str) -> IResult<&str, SelectItem> {
     // As with fields, the alias precedes what it names: `c:clients(*)`.
     let (input, alias) = opt(parse_alias_prefix)(input)?;
-    let (input, name) = parse_identifier(input)?;
+    let (input, name) = parse_field_name(input)?;
     let (input, (hint, join_type)) = parse_relation_modifiers(input)?;
     // The nested selection is parsed rather than skipped: it says which
     // columns of the related resource to return, and may embed further
@@ -305,8 +313,8 @@ fn parse_relation_select(input: &str) -> IResult<&str, SelectItem> {
     Ok((
         input,
         SelectItem::Relation {
-            relation: name.to_string(),
-            alias: alias.map(|s| s.to_string()),
+            relation: name,
+            alias,
             hint,
             join_type,
             select: nested,
@@ -321,7 +329,7 @@ fn parse_field_select(input: &str) -> IResult<&str, SelectItem> {
     // anything else backtracks and is read as the expression itself.
     let (input, alias) = opt(parse_alias_prefix)(input)?;
 
-    let (input, name) = parse_identifier(input)?;
+    let (input, name) = parse_field_name(input)?;
     let (input, json_path) = parse_json_path(input)?;
 
     // A cast on the column binds before the aggregate: `key::integer.sum()`
@@ -338,10 +346,7 @@ fn parse_field_select(input: &str) -> IResult<&str, SelectItem> {
     Ok((
         input,
         SelectItem::Field {
-            field: Field {
-                name: name.to_string(),
-                json_path,
-            },
+            field: Field { name, json_path },
             aggregate,
             aggregate_cast,
             cast: cast.map(|s| s.to_string()),
@@ -363,8 +368,8 @@ fn parse_field_select(input: &str) -> IResult<&str, SelectItem> {
 /// identifier followed by a colon, so the second colon is what tells them
 /// apart -- without this check `id::text` would be read as an alias `id`
 /// applied to nothing.
-fn parse_alias_prefix(input: &str) -> IResult<&str, &str> {
-    let (rest, name) = parse_identifier(input)?;
+fn parse_alias_prefix(input: &str) -> IResult<&str, String> {
+    let (rest, name) = parse_field_name(input)?;
     let (rest, _) = char(':')(rest)?;
 
     if rest.starts_with(':') {
@@ -400,13 +405,12 @@ fn parse_relation_modifiers(input: &str) -> IResult<&str, (Option<String>, Optio
 /// Parse a filter parameter (key=value where key is a field name).
 fn parse_filter_param(key: &str, value: &str) -> Result<(EmbedPath, Filter)> {
     // Parse the key for embedded path: rel.field or field
-    let (path, field_name) = parse_filter_key(key)?;
+    let (path, field) = parse_filter_key(key)?;
 
     // Parse the value for operator and operand
     let op_expr = parse_filter_value(value)?;
 
-    let filter = Filter::new(split_json_path(&field_name), op_expr);
-    Ok((path, filter))
+    Ok((path, Filter::new(field, op_expr)))
 }
 
 /// Split a reference like `data->a->>b` into its column and JSON path.
@@ -427,23 +431,67 @@ fn split_json_path(reference: &str) -> Field {
     }
 }
 
-/// Parse a filter key into path and field name.
-fn parse_filter_key(key: &str) -> Result<(EmbedPath, String)> {
-    let parts: Vec<&str> = key.split('.').collect();
-    if parts.is_empty() {
-        return Err(Error::InvalidQueryParam(key.into()));
+/// Parse a filter key into the embedded path and the field it names.
+///
+/// The key is a run of field names separated by `.`, optionally followed by a
+/// JSON path: `clients.id`, `data->>a`, `"a.dotted.column"`. Splitting on `.`
+/// alone would cut a quoted name in half, and would take the dot of
+/// `id.something` for a path separator, so the names are parsed rather than
+/// split.
+///
+/// A key the grammar cannot account for falls back to the plain split, which
+/// leaves whatever it produced to fail at column resolution -- an honest
+/// outcome, and the one this had before.
+fn parse_filter_key(key: &str) -> Result<(EmbedPath, Field)> {
+    if let Some(parsed) = parse_field_reference(key) {
+        return Ok(parsed);
     }
 
-    if parts.len() == 1 {
-        return Ok((vec![], parts[0].to_string()));
+    let mut parts: Vec<&str> = key.split('.').collect();
+    let field = parts
+        .pop()
+        .ok_or_else(|| Error::InvalidQueryParam(key.into()))?;
+    let path = parts.into_iter().map(String::from).collect();
+    Ok((path, split_json_path(field)))
+}
+
+/// A dotted path of field names followed by an optional JSON path.
+///
+/// `None` when the whole key was not consumed, which is the caller's signal
+/// that this grammar does not describe it.
+fn parse_field_reference(key: &str) -> Option<(EmbedPath, Field)> {
+    let mut names = Vec::new();
+    let mut rest = key;
+
+    loop {
+        let (remainder, name) = parse_field_name(rest).ok()?;
+        names.push(name);
+        match remainder.strip_prefix('.') {
+            Some(after) => rest = after,
+            None => {
+                rest = remainder;
+                break;
+            }
+        }
     }
 
-    let path: Vec<String> = parts[..parts.len() - 1]
-        .iter()
-        .map(|s| s.to_string())
-        .collect();
-    let field = parts.last().unwrap().to_string();
-    Ok((path, field))
+    let (rest, json_path) = parse_json_path(rest).ok()?;
+    if !rest.is_empty() {
+        return None;
+    }
+
+    let field = names.pop()?;
+    Some((names, Field::with_json_path(field, json_path)))
+}
+
+/// Whether a query parameter reads as a filter rather than a function argument.
+///
+/// On `/rpc/f?id=5&id=gt.2` the same name is both: `5` is the argument the
+/// function takes and `gt.2` filters what it returned. What tells them apart
+/// is the value -- an operator prefix means a filter -- so the classification
+/// has to look at the value rather than the name.
+pub fn value_is_filter(value: &str) -> bool {
+    parse_filter_value(value).is_ok()
 }
 
 /// Parse filter value: `operator.value` or `not.operator.value`
@@ -618,36 +666,84 @@ fn parse_operation(value: &str) -> Result<Operation> {
 
 /// Parse IN list: `(a,b,c)` -> vec!["a", "b", "c"]
 fn parse_in_list(value: &str) -> Result<Vec<String>> {
+    // Whitespace immediately inside the parentheses is not part of the first
+    // or last element: `in.(    )` is the empty list, while `in.( ,3,4)` has
+    // an empty first element and is a type error the database reports.
     let inner = value
+        .trim()
         .strip_prefix('(')
         .and_then(|s| s.strip_suffix(')'))
+        .map(|inner| {
+            inner
+                .trim_start_matches([' ', '\t'])
+                .trim_end_matches([' ', '\t'])
+        })
         .ok_or_else(|| Error::InvalidQueryParam(format!("in.{}", value)))?;
 
-    let mut values = Vec::new();
-    let mut current = String::new();
-    let mut quoted = false;
-    let mut chars = inner.chars();
+    // `in.()` names no values at all, which is not the same as naming one
+    // empty value -- and is what `?id=in.()` returning nothing means.
+    if inner.is_empty() {
+        return Ok(Vec::new());
+    }
 
-    while let Some(c) = chars.next() {
-        match c {
-            // A value may be double-quoted so that it can contain a comma.
-            // Inside the quotes a backslash escapes the next character, which
-            // is the only way to write a literal `"` or `\`.
-            '"' => quoted = !quoted,
-            '\\' if quoted => {
-                if let Some(escaped) = chars.next() {
-                    current.push(escaped);
-                }
+    let mut values = Vec::new();
+    let mut rest = inner;
+
+    loop {
+        // Quoting is what lets a value contain the comma that would otherwise
+        // end it, so it counts only when it spans the whole element: in
+        // `Double"Quote"McGraw"` the quotes are part of the name, and taking
+        // them for syntax would silently change what was asked for.
+        let element = match quoted_element(rest) {
+            Some((unquoted, remainder)) => {
+                rest = remainder;
+                unquoted
             }
-            ',' if !quoted => {
-                values.push(std::mem::take(&mut current));
+            None => {
+                let end = rest.find(',').unwrap_or(rest.len());
+                let (element, remainder) = rest.split_at(end);
+                rest = remainder;
+                element.to_string()
             }
-            _ => current.push(c),
+        };
+        values.push(element);
+
+        match rest.strip_prefix(',') {
+            Some(remainder) => rest = remainder,
+            None => break,
         }
     }
-    values.push(current);
 
     Ok(values)
+}
+
+/// A complete double-quoted element at the head of `input`.
+///
+/// `None` unless the closing quote ends the element -- what follows it has to
+/// be the comma that separates elements, or nothing at all.
+fn quoted_element(input: &str) -> Option<(String, &str)> {
+    let body = input.strip_prefix('"')?;
+
+    let mut value = String::new();
+    let mut chars = body.char_indices();
+    while let Some((index, ch)) = chars.next() {
+        match ch {
+            '\\' => {
+                let (_, escaped) = chars.next()?;
+                value.push(escaped);
+            }
+            '"' => {
+                let rest = &body[index + 1..];
+                return match rest.is_empty() || rest.starts_with(',') {
+                    true => Some((value, rest)),
+                    false => None,
+                };
+            }
+            other => value.push(other),
+        }
+    }
+
+    None
 }
 
 /// Parse FTS operation: `(language).query` or `.query`
@@ -734,10 +830,14 @@ fn parse_order_term(value: &str) -> Result<OrderTerm> {
 
 /// Parse `and` or `or` parameter: `(filter1,filter2)`
 fn parse_logic_param(op: LogicOperator, negated: bool, value: &str) -> Result<LogicTree> {
-    let inner = value
-        .strip_prefix('(')
-        .and_then(|s| s.strip_suffix(')'))
-        .ok_or_else(|| Error::InvalidQueryParam(value.into()))?;
+    // Whitespace around the group and around each member is insignificant, as
+    // it is in PostgREST: `and=( a.eq.1 , b.eq.2 )` is the same request as
+    // `and=(a.eq.1,b.eq.2)`.
+    // The group ends at the parenthesis that closes it, not at the last one in
+    // the string: `and=(a.eq.1,b.eq.2))` is a well-formed group with a stray
+    // character after it, and PostgREST reads it as one.
+    let inner =
+        balanced_group(value.trim()).ok_or_else(|| Error::InvalidQueryParam(value.into()))?;
 
     Ok(LogicTree::Expr {
         negated,
@@ -747,6 +847,39 @@ fn parse_logic_param(op: LogicOperator, negated: bool, value: &str) -> Result<Lo
             .map(parse_logic_child)
             .collect::<Result<Vec<_>>>()?,
     })
+}
+
+/// The contents of a parenthesised group at the head of `input`.
+///
+/// Anything after the closing parenthesis is not part of the group and is
+/// discarded, which is what a parser that does not demand end-of-input does.
+fn balanced_group(input: &str) -> Option<&str> {
+    let body = input.strip_prefix('(')?;
+
+    let mut depth = 0usize;
+    let mut quoted = false;
+    let mut escaped = false;
+
+    for (idx, ch) in body.char_indices() {
+        if quoted {
+            match ch {
+                _ if escaped => escaped = false,
+                '\\' => escaped = true,
+                '"' => quoted = false,
+                _ => {}
+            }
+            continue;
+        }
+        match ch {
+            '"' => quoted = true,
+            '(' => depth += 1,
+            ')' if depth == 0 => return Some(&body[..idx]),
+            ')' => depth -= 1,
+            _ => {}
+        }
+    }
+
+    None
 }
 
 /// Split a comma-separated list on its top-level commas only.
@@ -800,6 +933,7 @@ fn parse_logic_child(item: &str) -> Result<LogicTree> {
 
     for (name, op) in [("and", LogicOperator::And), ("or", LogicOperator::Or)] {
         if let Some(rest) = body.strip_prefix(name) {
+            let rest = rest.trim_start();
             if rest.starts_with('(') && rest.ends_with(')') {
                 return parse_logic_param(op, negated, rest);
             }
@@ -809,8 +943,43 @@ fn parse_logic_child(item: &str) -> Result<LogicTree> {
     let (key, val) = body
         .split_once('.')
         .ok_or_else(|| Error::InvalidQueryParam(item.into()))?;
-    let (_, filter) = parse_filter_param(key, val)?;
+    let (_, filter) = parse_filter_param(key, &unquote_logic_operand(val))?;
     Ok(LogicTree::Stmt(filter))
+}
+
+/// Strip the quotes from a logic-tree operand.
+///
+/// Inside `or=(...)` a value may be quoted so that it can contain the comma
+/// that would otherwise end it -- `name.eq."(grandchild,entity,4)"` -- and the
+/// quotes are then syntax rather than part of the value. Outside a logic tree
+/// there is nothing to protect the value from, so a quote there is a
+/// character like any other and is left alone.
+fn unquote_logic_operand(value: &str) -> String {
+    let Some(open) = value.find('"') else {
+        return value.to_string();
+    };
+    // The quote has to open the operand rather than sit inside one: `id.in.(
+    // "a","b")` is a list, which does its own unquoting element by element.
+    if open != 0 && !value[..open].ends_with('.') {
+        return value.to_string();
+    }
+    if !value.ends_with('"') || value.len() < open + 2 {
+        return value.to_string();
+    }
+
+    let mut unquoted = String::from(&value[..open]);
+    let mut chars = value[open + 1..value.len() - 1].chars();
+    while let Some(ch) = chars.next() {
+        match ch {
+            '\\' => {
+                if let Some(escaped) = chars.next() {
+                    unquoted.push(escaped);
+                }
+            }
+            other => unquoted.push(other),
+        }
+    }
+    unquoted
 }
 
 /// A query parameter that modifies a resource rather than filtering it.
@@ -858,8 +1027,72 @@ fn parse_modifier_key(key: &str) -> Option<(EmbedPath, Modifier)> {
 // Helper Parsers
 // ============================================================================
 
+/// The characters a bare identifier is made of.
+///
+/// PostgREST's set exactly: letters, digits, `_`, `$` and the space, with the
+/// result trimmed. A space is allowed because a column may genuinely have one
+/// -- `?select=Just A Server Model` -- and trimming is what keeps
+/// `?select=id, name` from asking for a column called `name ` .
 fn parse_identifier(input: &str) -> IResult<&str, &str> {
-    take_while1(|c: char| c.is_alphanumeric() || c == '_')(input)
+    let (rest, matched) =
+        take_while1(|c: char| c.is_alphanumeric() || c == '_' || c == '$' || c == ' ')(input)?;
+    Ok((rest, matched.trim()))
+}
+
+/// Parse a field name: a quoted name, or dash-joined identifiers.
+///
+/// Quoting is how a client names a column the bare grammar cannot spell --
+/// `"a.dotted.column"`, `"(inside,parens)"` -- and a backslash escapes the
+/// next character inside it.
+///
+/// Unquoted, a `-` joins identifiers into one name, so `field-with_sep` is a
+/// single column. A `-` that starts `->` is not a join: that is a JSON path,
+/// and it belongs to whatever comes after the name.
+fn parse_field_name(input: &str) -> IResult<&str, String> {
+    if let Ok(quoted) = parse_quoted_name(input) {
+        return Ok(quoted);
+    }
+
+    let (mut rest, first) = parse_identifier(input)?;
+    let mut name = first.to_string();
+
+    while let Some(after_dash) = rest.strip_prefix('-') {
+        if after_dash.starts_with('>') {
+            break;
+        }
+        let Ok((next, segment)) = parse_identifier(after_dash) else {
+            break;
+        };
+        name.push('-');
+        name.push_str(segment);
+        rest = next;
+    }
+
+    Ok((rest, name))
+}
+
+/// Parse a double-quoted name, honouring backslash escapes.
+fn parse_quoted_name(input: &str) -> IResult<&str, String> {
+    let (rest, _) = char('"')(input)?;
+
+    let mut name = String::new();
+    let mut chars = rest.char_indices();
+    while let Some((index, ch)) = chars.next() {
+        match ch {
+            '\\' => {
+                if let Some((_, escaped)) = chars.next() {
+                    name.push(escaped);
+                }
+            }
+            '"' => return Ok((&rest[index + 1..], name)),
+            other => name.push(other),
+        }
+    }
+
+    Err(nom::Err::Error(nom::error::Error::new(
+        input,
+        nom::error::ErrorKind::Verify,
+    )))
 }
 
 fn parse_json_path(input: &str) -> IResult<&str, JsonPath> {

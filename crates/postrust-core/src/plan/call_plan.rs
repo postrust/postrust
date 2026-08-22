@@ -139,12 +139,36 @@ fn extract_call_params(request: &ApiRequest, routine: &Routine) -> Result<CallPa
     // are arguments -- the rest are filters on the function's result, which
     // is how `/rpc/getallprojects?id=eq.1` filters rather than failing.
     if !request.query_params.params.is_empty() {
-        let args: Vec<(String, String)> = request
-            .query_params
-            .params
-            .iter()
-            .filter(|(name, _)| routine.params.iter().any(|p| &p.name == name))
-            .cloned()
+        let mut args: Vec<(String, Vec<String>)> = Vec::new();
+        for (name, value) in &request.query_params.params {
+            // A value carrying an operator filters the result; only a bare
+            // one is an argument. `?id=5&id=gt.2` is both at once.
+            if crate::api_request::value_is_filter(value) {
+                continue;
+            }
+            if !routine.params.iter().any(|p| &p.name == name) {
+                continue;
+            }
+            match args.iter_mut().find(|(existing, _)| existing == name) {
+                Some((_, values)) => values.push(value.clone()),
+                None => args.push((name.clone(), vec![value.clone()])),
+            }
+        }
+
+        // A name given more than once is one argument, not two: for a
+        // variadic parameter every value goes into the array it takes, and
+        // for any other the last one wins -- repeating it cannot mean asking
+        // for two values where the signature has room for one.
+        let args: Vec<(String, String)> = args
+            .into_iter()
+            .map(|(name, values)| {
+                let variadic = routine.params.iter().any(|p| p.name == name && p.variadic);
+                let value = match variadic {
+                    true => array_literal(&values),
+                    false => values.last().cloned().unwrap_or_default(),
+                };
+                (name, value)
+            })
             .collect();
 
         if !args.is_empty() {
@@ -154,6 +178,19 @@ fn extract_call_params(request: &ApiRequest, routine: &Routine) -> Result<CallPa
 
     // No parameters
     Ok(CallParams::None)
+}
+
+/// Render values as a PostgreSQL array literal.
+///
+/// Every element is quoted, which is always valid and saves deciding which
+/// ones would otherwise need it -- an element containing a comma, a brace or a
+/// quote of its own would silently change the array's shape.
+fn array_literal(values: &[String]) -> String {
+    let elements: Vec<String> = values
+        .iter()
+        .map(|value| format!("\"{}\"", value.replace('\\', "\\\\").replace('"', "\\\"")))
+        .collect();
+    format!("{{{}}}", elements.join(","))
 }
 
 #[cfg(test)]

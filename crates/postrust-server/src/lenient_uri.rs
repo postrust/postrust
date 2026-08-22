@@ -34,11 +34,18 @@ use std::pin::Pin;
 use std::task::{Context, Poll};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
-/// Bytes that httparse accepts in a request target but `http::Uri` rejects.
+/// Bytes that httparse accepts in a request target but `http::Uri` rejects,
+/// or reads as something other than part of the path and query.
 ///
 /// Checked against http 1.4 by parsing a URI containing each byte in turn.
+///
+/// `#` is not rejected -- it is read as starting a fragment, and everything
+/// after it disappears from the query. A fragment is a client-side notion that
+/// never reaches a server, so a `#` in a request target is an ordinary
+/// character of the query: `?select=data->!@#$%^&*_d` names a JSON key that
+/// happens to contain one.
 fn needs_encoding(b: u8) -> bool {
-    matches!(b, b'"' | b'<' | b'>') || b >= 0x80
+    matches!(b, b'"' | b'<' | b'>' | b'#') || b >= 0x80
 }
 
 /// Cap on a buffered request line or header line.

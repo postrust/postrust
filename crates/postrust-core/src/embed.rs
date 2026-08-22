@@ -312,6 +312,10 @@ impl EmbedPlan {
         child_alias: &str,
         inner_select: &str,
         limit: Option<i64>,
+        // `clients.offset=1` skips rows inside the embed. A to-one embed that
+        // is skipped past yields no row at all, which is null -- the same
+        // answer as no match, and the one PostgREST gives.
+        offset: i64,
         child_where: Option<&str>,
         // `clients.order=name.desc` orders the rows inside the embed, which
         // belongs to the child's own subselect -- and has to be applied before
@@ -391,6 +395,10 @@ impl EmbedPlan {
             inner.push_str(&format!(" LIMIT {}", limit));
         } else if !self.is_list {
             inner.push_str(" LIMIT 1");
+        }
+
+        if offset > 0 {
+            inner.push_str(&format!(" OFFSET {}", offset));
         }
 
         let alias = postrust_sql::escape_ident(&format!("{}_j", child_alias));
@@ -764,7 +772,16 @@ mod tests {
     #[test]
     fn embed_expression_aggregates_a_to_many_relation() {
         let sql = plan(true)
-            .embed_expression("p", "\"p\"", "posts", r#""id", "title""#, None, None, None)
+            .embed_expression(
+                "p",
+                "\"p\"",
+                "posts",
+                r#""id", "title""#,
+                None,
+                0,
+                None,
+                None,
+            )
             .unwrap();
 
         assert!(sql.starts_with("COALESCE((SELECT json_agg("), "{}", sql);
@@ -784,7 +801,7 @@ mod tests {
     #[test]
     fn embed_expression_takes_one_row_for_a_to_one_relation() {
         let sql = plan(false)
-            .embed_expression("p", "\"p\"", "author", r#""id""#, None, None, None)
+            .embed_expression("p", "\"p\"", "author", r#""id""#, None, 0, None, None)
             .unwrap();
 
         assert!(sql.contains("row_to_json"), "{}", sql);
@@ -799,7 +816,7 @@ mod tests {
     #[test]
     fn embed_expression_limits_rows_per_parent() {
         let sql = plan(true)
-            .embed_expression("p", "\"p\"", "posts", r#""id""#, Some(25), None, None)
+            .embed_expression("p", "\"p\"", "posts", r#""id""#, Some(25), 0, None, None)
             .unwrap();
         assert!(sql.contains("LIMIT 25"), "{}", sql);
     }

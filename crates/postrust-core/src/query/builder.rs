@@ -81,6 +81,14 @@ impl QueryBuilder {
     fn build_select_field(field: &CoercibleSelectField) -> Result<SqlFragment> {
         let mut frag = SqlFragment::new();
 
+        // `*` reaches here only where the columns are not known ahead of time
+        // -- a function's result, where the plan has no table to expand it
+        // against. Quoting it would ask for a column literally named `*`.
+        if field.field.name == "*" && field.aggregate.is_none() && field.cast.is_none() {
+            frag.push("*");
+            return Ok(frag);
+        }
+
         // Aggregate function
         if let Some(agg) = &field.aggregate {
             frag.push(agg.to_sql());
@@ -112,8 +120,10 @@ impl QueryBuilder {
             && field.field.json_path.is_empty()
             && !decodable_type(&field.field.ir_type);
         if render_as_json {
+            let mut inner = SqlFragment::new();
+            push_field_ref(&mut inner, &field.field);
             frag.push("to_jsonb(");
-            frag.push(&escape_ident(&field.field.name));
+            frag.push(inner.sql());
             frag.push(") AS ");
             frag.push(&escape_ident(
                 field.alias.as_deref().unwrap_or(&field.field.name),
@@ -130,8 +140,19 @@ impl QueryBuilder {
         if needs_parens {
             frag.push("(");
         }
-        frag.push(&escape_ident(&field.field.name));
-        push_json_path(&mut frag, &field.field.json_path);
+        // A transformer renders the column instead of this process: PostgREST
+        // uses it for a schema's declared data representations, and it is also
+        // how a value whose spelling depends on the session -- a `timestamptz`
+        // under `Prefer: timezone` -- gets rendered where the session is.
+        match &field.field.transform {
+            Some(function) => {
+                frag.push(function);
+                frag.push("(");
+                push_field_ref(&mut frag, &field.field);
+                frag.push(")");
+            }
+            None => push_field_ref(&mut frag, &field.field),
+        }
         if needs_parens {
             frag.push(")");
         }
@@ -167,8 +188,18 @@ impl QueryBuilder {
         // and PostgreSQL would label the column `?column?`. PostgREST names it
         // after the last key in the path, falling back to the column itself
         // when the path ends in an array index.
-        let implicit_alias = if field.alias.is_none() && !field.field.json_path.is_empty() {
+        let implicit_alias = if field.alias.is_some() {
+            None
+        } else if field.field.transform.is_some() {
+            Some(field.field.name.clone())
+        } else if !field.field.json_path.is_empty() {
             Some(json_path_alias(&field.field.name, &field.field.json_path))
+        } else if field.field.computed.is_some() {
+            // A call is an expression, and PostgreSQL would label it after the
+            // function -- which is the right name, but only by coincidence of
+            // the two agreeing. Naming it outright keeps a schema-qualified
+            // call from arriving under some other label.
+            Some(field.field.name.clone())
         } else {
             None
         };
@@ -230,8 +261,7 @@ impl QueryBuilder {
     /// assembled outside the read plan.
     pub fn column_sql(field: &crate::plan::CoercibleField) -> String {
         let mut frag = SqlFragment::new();
-        frag.push(&escape_ident(&field.name));
-        push_json_path(&mut frag, &field.json_path);
+        push_field_ref(&mut frag, field);
         frag.sql().to_string()
     }
 
@@ -245,6 +275,22 @@ impl QueryBuilder {
     /// name would resolve outward to the correlated parent instead.
     pub fn filter_sql(filter: &crate::api_request::Filter, pg_type: &str) -> Result<SqlFragment> {
         Self::build_filter(&CoercibleFilter::from_filter(filter, pg_type))
+    }
+
+    /// Build the SQL for a logic tree against a table whose column types
+    /// `type_resolver` supplies.
+    ///
+    /// Exposed for the same reason as `filter_sql`: an embedded resource's
+    /// `and=`/`or=` is applied inside a subquery the embedding path assembles
+    /// itself, without going through a full plan.
+    pub fn logic_sql<F>(
+        tree: &crate::api_request::LogicTree,
+        type_resolver: F,
+    ) -> Result<SqlFragment>
+    where
+        F: Fn(&str) -> String + Copy,
+    {
+        Self::build_logic_tree(&CoercibleLogicTree::from_logic_tree(tree, type_resolver))
     }
 
     fn build_filter(filter: &CoercibleFilter) -> Result<SqlFragment> {
@@ -264,16 +310,28 @@ impl QueryBuilder {
         // is not already one is wrapped, so `text_search=fts.x` searches the
         // text instead of failing to find an operator. A domain over tsvector
         // is already one, hence the prefix test rather than an equality.
-        let to_tsvector = matches!(
-            filter.op_expr.operation,
-            crate::api_request::Operation::Fts { .. }
-        ) && !filter.field.ir_type.starts_with("tsvector");
-        if to_tsvector {
+        //
+        // The language belongs on both sides: `to_tsvector('french', col) @@
+        // to_tsquery('french', $1)`. Left off the left-hand side the column is
+        // lexed with the default configuration -- English -- and a French
+        // query then matches nothing, quietly and with a 200.
+        let to_tsvector = match &filter.op_expr.operation {
+            crate::api_request::Operation::Fts { language, .. }
+                if !filter.field.ir_type.starts_with("tsvector") =>
+            {
+                Some(language.clone())
+            }
+            _ => None,
+        };
+        if let Some(language) = &to_tsvector {
             frag.push("to_tsvector(");
+            if let Some(language) = language {
+                frag.push_typed_param(language.clone(), "regconfig");
+                frag.push(", ");
+            }
         }
-        frag.push(&escape_ident(&filter.field.name));
-        push_json_path(&mut frag, &filter.field.json_path);
-        if to_tsvector {
+        push_field_ref(&mut frag, &filter.field);
+        if to_tsvector.is_some() {
             frag.push(")");
         }
 
@@ -284,14 +342,49 @@ impl QueryBuilder {
         let cast = if filter.field.json_path.is_empty() {
             castable_type(&filter.field.ir_type)
         } else {
-            None
+            // A JSON path leaves either `jsonb` (`->`) or `text` (`->>`) on the
+            // left. Text needs no cast, but `jsonb = $1` with the placeholder
+            // bound as text finds no operator, so the value is cast to match.
+            json_path_result_cast(&filter.field.json_path)
         };
-        let push_value = |frag: &mut SqlFragment, value: String| match cast {
-            Some(pg_type) => {
-                frag.push_typed_param(value, pg_type);
-            }
-            None => {
+
+        // `match` is `~`, and on an `ltree` the right-hand side of `~` is an
+        // `lquery` rather than another `ltree`: `path=match.*.Science` is a
+        // pattern, not a path. Casting it to the column's own type -- which is
+        // what every other operator wants -- finds no operator at all.
+        let cast = match (&filter.op_expr.operation, filter.field.ir_type.as_str()) {
+            (
+                crate::api_request::Operation::Quant {
+                    op:
+                        crate::api_request::QuantOperator::Match
+                        | crate::api_request::QuantOperator::IMatch,
+                    quantifier: None,
+                    ..
+                },
+                "ltree",
+            ) => Some("lquery"),
+            _ => cast,
+        };
+        // A schema that declared how one of its domains is written also
+        // declared how it is read: the cast parses the value the client sent,
+        // in its own spelling, rather than PostgreSQL's input function for the
+        // type underneath.
+        let parser = filter.field.transform.as_deref();
+        let push_value = |frag: &mut SqlFragment, value: String| {
+            if let Some(parser) = parser {
+                frag.push(parser);
+                frag.push("(");
                 frag.push_param(value);
+                frag.push(")");
+                return;
+            }
+            match cast {
+                Some(pg_type) => {
+                    frag.push_typed_param(value, pg_type);
+                }
+                None => {
+                    frag.push_param(value);
+                }
             }
         };
 
@@ -340,6 +433,14 @@ impl QueryBuilder {
                 } else {
                     push_value(&mut frag, value.clone());
                 }
+            }
+            crate::api_request::Operation::In(values) if values.is_empty() => {
+                // `IN ()` is a syntax error. The empty array says the same
+                // thing and is a single expression, so it needs no parentheses
+                // of its own wherever the filter ends up. It is false for
+                // every value, nulls included, which is what makes `not.in.()`
+                // match everything.
+                frag.push(" = ANY('{}')");
             }
             crate::api_request::Operation::In(values) => {
                 frag.push(" IN (");
@@ -395,8 +496,7 @@ impl QueryBuilder {
             OrderExpr::new(&term.field.name)
         } else {
             let mut frag = SqlFragment::new();
-            frag.push(&escape_ident(&term.field.name));
-            push_json_path(&mut frag, &term.field.json_path);
+            push_field_ref(&mut frag, &term.field);
             OrderExpr::raw(frag.sql())
         };
 
@@ -735,6 +835,44 @@ impl QueryBuilder {
 /// what distinguishes `data->'1'` from `data->1` in PostgreSQL. Operands reach
 /// us already restricted to alphanumerics and underscores by the parser; the
 /// quote doubling is belt-and-braces so this stays safe if that ever loosens.
+/// A column reference, converted to JSON first where the path requires it.
+fn push_field_ref(frag: &mut SqlFragment, field: &crate::plan::CoercibleField) {
+    // A computed field is a function of the whole row. PostgreSQL would also
+    // accept `items.always_true` and resolve it to the same call, but only
+    // where the reference is qualified by the relation -- which a bare column
+    // name here is not -- so the call is written out.
+    let column = match &field.computed {
+        Some(computed) => format!(
+            "{}.{}({})",
+            escape_ident(&computed.function.schema),
+            escape_ident(&computed.function.name),
+            escape_ident(&computed.relation),
+        ),
+        None => escape_ident(&field.name),
+    };
+
+    if field.to_json {
+        frag.push("to_jsonb(");
+        frag.push(&column);
+        frag.push(")");
+    } else {
+        frag.push(&column);
+    }
+    push_json_path(frag, &field.json_path);
+}
+
+/// The type a JSON path leaves on the left of a comparison.
+///
+/// `None` for a path ending in `->>`, which is already text -- the type filter
+/// values are bound as, so no cast is wanted.
+fn json_path_result_cast(path: &crate::api_request::JsonPath) -> Option<&'static str> {
+    use crate::api_request::JsonOperation;
+    match path.last()? {
+        JsonOperation::Arrow(_) => Some("jsonb"),
+        JsonOperation::DoubleArrow(_) => None,
+    }
+}
+
 fn push_json_path(frag: &mut SqlFragment, path: &crate::api_request::JsonPath) {
     use crate::api_request::{JsonOperand, JsonOperation};
 

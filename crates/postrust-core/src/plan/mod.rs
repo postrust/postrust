@@ -63,6 +63,7 @@ pub fn create_action_plan(request: &ApiRequest, schema_cache: &SchemaCache) -> R
             if matches!(db_action, DbAction::SchemaRead { .. }) {
                 return Ok(ActionPlan::Info(InfoPlan::OpenApiSpec));
             }
+            validate_embed_paths(request)?;
             let plan = create_db_plan(request, db_action, schema_cache)?;
             Ok(ActionPlan::Db(plan))
         }
@@ -70,6 +71,63 @@ pub fn create_action_plan(request: &ApiRequest, schema_cache: &SchemaCache) -> R
         Action::RoutineInfo { qi, .. } => Ok(ActionPlan::Info(InfoPlan::RoutineInfo(qi.clone()))),
         Action::SchemaInfo => Ok(ActionPlan::Info(InfoPlan::OpenApiSpec)),
     }
+}
+
+/// Check that every dotted filter, order or range names a resource that was
+/// embedded.
+///
+/// `?non_existent_projects.name=like.*x*` looks like a filter on an embedded
+/// resource, and answering it as though the prefix meant nothing would return
+/// the whole table with no sign that the filter was dropped. PostgREST reports
+/// the first segment it cannot account for, which is the one the client got
+/// wrong.
+fn validate_embed_paths(request: &ApiRequest) -> Result<()> {
+    use crate::api_request::SelectItem;
+
+    // An embed answers to the alias the request gave it and to the relation's
+    // own name: `the_tasks:tasks(*)` is addressed by either.
+    fn descend<'a>(items: &'a [SelectItem], segment: &str) -> Option<&'a [SelectItem]> {
+        items.iter().find_map(|item| match item {
+            SelectItem::Relation {
+                relation,
+                alias,
+                select,
+                ..
+            } if relation == segment || alias.as_deref() == Some(segment) => {
+                Some(select.as_slice())
+            }
+            SelectItem::SpreadRelation {
+                relation, select, ..
+            } if relation == segment => Some(select.as_slice()),
+            _ => None,
+        })
+    }
+
+    let check = |path: &[String]| -> Result<()> {
+        let mut items = request.query_params.select.as_slice();
+        for segment in path {
+            items = descend(items, segment)
+                .ok_or_else(|| Error::NotAnEmbeddedResource(segment.clone()))?;
+        }
+        Ok(())
+    };
+
+    for (path, _) in &request.query_params.filters {
+        check(path)?;
+    }
+    for (path, _) in &request.query_params.order {
+        check(path)?;
+    }
+    for (path, _) in &request.query_params.logic {
+        check(path)?;
+    }
+    for path in request.query_params.ranges.keys() {
+        if !path.is_empty() {
+            check(&path.split('.').map(String::from).collect::<Vec<_>>())?;
+        }
+    }
+
+    Ok(())
 }
 
 /// The arguments a request supplies to a function.
@@ -94,15 +152,16 @@ fn supplied_arguments(request: &ApiRequest) -> Vec<String> {
         })
         .collect();
 
-    request
-        .query_params
-        .params
-        .iter()
-        .map(|(name, _)| name.clone())
-        .filter(|name| {
-            !request.query_params.filter_fields.contains(name) && !embedded.contains(name)
-        })
-        .collect()
+    let mut names: Vec<String> = Vec::new();
+    for (name, value) in &request.query_params.params {
+        if crate::api_request::value_is_filter(value) || embedded.contains(name) {
+            continue;
+        }
+        if !names.contains(name) {
+            names.push(name.clone());
+        }
+    }
+    names
 }
 
 /// Choose which signature of a function the supplied arguments call.

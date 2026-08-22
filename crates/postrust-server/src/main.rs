@@ -215,21 +215,29 @@ async fn main() -> Result<()> {
         }
     }
 
-    // Add root info endpoint
-    app = app.route(
-        "/",
-        axum::routing::get(|| async {
-            Json(serde_json::json!({
-                "name": "postrust",
-                "version": env!("CARGO_PKG_VERSION"),
-                "api": "/api",
-                "custom": "/_",
-                "health": "/_/health",
-                "admin": "/admin",
-                "docs": "/admin/swagger"
-            }))
-        }),
-    );
+    // Add root info endpoint.
+    //
+    // Not in compatibility mode: there `/` is part of the API surface -- it is
+    // where PostgREST serves the schema description, and where it reports an
+    // `Accept-Profile` naming a schema that is not exposed. A directory of
+    // this server's own endpoints in its place answers a different question
+    // from the one asked.
+    if !config.compat_mode {
+        app = app.route(
+            "/",
+            axum::routing::get(|| async {
+                Json(serde_json::json!({
+                    "name": "postrust",
+                    "version": env!("CARGO_PKG_VERSION"),
+                    "api": "/api",
+                    "custom": "/_",
+                    "health": "/_/health",
+                    "admin": "/admin",
+                    "docs": "/admin/swagger"
+                }))
+            }),
+        );
+    }
 
     // Apply CORS and state
     let app = app

@@ -9,7 +9,7 @@ pub mod query_params;
 pub mod types;
 
 pub use preferences::parse_preferences;
-pub use query_params::parse_query_params;
+pub use query_params::{parse_query_params, value_is_filter};
 pub use types::*;
 
 use crate::error::{Error, Result};
@@ -95,20 +95,31 @@ fn parse_resource(path: &str) -> Result<Resource> {
         return Ok(Resource::Schema);
     }
 
+    // A trailing slash names the same resource: `/items/` is `/items`.
+    let path = path.trim_end_matches('/');
+    if path.is_empty() {
+        return Ok(Resource::Schema);
+    }
+
     if let Some(func_name) = path.strip_prefix("rpc/") {
         if func_name.is_empty() {
             return Err(Error::InvalidPath("Empty function name".into()));
         }
+        if func_name.contains('/') {
+            return Err(Error::InvalidResourcePath);
+        }
         return Ok(Resource::Routine(func_name.to_string()));
     }
 
-    // Table/view name is the first path segment
-    let name = path.split('/').next().unwrap_or(path);
-    if name.is_empty() {
-        return Err(Error::InvalidPath("Empty resource name".into()));
+    // A table is named by one segment. More than one names nothing at all --
+    // there is no nesting in the API -- and reading only the first would
+    // answer a request for `/first/second/third` with the contents of
+    // `first`, which is not what was asked for.
+    if path.contains('/') {
+        return Err(Error::InvalidResourcePath);
     }
 
-    Ok(Resource::Relation(name.to_string()))
+    Ok(Resource::Relation(path.to_string()))
 }
 
 /// Parse the schema from Accept-Profile or Content-Profile headers.
@@ -251,8 +262,11 @@ fn parse_media_type(s: &str) -> MediaType {
         "*/*" => MediaType::Any,
         s if s.starts_with("application/vnd.pgrst.object") => MediaType::SingularJson {
             nullable: s.contains("nulls=null"),
+            strip_nulls: s.contains("nulls=stripped"),
         },
-        s if s.starts_with("application/vnd.pgrst.array") => MediaType::ArrayJsonStrip,
+        s if s.starts_with("application/vnd.pgrst.array") => MediaType::ArrayJson {
+            strip_nulls: s.contains("nulls=stripped"),
+        },
         other => MediaType::Other(other.to_string()),
     }
 }

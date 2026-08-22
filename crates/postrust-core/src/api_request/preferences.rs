@@ -19,6 +19,12 @@ pub fn parse_preferences(headers: &HeaderMap) -> Result<Preferences> {
         parse_preference(&mut prefs, pref);
     }
 
+    // `handling=strict` asks to be told about preferences the server does not
+    // implement rather than have them quietly dropped.
+    if prefs.handling == PreferHandling::Strict && !prefs.invalid.is_empty() {
+        return Err(Error::InvalidPreferences(prefs.invalid));
+    }
+
     Ok(prefs)
 }
 
@@ -78,6 +84,8 @@ fn parse_preference(prefs: &mut Preferences, pref: &str) {
             "timezone" => {
                 prefs.timezone = Some(value.to_string());
             }
+            // Understood, and applied where the RPC path reads the body.
+            "params" => {}
             "max-affected" => {
                 if let Ok(n) = value.parse::<i64>() {
                     prefs.max_affected = Some(n);
@@ -145,6 +153,19 @@ pub fn preference_applied(prefs: &Preferences) -> Option<String> {
     match prefs.transaction {
         PreferTransaction::Rollback => applied.push("tx=rollback"),
         PreferTransaction::Commit => {}
+    }
+
+    // Strict handling and a timezone are both applied rather than merely
+    // understood, so both are reported back. The timezone is owned rather than
+    // borrowed, which is why the list is built as strings from here on.
+    let mut applied: Vec<String> = applied.into_iter().map(String::from).collect();
+
+    if prefs.handling == PreferHandling::Strict {
+        applied.insert(0, "handling=strict".to_string());
+    }
+
+    if let Some(timezone) = &prefs.timezone {
+        applied.push(format!("timezone={}", timezone));
     }
 
     if applied.is_empty() {

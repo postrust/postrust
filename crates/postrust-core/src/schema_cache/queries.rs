@@ -61,9 +61,22 @@ pub async fn load_tables(pool: &PgPool, schemas: &[String]) -> Result<TablesMap>
                   AND tp.table_name = t.table_name
                   AND tp.privilege_type = 'DELETE'
             ) as deletable
-        FROM information_schema.tables t
+        FROM (
+            -- `information_schema.tables` has no row for a materialized view,
+            -- so one is added from the catalogue. Everything downstream keys
+            -- off `table_type`, and a materialized view is a view that cannot
+            -- be written to -- which is what the privilege lookups above
+            -- already report, since it has no INSERT/UPDATE/DELETE grants.
+            SELECT table_schema, table_name, table_type
+              FROM information_schema.tables
+             WHERE table_type IN ('BASE TABLE', 'VIEW')
+            UNION ALL
+            SELECT n.nspname, c.relname, 'VIEW'
+              FROM pg_class c
+              JOIN pg_namespace n ON n.oid = c.relnamespace
+             WHERE c.relkind = 'm'
+        ) t
         WHERE t.table_schema = ANY($1)
-          AND t.table_type IN ('BASE TABLE', 'VIEW')
         ORDER BY t.table_schema, t.table_name
         "#,
     )
@@ -90,6 +103,7 @@ pub async fn load_tables(pool: &PgPool, schemas: &[String]) -> Result<TablesMap>
             deletable: row.get("deletable"),
             pk_cols: pk_cols.clone(),
             columns: load_columns(pool, &schema, &name, &pk_cols).await?,
+            computed_columns: Default::default(),
         };
 
         tables.insert(qi, table);
@@ -140,6 +154,13 @@ async fn load_columns(
     .fetch_all(pool)
     .await
     .map_err(|e| Error::SchemaCacheLoadFailed(e.to_string()))?;
+
+    // A materialized view has no rows in `information_schema.columns`; its
+    // columns come from the catalogue instead.
+    let rows = match rows.is_empty() {
+        true => load_catalog_columns(pool, schema, table).await?,
+        false => rows,
+    };
 
     for row in rows {
         let name: String = row.get("column_name");
@@ -605,37 +626,125 @@ pub async fn load_media_handlers(pool: &PgPool, schemas: &[String]) -> Result<Me
 /// depends on, but not which of the view's own columns each one became -- that
 /// lives in the parsed rule tree. Matching by name covers a view that selects
 /// its columns through unchanged, and misses one that renames them, which is
-/// the honest limit of doing this without parsing the rule.
-pub async fn load_view_columns(
+/// Columns read straight from the catalogue, for a relation
+/// `information_schema` does not describe.
+///
+/// The columns are shaped to match what the `information_schema` query
+/// returns, so the caller cannot tell which of the two answered.
+async fn load_catalog_columns(
     pool: &PgPool,
-    schemas: &[String],
-) -> Result<Vec<(QualifiedIdentifier, QualifiedIdentifier, String)>> {
+    schema: &str,
+    table: &str,
+) -> Result<Vec<sqlx::postgres::PgRow>> {
+    sqlx::query(
+        r#"
+        SELECT
+            a.attname AS column_name,
+            a.attnum::int AS ordinal_position,
+            CASE WHEN a.attnotnull THEN 'NO' ELSE 'YES' END AS is_nullable,
+            pg_catalog.format_type(a.atttypid, NULL) AS data_type,
+            t.typname AS udt_name,
+            NULL::int AS character_maximum_length,
+            pg_catalog.pg_get_expr(d.adbin, d.adrelid) AS column_default,
+            pg_catalog.col_description(c.oid, a.attnum) AS description,
+            COALESCE(
+                (SELECT array_agg(e.enumlabel ORDER BY e.enumsortorder)
+                   FROM pg_enum e WHERE e.enumtypid = t.oid),
+                ARRAY[]::text[]
+            ) AS enum_values
+        FROM pg_class c
+        JOIN pg_namespace n ON n.oid = c.relnamespace
+        JOIN pg_attribute a ON a.attrelid = c.oid AND a.attnum > 0 AND NOT a.attisdropped
+        JOIN pg_type t ON t.oid = a.atttypid
+        LEFT JOIN pg_attrdef d ON d.adrelid = c.oid AND d.adnum = a.attnum
+        WHERE n.nspname = $1 AND c.relname = $2
+        ORDER BY a.attnum
+        "#,
+    )
+    .bind(schema)
+    .bind(table)
+    .fetch_all(pool)
+    .await
+    .map_err(|e| Error::SchemaCacheLoadFailed(e.to_string()))
+}
+
+/// Casts a schema declares between one of its domains and `json` or `text`.
+///
+/// PostgREST calls these data representations: a domain over `integer` with a
+/// cast to `json` decides how a column of that domain is rendered, and a cast
+/// back from `text` decides how a filter value written against it is read. It
+/// lets a schema say that a colour is `"#01E240"` on the wire and an integer in
+/// storage, with neither the client nor the table having to know about the
+/// other.
+///
+/// Keyed by `(source type, target type)` so both directions come out of one
+/// query: the render is `(domain, json)` and the parse is `(text, domain)`.
+pub async fn load_representations(
+    pool: &PgPool,
+) -> Result<std::collections::HashMap<(String, String), String>> {
     let rows = sqlx::query(
         r#"
-        SELECT DISTINCT
-            vn.nspname AS view_schema,
-            v.relname  AS view_name,
-            tn.nspname AS base_schema,
-            t.relname  AS base_name,
-            va.attname AS column_name
-        FROM pg_depend d
-        JOIN pg_rewrite r    ON r.oid = d.objid AND r.rulename = '_RETURN'
-        JOIN pg_class v      ON v.oid = r.ev_class AND v.relkind = ANY (ARRAY['v','m'])
-        JOIN pg_namespace vn ON vn.oid = v.relnamespace
-        JOIN pg_class t      ON t.oid = d.refobjid
-                            AND t.relkind = ANY (ARRAY['r','v','m','p','f'])
-        JOIN pg_namespace tn ON tn.oid = t.relnamespace
-        JOIN pg_attribute ta ON ta.attrelid = t.oid
-                            AND ta.attnum = d.refobjsubid
-                            AND NOT ta.attisdropped
-        JOIN pg_attribute va ON va.attrelid = v.oid
-                            AND va.attname = ta.attname
-                            AND NOT va.attisdropped
-        WHERE d.classid = 'pg_rewrite'::regclass
-          AND d.refclassid = 'pg_class'::regclass
-          AND d.refobjsubid > 0
-          AND v.oid <> t.oid
-          AND vn.nspname = ANY($1)
+        SELECT c.castsource::regtype::text AS source,
+               c.casttarget::regtype::text AS target,
+               c.castfunc::regproc::text   AS function
+          FROM pg_catalog.pg_cast c
+          JOIN pg_catalog.pg_type src ON src.oid = c.castsource
+          JOIN pg_catalog.pg_type dst ON dst.oid = c.casttarget
+         WHERE c.castcontext = 'i'
+           AND c.castmethod = 'f'
+           AND has_function_privilege(c.castfunc, 'execute')
+           AND ((src.typtype = 'd' AND c.casttarget IN ('json'::regtype, 'text'::regtype))
+             OR (dst.typtype = 'd' AND c.castsource IN ('json'::regtype, 'text'::regtype)))
+        "#,
+    )
+    .fetch_all(pool)
+    .await
+    .map_err(|e| Error::SchemaCacheLoadFailed(e.to_string()))?;
+
+    Ok(rows
+        .into_iter()
+        .map(|row| {
+            (
+                (
+                    row.get::<String, _>("source"),
+                    row.get::<String, _>("target"),
+                ),
+                row.get::<String, _>("function"),
+            )
+        })
+        .collect())
+}
+
+/// Functions of a table's row type, which read as though they were columns.
+///
+/// `create function always_true(items) returns boolean` makes
+/// `?select=id,always_true` and `?always_true=is.true` work on `items`:
+/// PostgreSQL resolves `items.always_true` to the function call, and PostgREST
+/// exposes that. Only single-argument functions returning a single value
+/// qualify -- one returning `setof` another table is a computed *relationship*,
+/// which is embedded rather than selected.
+pub async fn load_computed_columns(
+    pool: &PgPool,
+    schemas: &[String],
+) -> Result<Vec<(QualifiedIdentifier, String, QualifiedIdentifier, String)>> {
+    let rows = sqlx::query(
+        r#"
+        SELECT tn.nspname AS table_schema,
+               t.relname  AS table_name,
+               fn.nspname AS function_schema,
+               p.proname  AS function_name,
+               pg_catalog.format_type(p.prorettype, null) AS return_type
+          FROM pg_proc p
+          JOIN pg_namespace fn ON fn.oid = p.pronamespace
+          JOIN pg_class t ON t.reltype = p.proargtypes[0]
+          JOIN pg_namespace tn ON tn.oid = t.relnamespace
+         WHERE p.pronargs = 1
+           AND NOT p.proretset
+           AND p.prokind = 'f'
+           AND p.prorettype <> 'pg_catalog.trigger'::pg_catalog.regtype
+           AND t.relkind = ANY (ARRAY['r', 'v', 'm', 'p', 'f'])
+           AND fn.nspname = ANY($1)
+           AND tn.nspname = ANY($1)
         "#,
     )
     .bind(schemas)
@@ -648,15 +757,168 @@ pub async fn load_view_columns(
         .map(|row| {
             (
                 QualifiedIdentifier::new(
-                    row.get::<String, _>("view_schema"),
-                    row.get::<String, _>("view_name"),
+                    row.get::<String, _>("table_schema"),
+                    row.get::<String, _>("table_name"),
                 ),
+                row.get::<String, _>("function_name"),
                 QualifiedIdentifier::new(
-                    row.get::<String, _>("base_schema"),
-                    row.get::<String, _>("base_name"),
+                    row.get::<String, _>("function_schema"),
+                    row.get::<String, _>("function_name"),
                 ),
-                row.get::<String, _>("column_name"),
+                row.get::<String, _>("return_type"),
             )
+        })
+        .collect())
+}
+
+/// One view column, and the base-table column it was selected from.
+#[derive(Clone, Debug)]
+pub struct ViewColumn {
+    /// The view.
+    pub view: QualifiedIdentifier,
+    /// The table the column ultimately comes from.
+    pub base: QualifiedIdentifier,
+    /// The column's name on the base table.
+    pub base_column: String,
+    /// The name the view gives it.
+    pub view_column: String,
+}
+
+/// Which base-table column each view column came from.
+///
+/// A view may rename what it selects -- `select article_id as "articleId"` --
+/// so matching by name gets the mapping wrong exactly where it matters, and a
+/// view over another view has to be followed through. PostgreSQL records the
+/// answer in the rewrite rule's target list, where every entry carries the
+/// table and column it originated from, but only as a `pg_node_tree`, which
+/// has no catalogue view and no parser exposed to SQL.
+///
+/// The shape below is PostgREST's: turn the node tree into JSON with a fixed
+/// series of string replacements -- the fields wanted are quoted first so the
+/// one regular expression can strip everything else -- read the target list
+/// out of it, then follow view-on-view chains recursively, stopping on a cycle.
+///
+/// One base column may arrive under several names (`select t1_id as t1_id1,
+/// t1_id as t1_id2`), so a single mapping is a row per name.
+pub async fn load_view_columns(pool: &PgPool, schemas: &[String]) -> Result<Vec<ViewColumn>> {
+    let rows = sqlx::query(
+        r#"
+        WITH RECURSIVE
+        views AS (
+            SELECT c.oid AS view_id, c.relnamespace AS view_schema_id,
+                   n.nspname AS view_schema, c.relname AS view_name,
+                   r.ev_action AS view_definition
+              FROM pg_class c
+              JOIN pg_namespace n ON n.oid = c.relnamespace
+              JOIN pg_rewrite r ON r.ev_class = c.oid
+             WHERE c.relkind IN ('v', 'm')
+        ),
+        transform_json AS (
+            SELECT view_id, view_schema_id, view_schema, view_name,
+                replace(
+                replace(
+                replace(
+                replace(
+                replace(
+                replace(
+                replace(
+                regexp_replace(
+                replace(
+                replace(
+                replace(
+                replace(
+                replace(
+                replace(
+                replace(
+                replace(
+                replace(
+                replace(
+                replace(
+                    view_definition::text,
+                    '<>', '()'
+                ), ',', ''
+                ), E'\\{', ''
+                ), E'\\}', ''
+                ), ' :targetList ', ',"targetList":'
+                ), ' :resno ', ',"resno":'
+                ), ' :resorigtbl ', ',"resorigtbl":'
+                ), ' :resorigcol ', ',"resorigcol":'
+                ), '{', '{ :'
+                ), '((', '{(('
+                ), '({', '{({'
+                ), ' :[^}{,]+', ',"":', 'g'
+                ), ',"":}', '}'
+                ), ',"":,', ','
+                ), '{(', '('
+                ), '{,', '{'
+                ), '(', '['
+                ), ')', ']'
+                ), ' ', ','
+                )::json AS view_definition
+              FROM views
+        ),
+        results AS (
+            SELECT view_id, view_schema_id, view_schema, view_name,
+                   (entry->>'resno')::int AS view_column,
+                   (entry->>'resorigtbl')::oid AS resorigtbl,
+                   (entry->>'resorigcol')::int AS resorigcol
+              FROM (
+                SELECT view_id, view_schema_id, view_schema, view_name,
+                       json_array_elements(view_definition->0->'targetList') AS entry
+                  FROM transform_json
+              ) target_entries
+        ),
+        -- A view over a view is followed down to the base table. `path`
+        -- carries the tables already visited so a cyclic definition stops
+        -- rather than recursing forever.
+        recursion(view_id, view_schema, view_name, view_column,
+                  resorigtbl, resorigcol, is_cycle, path) AS (
+            SELECT r.view_id, r.view_schema, r.view_name, r.view_column,
+                   r.resorigtbl, r.resorigcol, false, ARRAY[r.resorigtbl]
+              FROM results r
+             WHERE r.view_schema = ANY($1)
+            UNION ALL
+            SELECT v.view_id, v.view_schema, v.view_name, v.view_column,
+                   t.resorigtbl, t.resorigcol,
+                   t.resorigtbl = ANY(v.path), v.path || t.resorigtbl
+              FROM recursion v
+              JOIN results t ON v.resorigtbl = t.view_id AND v.resorigcol = t.view_column
+             WHERE NOT v.is_cycle
+        )
+        SELECT DISTINCT
+               rec.view_schema, rec.view_name,
+               sch.nspname AS base_schema, tbl.relname AS base_name,
+               col.attname AS base_column, vcol.attname AS view_column
+          FROM recursion rec
+          JOIN pg_attribute vcol ON vcol.attrelid = rec.view_id
+                                AND vcol.attnum = rec.view_column
+                                AND NOT vcol.attisdropped
+          JOIN pg_class tbl ON tbl.oid = rec.resorigtbl
+          JOIN pg_namespace sch ON sch.oid = tbl.relnamespace
+          JOIN pg_attribute col ON col.attrelid = tbl.oid
+                               AND col.attnum = rec.resorigcol
+                               AND NOT col.attisdropped
+         WHERE rec.resorigtbl <> 0
+        "#,
+    )
+    .bind(schemas)
+    .fetch_all(pool)
+    .await
+    .map_err(|e| Error::SchemaCacheLoadFailed(e.to_string()))?;
+
+    Ok(rows
+        .into_iter()
+        .map(|row| ViewColumn {
+            view: QualifiedIdentifier::new(
+                row.get::<String, _>("view_schema"),
+                row.get::<String, _>("view_name"),
+            ),
+            base: QualifiedIdentifier::new(
+                row.get::<String, _>("base_schema"),
+                row.get::<String, _>("base_name"),
+            ),
+            base_column: row.get::<String, _>("base_column"),
+            view_column: row.get::<String, _>("view_column"),
         })
         .collect())
 }

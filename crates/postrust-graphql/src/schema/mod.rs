@@ -655,6 +655,7 @@ mod tests {
             deletable,
             pk_cols: vec!["id".into()],
             columns,
+            computed_columns: Default::default(),
         }
     }
 
@@ -678,6 +679,7 @@ mod tests {
             timezones: HashSet::new(),
             media_handlers: HashMap::new(),
             pg_version: 150000,
+            representations: Default::default(),
         }
     }
 
@@ -952,6 +954,7 @@ mod tests {
             deletable: true,
             pk_cols: vec!["id".into()],
             columns: indexmap::IndexMap::new(),
+            computed_columns: Default::default(),
         };
         cache
             .tables

@@ -63,8 +63,7 @@ async fn process_request(
         .and_then(|v| v.to_str().ok());
 
     // Authenticate
-    let auth_result = authenticate(auth_header, &state.jwt_config)
-        .map_err(|e| postrust_core::Error::InvalidJwt(e.to_string()))?;
+    let auth_result = authenticate(auth_header, &state.jwt_config).map_err(jwt_error)?;
 
     debug!("Authenticated as role: {}", auth_result.role);
 
@@ -130,10 +129,46 @@ async fn process_request(
     .await?;
 
     // Format response
-    let response = format_response(&api_request, &result)
-        .map_err(|e| postrust_core::Error::Internal(e.to_string()))?;
+    // A singular response the result cannot satisfy is the client's business,
+    // not an internal failure: it asked for one object and the query answered
+    // with some other number of rows.
+    let response = format_response(&api_request, &result).map_err(|e| match e {
+        postrust_response::FormatError::MultipleRows | postrust_response::FormatError::NotFound => {
+            postrust_core::Error::NotSingular {
+                rows: result.rows.len(),
+            }
+        }
+        other => postrust_core::Error::Internal(other.to_string()),
+    })?;
 
     Ok(build_response(response))
+}
+
+/// Classify a JWT failure the way PostgREST reports it.
+///
+/// A token that could not be read at all and one that was read and found
+/// wanting are different answers to the client: the first says the credential
+/// is unusable, the second says what about it was unacceptable. PostgREST
+/// gives them different codes, and clients branch on them.
+fn jwt_error(error: postrust_auth::JwtError) -> postrust_core::Error {
+    use postrust_auth::JwtError;
+
+    match error {
+        JwtError::MissingHeader => postrust_core::Error::MissingAuth,
+        JwtError::Expired => postrust_core::Error::JwtClaim("JWT expired".into()),
+        JwtError::NotYetValid => postrust_core::Error::JwtClaim("JWT not yet valid".into()),
+        JwtError::InvalidAudience => postrust_core::Error::JwtClaim("JWT not in audience".into()),
+        JwtError::MissingRole => postrust_core::Error::JwtClaim("Parsing claims failed".into()),
+        JwtError::InvalidSignature => {
+            postrust_core::Error::InvalidJwt("JWT cryptographic operation failed".into())
+        }
+        JwtError::InvalidHeaderFormat => {
+            postrust_core::Error::InvalidJwt("Unsupported token type".into())
+        }
+        JwtError::InvalidToken(_) => {
+            postrust_core::Error::InvalidJwt("No suitable key or wrong key type".into())
+        }
+    }
 }
 
 /// Execute an action plan.
@@ -180,11 +215,33 @@ async fn execute_plan(
                 || matches!(&media_handler, Some((_, _, true)));
             let db_plan = &if needs_parent_row {
                 let mut adjusted = db_plan.clone();
-                if let DbActionPlan::Read(tree) = &mut adjusted {
-                    let mut field = postrust_core::plan::CoercibleField::simple(
-                        tree.root.from.name.clone(),
-                        String::new(),
-                    );
+                // A function's result is a relation too, named after the
+                // function, so the row is reachable there by exactly the same
+                // means -- which is what makes a computed relationship work on
+                // `/rpc/getallvideogames` and not only on a table.
+                let (tree, relation) = match &mut adjusted {
+                    DbActionPlan::Read(tree) => {
+                        let relation = tree.root.from.name.clone();
+                        (Some(tree), relation)
+                    }
+                    DbActionPlan::Call { call, read } => {
+                        let relation = call.function.name.clone();
+                        (read.as_mut(), relation)
+                    }
+                    DbActionPlan::MutateRead { .. } => (None, String::new()),
+                };
+
+                if let Some(tree) = tree {
+                    // An empty select means every column; naming the row would
+                    // otherwise replace them rather than join them.
+                    if tree.root.select.is_empty() {
+                        tree.root
+                            .select
+                            .push(postrust_core::plan::CoercibleSelectField::simple("*", ""));
+                    }
+
+                    let mut field =
+                        postrust_core::plan::CoercibleField::simple(relation, String::new());
                     field.full_row = true;
                     tree.root
                         .select
@@ -213,6 +270,16 @@ async fn execute_plan(
 
             let (mut sql, params) = query.build_main();
 
+            // A `Prefer: count` needs the same query without its page: the
+            // total is what the filters match, not what this page returned.
+            // LIMIT and OFFSET render as literals, so dropping them leaves the
+            // placeholders and their numbering untouched and the count query
+            // can be bound with the very same parameters.
+            let mut count_sql = match api_request.preferences.count {
+                Some(_) => unpaged_sql(db_plan, &auth.role)?,
+                None => None,
+            };
+
             // Embed related resources in the same query.
             //
             // Each relation becomes a correlated subselect in the SELECT list,
@@ -227,6 +294,7 @@ async fn execute_plan(
                 filters: &api_request.query_params.filters,
                 orders: &api_request.query_params.order,
                 ranges: &api_request.query_params.ranges,
+                logic: &api_request.query_params.logic,
                 params: Vec::new(),
                 base: params.len(),
                 max_rows: api_request.max_rows,
@@ -261,6 +329,7 @@ async fn execute_plan(
                         PARENT_ROW_COLUMN_REF,
                         &api_request.query_params.select,
                         &mut embed_filters,
+                        &[],
                         &[],
                     )?
                 }
@@ -326,7 +395,8 @@ async fn execute_plan(
                     projection.push_str(" AS ");
                     projection.push_str(&postrust_sql::escape_ident(field_name));
                 }
-                sql = format!("SELECT {} FROM ({}) AS src", projection, sql);
+                let inner_sql = std::mem::take(&mut sql);
+                sql = format!("SELECT {} FROM ({}) AS src", projection, inner_sql);
 
                 // `?clients=is.null` asks whether the embed matched anything,
                 // not about a column. The embed's expression is the thing to
@@ -368,6 +438,18 @@ async fn execute_plan(
                     sql.push_str(" ORDER BY ");
                     sql.push_str(&embed_level.orders.join(", "));
                 }
+
+                // `!inner` and `?rel=is.null` decide which parent rows survive,
+                // so the count has to be taken after them -- the same wrapper,
+                // over the unpaged query.
+                count_sql = count_sql.map(|base| {
+                    let mut counted = format!("SELECT {} FROM ({}) AS src", projection, base);
+                    if !predicates.is_empty() {
+                        counted.push_str(" WHERE ");
+                        counted.push_str(&predicates.join(" AND "));
+                    }
+                    counted
+                });
 
                 if let Some(range) = page {
                     if let Some(limit) = range.limit {
@@ -509,6 +591,18 @@ async fn execute_plan(
                     .map_err(map_sqlx_error)?;
             }
 
+            // `Prefer: timezone` is applied to the session, so every value
+            // the database renders -- and every `now()` a function calls --
+            // sees it. An unknown zone is PostgreSQL's to reject, and it does,
+            // with a message naming the value the client sent.
+            if let Some(timezone) = &api_request.preferences.timezone {
+                sqlx::query("SELECT set_config('timezone', $1, true)")
+                    .bind(timezone)
+                    .execute(&mut *tx)
+                    .await
+                    .map_err(map_sqlx_error)?;
+            }
+
             // Set role
             sqlx::query(&format!(
                 "SET LOCAL ROLE {}",
@@ -612,6 +706,22 @@ async fn execute_plan(
                 .await?;
             }
 
+            // The count runs on the same transaction and so under the same
+            // snapshot as the page it describes.
+            let total = match (&api_request.preferences.count, &count_sql) {
+                (Some(preference), Some(count_sql)) => {
+                    resolve_count(
+                        &mut tx,
+                        preference,
+                        count_sql,
+                        &params,
+                        api_request.max_rows,
+                    )
+                    .await?
+                }
+                _ => None,
+            };
+
             // Reads take no locks worth holding and write plans commit their
             // work, so the transaction is committed either way.
             tx.commit()
@@ -686,7 +796,20 @@ async fn execute_plan(
                 .unwrap_or(api_request.top_level_range.offset);
 
             let content_range =
-                postrust_response::ContentRange::from_pagination(offset, rows.len() as i64, None);
+                postrust_response::ContentRange::from_pagination(offset, rows.len() as i64, total);
+
+            // An offset past the end of the result is a range the server
+            // cannot satisfy, and saying how many rows there actually are is
+            // what lets the client correct it. Only reachable with a count
+            // preference: without one the total is unknown and there is
+            // nothing to be past the end of.
+            if content_range.status() == StatusCode::RANGE_NOT_SATISFIABLE {
+                return Err(postrust_core::Error::InvalidRange(format!(
+                    "An offset of {} was requested, but there are only {} rows.",
+                    offset,
+                    total.unwrap_or(0)
+                )));
+            }
 
             Ok(QueryResult {
                 status: mutation_status(db_plan, api_request)
@@ -826,6 +949,109 @@ fn is_read_only(api_request: &ApiRequest) -> bool {
     }
 }
 
+/// The plan's SQL with its page removed, for counting what the filters match.
+///
+/// Only reads and calls are counted. A mutation's `Content-Range` reports the
+/// rows it affected, which is the result set itself.
+#[allow(clippy::result_large_err)] // consistent with the crate's error type
+fn unpaged_sql(
+    db_plan: &postrust_core::plan::DbActionPlan,
+    role: &str,
+) -> Result<Option<String>, postrust_core::Error> {
+    use postrust_core::plan::{ActionPlan, DbActionPlan};
+
+    let unpaged = match db_plan {
+        DbActionPlan::Read(tree) => {
+            let mut tree = tree.clone();
+            tree.root.range = Default::default();
+            DbActionPlan::Read(tree)
+        }
+        DbActionPlan::Call { call, read } => {
+            let read = read.as_ref().map(|tree| {
+                let mut tree = tree.clone();
+                tree.root.range = Default::default();
+                tree
+            });
+            DbActionPlan::Call {
+                call: call.clone(),
+                read,
+            }
+        }
+        DbActionPlan::MutateRead { .. } => return Ok(None),
+    };
+
+    let query = postrust_core::query::build_query(&ActionPlan::Db(unpaged), Some(role))?;
+    Ok(query.has_main().then(|| query.build_main().0))
+}
+
+/// The total the `Prefer: count` asked for, or `None` when it asked for none.
+///
+/// `exact` counts the rows the filters match. `planned` asks the query planner
+/// what it expects without running anything, which is cheap on a large table
+/// and correspondingly rough. `estimated` is the planner's guess only where it
+/// matters: below the server's row ceiling the exact count is already paid for,
+/// so it is used, and above it the larger of the two is reported -- an estimate
+/// that came in under a count we have actually taken would be plainly wrong.
+async fn resolve_count(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    preference: &postrust_core::api_request::PreferCount,
+    count_sql: &str,
+    params: &[postrust_sql::SqlParam],
+    max_rows: Option<i64>,
+) -> Result<Option<i64>, postrust_core::Error> {
+    use postrust_core::api_request::PreferCount;
+
+    match preference {
+        PreferCount::Exact => exact_count(tx, count_sql, params).await,
+        PreferCount::Planned => planned_count(tx, count_sql, params).await,
+        PreferCount::Estimated => match (exact_count(tx, count_sql, params).await?, max_rows) {
+            (Some(exact), Some(ceiling)) if exact <= ceiling => Ok(Some(exact)),
+            (Some(exact), _) => {
+                let planned = planned_count(tx, count_sql, params).await?;
+                Ok(Some(exact.max(planned.unwrap_or(exact))))
+            }
+            (None, _) => planned_count(tx, count_sql, params).await,
+        },
+    }
+}
+
+/// The number of rows the filters match.
+async fn exact_count(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    count_sql: &str,
+    params: &[postrust_sql::SqlParam],
+) -> Result<Option<i64>, postrust_core::Error> {
+    use sqlx::Row;
+
+    let sql = format!("SELECT count(*) FROM ({}) AS pgrst_count", count_sql);
+    let row = bind_params(sqlx::query(&sql), params)
+        .fetch_one(&mut **tx)
+        .await
+        .map_err(map_sqlx_error)?;
+    Ok(row.try_get::<i64, _>(0).ok())
+}
+
+/// The number of rows the query planner expects, without running the query.
+async fn planned_count(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    count_sql: &str,
+    params: &[postrust_sql::SqlParam],
+) -> Result<Option<i64>, postrust_core::Error> {
+    use sqlx::Row;
+
+    let sql = format!("EXPLAIN (FORMAT JSON) {}", count_sql);
+    let row = bind_params(sqlx::query(&sql), params)
+        .fetch_one(&mut **tx)
+        .await
+        .map_err(map_sqlx_error)?;
+    let plan: serde_json::Value = row.try_get(0).unwrap_or(serde_json::Value::Null);
+    Ok(plan
+        .get(0)
+        .and_then(|node| node.get("Plan"))
+        .and_then(|node| node.get("Plan Rows"))
+        .and_then(serde_json::Value::as_i64))
+}
+
 /// Whether this plan changes data.
 fn is_mutation(db_plan: &postrust_core::plan::DbActionPlan) -> bool {
     matches!(
@@ -899,10 +1125,20 @@ fn add_embed_join_columns(
         .iter()
         .any(|item| matches!(item, SelectItem::Field { field, .. } if field.name == "*"));
 
+    // Only a column selected under its own name serves as a join key. An
+    // aliased one -- `myId:id` -- arrives in the result as `myId`, so the
+    // correlation would look for a column the inner query no longer has; the
+    // same goes for one that was cast or reached into with a JSON path.
     let selected: std::collections::HashSet<String> = select
         .iter()
         .filter_map(|item| match item {
-            SelectItem::Field { field, .. } => Some(field.name.clone()),
+            SelectItem::Field {
+                field,
+                aggregate: None,
+                cast: None,
+                alias: None,
+                ..
+            } if field.json_path.is_empty() => Some(field.name.clone()),
             _ => None,
         })
         .collect();
@@ -922,7 +1158,14 @@ fn add_embed_join_columns(
 
         let rel = schema_cache
             .find_relationship(&parent_qi, relation, hint.as_deref(), &parent_qi.schema)?
-            .ok_or_else(|| postrust_core::Error::RelationshipNotFound(relation.clone()))?;
+            .ok_or_else(|| {
+                schema_cache.relationship_not_found(
+                    &parent_qi,
+                    relation,
+                    hint.as_deref(),
+                    &parent_qi.schema,
+                )
+            })?;
 
         let plan = postrust_core::embed::EmbedPlan::resolve(rel, schema_cache)?;
 
@@ -1000,6 +1243,11 @@ struct EmbedFilters<'a> {
     )],
     /// Ranges asked of each embedded resource, by dotted path.
     ranges: &'a std::collections::HashMap<String, postrust_core::api_request::Range>,
+    /// `and=`/`or=` groups asked of each embedded resource, by path.
+    logic: &'a [(
+        postrust_core::api_request::EmbedPath,
+        postrust_core::api_request::LogicTree,
+    )],
     /// Row cap applied to each embedded resource.
     max_rows: Option<i64>,
     /// Source of unique subquery aliases across the whole embed tree.
@@ -1051,11 +1299,11 @@ impl EmbedFilters<'_> {
     ///
     /// `clients.order=name.desc` orders the rows inside the embed, which is a
     /// property of the child's own subselect rather than of the parent.
-    fn order_for(&self, path: &[String]) -> Option<String> {
+    fn order_for(&self, path: &[String], names: &[String]) -> Option<String> {
         let terms: Vec<String> = self
             .orders
             .iter()
-            .filter(|(p, _)| p.as_slice() == path)
+            .filter(|(p, _)| p.as_slice() == path || p.as_slice() == names)
             .flat_map(|(_, terms)| terms.iter())
             .map(|term| {
                 use postrust_core::api_request::{OrderDirection, OrderNulls, OrderTerm};
@@ -1098,30 +1346,46 @@ impl EmbedFilters<'_> {
     ///
     /// The server's own cap still applies, so an embed cannot be asked for
     /// more rows than the server is willing to return.
-    fn range_for(&self, path: &[String]) -> Option<i64> {
-        let requested = self.ranges.get(&path.join(".")).and_then(|r| r.limit);
-        match (requested, self.max_rows) {
+    fn range_for(&self, path: &[String], names: &[String]) -> (Option<i64>, i64) {
+        let range = self
+            .ranges
+            .get(&path.join("."))
+            .or_else(|| self.ranges.get(&names.join(".")));
+        let requested = range.and_then(|r| r.limit);
+        let offset = range.map(|r| r.offset).unwrap_or(0);
+        let limit = match (requested, self.max_rows) {
             (Some(limit), Some(cap)) => Some(limit.min(cap)),
             (Some(limit), None) => Some(limit),
             (None, cap) => cap,
-        }
+        };
+        (limit, offset)
     }
 
     #[allow(clippy::result_large_err)] // consistent with the crate's error type
     fn predicate_for(
         &mut self,
         path: &[String],
+        names: &[String],
         child_qi: &postrust_core::api_request::QualifiedIdentifier,
         schema_cache: &postrust_core::SchemaCache,
     ) -> Result<Option<String>, postrust_core::Error> {
+        let addresses = |candidate: &[String]| candidate == path || candidate == names;
+
         let matching: Vec<_> = self
             .filters
             .iter()
-            .filter(|(filter_path, _)| filter_path.as_slice() == path)
+            .filter(|(filter_path, _)| addresses(filter_path))
             .map(|(_, filter)| filter.clone())
             .collect();
 
-        if matching.is_empty() {
+        let matching_logic: Vec<_> = self
+            .logic
+            .iter()
+            .filter(|(logic_path, _)| addresses(logic_path))
+            .map(|(_, tree)| tree.clone())
+            .collect();
+
+        if matching.is_empty() && matching_logic.is_empty() {
             return Ok(None);
         }
 
@@ -1151,7 +1415,60 @@ impl EmbedFilters<'_> {
             self.params.extend(frag.params().iter().cloned());
         }
 
+        for tree in matching_logic {
+            // A name the child does not have would bind outward to the
+            // correlated parent and filter the wrong table, exactly as a plain
+            // filter would, so the tree is checked before it is rendered.
+            let mut unknown = None;
+            check_logic_columns(&tree, table, &mut unknown);
+            if let Some(name) = unknown {
+                return Err(postrust_core::Error::ColumnNotFound(format!(
+                    "{}.{}",
+                    child_qi.name, name
+                )));
+            }
+
+            let resolver = |name: &str| -> String {
+                table
+                    .and_then(|t| t.get_column(name))
+                    .map(|c| c.nominal_type.clone())
+                    .unwrap_or_else(|| "text".to_string())
+            };
+            let frag = postrust_core::query::QueryBuilder::logic_sql(&tree, resolver)?;
+            parts.push(shift_placeholders(
+                frag.sql(),
+                self.base + self.params.len(),
+            ));
+            self.params.extend(frag.params().iter().cloned());
+        }
+
         Ok(Some(format!("({})", parts.join(" AND "))))
+    }
+}
+
+/// Record the first column a logic tree names that the table does not have.
+fn check_logic_columns(
+    tree: &postrust_core::api_request::LogicTree,
+    table: Option<&postrust_core::schema_cache::Table>,
+    unknown: &mut Option<String>,
+) {
+    use postrust_core::api_request::LogicTree;
+
+    match tree {
+        LogicTree::Expr { children, .. } => {
+            for child in children {
+                check_logic_columns(child, table, unknown);
+            }
+        }
+        LogicTree::Stmt(filter) => {
+            if unknown.is_none()
+                && table
+                    .map(|t| t.get_column(&filter.field.name).is_none())
+                    .unwrap_or(true)
+            {
+                *unknown = Some(filter.field.name.clone());
+            }
+        }
     }
 }
 
@@ -1313,7 +1630,19 @@ fn build_embed_orders(
 
         let rel = schema_cache
             .find_relationship(parent_qi, relation, None, &parent_qi.schema)?
-            .ok_or_else(|| postrust_core::Error::RelationshipNotFound(relation.clone()))?;
+            .ok_or_else(|| {
+                schema_cache.relationship_not_found(parent_qi, relation, None, &parent_qi.schema)
+            })?;
+
+        // A resource that yields many rows per parent has no single value to
+        // order on, so there is nothing the request could mean.
+        if !rel.is_to_one() {
+            return Err(postrust_core::Error::RelatedOrderNotPossible {
+                origin: parent_qi.name.clone(),
+                relation: relation.clone(),
+            });
+        }
+
         let plan = postrust_core::embed::EmbedPlan::resolve(rel, schema_cache)?;
 
         let child_alias = ctx.next_alias();
@@ -1347,6 +1676,7 @@ fn build_embed_orders(
 }
 
 #[allow(clippy::result_large_err)] // consistent with the crate's error type
+#[allow(clippy::too_many_arguments)] // each names one part of where the embed sits
 fn build_embed_expressions(
     schema_cache: &postrust_core::SchemaCache,
     parent_qi: &postrust_core::api_request::QualifiedIdentifier,
@@ -1360,6 +1690,9 @@ fn build_embed_expressions(
     select: &[postrust_core::api_request::SelectItem],
     ctx: &mut EmbedFilters<'_>,
     path: &[String],
+    // The same path spelled with each relation's own name rather than the
+    // alias the request gave it.
+    names: &[String],
 ) -> Result<EmbedLevel, postrust_core::Error> {
     use postrust_core::api_request::SelectItem;
 
@@ -1389,7 +1722,14 @@ fn build_embed_expressions(
 
         let rel = schema_cache
             .find_relationship(parent_qi, relation, hint.as_deref(), &parent_qi.schema)?
-            .ok_or_else(|| postrust_core::Error::RelationshipNotFound(relation.clone()))?;
+            .ok_or_else(|| {
+                schema_cache.relationship_not_found(
+                    parent_qi,
+                    relation,
+                    hint.as_deref(),
+                    &parent_qi.schema,
+                )
+            })?;
         let plan = postrust_core::embed::EmbedPlan::resolve(rel, schema_cache)?;
 
         let child_alias = ctx.next_alias();
@@ -1398,11 +1738,14 @@ fn build_embed_expressions(
             &plan.foreign_table,
         );
 
-        // Filters are addressed by the name the client used, which is the
-        // alias when there is one -- `c:clients(*)&c.id=eq.1`.
+        // Filters are addressed by the name the client used, which may be
+        // either the alias or the relation itself: `c:clients(*)&c.id=eq.1`
+        // and `the_tasks:tasks(*)&tasks.id=eq.1` both name the same embed.
         let mut child_path = path.to_vec();
         child_path.push(alias.clone().unwrap_or_else(|| relation.clone()));
-        let child_where = ctx.predicate_for(&child_path, &child_qi, schema_cache)?;
+        let mut child_names = names.to_vec();
+        child_names.push(relation.clone());
+        let child_where = ctx.predicate_for(&child_path, &child_names, &child_qi, schema_cache)?;
 
         // Deeper relations first: they become part of this level's SELECT list.
         let child_row = postrust_sql::escape_ident(&child_alias);
@@ -1414,6 +1757,7 @@ fn build_embed_expressions(
             child_select,
             ctx,
             &child_path,
+            &child_names,
         )?;
 
         // A nested `!inner` is written against this child's alias, which is
@@ -1485,14 +1829,15 @@ fn build_embed_expressions(
         }
 
         let inner_select = parts.join(", ");
-        let child_order = ctx.order_for(&child_path);
-        let child_limit = ctx.range_for(&child_path);
+        let child_order = ctx.order_for(&child_path, &child_names);
+        let (child_limit, child_offset) = ctx.range_for(&child_path, &child_names);
         let expression = plan.embed_expression(
             parent_alias,
             parent_row,
             &child_alias,
             &inner_select,
             child_limit,
+            child_offset,
             child_where.as_deref(),
             child_order.as_deref(),
         )?;
@@ -1532,10 +1877,36 @@ fn build_embed_expressions(
                 child_where.as_deref(),
             ),
         ));
+
+        // `clients()` asks for none of the related resource's columns. It is
+        // written to narrow the parent -- with `!inner`, or with a filter on
+        // the embed -- and the resource itself is not part of the answer, so
+        // it gets no key at all rather than an empty object. The test is
+        // recursive: an embed whose only content is such an embed contributes
+        // nothing either.
+        if !yields_columns(child_select) {
+            continue;
+        }
+
         level.expressions.push((key, expression));
     }
 
     Ok(level)
+}
+
+/// Whether a selection produces any keys in the response.
+///
+/// A relation contributes only what its own selection does, so `tasks()` and
+/// `tasks(projects())` are alike empty, while `tasks(name)` is not.
+fn yields_columns(select: &[postrust_core::api_request::SelectItem]) -> bool {
+    use postrust_core::api_request::SelectItem;
+
+    select.iter().any(|item| match item {
+        SelectItem::Field { .. } => true,
+        SelectItem::Relation { select, .. } | SelectItem::SpreadRelation { select, .. } => {
+            yields_columns(select)
+        }
+    })
 }
 
 type EmbedFuture<'f> = std::pin::Pin<
@@ -1585,7 +1956,14 @@ fn embed_relations<'f>(
 
             let rel = schema_cache
                 .find_relationship(parent_qi, relation, hint.as_deref(), &parent_qi.schema)?
-                .ok_or_else(|| postrust_core::Error::RelationshipNotFound(relation.clone()))?;
+                .ok_or_else(|| {
+                    schema_cache.relationship_not_found(
+                        parent_qi,
+                        relation,
+                        hint.as_deref(),
+                        &parent_qi.schema,
+                    )
+                })?;
 
             let plan = postrust_core::embed::EmbedPlan::resolve(rel, schema_cache)?;
             let keys = postrust_core::embed::parent_keys(rows, &plan.local_column);
@@ -1879,6 +2257,25 @@ fn error_response(error: postrust_core::Error, verbatim_db_errors: bool) -> Resp
         .map(|v| v == "true" || v == "1")
         .unwrap_or(false);
 
+    // A function that raised `sqlstate 'PGRST'` supplied the whole response:
+    // its status, its headers and its body. Nothing here is the API layer's to
+    // decide, including whether to sanitise it -- the schema wrote it.
+    if let postrust_core::Error::Database(db) = &error {
+        if let Some(raised) = db.raised_response() {
+            let mut builder = Response::builder()
+                .status(status)
+                .header("content-type", "application/json");
+            for (name, value) in &raised.headers {
+                builder = builder.header(name, value);
+            }
+            return builder
+                .body(Body::from(
+                    serde_json::to_vec(&raised.body).unwrap_or_default(),
+                ))
+                .unwrap_or_else(|_| Response::new(Body::empty()));
+        }
+    }
+
     let body = if debug_mode {
         // Full error details in debug mode
         serde_json::to_vec(&error.to_json()).unwrap_or_default()
@@ -1904,9 +2301,17 @@ fn error_response(error: postrust_core::Error, verbatim_db_errors: bool) -> Resp
         serde_json::to_vec(&sanitized).unwrap_or_default()
     };
 
-    Response::builder()
+    let mut builder = Response::builder()
         .status(status)
-        .header("content-type", "application/json")
+        .header("content-type", "application/json");
+
+    // A 401 has to say what would satisfy it, or a client has no way to know
+    // it should be sending a token at all.
+    if status == StatusCode::UNAUTHORIZED {
+        builder = builder.header("www-authenticate", "Bearer");
+    }
+
+    builder
         .body(Body::from(body))
         .unwrap_or_else(|_| Response::new(Body::empty()))
 }
@@ -1922,7 +2327,7 @@ fn sanitize_error_message(error: &postrust_core::Error) -> String {
     // the database's own account of a failure, which is about the schema
     // rather than about the request.
     match error {
-        Error::TableNotFound(name) | Error::NotFound(name) => {
+        Error::TableNotFound { name, .. } | Error::NotFound(name) => {
             return format!("Could not find the table '{}' in the schema cache", name)
         }
         Error::FunctionNotFound { name, params, .. } => {
@@ -1946,10 +2351,23 @@ fn sanitize_error_message(error: &postrust_core::Error) -> String {
 
     (match error {
         Error::ColumnNotFound(_) | Error::UnknownColumn(_) => "Column not found",
-        Error::RelationshipNotFound(_) => "Relationship not found",
+        // Each of these says only what the request itself said: the resource
+        // it named, the preference it sent, the shape it asked for. Repeating
+        // that back tells the client nothing it did not already know, and is
+        // the difference between a message it can act on and one it cannot.
+        Error::RelationshipNotFound { .. }
+        | Error::NotAnEmbeddedResource(_)
+        | Error::RelatedOrderNotPossible { .. }
+        | Error::InvalidPreferences(_)
+        | Error::NotSingular { .. }
+        | Error::InvalidRange(_)
+        | Error::InvalidResourcePath => return error.to_string(),
         Error::InvalidPath(_) => "Invalid request path",
         Error::InvalidBody(_) => "Invalid request body",
-        Error::InvalidJwt(_) | Error::JwtExpired | Error::MissingAuth => "Unauthorized",
+        // What the token failed on is the client's own token, so naming it
+        // costs nothing and is the only way it can tell a bad signature from
+        // an expired one.
+        Error::InvalidJwt(_) | Error::JwtClaim(_) | Error::MissingAuth => return error.to_string(),
         Error::InsufficientPermissions(_) => "Forbidden",
 
         // A fixed policy message that reveals nothing about the request or the

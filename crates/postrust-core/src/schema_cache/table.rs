@@ -26,12 +26,26 @@ pub struct Table {
     pub pk_cols: Vec<String>,
     /// Columns indexed by name
     pub columns: ColumnMap,
+    /// Computed columns, indexed by name.
+    ///
+    /// Not part of the table, and never returned by `select=*`: a function of
+    /// one argument of the table's own row type, which PostgreSQL lets a query
+    /// read as though it were a column. PostgREST exposes them under the name
+    /// the function has, so `?select=id,always_true` and `?always_true=is.true`
+    /// both work on a table that has no such column.
+    #[serde(default)]
+    pub computed_columns: HashMap<String, ComputedColumn>,
 }
 
 impl Table {
     /// Get a column by name.
     pub fn get_column(&self, name: &str) -> Option<&Column> {
         self.columns.get(name)
+    }
+
+    /// Get a computed column by name.
+    pub fn get_computed_column(&self, name: &str) -> Option<&ComputedColumn> {
+        self.computed_columns.get(name)
     }
 
     /// Check if the table has a column.
@@ -53,6 +67,15 @@ impl Table {
     pub fn is_readonly(&self) -> bool {
         !self.insertable && !self.updatable && !self.deletable
     }
+}
+
+/// A function of the table's row type, read as though it were a column.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ComputedColumn {
+    /// The function to call.
+    pub function: QualifiedIdentifier,
+    /// What it returns.
+    pub data_type: String,
 }
 
 /// A table column.
@@ -132,6 +155,7 @@ mod tests {
             deletable: true,
             pk_cols: vec!["id".into()],
             columns: IndexMap::new(),
+            computed_columns: Default::default(),
         };
 
         let qi = table.qualified_identifier();

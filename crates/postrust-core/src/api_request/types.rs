@@ -677,9 +677,16 @@ pub enum MediaType {
     /// Custom media type
     Other(String),
     /// Singular JSON object (vnd.pgrst.object)
-    SingularJson { nullable: bool },
-    /// Array JSON with nulls stripped
-    ArrayJsonStrip,
+    SingularJson {
+        nullable: bool,
+        /// `;nulls=stripped`: omit keys whose value is null.
+        strip_nulls: bool,
+    },
+    /// Array JSON (vnd.pgrst.array)
+    ArrayJson {
+        /// `;nulls=stripped`: omit keys whose value is null.
+        strip_nulls: bool,
+    },
     /// EXPLAIN plan output
     Plan {
         base: Box<MediaType>,
@@ -702,7 +709,7 @@ impl MediaType {
             Self::Any => "*/*",
             Self::Other(s) => s,
             Self::SingularJson { .. } => "application/vnd.pgrst.object+json",
-            Self::ArrayJsonStrip => "application/vnd.pgrst.array+json",
+            Self::ArrayJson { .. } => "application/vnd.pgrst.array+json",
             Self::Plan { .. } => "application/vnd.pgrst.plan+json",
         }
     }
@@ -781,9 +788,12 @@ pub enum PreferMissing {
 #[derive(Clone, Debug, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub enum PreferHandling {
     /// Strict - fail on unknown parameters
-    #[default]
     Strict,
-    /// Lenient - ignore unknown parameters
+    /// Lenient - ignore unknown parameters.
+    ///
+    /// The default, as in PostgREST: a `Prefer` the server does not recognise
+    /// is a preference, and RFC 7240 says a preference may be ignored.
+    #[default]
     Lenient,
 }
 

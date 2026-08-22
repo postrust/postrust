@@ -103,6 +103,22 @@ pub fn format_response(
         return Ok(response);
     }
 
+    // `;nulls=stripped` asks for keys with a null value to be left out
+    // entirely, rather than sent as nulls.
+    let rows = match &media_type {
+        MediaType::SingularJson {
+            strip_nulls: true, ..
+        }
+        | MediaType::ArrayJson {
+            strip_nulls: true, ..
+        } => result.rows.iter().cloned().map(strip_nulls).collect(),
+        _ => result.rows.clone(),
+    };
+    let result = &QueryResult {
+        rows,
+        ..result.clone()
+    };
+
     match &media_type {
         MediaType::ApplicationJson => {
             let body = if result.singular {
@@ -123,7 +139,7 @@ pub fn format_response(
             add_common_headers(&mut response, request, result);
             Ok(response)
         }
-        MediaType::SingularJson { nullable } => {
+        MediaType::SingularJson { nullable, .. } => {
             let body = format_singular_json(&result.rows, *nullable)?;
             let mut response = Response::new(result.status, body);
             response.set_content_type("application/vnd.pgrst.object+json; charset=utf-8");
@@ -142,6 +158,27 @@ pub fn format_response(
             add_common_headers(&mut response, request, result);
             Ok(response)
         }
+    }
+}
+
+/// Remove every key whose value is null, at every depth.
+///
+/// `Accept: application/vnd.pgrst.array+json;nulls=stripped` asks for a body
+/// carrying only what a row actually has, which for a wide table with few
+/// populated columns is most of the response.
+fn strip_nulls(value: serde_json::Value) -> serde_json::Value {
+    match value {
+        serde_json::Value::Object(fields) => serde_json::Value::Object(
+            fields
+                .into_iter()
+                .filter(|(_, value)| !value.is_null())
+                .map(|(key, value)| (key, strip_nulls(value)))
+                .collect(),
+        ),
+        serde_json::Value::Array(items) => {
+            serde_json::Value::Array(items.into_iter().map(strip_nulls).collect())
+        }
+        other => other,
     }
 }
 
