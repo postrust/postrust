@@ -103,6 +103,24 @@ async fn process_request(
         api_request.payload = payload;
     }
 
+    // A body that names different columns row by row cannot be written by one
+    // statement. Skipped when `?columns=` says which columns to write, since
+    // then the rows are free to differ.
+    if api_request.query_params.columns.is_none() {
+        if let Some(payload) = &api_request.payload {
+            postrust_core::api_request::payload::validate_uniform_keys(payload)?;
+        }
+    }
+
+    // A write with nothing to write is refused here rather than left to
+    // produce an `UPDATE ... SET` with no assignments, which PostgreSQL
+    // reports as a syntax error -- true, and no use at all to the client.
+    if api_request.payload.is_none() && needs_payload(&api_request) {
+        return Err(postrust_core::Error::InvalidBody(
+            "Empty or invalid json".into(),
+        ));
+    }
+
     // Get schema cache
     let schema_cache = state.schema_cache().await;
 
@@ -142,6 +160,23 @@ async fn process_request(
     })?;
 
     Ok(build_response(response))
+}
+
+/// Whether this request must carry a body.
+///
+/// Insert, update and upsert all write values that can only come from one.
+/// A delete names its rows in the query string, and a function call may take
+/// no arguments at all.
+fn needs_payload(api_request: &ApiRequest) -> bool {
+    use postrust_core::api_request::{Action, DbAction, Mutation};
+
+    matches!(
+        &api_request.action,
+        Action::Db(DbAction::RelationMut {
+            mutation: Mutation::Create | Mutation::Update | Mutation::SingleUpsert,
+            ..
+        })
+    )
 }
 
 /// Classify a JWT failure the way PostgREST reports it.
@@ -1080,13 +1115,26 @@ fn mutation_status(
 ) -> Option<StatusCode> {
     use postrust_core::plan::{DbActionPlan, MutatePlan};
 
+    use postrust_core::api_request::{Action, DbAction, Mutation};
+
     let DbActionPlan::MutateRead { mutate, .. } = db_plan else {
         return None;
     };
 
+    // A `PUT` is an upsert, planned as an insert but answered as an update:
+    // the client named the row it is writing, so nothing was created from its
+    // point of view whether or not a row existed before.
+    let is_upsert = matches!(
+        &api_request.action,
+        Action::Db(DbAction::RelationMut {
+            mutation: Mutation::SingleUpsert,
+            ..
+        })
+    );
+
     Some(match mutate {
-        MutatePlan::Insert { .. } => StatusCode::CREATED,
-        MutatePlan::Update { .. } | MutatePlan::Delete { .. } => {
+        MutatePlan::Insert { .. } if !is_upsert => StatusCode::CREATED,
+        _ => {
             if wants_representation(api_request) {
                 StatusCode::OK
             } else {
@@ -2350,7 +2398,10 @@ fn sanitize_error_message(error: &postrust_core::Error) -> String {
     }
 
     (match error {
-        Error::ColumnNotFound(_) | Error::UnknownColumn(_) => "Column not found",
+        Error::ColumnNotFound(_) => "Column not found",
+        // The column is the client's own word and the relation is the one it
+        // addressed, so naming both says nothing it did not send.
+        Error::UnknownColumn { .. } => return error.to_string(),
         // Each of these says only what the request itself said: the resource
         // it named, the preference it sent, the shape it asked for. Repeating
         // that back tells the client nothing it did not already know, and is
@@ -2361,9 +2412,9 @@ fn sanitize_error_message(error: &postrust_core::Error) -> String {
         | Error::InvalidPreferences(_)
         | Error::NotSingular { .. }
         | Error::InvalidRange(_)
+        | Error::InvalidBody(_)
         | Error::InvalidResourcePath => return error.to_string(),
         Error::InvalidPath(_) => "Invalid request path",
-        Error::InvalidBody(_) => "Invalid request body",
         // What the token failed on is the client's own token, so naming it
         // costs nothing and is the only way it can tell a bad signature from
         // an expired one.

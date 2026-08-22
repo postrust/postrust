@@ -56,20 +56,30 @@ pub enum MutatePlan {
 
 impl MutatePlan {
     /// Create a mutation plan from an API request.
-    pub fn from_request(request: &ApiRequest, table: &Table, mutation: &Mutation) -> Result<Self> {
+    pub fn from_request(
+        request: &ApiRequest,
+        table: &Table,
+        mutation: &Mutation,
+        schema_cache: &crate::schema_cache::SchemaCache,
+    ) -> Result<Self> {
         let qi = table.qualified_identifier();
 
         match mutation {
-            Mutation::Create => Self::create_insert(request, table, qi),
-            Mutation::Update => Self::create_update(request, table, qi),
+            Mutation::Create => Self::create_insert(request, table, qi, schema_cache),
+            Mutation::Update => Self::create_update(request, table, qi, schema_cache),
             Mutation::Delete => Self::create_delete(request, table, qi),
-            Mutation::SingleUpsert => Self::create_upsert(request, table, qi),
+            Mutation::SingleUpsert => Self::create_upsert(request, table, qi, schema_cache),
         }
     }
 
     /// Create an INSERT plan.
-    fn create_insert(request: &ApiRequest, table: &Table, qi: QualifiedIdentifier) -> Result<Self> {
-        let columns = get_payload_columns(request, table)?;
+    fn create_insert(
+        request: &ApiRequest,
+        table: &Table,
+        qi: QualifiedIdentifier,
+        schema_cache: &crate::schema_cache::SchemaCache,
+    ) -> Result<Self> {
+        let columns = get_payload_columns(request, table, schema_cache)?;
         let body = get_body_bytes(request)?;
         let returning = get_returning_columns(request, table);
         let apply_defaults =
@@ -97,8 +107,13 @@ impl MutatePlan {
     }
 
     /// Create an UPDATE plan.
-    fn create_update(request: &ApiRequest, table: &Table, qi: QualifiedIdentifier) -> Result<Self> {
-        let columns = get_payload_columns(request, table)?;
+    fn create_update(
+        request: &ApiRequest,
+        table: &Table,
+        qi: QualifiedIdentifier,
+        schema_cache: &crate::schema_cache::SchemaCache,
+    ) -> Result<Self> {
+        let columns = get_payload_columns(request, table, schema_cache)?;
         let body = get_body_bytes(request)?;
         let where_clauses = build_mutation_where(request, table)?;
         let returning = get_returning_columns(request, table);
@@ -128,8 +143,13 @@ impl MutatePlan {
     }
 
     /// Create a PUT (upsert) plan.
-    fn create_upsert(request: &ApiRequest, table: &Table, qi: QualifiedIdentifier) -> Result<Self> {
-        let columns = get_payload_columns(request, table)?;
+    fn create_upsert(
+        request: &ApiRequest,
+        table: &Table,
+        qi: QualifiedIdentifier,
+        schema_cache: &crate::schema_cache::SchemaCache,
+    ) -> Result<Self> {
+        let columns = get_payload_columns(request, table, schema_cache)?;
         let body = get_body_bytes(request)?;
         let returning = get_returning_columns(request, table);
 
@@ -168,21 +188,43 @@ impl MutatePlan {
 }
 
 /// Get columns from payload.
-fn get_payload_columns(request: &ApiRequest, table: &Table) -> Result<Vec<CoercibleField>> {
+fn get_payload_columns(
+    request: &ApiRequest,
+    table: &Table,
+    schema_cache: &crate::schema_cache::SchemaCache,
+) -> Result<Vec<CoercibleField>> {
     let keys = match &request.payload {
         Some(Payload::ProcessedJson { keys, .. }) => keys,
         Some(Payload::ProcessedUrlEncoded { keys, .. }) => keys,
         _ => return Ok(vec![]),
     };
 
+    // `?columns=` names the columns to write and fixes their order, which is
+    // what makes a bulk insert of ragged rows well-defined. Without it the
+    // body's own keys are the columns.
+    let names: Vec<&String> = match &request.query_params.columns {
+        Some(columns) => columns.iter().collect(),
+        None => keys.iter().collect(),
+    };
+
     let mut columns = Vec::new();
 
-    for key in keys {
-        let column = table
-            .get_column(key)
-            .ok_or_else(|| Error::UnknownColumn(key.clone()))?;
+    for key in names {
+        let column = table.get_column(key).ok_or_else(|| Error::UnknownColumn {
+            column: key.clone(),
+            relation: table.name.clone(),
+        })?;
 
-        columns.push(CoercibleField::simple(key, &column.data_type));
+        let mut field = CoercibleField::simple(key, &column.nominal_type);
+        // A schema that declared how one of its domains is written in JSON
+        // also declared how one arrives: the value is read out of the body as
+        // JSON and handed to that cast, rather than to PostgreSQL's own input
+        // function for the type underneath.
+        if let Some(function) = schema_cache.representation("json", &column.nominal_type) {
+            field.ir_type = "json".to_string();
+            field.transform = Some(function.to_string());
+        }
+        columns.push(field);
     }
 
     Ok(columns)
@@ -210,13 +252,13 @@ fn get_body_bytes(request: &ApiRequest) -> Result<Option<bytes::Bytes>> {
 }
 
 /// Get returning columns.
-fn get_returning_columns(request: &ApiRequest, table: &Table) -> Vec<String> {
-    if request.preferences.representation.needs_body() {
-        table.column_names().map(|s| s.to_string()).collect()
-    } else {
-        // Always return PK for Location header
-        table.pk_cols.clone()
-    }
+fn get_returning_columns(_request: &ApiRequest, table: &Table) -> Vec<String> {
+    // Every column, always. What the client asked for is decided by the read
+    // that runs over the result -- `?select=` may name computed fields and
+    // embedded resources, neither of which a `RETURNING` list can express --
+    // and the primary key is needed for the `Location` header whether or not
+    // the client asked to see it.
+    table.column_names().map(|s| s.to_string()).collect()
 }
 
 /// Build WHERE clauses for mutations.

@@ -108,6 +108,26 @@ fn extract_call_params(request: &ApiRequest, routine: &Routine) -> Result<CallPa
                                 let value = match v {
                                     serde_json::Value::String(s) => s,
                                     serde_json::Value::Null => String::new(),
+                                    // A JSON array for a parameter the function
+                                    // declares as an array is that array, not a
+                                    // string spelled in JSON: `{"v":["a","b"]}`
+                                    // passes two values to a variadic. PostgreSQL
+                                    // reads `{...}`, not `[...]`.
+                                    serde_json::Value::Array(items)
+                                        if routine.params.iter().any(|p| {
+                                            p.name == k && p.param_type.ends_with("[]")
+                                        }) =>
+                                    {
+                                        array_literal(
+                                            &items
+                                                .iter()
+                                                .map(|item| match item {
+                                                    serde_json::Value::String(s) => s.clone(),
+                                                    other => other.to_string(),
+                                                })
+                                                .collect::<Vec<_>>(),
+                                        )
+                                    }
                                     other => other.to_string(),
                                 };
                                 (k, value)

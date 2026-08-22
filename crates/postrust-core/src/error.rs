@@ -31,7 +31,7 @@ pub enum Error {
     #[error("Invalid header: {0}")]
     InvalidHeader(&'static str),
 
-    #[error("Invalid request body: {0}")]
+    #[error("{0}")]
     InvalidBody(String),
 
     #[error("Unsupported HTTP method: {0}")]
@@ -47,8 +47,13 @@ pub enum Error {
         exposed: Vec<String>,
     },
 
-    #[error("Unknown column: {0}")]
-    UnknownColumn(String),
+    #[error("Could not find the '{column}' column of '{relation}' in the schema cache")]
+    UnknownColumn {
+        /// The column the request named.
+        column: String,
+        /// The relation it was looked for on.
+        relation: String,
+    },
 
     #[error("Requested range not satisfiable")]
     InvalidRange(String),
@@ -230,7 +235,7 @@ impl Error {
             | Self::InvalidMediaType(_)
             | Self::MissingParameter(_)
             | Self::AmbiguousRequest(_)
-            | Self::UnknownColumn(_)
+            | Self::UnknownColumn { .. }
             | Self::NotAnEmbeddedResource(_)
             | Self::RelatedOrderNotPossible { .. }
             | Self::InvalidPreferences(_)
@@ -292,13 +297,15 @@ impl Error {
             // both the path and the query string; PGRST101 is a function
             // invoked with a method its volatility does not allow.
             Self::InvalidQueryParam(_) => "PGRST100",
-            Self::InvalidHeader(_) => "PGRST102",
-            Self::InvalidBody(_) => "PGRST103",
+            // Not one of PostgREST's own: a malformed header is a request
+            // that did not parse, which is what PGRST100 covers.
+            Self::InvalidHeader(_) => "PGRST100",
+            Self::InvalidBody(_) => "PGRST102",
             Self::UnsupportedMethod(_) => "PGRST104",
             Self::UnacceptableSchema { .. } => "PGRST106",
-            Self::UnknownColumn(_) => "PGRST204",
+            Self::UnknownColumn { .. } => "PGRST204",
             Self::InvalidRange(_) => "PGRST103",
-            Self::InvalidMediaType(_) => "PGRST108",
+            Self::InvalidMediaType(_) => "PGRST107",
             Self::MissingParameter(_) => "PGRST109",
             Self::AmbiguousRequest(_) => "PGRST110",
             Self::AmbiguousFunction { .. } => "PGRST203",

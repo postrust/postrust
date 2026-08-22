@@ -121,8 +121,14 @@ impl ReadPlan {
         schema_cache: &SchemaCache,
     ) -> Result<Self> {
         let mut plan = Self::from_request(request, table, schema_cache)?;
-        // For mutations, we select from the CTE result
-        plan.from_alias = Some("pgrst_mutation_result".to_string());
+
+        // The rows read are the ones the mutation returned, not the table's.
+        // The filters chose which rows to affect and have already done their
+        // work; applying them again here would be harmless for an update and
+        // wrong for a delete, whose rows are gone by then.
+        plan.from = QualifiedIdentifier::unqualified(crate::query::MUTATION_RESULT);
+        plan.from_alias = None;
+        plan.where_clauses.clear();
         Ok(plan)
     }
 

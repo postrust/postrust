@@ -6,8 +6,7 @@ use crate::plan::{
     CoercibleSelectField, MutatePlan, ReadPlan, ReadPlanTree,
 };
 use postrust_sql::{
-    escape_ident, from_qi, DeleteBuilder, InsertBuilder, OrderExpr, SelectBuilder, SqlFragment,
-    SqlParam, UpdateBuilder,
+    escape_ident, from_qi, OrderExpr, SelectBuilder, SqlFragment, SqlParam,
 };
 
 /// Query builder for converting plans to SQL.
@@ -525,6 +524,7 @@ impl QueryBuilder {
                 columns,
                 body,
                 on_conflict,
+                where_clauses,
                 returning,
                 ..
             } => {
@@ -533,63 +533,84 @@ impl QueryBuilder {
                     &target.name,
                 );
 
-                let mut builder = InsertBuilder::new().into_table(&qi);
+                let mut frag = SqlFragment::new();
+                frag.push("INSERT INTO ");
+                frag.push(&from_qi(&qi));
 
-                // Column names
-                let col_names: Vec<String> = columns.iter().map(|c| c.name.clone()).collect();
-                builder = builder.columns(col_names);
+                match (body, columns.is_empty()) {
+                    // A body naming no columns -- `{}` -- inserts a row of
+                    // defaults. There is no column list to write and no values
+                    // to read out of the body.
+                    (_, true) => {
+                        frag.push(" DEFAULT VALUES");
+                    }
+                    (Some(body), false) => {
+                        frag.push(" (");
+                        push_column_list(&mut frag, columns);
+                        frag.push(") SELECT ");
+                        for (i, column) in columns.iter().enumerate() {
+                            if i > 0 {
+                                frag.push(", ");
+                            }
+                            frag.push("pgrst_body.");
+                            frag.push(&escape_ident(&column.name));
+                        }
+                        frag.push(" ");
+                        push_json_body(&mut frag, &qi, columns, body, false);
 
-                if let Some(body_bytes) = body {
-                    let body_str = String::from_utf8_lossy(body_bytes);
-
-                    // `json_populate_recordset` only accepts an array, but a
-                    // single-row insert posts a bare object. Wrapping it here
-                    // keeps one code path for both shapes -- checking the
-                    // first token is enough, since the payload has already
-                    // been validated as JSON by this point.
-                    let rows = if body_str.trim_start().starts_with('{') {
-                        format!("[{body_str}]")
-                    } else {
-                        body_str.into_owned()
-                    };
-
-                    let mut frag = SqlFragment::new();
-                    frag.push("SELECT * FROM json_populate_recordset(NULL::");
-                    frag.push(&from_qi(&qi));
-                    frag.push(", ");
-                    frag.push_param(rows);
-                    frag.push("::json)");
-                    return Ok(frag);
+                        // PUT names the row in the URL as well as in the body,
+                        // and the two have to agree -- the conditions are
+                        // written against the body so that a mismatch inserts
+                        // nothing rather than the wrong row.
+                        if !where_clauses.is_empty() {
+                            frag.push(" WHERE ");
+                            for (i, clause) in where_clauses.iter().enumerate() {
+                                if i > 0 {
+                                    frag.push(" AND ");
+                                }
+                                frag.append(Self::build_logic_tree(clause)?);
+                            }
+                        }
+                    }
+                    (None, false) => {
+                        frag.push(" DEFAULT VALUES");
+                    }
                 }
 
-                // ON CONFLICT
                 if let Some((resolution, conflict_cols)) = on_conflict {
+                    frag.push(" ON CONFLICT (");
+                    for (i, column) in conflict_cols.iter().enumerate() {
+                        if i > 0 {
+                            frag.push(", ");
+                        }
+                        frag.push(&escape_ident(column));
+                    }
+                    frag.push(") DO ");
                     match resolution {
                         crate::api_request::PreferResolution::IgnoreDuplicates => {
-                            builder = builder.on_conflict_do_nothing();
+                            frag.push("NOTHING");
+                        }
+                        crate::api_request::PreferResolution::MergeDuplicates
+                            if columns.is_empty() =>
+                        {
+                            frag.push("NOTHING");
                         }
                         crate::api_request::PreferResolution::MergeDuplicates => {
-                            let set_cols: Vec<(String, SqlFragment)> = columns
-                                .iter()
-                                .map(|c| {
-                                    let mut frag = SqlFragment::new();
-                                    frag.push("EXCLUDED.");
-                                    frag.push(&escape_ident(&c.name));
-                                    (c.name.clone(), frag)
-                                })
-                                .collect();
-                            builder =
-                                builder.on_conflict_do_update(conflict_cols.clone(), set_cols);
+                            frag.push("UPDATE SET ");
+                            for (i, column) in columns.iter().enumerate() {
+                                if i > 0 {
+                                    frag.push(", ");
+                                }
+                                frag.push(&escape_ident(&column.name));
+                                frag.push(" = EXCLUDED.");
+                                frag.push(&escape_ident(&column.name));
+                            }
                         }
                     }
                 }
 
-                // RETURNING
-                for col in returning {
-                    builder = builder.returning(col);
-                }
-
-                Ok(builder.build())
+                push_returning(&mut frag, returning);
+                Ok(frag)
             }
 
             MutatePlan::Update {
@@ -605,56 +626,47 @@ impl QueryBuilder {
                     &target.name,
                 );
 
-                let builder = UpdateBuilder::new().table(&qi);
-
-                // SET columns from body
-                if let Some(body_bytes) = body {
-                    let body_str = String::from_utf8_lossy(body_bytes);
-                    // Simplified: would properly parse JSON and set columns
+                // An update that assigns nothing is not valid SQL, and it is
+                // also not an error: `PATCH` with `{}` matches rows and
+                // changes none of them. Selecting no rows from the table gives
+                // the same answer with the same column names, which is what a
+                // `?select=` over the result needs.
+                if columns.is_empty() || body.is_none() {
                     let mut frag = SqlFragment::new();
-                    frag.push("UPDATE ");
+                    frag.push("SELECT * FROM ");
                     frag.push(&from_qi(&qi));
-                    frag.push(" SET ");
-
-                    for (i, col) in columns.iter().enumerate() {
-                        if i > 0 {
-                            frag.push(", ");
-                        }
-                        frag.push(&escape_ident(&col.name));
-                        frag.push(" = (");
-                        frag.push_param(body_str.to_string());
-                        frag.push("::json->>");
-                        frag.push_param(col.name.clone());
-                        frag.push(")::");
-                        frag.push(&col.ir_type);
-                    }
-
-                    // WHERE
-                    if !where_clauses.is_empty() {
-                        frag.push(" WHERE ");
-                        for (i, clause) in where_clauses.iter().enumerate() {
-                            if i > 0 {
-                                frag.push(" AND ");
-                            }
-                            frag.append(Self::build_logic_tree(clause)?);
-                        }
-                    }
-
-                    // RETURNING
-                    if !returning.is_empty() {
-                        frag.push(" RETURNING ");
-                        for (i, col) in returning.iter().enumerate() {
-                            if i > 0 {
-                                frag.push(", ");
-                            }
-                            frag.push(&escape_ident(col));
-                        }
-                    }
-
+                    frag.push(" WHERE false");
                     return Ok(frag);
                 }
 
-                Ok(builder.build())
+                let body = body.as_ref().expect("checked above");
+                let mut frag = SqlFragment::new();
+                frag.push("UPDATE ");
+                frag.push(&from_qi(&qi));
+                frag.push(" SET ");
+                for (i, column) in columns.iter().enumerate() {
+                    if i > 0 {
+                        frag.push(", ");
+                    }
+                    frag.push(&escape_ident(&column.name));
+                    frag.push(" = pgrst_body.");
+                    frag.push(&escape_ident(&column.name));
+                }
+                frag.push(" ");
+                push_json_body(&mut frag, &qi, columns, body, true);
+
+                if !where_clauses.is_empty() {
+                    frag.push(" WHERE ");
+                    for (i, clause) in where_clauses.iter().enumerate() {
+                        if i > 0 {
+                            frag.push(" AND ");
+                        }
+                        frag.append(Self::build_logic_tree(clause)?);
+                    }
+                }
+
+                push_returning(&mut frag, returning);
+                Ok(frag)
             }
 
             MutatePlan::Delete {
@@ -667,20 +679,22 @@ impl QueryBuilder {
                     &target.name,
                 );
 
-                let mut builder = DeleteBuilder::new().from_table(&qi);
+                let mut frag = SqlFragment::new();
+                frag.push("DELETE FROM ");
+                frag.push(&from_qi(&qi));
 
-                // WHERE
-                for clause in where_clauses {
-                    let expr = Self::build_logic_tree(clause)?;
-                    builder = builder.where_raw(expr);
+                if !where_clauses.is_empty() {
+                    frag.push(" WHERE ");
+                    for (i, clause) in where_clauses.iter().enumerate() {
+                        if i > 0 {
+                            frag.push(" AND ");
+                        }
+                        frag.append(Self::build_logic_tree(clause)?);
+                    }
                 }
 
-                // RETURNING
-                for col in returning {
-                    builder = builder.returning(col);
-                }
-
-                Ok(builder.build())
+                push_returning(&mut frag, returning);
+                Ok(frag)
             }
         }
     }
@@ -835,6 +849,92 @@ impl QueryBuilder {
 /// what distinguishes `data->'1'` from `data->1` in PostgreSQL. Operands reach
 /// us already restricted to alphanumerics and underscores by the parser; the
 /// quote doubling is belt-and-braces so this stays safe if that ever loosens.
+/// The columns a mutation writes, as a comma-separated identifier list.
+fn push_column_list(frag: &mut SqlFragment, columns: &[crate::plan::CoercibleField]) {
+    for (i, column) in columns.iter().enumerate() {
+        if i > 0 {
+            frag.push(", ");
+        }
+        frag.push(&escape_ident(&column.name));
+    }
+}
+
+/// The `FROM` clause that turns a JSON body into rows of the table's columns.
+///
+/// The body is read as a record set of exactly the columns being written, each
+/// typed as the column is -- or as `json`, where a data representation is going
+/// to parse it -- so PostgreSQL does the conversion and this process never has
+/// to guess at a literal's spelling.
+///
+/// `single` reads one object rather than an array, which is what a `PATCH`
+/// body is.
+fn push_json_body(
+    frag: &mut SqlFragment,
+    qi: &postrust_sql::identifier::QualifiedIdentifier,
+    columns: &[crate::plan::CoercibleField],
+    body: &bytes::Bytes,
+    single: bool,
+) {
+    let _ = qi;
+    let body = String::from_utf8_lossy(body).into_owned();
+    let object = body.trim_start().starts_with('{');
+
+    frag.push("FROM (SELECT ");
+    frag.push_param(body);
+    frag.push("::json AS json_data) pgrst_payload, LATERAL (SELECT ");
+    for (i, column) in columns.iter().enumerate() {
+        if i > 0 {
+            frag.push(", ");
+        }
+        match &column.transform {
+            Some(parser) => {
+                frag.push(parser);
+                frag.push("(");
+                frag.push(&escape_ident(&column.name));
+                frag.push(") AS ");
+                frag.push(&escape_ident(&column.name));
+            }
+            None => {
+                frag.push(&escape_ident(&column.name));
+            }
+        }
+    }
+    // `json_to_record` takes one object and `json_to_recordset` an array. A
+    // `PATCH` body is one object either way; an insert may be either, and the
+    // body itself says which.
+    frag.push(match single || object {
+        true => " FROM json_to_record(pgrst_payload.json_data) AS _(",
+        false => " FROM json_to_recordset(pgrst_payload.json_data) AS _(",
+    });
+    for (i, column) in columns.iter().enumerate() {
+        if i > 0 {
+            frag.push(", ");
+        }
+        frag.push(&escape_ident(&column.name));
+        frag.push(" ");
+        frag.push(castable_type(&column.ir_type).unwrap_or("text"));
+    }
+    frag.push(")");
+    if single && !object {
+        frag.push(" LIMIT 1");
+    }
+    frag.push(") pgrst_body");
+}
+
+/// The `RETURNING` list, or nothing when there is none.
+fn push_returning(frag: &mut SqlFragment, returning: &[String]) {
+    if returning.is_empty() {
+        return;
+    }
+    frag.push(" RETURNING ");
+    for (i, column) in returning.iter().enumerate() {
+        if i > 0 {
+            frag.push(", ");
+        }
+        frag.push(&escape_ident(column));
+    }
+}
+
 /// A column reference, converted to JSON first where the path requires it.
 fn push_field_ref(frag: &mut SqlFragment, field: &crate::plan::CoercibleField) {
     // A computed field is a function of the whole row. PostgreSQL would also

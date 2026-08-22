@@ -18,6 +18,9 @@ pub fn build_query(plan: &ActionPlan, role: Option<&str>) -> Result<MainQuery> {
     }
 }
 
+/// The name the rows a mutation affected are read from.
+pub const MUTATION_RESULT: &str = "pgrst_mutation_result";
+
 /// Build SQL from a database action plan.
 fn build_db_query(plan: &DbActionPlan, role: Option<&str>) -> Result<MainQuery> {
     let mut query = MainQuery::new();
@@ -35,10 +38,27 @@ fn build_db_query(plan: &DbActionPlan, role: Option<&str>) -> Result<MainQuery> 
             query.main = QueryBuilder::build_read(read_tree)?;
         }
         DbActionPlan::MutateRead { mutate, read } => {
-            query.main = QueryBuilder::build_mutate(mutate)?;
-            if let Some(read_tree) = read {
-                query.read = Some(QueryBuilder::build_read(read_tree)?);
-            }
+            let mutation = QueryBuilder::build_mutate(mutate)?;
+
+            // The rows a mutation affected are a relation like any other, so
+            // `?select=` is answered by reading from them -- which is also
+            // what lets a mutation embed, alias, cast and compute exactly as a
+            // read does. Without the wrapper the `RETURNING` list was the
+            // whole answer, and none of that reached it.
+            query.main = match read {
+                Some(read_tree) => {
+                    let read_sql = QueryBuilder::build_read(read_tree)?;
+                    let mut frag = SqlFragment::new();
+                    frag.push("WITH ");
+                    frag.push(MUTATION_RESULT);
+                    frag.push(" AS (");
+                    frag.append(mutation);
+                    frag.push(") ");
+                    frag.append(read_sql);
+                    frag
+                }
+                None => mutation,
+            };
         }
         DbActionPlan::Call { call, read } => {
             query.main = QueryBuilder::build_call(call, read.as_ref())?;

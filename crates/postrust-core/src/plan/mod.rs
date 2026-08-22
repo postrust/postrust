@@ -138,6 +138,19 @@ fn validate_embed_paths(request: &ApiRequest) -> Result<()> {
 /// taking nothing at all, while `/rpc/add_them?a=1&b=2&smthelse=x` is a call
 /// with an argument no signature declares.
 fn supplied_arguments(request: &ApiRequest) -> Vec<String> {
+    use crate::api_request::Payload;
+
+    // Over POST the arguments are the body's keys, and the query string holds
+    // filters over the result. Reading only the query string there picked the
+    // signature that takes nothing at all.
+    match &request.payload {
+        Some(Payload::ProcessedJson { keys, .. }) => return keys.iter().cloned().collect(),
+        Some(Payload::ProcessedUrlEncoded { data, .. }) => {
+            return data.iter().map(|(name, _)| name.clone()).collect()
+        }
+        _ => {}
+    }
+
     // A filter on an embedded resource is keyed by its path -- `clients.id`
     // -- and is no more an argument than a filter on the result itself.
     let embedded: HashSet<String> = request
@@ -264,7 +277,7 @@ fn create_db_plan(
 
         DbAction::RelationMut { qi, mutation } => {
             let table = schema_cache.require_table(qi)?;
-            let mutate_plan = MutatePlan::from_request(request, table, mutation)?;
+            let mutate_plan = MutatePlan::from_request(request, table, mutation, schema_cache)?;
 
             let read_plan = if request.preferences.representation.needs_body() {
                 let rp = ReadPlan::for_mutation(request, table, schema_cache)?;
