@@ -149,6 +149,8 @@ impl MutatePlan {
         qi: QualifiedIdentifier,
         schema_cache: &crate::schema_cache::SchemaCache,
     ) -> Result<Self> {
+        validate_put(request, table)?;
+
         let columns = get_payload_columns(request, table, schema_cache)?;
         let body = get_body_bytes(request)?;
         let returning = get_returning_columns(request, table);
@@ -228,6 +230,76 @@ fn get_payload_columns(
     }
 
     Ok(columns)
+}
+
+/// Check that a `PUT` names exactly one row, and that its body agrees.
+///
+/// `PUT` replaces the row the URL identifies, so the URL has to identify one:
+/// every primary key column, compared with `eq`, and nothing else. A page
+/// makes no sense on top of that, and a body naming a different row would
+/// write somewhere the client did not ask for.
+fn validate_put(request: &ApiRequest, table: &Table) -> Result<()> {
+    use crate::api_request::{Operation, QuantOperator};
+
+    if request
+        .query_params
+        .ranges
+        .values()
+        .any(|range| range.limit.is_some() || range.offset != 0)
+    {
+        return Err(Error::PutLimitNotAllowed);
+    }
+
+    let mut keyed: std::collections::HashMap<&str, &str> = std::collections::HashMap::new();
+    for filter in &request.query_params.filters_root {
+        let Operation::Quant {
+            op: QuantOperator::Equal,
+            quantifier: None,
+            value,
+        } = &filter.op_expr.operation
+        else {
+            return Err(Error::InvalidPutFilters);
+        };
+        if filter.op_expr.negated {
+            return Err(Error::InvalidPutFilters);
+        }
+        keyed.insert(&filter.field.name, value);
+    }
+
+    // Anything else in the query string that filters -- a logic group, a
+    // filter on an embedded resource -- also fails to name exactly one row.
+    if !request.query_params.logic.is_empty() || !request.query_params.filters.is_empty() {
+        return Err(Error::InvalidPutFilters);
+    }
+
+    if table.pk_cols.is_empty()
+        || keyed.len() != table.pk_cols.len()
+        || !table
+            .pk_cols
+            .iter()
+            .all(|key| keyed.contains_key(key.as_str()))
+    {
+        return Err(Error::InvalidPutFilters);
+    }
+
+    // The body may leave a key out -- the URL already said what it is -- but
+    // where it names one it has to be the same one.
+    if let Some(Payload::ProcessedJson { raw, .. }) = &request.payload {
+        if let Ok(serde_json::Value::Object(row)) = serde_json::from_slice(raw) {
+            for key in &table.pk_cols {
+                let Some(value) = row.get(key) else { continue };
+                let value = match value {
+                    serde_json::Value::String(text) => text.clone(),
+                    other => other.to_string(),
+                };
+                if keyed.get(key.as_str()) != Some(&value.as_str()) {
+                    return Err(Error::PutMatchingPk);
+                }
+            }
+        }
+    }
+
+    Ok(())
 }
 
 /// Get body as bytes.

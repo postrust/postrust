@@ -175,6 +175,55 @@ impl Relationship {
             }
     }
 
+    /// Whether this is a self-referential foreign key.
+    pub fn is_self_referential(&self) -> bool {
+        matches!(self, Self::ForeignKey { is_self, .. } if *is_self)
+    }
+
+    /// Whether this relationship yields many rows per row of its own table.
+    pub fn is_one_to_many(&self) -> bool {
+        matches!(
+            self,
+            Self::ForeignKey {
+                cardinality: Cardinality::O2M { .. },
+                ..
+            }
+        )
+    }
+
+    /// The single column this side joins on, where it joins on exactly one.
+    pub fn single_local_column(&self) -> Option<&str> {
+        match self.join_columns().len() {
+            1 => match self {
+                Self::ForeignKey { cardinality, .. } => match cardinality {
+                    Cardinality::O2M { columns, .. }
+                    | Cardinality::M2O { columns, .. }
+                    | Cardinality::O2O { columns, .. } => Some(columns[0].0.as_str()),
+                    Cardinality::M2M(_) => None,
+                },
+                Self::Computed { .. } => None,
+            },
+            _ => None,
+        }
+    }
+
+    /// The single column the other side joins on, where there is exactly one.
+    pub fn single_foreign_column(&self) -> Option<&str> {
+        match self {
+            Self::ForeignKey { cardinality, .. } => match cardinality {
+                Cardinality::O2M { columns, .. }
+                | Cardinality::M2O { columns, .. }
+                | Cardinality::O2O { columns, .. }
+                    if columns.len() == 1 =>
+                {
+                    Some(columns[0].1.as_str())
+                }
+                _ => None,
+            },
+            Self::Computed { .. } => None,
+        }
+    }
+
     /// Get the join columns for this relationship.
     pub fn join_columns(&self) -> Vec<(String, String)> {
         match self {

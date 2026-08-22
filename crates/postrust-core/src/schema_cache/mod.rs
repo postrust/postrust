@@ -309,6 +309,23 @@ impl SchemaCache {
                 // functions may return the same table, so the table's name
                 // would not tell them apart.
                 Relationship::Computed { function, .. } => function.name == to_name,
+                // One foreign key pointing at its own table is two
+                // relationships, and the table's name alone cannot tell them
+                // apart. The convention is PostgREST's: the table's name means
+                // the rows that point here -- the children -- and the key's own
+                // column means the row this one points at. A hint names the
+                // column the children point with, and so always means children.
+                r if r.is_self_referential() => match hint {
+                    None => {
+                        (r.foreign_table().name == to_name && r.is_one_to_many())
+                            || (r.single_local_column() == Some(to_name) && !r.is_one_to_many())
+                    }
+                    Some(hint) => {
+                        r.foreign_table().name == to_name
+                            && r.is_one_to_many()
+                            && r.single_foreign_column() == Some(hint)
+                    }
+                },
                 Relationship::ForeignKey { foreign_table, .. } => foreign_table.name == to_name,
             })
             .collect();
@@ -356,8 +373,11 @@ impl SchemaCache {
             }
         };
 
+        // A self-referential match has already accounted for the hint, and the
+        // general rule would reject it: both directions join on the same pair
+        // of columns, so the hint names them both.
         if let Some(hint) = hint {
-            matches.retain(|r| r.matches_hint(hint));
+            matches.retain(|r| r.is_self_referential() || r.matches_hint(hint));
         }
 
         match matches.len() {

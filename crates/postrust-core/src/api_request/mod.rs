@@ -229,6 +229,7 @@ fn parse_action(method: &Method, resource: &Resource, schema: &str) -> Result<Ac
         }),
 
         // Unsupported methods
+        (_, Resource::Routine(_)) => Err(Error::InvalidRpcMethod(method.to_string())),
         _ => Err(Error::UnsupportedMethod(method.to_string())),
     }
 }

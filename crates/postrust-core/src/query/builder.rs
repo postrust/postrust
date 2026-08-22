@@ -5,9 +5,7 @@ use crate::plan::{
     CallParams, CallPlan, CoercibleFilter, CoercibleLogicTree, CoercibleOrderTerm,
     CoercibleSelectField, MutatePlan, ReadPlan, ReadPlanTree,
 };
-use postrust_sql::{
-    escape_ident, from_qi, OrderExpr, SelectBuilder, SqlFragment, SqlParam,
-};
+use postrust_sql::{escape_ident, from_qi, OrderExpr, SelectBuilder, SqlFragment, SqlParam};
 
 /// Query builder for converting plans to SQL.
 pub struct QueryBuilder;

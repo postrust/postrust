@@ -809,6 +809,21 @@ async fn execute_plan(
                 (json_rows, false)
             };
 
+            // A function returning `void` has no result to report. PostgREST
+            // answers 204 rather than a body of `null`, which is the honest
+            // shape for something that returns nothing.
+            let returns_void = matches!(
+                db_plan,
+                DbActionPlan::Call { call, .. } if call.return_type.as_deref() == Some("void")
+            );
+            if returns_void {
+                return Ok(QueryResult {
+                    status: StatusCode::NO_CONTENT,
+                    omit_body: true,
+                    ..Default::default()
+                });
+            }
+
             // A mutation returns the affected rows only when the caller asked
             // for them; otherwise the body is empty whatever the status.
             let omit_body = is_mutation(db_plan) && !wants_representation(api_request);
@@ -2413,6 +2428,11 @@ fn sanitize_error_message(error: &postrust_core::Error) -> String {
         | Error::NotSingular { .. }
         | Error::InvalidRange(_)
         | Error::InvalidBody(_)
+        | Error::UnsupportedMethod(_)
+        | Error::InvalidRpcMethod(_)
+        | Error::InvalidPutFilters
+        | Error::PutLimitNotAllowed
+        | Error::PutMatchingPk
         | Error::InvalidResourcePath => return error.to_string(),
         Error::InvalidPath(_) => "Invalid request path",
         // What the token failed on is the client's own token, so naming it

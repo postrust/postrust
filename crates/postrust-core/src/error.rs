@@ -37,6 +37,14 @@ pub enum Error {
     #[error("Unsupported HTTP method: {0}")]
     UnsupportedMethod(String),
 
+    /// A method a function cannot be called with.
+    ///
+    /// A function is invoked with GET, HEAD or POST. The others are refused
+    /// with a message that says so rather than one about the method in
+    /// general, since the method is fine elsewhere in the API.
+    #[error("Cannot use the {0} method on RPC")]
+    InvalidRpcMethod(String),
+
     /// A profile header named a schema the server does not expose.
     ///
     /// Carries the schemas that *are* exposed, because the client needs them
@@ -127,6 +135,12 @@ pub enum Error {
         params: Vec<String>,
         /// A signature that does exist, where one does.
         candidate: Option<String>,
+        /// Whether a single unnamed `json` parameter was also considered.
+        ///
+        /// It is, over `POST`, where the whole body can be one argument --
+        /// and the message says so, since it widens what would have matched.
+        #[allow(dead_code)]
+        single_json: bool,
     },
 
     #[error("Column not found: {0}")]
@@ -179,6 +193,21 @@ pub enum Error {
     /// A path with more segments than any resource has.
     #[error("Invalid path specified in request URL")]
     InvalidResourcePath,
+
+    /// A `PUT` whose filters do not name exactly one row by its key.
+    ///
+    /// `PUT` writes the row the URL names, so the URL has to name exactly one:
+    /// every primary key column, with `eq`, and nothing else.
+    #[error("Filters must include all and only primary key columns with 'eq' operators")]
+    InvalidPutFilters,
+
+    /// A `PUT` carrying a page.
+    #[error("limit/offset querystring parameters are not allowed for PUT")]
+    PutLimitNotAllowed,
+
+    /// A `PUT` whose body names a different row from its URL.
+    #[error("Payload values do not match URL in primary key column(s)")]
+    PutMatchingPk,
 
     /// Preferences the server does not know, sent with `handling=strict`.
     ///
@@ -239,6 +268,8 @@ impl Error {
             | Self::NotAnEmbeddedResource(_)
             | Self::RelatedOrderNotPossible { .. }
             | Self::InvalidPreferences(_)
+            | Self::PutLimitNotAllowed
+            | Self::PutMatchingPk
             | Self::InvalidPlan(_)
             | Self::EmbeddingError(_)
             | Self::AggregatesNotAllowed => StatusCode::BAD_REQUEST,
@@ -262,7 +293,9 @@ impl Error {
             | Self::RelationshipNotFound { .. } => StatusCode::NOT_FOUND,
 
             // 405 Method Not Allowed
-            Self::UnsupportedMethod(_) => StatusCode::METHOD_NOT_ALLOWED,
+            Self::UnsupportedMethod(_) | Self::InvalidRpcMethod(_) | Self::InvalidPutFilters => {
+                StatusCode::METHOD_NOT_ALLOWED
+            }
 
             // 406 Not Acceptable
             Self::UnacceptableSchema { .. } | Self::NotSingular { .. } => {
@@ -301,7 +334,8 @@ impl Error {
             // that did not parse, which is what PGRST100 covers.
             Self::InvalidHeader(_) => "PGRST100",
             Self::InvalidBody(_) => "PGRST102",
-            Self::UnsupportedMethod(_) => "PGRST104",
+            Self::UnsupportedMethod(_) => "PGRST117",
+            Self::InvalidRpcMethod(_) => "PGRST101",
             Self::UnacceptableSchema { .. } => "PGRST106",
             Self::UnknownColumn { .. } => "PGRST204",
             Self::InvalidRange(_) => "PGRST103",
@@ -324,6 +358,9 @@ impl Error {
             Self::NotAnEmbeddedResource(_) => "PGRST108",
             Self::NotSingular { .. } => "PGRST116",
             Self::InvalidResourcePath => "PGRST125",
+            Self::InvalidPutFilters => "PGRST105",
+            Self::PutLimitNotAllowed => "PGRST114",
+            Self::PutMatchingPk => "PGRST115",
             Self::RelatedOrderNotPossible { .. } => "PGRST118",
             Self::InvalidPreferences(_) => "PGRST122",
 
@@ -405,13 +442,20 @@ impl Error {
                 "Invalid preferences: {}",
                 invalid.join(", ")
             ))),
-            Self::FunctionNotFound { name, params, .. } => Some(serde_json::Value::String(
-                format!(
-                    "Searched for the function {} {}, but no matches were found in the schema cache.",
-                    name,
-                    describe_params(params)
-                ),
-            )),
+            Self::FunctionNotFound {
+                name,
+                params,
+                single_json,
+                ..
+            } => Some(serde_json::Value::String(format!(
+                "Searched for the function {} {}{}, but no matches were found in the schema cache.",
+                name,
+                describe_params(params),
+                match single_json {
+                    true => " or with a single unnamed json/jsonb parameter",
+                    false => "",
+                }
+            ))),
             _ => None,
         }
     }

@@ -292,11 +292,13 @@ fn create_db_plan(
             })
         }
 
-        DbAction::Routine {
-            qi,
-            invoke_method: _,
-        } => {
+        DbAction::Routine { qi, invoke_method } => {
             let supplied = supplied_arguments(request);
+
+            // Over POST the whole body can be one unnamed `json` argument, so
+            // a signature taking that would also have matched. The message
+            // says which signatures were looked for, so it says so too.
+            let single_json = matches!(invoke_method, crate::api_request::InvokeMethod::Inv);
 
             // The name is reported as it was called, arguments and all, so the
             // client can see which signature was looked for.
@@ -304,6 +306,7 @@ fn create_db_plan(
                 name: qi.to_string(),
                 params: supplied.clone(),
                 candidate,
+                single_json,
             };
 
             let routines = schema_cache

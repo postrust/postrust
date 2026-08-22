@@ -126,16 +126,23 @@ write_reset_assets
 say "Extracting request cases from the spec suite"
 python3 "$HERE/extract.py" "$WORK/pgrst/test/spec/Feature" "$WORK/cases.json"
 
-say "Replaying against PostgREST $PGRST_VERSION (reference)"
-docker rm -f "$REF" >/dev/null 2>&1 || true
-docker run -d --name "$REF" --network "$NET" -p "$REF_PORT:3000" \
-    -e PGRST_DB_URI="postgres://postgres:postgres@$DB:5432/pgrst_conf" \
-    -e PGRST_DB_SCHEMAS="$SCHEMA" -e PGRST_DB_ANON_ROLE="$ANON_ROLE" \
-    -e PGRST_JWT_SECRET="$JWT_SECRET" -e PGRST_SERVER_PORT=3000 \
-    "postgrest/postgrest:$PGRST_VERSION" >/dev/null
-sleep 9
-python3 "$HERE/run.py" "$WORK/cases.json" "http://localhost:$REF_PORT" \
-    "$WORK/ref.json" "$RESET_CMD >/dev/null 2>&1"
+# The reference run is the expensive half and its answers only change when
+# PostgREST's version or the fixtures do, so a previous one can be reused
+# while iterating on the candidate. Set CONFORMANCE_REUSE_REF=1 to do that.
+if [ "${CONFORMANCE_REUSE_REF:-}" = "1" ] && [ -s "$WORK/ref.json" ]; then
+    say "Reusing the recorded PostgREST $PGRST_VERSION responses"
+else
+    say "Replaying against PostgREST $PGRST_VERSION (reference)"
+    docker rm -f "$REF" >/dev/null 2>&1 || true
+    docker run -d --name "$REF" --network "$NET" -p "$REF_PORT:3000" \
+        -e PGRST_DB_URI="postgres://postgres:postgres@$DB:5432/pgrst_conf" \
+        -e PGRST_DB_SCHEMAS="$SCHEMA" -e PGRST_DB_ANON_ROLE="$ANON_ROLE" \
+        -e PGRST_JWT_SECRET="$JWT_SECRET" -e PGRST_SERVER_PORT=3000 \
+        "postgrest/postgrest:$PGRST_VERSION" >/dev/null
+    sleep 9
+    python3 "$HERE/run.py" "$WORK/cases.json" "http://localhost:$REF_PORT" \
+        "$WORK/ref.json" "$RESET_CMD >/dev/null 2>&1"
+fi
 
 say "Replaying against Postrust (candidate)"
 full_load
