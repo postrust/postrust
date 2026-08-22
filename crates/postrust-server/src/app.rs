@@ -162,6 +162,79 @@ async fn process_request(
     Ok(build_response(response))
 }
 
+/// The prefix given to primary key columns added only to build `Location`.
+const LOCATION_KEY_PREFIX: &str = "pgrst_location_";
+
+/// Whether this request writes the row its URL names.
+fn is_upsert(api_request: &ApiRequest) -> bool {
+    use postrust_core::api_request::{Action, DbAction, Mutation};
+
+    matches!(
+        &api_request.action,
+        Action::Db(DbAction::RelationMut {
+            mutation: Mutation::SingleUpsert,
+            ..
+        })
+    )
+}
+
+/// The `Location` of a newly created row, and removal of the key columns that
+/// were added to find it.
+///
+/// `/projects?id=eq.7` -- the address the row can be read back from, which is
+/// what a 201 is required to give. A key column that came back null is
+/// addressed with `is.null`, since `eq.` would match nothing.
+fn build_location(
+    api_request: &ApiRequest,
+    rows: &mut [serde_json::Value],
+    keys: &[String],
+) -> Option<String> {
+    if keys.is_empty() {
+        return None;
+    }
+
+    let table = api_request.path.rsplit('/').next()?;
+    let mut conditions = Vec::with_capacity(keys.len());
+
+    for key in keys {
+        let value = rows
+            .first()?
+            .get(key)
+            .or_else(|| rows.first()?.get(format!("{}{}", LOCATION_KEY_PREFIX, key)))?;
+        conditions.push(match value {
+            serde_json::Value::Null => format!("{}=is.null", urlencode(key)),
+            serde_json::Value::String(text) => {
+                format!("{}=eq.{}", urlencode(key), urlencode(text))
+            }
+            other => format!("{}=eq.{}", urlencode(key), urlencode(&other.to_string())),
+        });
+    }
+
+    for row in rows.iter_mut() {
+        if let Some(object) = row.as_object_mut() {
+            for key in keys {
+                object.remove(&format!("{}{}", LOCATION_KEY_PREFIX, key));
+            }
+        }
+    }
+
+    Some(format!("/{}?{}", table, conditions.join("&")))
+}
+
+/// Percent-encode everything a query-string value may not carry literally.
+fn urlencode(value: &str) -> String {
+    let mut encoded = String::with_capacity(value.len());
+    for byte in value.as_bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                encoded.push(*byte as char)
+            }
+            other => encoded.push_str(&format!("%{:02X}", other)),
+        }
+    }
+    encoded
+}
+
 /// Whether this request must carry a body.
 ///
 /// Insert, update and upsert all write values that can only come from one.
@@ -291,6 +364,39 @@ async fn execute_plan(
                 adjusted
             } else {
                 db_plan.clone()
+            };
+
+            // The `Location` of a created row is built from its primary key,
+            // which the client may not have selected. The columns are added
+            // under names of our own so they cannot collide with anything the
+            // request asked for, and are taken back out of the response once
+            // the header is built.
+            let location_keys: Vec<String> = match db_plan {
+                DbActionPlan::MutateRead {
+                    mutate: postrust_core::plan::MutatePlan::Insert { pk_cols, .. },
+                    ..
+                } if !is_upsert(api_request) => pk_cols.clone(),
+                _ => Vec::new(),
+            };
+            let db_plan = &if location_keys.is_empty() {
+                db_plan.clone()
+            } else {
+                let mut adjusted = db_plan.clone();
+                if let DbActionPlan::MutateRead {
+                    read: Some(tree), ..
+                } = &mut adjusted
+                {
+                    for key in &location_keys {
+                        tree.root.select.push(
+                            postrust_core::plan::CoercibleSelectField::with_alias(
+                                key,
+                                "",
+                                &format!("{}{}", LOCATION_KEY_PREFIX, key),
+                            ),
+                        );
+                    }
+                }
+                adjusted
             };
 
             // Build SQL
@@ -799,7 +905,7 @@ async fn execute_plan(
             // In PostgREST-compatibility mode, reshape RPC responses to match
             // PostgREST: un-nest the function-name-keyed column and return a
             // bare value for non-set-returning functions.
-            let (json_rows, singular) = if state.config.compat_mode {
+            let (mut json_rows, singular) = if state.config.compat_mode {
                 if let ActionPlan::Db(DbActionPlan::Call { call, .. }) = plan {
                     unwrap_rpc_rows(json_rows, call)
                 } else {
@@ -823,6 +929,11 @@ async fn execute_plan(
                     ..Default::default()
                 });
             }
+
+            // The created row's own address, taken from its key and then
+            // removed from the body -- the client asked for a `?select=`, not
+            // for the key.
+            let location = build_location(api_request, &mut json_rows, &location_keys);
 
             // A mutation returns the affected rows only when the caller asked
             // for them; otherwise the body is empty whatever the status.
@@ -867,6 +978,7 @@ async fn execute_plan(
                 rows,
                 singular,
                 omit_body,
+                location,
                 content_range: Some(content_range),
                 ..Default::default()
             })
