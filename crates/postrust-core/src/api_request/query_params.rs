@@ -691,6 +691,19 @@ fn parse_order_term(value: &str) -> Result<OrderTerm> {
         }
     }
 
+    // `clients(name)` orders by a column of an embedded resource rather than
+    // by one of this table's own.
+    if let Some((relation, rest)) = field_name.split_once('(') {
+        if let Some(column) = rest.strip_suffix(')') {
+            return Ok(OrderTerm::Relation {
+                relation: relation.to_string(),
+                field: split_json_path(column),
+                direction,
+                nulls,
+            });
+        }
+    }
+
     Ok(OrderTerm::Field {
         field,
         direction,

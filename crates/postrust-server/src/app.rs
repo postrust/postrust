@@ -232,7 +232,7 @@ async fn execute_plan(
                 let schema_cache = state.schema_cache().await;
                 read_target(api_request, &schema_cache)
             };
-            let embed_level = match embed_parent {
+            let embed_level = match embed_parent.clone() {
                 Some(parent_qi)
                     if api_request.query_params.select.iter().any(|item| {
                         matches!(
@@ -254,6 +254,19 @@ async fn execute_plan(
                 }
                 _ => EmbedLevel::default(),
             };
+            let mut embed_level = embed_level;
+
+            // Ordering by an embedded column is resolved here rather than in
+            // the read plan: the plan has no way to reach another table.
+            if let (Some(parent_qi), DbActionPlan::Read(tree)) = (&embed_parent, db_plan) {
+                let schema_cache = state.schema_cache().await;
+                embed_level.orders = build_embed_orders(
+                    &schema_cache,
+                    parent_qi,
+                    &tree.root.order,
+                    &mut embed_filters,
+                )?;
+            }
 
             // Filter parameters are appended in the order the predicates were
             // renumbered, so placeholder N in the wrapped SQL lines up with
@@ -272,8 +285,16 @@ async fn execute_plan(
                 // Rebuilding is safe for parameter numbering: LIMIT and OFFSET
                 // render as literals, so dropping them leaves the placeholders
                 // and their count untouched.
+                //
+                // Ordering by an embedded resource's column needs the same
+                // treatment for the same reason: the value being ordered on is
+                // only reachable out here, so the page cannot be taken before
+                // it is known.
+                let orders_by_embed = matches!(db_plan, DbActionPlan::Read(tree)
+                    if tree.root.order.iter().any(|t| t.relation.is_some()));
+
                 let mut page = None;
-                if !embed_level.inner_joins.is_empty() {
+                if !embed_level.inner_joins.is_empty() || orders_by_embed {
                     if let DbActionPlan::Read(tree) = db_plan {
                         let mut unpaged = tree.clone();
                         page = Some(std::mem::take(&mut unpaged.root.range));
@@ -298,6 +319,11 @@ async fn execute_plan(
                 if !embed_level.inner_joins.is_empty() {
                     sql.push_str(" WHERE ");
                     sql.push_str(&embed_level.inner_joins.join(" AND "));
+                }
+
+                if !embed_level.orders.is_empty() {
+                    sql.push_str(" ORDER BY ");
+                    sql.push_str(&embed_level.orders.join(", "));
                 }
 
                 if let Some(range) = page {
@@ -1001,6 +1027,62 @@ struct EmbedLevel {
     /// `EXISTS` predicates from `!inner` on these relations. They reference
     /// the alias of the level *above*, so the caller applies them.
     inner_joins: Vec<String>,
+    /// `ORDER BY` expressions for terms naming an embedded resource.
+    orders: Vec<String>,
+}
+
+/// Build the `ORDER BY` expressions for terms naming an embedded resource.
+///
+/// `order=clients(name)` orders by a column the parent does not have, so each
+/// term becomes a scalar subselect fetched per parent row -- the same shape as
+/// the embed itself, reduced to one column.
+#[allow(clippy::result_large_err)] // consistent with the crate's error type
+fn build_embed_orders(
+    schema_cache: &postrust_core::SchemaCache,
+    parent_qi: &postrust_core::api_request::QualifiedIdentifier,
+    order: &[postrust_core::plan::CoercibleOrderTerm],
+    ctx: &mut EmbedFilters<'_>,
+) -> Result<Vec<String>, postrust_core::Error> {
+    let mut orders = Vec::new();
+
+    for term in order.iter() {
+        let Some(relation) = &term.relation else {
+            continue;
+        };
+
+        let rel = schema_cache
+            .find_relationship(parent_qi, relation, None, &parent_qi.schema)?
+            .ok_or_else(|| postrust_core::Error::RelationshipNotFound(relation.clone()))?;
+        let plan = postrust_core::embed::EmbedPlan::resolve(rel, schema_cache)?;
+
+        let child_alias = ctx.next_alias();
+        let column = postrust_core::query::QueryBuilder::column_sql(&term.field);
+        let mut expression = plan.order_expression(
+            "src",
+            PARENT_ROW_COLUMN_REF,
+            &child_alias,
+            &format!("{}.{}", postrust_sql::escape_ident(&child_alias), column),
+        );
+
+        match term.direction {
+            Some(postrust_core::api_request::OrderDirection::Desc) => expression.push_str(" DESC"),
+            Some(postrust_core::api_request::OrderDirection::Asc) => expression.push_str(" ASC"),
+            None => {}
+        }
+        match term.nulls {
+            Some(postrust_core::api_request::OrderNulls::First) => {
+                expression.push_str(" NULLS FIRST")
+            }
+            Some(postrust_core::api_request::OrderNulls::Last) => {
+                expression.push_str(" NULLS LAST")
+            }
+            None => {}
+        }
+
+        orders.push(expression);
+    }
+
+    Ok(orders)
 }
 
 #[allow(clippy::result_large_err)] // consistent with the crate's error type

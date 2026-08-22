@@ -402,6 +402,60 @@ impl EmbedPlan {
         })
     }
 
+    /// A scalar subselect yielding one column of the related row.
+    ///
+    /// This is what `order=clients(name)` orders by: the parent has no such
+    /// column, so the value is fetched per parent row exactly as the embed
+    /// itself is. A to-many relationship has no single value to order by, so
+    /// the first row wins -- which is what `LIMIT 1` says and what PostgREST
+    /// does.
+    pub fn order_expression(
+        &self,
+        parent_alias: &str,
+        parent_row: &str,
+        child_alias: &str,
+        column_sql: &str,
+    ) -> String {
+        let source = match (&self.function, &self.junction) {
+            (Some(function), _) => format!(
+                "{}.{}({}) AS {} WHERE true",
+                postrust_sql::escape_ident(&function.schema),
+                postrust_sql::escape_ident(&function.name),
+                parent_row,
+                postrust_sql::escape_ident(child_alias),
+            ),
+            (None, Some(junction)) => {
+                let junction_alias = format!("{}_j", child_alias);
+                format!(
+                    "{}.{} AS {} JOIN {}.{} AS {} ON {}.{} = {}.{} WHERE {}.{} = {}.{}",
+                    postrust_sql::escape_ident(&self.foreign_schema),
+                    postrust_sql::escape_ident(&self.foreign_table),
+                    postrust_sql::escape_ident(child_alias),
+                    postrust_sql::escape_ident(&junction.schema),
+                    postrust_sql::escape_ident(&junction.table),
+                    postrust_sql::escape_ident(&junction_alias),
+                    postrust_sql::escape_ident(&junction_alias),
+                    postrust_sql::escape_ident(&junction.child_column),
+                    postrust_sql::escape_ident(child_alias),
+                    postrust_sql::escape_ident(&self.foreign_column),
+                    postrust_sql::escape_ident(&junction_alias),
+                    postrust_sql::escape_ident(&junction.parent_column),
+                    postrust_sql::escape_ident(parent_alias),
+                    postrust_sql::escape_ident(&self.local_column),
+                )
+            }
+            (None, None) => format!(
+                "{}.{} AS {} WHERE {}",
+                postrust_sql::escape_ident(&self.foreign_schema),
+                postrust_sql::escape_ident(&self.foreign_table),
+                postrust_sql::escape_ident(child_alias),
+                self.correlation(parent_alias, child_alias),
+            ),
+        };
+
+        format!("(SELECT {} FROM {} LIMIT 1)", column_sql, source)
+    }
+
     /// An `EXISTS` predicate restricting parents to those with a matching child.
     ///
     /// This is what `!inner` means. The embed expression on its own only

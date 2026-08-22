@@ -58,7 +58,10 @@ impl QueryBuilder {
         }
 
         // ORDER BY
-        for term in &plan.order {
+        //
+        // A term naming an embedded resource is left for the caller: it orders
+        // by a column of another table, which this query has no way to reach.
+        for term in plan.order.iter().filter(|t| t.relation.is_none()) {
             let order = Self::build_order_term(term);
             builder = builder.order_by(order);
         }
@@ -219,6 +222,17 @@ impl QueryBuilder {
                 Ok(frag)
             }
         }
+    }
+
+    /// A column reference with its JSON path, as it appears in SQL.
+    ///
+    /// Exposed for ordering by an embedded resource's column, which is
+    /// assembled outside the read plan.
+    pub fn column_sql(field: &crate::plan::CoercibleField) -> String {
+        let mut frag = SqlFragment::new();
+        frag.push(&escape_ident(&field.name));
+        push_json_path(&mut frag, &field.json_path);
+        frag.sql().to_string()
     }
 
     /// Build the SQL for a single filter against a column of `pg_type`.
