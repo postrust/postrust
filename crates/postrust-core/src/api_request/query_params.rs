@@ -153,9 +153,12 @@ pub fn parse_select(input: &str) -> Result<Vec<SelectItem>> {
         return Ok(vec![]);
     }
 
+    // Anything left over is a parse failure, not something to ignore. Left
+    // ignored, one unparsable item silently discarded every item after it --
+    // `select=id, name, billing(address)` returned the id alone.
     match parse_select_items(input) {
-        Ok((_, items)) => Ok(items),
-        Err(_) => Err(Error::InvalidQueryParam("select".into())),
+        Ok(("", items)) => Ok(items),
+        _ => Err(Error::InvalidQueryParam(format!("select={}", input))),
     }
 }
 
@@ -164,6 +167,9 @@ fn parse_select_items(input: &str) -> IResult<&str, Vec<SelectItem>> {
 }
 
 fn parse_select_item(input: &str) -> IResult<&str, SelectItem> {
+    // A space after a comma is ordinary in a hand-written URL, and PostgREST
+    // accepts it.
+    let (input, _) = nom::character::complete::space0(input)?;
     alt((
         parse_star,
         // Before relations: `count()` is spelled exactly like an embed of a

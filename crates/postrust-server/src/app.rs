@@ -619,7 +619,21 @@ async fn execute_plan(
                 .map_err(|e| postrust_core::Error::ConnectionPool(e.to_string()))?;
 
             // Drop columns that were only selected to join the embeds.
-            for column in added_join_columns {
+            //
+            // Except where the embed answers to that very name: embedding
+            // through a column -- `?select=client_id(*)` -- keys the result by
+            // the column it joined on, and the embed is what the client asked
+            // for. Stripping by name would take it along with the column.
+            let embed_keys: std::collections::HashSet<&str> = embed_level
+                .expressions
+                .iter()
+                .map(|(key, _)| key.as_str())
+                .collect();
+
+            for column in added_join_columns
+                .iter()
+                .filter(|column| !embed_keys.contains(column.as_str()))
+            {
                 for row in json_rows.iter_mut() {
                     if let Some(object) = row.as_object_mut() {
                         object.remove(column);
