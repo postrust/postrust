@@ -139,12 +139,21 @@ impl Relationship {
         // telling name depends on the direction: `whatev_jobs!site_id_1` names
         // a column on the jobs, which is the far side when the request starts
         // from the sites.
+        //
+        // A self-referential relationship appears twice, once each way, and
+        // both directions join on the same pair of columns -- so matching
+        // either side would match both and make every hint ambiguous. The far
+        // side is the telling one: `family_tree!parent` asks for the rows
+        // whose `parent` points here.
+        let self_referential = matches!(self, Self::ForeignKey { is_self, .. } if *is_self);
+        let columns_match = self
+            .join_columns()
+            .iter()
+            .any(|(local, foreign)| foreign == hint || (!self_referential && local == hint));
+
         self.constraint_name() == hint
             || self.foreign_table().name == hint
-            || self
-                .join_columns()
-                .iter()
-                .any(|(local, foreign)| local == hint || foreign == hint)
+            || columns_match
             || match self {
                 Self::Computed { function, .. } => function.name == hint,
                 // A junction is named by the table it joins through, or by
