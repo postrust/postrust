@@ -153,6 +153,12 @@ async fn execute_plan(
                 alias_counter: 0,
             };
 
+            // The single-query form cannot express a spread, whose columns have
+            // to land in the parent object rather than under a key of their
+            // own. One anywhere in the tree sends the whole request down the
+            // two-query path, which can: taking the single-query path for the
+            // plain relations would embed those and drop the spread, since the
+            // two-query path only runs when the first produced nothing.
             let embed_level = match read_target(api_request) {
                 Some(parent_qi)
                     if api_request.query_params.select.iter().any(|item| {
@@ -160,7 +166,7 @@ async fn execute_plan(
                             item,
                             postrust_core::api_request::SelectItem::Relation { .. }
                         )
-                    }) =>
+                    }) && !contains_spread(&api_request.query_params.select) =>
                 {
                     let schema_cache = state.schema_cache().await;
                     build_embed_expressions(
@@ -472,11 +478,22 @@ fn selects_an_aggregate(api_request: &ApiRequest) -> bool {
         items.iter().any(|item| match item {
             SelectItem::Field { aggregate, .. } => aggregate.is_some(),
             SelectItem::Relation { select, .. } => walk(select),
-            SelectItem::SpreadRelation { .. } => false,
+            SelectItem::SpreadRelation { select, .. } => walk(select),
         })
     }
 
     walk(&api_request.query_params.select)
+}
+
+/// Whether a select list spreads a related resource, at any depth.
+fn contains_spread(items: &[postrust_core::api_request::SelectItem]) -> bool {
+    use postrust_core::api_request::SelectItem;
+
+    items.iter().any(|item| match item {
+        SelectItem::SpreadRelation { .. } => true,
+        SelectItem::Relation { select, .. } => contains_spread(select),
+        SelectItem::Field { .. } => false,
+    })
 }
 
 /// Whether this plan changes data.
@@ -867,14 +884,22 @@ fn embed_relations<'f>(
         }
 
         for item in select {
-            let SelectItem::Relation {
-                relation,
-                alias,
-                select: nested,
-                ..
-            } = item
-            else {
-                continue;
+            // A spread embed is fetched exactly like a plain one -- the two
+            // differ only in where the child's columns end up, which is
+            // settled once the rows are in hand.
+            let (relation, alias, nested, is_spread) = match item {
+                SelectItem::Relation {
+                    relation,
+                    alias,
+                    select: nested,
+                    ..
+                } => (relation, alias.clone(), nested, false),
+                SelectItem::SpreadRelation {
+                    relation,
+                    select: nested,
+                    ..
+                } => (relation, None, nested, true),
+                SelectItem::Field { .. } => continue,
             };
 
             let rel = schema_cache
@@ -1001,24 +1026,37 @@ fn embed_relations<'f>(
             // The projection in the query covers the columns; this covers what
             // is left over, which is the join column when the client did not
             // ask for it.
-            let requested: Option<std::collections::HashSet<String>> = if nested.is_empty() {
-                None
-            } else {
-                Some(
-                    nested
-                        .iter()
-                        .filter_map(|nested_item| match nested_item {
-                            SelectItem::Field { field, alias, .. } => {
-                                Some(alias.clone().unwrap_or_else(|| field.name.clone()))
-                            }
-                            SelectItem::Relation {
-                                relation, alias, ..
-                            } => Some(alias.clone().unwrap_or_else(|| relation.clone())),
-                            SelectItem::SpreadRelation { .. } => None,
-                        })
-                        .collect(),
-                )
-            };
+            // A spread picks its own columns out when it merges them, and does
+            // it by the child's own column names, so pruning here would only
+            // get in the way.
+            let requested: Option<std::collections::HashSet<String>> =
+                if nested.is_empty() || is_spread {
+                    None
+                } else {
+                    Some(
+                        nested
+                            .iter()
+                            .flat_map(|nested_item| match nested_item {
+                                SelectItem::Field { field, alias, .. } => {
+                                    vec![alias.clone().unwrap_or_else(|| field.name.clone())]
+                                }
+                                SelectItem::Relation {
+                                    relation, alias, ..
+                                } => vec![alias.clone().unwrap_or_else(|| relation.clone())],
+                                // A spread one level down has already merged
+                                // its columns into these rows, so they are
+                                // part of what was asked for.
+                                SelectItem::SpreadRelation { select, .. } => select
+                                    .iter()
+                                    .filter_map(|column| match column {
+                                        SelectItem::Field { field, .. } => Some(field.name.clone()),
+                                        _ => None,
+                                    })
+                                    .collect(),
+                            })
+                            .collect(),
+                    )
+                };
 
             if let Some(requested) = requested {
                 for group in grouped.values_mut() {
@@ -1029,9 +1067,25 @@ fn embed_relations<'f>(
                     }
                 }
             }
-            let field_name = alias.clone().unwrap_or_else(|| relation.clone());
-            for row in rows.iter_mut() {
-                postrust_core::embed::attach_to_parent(row, &field_name, &plan, &grouped);
+            if is_spread {
+                // The child rows carry the table's own column names, so the
+                // requested list is matched against those rather than against
+                // any alias.
+                let spread_columns: Vec<String> = nested
+                    .iter()
+                    .filter_map(|nested_item| match nested_item {
+                        SelectItem::Field { field, .. } => Some(field.name.clone()),
+                        _ => None,
+                    })
+                    .collect();
+                for row in rows.iter_mut() {
+                    postrust_core::embed::spread_into_parent(row, &plan, &grouped, &spread_columns);
+                }
+            } else {
+                let field_name = alias.clone().unwrap_or_else(|| relation.clone());
+                for row in rows.iter_mut() {
+                    postrust_core::embed::attach_to_parent(row, &field_name, &plan, &grouped);
+                }
             }
         }
 

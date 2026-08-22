@@ -202,11 +202,17 @@ fn parse_aggregate_suffix(input: &str) -> IResult<&str, AggregateFunction> {
     Ok((input, function))
 }
 
-/// Parse spread relation: `...relation`
+/// Parse spread relation: `...relation(cols)`
 fn parse_spread_relation(input: &str) -> IResult<&str, SelectItem> {
     let (input, _) = tag("...")(input)?;
     let (input, relation) = parse_identifier(input)?;
     let (input, (hint, join_type)) = parse_relation_modifiers(input)?;
+    // The parentheses are as much a part of the syntax here as they are for a
+    // plain embed. Leaving them for the caller to trip over meant the column
+    // list was silently discarded along with the rest of the select.
+    let (input, _) = char('(')(input)?;
+    let (input, nested) = parse_nested_select(input)?;
+    let (input, _) = char(')')(input)?;
 
     Ok((
         input,
@@ -214,6 +220,7 @@ fn parse_spread_relation(input: &str) -> IResult<&str, SelectItem> {
             relation: relation.to_string(),
             hint,
             join_type,
+            select: nested,
         },
     ))
 }
@@ -769,6 +776,53 @@ mod tests {
                 assert_eq!(values, &vec!["1", "2", "3"]);
             }
             _ => panic!("Expected In operation"),
+        }
+    }
+
+    #[test]
+    fn test_parse_spread_relation_keeps_its_columns() {
+        let items = parse_select("title,...directors(first_name,last_name)").unwrap();
+        assert_eq!(items.len(), 2);
+        match &items[1] {
+            SelectItem::SpreadRelation {
+                relation, select, ..
+            } => {
+                assert_eq!(relation, "directors");
+                let names: Vec<_> = select
+                    .iter()
+                    .map(|item| match item {
+                        SelectItem::Field { field, .. } => field.name.clone(),
+                        other => panic!("expected a field, got {:?}", other),
+                    })
+                    .collect();
+                assert_eq!(names, vec!["first_name", "last_name"]);
+            }
+            other => panic!("expected a spread relation, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_parse_spread_relation_does_not_swallow_later_items() {
+        // The column list used to be left unconsumed, which silently truncated
+        // everything after it.
+        let items = parse_select("...directors(name),year").unwrap();
+        assert_eq!(items.len(), 2);
+        assert!(matches!(items[0], SelectItem::SpreadRelation { .. }));
+        match &items[1] {
+            SelectItem::Field { field, .. } => assert_eq!(field.name, "year"),
+            other => panic!("expected a field, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_parse_nested_spread_relation() {
+        let items = parse_select("id,films(title,...directors(name))").unwrap();
+        match &items[1] {
+            SelectItem::Relation { select, .. } => {
+                assert_eq!(select.len(), 2);
+                assert!(matches!(select[1], SelectItem::SpreadRelation { .. }));
+            }
+            other => panic!("expected a relation, got {:?}", other),
         }
     }
 

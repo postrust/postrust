@@ -290,6 +290,7 @@ fn build_relation_selects(
                 relation,
                 hint: _,
                 join_type,
+                select: _,
             } => {
                 let _rel = schema_cache
                     .find_relationship(&table.qualified_identifier(), relation, &table.schema)

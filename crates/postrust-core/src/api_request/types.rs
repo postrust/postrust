@@ -481,10 +481,18 @@ pub enum SelectItem {
         select: Vec<SelectItem>,
     },
     /// Spread a related resource's columns (horizontal embedding)
+    ///
+    /// The related resource's columns land in the parent object itself rather
+    /// than under a key of their own, so unlike [`Self::Relation`] there is no
+    /// alias: nothing is being named.
     SpreadRelation {
         relation: FieldName,
         hint: Option<Hint>,
         join_type: Option<JoinType>,
+        /// Columns and further embeds selected on the related resource.
+        ///
+        /// Empty means every column, matching a bare `...relation()`.
+        select: Vec<SelectItem>,
     },
 }
 
