@@ -134,13 +134,69 @@ fn parse_preference(prefs: &mut Preferences, pref: &str) {
 
 /// Build the `Preference-Applied` header.
 ///
-/// Every preference the server understood, in the order it was sent. A client
-/// reads it to find out which of what it asked for was honoured, so a
-/// preference the server merely defaulted to has no business appearing.
-pub fn preference_applied(prefs: &Preferences) -> Option<String> {
-    match prefs.applied.is_empty() {
+/// Only preferences that were asked for, and only those the request could
+/// honour: `return=representation` says nothing on a read, and `missing`
+/// nothing on a delete. PostgREST filters the same way and in this order,
+/// and a client comparing the header against what it sent will notice.
+///
+/// `applied` records what was asked for, since a parsed field cannot say
+/// whether its value was requested or is merely its default.
+pub fn preference_applied(prefs: &Preferences, relevance: PreferenceScope) -> Option<String> {
+    let asked = |name: &str| {
+        prefs
+            .applied
+            .iter()
+            .find(|pref| pref.starts_with(name))
+            .cloned()
+    };
+
+    let mut values = Vec::new();
+    if relevance.resolution {
+        values.extend(asked("resolution="));
+    }
+    if relevance.missing {
+        values.extend(asked("missing="));
+    }
+    if relevance.representation {
+        values.extend(asked("return="));
+    }
+    values.extend(asked("count="));
+    values.extend(asked("tx="));
+    values.extend(asked("handling="));
+    values.extend(asked("timezone="));
+    // `max-affected` only has an effect under strict handling, so leniently
+    // it was not applied.
+    if relevance.max_affected && prefs.handling == PreferHandling::Strict {
+        values.extend(asked("max-affected="));
+    }
+
+    match values.is_empty() {
         true => None,
-        false => Some(prefs.applied.join(", ")),
+        false => Some(values.join(", ")),
+    }
+}
+
+/// Which preferences a given request could honour.
+///
+/// A preference that cannot apply to the request is not reported back, however
+/// plainly it was asked for -- saying it was applied when it was ignored is
+/// worse than saying nothing.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct PreferenceScope {
+    /// Insert, where duplicates can be resolved.
+    pub resolution: bool,
+    /// Insert or update, where a missing column can take a default.
+    pub representation: bool,
+    /// Insert or update.
+    pub missing: bool,
+    /// Update, delete or a function call.
+    pub max_affected: bool,
+}
+
+impl PreferenceScope {
+    /// What a read can honour: none of the write-only preferences.
+    pub fn read() -> Self {
+        Self::default()
     }
 }
 
@@ -203,10 +259,26 @@ mod tests {
     fn test_preference_applied() {
         let headers = headers_with_prefer("return=representation, count=exact");
         let prefs = parse_preferences(&headers).unwrap();
+        let writing = PreferenceScope {
+            representation: true,
+            ..PreferenceScope::read()
+        };
 
-        let applied = preference_applied(&prefs).unwrap();
+        let applied = preference_applied(&prefs, writing).unwrap();
         assert!(applied.contains("return=representation"));
         assert!(applied.contains("count=exact"));
+    }
+
+    /// A preference the request could not act on is not reported as applied.
+    #[test]
+    fn preference_applied_leaves_out_what_a_read_cannot_honour() {
+        let headers = headers_with_prefer("return=representation, count=exact");
+        let prefs = parse_preferences(&headers).unwrap();
+
+        assert_eq!(
+            preference_applied(&prefs, PreferenceScope::read()).as_deref(),
+            Some("count=exact")
+        );
     }
 
     /// A preference the server merely defaulted to is not one it applied.
@@ -216,9 +288,12 @@ mod tests {
         let prefs = parse_preferences(&headers).unwrap();
 
         assert_eq!(
-            preference_applied(&prefs).as_deref(),
+            preference_applied(&prefs, PreferenceScope::read()).as_deref(),
             Some("handling=lenient")
         );
-        assert_eq!(preference_applied(&Preferences::default()), None);
+        assert_eq!(
+            preference_applied(&Preferences::default(), PreferenceScope::read()),
+            None
+        );
     }
 }

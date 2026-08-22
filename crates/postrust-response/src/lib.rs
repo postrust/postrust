@@ -169,6 +169,32 @@ pub fn format_response(
     }
 }
 
+/// Which preferences this request could honour.
+pub(crate) fn preference_scope(
+    request: &ApiRequest,
+) -> postrust_core::api_request::preferences::PreferenceScope {
+    use postrust_core::api_request::preferences::PreferenceScope;
+    use postrust_core::api_request::{Action, DbAction, Mutation};
+
+    let Action::Db(action) = &request.action else {
+        return PreferenceScope::read();
+    };
+
+    match action {
+        DbAction::RelationMut { mutation, .. } => PreferenceScope {
+            resolution: matches!(mutation, Mutation::Create),
+            representation: true,
+            missing: matches!(mutation, Mutation::Create | Mutation::Update),
+            max_affected: matches!(mutation, Mutation::Update | Mutation::Delete),
+        },
+        DbAction::Routine { .. } => PreferenceScope {
+            max_affected: true,
+            ..PreferenceScope::read()
+        },
+        _ => PreferenceScope::read(),
+    }
+}
+
 /// Remove every key whose value is null, at every depth.
 ///
 /// `Accept: application/vnd.pgrst.array+json;nulls=stripped` asks for a body
@@ -203,9 +229,10 @@ fn add_common_headers(response: &mut Response, request: &ApiRequest, result: &Qu
     }
 
     // Preference-Applied
-    if let Some(applied) =
-        postrust_core::api_request::preferences::preference_applied(&request.preferences)
-    {
+    if let Some(applied) = postrust_core::api_request::preferences::preference_applied(
+        &request.preferences,
+        preference_scope(request),
+    ) {
         response.set_header("preference-applied", &applied);
     }
 
