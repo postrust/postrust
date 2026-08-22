@@ -51,8 +51,21 @@ impl SchemaCache {
         let tables = queries::load_tables(pool, schemas).await?;
         info!("Loaded {} tables/views", tables.len());
 
+        // Which base-table columns each view carries. Loaded before the
+        // relationships, because a view's base table may live in a schema
+        // that is not itself exposed -- `private.articles` behind a public
+        // view -- and its foreign keys are needed all the same.
+        let view_columns = queries::load_view_columns(pool, schemas).await?;
+
+        let mut relationship_schemas: Vec<String> = schemas.to_vec();
+        for (_, base, _) in &view_columns {
+            if !relationship_schemas.contains(&base.schema) {
+                relationship_schemas.push(base.schema.clone());
+            }
+        }
+
         // Load relationships
-        let relationships = queries::load_relationships(pool, schemas).await?;
+        let relationships = queries::load_relationships(pool, &relationship_schemas).await?;
         info!("Loaded {} relationship sets", relationships.len());
 
         // Load routines
@@ -64,6 +77,7 @@ impl SchemaCache {
         info!("Loaded {} timezones", timezones.len());
 
         let mut relationships = relationships;
+        add_view_relationships(&view_columns, &mut relationships);
         add_junction_relationships(&tables, &mut relationships);
 
         let media_handlers = queries::load_media_handlers(pool, schemas).await?;
@@ -199,17 +213,27 @@ impl SchemaCache {
             })
             .collect();
 
+        // A relationship projected onto a view carries the constraint and
+        // columns of the base one it came from, so naming either of those
+        // would match both. Only the view's own name selects the projection;
+        // the constraint and the column mean the relationship they belong to.
+        // PostgreSQL cannot point a foreign key at a view, so a view on the
+        // far side is exactly what marks a projection.
+        let declared = |r: &&Relationship| !matches!(r, Relationship::ForeignKey { foreign_table_is_view, .. } if *foreign_table_is_view);
+
         let mut matches = match by_target.is_empty() {
             false => by_target,
             true => {
                 let by_constraint: Vec<&Relationship> = candidates
                     .iter()
+                    .filter(declared)
                     .filter(|r| r.constraint_name() == to_name)
                     .collect();
                 match by_constraint.is_empty() {
                     false => by_constraint,
                     true => candidates
                         .iter()
+                        .filter(declared)
                         .filter(|r| r.join_columns().iter().any(|(local, _)| local == to_name))
                         .collect(),
                 }
@@ -232,6 +256,137 @@ impl SchemaCache {
                     .collect(),
             }),
         }
+    }
+}
+
+/// Project a base table's relationships onto the views that select from it.
+///
+/// A view has no foreign keys, but embedding one is ordinary usage: what makes
+/// it possible is that the view carries the columns the key joins on. So every
+/// relationship of a base table is offered to each view over it that keeps
+/// those columns, on both sides -- a view can be embedded, and can embed.
+fn add_view_relationships(
+    view_columns: &[(QualifiedIdentifier, QualifiedIdentifier, String)],
+    relationships: &mut RelationshipsMap,
+) {
+    use std::collections::HashMap;
+
+    // base table -> the views over it, each with the columns it carries
+    let mut views_over: HashMap<&QualifiedIdentifier, HashMap<&QualifiedIdentifier, Vec<&str>>> =
+        HashMap::new();
+    for (view, base, column) in view_columns {
+        views_over
+            .entry(base)
+            .or_default()
+            .entry(view)
+            .or_default()
+            .push(column);
+    }
+
+    let existing: Vec<((QualifiedIdentifier, String), Relationship)> = relationships
+        .iter()
+        .flat_map(|(key, rels)| rels.iter().map(move |rel| (key.clone(), rel.clone())))
+        .collect();
+
+    let mut derived: Vec<((QualifiedIdentifier, String), Relationship)> = Vec::new();
+
+    for ((source, _), rel) in &existing {
+        let Relationship::ForeignKey {
+            foreign_table,
+            cardinality,
+            table_is_view,
+            foreign_table_is_view,
+            constraint_name,
+            ..
+        } = rel
+        else {
+            continue;
+        };
+        // A many-to-many is derived from two others; projecting it as well
+        // would double up on whatever those produce.
+        if matches!(cardinality, Cardinality::M2M(_)) {
+            continue;
+        }
+
+        let columns = cardinality.columns();
+        let carries = |view_cols: &Vec<&str>, wanted: &dyn Fn(&(String, String)) -> String| {
+            columns
+                .iter()
+                .all(|pair| view_cols.iter().any(|c| *c == wanted(pair)))
+        };
+
+        // The view stands in for the near side.
+        if let Some(views) = views_over.get(source) {
+            for (view, view_cols) in views {
+                if !carries(view_cols, &|(local, _)| local.clone()) {
+                    continue;
+                }
+                derived.push((
+                    ((*view).clone(), view.schema.clone()),
+                    Relationship::ForeignKey {
+                        table: (*view).clone(),
+                        foreign_table: foreign_table.clone(),
+                        is_self: *view == foreign_table,
+                        cardinality: cardinality.clone(),
+                        table_is_view: true,
+                        foreign_table_is_view: *foreign_table_is_view,
+                        constraint_name: constraint_name.clone(),
+                    },
+                ));
+            }
+        }
+
+        // The view stands in for the far side.
+        if let Some(views) = views_over.get(foreign_table) {
+            for (view, view_cols) in views {
+                if !carries(view_cols, &|(_, foreign)| foreign.clone()) {
+                    continue;
+                }
+                derived.push((
+                    (source.clone(), source.schema.clone()),
+                    Relationship::ForeignKey {
+                        table: source.clone(),
+                        foreign_table: (*view).clone(),
+                        is_self: source == *view,
+                        cardinality: cardinality.clone(),
+                        table_is_view: *table_is_view,
+                        foreign_table_is_view: true,
+                        constraint_name: constraint_name.clone(),
+                    },
+                ));
+            }
+        }
+
+        // Both sides are views. Neither of the cases above covers it: each
+        // replaces one end and leaves the other as the base table.
+        if let (Some(near), Some(far)) = (views_over.get(source), views_over.get(foreign_table)) {
+            for (near_view, near_cols) in near {
+                if !carries(near_cols, &|(local, _)| local.clone()) {
+                    continue;
+                }
+                for (far_view, far_cols) in far {
+                    if !carries(far_cols, &|(_, foreign)| foreign.clone()) {
+                        continue;
+                    }
+                    derived.push((
+                        ((*near_view).clone(), near_view.schema.clone()),
+                        Relationship::ForeignKey {
+                            table: (*near_view).clone(),
+                            foreign_table: (*far_view).clone(),
+                            is_self: near_view == far_view,
+                            cardinality: cardinality.clone(),
+                            table_is_view: true,
+                            foreign_table_is_view: true,
+                            constraint_name: constraint_name.clone(),
+                        },
+                    ));
+                }
+            }
+        }
+    }
+
+    for (key, rel) in derived {
+        relationships.entry(key).or_default().push(rel);
     }
 }
 

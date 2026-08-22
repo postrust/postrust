@@ -594,3 +594,69 @@ pub async fn load_media_handlers(pool: &PgPool, schemas: &[String]) -> Result<Me
 
     Ok(handlers)
 }
+
+/// Which base-table column each of a view's columns comes from.
+///
+/// A view has no foreign keys of its own, but it can still be embedded: the
+/// relationships of the tables it selects from apply to it, through whichever
+/// of their columns it carries.
+///
+/// The mapping is made by name. PostgreSQL records which base columns a view
+/// depends on, but not which of the view's own columns each one became -- that
+/// lives in the parsed rule tree. Matching by name covers a view that selects
+/// its columns through unchanged, and misses one that renames them, which is
+/// the honest limit of doing this without parsing the rule.
+pub async fn load_view_columns(
+    pool: &PgPool,
+    schemas: &[String],
+) -> Result<Vec<(QualifiedIdentifier, QualifiedIdentifier, String)>> {
+    let rows = sqlx::query(
+        r#"
+        SELECT DISTINCT
+            vn.nspname AS view_schema,
+            v.relname  AS view_name,
+            tn.nspname AS base_schema,
+            t.relname  AS base_name,
+            va.attname AS column_name
+        FROM pg_depend d
+        JOIN pg_rewrite r    ON r.oid = d.objid AND r.rulename = '_RETURN'
+        JOIN pg_class v      ON v.oid = r.ev_class AND v.relkind = ANY (ARRAY['v','m'])
+        JOIN pg_namespace vn ON vn.oid = v.relnamespace
+        JOIN pg_class t      ON t.oid = d.refobjid
+                            AND t.relkind = ANY (ARRAY['r','v','m','p','f'])
+        JOIN pg_namespace tn ON tn.oid = t.relnamespace
+        JOIN pg_attribute ta ON ta.attrelid = t.oid
+                            AND ta.attnum = d.refobjsubid
+                            AND NOT ta.attisdropped
+        JOIN pg_attribute va ON va.attrelid = v.oid
+                            AND va.attname = ta.attname
+                            AND NOT va.attisdropped
+        WHERE d.classid = 'pg_rewrite'::regclass
+          AND d.refclassid = 'pg_class'::regclass
+          AND d.refobjsubid > 0
+          AND v.oid <> t.oid
+          AND vn.nspname = ANY($1)
+        "#,
+    )
+    .bind(schemas)
+    .fetch_all(pool)
+    .await
+    .map_err(|e| Error::SchemaCacheLoadFailed(e.to_string()))?;
+
+    Ok(rows
+        .into_iter()
+        .map(|row| {
+            (
+                QualifiedIdentifier::new(
+                    row.get::<String, _>("view_schema"),
+                    row.get::<String, _>("view_name"),
+                ),
+                QualifiedIdentifier::new(
+                    row.get::<String, _>("base_schema"),
+                    row.get::<String, _>("base_name"),
+                ),
+                row.get::<String, _>("column_name"),
+            )
+        })
+        .collect())
+}
