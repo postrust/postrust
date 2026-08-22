@@ -86,6 +86,17 @@ pub fn format_response(
     // A mutation the caller wanted no representation from sends no body at
     // all -- not an empty JSON array, which is what an empty row set would
     // otherwise render as. The headers still apply.
+    // A media type the schema renders itself: the database produced the whole
+    // payload, so there is nothing here to serialise.
+    if let Some((media_type, body)) = &result.raw_body {
+        let mut response = Response::new(result.status, body.clone().into_bytes());
+        response.set_content_type(media_type);
+        if let Some(range) = &result.content_range {
+            response.set_header("Content-Range", &range.to_string());
+        }
+        return Ok(response);
+    }
+
     if result.omit_body {
         let mut response = Response::new(result.status, bytes::Bytes::new());
         add_common_headers(&mut response, request, result);
@@ -259,6 +270,12 @@ pub struct QueryResult {
     /// function is not set-returning: the bare object/scalar is returned
     /// instead of a one-element array.
     pub singular: bool,
+    /// A body the database rendered in full, with the media type it is in.
+    ///
+    /// Set when the request asked for a media type the schema declares its own
+    /// renderer for. The value is the whole payload, so it replaces the usual
+    /// JSON rendering rather than being wrapped in it.
+    pub raw_body: Option<(String, String)>,
 }
 
 /// Response formatting error.

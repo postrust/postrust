@@ -1,6 +1,8 @@
 //! SQL queries for schema introspection.
 
-use super::relationship::{Cardinality, Relationship, RelationshipsMap};
+use super::relationship::{
+    Cardinality, MediaHandler, MediaHandlerMap, Relationship, RelationshipsMap,
+};
 use super::routine::{FuncVolatility, RetType, Routine, RoutineMap, RoutineParam};
 use super::table::{Column, ColumnMap, Table, TablesMap};
 use crate::api_request::QualifiedIdentifier;
@@ -519,4 +521,63 @@ pub async fn load_timezones(pool: &PgPool) -> Result<HashSet<String>> {
         .map_err(|e| Error::SchemaCacheLoadFailed(e.to_string()))?;
 
     Ok(rows.iter().map(|r| r.get("name")).collect())
+}
+
+/// Load user-defined renderers for media types.
+///
+/// A renderer is an aggregate whose state type is a domain named after a media
+/// type. The domain is how the name survives -- `application/geo+json` is not
+/// a legal identifier otherwise -- and the `/` in it is what makes an
+/// ordinary-looking domain recognisable as one.
+///
+/// The aggregate's argument says what it renders: a table's composite type
+/// renders that table, and `anyelement` renders anything in the schema.
+pub async fn load_media_handlers(pool: &PgPool, schemas: &[String]) -> Result<MediaHandlerMap> {
+    let rows = sqlx::query(
+        r#"
+        SELECT
+            n.nspname    AS agg_schema,
+            p.proname    AS agg_name,
+            t.typname    AS media_type,
+            argn.nspname AS arg_schema,
+            argc.relname AS arg_table
+        FROM pg_aggregate a
+        JOIN pg_proc p       ON p.oid = a.aggfnoid
+        JOIN pg_namespace n  ON n.oid = p.pronamespace
+        JOIN pg_type t       ON t.oid = a.aggtranstype
+        LEFT JOIN pg_type argt      ON argt.oid = p.proargtypes[0]
+        LEFT JOIN pg_class argc     ON argc.oid = argt.typrelid
+        LEFT JOIN pg_namespace argn ON argn.oid = argc.relnamespace
+        WHERE n.nspname = ANY($1)
+          AND t.typtype = 'd'
+          AND t.typname LIKE '%/%'
+        "#,
+    )
+    .bind(schemas)
+    .fetch_all(pool)
+    .await
+    .map_err(|e| Error::SchemaCacheLoadFailed(e.to_string()))?;
+
+    let mut handlers: MediaHandlerMap = HashMap::new();
+    for row in rows {
+        let agg_schema: String = row.get("agg_schema");
+        let media_type: String = row.get("media_type");
+        let table = match (
+            row.get::<Option<String>, _>("arg_schema"),
+            row.get::<Option<String>, _>("arg_table"),
+        ) {
+            (Some(schema), Some(name)) => Some(QualifiedIdentifier::new(schema, name)),
+            _ => None,
+        };
+
+        handlers
+            .entry((agg_schema.clone(), media_type))
+            .or_default()
+            .push(MediaHandler {
+                aggregate: QualifiedIdentifier::new(agg_schema, row.get::<String, _>("agg_name")),
+                table,
+            });
+    }
+
+    Ok(handlers)
 }

@@ -135,12 +135,39 @@ async fn execute_plan(
 ) -> Result<QueryResult, postrust_core::Error> {
     match plan {
         ActionPlan::Db(db_plan) => {
+            // A media type the schema renders itself replaces the whole
+            // response body: the aggregate is applied over the rows the
+            // request selected, so it sees exactly what would otherwise have
+            // been serialised as JSON.
+            let media_handler = {
+                let schema_cache = state.schema_cache().await;
+                read_target(api_request).and_then(|qi| {
+                    api_request.accept_media_types.iter().find_map(|media| {
+                        schema_cache
+                            .media_handler(&api_request.schema, media.content_type(), &qi)
+                            .map(|handler| {
+                                (
+                                    media.content_type().to_string(),
+                                    format!(
+                                        "{}.{}",
+                                        postrust_sql::escape_ident(&handler.aggregate.schema),
+                                        postrust_sql::escape_ident(&handler.aggregate.name)
+                                    ),
+                                    handler.table.is_some(),
+                                )
+                            })
+                    })
+                })
+            };
+
             // Carry the parent's whole row out of the inner query when a
             // computed relationship needs it as an argument. It has to be
             // taken here, where the real table is still in scope: a bare
             // reference to the table yields its composite type, whereas the
             // derived table it becomes one level up yields a `record`.
-            let db_plan = &if added_join_columns.iter().any(|c| c == PARENT_ROW_COLUMN) {
+            let needs_parent_row = added_join_columns.iter().any(|c| c == PARENT_ROW_COLUMN)
+                || matches!(&media_handler, Some((_, _, true)));
+            let db_plan = &if needs_parent_row {
                 let mut adjusted = db_plan.clone();
                 if let DbActionPlan::Read(tree) = &mut adjusted {
                     let mut field = postrust_core::plan::CoercibleField::simple(
@@ -277,6 +304,80 @@ async fn execute_plan(
                 }
             }
 
+            // `application/geo+json` has a rendering of its own even where no
+            // schema declares one: a FeatureCollection whose geometry is the
+            // table's geometry column and whose properties are the rest. A
+            // schema-declared handler overrides it, which is why this only
+            // runs when none matched.
+            let geojson_column = if media_handler.is_none() {
+                let schema_cache = state.schema_cache().await;
+                read_target(api_request)
+                    .filter(|_| {
+                        api_request
+                            .accept_media_types
+                            .iter()
+                            .any(|m| matches!(m, postrust_core::api_request::MediaType::GeoJson))
+                    })
+                    .and_then(|qi| {
+                        schema_cache.get_table(&qi).and_then(|table| {
+                            table
+                                .columns
+                                .values()
+                                .find(|c| {
+                                    matches!(c.nominal_type.as_str(), "geometry" | "geography")
+                                })
+                                .map(|c| c.name.clone())
+                        })
+                    })
+            } else {
+                None
+            };
+
+            if let Some(column) = &geojson_column {
+                // The geometry column already arrives as jsonb, since a
+                // user-defined type is rendered by the database. For a
+                // geometry that rendering is GeoJSON with a `crs` key, and
+                // dropping that key is exactly `ST_AsGeoJSON` -- which also
+                // means this needs no PostGIS function in scope.
+                //
+                // The name is a real column's, read from the catalogue rather
+                // than from the request, but it is quoted both ways all the
+                // same: as an identifier to read the column, and as a literal
+                // to drop that key from the properties.
+                sql = format!(
+                    "SELECT json_build_object('type', 'FeatureCollection', 'features', \
+                     COALESCE(json_agg(json_build_object('type', 'Feature', 'geometry', \
+                     pgrst_geo.{column} - 'crs', 'properties', \
+                     to_jsonb(pgrst_geo) - '{key}')), '[]'::json))::text \
+                     AS pgrst_body FROM ({sql}) pgrst_geo",
+                    column = postrust_sql::escape_ident(column),
+                    key = column.replace('\'', "''"),
+                    sql = sql
+                );
+            }
+
+            if let Some((media_type, aggregate, over_row)) = &media_handler {
+                // The aggregate takes the table's own row type. A derived
+                // table yields `record`, which will not cast to it, so where
+                // the handler names a table the aggregate is applied to the
+                // column carrying the real row -- the same column a computed
+                // relationship reads. A handler taking `anyelement` has no
+                // such requirement and takes the derived row directly.
+                let argument = if *over_row {
+                    format!(
+                        "pgrst_media.{}",
+                        postrust_sql::escape_ident(PARENT_ROW_COLUMN)
+                    )
+                } else {
+                    "pgrst_media".to_string()
+                };
+                sql = format!(
+                    "SELECT {}({})::text AS pgrst_body FROM ({}) pgrst_media",
+                    aggregate, argument, sql
+                );
+                debug!("Rendering {} via {}", media_type, aggregate);
+            }
+
             debug!("Executing SQL: {}", sql);
             debug!("With {} parameters", params.len());
 
@@ -306,8 +407,28 @@ async fn execute_plan(
             // right place to enforce it, since it covers anything reachable
             // from the statement -- a volatile function, a trigger, a rule --
             // rather than only what the planner thought to look at.
-            if !is_mutation(db_plan) {
+            if is_read_only(api_request) {
                 sqlx::query("SET TRANSACTION READ ONLY")
+                    .execute(&mut *tx)
+                    .await
+                    .map_err(map_sqlx_error)?;
+            }
+
+            // The request's schema comes first on the search path, then the
+            // schemas configured as extra. Without this, anything an exposed
+            // object refers to by bare name -- the domain behind a media type
+            // handler, a type from an extension -- fails to resolve, because
+            // the pool's connection carries whatever search path it was opened
+            // with.
+            {
+                let mut path = vec![api_request.schema.clone()];
+                path.extend(state.config.db_extra_search_path.iter().cloned());
+                let rendered = path
+                    .iter()
+                    .map(|s| postrust_sql::escape_ident(s))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                sqlx::query(&format!("SET LOCAL search_path TO {}", rendered))
                     .execute(&mut *tx)
                     .await
                     .map_err(map_sqlx_error)?;
@@ -362,6 +483,34 @@ async fn execute_plan(
             // `into_iter` matters for large result sets: each row's buffers are
             // freed as soon as it has been converted, rather than the whole
             // `Vec<PgRow>` staying alive alongside the whole `Vec<Value>`.
+            // A rendered media type is a single value, not a row set: the
+            // aggregate already produced the entire body.
+            if let Some(media_type) =
+                media_handler
+                    .as_ref()
+                    .map(|(m, _, _)| m.clone())
+                    .or_else(|| {
+                        geojson_column
+                            .as_ref()
+                            .map(|_| "application/geo+json".to_string())
+                    })
+            {
+                use sqlx::Row;
+                let body = rows
+                    .first()
+                    .and_then(|row| row.try_get::<Option<String>, _>(0).ok())
+                    .flatten()
+                    .unwrap_or_default();
+                tx.commit()
+                    .await
+                    .map_err(|e| postrust_core::Error::ConnectionPool(e.to_string()))?;
+                return Ok(QueryResult {
+                    status: StatusCode::OK,
+                    raw_body: Some((media_type, body)),
+                    ..QueryResult::default()
+                });
+            }
+
             let mut json_rows: Vec<serde_json::Value> = rows
                 .into_iter()
                 .map(|row| postrust_core::row_json::row_to_json(&row))
@@ -549,6 +698,26 @@ fn contains_spread(items: &[postrust_core::api_request::SelectItem]) -> bool {
         SelectItem::Relation { select, .. } => contains_spread(select),
         SelectItem::Field { .. } => false,
     })
+}
+
+/// Whether this request is a read, and so may run read-only.
+///
+/// It is the method that decides, not the plan: calling a function is a read
+/// over GET and a write over POST, and the same function may be either. Asking
+/// the plan instead would class every call as a read and refuse the writes a
+/// POST is entitled to make.
+fn is_read_only(api_request: &ApiRequest) -> bool {
+    use postrust_core::api_request::{Action, DbAction, InvokeMethod};
+
+    match &api_request.action {
+        Action::Db(DbAction::RelationRead { .. }) | Action::Db(DbAction::SchemaRead { .. }) => true,
+        Action::Db(DbAction::Routine { invoke_method, .. }) => {
+            matches!(invoke_method, InvokeMethod::InvRead { .. })
+        }
+        Action::Db(DbAction::RelationMut { .. }) => false,
+        // Metadata only; nothing is executed against the database.
+        Action::RelationInfo(_) | Action::RoutineInfo { .. } | Action::SchemaInfo => true,
+    }
 }
 
 /// Whether this plan changes data.

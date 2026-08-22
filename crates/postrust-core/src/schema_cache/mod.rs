@@ -8,7 +8,9 @@ mod relationship;
 mod routine;
 mod table;
 
-pub use relationship::{Cardinality, Junction, Relationship, RelationshipsMap};
+pub use relationship::{
+    Cardinality, Junction, MediaHandler, MediaHandlerMap, Relationship, RelationshipsMap,
+};
 pub use routine::{FuncVolatility, RetType, Routine, RoutineMap, RoutineParam};
 pub use table::{Column, ColumnMap, Table, TablesMap};
 
@@ -32,6 +34,8 @@ pub struct SchemaCache {
     pub timezones: HashSet<String>,
     /// PostgreSQL version.
     pub pg_version: i32,
+    /// User-defined renderers for media types, by (schema, media type).
+    pub media_handlers: MediaHandlerMap,
 }
 
 impl SchemaCache {
@@ -59,12 +63,16 @@ impl SchemaCache {
         let timezones = queries::load_timezones(pool).await?;
         info!("Loaded {} timezones", timezones.len());
 
+        let media_handlers = queries::load_media_handlers(pool, schemas).await?;
+        info!("Loaded {} media type handlers", media_handlers.len());
+
         Ok(Self {
             tables,
             relationships,
             routines,
             timezones,
             pg_version,
+            media_handlers,
         })
     }
 
@@ -107,6 +115,25 @@ impl SchemaCache {
             self.routines.len(),
             self.pg_version
         )
+    }
+
+    /// Find a user-defined renderer for a media type on a given table.
+    ///
+    /// A handler declared for the table itself wins over one taking
+    /// `anyelement`, which is the schema-wide fallback.
+    pub fn media_handler(
+        &self,
+        schema: &str,
+        media_type: &str,
+        table: &QualifiedIdentifier,
+    ) -> Option<&MediaHandler> {
+        let candidates = self
+            .media_handlers
+            .get(&(schema.to_string(), media_type.to_string()))?;
+        candidates
+            .iter()
+            .find(|h| h.table.as_ref() == Some(table))
+            .or_else(|| candidates.iter().find(|h| h.table.is_none()))
     }
 
     /// Find a relationship between two tables by name.

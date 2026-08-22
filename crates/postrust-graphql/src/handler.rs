@@ -1867,6 +1867,7 @@ mod tests {
             relationships: HashMap::new(),
             routines: HashMap::new(),
             timezones: HashSet::new(),
+            media_handlers: HashMap::new(),
             pg_version: 150000,
         }
     }

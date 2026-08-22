@@ -201,3 +201,22 @@ mod tests {
         assert_eq!(cols[0], ("id".into(), "user_id".into()));
     }
 }
+
+/// A user-defined renderer for a media type.
+///
+/// PostgREST lets a schema override how a media type is produced by declaring
+/// an aggregate whose state type is a domain named after that media type --
+/// `create domain "application/geo+json" as jsonb` and an aggregate over the
+/// table's rows returning it. The aggregate is then applied to the rows the
+/// request selected and its result is the whole response body.
+#[derive(Clone, Debug)]
+pub struct MediaHandler {
+    /// The aggregate to apply.
+    pub aggregate: QualifiedIdentifier,
+    /// The table it renders, or `None` when it takes `anyelement` and so
+    /// renders any of them.
+    pub table: Option<QualifiedIdentifier>,
+}
+
+/// Media handlers by (schema, media type).
+pub type MediaHandlerMap = std::collections::HashMap<(String, String), Vec<MediaHandler>>;
