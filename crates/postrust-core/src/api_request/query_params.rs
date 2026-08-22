@@ -165,6 +165,7 @@ fn parse_select_items(input: &str) -> IResult<&str, Vec<SelectItem>> {
 
 fn parse_select_item(input: &str) -> IResult<&str, SelectItem> {
     alt((
+        parse_star,
         // Before relations: `count()` is spelled exactly like an embed of a
         // relation named `count` with an empty selection.
         parse_bare_aggregate,
@@ -172,6 +173,16 @@ fn parse_select_item(input: &str) -> IResult<&str, SelectItem> {
         parse_relation_select,
         parse_field_select,
     ))(input)
+}
+
+/// Parse `*`, which names every column.
+///
+/// It is a select item like any other, so it composes: `*,clients(id)` asks
+/// for every column of this table and an embed besides, and `clients(*)` asks
+/// for every column of the embedded one.
+fn parse_star(input: &str) -> IResult<&str, SelectItem> {
+    let (input, _) = char('*')(input)?;
+    Ok((input, SelectItem::field("*")))
 }
 
 /// Parse a field-less aggregate: `count()`, `cnt:count()`, `count()::text`.

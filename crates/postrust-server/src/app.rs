@@ -25,6 +25,15 @@ use tracing::{debug, error};
 /// embed expression reads it from there. It is stripped from the response like
 /// any other column added for embedding.
 const PARENT_ROW_COLUMN: &str = "pgrst_parent_row";
+
+/// Marks an embedded object whose columns belong to its parent.
+///
+/// A spread has no key of its own in the response -- its columns land in the
+/// parent object. In SQL it is still one JSON column like any other embed, so
+/// it is given a name nothing can collide with and dissolved into its parent
+/// once the rows are JSON. Doing it there rather than in SQL is what lets a
+/// spread nest inside another, and lets it spread a computed relationship.
+const SPREAD_KEY_PREFIX: &str = "pgrst_spread_";
 const PARENT_ROW_COLUMN_REF: &str = "\"src\".\"pgrst_parent_row\"";
 
 /// Main request handler.
@@ -238,8 +247,9 @@ async fn execute_plan(
                         matches!(
                             item,
                             postrust_core::api_request::SelectItem::Relation { .. }
+                                | postrust_core::api_request::SelectItem::SpreadRelation { .. }
                         )
-                    }) && !contains_spread(&api_request.query_params.select) =>
+                    }) =>
                 {
                     let schema_cache = state.schema_cache().await;
                     build_embed_expressions(
@@ -584,6 +594,16 @@ async fn execute_plan(
                 }
             }
 
+            // A spread's columns belong to the object above it. This happens
+            // after the join columns are dropped, not before: a spread may
+            // legitimately produce a column of the same name as one added for
+            // joining, and dropping it afterwards would take the wrong one.
+            let spread_columns: std::collections::HashMap<String, Vec<String>> =
+                embed_level.spread_columns.iter().cloned().collect();
+            for row in json_rows.iter_mut() {
+                flatten_spreads(row, &spread_columns);
+            }
+
             // In PostgREST-compatibility mode, reshape RPC responses to match
             // PostgREST: un-nest the function-name-keyed column and return a
             // bare value for non-set-returning functions.
@@ -739,17 +759,6 @@ fn selects_an_aggregate(api_request: &ApiRequest) -> bool {
     walk(&api_request.query_params.select)
 }
 
-/// Whether a select list spreads a related resource, at any depth.
-fn contains_spread(items: &[postrust_core::api_request::SelectItem]) -> bool {
-    use postrust_core::api_request::SelectItem;
-
-    items.iter().any(|item| match item {
-        SelectItem::SpreadRelation { .. } => true,
-        SelectItem::Relation { select, .. } => contains_spread(select),
-        SelectItem::Field { .. } => false,
-    })
-}
-
 /// Whether this request is a read, and so may run read-only.
 ///
 /// It is the method that decides, not the plan: calling a function is a read
@@ -835,6 +844,14 @@ fn add_embed_join_columns(
         return Ok(Vec::new());
     }
 
+    // `*` already names every column, so no join column needs adding -- and
+    // adding one anyway selects it twice, which makes `src.*` ambiguous. The
+    // relations are still walked: a computed relationship needs the parent's
+    // row carried out, and `*` does not provide that.
+    let selects_everything = select
+        .iter()
+        .any(|item| matches!(item, SelectItem::Field { field, .. } if field.name == "*"));
+
     let selected: std::collections::HashSet<String> = select
         .iter()
         .filter_map(|item| match item {
@@ -883,6 +900,10 @@ fn add_embed_join_columns(
                 .map(|(local, _)| local.clone())
                 .collect(),
         };
+
+        if selects_everything {
+            continue;
+        }
 
         for column in join_columns {
             if !selected.contains(&column) && !added.contains(&column) {
@@ -1029,6 +1050,127 @@ struct EmbedLevel {
     inner_joins: Vec<String>,
     /// `ORDER BY` expressions for terms naming an embedded resource.
     orders: Vec<String>,
+    /// For each spread, the keys it contributes to its parent.
+    ///
+    /// Needed because a spread that matched nothing still carries them --
+    /// as nulls, or as empty arrays for a to-many -- and by then there is no
+    /// row to read the names off.
+    spread_columns: Vec<(String, Vec<String>)>,
+}
+
+/// The keys a spread's selection contributes to the object above it.
+///
+/// `*` names every column of the related table, an alias renames the column it
+/// precedes, and a nested spread contributes its own keys, having already been
+/// flattened into this one.
+fn spread_output_names(
+    schema_cache: &postrust_core::SchemaCache,
+    child_qi: &postrust_core::api_request::QualifiedIdentifier,
+    select: &[postrust_core::api_request::SelectItem],
+) -> Vec<String> {
+    use postrust_core::api_request::SelectItem;
+
+    let mut names = Vec::new();
+    for item in select {
+        match item {
+            SelectItem::Field { field, .. } if field.name == "*" => {
+                if let Some(table) = schema_cache.get_table(child_qi) {
+                    names.extend(table.columns.keys().cloned());
+                }
+            }
+            SelectItem::Field { field, alias, .. } => {
+                names.push(alias.clone().unwrap_or_else(|| field.name.clone()));
+            }
+            SelectItem::Relation {
+                relation, alias, ..
+            } => names.push(alias.clone().unwrap_or_else(|| relation.clone())),
+            SelectItem::SpreadRelation {
+                relation, select, ..
+            } => {
+                if let Some(rel) = schema_cache
+                    .find_relationship(child_qi, relation, None, &child_qi.schema)
+                    .ok()
+                    .flatten()
+                {
+                    let target = rel.foreign_table().clone();
+                    names.extend(spread_output_names(schema_cache, &target, select));
+                }
+            }
+        }
+    }
+    names
+}
+
+/// Dissolve spread embeds into the objects that contain them.
+///
+/// A spread arrives as an ordinary JSON column under a reserved name. This
+/// walks the response and, wherever it finds one, moves its columns up into
+/// the surrounding object and drops the name.
+///
+/// It recurses first, so a spread nested inside another is already flattened
+/// by the time its parent is -- which is what carries a grandchild's columns
+/// all the way up.
+///
+/// Spreading a to-many gives each column an array of that column's values
+/// across the matched rows, rather than an array of objects.
+fn flatten_spreads(
+    value: &mut serde_json::Value,
+    columns: &std::collections::HashMap<String, Vec<String>>,
+) {
+    match value {
+        serde_json::Value::Array(items) => {
+            for item in items {
+                flatten_spreads(item, columns);
+            }
+        }
+        serde_json::Value::Object(object) => {
+            for (_, child) in object.iter_mut() {
+                flatten_spreads(child, columns);
+            }
+
+            let spread_keys: Vec<String> = object
+                .keys()
+                .filter(|key| key.starts_with(SPREAD_KEY_PREFIX))
+                .cloned()
+                .collect();
+
+            for key in spread_keys {
+                let Some(spread) = object.remove(&key) else {
+                    continue;
+                };
+                let names = columns.get(&key).cloned().unwrap_or_default();
+                match spread {
+                    serde_json::Value::Object(columns) => {
+                        for (name, column) in columns {
+                            object.insert(name, column);
+                        }
+                    }
+                    // A to-many: one array per column rather than an array of
+                    // objects, so the rows are transposed. With no rows the
+                    // columns are still named, each holding an empty array.
+                    serde_json::Value::Array(rows) => {
+                        for name in names {
+                            let column = rows
+                                .iter()
+                                .map(|row| {
+                                    row.get(&name).cloned().unwrap_or(serde_json::Value::Null)
+                                })
+                                .collect();
+                            object.insert(name, serde_json::Value::Array(column));
+                        }
+                    }
+                    // The relationship matched nothing. The keys are still
+                    // the client's to expect, so they are there, holding null.
+                    _ => {
+                        for name in names {
+                            object.insert(name, serde_json::Value::Null);
+                        }
+                    }
+                }
+            }
+        }
+        _ => {}
+    }
 }
 
 /// Build the `ORDER BY` expressions for terms naming an embedded resource.
@@ -1105,15 +1247,25 @@ fn build_embed_expressions(
     let mut level = EmbedLevel::default();
 
     for item in select {
-        let SelectItem::Relation {
-            relation,
-            alias,
-            select: child_select,
-            join_type,
-            hint,
-        } = item
-        else {
-            continue;
+        // A spread is embedded exactly like a plain relation. The two differ
+        // only in where the child's columns end up, and that is settled once
+        // the rows are JSON -- so here the spread is marked by the name its
+        // expression is given, and flattened afterwards.
+        let (relation, alias, child_select, join_type, hint, is_spread) = match item {
+            SelectItem::Relation {
+                relation,
+                alias,
+                select,
+                join_type,
+                hint,
+            } => (relation, alias.clone(), select, join_type, hint, false),
+            SelectItem::SpreadRelation {
+                relation,
+                select,
+                join_type,
+                hint,
+            } => (relation, None, select, join_type, hint, true),
+            SelectItem::Field { .. } => continue,
         };
 
         let rel = schema_cache
@@ -1174,6 +1326,7 @@ fn build_embed_expressions(
             ));
         }
 
+        level.spread_columns.extend(nested.spread_columns);
         let nested_expressions = nested.expressions;
 
         // The child's own columns. Empty means every column, which is what a
@@ -1182,6 +1335,9 @@ fn build_embed_expressions(
         let mut project_everything = child_select.is_empty();
         for nested_item in child_select {
             match nested_item {
+                SelectItem::Field { field, .. } if field.name == "*" => {
+                    project_everything = true;
+                }
                 SelectItem::Field { field, alias, .. } => {
                     let column = postrust_sql::escape_ident(&field.name);
                     match alias {
@@ -1194,8 +1350,7 @@ fn build_embed_expressions(
                     }
                 }
                 // Handled as an expression, not a column.
-                SelectItem::Relation { .. } => {}
-                SelectItem::SpreadRelation { .. } => project_everything = true,
+                SelectItem::Relation { .. } | SelectItem::SpreadRelation { .. } => {}
             }
         }
         if project_everything {
@@ -1220,10 +1375,26 @@ fn build_embed_expressions(
             child_where.as_deref(),
         )?;
 
-        level.expressions.push((
-            alias.clone().unwrap_or_else(|| relation.clone()),
-            expression,
-        ));
+        if is_spread {
+            let names = spread_output_names(schema_cache, &child_qi, child_select);
+            if names.is_empty() {
+                // `...clients()` spreads no columns, so there is nothing to
+                // fetch and nothing to merge.
+                continue;
+            }
+            level
+                .spread_columns
+                .push((format!("{}{}", SPREAD_KEY_PREFIX, child_alias), names));
+        }
+
+        let key = match is_spread {
+            // A name nothing can collide with, since the object it names is
+            // dissolved into its parent before anyone sees it.
+            true => format!("{}{}", SPREAD_KEY_PREFIX, child_alias),
+            false => alias.clone().unwrap_or_else(|| relation.clone()),
+        };
+
+        level.expressions.push((key, expression));
     }
 
     Ok(level)

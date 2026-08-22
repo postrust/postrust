@@ -115,6 +115,15 @@ fn build_select_fields(items: &[SelectItem], table: &Table) -> Result<Vec<Coerci
 
     for item in items {
         match item {
+            // `*` stands for every column, and may sit alongside others.
+            SelectItem::Field { field, .. } if field.name == "*" => {
+                fields.extend(
+                    table
+                        .columns
+                        .iter()
+                        .map(|(name, col)| CoercibleSelectField::simple(name, &col.data_type)),
+                );
+            }
             SelectItem::Field {
                 field,
                 aggregate,
