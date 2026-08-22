@@ -424,16 +424,20 @@ pub fn attach_to_parent(
 /// Spreading a to-many relationship gives each column an array of that
 /// column's value across the matched rows, rather than an array of objects.
 ///
-/// `columns` names the columns the client asked for, in order. It is what lets
-/// a parent with no matching child still carry the right keys with null
-/// values, since there is no child row to read the names off. A spread with no
-/// explicit column list has no such list to fall back on, so in that case a
-/// parent with no match gains nothing.
+/// `columns` pairs each requested column with the key it should appear under,
+/// which differ when the client aliased it: `...clients(client_name:name)`
+/// reads `name` and writes `client_name`. Listing them explicitly is also what
+/// lets a parent with no matching child still carry the right keys with null
+/// values, since there is no child row to read the names off.
+///
+/// An empty list spreads nothing, which is what `...clients()` means. Falling
+/// back to every column the child happens to have would be actively wrong: the
+/// related table's own `id` would land on top of the parent's.
 pub fn spread_into_parent(
     parent: &mut serde_json::Value,
     plan: &EmbedPlan,
     grouped: &HashMap<String, Vec<serde_json::Value>>,
-    columns: &[String],
+    columns: &[(String, String)],
 ) {
     let key = parent.get(&plan.local_column).and_then(key_to_text);
     let matches = key
@@ -442,41 +446,30 @@ pub fn spread_into_parent(
         .cloned()
         .unwrap_or_default();
 
-    // Which keys to write, and in which order. An explicit column list wins,
-    // so the shape does not depend on which rows happened to match; otherwise
-    // take the union of the keys the matched rows carry, first seen first.
-    let mut names: Vec<String> = columns.to_vec();
-    if names.is_empty() {
-        for child in &matches {
-            if let Some(object) = child.as_object() {
-                for name in object.keys() {
-                    if !names.iter().any(|existing| existing == name) {
-                        names.push(name.clone());
-                    }
-                }
-            }
-        }
-    }
-
     let Some(object) = parent.as_object_mut() else {
         return;
     };
 
-    for name in names {
+    for (source, output) in columns {
         let value = if plan.is_list {
             serde_json::Value::Array(
                 matches
                     .iter()
-                    .map(|child| child.get(&name).cloned().unwrap_or(serde_json::Value::Null))
+                    .map(|child| {
+                        child
+                            .get(source)
+                            .cloned()
+                            .unwrap_or(serde_json::Value::Null)
+                    })
                     .collect(),
             )
         } else {
             matches
                 .first()
-                .and_then(|child| child.get(&name).cloned())
+                .and_then(|child| child.get(source).cloned())
                 .unwrap_or(serde_json::Value::Null)
         };
-        object.insert(name, value);
+        object.insert(output.clone(), value);
     }
 }
 
@@ -697,7 +690,10 @@ mod tests {
             &mut parent,
             &plan(false),
             &grouped,
-            &["first_name".to_string(), "last_name".to_string()],
+            &[
+                ("first_name".into(), "first_name".into()),
+                ("last_name".into(), "last_name".into()),
+            ],
         );
 
         // Flat, not nested under a key of its own.
@@ -714,7 +710,7 @@ mod tests {
             &mut parent,
             &plan(false),
             &HashMap::new(),
-            &["first_name".to_string()],
+            &[("first_name".into(), "first_name".into())],
         );
         assert_eq!(parent["first_name"], serde_json::Value::Null);
     }
@@ -731,20 +727,26 @@ mod tests {
         );
 
         let mut parent = serde_json::json!({"id": 1});
-        spread_into_parent(&mut parent, &plan(true), &grouped, &["title".to_string()]);
+        spread_into_parent(
+            &mut parent,
+            &plan(true),
+            &grouped,
+            &[("title".into(), "title".into())],
+        );
 
         assert_eq!(parent["title"], serde_json::json!(["a", "b"]));
     }
 
     #[test]
-    fn spread_without_a_column_list_takes_the_child_keys() {
+    fn spread_without_a_column_list_adds_nothing() {
+        // `...clients()` spreads no columns. Taking every column the child has
+        // would drop the related table's `id` on top of the parent's.
         let mut grouped = HashMap::new();
-        grouped.insert("1".to_string(), vec![serde_json::json!({"a": 1, "b": 2})]);
+        grouped.insert("1".to_string(), vec![serde_json::json!({"id": 7, "b": 2})]);
 
         let mut parent = serde_json::json!({"id": 1});
         spread_into_parent(&mut parent, &plan(false), &grouped, &[]);
 
-        assert_eq!(parent["a"], 1);
-        assert_eq!(parent["b"], 2);
+        assert_eq!(parent, serde_json::json!({"id": 1}));
     }
 }

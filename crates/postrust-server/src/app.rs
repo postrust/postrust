@@ -572,8 +572,14 @@ fn add_embed_join_columns(
     let mut added = Vec::new();
 
     for item in select.clone() {
-        let SelectItem::Relation { relation, .. } = &item else {
-            continue;
+        // A spread joins on a parent column exactly as a plain embed does, so
+        // it needs that column selected just the same. Without it the parent
+        // row has no key to match children against and every spread column
+        // comes back null.
+        let relation = match &item {
+            SelectItem::Relation { relation, .. } => relation,
+            SelectItem::SpreadRelation { relation, .. } => relation,
+            SelectItem::Field { .. } => continue,
         };
 
         let rel = schema_cache
@@ -1068,13 +1074,15 @@ fn embed_relations<'f>(
                 }
             }
             if is_spread {
-                // The child rows carry the table's own column names, so the
-                // requested list is matched against those rather than against
-                // any alias.
-                let spread_columns: Vec<String> = nested
+                // The child rows carry the table's own column names, so a
+                // column is read by its real name and written under its alias.
+                let spread_columns: Vec<(String, String)> = nested
                     .iter()
                     .filter_map(|nested_item| match nested_item {
-                        SelectItem::Field { field, .. } => Some(field.name.clone()),
+                        SelectItem::Field { field, alias, .. } => Some((
+                            field.name.clone(),
+                            alias.clone().unwrap_or_else(|| field.name.clone()),
+                        )),
                         _ => None,
                     })
                     .collect();
