@@ -34,9 +34,11 @@ pub async fn handle_request(State(state): State<Arc<AppState>>, request: Request
 
     debug!("{} {}", method, path);
 
+    let verbatim_db_errors = state.config.compat_mode;
+
     match process_request(state, request).await {
         Ok(response) => response.into_response(),
-        Err(e) => error_response(e).into_response(),
+        Err(e) => error_response(e, verbatim_db_errors).into_response(),
     }
 }
 
@@ -141,7 +143,7 @@ async fn execute_plan(
             // been serialised as JSON.
             let media_handler = {
                 let schema_cache = state.schema_cache().await;
-                read_target(api_request).and_then(|qi| {
+                read_target(api_request, &schema_cache).and_then(|qi| {
                     api_request.accept_media_types.iter().find_map(|media| {
                         schema_cache
                             .media_handler(&api_request.schema, media.content_type(), &qi)
@@ -226,7 +228,11 @@ async fn execute_plan(
             // two-query path, which can: taking the single-query path for the
             // plain relations would embed those and drop the spread, since the
             // two-query path only runs when the first produced nothing.
-            let embed_level = match read_target(api_request) {
+            let embed_parent = {
+                let schema_cache = state.schema_cache().await;
+                read_target(api_request, &schema_cache)
+            };
+            let embed_level = match embed_parent {
                 Some(parent_qi)
                     if api_request.query_params.select.iter().any(|item| {
                         matches!(
@@ -311,7 +317,7 @@ async fn execute_plan(
             // runs when none matched.
             let geojson_column = if media_handler.is_none() {
                 let schema_cache = state.schema_cache().await;
-                read_target(api_request)
+                read_target(api_request, &schema_cache)
                     .filter(|_| {
                         api_request
                             .accept_media_types
@@ -519,8 +525,11 @@ async fn execute_plan(
             // Embeds already came back with the parent query when the SELECT
             // list carried relations. This path remains for anything the
             // single-query form did not handle.
-            if let Some(parent_qi) =
-                read_target(api_request).filter(|_| embed_level.expressions.is_empty())
+            let two_query_parent = {
+                let schema_cache = state.schema_cache().await;
+                read_target(api_request, &schema_cache)
+            };
+            if let Some(parent_qi) = two_query_parent.filter(|_| embed_level.expressions.is_empty())
             {
                 let schema_cache = state.schema_cache().await;
                 embed_relations(
@@ -665,11 +674,17 @@ fn unwrap_rpc_rows(
 /// The table a read targets, if the request is a read.
 fn read_target(
     api_request: &postrust_core::api_request::ApiRequest,
+    schema_cache: &postrust_core::SchemaCache,
 ) -> Option<postrust_core::api_request::QualifiedIdentifier> {
     use postrust_core::api_request::{Action, DbAction};
 
     match &api_request.action {
         Action::Db(DbAction::RelationRead { qi, .. }) => Some(qi.clone()),
+        // A function returning a table's rows embeds, and renders, exactly as
+        // that table does.
+        Action::Db(DbAction::Routine { qi, .. }) => schema_cache
+            .routine_returned_table(qi)
+            .map(|table| table.qualified_identifier()),
         _ => None,
     }
 }
@@ -776,7 +791,7 @@ fn add_embed_join_columns(
 ) -> Result<Vec<String>, postrust_core::Error> {
     use postrust_core::api_request::{Field, SelectItem};
 
-    let Some(parent_qi) = read_target(api_request) else {
+    let Some(parent_qi) = read_target(api_request, schema_cache) else {
         return Ok(Vec::new());
     };
 
@@ -1428,7 +1443,16 @@ fn build_response(response: PgrstResponse) -> Response {
 ///
 /// In production mode (PGRST_DEBUG=false or unset), sensitive error details
 /// are hidden to prevent information leakage.
-fn error_response(error: postrust_core::Error) -> Response {
+/// Build the response for a failed request.
+///
+/// `verbatim_db_errors` passes a database failure through as PostgreSQL
+/// reported it -- its SQLSTATE, message, detail and hint -- which is what
+/// PostgREST does and what a client written against PostgREST branches on.
+/// It is off unless compatibility mode is on, because those fields describe
+/// the schema rather than the request: a constraint's name, a column that was
+/// not selected, the text of a failing query. Everything else is reported the
+/// same either way.
+fn error_response(error: postrust_core::Error, verbatim_db_errors: bool) -> Response {
     let status = error.status_code();
 
     // Check if debug mode is enabled
@@ -1439,6 +1463,14 @@ fn error_response(error: postrust_core::Error) -> Response {
     let body = if debug_mode {
         // Full error details in debug mode
         serde_json::to_vec(&error.to_json()).unwrap_or_default()
+    } else if let (true, postrust_core::Error::Database(db)) = (verbatim_db_errors, &error) {
+        serde_json::to_vec(&serde_json::json!({
+            "code": db.code,
+            "message": db.message,
+            "details": db.details,
+            "hint": db.hint,
+        }))
+        .unwrap_or_default()
     } else {
         // Sanitized error in production
         let sanitized = serde_json::json!({

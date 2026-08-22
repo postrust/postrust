@@ -41,10 +41,7 @@ fn build_db_query(plan: &DbActionPlan, role: Option<&str>) -> Result<MainQuery> 
             }
         }
         DbActionPlan::Call { call, read } => {
-            query.main = QueryBuilder::build_call(call)?;
-            if let Some(read_tree) = read {
-                query.read = Some(QueryBuilder::build_read(read_tree)?);
-            }
+            query.main = QueryBuilder::build_call(call, read.as_ref())?;
         }
     }
 

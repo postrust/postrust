@@ -115,9 +115,19 @@ fn create_db_plan(
 
             let call_plan = CallPlan::from_request(request, routine)?;
 
+            // The rows a function returns are shaped like any other read:
+            // selected, filtered, ordered, paged and embedded on. That needs a
+            // table to resolve columns against, so it applies exactly when the
+            // function returns rows of one this cache knows.
+            let read = schema_cache
+                .routine_returned_table(qi)
+                .map(|table| ReadPlan::from_request(request, table, schema_cache))
+                .transpose()?
+                .map(ReadPlanTree::leaf);
+
             Ok(DbActionPlan::Call {
                 call: call_plan,
-                read: None,
+                read,
             })
         }
 

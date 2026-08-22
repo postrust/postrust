@@ -117,6 +117,25 @@ impl SchemaCache {
         )
     }
 
+    /// The table whose rows a function returns, if it returns rows of one.
+    ///
+    /// This is what makes a function behave like a table for everything after
+    /// the call: its result can be selected from, filtered, ordered, paged and
+    /// embedded on, all of which need a table to resolve columns against.
+    ///
+    /// `format_type` may or may not qualify the name, depending on the search
+    /// path it was rendered against, so both spellings are tried -- and an
+    /// unqualified one is looked for in the function's own schema.
+    pub fn routine_returned_table(&self, qi: &QualifiedIdentifier) -> Option<&Table> {
+        let routine = self.get_routines(qi)?.first()?;
+        let type_name = routine.return_type.type_name()?;
+        let candidate = match type_name.split_once('.') {
+            Some((schema, name)) => QualifiedIdentifier::new(schema, name),
+            None => QualifiedIdentifier::new(&qi.schema, type_name),
+        };
+        self.get_table(&candidate)
+    }
+
     /// Find a user-defined renderer for a media type on a given table.
     ///
     /// A handler declared for the table itself wins over one taking

@@ -107,7 +107,7 @@ impl QueryBuilder {
         let render_as_json = field.aggregate.is_none()
             && field.cast.is_none()
             && field.field.json_path.is_empty()
-            && field.field.ir_type == "USER-DEFINED";
+            && !decodable_type(&field.field.ir_type);
         if render_as_json {
             frag.push("to_jsonb(");
             frag.push(&escape_ident(&field.field.name));
@@ -572,14 +572,31 @@ impl QueryBuilder {
     }
 
     /// Build an RPC call query.
-    pub fn build_call(plan: &CallPlan) -> Result<SqlFragment> {
+    pub fn build_call(plan: &CallPlan, read: Option<&ReadPlanTree>) -> Result<SqlFragment> {
         let qi = postrust_sql::identifier::QualifiedIdentifier::new(
             &plan.function.schema,
             &plan.function.name,
         );
 
+        // The call itself is the source of rows; the read plan, when there is
+        // one, shapes them exactly as it would shape a table's.
         let mut frag = SqlFragment::new();
-        frag.push("SELECT * FROM ");
+        frag.push("SELECT ");
+        match read.filter(|tree| !tree.root.select.is_empty()) {
+            Some(tree) => {
+                for (i, field) in tree.root.select.iter().enumerate() {
+                    if i > 0 {
+                        frag.push(", ");
+                    }
+                    let column = Self::build_select_field(field)?;
+                    frag.append(column);
+                }
+            }
+            None => {
+                frag.push("*");
+            }
+        }
+        frag.push(" FROM ");
         frag.push(&from_qi(&qi));
         frag.push("(");
 
@@ -632,6 +649,32 @@ impl QueryBuilder {
         }
 
         frag.push(")");
+
+        // Filters, ordering and paging over the returned rows.
+        //
+        // The call is left unaliased: a function returning a table's rows is
+        // referred to by that table's name, which is what an unqualified
+        // column in a filter resolves against.
+        if let Some(tree) = read {
+            for (i, clause) in tree.root.where_clauses.iter().enumerate() {
+                frag.push(if i == 0 { " WHERE " } else { " AND " });
+                let expr = Self::build_logic_tree(clause)?;
+                frag.append(expr);
+            }
+
+            for (i, term) in tree.root.order.iter().enumerate() {
+                frag.push(if i == 0 { " ORDER BY " } else { ", " });
+                let order = Self::build_order_term(term).into_fragment();
+                frag.append(order);
+            }
+
+            if let Some(limit) = tree.root.range.limit {
+                frag.push(&format!(" LIMIT {}", limit));
+            }
+            if tree.root.range.offset > 0 {
+                frag.push(&format!(" OFFSET {}", tree.root.range.offset));
+            }
+        }
 
         Ok(frag)
     }
@@ -689,6 +732,42 @@ fn json_path_alias(column: &str, path: &crate::api_request::JsonPath) -> String 
             _ => None,
         })
         .unwrap_or_else(|| column.to_string())
+}
+
+/// Whether this process can decode a column of this type.
+///
+/// The row converter maps a fixed set of types by name and otherwise reads the
+/// column as text, which only works for what PostgreSQL will hand over as
+/// text. Anything else -- `xml`, `bytea`, an array, a PostGIS geometry -- fails
+/// to decode and the column comes back null, so it is rendered in the database
+/// instead. An empty type is a field with no column behind it, such as
+/// `count()`, and never reaches this.
+fn decodable_type(data_type: &str) -> bool {
+    matches!(
+        data_type,
+        "" | "smallint"
+            | "integer"
+            | "bigint"
+            | "numeric"
+            | "decimal"
+            | "real"
+            | "double precision"
+            | "boolean"
+            | "text"
+            | "character varying"
+            | "character"
+            | "name"
+            | "date"
+            | "time"
+            | "time without time zone"
+            | "time with time zone"
+            | "timestamp"
+            | "timestamp without time zone"
+            | "timestamp with time zone"
+            | "uuid"
+            | "json"
+            | "jsonb"
+    )
 }
 
 fn castable_type(pg_type: &str) -> Option<&str> {
