@@ -1276,7 +1276,10 @@ fn error_response(error: postrust_core::Error) -> Response {
             "code": error.code(),
             "message": sanitize_error_message(&error),
             "details": null,
-            "hint": null
+            // A hint says how to correct the request. It is carried by the
+            // error itself, so it never has to reach for anything the
+            // sanitised message deliberately left out.
+            "hint": error.hint(),
         });
         serde_json::to_vec(&sanitized).unwrap_or_default()
     };
@@ -1289,18 +1292,36 @@ fn error_response(error: postrust_core::Error) -> Response {
 }
 
 /// Sanitize error messages for production.
-fn sanitize_error_message(error: &postrust_core::Error) -> &'static str {
+fn sanitize_error_message(error: &postrust_core::Error) -> String {
     use postrust_core::Error;
+
+    // A schema-cache miss names what the client asked for, and the client
+    // already knows that -- it is what it sent. Saying so is what makes the
+    // difference between "Resource not found" and a message the client can act
+    // on, and it discloses nothing it did not supply. What stays sanitised is
+    // the database's own account of a failure, which is about the schema
+    // rather than about the request.
     match error {
-        Error::TableNotFound(_) | Error::NotFound(_) => "Resource not found",
-        Error::FunctionNotFound(_) => "Function not found",
+        Error::TableNotFound(name) | Error::NotFound(name) => {
+            return format!("Could not find the table '{}' in the schema cache", name)
+        }
+        Error::FunctionNotFound(name) => {
+            return format!("Could not find the function {} in the schema cache", name)
+        }
+        Error::UnacceptableSchema { requested, .. } => {
+            return format!("Invalid schema: {}", requested)
+        }
+        _ => {}
+    }
+
+    (match error {
         Error::ColumnNotFound(_) | Error::UnknownColumn(_) => "Column not found",
         Error::RelationshipNotFound(_) => "Relationship not found",
         Error::InvalidPath(_) => "Invalid request path",
         Error::InvalidBody(_) => "Invalid request body",
         Error::InvalidJwt(_) | Error::JwtExpired | Error::MissingAuth => "Unauthorized",
         Error::InsufficientPermissions(_) => "Forbidden",
-        Error::UnacceptableSchema(_) => "Invalid schema",
+
         // A fixed policy message that reveals nothing about the request or the
         // schema, so it is passed through verbatim -- and it is what PostgREST
         // says, which is what a client branching on it will be matching.
@@ -1310,7 +1331,8 @@ fn sanitize_error_message(error: &postrust_core::Error) -> &'static str {
         Error::ConnectionPool(_) => "Service temporarily unavailable",
         Error::Internal(_) => "Internal server error",
         _ => "An error occurred",
-    }
+    })
+    .to_string()
 }
 
 #[cfg(test)]

@@ -37,8 +37,15 @@ pub enum Error {
     #[error("Unsupported HTTP method: {0}")]
     UnsupportedMethod(String),
 
-    #[error("Unacceptable schema: {0}")]
-    UnacceptableSchema(String),
+    /// A profile header named a schema the server does not expose.
+    ///
+    /// Carries the schemas that *are* exposed, because the client needs them
+    /// to correct the request and they are part of the API's own contract.
+    #[error("Invalid schema: {requested}")]
+    UnacceptableSchema {
+        requested: String,
+        exposed: Vec<String>,
+    },
 
     #[error("Unknown column: {0}")]
     UnknownColumn(String),
@@ -160,7 +167,7 @@ impl Error {
             Self::UnsupportedMethod(_) => StatusCode::METHOD_NOT_ALLOWED,
 
             // 406 Not Acceptable
-            Self::UnacceptableSchema(_) => StatusCode::NOT_ACCEPTABLE,
+            Self::UnacceptableSchema { .. } => StatusCode::NOT_ACCEPTABLE,
 
             // 500 Internal Server Error
             Self::SchemaCacheNotLoaded
@@ -186,23 +193,23 @@ impl Error {
             Self::InvalidHeader(_) => "PGRST102",
             Self::InvalidBody(_) => "PGRST103",
             Self::UnsupportedMethod(_) => "PGRST104",
-            Self::UnacceptableSchema(_) => "PGRST105",
-            Self::UnknownColumn(_) => "PGRST106",
+            Self::UnacceptableSchema { .. } => "PGRST106",
+            Self::UnknownColumn(_) => "PGRST204",
             Self::InvalidRange(_) => "PGRST107",
             Self::InvalidMediaType(_) => "PGRST108",
             Self::MissingParameter(_) => "PGRST109",
             Self::AmbiguousRequest(_) => "PGRST110",
 
-            Self::InvalidJwt(_) => "PGRST200",
-            Self::JwtExpired => "PGRST201",
-            Self::MissingAuth => "PGRST202",
+            Self::InvalidJwt(_) => "PGRST303",
+            Self::JwtExpired => "PGRST301",
+            Self::MissingAuth => "PGRST302",
             Self::InsufficientPermissions(_) => "PGRST203",
 
-            Self::NotFound(_) => "PGRST300",
-            Self::TableNotFound(_) => "PGRST301",
-            Self::FunctionNotFound(_) => "PGRST302",
-            Self::ColumnNotFound(_) => "PGRST303",
-            Self::RelationshipNotFound(_) => "PGRST304",
+            Self::NotFound(_) => "PGRST205",
+            Self::TableNotFound(_) => "PGRST205",
+            Self::FunctionNotFound(_) => "PGRST202",
+            Self::ColumnNotFound(_) => "PGRST204",
+            Self::RelationshipNotFound(_) => "PGRST200",
 
             Self::SchemaCacheNotLoaded => "PGRST400",
             Self::SchemaCacheLoadFailed(_) => "PGRST401",
@@ -237,14 +244,19 @@ impl Error {
     }
 
     /// Get a hint for resolving the error.
-    fn hint(&self) -> Option<String> {
+    pub fn hint(&self) -> Option<String> {
         match self {
             Self::InvalidJwt(_) => {
                 Some("Check that the JWT is properly signed and not expired".into())
             }
             Self::MissingAuth => Some("Provide a valid JWT in the Authorization header".into()),
-            Self::TableNotFound(_) => Some("Check the table name and schema".into()),
-            Self::UnknownColumn(_) => Some("Check column names against the table schema".into()),
+            // The schemas a server exposes are part of its contract, not an
+            // internal detail, so naming them is how the client is told what
+            // to ask for instead.
+            Self::UnacceptableSchema { exposed, .. } => Some(format!(
+                "Only the following schemas are exposed: {}",
+                exposed.join(", ")
+            )),
             Self::Database(db_err) => db_err.hint.clone(),
             _ => None,
         }
@@ -328,8 +340,8 @@ mod tests {
         // A malformed query string is a parse failure, PGRST100 -- the same
         // code as a malformed path. PGRST101 means something else entirely.
         assert_eq!(Error::InvalidQueryParam("test".into()).code(), "PGRST100");
-        assert_eq!(Error::MissingAuth.code(), "PGRST202");
-        assert_eq!(Error::TableNotFound("users".into()).code(), "PGRST301");
+        assert_eq!(Error::MissingAuth.code(), "PGRST302");
+        assert_eq!(Error::TableNotFound("users".into()).code(), "PGRST205");
     }
 
     #[test]

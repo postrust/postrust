@@ -123,7 +123,10 @@ fn parse_schema<B>(
             .to_str()
             .map_err(|_| Error::InvalidHeader("Accept-Profile"))?;
         if !schemas.contains(&schema.to_string()) {
-            return Err(Error::UnacceptableSchema(schema.into()));
+            return Err(Error::UnacceptableSchema {
+                requested: schema.into(),
+                exposed: schemas.to_vec(),
+            });
         }
         return Ok((schema.to_string(), true));
     }
@@ -134,7 +137,10 @@ fn parse_schema<B>(
             .to_str()
             .map_err(|_| Error::InvalidHeader("Content-Profile"))?;
         if !schemas.contains(&schema.to_string()) {
-            return Err(Error::UnacceptableSchema(schema.into()));
+            return Err(Error::UnacceptableSchema {
+                requested: schema.into(),
+                exposed: schemas.to_vec(),
+            });
         }
         return Ok((schema.to_string(), true));
     }
