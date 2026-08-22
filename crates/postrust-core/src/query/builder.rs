@@ -257,8 +257,20 @@ impl QueryBuilder {
     /// Exposed for ordering by an embedded resource's column, which is
     /// assembled outside the read plan.
     pub fn column_sql(field: &crate::plan::CoercibleField) -> String {
+        Self::qualified_column_sql(None, field)
+    }
+
+    /// The same, with the column qualified by a relation alias.
+    ///
+    /// The alias belongs to the column, not to the expression around it:
+    /// `to_jsonb(e2."settings")->'a'`, never `e2.to_jsonb(...)`, which reads
+    /// as a function in a schema called `e2`.
+    pub fn qualified_column_sql(
+        qualifier: Option<&str>,
+        field: &crate::plan::CoercibleField,
+    ) -> String {
         let mut frag = SqlFragment::new();
-        push_field_ref(&mut frag, field);
+        push_qualified_field_ref(&mut frag, qualifier, field);
         frag.sql().to_string()
     }
 
@@ -930,6 +942,15 @@ fn push_returning(frag: &mut SqlFragment, returning: &[String]) {
 
 /// A column reference, converted to JSON first where the path requires it.
 fn push_field_ref(frag: &mut SqlFragment, field: &crate::plan::CoercibleField) {
+    push_qualified_field_ref(frag, None, field)
+}
+
+/// The same, with the column qualified by a relation alias.
+fn push_qualified_field_ref(
+    frag: &mut SqlFragment,
+    qualifier: Option<&str>,
+    field: &crate::plan::CoercibleField,
+) {
     // A computed field is a function of the whole row. PostgreSQL would also
     // accept `items.always_true` and resolve it to the same call, but only
     // where the reference is qualified by the relation -- which a bare column
@@ -941,7 +962,10 @@ fn push_field_ref(frag: &mut SqlFragment, field: &crate::plan::CoercibleField) {
             escape_ident(&computed.function.name),
             escape_ident(&computed.relation),
         ),
-        None => escape_ident(&field.name),
+        None => match qualifier {
+            Some(alias) => format!("{}.{}", escape_ident(alias), escape_ident(&field.name)),
+            None => escape_ident(&field.name),
+        },
     };
 
     if field.to_json {

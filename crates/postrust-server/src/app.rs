@@ -872,8 +872,7 @@ async fn execute_plan(
                 let schema_cache = state.schema_cache().await;
                 read_target(api_request, &schema_cache)
             };
-            if let Some(parent_qi) = two_query_parent.filter(|_| embed_level.expressions.is_empty())
-            {
+            if let Some(parent_qi) = two_query_parent.filter(|_| !embed_level.saw_relations) {
                 let schema_cache = state.schema_cache().await;
                 embed_relations(
                     &mut tx,
@@ -1745,6 +1744,13 @@ struct EmbedLevel {
     /// as nulls, or as empty arrays for a to-many -- and by then there is no
     /// row to read the names off.
     spread_columns: Vec<(String, Vec<String>)>,
+    /// Whether this level had any relation to embed at all.
+    ///
+    /// Distinct from having produced an expression: `clients()` is a relation
+    /// that deliberately contributes nothing, and the fallback path must not
+    /// take an absent expression for a relation the single-query form could
+    /// not handle.
+    saw_relations: bool,
 }
 
 /// The keys a spread's selection contributes to the object above it.
@@ -1899,13 +1905,27 @@ fn build_embed_orders(
         let plan = postrust_core::embed::EmbedPlan::resolve(rel, schema_cache)?;
 
         let child_alias = ctx.next_alias();
-        let column = postrust_core::query::QueryBuilder::column_sql(&term.field);
-        let mut expression = plan.order_expression(
-            "src",
-            PARENT_ROW_COLUMN_REF,
-            &child_alias,
-            &format!("{}.{}", postrust_sql::escape_ident(&child_alias), column),
+
+        // The column belongs to the related table, so its type has to be read
+        // from there. Resolved against the parent it would be unknown, and an
+        // unknown type is one this process asks the database to render -- for
+        // a `jsonb` column that would wrap it in `to_jsonb` and then reach
+        // into the wrapper.
+        let child_qi = postrust_core::api_request::QualifiedIdentifier::new(
+            &plan.foreign_schema,
+            &plan.foreign_table,
         );
+        let mut field = term.field.clone();
+        field.to_json = !field.json_path.is_empty()
+            && !schema_cache
+                .get_table(&child_qi)
+                .and_then(|table| table.get_column(&field.name))
+                .is_some_and(|column| matches!(column.data_type.as_str(), "json" | "jsonb"));
+
+        let column =
+            postrust_core::query::QueryBuilder::qualified_column_sql(Some(&child_alias), &field);
+        let mut expression =
+            plan.order_expression("src", PARENT_ROW_COLUMN_REF, &child_alias, &column);
 
         match term.direction {
             Some(postrust_core::api_request::OrderDirection::Desc) => expression.push_str(" DESC"),
@@ -1972,6 +1992,8 @@ fn build_embed_expressions(
             } => (relation, None, select, join_type, hint, true),
             SelectItem::Field { .. } => continue,
         };
+
+        level.saw_relations = true;
 
         let rel = schema_cache
             .find_relationship(parent_qi, relation, hint.as_deref(), &parent_qi.schema)?
