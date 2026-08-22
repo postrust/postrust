@@ -62,25 +62,38 @@ pub fn parse_query_params(query: &str, is_rpc: bool) -> Result<QueryParams> {
             .to_string();
         let key: &str = &decoded_key;
 
+        // Modifiers come before filters, since both are dotted: `clients.order`
+        // orders an embedded resource while `clients.name` filters one.
+        if let Some((path, modifier)) = parse_modifier_key(key) {
+            match modifier {
+                Modifier::Order => {
+                    let (_, terms) = parse_order_param(&decoded_value)?;
+                    params.order.push((path, terms));
+                }
+                Modifier::Limit => {
+                    let limit: i64 = decoded_value
+                        .parse()
+                        .map_err(|_| Error::InvalidQueryParam("limit".into()))?;
+                    params.ranges.entry(path.join(".")).or_default().limit = Some(limit);
+                }
+                Modifier::Offset => {
+                    let offset: i64 = decoded_value
+                        .parse()
+                        .map_err(|_| Error::InvalidQueryParam("offset".into()))?;
+                    params.ranges.entry(path.join(".")).or_default().offset = offset;
+                }
+                Modifier::Logic(op, negated) => {
+                    params
+                        .logic
+                        .push((path, parse_logic_param(op, negated, &decoded_value)?));
+                }
+            }
+            continue;
+        }
+
         match key {
             "select" => {
                 params.select = parse_select(&decoded_value)?;
-            }
-            "order" => {
-                let (path, terms) = parse_order_param(&decoded_value)?;
-                params.order.push((path, terms));
-            }
-            "limit" => {
-                let limit: i64 = decoded_value
-                    .parse()
-                    .map_err(|_| Error::InvalidQueryParam("limit".into()))?;
-                params.ranges.entry(String::new()).or_default().limit = Some(limit);
-            }
-            "offset" => {
-                let offset: i64 = decoded_value
-                    .parse()
-                    .map_err(|_| Error::InvalidQueryParam("offset".into()))?;
-                params.ranges.entry(String::new()).or_default().offset = offset;
             }
             "columns" => {
                 params.columns = Some(
@@ -97,10 +110,6 @@ pub fn parse_query_params(query: &str, is_rpc: bool) -> Result<QueryParams> {
                         .map(|s| s.trim().to_string())
                         .collect(),
                 );
-            }
-            "and" | "or" => {
-                let logic = parse_logic_param(key, &decoded_value)?;
-                params.logic.push((vec![], logic));
             }
             key if !key.starts_with('_') => {
                 if is_rpc {
@@ -554,8 +563,12 @@ fn parse_operation(value: &str) -> Result<Operation> {
 
     // IS operator
     if let Some(rest) = value.strip_prefix("is.") {
-        let is_val = match rest {
+        // These are the only case-insensitive operands in the grammar, and
+        // `not_null` has no operator of its own -- `is.not_null` is the only
+        // spelling of `IS NOT NULL`.
+        let is_val = match rest.to_ascii_lowercase().as_str() {
             "null" => IsValue::Null,
+            "not_null" => IsValue::NotNull,
             "true" => IsValue::True,
             "false" => IsValue::False,
             "unknown" => IsValue::Unknown,
@@ -690,35 +703,125 @@ fn parse_order_term(value: &str) -> Result<OrderTerm> {
 // ============================================================================
 
 /// Parse `and` or `or` parameter: `(filter1,filter2)`
-fn parse_logic_param(op: &str, value: &str) -> Result<LogicTree> {
-    let logic_op = match op {
-        "and" => LogicOperator::And,
-        "or" => LogicOperator::Or,
-        _ => return Err(Error::InvalidQueryParam(op.into())),
-    };
-
-    // Parse nested filters: (field.op.value,field2.op.value)
-    let value = value
+fn parse_logic_param(op: LogicOperator, negated: bool, value: &str) -> Result<LogicTree> {
+    let inner = value
         .strip_prefix('(')
         .and_then(|s| s.strip_suffix(')'))
-        .ok_or_else(|| Error::InvalidQueryParam(format!("{}={}", op, value)))?;
-
-    let children: Vec<LogicTree> = value
-        .split(',')
-        .map(|s| {
-            let (key, val) = s
-                .split_once('.')
-                .ok_or_else(|| Error::InvalidQueryParam(s.into()))?;
-            let (_, filter) = parse_filter_param(key, val)?;
-            Ok(LogicTree::Stmt(filter))
-        })
-        .collect::<Result<Vec<_>>>()?;
+        .ok_or_else(|| Error::InvalidQueryParam(value.into()))?;
 
     Ok(LogicTree::Expr {
-        negated: false,
-        op: logic_op,
-        children,
+        negated,
+        op,
+        children: split_top_level(inner)
+            .into_iter()
+            .map(parse_logic_child)
+            .collect::<Result<Vec<_>>>()?,
     })
+}
+
+/// Split a comma-separated list on its top-level commas only.
+///
+/// A logic list holds whole conditions, and a condition may contain commas of
+/// its own -- `id.in.(1,2)`, `arr.cs.{1,2}`, a nested `and(...)`, or a quoted
+/// value. Splitting on every comma tears those apart.
+fn split_top_level(input: &str) -> Vec<&str> {
+    let mut parts = Vec::new();
+    let mut depth = 0usize;
+    let mut quoted = false;
+    let mut escaped = false;
+    let mut start = 0usize;
+
+    for (idx, ch) in input.char_indices() {
+        if quoted {
+            match ch {
+                _ if escaped => escaped = false,
+                '\\' => escaped = true,
+                '"' => quoted = false,
+                _ => {}
+            }
+            continue;
+        }
+        match ch {
+            '"' => quoted = true,
+            '(' | '{' | '[' => depth += 1,
+            ')' | '}' | ']' => depth = depth.saturating_sub(1),
+            ',' if depth == 0 => {
+                parts.push(&input[start..idx]);
+                start = idx + ch.len_utf8();
+            }
+            _ => {}
+        }
+    }
+    parts.push(&input[start..]);
+    parts
+}
+
+/// Parse one member of a logic list: either a nested group or a condition.
+fn parse_logic_child(item: &str) -> Result<LogicTree> {
+    let item = item.trim();
+
+    // `not.and(...)` negates the group. A leading `not.` on anything else
+    // belongs to the condition's operator (`arr.not.cs.{1,2}`), so it is left
+    // in place for the filter parser to deal with.
+    let (body, negated) = match item.strip_prefix("not.") {
+        Some(rest) if rest.starts_with("and(") || rest.starts_with("or(") => (rest, true),
+        _ => (item, false),
+    };
+
+    for (name, op) in [("and", LogicOperator::And), ("or", LogicOperator::Or)] {
+        if let Some(rest) = body.strip_prefix(name) {
+            if rest.starts_with('(') && rest.ends_with(')') {
+                return parse_logic_param(op, negated, rest);
+            }
+        }
+    }
+
+    let (key, val) = body
+        .split_once('.')
+        .ok_or_else(|| Error::InvalidQueryParam(item.into()))?;
+    let (_, filter) = parse_filter_param(key, val)?;
+    Ok(LogicTree::Stmt(filter))
+}
+
+/// A query parameter that modifies a resource rather than filtering it.
+enum Modifier {
+    Order,
+    Limit,
+    Offset,
+    Logic(LogicOperator, bool),
+}
+
+/// Recognise a modifier key and the embedded resource it addresses.
+///
+/// Every modifier may be aimed at an embedded resource by prefixing it with
+/// the path to that resource: `clients.order=name` orders the embedded
+/// clients, `clients.limit=1` pages them, `clients.or=(...)` filters them. The
+/// bare forms are the same thing with an empty path.
+fn parse_modifier_key(key: &str) -> Option<(EmbedPath, Modifier)> {
+    let mut parts: Vec<&str> = key.split('.').collect();
+    let last = parts.pop()?;
+
+    let modifier = match last {
+        "order" => Modifier::Order,
+        "limit" => Modifier::Limit,
+        "offset" => Modifier::Offset,
+        "and" | "or" => {
+            let op = if last == "and" {
+                LogicOperator::And
+            } else {
+                LogicOperator::Or
+            };
+            // `not.or=(...)` negates the whole group.
+            let negated = parts.last() == Some(&"not");
+            if negated {
+                parts.pop();
+            }
+            Modifier::Logic(op, negated)
+        }
+        _ => return None,
+    };
+
+    Some((parts.into_iter().map(String::from).collect(), modifier))
 }
 
 // ============================================================================

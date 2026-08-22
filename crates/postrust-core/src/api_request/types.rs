@@ -297,6 +297,7 @@ impl FtsOperator {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum IsValue {
     Null,
+    NotNull,
     True,
     False,
     Unknown,
@@ -306,6 +307,7 @@ impl IsValue {
     pub fn to_sql(&self) -> &'static str {
         match self {
             Self::Null => "NULL",
+            Self::NotNull => "NOT NULL",
             Self::True => "TRUE",
             Self::False => "FALSE",
             Self::Unknown => "UNKNOWN",

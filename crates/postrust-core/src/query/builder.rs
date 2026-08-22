@@ -222,9 +222,24 @@ impl QueryBuilder {
             frag.push("NOT (");
         }
 
-        // Column name
+        // Column name.
+        //
+        // A text-search operator wants a `tsvector` on the left. A column that
+        // is not already one is wrapped, so `text_search=fts.x` searches the
+        // text instead of failing to find an operator. A domain over tsvector
+        // is already one, hence the prefix test rather than an equality.
+        let to_tsvector = matches!(
+            filter.op_expr.operation,
+            crate::api_request::Operation::Fts { .. }
+        ) && !filter.field.ir_type.starts_with("tsvector");
+        if to_tsvector {
+            frag.push("to_tsvector(");
+        }
         frag.push(&escape_ident(&filter.field.name));
         push_json_path(&mut frag, &filter.field.json_path);
+        if to_tsvector {
+            frag.push(")");
+        }
 
         // Filter values are always bound as text, so a comparison against a
         // non-text column needs an explicit cast on the placeholder -- without
@@ -317,9 +332,15 @@ impl QueryBuilder {
                 frag.push(op.to_function());
                 frag.push("(");
                 if let Some(lang) = language {
-                    frag.push_param(lang.clone());
+                    // The text-search functions take their configuration as a
+                    // `regconfig`, and there is no `to_tsquery(text, text)` to
+                    // fall back on -- bound as plain text the call resolves to
+                    // no function at all.
+                    frag.push_typed_param(lang.clone(), "regconfig");
                     frag.push(", ");
                 }
+                // The query is text whatever the column holds, so it never
+                // takes the column's own cast.
                 frag.push_param(value.clone());
                 frag.push(")");
             }

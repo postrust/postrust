@@ -179,7 +179,10 @@ impl Error {
         match self {
             Self::InvalidPath(_) => "PGRST100",
             Self::AggregatesNotAllowed => "PGRST123",
-            Self::InvalidQueryParam(_) => "PGRST101",
+            // PGRST100 is the parse failure in PostgREST's taxonomy, covering
+            // both the path and the query string; PGRST101 is a function
+            // invoked with a method its volatility does not allow.
+            Self::InvalidQueryParam(_) => "PGRST100",
             Self::InvalidHeader(_) => "PGRST102",
             Self::InvalidBody(_) => "PGRST103",
             Self::UnsupportedMethod(_) => "PGRST104",
@@ -266,6 +269,9 @@ impl DatabaseError {
     pub fn status_code(&self) -> StatusCode {
         // PostgreSQL error codes: https://www.postgresql.org/docs/current/errcodes-appendix.html
         match self.code.as_str() {
+            // A write attempted inside the read-only transaction a read
+            // request runs in. The request was not wrong, the method was.
+            "25006" => StatusCode::METHOD_NOT_ALLOWED,
             // Class 23 - Integrity Constraint Violation
             c if c.starts_with("23") => StatusCode::CONFLICT,
             // Class 42 - Syntax Error or Access Rule Violation
@@ -319,7 +325,9 @@ mod tests {
 
     #[test]
     fn test_error_codes() {
-        assert_eq!(Error::InvalidQueryParam("test".into()).code(), "PGRST101");
+        // A malformed query string is a parse failure, PGRST100 -- the same
+        // code as a malformed path. PGRST101 means something else entirely.
+        assert_eq!(Error::InvalidQueryParam("test".into()).code(), "PGRST100");
         assert_eq!(Error::MissingAuth.code(), "PGRST202");
         assert_eq!(Error::TableNotFound("users".into()).code(), "PGRST301");
     }
@@ -342,7 +350,7 @@ mod tests {
     fn test_error_to_json() {
         let error = Error::InvalidQueryParam("bad filter".into());
         let json = error.to_json();
-        assert_eq!(json["code"], "PGRST101");
+        assert_eq!(json["code"], "PGRST100");
         assert!(json["message"].as_str().unwrap().contains("bad filter"));
     }
 }

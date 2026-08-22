@@ -258,6 +258,20 @@ async fn execute_plan(
                 .await
                 .map_err(|e| postrust_core::Error::ConnectionPool(e.to_string()))?;
 
+            // A read request runs in a read-only transaction.
+            //
+            // Without this a GET can change data: `GET /rpc/some_volatile_fn`
+            // happily executes whatever the function does. PostgreSQL is the
+            // right place to enforce it, since it covers anything reachable
+            // from the statement -- a volatile function, a trigger, a rule --
+            // rather than only what the planner thought to look at.
+            if !is_mutation(db_plan) {
+                sqlx::query("SET TRANSACTION READ ONLY")
+                    .execute(&mut *tx)
+                    .await
+                    .map_err(map_sqlx_error)?;
+            }
+
             // Set role
             sqlx::query(&format!(
                 "SET LOCAL ROLE {}",
