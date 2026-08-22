@@ -1408,6 +1408,7 @@ fn build_embed_expressions(
                 &parts.join(", "),
                 max_rows,
                 None,
+                None,
             )
             .map_err(|e| async_graphql::Error::new(e.to_string()))?;
 

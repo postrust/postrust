@@ -304,6 +304,7 @@ impl EmbedPlan {
     /// request, so embedding does not change how a NUMERIC or a timestamp is
     /// rendered. Only the relationship column arrives as JSON, which is what
     /// the separate child query already returned.
+    #[allow(clippy::too_many_arguments)] // one parameter per SQL clause
     pub fn embed_expression(
         &self,
         parent_alias: &str,
@@ -312,6 +313,10 @@ impl EmbedPlan {
         inner_select: &str,
         limit: Option<i64>,
         child_where: Option<&str>,
+        // `clients.order=name.desc` orders the rows inside the embed, which
+        // belongs to the child's own subselect -- and has to be applied before
+        // the child's own limit, or the limit takes an unsorted window.
+        order_by: Option<&str>,
     ) -> Result<String> {
         // The child table is aliased rather than referred to by name. A
         // self-referential relationship would otherwise make the correlation
@@ -371,6 +376,11 @@ impl EmbedPlan {
         if let Some(child_where) = child_where {
             inner.push_str(" AND ");
             inner.push_str(child_where);
+        }
+
+        if let Some(order_by) = order_by {
+            inner.push_str(" ORDER BY ");
+            inner.push_str(order_by);
         }
 
         // A to-one relationship takes the first row; a to-many takes them all.
@@ -754,7 +764,7 @@ mod tests {
     #[test]
     fn embed_expression_aggregates_a_to_many_relation() {
         let sql = plan(true)
-            .embed_expression("p", "\"p\"", "posts", r#""id", "title""#, None, None)
+            .embed_expression("p", "\"p\"", "posts", r#""id", "title""#, None, None, None)
             .unwrap();
 
         assert!(sql.starts_with("COALESCE((SELECT json_agg("), "{}", sql);
@@ -774,7 +784,7 @@ mod tests {
     #[test]
     fn embed_expression_takes_one_row_for_a_to_one_relation() {
         let sql = plan(false)
-            .embed_expression("p", "\"p\"", "author", r#""id""#, None, None)
+            .embed_expression("p", "\"p\"", "author", r#""id""#, None, None, None)
             .unwrap();
 
         assert!(sql.contains("row_to_json"), "{}", sql);
@@ -789,7 +799,7 @@ mod tests {
     #[test]
     fn embed_expression_limits_rows_per_parent() {
         let sql = plan(true)
-            .embed_expression("p", "\"p\"", "posts", r#""id""#, Some(25), None)
+            .embed_expression("p", "\"p\"", "posts", r#""id""#, Some(25), None, None)
             .unwrap();
         assert!(sql.contains("LIMIT 25"), "{}", sql);
     }

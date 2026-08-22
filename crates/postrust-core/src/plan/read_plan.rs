@@ -219,10 +219,31 @@ fn build_where_clauses(request: &ApiRequest, table: &Table) -> Result<Vec<Coerci
             .unwrap_or_else(|| "text".to_string())
     };
 
+    // `?clients=is.null` names an embedded resource, not a column: it asks
+    // whether the embed matched. That is decided where the embed exists, which
+    // is above this query, so it is left out here. A real column of the same
+    // name wins, since then the filter means what it usually means.
+    let embedded: std::collections::HashSet<&str> = request
+        .query_params
+        .select
+        .iter()
+        .filter_map(|item| match item {
+            SelectItem::Relation {
+                relation, alias, ..
+            } => Some(alias.as_deref().unwrap_or(relation)),
+            SelectItem::SpreadRelation { relation, .. } => Some(relation.as_str()),
+            SelectItem::Field { .. } => None,
+        })
+        .filter(|name| table.get_column(name).is_none())
+        .collect();
+
     let mut clauses = Vec::new();
 
     // Add root filters
     for filter in &request.query_params.filters_root {
+        if embedded.contains(filter.field.name.as_str()) {
+            continue;
+        }
         let pg_type = type_resolver(&filter.field.name);
         clauses.push(CoercibleLogicTree::Stmt(CoercibleFilter::from_filter(
             filter, &pg_type,

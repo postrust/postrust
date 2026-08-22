@@ -225,6 +225,8 @@ async fn execute_plan(
             // or timestamp renders identically either way.
             let mut embed_filters = EmbedFilters {
                 filters: &api_request.query_params.filters,
+                orders: &api_request.query_params.order,
+                ranges: &api_request.query_params.ranges,
                 params: Vec::new(),
                 base: params.len(),
                 max_rows: api_request.max_rows,
@@ -326,9 +328,40 @@ async fn execute_plan(
                 }
                 sql = format!("SELECT {} FROM ({}) AS src", projection, sql);
 
-                if !embed_level.inner_joins.is_empty() {
+                // `?clients=is.null` asks whether the embed matched anything,
+                // not about a column. The embed's expression is the thing to
+                // test, and it is only in scope out here -- referring to the
+                // name it is given would be referring to a column of the very
+                // select that defines it.
+                let mut predicates = embed_level.inner_joins.clone();
+                for filter in &api_request.query_params.filters_root {
+                    let Some((_, exists)) = embed_level
+                        .filterable
+                        .iter()
+                        .find(|(name, _)| name == &filter.field.name)
+                    else {
+                        continue;
+                    };
+                    let negated = match &filter.op_expr.operation {
+                        postrust_core::api_request::Operation::Is(
+                            postrust_core::api_request::IsValue::Null,
+                        ) => filter.op_expr.negated,
+                        postrust_core::api_request::Operation::Is(
+                            postrust_core::api_request::IsValue::NotNull,
+                        ) => !filter.op_expr.negated,
+                        _ => continue,
+                    };
+                    // `is.null` asks for parents the embed did not match, so
+                    // the existence test is the negation of it.
+                    predicates.push(match negated {
+                        true => exists.clone(),
+                        false => format!("NOT {}", exists),
+                    });
+                }
+
+                if !predicates.is_empty() {
                     sql.push_str(" WHERE ");
-                    sql.push_str(&embed_level.inner_joins.join(" AND "));
+                    sql.push_str(&predicates.join(" AND "));
                 }
 
                 if !embed_level.orders.is_empty() {
@@ -946,6 +979,13 @@ struct EmbedFilters<'a> {
     params: Vec<postrust_sql::SqlParam>,
     /// How many parameters the main query already uses.
     base: usize,
+    /// Ordering asked of each embedded resource, by path.
+    orders: &'a [(
+        postrust_core::api_request::EmbedPath,
+        Vec<postrust_core::api_request::OrderTerm>,
+    )],
+    /// Ranges asked of each embedded resource, by dotted path.
+    ranges: &'a std::collections::HashMap<String, postrust_core::api_request::Range>,
     /// Row cap applied to each embedded resource.
     max_rows: Option<i64>,
     /// Source of unique subquery aliases across the whole embed tree.
@@ -992,6 +1032,67 @@ impl EmbedFilters<'_> {
     }
 
     /// The `WHERE` fragment for one embedded resource, or `None` if unfiltered.
+    #[allow(clippy::result_large_err)] // consistent with the crate's error type
+    /// The `ORDER BY` an embedded resource was asked for, if any.
+    ///
+    /// `clients.order=name.desc` orders the rows inside the embed, which is a
+    /// property of the child's own subselect rather than of the parent.
+    fn order_for(&self, path: &[String]) -> Option<String> {
+        let terms: Vec<String> = self
+            .orders
+            .iter()
+            .filter(|(p, _)| p.as_slice() == path)
+            .flat_map(|(_, terms)| terms.iter())
+            .map(|term| {
+                use postrust_core::api_request::{OrderDirection, OrderNulls, OrderTerm};
+                let (field, direction, nulls) = match term {
+                    OrderTerm::Field {
+                        field,
+                        direction,
+                        nulls,
+                    }
+                    | OrderTerm::Relation {
+                        field,
+                        direction,
+                        nulls,
+                        ..
+                    } => (field, direction, nulls),
+                };
+
+                let mut rendered = postrust_sql::escape_ident(&field.name);
+                match direction {
+                    Some(OrderDirection::Desc) => rendered.push_str(" DESC"),
+                    Some(OrderDirection::Asc) => rendered.push_str(" ASC"),
+                    None => {}
+                }
+                match nulls {
+                    Some(OrderNulls::First) => rendered.push_str(" NULLS FIRST"),
+                    Some(OrderNulls::Last) => rendered.push_str(" NULLS LAST"),
+                    None => {}
+                }
+                rendered
+            })
+            .collect();
+
+        match terms.is_empty() {
+            true => None,
+            false => Some(terms.join(", ")),
+        }
+    }
+
+    /// The row window an embedded resource was asked for.
+    ///
+    /// The server's own cap still applies, so an embed cannot be asked for
+    /// more rows than the server is willing to return.
+    fn range_for(&self, path: &[String]) -> Option<i64> {
+        let requested = self.ranges.get(&path.join(".")).and_then(|r| r.limit);
+        match (requested, self.max_rows) {
+            (Some(limit), Some(cap)) => Some(limit.min(cap)),
+            (Some(limit), None) => Some(limit),
+            (None, cap) => cap,
+        }
+    }
+
     #[allow(clippy::result_large_err)] // consistent with the crate's error type
     fn predicate_for(
         &mut self,
@@ -1050,6 +1151,10 @@ struct EmbedLevel {
     inner_joins: Vec<String>,
     /// `ORDER BY` expressions for terms naming an embedded resource.
     orders: Vec<String>,
+    /// Each embed under the name the client used for it, with its
+    /// expression. A spread's response key is internal, so this is what a
+    /// filter naming the embed -- `?clients=is.null` -- is matched against.
+    filterable: Vec<(String, String)>,
     /// For each spread, the keys it contributes to its parent.
     ///
     /// Needed because a spread that matched nothing still carries them --
@@ -1366,13 +1471,16 @@ fn build_embed_expressions(
         }
 
         let inner_select = parts.join(", ");
+        let child_order = ctx.order_for(&child_path);
+        let child_limit = ctx.range_for(&child_path);
         let expression = plan.embed_expression(
             parent_alias,
             parent_row,
             &child_alias,
             &inner_select,
-            ctx.max_rows,
+            child_limit,
             child_where.as_deref(),
+            child_order.as_deref(),
         )?;
 
         if is_spread {
@@ -1394,6 +1502,22 @@ fn build_embed_expressions(
             false => alias.clone().unwrap_or_else(|| relation.clone()),
         };
 
+        // Under the name the client used, whatever the response key is: a
+        // filter naming the embed is written against that name.
+        //
+        // What it records is an existence test, not the expression. Asking
+        // whether a to-many embed is null would never be true -- it renders as
+        // `[]`, never as null -- and "did this match anything" is the question
+        // either way.
+        level.filterable.push((
+            alias.clone().unwrap_or_else(|| relation.clone()),
+            plan.inner_join_predicate(
+                parent_alias,
+                parent_row,
+                &child_alias,
+                child_where.as_deref(),
+            ),
+        ));
         level.expressions.push((key, expression));
     }
 
