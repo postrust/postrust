@@ -34,6 +34,12 @@ pub struct EmbedPlan {
     pub foreign_table: String,
     /// Whether the relationship yields many rows per parent.
     pub is_list: bool,
+    /// Every column pair the join is on, parent side first.
+    ///
+    /// Usually one. A foreign key over several columns joins on all of them,
+    /// and the pairs are ordered so each parent column sits with the child
+    /// column it actually references.
+    pub columns: Vec<(String, String)>,
     /// The junction of a many-to-many relationship, if that is what this is.
     ///
     /// The parent and the child share no key; each points at a table that
@@ -83,6 +89,7 @@ impl EmbedPlan {
                 foreign_schema: foreign_table.schema.clone(),
                 foreign_table: foreign_table.name.clone(),
                 is_list: !to_one,
+                columns: Vec::new(),
                 junction: None,
                 function: Some(function.clone()),
             });
@@ -110,6 +117,7 @@ impl EmbedPlan {
                 foreign_table: foreign_table_qi.name.clone(),
                 // A junction always yields a set: that is what it is for.
                 is_list: true,
+                columns: Vec::new(),
                 junction: Some(EmbedJunction {
                     schema: junction.table.schema.clone(),
                     table: junction.table.name.clone(),
@@ -125,16 +133,10 @@ impl EmbedPlan {
             Relationship::Computed { .. } => unreachable!("handled above"),
         };
 
-        if columns.len() != 1 {
-            return Err(Error::EmbeddingError(format!(
-                "embedding \"{}\" is not supported yet: it joins on {} columns and \
-                 only single-column joins are implemented",
-                foreign_table_qi.name,
-                columns.len()
-            )));
-        }
-
-        let (local_column, foreign_column) = columns[0].clone();
+        let (local_column, foreign_column) = columns
+            .first()
+            .cloned()
+            .ok_or_else(|| Error::EmbeddingError("relationship joins on no columns".into()))?;
 
         let foreign_table: &Table = schema_cache.get_table(&foreign_table_qi).ok_or_else(|| {
             Error::EmbeddingError(format!(
@@ -160,9 +162,36 @@ impl EmbedPlan {
             foreign_schema: foreign_table_qi.schema.clone(),
             foreign_table: foreign_table_qi.name.clone(),
             is_list: !relationship.is_to_one(),
+            columns,
             junction: None,
             function: None,
         })
+    }
+
+    /// The predicate correlating child rows to one parent row.
+    ///
+    /// A foreign key over several columns joins on all of them, so this is one
+    /// equality per pair rather than a single one.
+    fn correlation(&self, parent_alias: &str, child_alias: &str) -> String {
+        let pairs = if self.columns.is_empty() {
+            vec![(self.local_column.clone(), self.foreign_column.clone())]
+        } else {
+            self.columns.clone()
+        };
+
+        pairs
+            .iter()
+            .map(|(local, foreign)| {
+                format!(
+                    "{}.{} = {}.{}",
+                    postrust_sql::escape_ident(child_alias),
+                    postrust_sql::escape_ident(foreign),
+                    postrust_sql::escape_ident(parent_alias),
+                    postrust_sql::escape_ident(local),
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(" AND ")
     }
 
     /// SQL that fetches every related row for the given parent key values.
@@ -219,6 +248,15 @@ impl EmbedPlan {
     /// `limit` still bounds the rows scanned, not the rows per parent, so it is
     /// applied to the inner select exactly as the ungrouped form does.
     pub fn children_grouped_sql(&self, limit: Option<i64>, columns: &[String]) -> Result<String> {
+        if self.columns.len() > 1 {
+            return Err(Error::EmbeddingError(format!(
+                "embedding \"{}\" this way is not supported: it joins on {} columns, and \
+                 grouping children by key needs a single one",
+                self.foreign_table,
+                self.columns.len()
+            )));
+        }
+
         let type_name = castable_type_name(&self.foreign_column_type).ok_or_else(|| {
             Error::EmbeddingError(format!(
                 "cannot embed \"{}\": join column type \"{}\" is not a plain type name",
@@ -317,15 +355,12 @@ impl EmbedPlan {
                     )
                 }
                 None => format!(
-                    "SELECT {} FROM {}.{} AS {} WHERE {}.{} = {}.{}",
+                    "SELECT {} FROM {}.{} AS {} WHERE {}",
                     inner_select,
                     postrust_sql::escape_ident(&self.foreign_schema),
                     postrust_sql::escape_ident(&self.foreign_table),
                     postrust_sql::escape_ident(child_alias),
-                    postrust_sql::escape_ident(child_alias),
-                    postrust_sql::escape_ident(&self.foreign_column),
-                    postrust_sql::escape_ident(parent_alias),
-                    postrust_sql::escape_ident(&self.local_column),
+                    self.correlation(parent_alias, child_alias),
                 ),
             },
         };
@@ -413,14 +448,11 @@ impl EmbedPlan {
                     )
                 }
                 None => format!(
-                    "EXISTS (SELECT 1 FROM {}.{} AS {} WHERE {}.{} = {}.{}",
+                    "EXISTS (SELECT 1 FROM {}.{} AS {} WHERE {}",
                     postrust_sql::escape_ident(&self.foreign_schema),
                     postrust_sql::escape_ident(&self.foreign_table),
                     postrust_sql::escape_ident(child_alias),
-                    postrust_sql::escape_ident(child_alias),
-                    postrust_sql::escape_ident(&self.foreign_column),
-                    postrust_sql::escape_ident(parent_alias),
-                    postrust_sql::escape_ident(&self.local_column),
+                    self.correlation(parent_alias, child_alias),
                 ),
             },
         };
@@ -649,6 +681,7 @@ mod tests {
             foreign_schema: "public".into(),
             foreign_table: "posts".into(),
             is_list,
+            columns: vec![("id".into(), "user_id".into())],
             junction: None,
             function: None,
         }

@@ -159,38 +159,79 @@ impl SchemaCache {
     }
 
     /// Find a relationship between two tables by name.
+    ///
+    /// `hint` is the `!hint` of `person_detail!message_sender_fkey(name)`,
+    /// which names the relationship when the two resources are connected by
+    /// more than one.
+    ///
+    /// Returns `Ok(None)` when nothing matches, and an error when several do
+    /// and no hint told them apart -- picking one arbitrarily would answer a
+    /// question the client did not ask.
     pub fn find_relationship(
         &self,
         from: &QualifiedIdentifier,
         to_name: &str,
+        hint: Option<&str>,
         schema: &str,
-    ) -> Option<&Relationship> {
-        let candidates = self.get_relationships(from, schema)?;
+    ) -> Result<Option<&Relationship>> {
+        let Some(candidates) = self.get_relationships(from, schema) else {
+            return Ok(None);
+        };
 
         // An embedding may be named three ways, and they are tried in the
         // order of how specifically they identify one relationship.
         //
-        // The target table's name is the usual spelling, but it is ambiguous
-        // as soon as two foreign keys point at the same table. The foreign key
-        // constraint names exactly one relationship, and so does the column
-        // that joins them -- `/messages?select=*,sender(*)` embeds through the
-        // `sender` column, and `/projects?select=*,client(*)` through the
-        // constraint called `client`.
-        candidates
+        // The target table's name is the usual spelling, but it stops
+        // identifying anything as soon as two foreign keys point at the same
+        // table. The foreign key constraint names exactly one relationship,
+        // and so does the column that joins them -- `/messages?select=*,
+        // sender(*)` embeds through the `sender` column, and
+        // `/projects?select=*,client(*)` through the constraint called
+        // `client`.
+        let by_target: Vec<&Relationship> = candidates
             .iter()
-            .find(|r| match r {
+            .filter(|r| match r {
                 // A computed relationship is named by its function. Two
                 // functions may return the same table, so the table's name
                 // would not tell them apart.
                 Relationship::Computed { function, .. } => function.name == to_name,
                 Relationship::ForeignKey { foreign_table, .. } => foreign_table.name == to_name,
             })
-            .or_else(|| candidates.iter().find(|r| r.constraint_name() == to_name))
-            .or_else(|| {
-                candidates
+            .collect();
+
+        let mut matches = match by_target.is_empty() {
+            false => by_target,
+            true => {
+                let by_constraint: Vec<&Relationship> = candidates
                     .iter()
-                    .find(|r| r.join_columns().iter().any(|(local, _)| local == to_name))
-            })
+                    .filter(|r| r.constraint_name() == to_name)
+                    .collect();
+                match by_constraint.is_empty() {
+                    false => by_constraint,
+                    true => candidates
+                        .iter()
+                        .filter(|r| r.join_columns().iter().any(|(local, _)| local == to_name))
+                        .collect(),
+                }
+            }
+        };
+
+        if let Some(hint) = hint {
+            matches.retain(|r| r.matches_hint(hint));
+        }
+
+        match matches.len() {
+            0 => Ok(None),
+            1 => Ok(Some(matches[0])),
+            _ => Err(Error::AmbiguousRelationship {
+                origin: from.name.clone(),
+                target: to_name.to_string(),
+                candidates: matches
+                    .iter()
+                    .map(|r| (r.cardinality_name().to_string(), r.describe()))
+                    .collect(),
+            }),
+        }
     }
 }
 

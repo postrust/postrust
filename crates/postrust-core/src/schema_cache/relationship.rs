@@ -77,6 +77,70 @@ impl Relationship {
         }
     }
 
+    /// How PostgREST names this relationship's cardinality.
+    pub fn cardinality_name(&self) -> &'static str {
+        match self {
+            Self::ForeignKey { cardinality, .. } => match cardinality {
+                Cardinality::O2M { .. } => "one-to-many",
+                Cardinality::M2O { .. } => "many-to-one",
+                Cardinality::O2O { .. } => "one-to-one",
+                Cardinality::M2M(_) => "many-to-many",
+            },
+            Self::Computed { to_one, .. } => match to_one {
+                true => "many-to-one",
+                false => "one-to-many",
+            },
+        }
+    }
+
+    /// How this relationship reads when several of them cannot be told apart.
+    ///
+    /// `message_sender_fkey using message(sender) and person_detail(id)` --
+    /// the constraint, then each side with the columns it joins on, which is
+    /// what a client needs to write the hint that disambiguates it.
+    pub fn describe(&self) -> String {
+        match self {
+            Self::ForeignKey {
+                table,
+                foreign_table,
+                cardinality,
+                ..
+            } => {
+                let columns = cardinality.columns();
+                let local = columns
+                    .iter()
+                    .map(|(local, _)| local.clone())
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                let foreign = columns
+                    .iter()
+                    .map(|(_, foreign)| foreign.clone())
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                format!(
+                    "{} using {}({}) and {}({})",
+                    self.constraint_name(),
+                    table.name,
+                    local,
+                    foreign_table.name,
+                    foreign
+                )
+            }
+            Self::Computed { function, .. } => function.name.clone(),
+        }
+    }
+
+    /// Whether a hint names this relationship.
+    ///
+    /// A hint may be the constraint, the column that joins them, or the table
+    /// on the far side -- whichever the client found unambiguous.
+    pub fn matches_hint(&self, hint: &str) -> bool {
+        self.constraint_name() == hint
+            || self.foreign_table().name == hint
+            || self.join_columns().iter().any(|(local, _)| local == hint)
+            || matches!(self, Self::Computed { function, .. } if function.name == hint)
+    }
+
     /// Get the join columns for this relationship.
     pub fn join_columns(&self) -> Vec<(String, String)> {
         match self {

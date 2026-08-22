@@ -181,27 +181,40 @@ pub async fn load_relationships(pool: &PgPool, schemas: &[String]) -> Result<Rel
             t1.relname as table_name,
             ns2.nspname as foreign_table_schema,
             t2.relname as foreign_table_name,
-            array_agg(a1.attname ORDER BY array_position(c.conkey, a1.attnum)) as columns,
-            array_agg(a2.attname ORDER BY array_position(c.confkey, a2.attnum)) as foreign_columns,
+            -- Each key's columns are read in their own subquery, by ordinal
+            -- position. Joining pg_attribute twice in the outer query instead
+            -- would multiply the two keys together: a two-column foreign key
+            -- came back as four pairs, of which two paired a column with the
+            -- wrong one on the other side.
+            (SELECT array_agg(a.attname ORDER BY k.ord)
+               FROM unnest(c.conkey) WITH ORDINALITY AS k(attnum, ord)
+               JOIN pg_attribute a
+                 ON a.attrelid = c.conrelid AND a.attnum = k.attnum) as columns,
+            (SELECT array_agg(a.attname ORDER BY k.ord)
+               FROM unnest(c.confkey) WITH ORDINALITY AS k(attnum, ord)
+               JOIN pg_attribute a
+                 ON a.attrelid = c.confrelid AND a.attnum = k.attnum) as foreign_columns,
             t1.relkind = 'v' as table_is_view,
             t2.relkind = 'v' as foreign_table_is_view,
+            -- The key is unique when a unique index is *covered by* it, not
+            -- when the index merely contains it. Asked the other way round,
+            -- any key that is part of a wider unique index looked unique --
+            -- so a foreign key on two of a three-column primary key became a
+            -- one-to-one, and the far side embedded a single object where it
+            -- should have embedded an array.
             EXISTS (
                 SELECT 1 FROM pg_index i
                 WHERE i.indrelid = c.conrelid
                   AND i.indisunique
-                  AND i.indkey::int[] @> c.conkey::int[]
+                  AND c.conkey::int[] @> i.indkey::int[]
             ) as is_unique
         FROM pg_constraint c
         JOIN pg_class t1 ON t1.oid = c.conrelid
         JOIN pg_namespace ns1 ON ns1.oid = t1.relnamespace
         JOIN pg_class t2 ON t2.oid = c.confrelid
         JOIN pg_namespace ns2 ON ns2.oid = t2.relnamespace
-        JOIN pg_attribute a1 ON a1.attrelid = c.conrelid AND a1.attnum = ANY(c.conkey)
-        JOIN pg_attribute a2 ON a2.attrelid = c.confrelid AND a2.attnum = ANY(c.confkey)
         WHERE c.contype = 'f'
           AND ns1.nspname = ANY($1)
-        GROUP BY c.conname, ns1.nspname, t1.relname, ns2.nspname, t2.relname,
-                 t1.relkind, t2.relkind, c.conrelid, c.conkey
         "#,
     )
     .bind(schemas)

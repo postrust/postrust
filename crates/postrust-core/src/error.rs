@@ -66,6 +66,15 @@ pub enum Error {
     #[error("Could not choose the best candidate function between: {}", .candidates.join(", "))]
     AmbiguousFunction { candidates: Vec<String> },
 
+    /// Several relationships connect the two resources and none was named.
+    #[error("Could not embed because more than one relationship was found for '{origin}' and '{target}'")]
+    AmbiguousRelationship {
+        origin: String,
+        target: String,
+        /// Each candidate as `(cardinality, description)`.
+        candidates: Vec<(String, String)>,
+    },
+
     // ========================================================================
     // Authentication/Authorization Errors (401/403)
     // ========================================================================
@@ -167,7 +176,9 @@ impl Error {
             | Self::AggregatesNotAllowed => StatusCode::BAD_REQUEST,
 
             // The request names something real, but not which one of it.
-            Self::AmbiguousFunction { .. } => StatusCode::MULTIPLE_CHOICES,
+            Self::AmbiguousFunction { .. } | Self::AmbiguousRelationship { .. } => {
+                StatusCode::MULTIPLE_CHOICES
+            }
 
             // 401 Unauthorized
             Self::InvalidJwt(_) | Self::JwtExpired | Self::MissingAuth => StatusCode::UNAUTHORIZED,
@@ -219,6 +230,7 @@ impl Error {
             Self::MissingParameter(_) => "PGRST109",
             Self::AmbiguousRequest(_) => "PGRST110",
             Self::AmbiguousFunction { .. } => "PGRST203",
+            Self::AmbiguousRelationship { .. } => "PGRST201",
 
             Self::InvalidJwt(_) => "PGRST303",
             Self::JwtExpired => "PGRST301",
@@ -256,13 +268,33 @@ impl Error {
     }
 
     /// Get additional details for the error.
-    pub fn details(&self) -> Option<String> {
+    pub fn details(&self) -> Option<serde_json::Value> {
         match self {
-            Self::Database(db_err) => db_err.details.clone(),
-            Self::FunctionNotFound { name, params, .. } => Some(format!(
-                "Searched for the function {} {}, but no matches were found in the schema cache.",
-                name,
-                describe_params(params)
+            Self::Database(db_err) => db_err.details.clone().map(serde_json::Value::String),
+            // A structured list rather than a sentence: each candidate is
+            // named so the client can pick one and say which.
+            Self::AmbiguousRelationship {
+                origin,
+                target,
+                candidates,
+            } => Some(serde_json::Value::Array(
+                candidates
+                    .iter()
+                    .map(|(cardinality, description)| {
+                        serde_json::json!({
+                            "cardinality": cardinality,
+                            "embedding": format!("{} with {}", origin, target),
+                            "relationship": description,
+                        })
+                    })
+                    .collect(),
+            )),
+            Self::FunctionNotFound { name, params, .. } => Some(serde_json::Value::String(
+                format!(
+                    "Searched for the function {} {}, but no matches were found in the schema cache.",
+                    name,
+                    describe_params(params)
+                ),
             )),
             _ => None,
         }

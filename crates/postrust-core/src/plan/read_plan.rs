@@ -268,13 +268,18 @@ fn build_relation_selects(
             SelectItem::Relation {
                 relation,
                 alias,
-                hint: _,
+                hint,
                 join_type,
                 select: _,
             } => {
                 // Verify relationship exists
                 let _rel = schema_cache
-                    .find_relationship(&table.qualified_identifier(), relation, &table.schema)
+                    .find_relationship(
+                        &table.qualified_identifier(),
+                        relation,
+                        hint.as_deref(),
+                        &table.schema,
+                    )?
                     .ok_or_else(|| Error::RelationshipNotFound(relation.clone()))?;
 
                 rel_selects.push(RelSelectField {
@@ -288,12 +293,17 @@ fn build_relation_selects(
             }
             SelectItem::SpreadRelation {
                 relation,
-                hint: _,
+                hint,
                 join_type,
                 select: _,
             } => {
                 let _rel = schema_cache
-                    .find_relationship(&table.qualified_identifier(), relation, &table.schema)
+                    .find_relationship(
+                        &table.qualified_identifier(),
+                        relation,
+                        hint.as_deref(),
+                        &table.schema,
+                    )?
                     .ok_or_else(|| Error::RelationshipNotFound(relation.clone()))?;
 
                 rel_selects.push(RelSelectField {

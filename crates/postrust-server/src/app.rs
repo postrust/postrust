@@ -824,14 +824,14 @@ fn add_embed_join_columns(
         // it needs that column selected just the same. Without it the parent
         // row has no key to match children against and every spread column
         // comes back null.
-        let relation = match &item {
-            SelectItem::Relation { relation, .. } => relation,
-            SelectItem::SpreadRelation { relation, .. } => relation,
+        let (relation, hint) = match &item {
+            SelectItem::Relation { relation, hint, .. } => (relation, hint),
+            SelectItem::SpreadRelation { relation, hint, .. } => (relation, hint),
             SelectItem::Field { .. } => continue,
         };
 
         let rel = schema_cache
-            .find_relationship(&parent_qi, relation, &parent_qi.schema)
+            .find_relationship(&parent_qi, relation, hint.as_deref(), &parent_qi.schema)?
             .ok_or_else(|| postrust_core::Error::RelationshipNotFound(relation.clone()))?;
 
         let plan = postrust_core::embed::EmbedPlan::resolve(rel, schema_cache)?;
@@ -846,15 +846,29 @@ fn add_embed_join_columns(
             continue;
         }
 
-        if !selected.contains(&plan.local_column) && !added.contains(&plan.local_column) {
-            api_request.query_params.select.push(SelectItem::Field {
-                field: Field::simple(&plan.local_column),
-                aggregate: None,
-                aggregate_cast: None,
-                cast: None,
-                alias: None,
-            });
-            added.push(plan.local_column.clone());
+        // Every column the join is on, not just the first: a foreign key over
+        // several columns correlates on all of them, and one left unselected
+        // is a column the correlation cannot see.
+        let join_columns: Vec<String> = match plan.columns.is_empty() {
+            true => vec![plan.local_column.clone()],
+            false => plan
+                .columns
+                .iter()
+                .map(|(local, _)| local.clone())
+                .collect(),
+        };
+
+        for column in join_columns {
+            if !selected.contains(&column) && !added.contains(&column) {
+                api_request.query_params.select.push(SelectItem::Field {
+                    field: Field::simple(&column),
+                    aggregate: None,
+                    aggregate_cast: None,
+                    cast: None,
+                    alias: None,
+                });
+                added.push(column);
+            }
         }
     }
 
@@ -1014,14 +1028,14 @@ fn build_embed_expressions(
             alias,
             select: child_select,
             join_type,
-            ..
+            hint,
         } = item
         else {
             continue;
         };
 
         let rel = schema_cache
-            .find_relationship(parent_qi, relation, &parent_qi.schema)
+            .find_relationship(parent_qi, relation, hint.as_deref(), &parent_qi.schema)?
             .ok_or_else(|| postrust_core::Error::RelationshipNotFound(relation.clone()))?;
         let plan = postrust_core::embed::EmbedPlan::resolve(rel, schema_cache)?;
 
@@ -1161,23 +1175,25 @@ fn embed_relations<'f>(
             // A spread embed is fetched exactly like a plain one -- the two
             // differ only in where the child's columns end up, which is
             // settled once the rows are in hand.
-            let (relation, alias, nested, is_spread) = match item {
+            let (relation, alias, nested, is_spread, hint) = match item {
                 SelectItem::Relation {
                     relation,
                     alias,
                     select: nested,
+                    hint,
                     ..
-                } => (relation, alias.clone(), nested, false),
+                } => (relation, alias.clone(), nested, false, hint),
                 SelectItem::SpreadRelation {
                     relation,
                     select: nested,
+                    hint,
                     ..
-                } => (relation, None, nested, true),
+                } => (relation, None, nested, true, hint),
                 SelectItem::Field { .. } => continue,
             };
 
             let rel = schema_cache
-                .find_relationship(parent_qi, relation, &parent_qi.schema)
+                .find_relationship(parent_qi, relation, hint.as_deref(), &parent_qi.schema)?
                 .ok_or_else(|| postrust_core::Error::RelationshipNotFound(relation.clone()))?;
 
             let plan = postrust_core::embed::EmbedPlan::resolve(rel, schema_cache)?;
@@ -1205,7 +1221,10 @@ fn embed_relations<'f>(
                 match nested_item {
                     SelectItem::Field { field, .. } => child_columns.push(field.name.clone()),
                     SelectItem::Relation { relation, .. } => {
-                        match schema_cache.find_relationship(&child_qi, relation, &child_qi.schema)
+                        match schema_cache
+                            .find_relationship(&child_qi, relation, None, &child_qi.schema)
+                            .ok()
+                            .flatten()
                         {
                             Some(nested_rel) => {
                                 let nested_plan = postrust_core::embed::EmbedPlan::resolve(
@@ -1526,7 +1545,11 @@ fn sanitize_error_message(error: &postrust_core::Error) -> String {
         }
         // The candidate list is the whole point of the message: it names the
         // signatures that could not be told apart.
-        Error::AmbiguousFunction { .. } => return error.to_string(),
+        Error::AmbiguousFunction { .. } | Error::AmbiguousRelationship { .. } => {
+            // The candidates are the whole point of these messages: they name
+            // what could not be told apart.
+            return error.to_string();
+        }
         _ => {}
     }
 
