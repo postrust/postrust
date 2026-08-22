@@ -76,9 +76,14 @@ impl SchemaCache {
         let timezones = queries::load_timezones(pool).await?;
         info!("Loaded {} timezones", timezones.len());
 
+        // Junctions first, then views: a many-to-many derived from a
+        // junction is itself a relationship a view can carry, and the
+        // junction may live in a schema that is not exposed.
+        let primary_keys = queries::load_primary_keys(pool, &relationship_schemas).await?;
+
         let mut relationships = relationships;
-        add_view_relationships(&view_columns, &mut relationships);
-        add_junction_relationships(&tables, &mut relationships);
+        add_junction_relationships(&primary_keys, &mut relationships);
+        add_view_relationships(&tables, &view_columns, &mut relationships);
 
         let media_handlers = queries::load_media_handlers(pool, schemas).await?;
         info!("Loaded {} media type handlers", media_handlers.len());
@@ -266,6 +271,7 @@ impl SchemaCache {
 /// relationship of a base table is offered to each view over it that keeps
 /// those columns, on both sides -- a view can be embedded, and can embed.
 fn add_view_relationships(
+    tables: &TablesMap,
     view_columns: &[(QualifiedIdentifier, QualifiedIdentifier, String)],
     relationships: &mut RelationshipsMap,
 ) {
@@ -302,23 +308,45 @@ fn add_view_relationships(
         else {
             continue;
         };
-        // A many-to-many is derived from two others; projecting it as well
-        // would double up on whatever those produce.
-        if matches!(cardinality, Cardinality::M2M(_)) {
-            continue;
-        }
-
-        let columns = cardinality.columns();
-        let carries = |view_cols: &Vec<&str>, wanted: &dyn Fn(&(String, String)) -> String| {
-            columns
+        // Which columns each end has to carry for the view to stand in for
+        // it. A many-to-many joins through a junction, so the two ends are
+        // described by different halves of it -- the near side by the columns
+        // going into the junction, the far side by the ones coming out.
+        let (near_needs, far_needs): (Vec<String>, Vec<String>) = match cardinality {
+            Cardinality::M2M(junction) => (
+                junction
+                    .source_columns
+                    .iter()
+                    .map(|(near, _)| near.clone())
+                    .collect(),
+                junction
+                    .target_columns
+                    .iter()
+                    .map(|(_, far)| far.clone())
+                    .collect(),
+            ),
+            _ => {
+                let columns = cardinality.columns();
+                (
+                    columns.iter().map(|(near, _)| near.clone()).collect(),
+                    columns.iter().map(|(_, far)| far.clone()).collect(),
+                )
+            }
+        };
+        let carries = |view_cols: &Vec<&str>, needed: &[String]| {
+            needed
                 .iter()
-                .all(|pair| view_cols.iter().any(|c| *c == wanted(pair)))
+                .all(|name| view_cols.iter().any(|c| c == name))
         };
 
         // The view stands in for the near side.
+        //
+        // Skipped when the far side has views of its own: the both-views case
+        // below covers that pair, and this one would leave the far side as a
+        // table the client may not even be able to name.
         if let Some(views) = views_over.get(source) {
             for (view, view_cols) in views {
-                if !carries(view_cols, &|(local, _)| local.clone()) {
+                if !carries(view_cols, &near_needs) {
                     continue;
                 }
                 derived.push((
@@ -336,10 +364,10 @@ fn add_view_relationships(
             }
         }
 
-        // The view stands in for the far side.
+        // The view stands in for the far side, and likewise.
         if let Some(views) = views_over.get(foreign_table) {
             for (view, view_cols) in views {
-                if !carries(view_cols, &|(_, foreign)| foreign.clone()) {
+                if !carries(view_cols, &far_needs) {
                     continue;
                 }
                 derived.push((
@@ -361,11 +389,11 @@ fn add_view_relationships(
         // replaces one end and leaves the other as the base table.
         if let (Some(near), Some(far)) = (views_over.get(source), views_over.get(foreign_table)) {
             for (near_view, near_cols) in near {
-                if !carries(near_cols, &|(local, _)| local.clone()) {
+                if !carries(near_cols, &near_needs) {
                     continue;
                 }
                 for (far_view, far_cols) in far {
-                    if !carries(far_cols, &|(_, foreign)| foreign.clone()) {
+                    if !carries(far_cols, &far_needs) {
                         continue;
                     }
                     derived.push((
@@ -385,7 +413,14 @@ fn add_view_relationships(
         }
     }
 
+    // A projection is only useful if the client can name both ends. The base
+    // table behind a view is often in a schema that is not exposed, and
+    // offering it as a target would produce a relationship that resolves to a
+    // table the request has no permission to read.
     for (key, rel) in derived {
+        if !tables.contains_key(&key.0) || !tables.contains_key(rel.foreign_table()) {
+            continue;
+        }
         relationships.entry(key).or_default().push(rel);
     }
 }
@@ -400,10 +435,13 @@ fn add_view_relationships(
 ///
 /// Both sides get the relationship, named after the table across the junction,
 /// so `/users?select=name,tasks(name)` works from either end.
-fn add_junction_relationships(tables: &TablesMap, relationships: &mut RelationshipsMap) {
+fn add_junction_relationships(
+    primary_keys: &std::collections::HashMap<QualifiedIdentifier, Vec<String>>,
+    relationships: &mut RelationshipsMap,
+) {
     let mut derived: Vec<((QualifiedIdentifier, String), Relationship)> = Vec::new();
 
-    for (junction_qi, junction) in tables {
+    for (junction_qi, junction_pk) in primary_keys {
         let key = (junction_qi.clone(), junction_qi.schema.clone());
         let Some(rels) = relationships.get(&key) else {
             continue;
@@ -426,7 +464,7 @@ fn add_junction_relationships(tables: &TablesMap, relationships: &mut Relationsh
             })
             .collect();
 
-        let mut pk: Vec<&str> = junction.pk_cols.iter().map(String::as_str).collect();
+        let mut pk: Vec<&str> = junction_pk.iter().map(String::as_str).collect();
         pk.sort_unstable();
         if pk.len() != 2 {
             continue;

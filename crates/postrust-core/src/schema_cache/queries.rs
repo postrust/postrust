@@ -660,3 +660,49 @@ pub async fn load_view_columns(
         })
         .collect())
 }
+
+/// Primary key columns for every table in the given schemas.
+///
+/// Junction detection needs the key of the table doing the joining, and that
+/// table may sit in a schema which is not exposed -- the junction behind two
+/// public views. Loading the key alone keeps it out of the API surface while
+/// still letting the relationship be derived.
+pub async fn load_primary_keys(
+    pool: &PgPool,
+    schemas: &[String],
+) -> Result<HashMap<QualifiedIdentifier, Vec<String>>> {
+    let rows = sqlx::query(
+        r#"
+        SELECT
+            n.nspname AS table_schema,
+            c.relname AS table_name,
+            (SELECT array_agg(a.attname ORDER BY k.ord)
+               FROM unnest(i.indkey) WITH ORDINALITY AS k(attnum, ord)
+               JOIN pg_attribute a
+                 ON a.attrelid = c.oid AND a.attnum = k.attnum) AS pk_cols
+        FROM pg_index i
+        JOIN pg_class c      ON c.oid = i.indrelid
+        JOIN pg_namespace n  ON n.oid = c.relnamespace
+        WHERE i.indisprimary
+          AND n.nspname = ANY($1)
+        "#,
+    )
+    .bind(schemas)
+    .fetch_all(pool)
+    .await
+    .map_err(|e| Error::SchemaCacheLoadFailed(e.to_string()))?;
+
+    Ok(rows
+        .into_iter()
+        .filter_map(|row| {
+            let columns: Option<Vec<String>> = row.get("pk_cols");
+            Some((
+                QualifiedIdentifier::new(
+                    row.get::<String, _>("table_schema"),
+                    row.get::<String, _>("table_name"),
+                ),
+                columns?,
+            ))
+        })
+        .collect())
+}
