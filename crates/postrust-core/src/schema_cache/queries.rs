@@ -1,7 +1,7 @@
 //! SQL queries for schema introspection.
 
 use super::relationship::{Cardinality, Relationship, RelationshipsMap};
-use super::routine::{FuncVolatility, RetType, Routine, RoutineMap};
+use super::routine::{FuncVolatility, RetType, Routine, RoutineMap, RoutineParam};
 use super::table::{Column, ColumnMap, Table, TablesMap};
 use crate::api_request::QualifiedIdentifier;
 use crate::error::{Error, Result};
@@ -298,6 +298,41 @@ pub async fn load_relationships(pool: &PgPool, schemas: &[String]) -> Result<Rel
     Ok(relationships)
 }
 
+/// Decode the `params` JSON built by [`load_routines`]'s query.
+///
+/// Anything malformed yields no parameters rather than an error: an argument
+/// whose type we don't know is bound untyped, which is how the server behaved
+/// before parameter types were loaded at all.
+fn parse_routine_params(value: serde_json::Value) -> Vec<RoutineParam> {
+    let Some(items) = value.as_array() else {
+        return Vec::new();
+    };
+
+    items
+        .iter()
+        .filter_map(|item| {
+            let param_type = item.get("type")?.as_str()?.to_string();
+            Some(RoutineParam {
+                name: item
+                    .get("name")
+                    .and_then(|n| n.as_str())
+                    .unwrap_or_default()
+                    .to_string(),
+                type_max_length: param_type.clone(),
+                param_type,
+                required: item
+                    .get("required")
+                    .and_then(|r| r.as_bool())
+                    .unwrap_or(true),
+                variadic: item
+                    .get("variadic")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false),
+            })
+        })
+        .collect()
+}
+
 /// Load stored functions.
 pub async fn load_routines(pool: &PgPool, schemas: &[String]) -> Result<RoutineMap> {
     let mut routines: RoutineMap = HashMap::new();
@@ -312,6 +347,24 @@ pub async fn load_routines(pool: &PgPool, schemas: &[String]) -> Result<RoutineM
             p.provariadic <> 0 as has_variadic,
             p.prokind = 'p' as is_procedure,
             pg_get_function_identity_arguments(p.oid) as args,
+            -- Input parameters, in declaration order. Built from the catalog
+            -- rather than parsed out of the identity-arguments string, whose
+            -- types can themselves contain commas (`numeric(10,2)`).
+            -- `proargtypes` covers the IN parameters only and is 0-indexed;
+            -- `proargnames` is 1-indexed and lists IN names first, so the two
+            -- line up over 1..pronargs. A parameter is optional when it falls
+            -- inside the trailing run that has defaults.
+            COALESCE((
+                SELECT json_agg(
+                    json_build_object(
+                        'name', COALESCE(p.proargnames[i], ''),
+                        'type', pg_catalog.format_type(p.proargtypes[i - 1], NULL),
+                        'required', i <= (p.pronargs - p.pronargdefaults),
+                        'variadic', p.provariadic <> 0 AND i = p.pronargs
+                    ) ORDER BY i
+                )
+                FROM generate_series(1, p.pronargs) AS i
+            ), '[]'::json) as params,
             CASE
                 WHEN p.proretset THEN 'SETOF ' || pg_catalog.format_type(p.prorettype, NULL)
                 ELSE pg_catalog.format_type(p.prorettype, NULL)
@@ -361,7 +414,7 @@ pub async fn load_routines(pool: &PgPool, schemas: &[String]) -> Result<RoutineM
             schema,
             name,
             description: row.get("description"),
-            params: vec![], // Simplified - full implementation would parse args
+            params: parse_routine_params(row.get("params")),
             return_type,
             returns_composite,
             volatility: FuncVolatility::from_char(volatility.chars().next().unwrap_or('v')),

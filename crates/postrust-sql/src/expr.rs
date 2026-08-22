@@ -256,6 +256,12 @@ impl Expr {
 #[derive(Clone, Debug)]
 pub struct OrderExpr {
     column: String,
+    /// Whether `column` is already SQL rather than a bare identifier.
+    ///
+    /// A JSON path (`"data" ->> 'id'`) is an expression, so escaping it as one
+    /// identifier would quote the whole thing into a column name that does not
+    /// exist.
+    raw: bool,
     direction: Option<OrderDirection>,
     nulls: Option<NullsOrder>,
 }
@@ -277,6 +283,17 @@ impl OrderExpr {
     pub fn new(column: impl Into<String>) -> Self {
         Self {
             column: column.into(),
+            raw: false,
+            direction: None,
+            nulls: None,
+        }
+    }
+
+    /// Order by an already-rendered SQL expression.
+    pub fn raw(expression: impl Into<String>) -> Self {
+        Self {
+            column: expression.into(),
+            raw: true,
             direction: None,
             nulls: None,
         }
@@ -308,7 +325,11 @@ impl OrderExpr {
 
     /// Convert to SQL fragment.
     pub fn into_fragment(self) -> SqlFragment {
-        let mut frag = SqlFragment::raw(escape_ident(&self.column));
+        let mut frag = SqlFragment::raw(if self.raw {
+            self.column.clone()
+        } else {
+            escape_ident(&self.column)
+        });
 
         if let Some(dir) = self.direction {
             match dir {

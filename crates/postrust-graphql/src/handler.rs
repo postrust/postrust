@@ -1399,7 +1399,13 @@ fn build_embed_expressions(
         }
 
         let expression = plan
-            .embed_expression(parent_alias, &child_alias, &parts.join(", "), max_rows)
+            .embed_expression(
+                parent_alias,
+                &child_alias,
+                &parts.join(", "),
+                max_rows,
+                None,
+            )
             .map_err(|e| async_graphql::Error::new(e.to_string()))?;
 
         expressions.push((rel.name.clone(), expression));

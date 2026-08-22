@@ -52,8 +52,11 @@ pub struct AppConfig {
     /// Maximum rows allowed in a response
     pub db_max_rows: Option<i64>,
 
-    /// Enable aggregate functions
-    #[serde(default = "default_true")]
+    /// Enable aggregate functions in `select`.
+    ///
+    /// Off by default, as in PostgREST: an aggregate over a large table costs
+    /// far more than the request looks like it asks for.
+    #[serde(default)]
     pub db_aggregates_enabled: bool,
 
     // ========================================================================
@@ -155,7 +158,7 @@ impl Default for AppConfig {
             db_channel_enabled: false,
             db_pre_request: None,
             db_max_rows: None,
-            db_aggregates_enabled: true,
+            db_aggregates_enabled: false,
             server_host: default_host(),
             server_port: default_port(),
             server_unix_socket: None,
@@ -199,6 +202,10 @@ impl AppConfig {
             }
         }
         // `PGRST_MAX_ROWS` is the name used in our own documentation;
+        if let Ok(v) = std::env::var("PGRST_DB_AGGREGATES_ENABLED") {
+            config.db_aggregates_enabled = matches!(v.to_ascii_lowercase().as_str(), "1" | "true");
+        }
+
         // `PGRST_DB_MAX_ROWS` mirrors PostgREST's `db-max-rows`. Accept both.
         for var in ["PGRST_DB_MAX_ROWS", "PGRST_MAX_ROWS"] {
             if let Ok(max_rows) = std::env::var(var) {

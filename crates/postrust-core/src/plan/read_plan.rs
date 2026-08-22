@@ -122,12 +122,39 @@ fn build_select_fields(items: &[SelectItem], table: &Table) -> Result<Vec<Coerci
                 cast,
                 alias,
             } => {
-                let column = table
-                    .get_column(&field.name)
-                    .ok_or_else(|| Error::ColumnNotFound(field.name.clone()))?;
+                // A bare `count` means COUNT(*) -- PostgREST's original
+                // spelling, still accepted and, unlike `count()`, not gated
+                // behind db-aggregates-enabled. A table that really has a
+                // column of that name wins, which is why this is decided here
+                // rather than in the parser.
+                let legacy_count = aggregate.is_none()
+                    && field.name == "count"
+                    && field.json_path.is_empty()
+                    && table.get_column("count").is_none();
+
+                // `count()` has no column behind it, so there is nothing to
+                // resolve and no type to carry.
+                let pg_type = if field.name.is_empty() || legacy_count {
+                    String::new()
+                } else {
+                    table
+                        .get_column(&field.name)
+                        .ok_or_else(|| Error::ColumnNotFound(field.name.clone()))?
+                        .data_type
+                        .clone()
+                };
+
+                let (field, aggregate) = if legacy_count {
+                    (
+                        &crate::api_request::Field::simple(""),
+                        &Some(crate::api_request::AggregateFunction::Count),
+                    )
+                } else {
+                    (field, aggregate)
+                };
 
                 fields.push(CoercibleSelectField {
-                    field: CoercibleField::from_field(field, &column.data_type),
+                    field: CoercibleField::from_field(field, &pg_type),
                     aggregate: aggregate.clone(),
                     aggregate_cast: aggregate_cast.clone(),
                     cast: cast.clone(),

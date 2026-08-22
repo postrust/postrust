@@ -17,6 +17,14 @@ pub enum Error {
     #[error("Invalid path: {0}")]
     InvalidPath(String),
 
+    /// An aggregate was requested while `db-aggregates-enabled` is off.
+    ///
+    /// Off is the default, matching PostgREST: an unrestricted aggregate over
+    /// a large table is an easy way to make a server do far more work than the
+    /// request looks like it asks for.
+    #[error("Use of aggregate functions is not allowed")]
+    AggregatesNotAllowed,
+
     #[error("Invalid query parameter: {0}")]
     InvalidQueryParam(String),
 
@@ -132,7 +140,8 @@ impl Error {
             | Self::AmbiguousRequest(_)
             | Self::UnknownColumn(_)
             | Self::InvalidPlan(_)
-            | Self::EmbeddingError(_) => StatusCode::BAD_REQUEST,
+            | Self::EmbeddingError(_)
+            | Self::AggregatesNotAllowed => StatusCode::BAD_REQUEST,
 
             // 401 Unauthorized
             Self::InvalidJwt(_) | Self::JwtExpired | Self::MissingAuth => StatusCode::UNAUTHORIZED,
@@ -169,6 +178,7 @@ impl Error {
     pub fn code(&self) -> &'static str {
         match self {
             Self::InvalidPath(_) => "PGRST100",
+            Self::AggregatesNotAllowed => "PGRST123",
             Self::InvalidQueryParam(_) => "PGRST101",
             Self::InvalidHeader(_) => "PGRST102",
             Self::InvalidBody(_) => "PGRST103",

@@ -43,8 +43,13 @@ where
     // Parse action from method and resource
     let action = parse_action(method, &resource, &schema)?;
 
-    // Parse query parameters
-    let query_params = parse_query_params(query)?;
+    // Parse query parameters. On a function the unrecognized ones are
+    // arguments rather than malformed filters.
+    let is_rpc = matches!(
+        action,
+        Action::Db(DbAction::Routine { .. }) | Action::RoutineInfo { .. }
+    );
+    let query_params = parse_query_params(query, is_rpc)?;
 
     // Parse preferences from Prefer header
     let preferences = parse_preferences(req.headers())?;

@@ -5,7 +5,11 @@ use postrust_core::ApiRequest;
 use std::fmt;
 
 /// Content-Range header value.
-#[derive(Clone, Debug)]
+///
+/// Rendered exactly as PostgREST's `contentRangeH`: no unit prefix, `*` for an
+/// unknown total, and `*` in place of the range itself when the response is
+/// empty. See `RangeQuery.hs` in the PostgREST source.
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ContentRange {
     /// Start of range (0-based)
     pub start: i64,
@@ -13,42 +17,55 @@ pub struct ContentRange {
     pub end: i64,
     /// Total count (or None if unknown)
     pub total: Option<i64>,
-    /// Unit name
-    pub unit: String,
 }
 
 impl ContentRange {
     /// Create a new content range.
     pub fn new(start: i64, end: i64, total: Option<i64>) -> Self {
-        Self {
-            start,
-            end,
-            total,
-            unit: "items".to_string(),
-        }
+        Self { start, end, total }
     }
 
-    /// Create from offset, limit, and total.
-    pub fn from_pagination(
-        offset: i64,
-        limit: Option<i64>,
-        count: i64,
-        total: Option<i64>,
-    ) -> Self {
-        let end = match limit {
-            Some(l) => (offset + l - 1).min(offset + count - 1).max(offset),
-            None => offset + count - 1,
-        };
+    /// Build the range for a response that returned `count` rows starting at
+    /// `offset`.
+    ///
+    /// `count` is what the query actually returned, so any limit has already
+    /// been applied; an empty result yields `end < start`, which renders as
+    /// `*` rather than a zero-length range.
+    pub fn from_pagination(offset: i64, count: i64, total: Option<i64>) -> Self {
+        Self::new(offset, offset + count - 1, total)
+    }
 
-        Self::new(offset, end, total)
+    /// The HTTP status this range implies, following PostgREST's `rangeStatus`.
+    ///
+    /// Without a total there is nothing to be partial about, so the answer is
+    /// always 200.
+    pub fn status(&self) -> http::StatusCode {
+        match self.total {
+            None => http::StatusCode::OK,
+            Some(total) => {
+                if self.start > total {
+                    http::StatusCode::RANGE_NOT_SATISFIABLE
+                } else if (1 + self.end - self.start) < total {
+                    http::StatusCode::PARTIAL_CONTENT
+                } else {
+                    http::StatusCode::OK
+                }
+            }
+        }
     }
 }
 
 impl fmt::Display for ContentRange {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // An empty result, or a known-zero total, reports `*` for the range.
+        if self.total == Some(0) || self.start > self.end {
+            write!(f, "*")?;
+        } else {
+            write!(f, "{}-{}", self.start, self.end)?;
+        }
         match self.total {
-            Some(total) => write!(f, "{} {}-{}/{}", self.unit, self.start, self.end, total),
-            None => write!(f, "{} {}-{}/*", self.unit, self.start, self.end),
+            Some(total) => write!(f, "/{total}"),
+            None => write!(f, "/*"),
         }
     }
 }
@@ -124,24 +141,54 @@ mod tests {
 
     #[test]
     fn test_content_range_display() {
-        let range = ContentRange::new(0, 9, Some(100));
-        assert_eq!(range.to_string(), "items 0-9/100");
+        // No unit prefix, and `*` stands in for an unknown total.
+        assert_eq!(ContentRange::new(0, 9, Some(100)).to_string(), "0-9/100");
+        assert_eq!(ContentRange::new(10, 19, None).to_string(), "10-19/*");
+    }
 
-        let range = ContentRange::new(10, 19, None);
-        assert_eq!(range.to_string(), "items 10-19/*");
+    #[test]
+    fn test_content_range_display_empty() {
+        // An empty result reports `*` for the range, not a zero-length one.
+        assert_eq!(ContentRange::from_pagination(0, 0, None).to_string(), "*/*");
+        assert_eq!(
+            ContentRange::from_pagination(0, 0, Some(0)).to_string(),
+            "*/0"
+        );
     }
 
     #[test]
     fn test_content_range_from_pagination() {
-        // First page of 10
-        let range = ContentRange::from_pagination(0, Some(10), 10, Some(100));
-        assert_eq!(range.start, 0);
-        assert_eq!(range.end, 9);
+        // A full page: `count` is what came back, so the limit is already applied.
+        let range = ContentRange::from_pagination(0, 10, Some(100));
+        assert_eq!((range.start, range.end), (0, 9));
 
-        // Partial last page
-        let range = ContentRange::from_pagination(90, Some(10), 5, Some(95));
-        assert_eq!(range.start, 90);
-        assert_eq!(range.end, 94);
+        // Partial last page.
+        let range = ContentRange::from_pagination(90, 5, Some(95));
+        assert_eq!((range.start, range.end), (90, 94));
+    }
+
+    #[test]
+    fn test_content_range_status() {
+        // Without a total there is nothing to be partial about.
+        assert_eq!(
+            ContentRange::from_pagination(0, 10, None).status(),
+            http::StatusCode::OK
+        );
+        // A window narrower than the total is partial content.
+        assert_eq!(
+            ContentRange::from_pagination(0, 10, Some(100)).status(),
+            http::StatusCode::PARTIAL_CONTENT
+        );
+        // The whole set is a plain 200.
+        assert_eq!(
+            ContentRange::from_pagination(0, 15, Some(15)).status(),
+            http::StatusCode::OK
+        );
+        // Asking past the end is not satisfiable.
+        assert_eq!(
+            ContentRange::from_pagination(50, 0, Some(15)).status(),
+            http::StatusCode::RANGE_NOT_SATISFIABLE
+        );
     }
 
     #[test]

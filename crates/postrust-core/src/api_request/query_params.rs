@@ -17,7 +17,15 @@ use nom::{
 use percent_encoding::percent_decode_str;
 
 /// Parse a query string into QueryParams.
-pub fn parse_query_params(query: &str) -> Result<QueryParams> {
+///
+/// `is_rpc` changes what an unrecognized key means. On a table, `a=2` is a
+/// malformed filter and an error, because a filter value must carry an
+/// operator. On a function, it is an argument -- so every such key is also
+/// recorded as a candidate argument, and one that fails to parse as a filter
+/// is no longer fatal. Which candidates are really arguments is settled at
+/// plan time, against the parameters the routine actually declares; a
+/// well-formed filter such as `id=eq.1` stays available to filter the result.
+pub fn parse_query_params(query: &str, is_rpc: bool) -> Result<QueryParams> {
     let mut params = QueryParams::default();
 
     if query.is_empty() {
@@ -44,6 +52,15 @@ pub fn parse_query_params(query: &str) -> Result<QueryParams> {
             .decode_utf8()
             .map_err(|_| Error::InvalidQueryParam(key.into()))?
             .to_string();
+
+        // The key is decoded as well as the value. A filter on a JSON path
+        // arrives as `data-%3E%3Eb` from any client that escapes `>`, and
+        // would otherwise be looked up as a column of that literal name.
+        let decoded_key = percent_decode_str(key)
+            .decode_utf8()
+            .map_err(|_| Error::InvalidQueryParam(key.into()))?
+            .to_string();
+        let key: &str = &decoded_key;
 
         match key {
             "select" => {
@@ -86,8 +103,20 @@ pub fn parse_query_params(query: &str) -> Result<QueryParams> {
                 params.logic.push((vec![], logic));
             }
             key if !key.starts_with('_') => {
+                if is_rpc {
+                    params.params.push((key.to_string(), decoded_value.clone()));
+                }
+
                 // Filter parameter
-                let (path, filter) = parse_filter_param(key, &decoded_value)?;
+                let parsed = parse_filter_param(key, &decoded_value);
+                let (path, filter) = match parsed {
+                    Ok(parsed) => parsed,
+                    // On a function, a key that isn't a filter is just an
+                    // argument, which was recorded above.
+                    Err(_) if is_rpc => continue,
+                    Err(e) => return Err(e),
+                };
+
                 if path.is_empty() {
                     params.filter_fields.insert(filter.field.name.clone());
                     params.filters_root.push(filter);
@@ -127,24 +156,63 @@ fn parse_select_items(input: &str) -> IResult<&str, Vec<SelectItem>> {
 
 fn parse_select_item(input: &str) -> IResult<&str, SelectItem> {
     alt((
+        // Before relations: `count()` is spelled exactly like an embed of a
+        // relation named `count` with an empty selection.
+        parse_bare_aggregate,
         parse_spread_relation,
         parse_relation_select,
         parse_field_select,
     ))(input)
 }
 
+/// Parse a field-less aggregate: `count()`, `cnt:count()`, `count()::text`.
+///
+/// Only `count` is meaningful without a field -- the others have nothing to
+/// sum -- which is also what keeps this from swallowing embeds.
+fn parse_bare_aggregate(input: &str) -> IResult<&str, SelectItem> {
+    let (input, alias) = opt(parse_alias_prefix)(input)?;
+    let (input, _) = tag("count()")(input)?;
+    let (input, cast) = opt(preceded(tag("::"), parse_identifier))(input)?;
+
+    Ok((
+        input,
+        SelectItem::Field {
+            // An empty name marks the `COUNT(*)` form: there is no column to
+            // resolve, and nothing to group by.
+            field: Field::simple(""),
+            aggregate: Some(AggregateFunction::Count),
+            aggregate_cast: cast.map(|s| s.to_string()),
+            cast: None,
+            alias: alias.map(|s| s.to_string()),
+        },
+    ))
+}
+
+/// Parse an aggregate applied to a field: the `.sum()` of `amount.sum()`.
+fn parse_aggregate_suffix(input: &str) -> IResult<&str, AggregateFunction> {
+    let (input, _) = char('.')(input)?;
+    let (input, function) = alt((
+        value(AggregateFunction::Sum, tag("sum")),
+        value(AggregateFunction::Avg, tag("avg")),
+        value(AggregateFunction::Max, tag("max")),
+        value(AggregateFunction::Min, tag("min")),
+        value(AggregateFunction::Count, tag("count")),
+    ))(input)?;
+    let (input, _) = tag("()")(input)?;
+    Ok((input, function))
+}
+
 /// Parse spread relation: `...relation`
 fn parse_spread_relation(input: &str) -> IResult<&str, SelectItem> {
     let (input, _) = tag("...")(input)?;
     let (input, relation) = parse_identifier(input)?;
-    let (input, hint) = opt(preceded(char('!'), parse_identifier))(input)?;
-    let (input, join_type) = opt(preceded(char('!'), parse_join_type))(input)?;
+    let (input, (hint, join_type)) = parse_relation_modifiers(input)?;
 
     Ok((
         input,
         SelectItem::SpreadRelation {
             relation: relation.to_string(),
-            hint: hint.map(|s| s.to_string()),
+            hint,
             join_type,
         },
     ))
@@ -190,10 +258,10 @@ fn parse_nested_select(input: &str) -> IResult<&str, Vec<SelectItem>> {
 
 /// Parse relation with embedded select: `relation(select_items)`
 fn parse_relation_select(input: &str) -> IResult<&str, SelectItem> {
+    // As with fields, the alias precedes what it names: `c:clients(*)`.
+    let (input, alias) = opt(parse_alias_prefix)(input)?;
     let (input, name) = parse_identifier(input)?;
-    let (input, alias) = opt(preceded(char(':'), parse_identifier))(input)?;
-    let (input, hint) = opt(preceded(char('!'), parse_identifier))(input)?;
-    let (input, join_type) = opt(preceded(char('!'), parse_join_type))(input)?;
+    let (input, (hint, join_type)) = parse_relation_modifiers(input)?;
     // The nested selection is parsed rather than skipped: it says which
     // columns of the related resource to return, and may embed further
     // relations of its own.
@@ -206,7 +274,7 @@ fn parse_relation_select(input: &str) -> IResult<&str, SelectItem> {
         SelectItem::Relation {
             relation: name.to_string(),
             alias: alias.map(|s| s.to_string()),
-            hint: hint.map(|s| s.to_string()),
+            hint,
             join_type,
             select: nested,
         },
@@ -215,28 +283,24 @@ fn parse_relation_select(input: &str) -> IResult<&str, SelectItem> {
 
 /// Parse field select: `field`, `field::cast`, `field:alias`, `agg(field)`
 fn parse_field_select(input: &str) -> IResult<&str, SelectItem> {
-    // Check for aggregate function
-    let (input, aggregate) = opt(parse_aggregate_prefix)(input)?;
+    // `alias:expression` -- the alias comes first, as in `myId:id` or
+    // `total:sum(amount)`. Only a name immediately followed by `:` is one;
+    // anything else backtracks and is read as the expression itself.
+    let (input, alias) = opt(parse_alias_prefix)(input)?;
 
     let (input, name) = parse_identifier(input)?;
     let (input, json_path) = parse_json_path(input)?;
 
-    // Close aggregate if present
+    // A cast on the column binds before the aggregate: `key::integer.sum()`
+    // sums integers, where `.sum()::text` renders the sum as text.
+    let (input, cast) = opt(preceded(tag("::"), parse_identifier))(input)?;
+    let (input, aggregate) = opt(parse_aggregate_suffix)(input)?;
     let (input, aggregate_cast) = if aggregate.is_some() {
-        let (input, _) = char(')')(input)?;
         let (input, cast) = opt(preceded(tag("::"), parse_identifier))(input)?;
         (input, cast.map(|s| s.to_string()))
     } else {
         (input, None)
     };
-
-    let (input, cast) = if aggregate.is_none() {
-        opt(preceded(tag("::"), parse_identifier))(input)?
-    } else {
-        (input, None)
-    };
-
-    let (input, alias) = opt(preceded(char(':'), parse_identifier))(input)?;
 
     Ok((
         input,
@@ -253,21 +317,47 @@ fn parse_field_select(input: &str) -> IResult<&str, SelectItem> {
     ))
 }
 
-fn parse_aggregate_prefix(input: &str) -> IResult<&str, AggregateFunction> {
-    alt((
-        value(AggregateFunction::Sum, tag("sum(")),
-        value(AggregateFunction::Avg, tag("avg(")),
-        value(AggregateFunction::Max, tag("max(")),
-        value(AggregateFunction::Min, tag("min(")),
-        value(AggregateFunction::Count, tag("count(")),
-    ))(input)
+/// Parse the `!`-prefixed modifiers on an embedded relation.
+///
+/// A relation may carry a disambiguating hint, a join type, or both, in either
+/// order: `books!author(*)`, `books!inner(*)`, `books!author!inner(*)`. They
+/// cannot be told apart by position, only by spelling -- `inner` and `left`
+/// are join types and anything else names a foreign key or table -- so each
+/// modifier is read in turn and classified.
+/// An `alias:` prefix, distinguished from the `::` of a cast.
+///
+/// `myId:id` names the column; `id::text` casts it. Both start with an
+/// identifier followed by a colon, so the second colon is what tells them
+/// apart -- without this check `id::text` would be read as an alias `id`
+/// applied to nothing.
+fn parse_alias_prefix(input: &str) -> IResult<&str, &str> {
+    let (rest, name) = parse_identifier(input)?;
+    let (rest, _) = char(':')(rest)?;
+
+    if rest.starts_with(':') {
+        return Err(nom::Err::Error(nom::error::Error::new(
+            input,
+            nom::error::ErrorKind::Verify,
+        )));
+    }
+
+    Ok((rest, name))
 }
 
-fn parse_join_type(input: &str) -> IResult<&str, JoinType> {
-    alt((
-        value(JoinType::Inner, tag("inner")),
-        value(JoinType::Left, tag("left")),
-    ))(input)
+fn parse_relation_modifiers(input: &str) -> IResult<&str, (Option<String>, Option<JoinType>)> {
+    let (input, modifiers) = many0(preceded(char('!'), parse_identifier))(input)?;
+
+    let mut hint = None;
+    let mut join_type = None;
+    for modifier in modifiers {
+        match modifier {
+            "inner" => join_type = Some(JoinType::Inner),
+            "left" => join_type = Some(JoinType::Left),
+            other => hint = Some(other.to_string()),
+        }
+    }
+
+    Ok((input, (hint, join_type)))
 }
 
 // ============================================================================
@@ -282,8 +372,26 @@ fn parse_filter_param(key: &str, value: &str) -> Result<(EmbedPath, Filter)> {
     // Parse the value for operator and operand
     let op_expr = parse_filter_value(value)?;
 
-    let filter = Filter::new(Field::simple(field_name), op_expr);
+    let filter = Filter::new(split_json_path(&field_name), op_expr);
     Ok((path, filter))
+}
+
+/// Split a reference like `data->a->>b` into its column and JSON path.
+///
+/// A name with no arrows is returned unchanged, so this is safe to apply to
+/// every field reference. A trailing fragment that does not parse as a path is
+/// left attached to the column name rather than silently dropped -- the column
+/// then fails to resolve, which is the honest outcome.
+fn split_json_path(reference: &str) -> Field {
+    let Some(arrow) = reference.find("->") else {
+        return Field::simple(reference);
+    };
+
+    let (column, rest) = reference.split_at(arrow);
+    match parse_json_path(rest) {
+        Ok(("", json_path)) if !json_path.is_empty() => Field::with_json_path(column, json_path),
+        _ => Field::simple(reference),
+    }
 }
 
 /// Parse a filter key into path and field name.
@@ -534,6 +642,7 @@ fn parse_order_term(value: &str) -> Result<OrderTerm> {
     }
 
     let field_name = parts[0];
+    let field = split_json_path(field_name);
     let mut direction = None;
     let mut nulls = None;
 
@@ -548,7 +657,7 @@ fn parse_order_term(value: &str) -> Result<OrderTerm> {
     }
 
     Ok(OrderTerm::Field {
-        field: Field::simple(field_name),
+        field,
         direction,
         nulls,
     })
@@ -626,20 +735,20 @@ mod tests {
 
     #[test]
     fn test_parse_simple_filter() {
-        let params = parse_query_params("name=eq.John").unwrap();
+        let params = parse_query_params("name=eq.John", false).unwrap();
         assert_eq!(params.filters_root.len(), 1);
         assert_eq!(params.filters_root[0].field.name, "name");
     }
 
     #[test]
     fn test_parse_negated_filter() {
-        let params = parse_query_params("status=not.eq.active").unwrap();
+        let params = parse_query_params("status=not.eq.active", false).unwrap();
         assert!(params.filters_root[0].op_expr.negated);
     }
 
     #[test]
     fn test_parse_in_filter() {
-        let params = parse_query_params("id=in.(1,2,3)").unwrap();
+        let params = parse_query_params("id=in.(1,2,3)", false).unwrap();
         match &params.filters_root[0].op_expr.operation {
             Operation::In(values) => {
                 assert_eq!(values, &vec!["1", "2", "3"]);
@@ -650,7 +759,7 @@ mod tests {
 
     #[test]
     fn test_parse_is_null() {
-        let params = parse_query_params("deleted_at=is.null").unwrap();
+        let params = parse_query_params("deleted_at=is.null", false).unwrap();
         match &params.filters_root[0].op_expr.operation {
             Operation::Is(IsValue::Null) => {}
             _ => panic!("Expected Is Null"),
@@ -659,7 +768,7 @@ mod tests {
 
     #[test]
     fn test_parse_order() {
-        let params = parse_query_params("order=name.asc,age.desc.nullslast").unwrap();
+        let params = parse_query_params("order=name.asc,age.desc.nullslast", false).unwrap();
         assert_eq!(params.order.len(), 1);
         let (_, terms) = &params.order[0];
         assert_eq!(terms.len(), 2);
@@ -667,7 +776,7 @@ mod tests {
 
     #[test]
     fn test_parse_limit_offset() {
-        let params = parse_query_params("limit=10&offset=20").unwrap();
+        let params = parse_query_params("limit=10&offset=20", false).unwrap();
         let range = params.ranges.get("").unwrap();
         assert_eq!(range.limit, Some(10));
         assert_eq!(range.offset, 20);
@@ -681,7 +790,7 @@ mod tests {
 
     #[test]
     fn test_parse_fts() {
-        let params = parse_query_params("content=fts(english).search+term").unwrap();
+        let params = parse_query_params("content=fts(english).search+term", false).unwrap();
         match &params.filters_root[0].op_expr.operation {
             Operation::Fts {
                 op,

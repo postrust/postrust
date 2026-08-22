@@ -198,6 +198,7 @@ impl EmbedPlan {
         child_alias: &str,
         inner_select: &str,
         limit: Option<i64>,
+        child_where: Option<&str>,
     ) -> Result<String> {
         // The child table is aliased rather than referred to by name. A
         // self-referential relationship would otherwise make the correlation
@@ -213,6 +214,14 @@ impl EmbedPlan {
             postrust_sql::escape_ident(parent_alias),
             postrust_sql::escape_ident(&self.local_column),
         );
+
+        // Filters written against the embedded resource (`clients.id=eq.1`)
+        // narrow the children, exactly as they would if the child had been
+        // requested on its own.
+        if let Some(child_where) = child_where {
+            inner.push_str(" AND ");
+            inner.push_str(child_where);
+        }
 
         // A to-one relationship takes the first row; a to-many takes them all.
         // The limit bounds rows per parent here, which is what a client asking
@@ -241,6 +250,40 @@ impl EmbedPlan {
                 inner = inner
             )
         })
+    }
+
+    /// An `EXISTS` predicate restricting parents to those with a matching child.
+    ///
+    /// This is what `!inner` means. The embed expression on its own only
+    /// decides what the relationship column contains; without this the parent
+    /// row survives even when the relationship matched nothing, which is a
+    /// left join. `child_where` should be the same predicate given to
+    /// [`Self::embed_expression`] -- placeholders may be referenced from both
+    /// places, so no parameter needs binding twice.
+    pub fn inner_join_predicate(
+        &self,
+        parent_alias: &str,
+        child_alias: &str,
+        child_where: Option<&str>,
+    ) -> String {
+        let mut predicate = format!(
+            "EXISTS (SELECT 1 FROM {}.{} AS {} WHERE {}.{} = {}.{}",
+            postrust_sql::escape_ident(&self.foreign_schema),
+            postrust_sql::escape_ident(&self.foreign_table),
+            postrust_sql::escape_ident(child_alias),
+            postrust_sql::escape_ident(child_alias),
+            postrust_sql::escape_ident(&self.foreign_column),
+            postrust_sql::escape_ident(parent_alias),
+            postrust_sql::escape_ident(&self.local_column),
+        );
+
+        if let Some(child_where) = child_where {
+            predicate.push_str(" AND ");
+            predicate.push_str(child_where);
+        }
+
+        predicate.push(')');
+        predicate
     }
 
     /// The child projection list: the requested columns plus the join column.
@@ -416,7 +459,7 @@ mod tests {
     #[test]
     fn embed_expression_aggregates_a_to_many_relation() {
         let sql = plan(true)
-            .embed_expression("p", "posts", r#""id", "title""#, None)
+            .embed_expression("p", "posts", r#""id", "title""#, None, None)
             .unwrap();
 
         assert!(sql.starts_with("COALESCE((SELECT json_agg("), "{}", sql);
@@ -436,7 +479,7 @@ mod tests {
     #[test]
     fn embed_expression_takes_one_row_for_a_to_one_relation() {
         let sql = plan(false)
-            .embed_expression("p", "author", r#""id""#, None)
+            .embed_expression("p", "author", r#""id""#, None, None)
             .unwrap();
 
         assert!(sql.contains("row_to_json"), "{}", sql);
@@ -451,7 +494,7 @@ mod tests {
     #[test]
     fn embed_expression_limits_rows_per_parent() {
         let sql = plan(true)
-            .embed_expression("p", "posts", r#""id""#, Some(25))
+            .embed_expression("p", "posts", r#""id""#, Some(25), None)
             .unwrap();
         assert!(sql.contains("LIMIT 25"), "{}", sql);
     }

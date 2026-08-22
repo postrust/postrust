@@ -48,6 +48,15 @@ impl QueryBuilder {
             builder = builder.where_raw(expr);
         }
 
+        // GROUP BY. Selecting an aggregate alongside plain columns means one
+        // row per distinct combination of those columns, so every one of them
+        // has to be grouped -- PostgreSQL rejects the query otherwise.
+        if plan.select.iter().any(|f| f.aggregate.is_some()) {
+            for field in plan.select.iter().filter(|f| f.aggregate.is_none()) {
+                builder = builder.group_by(&field.field.name);
+            }
+        }
+
         // ORDER BY
         for term in &plan.order {
             let order = Self::build_order_term(term);
@@ -75,22 +84,71 @@ impl QueryBuilder {
             frag.push("(");
         }
 
-        // Column name with JSON path
-        frag.push(&escape_ident(&field.field.name));
+        // `count()` counts rows rather than a column's non-null values.
+        if field.aggregate.is_some() && field.field.name.is_empty() {
+            frag.push("*)");
+            if let Some(cast) = &field.aggregate_cast {
+                frag.push("::");
+                frag.push(cast);
+            }
+            frag.push(" AS ");
+            frag.push(&escape_ident(field.alias.as_deref().unwrap_or("count")));
+            return Ok(frag);
+        }
 
-        // Close aggregate
-        if field.aggregate.is_some() {
+        // Column name with JSON path.
+        //
+        // `::` binds tighter than `->>`, so a cast over a JSON path has to be
+        // parenthesised: `settings ->> 'foo'::json` would cast the *key*
+        // rather than the extracted value.
+        let needs_parens = field.cast.is_some() && !field.field.json_path.is_empty();
+        if needs_parens {
+            frag.push("(");
+        }
+        frag.push(&escape_ident(&field.field.name));
+        push_json_path(&mut frag, &field.field.json_path);
+        if needs_parens {
             frag.push(")");
         }
 
-        // Cast
+        // Cast on the column, inside the aggregate.
         if let Some(cast) = &field.cast {
             frag.push("::");
             frag.push(cast);
         }
 
+        // Close aggregate, then any cast applied to its result.
+        if let Some(agg) = &field.aggregate {
+            frag.push(")");
+            if let Some(cast) = &field.aggregate_cast {
+                frag.push("::");
+                frag.push(cast);
+            }
+            // An aggregate is an expression, so it needs a name. PostgREST
+            // uses the function's own, lowercased.
+            frag.push(" AS ");
+            frag.push(&escape_ident(
+                field
+                    .alias
+                    .as_deref()
+                    .unwrap_or(&agg.to_sql().to_lowercase()),
+            ));
+            return Ok(frag);
+        }
+
         // Alias
-        if let Some(alias) = &field.alias {
+        //
+        // A JSON path always needs one: `data -> 'a' ->> 'b'` is an expression,
+        // and PostgreSQL would label the column `?column?`. PostgREST names it
+        // after the last key in the path, falling back to the column itself
+        // when the path ends in an array index.
+        let implicit_alias = if field.alias.is_none() && !field.field.json_path.is_empty() {
+            Some(json_path_alias(&field.field.name, &field.field.json_path))
+        } else {
+            None
+        };
+
+        if let Some(alias) = field.alias.as_deref().or(implicit_alias.as_deref()) {
             frag.push(" AS ");
             frag.push(&escape_ident(alias));
         }
@@ -141,7 +199,18 @@ impl QueryBuilder {
         }
     }
 
-    /// Build a filter expression.
+    /// Build the SQL for a single filter against a column of `pg_type`.
+    ///
+    /// Exposed for the embedding path, which applies filters inside a child
+    /// subquery it assembles itself rather than through a full plan. Column
+    /// names are left unqualified: inside the child's subselect the innermost
+    /// `FROM` wins, so a bare name binds to the child. The caller is
+    /// responsible for having checked the column exists there -- otherwise the
+    /// name would resolve outward to the correlated parent instead.
+    pub fn filter_sql(filter: &crate::api_request::Filter, pg_type: &str) -> Result<SqlFragment> {
+        Self::build_filter(&CoercibleFilter::from_filter(filter, pg_type))
+    }
+
     fn build_filter(filter: &CoercibleFilter) -> Result<SqlFragment> {
         let mut frag = SqlFragment::new();
 
@@ -155,6 +224,7 @@ impl QueryBuilder {
 
         // Column name
         frag.push(&escape_ident(&filter.field.name));
+        push_json_path(&mut frag, &filter.field.json_path);
 
         // Filter values are always bound as text, so a comparison against a
         // non-text column needs an explicit cast on the placeholder -- without
@@ -187,6 +257,15 @@ impl QueryBuilder {
                 quantifier,
                 value,
             } => {
+                // PostgREST spells the LIKE wildcard `*` rather than `%`, and
+                // maps it unconditionally -- `*` is never a literal asterisk in
+                // a like/ilike operand. Other operators take the value as-is,
+                // so `match`/`imatch` regexes keep their own `*`.
+                let value = &match op {
+                    crate::api_request::QuantOperator::Like
+                    | crate::api_request::QuantOperator::ILike => value.replace('*', "%"),
+                    _ => value.clone(),
+                };
                 frag.push(" ");
                 frag.push(op.to_sql());
                 frag.push(" ");
@@ -255,7 +334,14 @@ impl QueryBuilder {
 
     /// Build an ORDER BY term.
     fn build_order_term(term: &CoercibleOrderTerm) -> OrderExpr {
-        let mut order = OrderExpr::new(&term.field.name);
+        let mut order = if term.field.json_path.is_empty() {
+            OrderExpr::new(&term.field.name)
+        } else {
+            let mut frag = SqlFragment::new();
+            frag.push(&escape_ident(&term.field.name));
+            push_json_path(&mut frag, &term.field.json_path);
+            OrderExpr::raw(frag.sql())
+        };
 
         if let Some(dir) = &term.direction {
             order = match dir {
@@ -296,16 +382,25 @@ impl QueryBuilder {
                 let col_names: Vec<String> = columns.iter().map(|c| c.name.clone()).collect();
                 builder = builder.columns(col_names);
 
-                // For bulk insert, we'd use json_populate_recordset
-                // For now, simplified single-row insert
                 if let Some(body_bytes) = body {
-                    // This would be expanded with proper JSON handling
                     let body_str = String::from_utf8_lossy(body_bytes);
+
+                    // `json_populate_recordset` only accepts an array, but a
+                    // single-row insert posts a bare object. Wrapping it here
+                    // keeps one code path for both shapes -- checking the
+                    // first token is enough, since the payload has already
+                    // been validated as JSON by this point.
+                    let rows = if body_str.trim_start().starts_with('{') {
+                        format!("[{body_str}]")
+                    } else {
+                        body_str.into_owned()
+                    };
+
                     let mut frag = SqlFragment::new();
                     frag.push("SELECT * FROM json_populate_recordset(NULL::");
                     frag.push(&from_qi(&qi));
                     frag.push(", ");
-                    frag.push_param(body_str.to_string());
+                    frag.push_param(rows);
                     frag.push("::json)");
                     return Ok(frag);
                 }
@@ -445,6 +540,18 @@ impl QueryBuilder {
         frag.push(&from_qi(&qi));
         frag.push("(");
 
+        // Arguments come off the wire as strings. Casting each one to the type
+        // the function actually declares is what lets PostgreSQL resolve the
+        // signature; binding everything as `text` only works for text-taking
+        // functions. An argument the schema cache doesn't know is left
+        // untyped, so PostgreSQL applies its own inference rather than failing.
+        let declared_type = |name: &str| {
+            plan.param_types
+                .iter()
+                .find(|(n, _)| n == name)
+                .map(|(_, t)| t.clone())
+        };
+
         match &plan.params {
             CallParams::Named(params) => {
                 for (i, (name, value)) in params.iter().enumerate() {
@@ -453,7 +560,12 @@ impl QueryBuilder {
                     }
                     frag.push(&escape_ident(name));
                     frag.push(" => ");
-                    frag.push_param(SqlParam::Text(value.clone()));
+                    match declared_type(name) {
+                        Some(pg_type) => {
+                            frag.push_typed_param(SqlParam::Text(value.clone()), &pg_type)
+                        }
+                        None => frag.push_param(SqlParam::Text(value.clone())),
+                    };
                 }
             }
             CallParams::Positional(values) => {
@@ -461,7 +573,12 @@ impl QueryBuilder {
                     if i > 0 {
                         frag.push(", ");
                     }
-                    frag.push_param(SqlParam::Text(value.clone()));
+                    match plan.param_types.get(i) {
+                        Some((_, pg_type)) => {
+                            frag.push_typed_param(SqlParam::Text(value.clone()), pg_type)
+                        }
+                        None => frag.push_param(SqlParam::Text(value.clone())),
+                    };
                 }
             }
             CallParams::SingleObject(body) => {
@@ -484,6 +601,53 @@ impl QueryBuilder {
 /// `character varying(255)`, or the `ARRAY`/`USER-DEFINED` placeholders that
 /// `information_schema` reports) yields `None` and the value is bound
 /// uncast, preserving the previous behaviour.
+/// Append a JSON path to a column reference: `"data" -> 'a' ->> 'b'`.
+///
+/// Keys are emitted as string literals and indices as bare integers, which is
+/// what distinguishes `data->'1'` from `data->1` in PostgreSQL. Operands reach
+/// us already restricted to alphanumerics and underscores by the parser; the
+/// quote doubling is belt-and-braces so this stays safe if that ever loosens.
+fn push_json_path(frag: &mut SqlFragment, path: &crate::api_request::JsonPath) {
+    use crate::api_request::{JsonOperand, JsonOperation};
+
+    for operation in path {
+        let (arrow, operand) = match operation {
+            JsonOperation::Arrow(operand) => ("->", operand),
+            JsonOperation::DoubleArrow(operand) => ("->>", operand),
+        };
+
+        frag.push(" ");
+        frag.push(arrow);
+        frag.push(" ");
+
+        match operand {
+            JsonOperand::Key(key) => {
+                frag.push(&format!("'{}'", key.replace('\'', "''")));
+            }
+            JsonOperand::Idx(index) => {
+                frag.push(&index.to_string());
+            }
+        }
+    }
+}
+
+/// The name PostgREST gives an unaliased JSON path expression.
+///
+/// The last key in the path wins -- `data->a->>b` is reported as `b`. A path
+/// that ends in an array index has no name to take, so it keeps the column's.
+fn json_path_alias(column: &str, path: &crate::api_request::JsonPath) -> String {
+    use crate::api_request::{JsonOperand, JsonOperation};
+
+    path.iter()
+        .rev()
+        .find_map(|operation| match operation {
+            JsonOperation::Arrow(JsonOperand::Key(key))
+            | JsonOperation::DoubleArrow(JsonOperand::Key(key)) => Some(key.clone()),
+            _ => None,
+        })
+        .unwrap_or_else(|| column.to_string())
+}
+
 fn castable_type(pg_type: &str) -> Option<&str> {
     if pg_type.is_empty() {
         return None;

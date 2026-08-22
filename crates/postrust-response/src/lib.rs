@@ -83,6 +83,15 @@ pub fn format_response(
         .cloned()
         .unwrap_or(MediaType::ApplicationJson);
 
+    // A mutation the caller wanted no representation from sends no body at
+    // all -- not an empty JSON array, which is what an empty row set would
+    // otherwise render as. The headers still apply.
+    if result.omit_body {
+        let mut response = Response::new(result.status, bytes::Bytes::new());
+        add_common_headers(&mut response, request, result);
+        return Ok(response);
+    }
+
     match &media_type {
         MediaType::ApplicationJson => {
             let body = if result.singular {
@@ -238,6 +247,12 @@ pub struct QueryResult {
     pub guc_headers: Option<String>,
     /// Custom status from GUC
     pub guc_status: Option<String>,
+    /// Whether to send no body at all.
+    ///
+    /// Set for a mutation the caller asked no representation from: the
+    /// response carries headers and a status but no payload, where an empty
+    /// row set would otherwise render as `[]`.
+    pub omit_body: bool,
     /// Whether the result should be rendered as a single (un-arrayed) value.
     ///
     /// Set for PostgREST-compatibility RPC responses where the underlying

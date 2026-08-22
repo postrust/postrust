@@ -89,6 +89,10 @@ async fn process_request(
     // way is removed from the response once the embed is attached.
     let added_join_columns = add_embed_join_columns(&mut api_request, &schema_cache)?;
 
+    if !state.config.db_aggregates_enabled && selects_an_aggregate(&api_request) {
+        return Err(postrust_core::Error::AggregatesNotAllowed);
+    }
+
     // Create execution plan
     let plan = create_action_plan(&api_request, &schema_cache)?;
 
@@ -141,7 +145,15 @@ async fn execute_plan(
             // Parent columns stay ordinary typed columns, so they are converted
             // to JSON by the same code as a request without embeds and a NUMERIC
             // or timestamp renders identically either way.
-            let embed_expressions = match read_target(api_request) {
+            let mut embed_filters = EmbedFilters {
+                filters: &api_request.query_params.filters,
+                params: Vec::new(),
+                base: params.len(),
+                max_rows: api_request.max_rows,
+                alias_counter: 0,
+            };
+
+            let embed_level = match read_target(api_request) {
                 Some(parent_qi)
                     if api_request.query_params.select.iter().any(|item| {
                         matches!(
@@ -151,28 +163,71 @@ async fn execute_plan(
                     }) =>
                 {
                     let schema_cache = state.schema_cache().await;
-                    let mut counter = 0;
                     build_embed_expressions(
                         &schema_cache,
                         &parent_qi,
                         "src",
                         &api_request.query_params.select,
-                        api_request.max_rows,
-                        &mut counter,
+                        &mut embed_filters,
+                        &[],
                     )?
                 }
-                _ => Vec::new(),
+                _ => EmbedLevel::default(),
             };
 
-            if !embed_expressions.is_empty() {
+            // Filter parameters are appended in the order the predicates were
+            // renumbered, so placeholder N in the wrapped SQL lines up with
+            // params[N - 1].
+            let mut params = params;
+            params.extend(embed_filters.params);
+
+            if !embed_level.expressions.is_empty() {
+                // `!inner` removes parent rows, so it has to be applied before
+                // the page is taken. Left where it is, the inner query's
+                // LIMIT would run first and the join would then trim an
+                // already-truncated page -- a request for one row could come
+                // back empty. So the inner query is rebuilt unpaged and the
+                // range moves out to the wrapper, after the join.
+                //
+                // Rebuilding is safe for parameter numbering: LIMIT and OFFSET
+                // render as literals, so dropping them leaves the placeholders
+                // and their count untouched.
+                let mut page = None;
+                if !embed_level.inner_joins.is_empty() {
+                    if let DbActionPlan::Read(tree) = db_plan {
+                        let mut unpaged = tree.clone();
+                        page = Some(std::mem::take(&mut unpaged.root.range));
+                        sql = postrust_core::query::build_query(
+                            &ActionPlan::Db(DbActionPlan::Read(unpaged)),
+                            Some(&auth.role),
+                        )?
+                        .build_main()
+                        .0;
+                    }
+                }
+
                 let mut projection = String::from("src.*");
-                for (field_name, expression) in &embed_expressions {
+                for (field_name, expression) in &embed_level.expressions {
                     projection.push_str(", ");
                     projection.push_str(expression);
                     projection.push_str(" AS ");
                     projection.push_str(&postrust_sql::escape_ident(field_name));
                 }
                 sql = format!("SELECT {} FROM ({}) AS src", projection, sql);
+
+                if !embed_level.inner_joins.is_empty() {
+                    sql.push_str(" WHERE ");
+                    sql.push_str(&embed_level.inner_joins.join(" AND "));
+                }
+
+                if let Some(range) = page {
+                    if let Some(limit) = range.limit {
+                        sql.push_str(&format!(" LIMIT {}", limit));
+                    }
+                    if range.offset > 0 {
+                        sql.push_str(&format!(" OFFSET {}", range.offset));
+                    }
+                }
             }
 
             debug!("Executing SQL: {}", sql);
@@ -255,7 +310,7 @@ async fn execute_plan(
             // list carried relations. This path remains for anything the
             // single-query form did not handle.
             if let Some(parent_qi) =
-                read_target(api_request).filter(|_| embed_expressions.is_empty())
+                read_target(api_request).filter(|_| embed_level.expressions.is_empty())
             {
                 let schema_cache = state.schema_cache().await;
                 embed_relations(
@@ -297,10 +352,28 @@ async fn execute_plan(
                 (json_rows, false)
             };
 
+            // A mutation returns the affected rows only when the caller asked
+            // for them; otherwise the body is empty whatever the status.
+            let omit_body = is_mutation(db_plan) && !wants_representation(api_request);
+            let rows = if omit_body { Vec::new() } else { json_rows };
+
+            // PostgREST reports the returned window on every successful data
+            // response -- reads, mutations and RPC alike, but not on errors or
+            // OPTIONS. Without an exact count the total is unknown, which
+            // renders as `*` and keeps the status at 200.
+            let content_range = postrust_response::ContentRange::from_pagination(
+                api_request.top_level_range.offset,
+                rows.len() as i64,
+                None,
+            );
+
             Ok(QueryResult {
-                status: StatusCode::OK,
-                rows: json_rows,
+                status: mutation_status(db_plan, api_request)
+                    .unwrap_or_else(|| content_range.status()),
+                rows,
                 singular,
+                omit_body,
+                content_range: Some(content_range),
                 ..Default::default()
             })
         }
@@ -391,6 +464,65 @@ fn read_target(
     }
 }
 
+/// Whether any part of the selection, at any depth, asks for an aggregate.
+fn selects_an_aggregate(api_request: &ApiRequest) -> bool {
+    use postrust_core::api_request::SelectItem;
+
+    fn walk(items: &[SelectItem]) -> bool {
+        items.iter().any(|item| match item {
+            SelectItem::Field { aggregate, .. } => aggregate.is_some(),
+            SelectItem::Relation { select, .. } => walk(select),
+            SelectItem::SpreadRelation { .. } => false,
+        })
+    }
+
+    walk(&api_request.query_params.select)
+}
+
+/// Whether this plan changes data.
+fn is_mutation(db_plan: &postrust_core::plan::DbActionPlan) -> bool {
+    matches!(
+        db_plan,
+        postrust_core::plan::DbActionPlan::MutateRead { .. }
+    )
+}
+
+/// Whether the caller asked for the affected rows back.
+fn wants_representation(api_request: &ApiRequest) -> bool {
+    matches!(
+        api_request.preferences.representation,
+        postrust_core::api_request::PreferRepresentation::Full
+    )
+}
+
+/// The status PostgREST gives a successful mutation, or `None` for anything
+/// that isn't one.
+///
+/// An insert reports 201 Created. An update or delete reports 204 No Content
+/// unless the caller asked for the rows back, in which case there is content
+/// to report and it is a plain 200.
+fn mutation_status(
+    db_plan: &postrust_core::plan::DbActionPlan,
+    api_request: &ApiRequest,
+) -> Option<StatusCode> {
+    use postrust_core::plan::{DbActionPlan, MutatePlan};
+
+    let DbActionPlan::MutateRead { mutate, .. } = db_plan else {
+        return None;
+    };
+
+    Some(match mutate {
+        MutatePlan::Insert { .. } => StatusCode::CREATED,
+        MutatePlan::Update { .. } | MutatePlan::Delete { .. } => {
+            if wants_representation(api_request) {
+                StatusCode::OK
+            } else {
+                StatusCode::NO_CONTENT
+            }
+        }
+    })
+}
+
 /// Ensure every embedded relation's join column is selected on the parent.
 ///
 /// Returns the columns that were added purely to make the join possible, so
@@ -457,23 +589,144 @@ fn add_embed_join_columns(
 /// `alias_counter` hands out a distinct alias per level, so a self-referential
 /// relationship stays unambiguous.
 #[allow(clippy::result_large_err)] // consistent with the crate's error type
+/// Filters addressed at embedded resources, and the parameters they bind.
+///
+/// The embed expressions are assembled as SQL text and wrapped around a main
+/// query that already owns `$1..$n`, so any placeholder introduced here has to
+/// be renumbered past that point and its value appended in the same order.
+struct EmbedFilters<'a> {
+    /// Every path-scoped filter on the request, e.g. `(["clients"], id=eq.1)`.
+    filters: &'a [(
+        postrust_core::api_request::EmbedPath,
+        postrust_core::api_request::Filter,
+    )],
+    /// Values bound by the predicates built so far, in placeholder order.
+    params: Vec<postrust_sql::SqlParam>,
+    /// How many parameters the main query already uses.
+    base: usize,
+    /// Row cap applied to each embedded resource.
+    max_rows: Option<i64>,
+    /// Source of unique subquery aliases across the whole embed tree.
+    alias_counter: usize,
+}
+
+/// Renumber the placeholders in `sql` so they start after `offset`.
+///
+/// Scans rather than string-replaces: a naive replacement of `$1` would also
+/// corrupt the `$1` inside `$10`.
+fn shift_placeholders(sql: &str, offset: usize) -> String {
+    let mut out = String::with_capacity(sql.len());
+    let mut chars = sql.char_indices().peekable();
+
+    while let Some((i, ch)) = chars.next() {
+        if ch != '$' {
+            out.push(ch);
+            continue;
+        }
+        let start = i + 1;
+        let mut end = start;
+        while let Some((j, d)) = chars.peek() {
+            if d.is_ascii_digit() {
+                end = j + d.len_utf8();
+                chars.next();
+            } else {
+                break;
+            }
+        }
+        match sql[start..end].parse::<usize>() {
+            Ok(n) => out.push_str(&format!("${}", n + offset)),
+            Err(_) => out.push('$'),
+        }
+    }
+
+    out
+}
+
+impl EmbedFilters<'_> {
+    /// A fresh alias, unique across the embed tree.
+    fn next_alias(&mut self) -> String {
+        self.alias_counter += 1;
+        format!("e{}", self.alias_counter)
+    }
+
+    /// The `WHERE` fragment for one embedded resource, or `None` if unfiltered.
+    #[allow(clippy::result_large_err)] // consistent with the crate's error type
+    fn predicate_for(
+        &mut self,
+        path: &[String],
+        child_qi: &postrust_core::api_request::QualifiedIdentifier,
+        schema_cache: &postrust_core::SchemaCache,
+    ) -> Result<Option<String>, postrust_core::Error> {
+        let matching: Vec<_> = self
+            .filters
+            .iter()
+            .filter(|(filter_path, _)| filter_path.as_slice() == path)
+            .map(|(_, filter)| filter.clone())
+            .collect();
+
+        if matching.is_empty() {
+            return Ok(None);
+        }
+
+        let table = schema_cache.get_table(child_qi);
+        let mut parts = Vec::with_capacity(matching.len());
+
+        for filter in &matching {
+            // Inside the child's subselect an unqualified name binds to the
+            // child, but only because the child has that column: an unknown
+            // name would resolve outward to the correlated parent and filter
+            // the wrong table silently. Refuse instead.
+            let column = table
+                .and_then(|t| t.columns.get(&filter.field.name))
+                .ok_or_else(|| {
+                    postrust_core::Error::ColumnNotFound(format!(
+                        "{}.{}",
+                        child_qi.name, filter.field.name
+                    ))
+                })?;
+
+            let frag =
+                postrust_core::query::QueryBuilder::filter_sql(filter, &column.nominal_type)?;
+            parts.push(shift_placeholders(
+                frag.sql(),
+                self.base + self.params.len(),
+            ));
+            self.params.extend(frag.params().iter().cloned());
+        }
+
+        Ok(Some(format!("({})", parts.join(" AND "))))
+    }
+}
+
+/// One level of the embed tree.
+#[derive(Default)]
+struct EmbedLevel {
+    /// `(response key, SQL expression)` for each relation at this level.
+    expressions: Vec<(String, String)>,
+    /// `EXISTS` predicates from `!inner` on these relations. They reference
+    /// the alias of the level *above*, so the caller applies them.
+    inner_joins: Vec<String>,
+}
+
+#[allow(clippy::result_large_err)] // consistent with the crate's error type
 fn build_embed_expressions(
     schema_cache: &postrust_core::SchemaCache,
     parent_qi: &postrust_core::api_request::QualifiedIdentifier,
     parent_alias: &str,
     select: &[postrust_core::api_request::SelectItem],
-    max_rows: Option<i64>,
-    alias_counter: &mut usize,
-) -> Result<Vec<(String, String)>, postrust_core::Error> {
+    ctx: &mut EmbedFilters<'_>,
+    path: &[String],
+) -> Result<EmbedLevel, postrust_core::Error> {
     use postrust_core::api_request::SelectItem;
 
-    let mut expressions = Vec::new();
+    let mut level = EmbedLevel::default();
 
     for item in select {
         let SelectItem::Relation {
             relation,
             alias,
-            select: nested,
+            select: child_select,
+            join_type,
             ..
         } = item
         else {
@@ -485,28 +738,63 @@ fn build_embed_expressions(
             .ok_or_else(|| postrust_core::Error::RelationshipNotFound(relation.clone()))?;
         let plan = postrust_core::embed::EmbedPlan::resolve(rel, schema_cache)?;
 
-        *alias_counter += 1;
-        let child_alias = format!("e{}", alias_counter);
+        let child_alias = ctx.next_alias();
         let child_qi = postrust_core::api_request::QualifiedIdentifier::new(
             &plan.foreign_schema,
             &plan.foreign_table,
         );
 
+        // Filters are addressed by the name the client used, which is the
+        // alias when there is one -- `c:clients(*)&c.id=eq.1`.
+        let mut child_path = path.to_vec();
+        child_path.push(alias.clone().unwrap_or_else(|| relation.clone()));
+        let child_where = ctx.predicate_for(&child_path, &child_qi, schema_cache)?;
+
         // Deeper relations first: they become part of this level's SELECT list.
-        let nested_expressions = build_embed_expressions(
+        let nested = build_embed_expressions(
             schema_cache,
             &child_qi,
             &child_alias,
-            nested,
-            max_rows,
-            alias_counter,
+            child_select,
+            ctx,
+            &child_path,
         )?;
+
+        // A nested `!inner` is written against this child's alias, which is
+        // only in scope inside this child's own subselect -- so it narrows the
+        // child here rather than travelling up to the top-level wrapper.
+        let child_where = match (child_where, nested.inner_joins.is_empty()) {
+            (existing, true) => existing,
+            (Some(existing), false) => Some(format!(
+                "{} AND {}",
+                existing,
+                nested.inner_joins.join(" AND ")
+            )),
+            (None, false) => Some(nested.inner_joins.join(" AND ")),
+        };
+
+        // `!inner` on this relation restricts the parent rows. It is emitted
+        // against `parent_alias`, so it belongs to the caller's level; reusing
+        // the same predicate string lets both places share placeholders.
+        // The child keeps the same alias it has in the embed subselect. The
+        // two are sibling scopes, never nested, so there is no collision --
+        // and any nested predicate folded into `child_where` already names
+        // that alias, so it has to be the one in scope here too.
+        if matches!(join_type, Some(postrust_core::api_request::JoinType::Inner)) {
+            level.inner_joins.push(plan.inner_join_predicate(
+                parent_alias,
+                &child_alias,
+                child_where.as_deref(),
+            ));
+        }
+
+        let nested_expressions = nested.expressions;
 
         // The child's own columns. Empty means every column, which is what a
         // relation with no explicit selection asks for.
         let mut parts: Vec<String> = Vec::new();
-        let mut project_everything = nested.is_empty();
-        for nested_item in nested {
+        let mut project_everything = child_select.is_empty();
+        for nested_item in child_select {
             match nested_item {
                 SelectItem::Field { field, alias, .. } => {
                     let column = postrust_sql::escape_ident(&field.name);
@@ -537,16 +825,21 @@ fn build_embed_expressions(
         }
 
         let inner_select = parts.join(", ");
-        let expression =
-            plan.embed_expression(parent_alias, &child_alias, &inner_select, max_rows)?;
+        let expression = plan.embed_expression(
+            parent_alias,
+            &child_alias,
+            &inner_select,
+            ctx.max_rows,
+            child_where.as_deref(),
+        )?;
 
-        expressions.push((
+        level.expressions.push((
             alias.clone().unwrap_or_else(|| relation.clone()),
             expression,
         ));
     }
 
-    Ok(expressions)
+    Ok(level)
 }
 
 type EmbedFuture<'f> = std::pin::Pin<
@@ -871,6 +1164,10 @@ fn sanitize_error_message(error: &postrust_core::Error) -> &'static str {
         Error::InvalidJwt(_) | Error::JwtExpired | Error::MissingAuth => "Unauthorized",
         Error::InsufficientPermissions(_) => "Forbidden",
         Error::UnacceptableSchema(_) => "Invalid schema",
+        // A fixed policy message that reveals nothing about the request or the
+        // schema, so it is passed through verbatim -- and it is what PostgREST
+        // says, which is what a client branching on it will be matching.
+        Error::AggregatesNotAllowed => "Use of aggregate functions is not allowed",
         Error::InvalidHeader(_) | Error::InvalidQueryParam(_) => "Invalid request",
         Error::Database(_) => "Database error",
         Error::ConnectionPool(_) => "Service temporarily unavailable",
@@ -894,6 +1191,7 @@ mod tests {
             returns_set,
             returns_composite: false,
             volatility: "Volatile".into(),
+            param_types: Vec::new(),
         }
     }
 

@@ -22,6 +22,15 @@ pub struct CallPlan {
     pub returns_composite: bool,
     /// Function volatility (for transaction handling)
     pub volatility: String,
+    /// Declared parameter types, in the routine's own order, as
+    /// `(name, pg_type)`.
+    ///
+    /// Arguments arrive from the URL or a JSON body as strings. Binding them
+    /// as `text` leaves PostgreSQL unable to resolve any signature that isn't
+    /// text -- `add_them(a => text, b => text) does not exist` -- so each one
+    /// is cast to its declared type at call time.
+    #[serde(default)]
+    pub param_types: Vec<(String, String)>,
 }
 
 /// How parameters are passed to the function.
@@ -58,6 +67,11 @@ impl CallPlan {
             returns_set: routine.return_type.is_set_returning(),
             returns_composite: routine.returns_composite,
             volatility: format!("{:?}", routine.volatility),
+            param_types: routine
+                .params
+                .iter()
+                .map(|p| (p.name.clone(), p.param_type.clone()))
+                .collect(),
         })
     }
 
@@ -68,7 +82,7 @@ impl CallPlan {
 }
 
 /// Extract call parameters from request.
-fn extract_call_params(request: &ApiRequest, _routine: &Routine) -> Result<CallParams> {
+fn extract_call_params(request: &ApiRequest, routine: &Routine) -> Result<CallParams> {
     // Check for JSON body first
     if let Some(payload) = &request.payload {
         match payload {
@@ -114,9 +128,21 @@ fn extract_call_params(request: &ApiRequest, _routine: &Routine) -> Result<CallP
         }
     }
 
-    // Fall back to query parameters
+    // Fall back to query parameters. Only those naming a declared parameter
+    // are arguments -- the rest are filters on the function's result, which
+    // is how `/rpc/getallprojects?id=eq.1` filters rather than failing.
     if !request.query_params.params.is_empty() {
-        return Ok(CallParams::Named(request.query_params.params.clone()));
+        let args: Vec<(String, String)> = request
+            .query_params
+            .params
+            .iter()
+            .filter(|(name, _)| routine.params.iter().any(|p| &p.name == name))
+            .cloned()
+            .collect();
+
+        if !args.is_empty() {
+            return Ok(CallParams::Named(args));
+        }
     }
 
     // No parameters
