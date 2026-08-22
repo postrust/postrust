@@ -34,6 +34,11 @@ pub struct EmbedPlan {
     pub foreign_table: String,
     /// Whether the relationship yields many rows per parent.
     pub is_list: bool,
+    /// The junction of a many-to-many relationship, if that is what this is.
+    ///
+    /// The parent and the child share no key; each points at a table that
+    /// exists to join them, so reaching the child means going through it.
+    pub junction: Option<EmbedJunction>,
     /// The function behind a computed relationship, if that is what this is.
     ///
     /// A computed relationship is a function taking the parent row and
@@ -41,6 +46,17 @@ pub struct EmbedPlan {
     /// parent row is the argument -- so the columns above are empty and the
     /// relationship can only be expressed as a call correlated to the parent.
     pub function: Option<crate::api_request::QualifiedIdentifier>,
+}
+
+/// The table a many-to-many relationship is joined through.
+#[derive(Clone, Debug)]
+pub struct EmbedJunction {
+    pub schema: String,
+    pub table: String,
+    /// Column on the junction matching the parent's own key.
+    pub parent_column: String,
+    /// Column on the junction matching the child's key.
+    pub child_column: String,
 }
 
 impl EmbedPlan {
@@ -67,7 +83,40 @@ impl EmbedPlan {
                 foreign_schema: foreign_table.schema.clone(),
                 foreign_table: foreign_table.name.clone(),
                 is_list: !to_one,
+                junction: None,
                 function: Some(function.clone()),
+            });
+        }
+
+        if let Relationship::ForeignKey {
+            cardinality: crate::schema_cache::Cardinality::M2M(junction),
+            ..
+        } = relationship
+        {
+            let (local_column, parent_column) =
+                junction.source_columns.first().cloned().ok_or_else(|| {
+                    Error::EmbeddingError("junction has no source columns".into())
+                })?;
+            let (child_column, foreign_column) =
+                junction.target_columns.first().cloned().ok_or_else(|| {
+                    Error::EmbeddingError("junction has no target columns".into())
+                })?;
+
+            return Ok(Self {
+                local_column,
+                foreign_column,
+                foreign_column_type: String::new(),
+                foreign_schema: foreign_table_qi.schema.clone(),
+                foreign_table: foreign_table_qi.name.clone(),
+                // A junction always yields a set: that is what it is for.
+                is_list: true,
+                junction: Some(EmbedJunction {
+                    schema: junction.table.schema.clone(),
+                    table: junction.table.name.clone(),
+                    parent_column,
+                    child_column,
+                }),
+                function: None,
             });
         }
 
@@ -111,6 +160,7 @@ impl EmbedPlan {
             foreign_schema: foreign_table_qi.schema.clone(),
             foreign_table: foreign_table_qi.name.clone(),
             is_list: !relationship.is_to_one(),
+            junction: None,
             function: None,
         })
     }
@@ -241,17 +291,43 @@ impl EmbedPlan {
                 parent_row,
                 postrust_sql::escape_ident(child_alias),
             ),
-            None => format!(
-                "SELECT {} FROM {}.{} AS {} WHERE {}.{} = {}.{}",
-                inner_select,
-                postrust_sql::escape_ident(&self.foreign_schema),
-                postrust_sql::escape_ident(&self.foreign_table),
-                postrust_sql::escape_ident(child_alias),
-                postrust_sql::escape_ident(child_alias),
-                postrust_sql::escape_ident(&self.foreign_column),
-                postrust_sql::escape_ident(parent_alias),
-                postrust_sql::escape_ident(&self.local_column),
-            ),
+            None => match &self.junction {
+                // Two hops: the child is reached through the table that joins
+                // it to the parent, so the correlation lands on the junction.
+                Some(junction) => {
+                    let junction_alias = format!("{}_j", child_alias);
+                    format!(
+                        "SELECT {} FROM {}.{} AS {} JOIN {}.{} AS {} ON {}.{} = {}.{} \
+                         WHERE {}.{} = {}.{}",
+                        inner_select,
+                        postrust_sql::escape_ident(&self.foreign_schema),
+                        postrust_sql::escape_ident(&self.foreign_table),
+                        postrust_sql::escape_ident(child_alias),
+                        postrust_sql::escape_ident(&junction.schema),
+                        postrust_sql::escape_ident(&junction.table),
+                        postrust_sql::escape_ident(&junction_alias),
+                        postrust_sql::escape_ident(&junction_alias),
+                        postrust_sql::escape_ident(&junction.child_column),
+                        postrust_sql::escape_ident(child_alias),
+                        postrust_sql::escape_ident(&self.foreign_column),
+                        postrust_sql::escape_ident(&junction_alias),
+                        postrust_sql::escape_ident(&junction.parent_column),
+                        postrust_sql::escape_ident(parent_alias),
+                        postrust_sql::escape_ident(&self.local_column),
+                    )
+                }
+                None => format!(
+                    "SELECT {} FROM {}.{} AS {} WHERE {}.{} = {}.{}",
+                    inner_select,
+                    postrust_sql::escape_ident(&self.foreign_schema),
+                    postrust_sql::escape_ident(&self.foreign_table),
+                    postrust_sql::escape_ident(child_alias),
+                    postrust_sql::escape_ident(child_alias),
+                    postrust_sql::escape_ident(&self.foreign_column),
+                    postrust_sql::escape_ident(parent_alias),
+                    postrust_sql::escape_ident(&self.local_column),
+                ),
+            },
         };
 
         // Filters written against the embedded resource (`clients.id=eq.1`)
@@ -314,16 +390,39 @@ impl EmbedPlan {
                 parent_row,
                 postrust_sql::escape_ident(child_alias),
             ),
-            None => format!(
-                "EXISTS (SELECT 1 FROM {}.{} AS {} WHERE {}.{} = {}.{}",
-                postrust_sql::escape_ident(&self.foreign_schema),
-                postrust_sql::escape_ident(&self.foreign_table),
-                postrust_sql::escape_ident(child_alias),
-                postrust_sql::escape_ident(child_alias),
-                postrust_sql::escape_ident(&self.foreign_column),
-                postrust_sql::escape_ident(parent_alias),
-                postrust_sql::escape_ident(&self.local_column),
-            ),
+            None => match &self.junction {
+                Some(junction) => {
+                    let junction_alias = format!("{}_j", child_alias);
+                    format!(
+                        "EXISTS (SELECT 1 FROM {}.{} AS {} JOIN {}.{} AS {} ON {}.{} = {}.{} \
+                         WHERE {}.{} = {}.{}",
+                        postrust_sql::escape_ident(&self.foreign_schema),
+                        postrust_sql::escape_ident(&self.foreign_table),
+                        postrust_sql::escape_ident(child_alias),
+                        postrust_sql::escape_ident(&junction.schema),
+                        postrust_sql::escape_ident(&junction.table),
+                        postrust_sql::escape_ident(&junction_alias),
+                        postrust_sql::escape_ident(&junction_alias),
+                        postrust_sql::escape_ident(&junction.child_column),
+                        postrust_sql::escape_ident(child_alias),
+                        postrust_sql::escape_ident(&self.foreign_column),
+                        postrust_sql::escape_ident(&junction_alias),
+                        postrust_sql::escape_ident(&junction.parent_column),
+                        postrust_sql::escape_ident(parent_alias),
+                        postrust_sql::escape_ident(&self.local_column),
+                    )
+                }
+                None => format!(
+                    "EXISTS (SELECT 1 FROM {}.{} AS {} WHERE {}.{} = {}.{}",
+                    postrust_sql::escape_ident(&self.foreign_schema),
+                    postrust_sql::escape_ident(&self.foreign_table),
+                    postrust_sql::escape_ident(child_alias),
+                    postrust_sql::escape_ident(child_alias),
+                    postrust_sql::escape_ident(&self.foreign_column),
+                    postrust_sql::escape_ident(parent_alias),
+                    postrust_sql::escape_ident(&self.local_column),
+                ),
+            },
         };
 
         if let Some(child_where) = child_where {
@@ -550,6 +649,7 @@ mod tests {
             foreign_schema: "public".into(),
             foreign_table: "posts".into(),
             is_list,
+            junction: None,
             function: None,
         }
     }

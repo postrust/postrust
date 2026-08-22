@@ -63,6 +63,9 @@ impl SchemaCache {
         let timezones = queries::load_timezones(pool).await?;
         info!("Loaded {} timezones", timezones.len());
 
+        let mut relationships = relationships;
+        add_junction_relationships(&tables, &mut relationships);
+
         let media_handlers = queries::load_media_handlers(pool, schemas).await?;
         info!("Loaded {} media type handlers", media_handlers.len());
 
@@ -188,6 +191,98 @@ impl SchemaCache {
                     .iter()
                     .find(|r| r.join_columns().iter().any(|(local, _)| local == to_name))
             })
+    }
+}
+
+/// Derive many-to-many relationships from junction tables.
+///
+/// A junction is a table that exists only to join two others: it has exactly
+/// two foreign keys, to two different tables, and its primary key is precisely
+/// the columns of those keys. That last condition is what separates a junction
+/// from an ordinary table that happens to reference two others, which would
+/// otherwise sprout a relationship it has no business having.
+///
+/// Both sides get the relationship, named after the table across the junction,
+/// so `/users?select=name,tasks(name)` works from either end.
+fn add_junction_relationships(tables: &TablesMap, relationships: &mut RelationshipsMap) {
+    let mut derived: Vec<((QualifiedIdentifier, String), Relationship)> = Vec::new();
+
+    for (junction_qi, junction) in tables {
+        let key = (junction_qi.clone(), junction_qi.schema.clone());
+        let Some(rels) = relationships.get(&key) else {
+            continue;
+        };
+
+        // The single-column keys out of the junction. A junction joins two
+        // tables by one column each; a composite key to somewhere else is a
+        // different relationship that happens to share the table.
+        let outgoing: Vec<(&Relationship, (String, String))> = rels
+            .iter()
+            .filter(|r| matches!(r, Relationship::ForeignKey { table, .. } if table == junction_qi))
+            .filter(|r| r.is_to_one())
+            .filter_map(|r| {
+                let mut columns = r.join_columns();
+                columns.dedup();
+                match columns.len() {
+                    1 => Some((r, columns.remove(0))),
+                    _ => None,
+                }
+            })
+            .collect();
+
+        let mut pk: Vec<&str> = junction.pk_cols.iter().map(String::as_str).collect();
+        pk.sort_unstable();
+        if pk.len() != 2 {
+            continue;
+        }
+
+        // The pair whose columns are exactly the primary key is the one that
+        // makes this a junction. Requiring the whole key is what separates a
+        // junction from a table that merely references two others.
+        for near in 0..outgoing.len() {
+            for far in 0..outgoing.len() {
+                if near == far {
+                    continue;
+                }
+                let (near_rel, (near_local, near_foreign)) = &outgoing[near];
+                let (far_rel, (far_local, far_foreign)) = &outgoing[far];
+                if near_rel.foreign_table() == far_rel.foreign_table() {
+                    continue;
+                }
+                let mut covered = vec![near_local.as_str(), far_local.as_str()];
+                covered.sort_unstable();
+                if covered != pk {
+                    continue;
+                }
+
+                let source = near_rel.foreign_table().clone();
+                let target = far_rel.foreign_table().clone();
+
+                derived.push((
+                    (source.clone(), source.schema.clone()),
+                    Relationship::ForeignKey {
+                        table: source,
+                        foreign_table: target,
+                        is_self: false,
+                        cardinality: Cardinality::M2M(Junction {
+                            table: junction_qi.clone(),
+                            constraint1: near_rel.constraint_name().to_string(),
+                            constraint2: far_rel.constraint_name().to_string(),
+                            // Source to junction, then junction to target.
+                            source_columns: vec![(near_foreign.clone(), near_local.clone())],
+                            target_columns: vec![(far_local.clone(), far_foreign.clone())],
+                        }),
+                        table_is_view: false,
+                        foreign_table_is_view: false,
+                        constraint_name: String::new(),
+                    },
+                ));
+            }
+        }
+    }
+
+    for (key, rel) in derived {
+        relationships.entry(key).or_default().push(rel);
     }
 }
 
