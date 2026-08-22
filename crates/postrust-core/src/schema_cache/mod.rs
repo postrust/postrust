@@ -116,11 +116,25 @@ impl SchemaCache {
         to_name: &str,
         schema: &str,
     ) -> Option<&Relationship> {
-        self.get_relationships(from, schema)?
+        let candidates = self.get_relationships(from, schema)?;
+
+        // An embedding may be named three ways, and they are tried in the
+        // order of how specifically they identify one relationship.
+        //
+        // The target table's name is the usual spelling, but it is ambiguous
+        // as soon as two foreign keys point at the same table. The foreign key
+        // constraint names exactly one relationship, and so does the column
+        // that joins them -- `/messages?select=*,sender(*)` embeds through the
+        // `sender` column, and `/projects?select=*,client(*)` through the
+        // constraint called `client`.
+        candidates
             .iter()
-            .find(|r| match r {
-                Relationship::ForeignKey { foreign_table, .. } => foreign_table.name == to_name,
-                Relationship::Computed { foreign_table, .. } => foreign_table.name == to_name,
+            .find(|r| r.foreign_table().name == to_name)
+            .or_else(|| candidates.iter().find(|r| r.constraint_name() == to_name))
+            .or_else(|| {
+                candidates
+                    .iter()
+                    .find(|r| r.join_columns().iter().any(|(local, _)| local == to_name))
             })
     }
 }

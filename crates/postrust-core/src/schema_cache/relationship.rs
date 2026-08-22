@@ -61,6 +61,22 @@ impl Relationship {
         }
     }
 
+    /// The name of the foreign key constraint behind this relationship.
+    ///
+    /// Empty for a many-to-many, which is two constraints rather than one, and
+    /// for a computed relationship, which has none.
+    pub fn constraint_name(&self) -> &str {
+        match self {
+            Self::ForeignKey { cardinality, .. } => match cardinality {
+                Cardinality::O2M { constraint, .. }
+                | Cardinality::M2O { constraint, .. }
+                | Cardinality::O2O { constraint, .. } => constraint,
+                Cardinality::M2M(_) => "",
+            },
+            Self::Computed { .. } => "",
+        }
+    }
+
     /// Get the join columns for this relationship.
     pub fn join_columns(&self) -> Vec<(String, String)> {
         match self {
