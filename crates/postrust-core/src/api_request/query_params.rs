@@ -8,8 +8,8 @@ use crate::error::{Error, Result};
 use nom::{
     branch::alt,
     bytes::complete::{tag, take_while1},
-    character::complete::{char, digit1},
-    combinator::{map, opt, value},
+    character::complete::char,
+    combinator::{opt, value},
     multi::{many0, separated_list0},
     sequence::preceded,
     IResult,
@@ -833,24 +833,57 @@ fn parse_identifier(input: &str) -> IResult<&str, &str> {
 }
 
 fn parse_json_path(input: &str) -> IResult<&str, JsonPath> {
-    many0(alt((parse_arrow, parse_double_arrow)))(input)
+    // `->>` first: it starts with `->`, so trying the shorter one first would
+    // match it and leave the second `>` at the head of the key.
+    many0(alt((parse_double_arrow, parse_arrow)))(input)
+}
+
+/// Parse one step of a JSON path.
+///
+/// A JSON object key can be very nearly anything, and PostgREST's grammar says
+/// so: everything up to the next thing the select grammar itself reserves is
+/// the key. `data->>!@#$%^&*_e` and `data->23-xy-45` are ordinary keys, not
+/// syntax errors, and reading a key as alphanumeric-only silently truncated
+/// the path and returned the whole column instead.
+///
+/// A key made entirely of digits is an array index, which is why this decides
+/// between the two only once the whole key has been read: `data->0xy1` steps
+/// into the key `0xy1`, not into element 0 of an array.
+fn parse_json_operand(input: &str) -> IResult<&str, JsonOperand> {
+    let mut end = input.len();
+    for (idx, ch) in input.char_indices() {
+        // `,` ends the select item, `(` and `)` bound an embedding, `:` starts
+        // a cast or an alias, and `->` starts the next step.
+        if matches!(ch, ',' | '(' | ')' | ':') || input[idx..].starts_with("->") {
+            end = idx;
+            break;
+        }
+    }
+
+    let (key, rest) = input.split_at(end);
+    if key.is_empty() {
+        return Err(nom::Err::Error(nom::error::Error::new(
+            input,
+            nom::error::ErrorKind::TakeWhile1,
+        )));
+    }
+
+    let operand = match key.parse::<i32>() {
+        Ok(index) => JsonOperand::Idx(index),
+        Err(_) => JsonOperand::Key(key.to_string()),
+    };
+    Ok((rest, operand))
 }
 
 fn parse_arrow(input: &str) -> IResult<&str, JsonOperation> {
     let (input, _) = tag("->")(input)?;
-    let (input, operand) = alt((
-        map(digit1, |s: &str| JsonOperand::Idx(s.parse().unwrap_or(0))),
-        map(parse_identifier, |s| JsonOperand::Key(s.to_string())),
-    ))(input)?;
+    let (input, operand) = parse_json_operand(input)?;
     Ok((input, JsonOperation::Arrow(operand)))
 }
 
 fn parse_double_arrow(input: &str) -> IResult<&str, JsonOperation> {
     let (input, _) = tag("->>")(input)?;
-    let (input, operand) = alt((
-        map(digit1, |s: &str| JsonOperand::Idx(s.parse().unwrap_or(0))),
-        map(parse_identifier, |s| JsonOperand::Key(s.to_string())),
-    ))(input)?;
+    let (input, operand) = parse_json_operand(input)?;
     Ok((input, JsonOperation::DoubleArrow(operand)))
 }
 
@@ -879,6 +912,74 @@ mod tests {
                 assert_eq!(values, &vec!["1", "2", "3"]);
             }
             _ => panic!("Expected In operation"),
+        }
+    }
+
+    #[test]
+    fn test_json_path_double_arrow_wins_over_single() {
+        let items = parse_select("settings->foo->>bar").unwrap();
+        match &items[0] {
+            SelectItem::Field { field, .. } => {
+                assert_eq!(
+                    field.json_path,
+                    vec![
+                        JsonOperation::Arrow(JsonOperand::Key("foo".into())),
+                        JsonOperation::DoubleArrow(JsonOperand::Key("bar".into())),
+                    ]
+                );
+            }
+            other => panic!("expected a field, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_json_path_accepts_awkward_keys() {
+        // PostgREST reserves only what its own grammar needs, so a key may
+        // hold punctuation and hyphens.
+        let items = parse_select("data->23-xy-45->>!@#$%^&*_e").unwrap();
+        match &items[0] {
+            SelectItem::Field { field, .. } => {
+                assert_eq!(
+                    field.json_path,
+                    vec![
+                        JsonOperation::Arrow(JsonOperand::Key("23-xy-45".into())),
+                        JsonOperation::DoubleArrow(JsonOperand::Key("!@#$%^&*_e".into())),
+                    ]
+                );
+            }
+            other => panic!("expected a field, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_json_path_digits_are_an_index_but_only_when_whole() {
+        let items = parse_select("data->0,other->0xy1").unwrap();
+        let paths: Vec<_> = items
+            .iter()
+            .map(|i| match i {
+                SelectItem::Field { field, .. } => field.json_path.clone(),
+                other => panic!("expected a field, got {:?}", other),
+            })
+            .collect();
+        assert_eq!(paths[0], vec![JsonOperation::Arrow(JsonOperand::Idx(0))]);
+        assert_eq!(
+            paths[1],
+            vec![JsonOperation::Arrow(JsonOperand::Key("0xy1".into()))]
+        );
+    }
+
+    #[test]
+    fn test_json_path_stops_at_a_cast() {
+        let items = parse_select("settings->>foo::json").unwrap();
+        match &items[0] {
+            SelectItem::Field { field, cast, .. } => {
+                assert_eq!(
+                    field.json_path,
+                    vec![JsonOperation::DoubleArrow(JsonOperand::Key("foo".into()))]
+                );
+                assert_eq!(cast.as_deref(), Some("json"));
+            }
+            other => panic!("expected a field, got {:?}", other),
         }
     }
 
