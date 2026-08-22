@@ -86,8 +86,20 @@ pub enum Error {
     #[error("Table not found: {0}")]
     TableNotFound(String),
 
-    #[error("Function not found: {0}")]
-    FunctionNotFound(String),
+    /// No function of that name accepts the arguments supplied.
+    ///
+    /// Carries what was looked for so the client can see why nothing matched:
+    /// the name, the argument names it was called with, and the signature of
+    /// an overload that does exist, where one does.
+    #[error("Could not find the function {name}")]
+    FunctionNotFound {
+        /// The function's qualified name, without arguments.
+        name: String,
+        /// The argument names it was called with.
+        params: Vec<String>,
+        /// A signature that does exist, where one does.
+        candidate: Option<String>,
+    },
 
     #[error("Column not found: {0}")]
     ColumnNotFound(String),
@@ -159,7 +171,7 @@ impl Error {
             // 404 Not Found
             Self::NotFound(_)
             | Self::TableNotFound(_)
-            | Self::FunctionNotFound(_)
+            | Self::FunctionNotFound { .. }
             | Self::ColumnNotFound(_)
             | Self::RelationshipNotFound(_) => StatusCode::NOT_FOUND,
 
@@ -207,7 +219,7 @@ impl Error {
 
             Self::NotFound(_) => "PGRST205",
             Self::TableNotFound(_) => "PGRST205",
-            Self::FunctionNotFound(_) => "PGRST202",
+            Self::FunctionNotFound { .. } => "PGRST202",
             Self::ColumnNotFound(_) => "PGRST204",
             Self::RelationshipNotFound(_) => "PGRST200",
 
@@ -236,9 +248,14 @@ impl Error {
     }
 
     /// Get additional details for the error.
-    fn details(&self) -> Option<String> {
+    pub fn details(&self) -> Option<String> {
         match self {
             Self::Database(db_err) => db_err.details.clone(),
+            Self::FunctionNotFound { name, params, .. } => Some(format!(
+                "Searched for the function {} {}, but no matches were found in the schema cache.",
+                name,
+                describe_params(params)
+            )),
             _ => None,
         }
     }
@@ -250,6 +267,9 @@ impl Error {
                 Some("Check that the JWT is properly signed and not expired".into())
             }
             Self::MissingAuth => Some("Provide a valid JWT in the Authorization header".into()),
+            Self::FunctionNotFound { candidate, .. } => candidate
+                .as_ref()
+                .map(|c| format!("Perhaps you meant to call the function {}", c)),
             // The schemas a server exposes are part of its contract, not an
             // internal detail, so naming them is how the client is told what
             // to ask for instead.
@@ -260,6 +280,25 @@ impl Error {
             Self::Database(db_err) => db_err.hint.clone(),
             _ => None,
         }
+    }
+}
+
+/// How a function's argument list reads in an error message.
+///
+/// PostgREST words the no-argument case differently rather than printing an
+/// empty list, and the messages are matched verbatim by clients.
+pub fn function_signature(name: &str, params: &[String]) -> String {
+    match params.is_empty() {
+        true => format!("{} without parameters", name),
+        false => format!("{}({})", name, params.join(", ")),
+    }
+}
+
+fn describe_params(params: &[String]) -> String {
+    match params.len() {
+        0 => "without parameters".to_string(),
+        1 => format!("with parameter {}", params[0]),
+        _ => format!("with parameters {}", params.join(", ")),
     }
 }
 

@@ -580,11 +580,20 @@ async fn execute_plan(
             // response -- reads, mutations and RPC alike, but not on errors or
             // OPTIONS. Without an exact count the total is unknown, which
             // renders as `*` and keeps the status at 200.
-            let content_range = postrust_response::ContentRange::from_pagination(
-                api_request.top_level_range.offset,
-                rows.len() as i64,
-                None,
-            );
+            // The window starts where the request asked it to, and `offset`
+            // overrides the `Range` header exactly as it does when the plan
+            // resolves the range -- otherwise the reported window says 0 for a
+            // request that plainly skipped rows.
+            let offset = api_request
+                .query_params
+                .ranges
+                .get("")
+                .map(|range| range.offset)
+                .filter(|offset| *offset != 0)
+                .unwrap_or(api_request.top_level_range.offset);
+
+            let content_range =
+                postrust_response::ContentRange::from_pagination(offset, rows.len() as i64, None);
 
             Ok(QueryResult {
                 status: mutation_status(db_plan, api_request)
@@ -1476,7 +1485,7 @@ fn error_response(error: postrust_core::Error, verbatim_db_errors: bool) -> Resp
         let sanitized = serde_json::json!({
             "code": error.code(),
             "message": sanitize_error_message(&error),
-            "details": null,
+            "details": error.details(),
             // A hint says how to correct the request. It is carried by the
             // error itself, so it never has to reach for anything the
             // sanitised message deliberately left out.
@@ -1506,8 +1515,11 @@ fn sanitize_error_message(error: &postrust_core::Error) -> String {
         Error::TableNotFound(name) | Error::NotFound(name) => {
             return format!("Could not find the table '{}' in the schema cache", name)
         }
-        Error::FunctionNotFound(name) => {
-            return format!("Could not find the function {} in the schema cache", name)
+        Error::FunctionNotFound { name, params, .. } => {
+            return format!(
+                "Could not find the function {} in the schema cache",
+                postrust_core::error::function_signature(name, params)
+            )
         }
         Error::UnacceptableSchema { requested, .. } => {
             return format!("Invalid schema: {}", requested)

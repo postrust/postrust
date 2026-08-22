@@ -15,7 +15,8 @@ pub use types::*;
 
 use crate::api_request::{Action, ApiRequest, DbAction, QualifiedIdentifier};
 use crate::error::{Error, Result};
-use crate::schema_cache::SchemaCache;
+use crate::schema_cache::{Routine, SchemaCache};
+use std::collections::HashSet;
 
 /// The execution plan for an API request.
 #[derive(Clone, Debug)]
@@ -71,6 +72,54 @@ pub fn create_action_plan(request: &ApiRequest, schema_cache: &SchemaCache) -> R
     }
 }
 
+/// Choose which signature of a function the supplied arguments call.
+///
+/// A name may carry several, and taking whichever happened to be loaded first
+/// calls the wrong one -- or calls one the arguments do not fit, which
+/// PostgreSQL then rejects with a message about a function that does not
+/// exist, where the truth is that none of them matched.
+///
+/// A signature fits when every parameter it requires is supplied. A key that
+/// names no parameter is not disqualifying: on a function call an unrecognised
+/// key filters the result rather than arguing with the signature, which is why
+/// `/rpc/getallprojects?id=gt.1` calls a function taking nothing at all.
+///
+/// Among those that fit, the one matching most of its parameters wins, and the
+/// shorter signature breaks a tie -- it leaves least to defaults the caller
+/// did not ask for.
+fn select_overload<'a>(routines: &'a [Routine], request: &ApiRequest) -> Option<&'a Routine> {
+    // Arguments in a body are not inspected here. The payload is parsed
+    // further down, and a mismatch there is PostgreSQL's to report.
+    if request.payload.is_some() {
+        return routines.first();
+    }
+
+    let supplied: HashSet<&str> = request
+        .query_params
+        .params
+        .iter()
+        .map(|(name, _)| name.as_str())
+        .collect();
+
+    routines
+        .iter()
+        .filter(|routine| {
+            routine
+                .params
+                .iter()
+                .filter(|p| p.required)
+                .all(|p| supplied.contains(p.name.as_str()))
+        })
+        .max_by_key(|routine| {
+            let matched = routine
+                .params
+                .iter()
+                .filter(|p| supplied.contains(p.name.as_str()))
+                .count();
+            (matched, std::cmp::Reverse(routine.params.len()))
+        })
+}
+
 /// Create a database action plan.
 fn create_db_plan(
     request: &ApiRequest,
@@ -105,13 +154,41 @@ fn create_db_plan(
             qi,
             invoke_method: _,
         } => {
+            let supplied: Vec<String> = request
+                .query_params
+                .params
+                .iter()
+                .map(|(name, _)| name.clone())
+                .collect();
+
+            // The name is reported as it was called, arguments and all, so the
+            // client can see which signature was looked for.
+            let not_found = |candidate: Option<String>| Error::FunctionNotFound {
+                name: qi.to_string(),
+                params: supplied.clone(),
+                candidate,
+            };
+
             let routines = schema_cache
                 .get_routines(qi)
-                .ok_or_else(|| Error::FunctionNotFound(qi.to_string()))?;
+                .ok_or_else(|| not_found(None))?;
 
-            let routine = routines
-                .first()
-                .ok_or_else(|| Error::FunctionNotFound(qi.to_string()))?;
+            let routine = select_overload(routines, request).ok_or_else(|| {
+                // The name exists but nothing takes these arguments, so an
+                // overload that does exist is worth naming.
+                let candidate = routines.first().map(|r| {
+                    format!(
+                        "{}({})",
+                        qi,
+                        r.params
+                            .iter()
+                            .map(|p| p.name.clone())
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    )
+                });
+                not_found(candidate)
+            })?;
 
             let call_plan = CallPlan::from_request(request, routine)?;
 
