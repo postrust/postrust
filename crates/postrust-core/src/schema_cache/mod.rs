@@ -129,7 +129,13 @@ impl SchemaCache {
         // constraint called `client`.
         candidates
             .iter()
-            .find(|r| r.foreign_table().name == to_name)
+            .find(|r| match r {
+                // A computed relationship is named by its function. Two
+                // functions may return the same table, so the table's name
+                // would not tell them apart.
+                Relationship::Computed { function, .. } => function.name == to_name,
+                Relationship::ForeignKey { foreign_table, .. } => foreign_table.name == to_name,
+            })
             .or_else(|| candidates.iter().find(|r| r.constraint_name() == to_name))
             .or_else(|| {
                 candidates

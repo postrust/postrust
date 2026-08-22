@@ -1401,6 +1401,9 @@ fn build_embed_expressions(
         let expression = plan
             .embed_expression(
                 parent_alias,
+                // GraphQL does not expose computed relationships, so the row
+                // expression is never read; the alias is the honest value.
+                &postrust_sql::escape_ident(parent_alias),
                 &child_alias,
                 &parts.join(", "),
                 max_rows,

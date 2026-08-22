@@ -34,6 +34,13 @@ pub struct EmbedPlan {
     pub foreign_table: String,
     /// Whether the relationship yields many rows per parent.
     pub is_list: bool,
+    /// The function behind a computed relationship, if that is what this is.
+    ///
+    /// A computed relationship is a function taking the parent row and
+    /// returning rows of the related table. There is no key to join on -- the
+    /// parent row is the argument -- so the columns above are empty and the
+    /// relationship can only be expressed as a call correlated to the parent.
+    pub function: Option<crate::api_request::QualifiedIdentifier>,
 }
 
 impl EmbedPlan {
@@ -44,13 +51,29 @@ impl EmbedPlan {
     pub fn resolve(relationship: &Relationship, schema_cache: &SchemaCache) -> Result<Self> {
         let foreign_table_qi = relationship.foreign_table().clone();
 
+        // A computed relationship takes the parent row as its argument, so
+        // there is nothing to look up and nothing to join on.
+        if let Relationship::Computed {
+            function,
+            foreign_table,
+            to_one,
+            ..
+        } = relationship
+        {
+            return Ok(Self {
+                local_column: String::new(),
+                foreign_column: String::new(),
+                foreign_column_type: String::new(),
+                foreign_schema: foreign_table.schema.clone(),
+                foreign_table: foreign_table.name.clone(),
+                is_list: !to_one,
+                function: Some(function.clone()),
+            });
+        }
+
         let columns = match relationship {
             Relationship::ForeignKey { cardinality, .. } => cardinality.columns(),
-            Relationship::Computed { .. } => {
-                return Err(Error::EmbeddingError(
-                    "embedding a computed relationship is not supported yet".into(),
-                ))
-            }
+            Relationship::Computed { .. } => unreachable!("handled above"),
         };
 
         if columns.len() != 1 {
@@ -88,6 +111,7 @@ impl EmbedPlan {
             foreign_schema: foreign_table_qi.schema.clone(),
             foreign_table: foreign_table_qi.name.clone(),
             is_list: !relationship.is_to_one(),
+            function: None,
         })
     }
 
@@ -195,6 +219,7 @@ impl EmbedPlan {
     pub fn embed_expression(
         &self,
         parent_alias: &str,
+        parent_row: &str,
         child_alias: &str,
         inner_select: &str,
         limit: Option<i64>,
@@ -203,17 +228,31 @@ impl EmbedPlan {
         // The child table is aliased rather than referred to by name. A
         // self-referential relationship would otherwise make the correlation
         // ambiguous, since the parent and the child are the same table.
-        let mut inner = format!(
-            "SELECT {} FROM {}.{} AS {} WHERE {}.{} = {}.{}",
-            inner_select,
-            postrust_sql::escape_ident(&self.foreign_schema),
-            postrust_sql::escape_ident(&self.foreign_table),
-            postrust_sql::escape_ident(child_alias),
-            postrust_sql::escape_ident(child_alias),
-            postrust_sql::escape_ident(&self.foreign_column),
-            postrust_sql::escape_ident(parent_alias),
-            postrust_sql::escape_ident(&self.local_column),
-        );
+        //
+        // A computed relationship is correlated by argument rather than by a
+        // key: the function takes the parent row, so the parent alias is
+        // passed to it and there is no predicate to write.
+        let mut inner = match &self.function {
+            Some(function) => format!(
+                "SELECT {} FROM {}.{}({}) AS {} WHERE true",
+                inner_select,
+                postrust_sql::escape_ident(&function.schema),
+                postrust_sql::escape_ident(&function.name),
+                parent_row,
+                postrust_sql::escape_ident(child_alias),
+            ),
+            None => format!(
+                "SELECT {} FROM {}.{} AS {} WHERE {}.{} = {}.{}",
+                inner_select,
+                postrust_sql::escape_ident(&self.foreign_schema),
+                postrust_sql::escape_ident(&self.foreign_table),
+                postrust_sql::escape_ident(child_alias),
+                postrust_sql::escape_ident(child_alias),
+                postrust_sql::escape_ident(&self.foreign_column),
+                postrust_sql::escape_ident(parent_alias),
+                postrust_sql::escape_ident(&self.local_column),
+            ),
+        };
 
         // Filters written against the embedded resource (`clients.id=eq.1`)
         // narrow the children, exactly as they would if the child had been
@@ -263,19 +302,29 @@ impl EmbedPlan {
     pub fn inner_join_predicate(
         &self,
         parent_alias: &str,
+        parent_row: &str,
         child_alias: &str,
         child_where: Option<&str>,
     ) -> String {
-        let mut predicate = format!(
-            "EXISTS (SELECT 1 FROM {}.{} AS {} WHERE {}.{} = {}.{}",
-            postrust_sql::escape_ident(&self.foreign_schema),
-            postrust_sql::escape_ident(&self.foreign_table),
-            postrust_sql::escape_ident(child_alias),
-            postrust_sql::escape_ident(child_alias),
-            postrust_sql::escape_ident(&self.foreign_column),
-            postrust_sql::escape_ident(parent_alias),
-            postrust_sql::escape_ident(&self.local_column),
-        );
+        let mut predicate = match &self.function {
+            Some(function) => format!(
+                "EXISTS (SELECT 1 FROM {}.{}({}) AS {} WHERE true",
+                postrust_sql::escape_ident(&function.schema),
+                postrust_sql::escape_ident(&function.name),
+                parent_row,
+                postrust_sql::escape_ident(child_alias),
+            ),
+            None => format!(
+                "EXISTS (SELECT 1 FROM {}.{} AS {} WHERE {}.{} = {}.{}",
+                postrust_sql::escape_ident(&self.foreign_schema),
+                postrust_sql::escape_ident(&self.foreign_table),
+                postrust_sql::escape_ident(child_alias),
+                postrust_sql::escape_ident(child_alias),
+                postrust_sql::escape_ident(&self.foreign_column),
+                postrust_sql::escape_ident(parent_alias),
+                postrust_sql::escape_ident(&self.local_column),
+            ),
+        };
 
         if let Some(child_where) = child_where {
             predicate.push_str(" AND ");
@@ -501,6 +550,7 @@ mod tests {
             foreign_schema: "public".into(),
             foreign_table: "posts".into(),
             is_list,
+            function: None,
         }
     }
 
@@ -517,7 +567,7 @@ mod tests {
     #[test]
     fn embed_expression_aggregates_a_to_many_relation() {
         let sql = plan(true)
-            .embed_expression("p", "posts", r#""id", "title""#, None, None)
+            .embed_expression("p", "\"p\"", "posts", r#""id", "title""#, None, None)
             .unwrap();
 
         assert!(sql.starts_with("COALESCE((SELECT json_agg("), "{}", sql);
@@ -537,7 +587,7 @@ mod tests {
     #[test]
     fn embed_expression_takes_one_row_for_a_to_one_relation() {
         let sql = plan(false)
-            .embed_expression("p", "author", r#""id""#, None, None)
+            .embed_expression("p", "\"p\"", "author", r#""id""#, None, None)
             .unwrap();
 
         assert!(sql.contains("row_to_json"), "{}", sql);
@@ -552,7 +602,7 @@ mod tests {
     #[test]
     fn embed_expression_limits_rows_per_parent() {
         let sql = plan(true)
-            .embed_expression("p", "posts", r#""id""#, Some(25), None)
+            .embed_expression("p", "\"p\"", "posts", r#""id""#, Some(25), None)
             .unwrap();
         assert!(sql.contains("LIMIT 25"), "{}", sql);
     }

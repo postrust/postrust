@@ -15,6 +15,18 @@ use postrust_response::{format_response, QueryResult, Response as PgrstResponse}
 use std::sync::Arc;
 use tracing::{debug, error};
 
+/// Column carrying the parent's whole row, for computed relationships.
+///
+/// A computed relationship is a function taking the parent row. By the time an
+/// embed expression runs, the parent is a derived table, and a derived table's
+/// alias has type `record` -- which PostgreSQL will not cast to the table's
+/// composite type. So the row is captured one level down, where the real table
+/// is still in scope and a bare reference to it yields the composite, and the
+/// embed expression reads it from there. It is stripped from the response like
+/// any other column added for embedding.
+const PARENT_ROW_COLUMN: &str = "pgrst_parent_row";
+const PARENT_ROW_COLUMN_REF: &str = "\"src\".\"pgrst_parent_row\"";
+
 /// Main request handler.
 pub async fn handle_request(State(state): State<Arc<AppState>>, request: Request) -> Response {
     let method = request.method().clone();
@@ -123,6 +135,34 @@ async fn execute_plan(
 ) -> Result<QueryResult, postrust_core::Error> {
     match plan {
         ActionPlan::Db(db_plan) => {
+            // Carry the parent's whole row out of the inner query when a
+            // computed relationship needs it as an argument. It has to be
+            // taken here, where the real table is still in scope: a bare
+            // reference to the table yields its composite type, whereas the
+            // derived table it becomes one level up yields a `record`.
+            let db_plan = &if added_join_columns.iter().any(|c| c == PARENT_ROW_COLUMN) {
+                let mut adjusted = db_plan.clone();
+                if let DbActionPlan::Read(tree) = &mut adjusted {
+                    let mut field = postrust_core::plan::CoercibleField::simple(
+                        tree.root.from.name.clone(),
+                        String::new(),
+                    );
+                    field.full_row = true;
+                    tree.root
+                        .select
+                        .push(postrust_core::plan::CoercibleSelectField {
+                            field,
+                            aggregate: None,
+                            aggregate_cast: None,
+                            cast: None,
+                            alias: Some(PARENT_ROW_COLUMN.to_string()),
+                        });
+                }
+                adjusted
+            } else {
+                db_plan.clone()
+            };
+
             // Build SQL
             let query = postrust_core::query::build_query(
                 &ActionPlan::Db(db_plan.clone()),
@@ -173,6 +213,7 @@ async fn execute_plan(
                         &schema_cache,
                         &parent_qi,
                         "src",
+                        PARENT_ROW_COLUMN_REF,
                         &api_request.query_params.select,
                         &mut embed_filters,
                         &[],
@@ -602,6 +643,16 @@ fn add_embed_join_columns(
 
         let plan = postrust_core::embed::EmbedPlan::resolve(rel, schema_cache)?;
 
+        // A computed relationship joins on nothing -- the parent row is the
+        // function's argument. That row has to be carried out of the inner
+        // query, which is a column of its own rather than a join key.
+        if plan.function.is_some() {
+            if !added.iter().any(|c| c == PARENT_ROW_COLUMN) {
+                added.push(PARENT_ROW_COLUMN.to_string());
+            }
+            continue;
+        }
+
         if !selected.contains(&plan.local_column) && !added.contains(&plan.local_column) {
             api_request.query_params.select.push(SelectItem::Field {
                 field: Field::simple(&plan.local_column),
@@ -750,6 +801,12 @@ fn build_embed_expressions(
     schema_cache: &postrust_core::SchemaCache,
     parent_qi: &postrust_core::api_request::QualifiedIdentifier,
     parent_alias: &str,
+    // The SQL expression yielding the parent's whole row, which a computed
+    // relationship takes as its argument. At a nested level the parent is a
+    // real table alias and so is the row; at the top level the parent is a
+    // derived table, whose alias is a `record` rather than the table's own
+    // composite type, so a column carrying the row is passed instead.
+    parent_row: &str,
     select: &[postrust_core::api_request::SelectItem],
     ctx: &mut EmbedFilters<'_>,
     path: &[String],
@@ -788,10 +845,12 @@ fn build_embed_expressions(
         let child_where = ctx.predicate_for(&child_path, &child_qi, schema_cache)?;
 
         // Deeper relations first: they become part of this level's SELECT list.
+        let child_row = postrust_sql::escape_ident(&child_alias);
         let nested = build_embed_expressions(
             schema_cache,
             &child_qi,
             &child_alias,
+            &child_row,
             child_select,
             ctx,
             &child_path,
@@ -820,6 +879,7 @@ fn build_embed_expressions(
         if matches!(join_type, Some(postrust_core::api_request::JoinType::Inner)) {
             level.inner_joins.push(plan.inner_join_predicate(
                 parent_alias,
+                parent_row,
                 &child_alias,
                 child_where.as_deref(),
             ));
@@ -864,6 +924,7 @@ fn build_embed_expressions(
         let inner_select = parts.join(", ");
         let expression = plan.embed_expression(
             parent_alias,
+            parent_row,
             &child_alias,
             &inner_select,
             ctx.max_rows,

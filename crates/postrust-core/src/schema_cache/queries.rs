@@ -295,7 +295,88 @@ pub async fn load_relationships(pool: &PgPool, schemas: &[String]) -> Result<Rel
             .push(reverse_rel);
     }
 
+    load_computed_relationships(pool, schemas, &mut relationships).await?;
+
     Ok(relationships)
+}
+
+/// Add relationships that are computed by a function rather than declared by a
+/// foreign key.
+///
+/// A function qualifies when it takes exactly one argument, that argument is
+/// the composite type of an exposed table, and it returns rows of an exposed
+/// table. `SETOF t` yields many rows per parent and a bare `t` yields one;
+/// `ROWS 1` on a set-returning function declares it yields one as well, which
+/// is how a to-one computed relationship is written.
+///
+/// The relationship is named after the function, not after the table it
+/// returns, so that two functions returning the same table stay distinct.
+async fn load_computed_relationships(
+    pool: &PgPool,
+    schemas: &[String],
+    relationships: &mut RelationshipsMap,
+) -> Result<()> {
+    let rows = sqlx::query(
+        r#"
+        SELECT
+            pn.nspname  AS function_schema,
+            p.proname   AS function_name,
+            tn.nspname  AS table_schema,
+            t.relname   AS table_name,
+            fn.nspname  AS foreign_table_schema,
+            f.relname   AS foreign_table_name,
+            (NOT p.proretset) OR p.prorows = 1 AS to_one
+        FROM pg_proc p
+        JOIN pg_namespace pn ON pn.oid = p.pronamespace
+        -- the single argument is a table's composite type
+        JOIN pg_type argt ON argt.oid = p.proargtypes[0]
+        JOIN pg_class t   ON t.oid = argt.typrelid
+        JOIN pg_namespace tn ON tn.oid = t.relnamespace
+        -- and the return type is a table as well
+        JOIN pg_type rett ON rett.oid = p.prorettype
+        JOIN pg_class f   ON f.oid = rett.typrelid
+        JOIN pg_namespace fn ON fn.oid = f.relnamespace
+        WHERE p.pronargs = 1
+          AND pn.nspname = ANY($1)
+          AND tn.nspname = ANY($1)
+          AND fn.nspname = ANY($1)
+          -- relkind 'c' would be a standalone composite type, not a relation
+          AND t.relkind = ANY (ARRAY['r','v','m','f','p'])
+          AND f.relkind = ANY (ARRAY['r','v','m','f','p'])
+        "#,
+    )
+    .bind(schemas)
+    .fetch_all(pool)
+    .await
+    .map_err(|e| Error::SchemaCacheLoadFailed(e.to_string()))?;
+
+    for row in rows {
+        let function = QualifiedIdentifier::new(
+            row.get::<String, _>("function_schema"),
+            row.get::<String, _>("function_name"),
+        );
+        let table_schema: String = row.get("table_schema");
+        let table = QualifiedIdentifier::new(&table_schema, row.get::<String, _>("table_name"));
+        let foreign_table = QualifiedIdentifier::new(
+            row.get::<String, _>("foreign_table_schema"),
+            row.get::<String, _>("foreign_table_name"),
+        );
+        let is_self = table == foreign_table;
+
+        relationships
+            .entry((table.clone(), table_schema))
+            .or_default()
+            .push(Relationship::Computed {
+                function,
+                table: table.clone(),
+                foreign_table: foreign_table.clone(),
+                table_alias: table,
+                to_one: row.get("to_one"),
+                is_self,
+            });
+    }
+
+    Ok(())
 }
 
 /// Decode the `params` JSON built by [`load_routines`]'s query.
