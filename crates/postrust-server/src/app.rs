@@ -1563,6 +1563,7 @@ mod tests {
             function: QualifiedIdentifier::new("public", name),
             params: CallParams::None,
             returns_scalar: !returns_set,
+            return_type: None,
             returns_set,
             returns_composite: false,
             volatility: "Volatile".into(),
@@ -1574,6 +1575,7 @@ mod tests {
         CallPlan {
             returns_composite: true,
             returns_scalar: false,
+            return_type: None,
             ..call_plan(name, returns_set)
         }
     }

@@ -14,6 +14,12 @@ pub struct CallPlan {
     pub params: CallParams,
     /// Whether to return a scalar result
     pub returns_scalar: bool,
+    /// The declared return type, as PostgreSQL spells it.
+    ///
+    /// Used to decide whether this process can decode the result or whether
+    /// the database should render it, exactly as for a table's columns.
+    #[serde(default)]
+    pub return_type: Option<String>,
     /// Whether the function is set-returning
     pub returns_set: bool,
     /// Whether the return type is composite (row type or `record`): its
@@ -64,6 +70,7 @@ impl CallPlan {
             function: qi,
             params,
             returns_scalar,
+            return_type: routine.return_type.type_name().map(str::to_string),
             returns_set: routine.return_type.is_set_returning(),
             returns_composite: routine.returns_composite,
             volatility: format!("{:?}", routine.volatility),

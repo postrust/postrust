@@ -580,8 +580,29 @@ impl QueryBuilder {
 
         // The call itself is the source of rows; the read plan, when there is
         // one, shapes them exactly as it would shape a table's.
+        // A result this process cannot decode is rendered by the database,
+        // exactly as a column of such a type is. Without it a function
+        // returning `xml` or `bytea` answered null.
+        // A composite return -- OUT parameters, `RETURNS TABLE`, a row type --
+        // already expands to its own columns, and wrapping it would bury them
+        // under the function's name.
+        let render_as_json = read.is_none()
+            && !plan.returns_composite
+            && plan
+                .return_type
+                .as_deref()
+                .map(|t| !decodable_type(t) && t != "record")
+                .unwrap_or(false);
+
         let mut frag = SqlFragment::new();
         frag.push("SELECT ");
+        if render_as_json {
+            frag.push("to_jsonb(pgrst_scalar) AS ");
+            frag.push(&escape_ident(&plan.function.name));
+            frag.push(" FROM ");
+            frag.push(&from_qi(&qi));
+            frag.push("(");
+        }
         match read.filter(|tree| !tree.root.select.is_empty()) {
             Some(tree) => {
                 for (i, field) in tree.root.select.iter().enumerate() {
@@ -593,12 +614,16 @@ impl QueryBuilder {
                 }
             }
             None => {
-                frag.push("*");
+                if !render_as_json {
+                    frag.push("*");
+                }
             }
         }
-        frag.push(" FROM ");
-        frag.push(&from_qi(&qi));
-        frag.push("(");
+        if !render_as_json {
+            frag.push(" FROM ");
+            frag.push(&from_qi(&qi));
+            frag.push("(");
+        }
 
         // Arguments come off the wire as strings. Casting each one to the type
         // the function actually declares is what lets PostgreSQL resolve the
@@ -649,6 +674,9 @@ impl QueryBuilder {
         }
 
         frag.push(")");
+        if render_as_json {
+            frag.push(" AS pgrst_scalar");
+        }
 
         // Filters, ordering and paging over the returned rows.
         //
