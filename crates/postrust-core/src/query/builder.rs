@@ -554,7 +554,7 @@ impl QueryBuilder {
                             frag.push(&escape_ident(&column.name));
                         }
                         frag.push(" ");
-                        push_json_body(&mut frag, &qi, columns, body, false);
+                        push_json_body(&mut frag, columns, body, false);
 
                         // PUT names the row in the URL as well as in the body,
                         // and the two have to agree -- the conditions are
@@ -651,7 +651,7 @@ impl QueryBuilder {
                     frag.push(&escape_ident(&column.name));
                 }
                 frag.push(" ");
-                push_json_body(&mut frag, &qi, columns, body, true);
+                push_json_body(&mut frag, columns, body, true);
 
                 if !where_clauses.is_empty() {
                     frag.push(" WHERE ");
@@ -868,12 +868,10 @@ fn push_column_list(frag: &mut SqlFragment, columns: &[crate::plan::CoercibleFie
 /// body is.
 fn push_json_body(
     frag: &mut SqlFragment,
-    qi: &postrust_sql::identifier::QualifiedIdentifier,
     columns: &[crate::plan::CoercibleField],
     body: &bytes::Bytes,
     single: bool,
 ) {
-    let _ = qi;
     let body = String::from_utf8_lossy(body).into_owned();
     let object = body.trim_start().starts_with('{');
 
@@ -897,9 +895,10 @@ fn push_json_body(
             }
         }
     }
-    // `json_to_record` takes one object and `json_to_recordset` an array. A
-    // `PATCH` body is one object either way; an insert may be either, and the
-    // body itself says which.
+    // `json_to_record` takes one object and `json_to_recordset` an array. An
+    // update writes one set of values whatever it matches, so its body is one
+    // object -- and a body that is not is an error PostgreSQL words better
+    // than this could. An insert may be either, and the body says which.
     frag.push(match single || object {
         true => " FROM json_to_record(pgrst_payload.json_data) AS _(",
         false => " FROM json_to_recordset(pgrst_payload.json_data) AS _(",
@@ -911,10 +910,6 @@ fn push_json_body(
         frag.push(&escape_ident(&column.name));
         frag.push(" ");
         frag.push(castable_type(&column.ir_type).unwrap_or("text"));
-    }
-    frag.push(")");
-    if single && !object {
-        frag.push(" LIMIT 1");
     }
     frag.push(") pgrst_body");
 }
