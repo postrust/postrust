@@ -204,6 +204,16 @@ fn mutation_kind(api_request: &ApiRequest) -> Option<postrust_core::api_request:
 /// The prefix given to primary key columns added only to build `Location`.
 const LOCATION_KEY_PREFIX: &str = "pgrst_location_";
 
+/// Whether this request writes rows of a table.
+fn is_relation_mutation(api_request: &ApiRequest) -> bool {
+    use postrust_core::api_request::{Action, DbAction};
+
+    matches!(
+        &api_request.action,
+        Action::Db(DbAction::RelationMut { .. })
+    )
+}
+
 /// Whether this request writes the row its URL names.
 fn is_upsert(api_request: &ApiRequest) -> bool {
     use postrust_core::api_request::{Action, DbAction, Mutation};
@@ -524,11 +534,20 @@ async fn execute_plan(
                     }) =>
                 {
                     let schema_cache = state.schema_cache().await;
+                    // A computed relationship takes the parent's row, and a
+                    // mutation's result is a CTE whose row type is anonymous
+                    // -- there is nothing to pass it. Saying so here leaves
+                    // the embed out rather than referring to a column the
+                    // query does not have.
+                    let parent_row = match is_mutation(db_plan) {
+                        true => "",
+                        false => PARENT_ROW_COLUMN_REF,
+                    };
                     build_embed_expressions(
                         &schema_cache,
                         &parent_qi,
                         "src",
-                        PARENT_ROW_COLUMN_REF,
+                        parent_row,
                         &api_request.query_params.select,
                         &mut embed_filters,
                         &[],
@@ -1188,6 +1207,11 @@ fn read_target(
 
     match &api_request.action {
         Action::Db(DbAction::RelationRead { qi, .. }) => Some(qi.clone()),
+        // The rows a mutation affected are rows of that table, so `?select=`
+        // reaches through them to related resources exactly as it does on a
+        // read -- `DELETE /tasks?select=name,project:projects(id)` says what
+        // was deleted and what it belonged to.
+        Action::Db(DbAction::RelationMut { qi, .. }) => Some(qi.clone()),
         // A function returning a table's rows embeds, and renders, exactly as
         // that table does.
         Action::Db(DbAction::Routine { qi, .. }) => schema_cache
@@ -1471,8 +1495,12 @@ fn add_embed_join_columns(
 
         // A computed relationship joins on nothing -- the parent row is the
         // function's argument. That row has to be carried out of the inner
-        // query, which is a column of its own rather than a join key.
+        // query, which is a column of its own rather than a join key. A
+        // mutation has no such row to carry, so the embed is left out there.
         if plan.function.is_some() {
+            if is_relation_mutation(api_request) {
+                continue;
+            }
             if !added.iter().any(|c| c == PARENT_ROW_COLUMN) {
                 added.push(PARENT_ROW_COLUMN.to_string());
             }
@@ -2054,6 +2082,12 @@ fn build_embed_expressions(
                 )
             })?;
         let plan = postrust_core::embed::EmbedPlan::resolve(rel, schema_cache)?;
+
+        // No row to pass: the caller said the parent's is not expressible
+        // here, and a computed relationship is a function of it.
+        if plan.function.is_some() && parent_row.is_empty() {
+            continue;
+        }
 
         let child_alias = ctx.next_alias();
         let child_qi = postrust_core::api_request::QualifiedIdentifier::new(
