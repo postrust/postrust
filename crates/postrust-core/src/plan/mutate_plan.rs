@@ -174,12 +174,18 @@ impl MutatePlan {
         // Upsert uses PK for conflict
         let on_conflict = Some((PreferResolution::MergeDuplicates, table.pk_cols.clone()));
 
+        // The URL's filters narrow the *body*, not the table: a `PUT` writes
+        // the row the URL names, so a body row naming a different one is left
+        // unwritten rather than rejected outright. Whether exactly one row
+        // came of it is checked afterwards.
+        let where_clauses = build_mutation_where(request, table)?;
+
         Ok(Self::Insert {
             target: qi,
             columns,
             body,
             on_conflict,
-            where_clauses: vec![],
+            where_clauses,
             returning,
             pk_cols: table.pk_cols.clone(),
             apply_defaults: asked_for_defaults(request),
@@ -313,36 +319,9 @@ fn validate_put(request: &ApiRequest, table: &Table) -> Result<()> {
         return Err(Error::InvalidPutFilters);
     }
 
-    // The body may leave a key out -- the URL already said what it is -- but
-    // where it names one it has to be the same one. A body written as an
-    // array is checked element by element: `PUT` writes the row the URL names
-    // and no other, however many the body offers.
-    if let Some(Payload::ProcessedJson { raw, .. }) = &request.payload {
-        let rows = match serde_json::from_slice(raw) {
-            Ok(serde_json::Value::Object(row)) => vec![row],
-            Ok(serde_json::Value::Array(rows)) => rows
-                .into_iter()
-                .filter_map(|row| match row {
-                    serde_json::Value::Object(row) => Some(row),
-                    _ => None,
-                })
-                .collect(),
-            _ => vec![],
-        };
-
-        for row in rows {
-            for key in &table.pk_cols {
-                let Some(value) = row.get(key) else { continue };
-                let value = match value {
-                    serde_json::Value::String(text) => text.clone(),
-                    other => other.to_string(),
-                };
-                if keyed.get(key.as_str()) != Some(&value.as_str()) {
-                    return Err(Error::PutMatchingPk);
-                }
-            }
-        }
-    }
+    // Whether the body agrees with the URL is not decided here: the filters
+    // are applied to the body itself, so a row naming another key is simply
+    // not written, and the count that comes back says whether exactly one was.
 
     Ok(())
 }

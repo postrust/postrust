@@ -603,16 +603,18 @@ impl QueryBuilder {
                         push_json_body(&mut frag, columns, body, false, *apply_defaults);
 
                         // PUT names the row in the URL as well as in the body,
-                        // and the two have to agree -- the conditions are
-                        // written against the body so that a mismatch inserts
-                        // nothing rather than the wrong row.
+                        // and the two have to agree. The conditions are
+                        // written against the body, so a row naming another
+                        // key is left unwritten rather than writing the wrong
+                        // one -- and the count that comes back then says
+                        // whether the request meant exactly one row.
                         if !where_clauses.is_empty() {
                             frag.push(" WHERE ");
                             for (i, clause) in where_clauses.iter().enumerate() {
                                 if i > 0 {
                                     frag.push(" AND ");
                                 }
-                                frag.append(Self::build_logic_tree(clause)?);
+                                frag.append(Self::build_logic_tree_in(Some("pgrst_body"), clause)?);
                             }
                         }
                     }

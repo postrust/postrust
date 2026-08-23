@@ -1083,6 +1083,15 @@ async fn execute_plan(
                 }
             }
 
+            // A `PUT` writes the row its URL names, and exactly that row. The
+            // filters were applied to the body, so a body naming some other
+            // row wrote nothing -- and one naming several wrote several. Both
+            // are the same mistake, and PostgreSQL cannot report it because
+            // neither is a database error.
+            if is_upsert(api_request) && json_rows.len() != 1 {
+                return Err(postrust_core::Error::PutMatchingPk);
+            }
+
             // The created row's own address, taken from its key and then
             // removed from the body -- the client asked for a `?select=`, not
             // for the key.
