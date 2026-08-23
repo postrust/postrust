@@ -402,7 +402,42 @@ pub enum LogicTree {
     Stmt(Filter),
 }
 
+/// The names embedded resources answer to in a selection.
+///
+/// The name a filter would use is the one the response uses: the alias where
+/// there is one, the relation's own name otherwise. A spread has neither --
+/// its columns land in the parent and nothing is named -- so there is nothing
+/// to filter by.
+pub fn embedded_names(select: &[SelectItem]) -> Vec<String> {
+    select
+        .iter()
+        .filter_map(|item| match item {
+            SelectItem::Relation {
+                relation, alias, ..
+            } => Some(alias.clone().unwrap_or_else(|| relation.clone())),
+            _ => None,
+        })
+        .collect()
+}
+
 impl LogicTree {
+    /// Whether every leaf of this tree names one of `embeds`.
+    ///
+    /// `or=(clientinfo.not.is.null,contact.not.is.null)` asks about embedded
+    /// resources rather than about columns: whether the related row was
+    /// there. Those are not names the table has, so a tree made only of them
+    /// cannot be evaluated where the table's own filters are -- it has to
+    /// wait until the embeds themselves are in scope. Answering this decides
+    /// which of the two places the tree belongs to.
+    pub fn names_only(&self, embeds: &[String]) -> bool {
+        match self {
+            Self::Expr { children, .. } => {
+                !children.is_empty() && children.iter().all(|child| child.names_only(embeds))
+            }
+            Self::Stmt(filter) => embeds.contains(&filter.field.name),
+        }
+    }
+
     pub fn and(children: Vec<LogicTree>) -> Self {
         Self::Expr {
             negated: false,

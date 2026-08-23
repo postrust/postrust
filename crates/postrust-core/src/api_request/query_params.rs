@@ -104,12 +104,7 @@ pub fn parse_query_params(query: &str, is_rpc: bool) -> Result<QueryParams> {
                 params.select = parse_select(&decoded_value)?;
             }
             "columns" => {
-                params.columns = Some(
-                    decoded_value
-                        .split(',')
-                        .map(|s| s.trim().to_string())
-                        .collect(),
-                );
+                params.columns = Some(parse_columns(&decoded_value)?.into_iter().collect());
             }
             "on_conflict" => {
                 params.on_conflict = Some(
@@ -154,6 +149,50 @@ pub fn parse_query_params(query: &str, is_rpc: bool) -> Result<QueryParams> {
 // ============================================================================
 // Select Parsing
 // ============================================================================
+
+/// Parse the `columns` parameter value.
+///
+/// A list of field names and nothing else, so the only thing that can go wrong
+/// is a name that is not there -- `?columns=` names none, and `?columns=a,,b`
+/// leaves a gap in the middle. Both were read as a field whose name is the
+/// empty string, which got as far as the schema cache and came back as
+/// "Could not find the '' column", describing a lookup the client never asked
+/// for rather than the parameter it actually wrote.
+fn parse_columns(input: &str) -> Result<Vec<String>> {
+    const EXPECTED: &str = "expecting field name (* or [a..z0..9_$])";
+
+    let mut columns = Vec::new();
+    let mut at = 0usize;
+
+    for (index, field) in input.split(',').enumerate() {
+        if index > 0 {
+            // The comma that separated this field from the last one.
+            at += 1;
+        }
+        let trimmed = field.trim();
+        if trimmed.is_empty() {
+            return Err(Error::UnparsableQuery {
+                kind: "columns parameter",
+                text: input.to_string(),
+                // Counting from one, at the character that should have begun
+                // the name -- the end of the input where there is none left.
+                column: at + 1,
+                expected: match at >= input.len() {
+                    true => format!("unexpected end of input {}", EXPECTED),
+                    false => format!(
+                        "unexpected {:?} {}",
+                        input[at..].chars().next().unwrap_or_default(),
+                        EXPECTED
+                    ),
+                },
+            });
+        }
+        columns.push(trimmed.to_string());
+        at += field.len();
+    }
+
+    Ok(columns)
+}
 
 /// Parse the `select` parameter value.
 pub fn parse_select(input: &str) -> Result<Vec<SelectItem>> {
@@ -1223,6 +1262,21 @@ fn parse_json_operand(input: &str) -> IResult<&str, JsonOperand> {
 
     let operand = match key.parse::<i32>() {
         Ok(index) => JsonOperand::Idx(index),
+        // A leading `-` begins an array index counted from the end, so what
+        // follows it has to be a number. `data->>--34` was read as a key
+        // literally named `--34` and answered 200 with nulls, where the
+        // grammar has no such key in it and PostgREST says so.
+        // A `Failure` rather than an `Error`: the arrow has already been read,
+        // so this is not a step that some other rule might match instead.
+        // Reported as a recoverable error, `alt` backtracked from `->>` to
+        // `->` and read the rest as a key beginning with `>`, which turned a
+        // malformed index into an ordinary lookup that answered 200.
+        Err(_) if key.starts_with('-') => {
+            return Err(nom::Err::Failure(nom::error::Error::new(
+                &input[1..],
+                nom::error::ErrorKind::Digit,
+            )))
+        }
         Err(_) => JsonOperand::Key(key.to_string()),
     };
     Ok((rest, operand))
@@ -1519,4 +1573,49 @@ mod tests {
             _ => panic!("Expected FTS operation"),
         }
     }
+    /// `?columns=` names no field, and is reported as the parameter it is.
+    #[test]
+    fn an_empty_columns_parameter_is_a_parse_error() {
+        let error = parse_columns("").unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "\"failed to parse columns parameter ()\" (line 1, column 1)"
+        );
+        match error {
+            Error::UnparsableQuery { expected, .. } => assert_eq!(
+                expected,
+                "unexpected end of input expecting field name (* or [a..z0..9_$])"
+            ),
+            other => panic!("wrong variant: {:?}", other),
+        }
+    }
+
+    /// A gap in the middle is reported where the gap is, not at the end.
+    #[test]
+    fn a_missing_field_in_columns_is_reported_where_it_is() {
+        let error = parse_columns("a,,b").unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "\"failed to parse columns parameter (a,,b)\" (line 1, column 3)"
+        );
+    }
+
+    #[test]
+    fn columns_parses_a_plain_list() {
+        assert_eq!(
+            parse_columns("a, b ,c").unwrap(),
+            vec!["a".to_string(), "b".to_string(), "c".to_string()]
+        );
+    }
+
+    /// A `-` inside a JSON path begins an index, so a non-number after it is
+    /// not a key by another name.
+    #[test]
+    fn a_json_path_index_that_is_not_a_number_is_refused() {
+        assert!(parse_select("data->>--34").is_err());
+        assert!(parse_select("data->>-34").is_ok());
+        assert!(parse_select("data->>34").is_ok());
+        assert!(parse_select("data->>key").is_ok());
+    }
+
 }
