@@ -60,7 +60,8 @@ pub async fn load_tables(pool: &PgPool, schemas: &[String]) -> Result<TablesMap>
                 WHERE tp.table_schema = t.table_schema
                   AND tp.table_name = t.table_name
                   AND tp.privilege_type = 'DELETE'
-            ) as deletable
+            ) as deletable,
+            COALESCE(k.is_partitioned, false) as is_partitioned
         FROM (
             -- `information_schema.tables` has no row for a materialized view,
             -- so one is added from the catalogue. Everything downstream keys
@@ -76,6 +77,12 @@ pub async fn load_tables(pool: &PgPool, schemas: &[String]) -> Result<TablesMap>
               JOIN pg_namespace n ON n.oid = c.relnamespace
              WHERE c.relkind = 'm'
         ) t
+        LEFT JOIN LATERAL (
+            SELECT c.relkind = 'p' AS is_partitioned
+              FROM pg_class c
+              JOIN pg_namespace n ON n.oid = c.relnamespace
+             WHERE n.nspname = t.table_schema AND c.relname = t.table_name
+        ) k ON true
         WHERE t.table_schema = ANY($1)
         ORDER BY t.table_schema, t.table_name
         "#,
@@ -98,6 +105,7 @@ pub async fn load_tables(pool: &PgPool, schemas: &[String]) -> Result<TablesMap>
             name: name.clone(),
             description: row.get("description"),
             is_view: table_type == "VIEW",
+            is_partitioned: row.get("is_partitioned"),
             insertable: row.get("insertable"),
             updatable: row.get("updatable"),
             deletable: row.get("deletable"),

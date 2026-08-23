@@ -16,6 +16,12 @@ pub struct Table {
     pub description: Option<String>,
     /// Whether this is a view (vs a table)
     pub is_view: bool,
+    /// Whether this is a partitioned table.
+    ///
+    /// It behaves as a table for reading and writing, but not for everything:
+    /// a system column such as `xmax` cannot be read back from one.
+    #[serde(default)]
+    pub is_partitioned: bool,
     /// Whether INSERT is allowed
     pub insertable: bool,
     /// Whether UPDATE is allowed
@@ -156,6 +162,7 @@ mod tests {
             pk_cols: vec!["id".into()],
             columns: IndexMap::new(),
             computed_columns: Default::default(),
+            is_partitioned: false,
         };
 
         let qi = table.qualified_identifier();

@@ -554,6 +554,7 @@ impl QueryBuilder {
                 on_conflict,
                 where_clauses,
                 returning,
+                reports_inserted,
                 ..
             } => {
                 let qi = postrust_sql::identifier::QualifiedIdentifier::new(
@@ -657,7 +658,7 @@ impl QueryBuilder {
                 // one, which is the difference between 201 and 200 and is
                 // knowable only here: `xmax` is zero on a row this statement
                 // created and non-zero on one it updated.
-                if on_conflict.is_some() && !returning.is_empty() {
+                if on_conflict.is_some() && *reports_inserted && !returning.is_empty() {
                     frag.push(", (xmax = 0) AS ");
                     frag.push(&escape_ident(INSERTED_COLUMN));
                 }

@@ -125,6 +125,7 @@ mod tests {
             returning: vec!["id".into()],
             pk_cols: vec!["id".into()],
             apply_defaults: true,
+            reports_inserted: false,
         };
         let read = ReadPlan {
             select: vec![CoercibleSelectField::simple("id", "bigint")],

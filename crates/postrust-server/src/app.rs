@@ -201,6 +201,41 @@ fn mutation_kind(api_request: &ApiRequest) -> Option<postrust_core::api_request:
     }
 }
 
+/// Split a leading `WITH ... AS (...)` off the front of a statement.
+///
+/// Returns the clause -- with its trailing space, or empty when there is none
+/// -- and the statement that follows it. A `WITH` containing an `INSERT`,
+/// `UPDATE` or `DELETE` may only appear at the top level, so anything that
+/// wraps the statement has to wrap what follows the clause and put the clause
+/// back in front.
+fn split_leading_cte(sql: &str) -> (String, &str) {
+    let Some(open) = sql.strip_prefix("WITH ").and_then(|rest| rest.find('(')) else {
+        return (String::new(), sql);
+    };
+    let open = open + "WITH ".len();
+
+    let mut depth = 0usize;
+    let mut quoted = None::<char>;
+    for (index, ch) in sql[open..].char_indices() {
+        match (quoted, ch) {
+            (Some(quote), ch) if ch == quote => quoted = None,
+            (Some(_), _) => {}
+            (None, '\'') | (None, '"') => quoted = Some(ch),
+            (None, '(') => depth += 1,
+            (None, ')') => {
+                depth -= 1;
+                if depth == 0 {
+                    let end = open + index + 1;
+                    return (format!("{} ", &sql[..end]), sql[end..].trim_start());
+                }
+            }
+            _ => {}
+        }
+    }
+
+    (String::new(), sql)
+}
+
 /// The prefix given to primary key columns added only to build `Location`.
 const LOCATION_KEY_PREFIX: &str = "pgrst_location_";
 
@@ -621,8 +656,16 @@ async fn execute_plan(
                     projection.push_str(" AS ");
                     projection.push_str(&postrust_sql::escape_ident(field_name));
                 }
+                // A data-modifying `WITH` has to stay at the top level:
+                // PostgreSQL refuses one nested inside a subquery, which is
+                // where wrapping the whole statement would put it. The clause
+                // is lifted out and put back in front of the wrapper.
                 let inner_sql = std::mem::take(&mut sql);
-                sql = format!("SELECT {} FROM ({}) AS src", projection, inner_sql);
+                let (with_clause, inner_sql) = split_leading_cte(&inner_sql);
+                sql = format!(
+                    "{}SELECT {} FROM ({}) AS src",
+                    with_clause, projection, inner_sql
+                );
 
                 // `?clients=is.null` asks whether the embed matched anything,
                 // not about a column. The embed's expression is the thing to
@@ -669,7 +712,11 @@ async fn execute_plan(
                 // so the count has to be taken after them -- the same wrapper,
                 // over the unpaged query.
                 count_sql = count_sql.map(|base| {
-                    let mut counted = format!("SELECT {} FROM ({}) AS src", projection, base);
+                    let (with_clause, base) = split_leading_cte(&base);
+                    let mut counted = format!(
+                        "{}SELECT {} FROM ({}) AS src",
+                        with_clause, projection, base
+                    );
                     if !predicates.is_empty() {
                         counted.push_str(" WHERE ");
                         counted.push_str(&predicates.join(" AND "));
@@ -2752,6 +2799,32 @@ fn sanitize_error_message(error: &postrust_core::Error) -> String {
 
 #[cfg(test)]
 mod tests {
+    /// A data-modifying `WITH` may only appear at the top level, so anything
+    /// that wraps the statement has to leave the clause where it is.
+    #[test]
+    fn a_leading_cte_is_lifted_off_the_statement() {
+        let (clause, body) = super::split_leading_cte(
+            "WITH pgrst_mutation_result AS (DELETE FROM t WHERE n = ')' RETURNING t.id) \
+             SELECT \"id\" FROM \"pgrst_mutation_result\"",
+        );
+
+        assert_eq!(
+            clause,
+            "WITH pgrst_mutation_result AS (DELETE FROM t WHERE n = ')' RETURNING t.id) "
+        );
+        assert_eq!(body, "SELECT \"id\" FROM \"pgrst_mutation_result\"");
+    }
+
+    /// A plain read has no clause to lift.
+    #[test]
+    fn a_statement_without_a_cte_is_left_alone() {
+        let sql = "SELECT \"id\" FROM \"test\".\"items\"";
+        let (clause, body) = super::split_leading_cte(sql);
+
+        assert!(clause.is_empty());
+        assert_eq!(body, sql);
+    }
+
     use super::*;
     use postrust_core::plan::CallParams;
     use postrust_core::QualifiedIdentifier;

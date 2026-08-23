@@ -27,6 +27,12 @@ pub enum MutatePlan {
         pk_cols: Vec<String>,
         /// Apply defaults for missing columns
         apply_defaults: bool,
+        /// Whether the statement can report which rows it created.
+        ///
+        /// It asks PostgreSQL for `xmax`, which a plain table will give back
+        /// and a view or a partitioned table will not.
+        #[serde(default)]
+        reports_inserted: bool,
     },
     /// UPDATE operation
     Update {
@@ -114,6 +120,7 @@ impl MutatePlan {
             returning,
             pk_cols: table.pk_cols.clone(),
             apply_defaults,
+            reports_inserted: !table.is_view && !table.is_partitioned,
         })
     }
 
@@ -178,6 +185,7 @@ impl MutatePlan {
             returning,
             pk_cols: table.pk_cols.clone(),
             apply_defaults: true,
+            reports_inserted: !table.is_view && !table.is_partitioned,
         })
     }
 
@@ -408,6 +416,7 @@ mod tests {
             returning: vec![],
             pk_cols: vec![],
             apply_defaults: true,
+            reports_inserted: false,
         };
         assert!(insert.has_body());
 

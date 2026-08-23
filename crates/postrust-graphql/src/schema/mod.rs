@@ -656,6 +656,7 @@ mod tests {
             pk_cols: vec!["id".into()],
             columns,
             computed_columns: Default::default(),
+            is_partitioned: false,
         }
     }
 
@@ -955,6 +956,7 @@ mod tests {
             pk_cols: vec!["id".into()],
             columns: indexmap::IndexMap::new(),
             computed_columns: Default::default(),
+            is_partitioned: false,
         };
         cache
             .tables

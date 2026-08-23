@@ -1857,6 +1857,7 @@ mod tests {
             pk_cols: vec!["id".into()],
             columns,
             computed_columns: Default::default(),
+            is_partitioned: false,
         }
     }
 
