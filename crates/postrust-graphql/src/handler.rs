@@ -262,10 +262,13 @@ fn build_dynamic_schema(
     let subscription = subscription_fields.map(create_subscription_type);
 
     // Build schema
+    // `query_root`, not `Query`. The root type's name is not private to the
+    // server: a fragment is declared `on query_root`, and a client that writes
+    // one names the type it was generated against.
     let mut builder = Schema::build(
-        "Query",
-        mutation.as_ref().map(|_| "Mutation"),
-        subscription.as_ref().map(|_| "Subscription"),
+        "query_root",
+        mutation.as_ref().map(|_| "mutation_root"),
+        subscription.as_ref().map(|_| "subscription_root"),
     );
 
     // Register all object types
@@ -635,7 +638,7 @@ fn create_query_type(
     max_rows: Option<i64>,
     relationships: Arc<HashMap<String, Vec<RelationshipField>>>,
 ) -> Object {
-    let mut query = Object::new("Query");
+    let mut query = Object::new("query_root");
 
     for field in &generated.query_fields {
         let table_name = field.table_name.clone();
@@ -759,9 +762,26 @@ fn create_query_type(
     query
 }
 
+/// Add the operators an update may be written with.
+///
+/// All optional, and at least one required -- which GraphQL cannot express, so
+/// the resolver says so instead of the schema. Making `_set` non-null would
+/// have been expressible and wrong: an update that only increments a counter
+/// never sends one.
+fn with_update_operators(field: Field) -> Field {
+    field
+        .argument(InputValue::new("_set", TypeRef::named("JSON")))
+        .argument(InputValue::new("_inc", TypeRef::named("JSON")))
+        .argument(InputValue::new("_append", TypeRef::named("JSON")))
+        .argument(InputValue::new("_prepend", TypeRef::named("JSON")))
+        .argument(InputValue::new("_delete_key", TypeRef::named("JSON")))
+        .argument(InputValue::new("_delete_elem", TypeRef::named("JSON")))
+        .argument(InputValue::new("_delete_at_path", TypeRef::named("JSON")))
+}
+
 /// Create the Mutation type with all mutation fields.
 fn create_mutation_type(generated: &GeneratedSchema) -> Object {
-    let mut mutation = Object::new("Mutation");
+    let mut mutation = Object::new("mutation_root");
 
     for field in &generated.mutation_fields {
         let table_name = field.table_name.clone();
@@ -805,20 +825,21 @@ fn create_mutation_type(generated: &GeneratedSchema) -> Object {
                     gql_field.argument(InputValue::new("object", TypeRef::named_nn("JSON")));
             }
             MutationType::UpdateByPk => {
-                gql_field = gql_field
-                    .argument(InputValue::new("_set", TypeRef::named("JSON")))
-                    .argument(InputValue::new(
-                        "pk_columns",
-                        TypeRef::named_nn(format!("{}_pk_columns_input", where_type)),
-                    ));
+                gql_field = gql_field.argument(InputValue::new(
+                    "pk_columns",
+                    TypeRef::named_nn(format!("{}_pk_columns_input", where_type)),
+                ));
+                gql_field = with_update_operators(gql_field);
             }
             MutationType::Update => {
                 gql_field = gql_field
                     .argument(InputValue::new(
                         "where",
-                        TypeRef::named(crate::input::bool_exp::bool_exp_type_name(&where_type)),
-                    ))
-                    .argument(InputValue::new("_set", TypeRef::named_nn("JSON")));
+                        TypeRef::named_nn(crate::input::bool_exp::bool_exp_type_name(
+                            &where_type,
+                        )),
+                    ));
+                gql_field = with_update_operators(gql_field);
             }
             MutationType::DeleteByPk => {
                 for (col_name, pg_type) in &pk_columns {
@@ -848,7 +869,7 @@ fn create_mutation_type(generated: &GeneratedSchema) -> Object {
 
 /// Create the Subscription type with all subscription fields.
 fn create_subscription_type(fields: &[SubField]) -> Subscription {
-    let mut subscription = Subscription::new("Subscription");
+    let mut subscription = Subscription::new("subscription_root");
 
     for field in fields {
         let channel_name = field.channel_name();
@@ -1350,17 +1371,34 @@ async fn resolve_mutation<'a>(
                 table_name,
                 gql_ctx.role(),
                 objects,
+                column_types_of(&gql_ctx.schema_cache, schema_name, table_name).await,
                 mutation_type,
             )
             .await?
         }
         MutationType::Update | MutationType::UpdateByPk => {
-            let set_value = ctx
-                .args
-                .try_get("_set")
-                .ok()
-                .map(|v| accessor_to_json(&v))
-                .unwrap_or_else(|| serde_json::json!({}));
+            // `_set` replaces, the others read the column they write. A client
+            // may send more than one, so all of them are collected rather than
+            // the first that happens to be present.
+            const OPERATORS: [&str; 7] = [
+                "_set",
+                "_inc",
+                "_append",
+                "_prepend",
+                "_delete_key",
+                "_delete_elem",
+                "_delete_at_path",
+            ];
+            let operators: Vec<(&'static str, serde_json::Value)> = OPERATORS
+                .iter()
+                .filter_map(|name| {
+                    ctx.args
+                        .try_get(name)
+                        .ok()
+                        .map(|v| (*name, accessor_to_json(&v)))
+                })
+                .filter(|(_, value)| !value.is_null())
+                .collect();
 
             let where_clause = if mutation_type == MutationType::UpdateByPk {
                 Some(pk_where_from_args(ctx, table_name, pk_columns)?)
@@ -1373,7 +1411,8 @@ async fn resolve_mutation<'a>(
                 schema_name,
                 table_name,
                 gql_ctx.role(),
-                set_value,
+                operators,
+                column_types_of(&gql_ctx.schema_cache, schema_name, table_name).await,
                 where_clause,
                 mutation_type,
             )
@@ -1473,6 +1512,43 @@ async fn execute_query_on(
     Ok(results)
 }
 
+/// The cast a written value needs to reach a column of this type.
+///
+/// A bound parameter arrives as text. PostgreSQL will coerce it to a numeric
+/// or a date on assignment, but not to `jsonb`, an array, or a user-defined
+/// type -- `column "details" is of type jsonb but expression is of type text`
+/// is what an uncast insert answers. Naming the column's own type covers all
+/// of them and changes nothing where the coercion would have worked anyway.
+fn write_cast(column_types: &HashMap<String, String>, column: &str) -> String {
+    match column_types.get(column) {
+        Some(pg_type) => format!("::{}", pg_type),
+        None => String::new(),
+    }
+}
+
+/// Every column of a table with the type it is declared as.
+async fn column_types_of(
+    schema_cache: &postrust_core::schema_cache::SchemaCacheRef,
+    schema_name: &str,
+    table_name: &str,
+) -> HashMap<String, String> {
+    let Ok(guard) = schema_cache.get().await else {
+        return HashMap::new();
+    };
+    let Some(cache) = guard.as_ref() else {
+        return HashMap::new();
+    };
+    let qi = postrust_core::api_request::QualifiedIdentifier::new(schema_name, table_name);
+    match cache.get_table(&qi) {
+        Some(table) => table
+            .columns
+            .values()
+            .map(|c| (c.name.clone(), c.nominal_type.clone()))
+            .collect(),
+        None => HashMap::new(),
+    }
+}
+
 /// Execute an insert mutation.
 async fn execute_insert<'a>(
     pool: &PgPool,
@@ -1480,6 +1556,7 @@ async fn execute_insert<'a>(
     table_name: &str,
     role: &str,
     objects: serde_json::Value,
+    column_types: HashMap<String, String>,
     mutation_type: MutationType,
 ) -> Result<Option<FieldValue<'a>>, async_graphql::Error> {
     use sqlx::Row;
@@ -1509,8 +1586,11 @@ async fn execute_insert<'a>(
         if let serde_json::Value::Object(map) = obj {
             // Build INSERT query
             let columns: Vec<&str> = map.keys().map(|k| k.as_str()).collect();
-            let placeholders: Vec<String> =
-                (1..=columns.len()).map(|i| format!("${}", i)).collect();
+            let placeholders: Vec<String> = columns
+                .iter()
+                .enumerate()
+                .map(|(i, column)| format!("${}{}", i + 1, write_cast(&column_types, column)))
+                .collect();
 
             let sql = format!(
                 "INSERT INTO {}.{} ({}) VALUES ({}) RETURNING row_to_json({}.{}.*)",
@@ -1602,35 +1682,83 @@ async fn execute_update<'a>(
     schema_name: &str,
     table_name: &str,
     role: &str,
-    set_value: serde_json::Value,
+    operators: Vec<(&'static str, serde_json::Value)>,
+    column_types: HashMap<String, String>,
     where_clause: Option<serde_json::Value>,
     mutation_type: MutationType,
 ) -> Result<Option<FieldValue<'a>>, async_graphql::Error> {
     use sqlx::Row;
 
-    trace!("Update mutation for {}: {:?}", table_name, set_value);
-
-    let set_map = match set_value {
-        serde_json::Value::Object(map) => map,
-        _ => return Err(async_graphql::Error::new("set must be an object")),
-    };
-
-    if set_map.is_empty() {
-        return Err(async_graphql::Error::new("set cannot be empty"));
-    }
+    trace!("Update mutation for {}: {:?}", table_name, operators);
 
     let mut conn = begin_with_role(pool, role).await?;
 
-    // Build SET clause
+    // Build the SET clause. Each operator writes a column in terms of itself
+    // except `_set`, which replaces it -- `_inc` adds, the jsonb operators
+    // concatenate or remove, and a client may send several in one mutation as
+    // long as they name different columns.
     let mut set_parts: Vec<String> = Vec::new();
+    let mut set_values: Vec<serde_json::Value> = Vec::new();
     let mut param_idx = 1;
-    for key in set_map.keys() {
-        set_parts.push(format!(
-            "{} = ${}",
-            postrust_sql::escape_ident(key),
-            param_idx
-        ));
-        param_idx += 1;
+    let mut written: HashSet<String> = HashSet::new();
+
+    for (operator, payload) in &operators {
+        let serde_json::Value::Object(map) = payload else {
+            return Err(async_graphql::Error::new(format!(
+                "\"{}\" takes an object mapping columns to values",
+                operator
+            )));
+        };
+        for (column, value) in map {
+            if !written.insert(column.clone()) {
+                return Err(async_graphql::Error::new(format!(
+                    "\"{}\" is written twice in one update; a column may be \
+                     changed by one operator at a time",
+                    column
+                )));
+            }
+            let quoted = postrust_sql::escape_ident(column);
+            // `_set` writes the column, so its value is cast to the column's
+            // type. The others already say what they need -- `::jsonb` for a
+            // concatenation, `::text[]` for a path -- and casting twice would
+            // be wrong for `_delete_elem`, whose operand is an integer rather
+            // than a value of the column.
+            let placeholder = if *operator == "_set" {
+                format!("${}{}", param_idx, write_cast(&column_types, column))
+            } else {
+                format!("${}", param_idx)
+            };
+            // The assignment PostgreSQL needs, which for everything but `_set`
+            // reads the column's current value.
+            let assignment = match *operator {
+                "_set" => format!("{} = {}", quoted, placeholder),
+                "_inc" => format!("{} = {} + {}", quoted, quoted, placeholder),
+                "_append" => format!("{} = {} || {}::jsonb", quoted, quoted, placeholder),
+                "_prepend" => format!("{} = {}::jsonb || {}", quoted, placeholder, quoted),
+                "_delete_key" => format!("{} = {} - {}::text", quoted, quoted, placeholder),
+                "_delete_elem" => format!("{} = {} - {}::int", quoted, quoted, placeholder),
+                "_delete_at_path" => {
+                    format!("{} = {} #- {}::text[]", quoted, quoted, placeholder)
+                }
+                other => {
+                    return Err(async_graphql::Error::new(format!(
+                        "unsupported update operator \"{}\"",
+                        other
+                    )))
+                }
+            };
+            set_parts.push(assignment);
+            set_values.push(value.clone());
+            param_idx += 1;
+        }
+    }
+
+    if set_parts.is_empty() {
+        return Err(async_graphql::Error::new(format!(
+            "update on \"{}\" changes nothing; give it _set, _inc or one of \
+             the jsonb operators",
+            table_name
+        )));
     }
 
     // Build WHERE clause
@@ -1664,7 +1792,7 @@ async fn execute_update<'a>(
     let mut query = sqlx::query(&sql);
 
     // Bind SET values
-    for val in set_map.values() {
+    for val in &set_values {
         query = bind_json_value(query, val);
     }
 
