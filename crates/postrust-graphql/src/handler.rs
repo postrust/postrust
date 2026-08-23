@@ -991,7 +991,7 @@ async fn resolve_aggregate<'a>(
             parts.join(", "),
             inner
         );
-        let mut conn = begin_with_role(pool, gql_ctx.role()).await?;
+        let mut conn = begin_with_session(pool, gql_ctx.role(), &gql_ctx.session_settings()).await?;
         let rows = execute_query_on(&mut conn, &sql, &bound_values).await?;
         conn.commit().await?;
         if let Some(first) = rows.into_iter().next() {
@@ -1009,7 +1009,7 @@ async fn resolve_aggregate<'a>(
             "SELECT row_to_json(pgrst_nodes)::text FROM ({}) AS pgrst_nodes",
             inner
         );
-        let mut conn = begin_with_role(pool, gql_ctx.role()).await?;
+        let mut conn = begin_with_session(pool, gql_ctx.role(), &gql_ctx.session_settings()).await?;
         let rows = execute_query_on(&mut conn, &sql, &bound_values).await?;
         conn.commit().await?;
         result.insert(
@@ -1196,7 +1196,7 @@ async fn resolve_query<'a>(
     // One transaction for the query and any embeds hanging off it, so the role
     // applies to all of them and the parent and child rows come from a single
     // snapshot.
-    let mut tx = begin_with_role(pool, gql_ctx.role()).await?;
+    let mut tx = begin_with_session(pool, gql_ctx.role(), &gql_ctx.session_settings()).await?;
 
     // Execute query - returns Vec<serde_json::Value>
     let mut result = execute_query_on(&mut tx, &sql, &bound_values).await?;
@@ -1342,7 +1342,29 @@ async fn begin_with_role(
     pool: &PgPool,
     role: &str,
 ) -> Result<sqlx::Transaction<'static, sqlx::Postgres>, async_graphql::Error> {
+    begin_with_session(pool, role, &[]).await
+}
+
+/// Begin a transaction with the request's role and session variables applied.
+///
+/// The settings go in before the role does. A role with fewer privileges may
+/// not be allowed to call `set_config` at all, and a policy that reads a
+/// setting the caller could then change is not a policy.
+async fn begin_with_session(
+    pool: &PgPool,
+    role: &str,
+    settings: &[(String, String)],
+) -> Result<sqlx::Transaction<'static, sqlx::Postgres>, async_graphql::Error> {
     let mut tx = pool.begin().await?;
+
+    for (name, value) in settings {
+        sqlx::query("SELECT set_config($1, $2, true)")
+            .bind(name)
+            .bind(value)
+            .execute(&mut *tx)
+            .await?;
+    }
+
     sqlx::query(&format!(
         "SET LOCAL ROLE {}",
         postrust_sql::escape_ident(role)

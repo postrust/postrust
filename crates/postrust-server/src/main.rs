@@ -195,11 +195,23 @@ async fn main() -> Result<()> {
                 (*app_state.gql_state.schema_cache).clone(),
             );
 
+            // Session variables come from the verified token, never from the
+            // request's own headers. Hasura reads `X-Hasura-User-Id` off the
+            // wire because it has an admin secret to gate that on; here a raw
+            // header would let any caller name its own identity, and a policy
+            // reading a value the caller chose is not a policy. A client
+            // migrating from Hasura keeps sending the same JWT, and its
+            // `x-hasura-*` claims -- top level or under Hasura's own namespace
+            // -- are what a row-level security policy reads as
+            // `current_setting('hasura.user_id')`.
+            let session = hasura_session_from_claims(&auth_result.claims);
+
             let gql_ctx = postrust_graphql::context::GraphQLContext::new(
                 app_state.gql_state.pool.clone(),
                 schema_cache_ref,
                 auth_result,
-            );
+            )
+            .with_session(session);
 
             let request = req
                 .into_inner()
@@ -208,6 +220,50 @@ async fn main() -> Result<()> {
                 .data(Arc::clone(&app_state.gql_state.broker));
             let response = app_state.gql_state.schema.execute(request).await;
             Json(postrust_graphql::hasura::envelope(response))
+        }
+
+        /// Collect `x-hasura-*` claims from a verified token.
+        ///
+        /// Hasura puts them under `https://hasura.io/jwt/claims` by default and
+        /// allows them at the top level; both spellings are read, and the
+        /// prefix is dropped so a policy names `hasura.user_id` rather than
+        /// `hasura.x-hasura-user-id`. `x-hasura-role` is left out: the role is
+        /// what the token was authenticated as, and re-reading it here would
+        /// let a claim override that decision.
+        fn hasura_session_from_claims(
+            claims: &std::collections::HashMap<String, serde_json::Value>,
+        ) -> std::collections::HashMap<String, String> {
+            const NAMESPACE: &str = "https://hasura.io/jwt/claims";
+            let mut session = std::collections::HashMap::new();
+
+            let mut take = |key: &str, value: &serde_json::Value| {
+                let lowered = key.to_ascii_lowercase();
+                let Some(name) = lowered.strip_prefix("x-hasura-") else {
+                    return;
+                };
+                if name == "role" || name.is_empty() {
+                    return;
+                }
+                // A claim may be a string, a number or a list of ids; the
+                // setting is text either way, and a string keeps its own
+                // spelling rather than gaining quotes.
+                let rendered = match value {
+                    serde_json::Value::String(text) => text.clone(),
+                    other => other.to_string(),
+                };
+                session.insert(name.replace('-', "_"), rendered);
+            };
+
+            if let Some(serde_json::Value::Object(namespaced)) = claims.get(NAMESPACE) {
+                for (key, value) in namespaced {
+                    take(key, value);
+                }
+            }
+            for (key, value) in claims {
+                take(key, value);
+            }
+
+            session
         }
 
         // Add GraphQL routes with WebSocket support for subscriptions

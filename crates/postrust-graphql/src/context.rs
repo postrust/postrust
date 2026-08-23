@@ -3,6 +3,7 @@
 use postrust_auth::AuthResult;
 use postrust_core::schema_cache::SchemaCacheRef;
 use sqlx::PgPool;
+use std::collections::HashMap;
 
 /// Context available to all GraphQL resolvers.
 pub struct GraphQLContext {
@@ -12,6 +13,16 @@ pub struct GraphQLContext {
     pub schema_cache: SchemaCacheRef,
     /// Authentication result with role and claims.
     pub auth: AuthResult,
+    /// Session variables carried into the transaction, without their
+    /// `x-hasura-` prefix and lowercased: `user_id`, `org_id`.
+    ///
+    /// This is the half of Hasura's permission model that transfers. Its rules
+    /// live in metadata and are compiled into every query; here permissions
+    /// live in the database as roles and row level security, and what a policy
+    /// needs is the caller's identity. A policy written against
+    /// `current_setting('hasura.user_id')` sees what the Hasura permission
+    /// would have seen.
+    pub session: HashMap<String, String>,
 }
 
 impl GraphQLContext {
@@ -21,7 +32,33 @@ impl GraphQLContext {
             pool,
             schema_cache,
             auth,
+            session: HashMap::new(),
         }
+    }
+
+    /// Carry session variables into every transaction this request opens.
+    pub fn with_session(mut self, session: HashMap<String, String>) -> Self {
+        self.session = session;
+        self
+    }
+
+    /// The `SET LOCAL` statements this request's session variables need.
+    ///
+    /// The setting name is built from the variable's own name after it has
+    /// been checked, and the value is bound rather than interpolated:
+    /// `set_config` takes both as arguments, where `SET LOCAL` would need the
+    /// value written into the statement.
+    pub fn session_settings(&self) -> Vec<(String, String)> {
+        self.session
+            .iter()
+            .filter(|(name, _)| {
+                !name.is_empty()
+                    && name
+                        .chars()
+                        .all(|c| c.is_ascii_alphanumeric() || c == '_')
+            })
+            .map(|(name, value)| (format!("hasura.{}", name), value.clone()))
+            .collect()
     }
 
     /// Get the current role.
@@ -38,7 +75,6 @@ impl GraphQLContext {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::collections::HashMap;
 
     fn create_test_auth() -> AuthResult {
         let mut claims = HashMap::new();
