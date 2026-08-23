@@ -58,7 +58,9 @@ impl ReadPlan {
             let Some(column) = table.get_column(&field.field.name) else {
                 continue;
             };
-            if let Some(function) = schema_cache.representation(&column.nominal_type, "json") {
+            if let Some(function) =
+                schema_cache.representation(column.representation_type(), "json")
+            {
                 field.field.transform = Some(function.to_string());
             }
         }
@@ -337,7 +339,7 @@ fn attach_representation(field: &mut CoercibleField, table: &Table, schema_cache
     let Some(column) = table.get_column(&field.name) else {
         return;
     };
-    if let Some(function) = schema_cache.representation("text", &column.nominal_type) {
+    if let Some(function) = schema_cache.representation("text", column.representation_type()) {
         field.transform = Some(function.to_string());
     }
 }

@@ -246,7 +246,7 @@ fn get_payload_columns(
         // also declared how one arrives: the value is read out of the body as
         // JSON and handed to that cast, rather than to PostgreSQL's own input
         // function for the type underneath.
-        if let Some(function) = schema_cache.representation("json", &column.nominal_type) {
+        if let Some(function) = schema_cache.representation("json", column.representation_type()) {
             field.ir_type = "json".to_string();
             field.transform = Some(function.to_string());
         }

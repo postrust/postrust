@@ -43,6 +43,15 @@ pub struct Table {
     pub computed_columns: HashMap<String, ComputedColumn>,
 }
 
+impl Column {
+    /// The type a data representation would be declared on.
+    ///
+    /// The domain where the column has one, and the type itself otherwise.
+    pub fn representation_type(&self) -> &str {
+        self.domain_type.as_deref().unwrap_or(&self.nominal_type)
+    }
+}
+
 impl Table {
     /// Get a column by name.
     pub fn get_column(&self, name: &str) -> Option<&Column> {
@@ -97,6 +106,14 @@ pub struct Column {
     pub data_type: String,
     /// Base type (for domains)
     pub nominal_type: String,
+    /// The domain this column is declared over, where it is declared over one.
+    ///
+    /// `information_schema` reports the type *underneath* a domain in
+    /// `data_type` and `udt_name`, so nothing else says that a value is a
+    /// `color` rather than an integer -- and a data representation is declared
+    /// on the domain.
+    #[serde(default)]
+    pub domain_type: Option<String>,
     /// Maximum length (for varchar, etc.)
     pub max_len: Option<i32>,
     /// Default value expression
@@ -183,6 +200,7 @@ mod tests {
             enum_values: vec![],
             is_pk: true,
             position: 1,
+            domain_type: None,
         };
         assert!(col1.is_auto());
 
@@ -197,6 +215,7 @@ mod tests {
             enum_values: vec![],
             is_pk: false,
             position: 2,
+            domain_type: None,
         };
         assert!(col2.is_auto());
 
@@ -211,6 +230,7 @@ mod tests {
             enum_values: vec![],
             is_pk: false,
             position: 3,
+            domain_type: None,
         };
         assert!(!col3.is_auto());
     }

@@ -470,6 +470,7 @@ async fn execute_plan(
                 DbActionPlan::MutateRead {
                     mutate: postrust_core::plan::MutatePlan::Insert {
                         on_conflict: Some(_),
+                        reports_inserted: true,
                         ..
                     },
                     ..

@@ -372,6 +372,7 @@ mod tests {
                 enum_values: vec![],
                 is_pk: true,
                 position: 1,
+                domain_type: None,
             },
         );
         columns.insert(
@@ -387,6 +388,7 @@ mod tests {
                 enum_values: vec![],
                 is_pk: false,
                 position: 2,
+                domain_type: None,
             },
         );
         columns.insert(
@@ -402,6 +404,7 @@ mod tests {
                 enum_values: vec![],
                 is_pk: false,
                 position: 3,
+                domain_type: None,
             },
         );
         columns.insert(
@@ -417,6 +420,7 @@ mod tests {
                 enum_values: vec![],
                 is_pk: false,
                 position: 4,
+                domain_type: None,
             },
         );
 

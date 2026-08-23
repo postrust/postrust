@@ -137,6 +137,11 @@ async fn load_columns(
             c.is_nullable,
             c.data_type,
             c.udt_name,
+            -- A domain's own name. `information_schema` reports the type
+            -- underneath it in `data_type` and `udt_name`, so this is the only
+            -- column that says a value is a `color` rather than an integer --
+            -- and the domain is what a data representation is declared on.
+            c.domain_name,
             c.character_maximum_length,
             c.column_default,
             pg_catalog.col_description(
@@ -152,7 +157,7 @@ async fn load_columns(
         LEFT JOIN pg_enum e ON e.enumtypid = t.oid
         WHERE c.table_schema = $1 AND c.table_name = $2
         GROUP BY c.table_schema, c.table_name, c.column_name, c.ordinal_position, c.is_nullable,
-                 c.data_type, c.udt_name, c.character_maximum_length,
+                 c.data_type, c.udt_name, c.domain_name, c.character_maximum_length,
                  c.column_default, t.oid, e.enumtypid
         ORDER BY c.ordinal_position
         "#,
@@ -185,6 +190,7 @@ async fn load_columns(
             nullable: is_nullable == "YES",
             data_type,
             nominal_type: udt_name,
+            domain_type: row.get("domain_name"),
             max_len,
             default: row.get("column_default"),
             enum_values,
@@ -652,6 +658,7 @@ async fn load_catalog_columns(
             CASE WHEN a.attnotnull THEN 'NO' ELSE 'YES' END AS is_nullable,
             pg_catalog.format_type(a.atttypid, NULL) AS data_type,
             t.typname AS udt_name,
+            CASE WHEN t.typtype = 'd' THEN t.typname END AS domain_name,
             NULL::int AS character_maximum_length,
             pg_catalog.pg_get_expr(d.adbin, d.adrelid) AS column_default,
             pg_catalog.col_description(c.oid, a.attnum) AS description,
