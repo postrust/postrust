@@ -145,6 +145,15 @@ pub enum Error {
         single_param: Option<String>,
     },
 
+    /// A `RAISE sqlstate 'PGRST'` the schema wrote wrongly.
+    ///
+    /// The message and the detail are both JSON documents with required keys,
+    /// and a function that gets one wrong has not asked for a response -- it
+    /// has a bug. Reporting it as the 500 it is says so; applying half of what
+    /// it asked for would not.
+    #[error("Could not parse JSON in the \"RAISE SQLSTATE 'PGRST'\" error")]
+    RaiseNotUnderstood(RaiseFault),
+
     #[error("Column not found: {0}")]
     ColumnNotFound(String),
 
@@ -306,11 +315,15 @@ impl Error {
             Self::InsufficientPermissions(_) => StatusCode::FORBIDDEN,
 
             // 404 Not Found
-            Self::NotFound(_)
-            | Self::TableNotFound { .. }
-            | Self::FunctionNotFound { .. }
-            | Self::ColumnNotFound(_)
-            | Self::RelationshipNotFound { .. } => StatusCode::NOT_FOUND,
+            Self::NotFound(_) | Self::TableNotFound { .. } | Self::FunctionNotFound { .. } => {
+                StatusCode::NOT_FOUND
+            }
+
+            // A relationship or a column the schema does not have is a fault
+            // in the request, not a missing resource: the resource addressed
+            // by the URL exists, and `?select=` asked it for something it
+            // cannot give. The table it names is what a 404 would be about.
+            Self::ColumnNotFound(_) | Self::RelationshipNotFound { .. } => StatusCode::BAD_REQUEST,
 
             // 405 Method Not Allowed
             Self::UnsupportedMethod(_) | Self::InvalidRpcMethod(_) | Self::InvalidPutFilters => {
@@ -330,7 +343,8 @@ impl Error {
             Self::InvalidRange(_) => StatusCode::RANGE_NOT_SATISFIABLE,
 
             // 500 Internal Server Error
-            Self::InvalidGucHeaders
+            Self::RaiseNotUnderstood(_)
+            | Self::InvalidGucHeaders
             | Self::InvalidGucStatus
             | Self::SchemaCacheNotLoaded
             | Self::SchemaCacheLoadFailed(_)
@@ -384,6 +398,7 @@ impl Error {
             Self::PutLimitNotAllowed => "PGRST114",
             Self::PutMatchingPk => "PGRST115",
             Self::MaxAffectedExceeded(_) => "PGRST124",
+            Self::RaiseNotUnderstood(_) => "PGRST121",
             Self::InvalidGucHeaders => "PGRST111",
             Self::InvalidGucStatus => "PGRST112",
             Self::RelatedOrderNotPossible { .. } => "PGRST118",
@@ -471,6 +486,7 @@ impl Error {
                 "Invalid preferences: {}",
                 invalid.join(", ")
             ))),
+            Self::RaiseNotUnderstood(fault) => Some(serde_json::Value::String(fault.details())),
             Self::FunctionNotFound {
                 name,
                 params,
@@ -517,6 +533,7 @@ impl Error {
                  overloading can be resolved"
                     .into(),
             ),
+            Self::RaiseNotUnderstood(fault) => Some(fault.hint().into()),
             // A body that is one value names no arguments, so there is no
             // near miss to point at: any function of that name would have
             // done, and none of them takes this body.
@@ -587,11 +604,49 @@ pub struct DatabaseError {
     pub column: Option<String>,
 }
 
+/// What was wrong with a `RAISE sqlstate 'PGRST'`.
+#[derive(Clone, Debug)]
+pub enum RaiseFault {
+    /// The MESSAGE was not the JSON object it has to be.
+    Message(String),
+    /// The DETAIL was not the JSON object it has to be.
+    Detail(String),
+    /// There was no DETAIL, and the status has to come from somewhere.
+    NoDetail,
+}
+
+impl RaiseFault {
+    /// What the schema author has to look at.
+    pub fn details(&self) -> String {
+        match self {
+            Self::Message(raw) => format!("Invalid JSON value for MESSAGE: '{}'", raw),
+            Self::Detail(raw) => format!("Invalid JSON value for DETAIL: '{}'", raw),
+            Self::NoDetail => "DETAIL is missing in the RAISE statement".to_string(),
+        }
+    }
+
+    /// What the document should have contained.
+    pub fn hint(&self) -> &'static str {
+        match self {
+            Self::Message(_) => {
+                "MESSAGE must be a JSON object with obligatory keys: 'code', 'message' and \
+                 optional keys: 'details', 'hint'."
+            }
+            _ => {
+                "DETAIL must be a JSON object with obligatory keys: 'status', 'headers' and \
+                 optional key: 'status_text'."
+            }
+        }
+    }
+}
+
 /// A response a database function asked for outright.
 #[derive(Clone, Debug)]
 pub struct RaisedResponse {
     /// The HTTP status to answer with.
     pub status: u16,
+    /// The reason phrase, where the schema named one of its own.
+    pub status_text: Option<String>,
     /// Headers to add to the response.
     pub headers: Vec<(String, String)>,
     /// The response body, verbatim.
@@ -606,33 +661,70 @@ impl DatabaseError {
     /// status text and any headers. It is how a schema returns a 402 with its
     /// own payload without the API layer knowing anything about billing.
     ///
-    /// `None` when this is not that error, or when either JSON does not parse
-    /// -- the latter is a fault in the schema, and reporting it as such is
-    /// more use than a half-applied response.
-    pub fn raised_response(&self) -> Option<RaisedResponse> {
+    /// `None` when this is not that error. `Err` when it is and the schema
+    /// wrote it wrongly, which is a bug in the schema rather than a response
+    /// to half-apply.
+    pub fn raised_response(&self) -> Option<std::result::Result<RaisedResponse, RaiseFault>> {
         if self.code != "PGRST" {
             return None;
         }
+        Some(self.parse_raise())
+    }
 
-        let body: serde_json::Value = serde_json::from_str(&self.message).ok()?;
-        let control: serde_json::Value =
-            serde_json::from_str(self.details.as_deref().unwrap_or("{}")).ok()?;
+    fn parse_raise(&self) -> std::result::Result<RaisedResponse, RaiseFault> {
+        let object = |raw: &str| -> Option<serde_json::Map<String, serde_json::Value>> {
+            match serde_json::from_str(raw) {
+                Ok(serde_json::Value::Object(map)) => Some(map),
+                _ => None,
+            }
+        };
 
-        Some(RaisedResponse {
-            status: control.get("status").and_then(serde_json::Value::as_u64)? as u16,
-            headers: control
-                .get("headers")
-                .and_then(serde_json::Value::as_object)
-                .map(|headers| {
-                    headers
-                        .iter()
-                        .filter_map(|(name, value)| {
-                            Some((name.clone(), value.as_str()?.to_string()))
-                        })
-                        .collect()
-                })
-                .unwrap_or_default(),
-            body,
+        // The message is the body, and a body has to say what went wrong and
+        // under what code -- the two keys a client reads first.
+        let message =
+            object(&self.message).ok_or_else(|| RaiseFault::Message(self.message.clone()))?;
+        if !message.contains_key("code") || !message.contains_key("message") {
+            return Err(RaiseFault::Message(self.message.clone()));
+        }
+
+        let raw_detail = self.details.as_deref().ok_or(RaiseFault::NoDetail)?;
+        let detail =
+            object(raw_detail).ok_or_else(|| RaiseFault::Detail(raw_detail.to_string()))?;
+        let status = detail
+            .get("status")
+            .and_then(serde_json::Value::as_u64)
+            .ok_or_else(|| RaiseFault::Detail(raw_detail.to_string()))?;
+        let headers = detail
+            .get("headers")
+            .and_then(serde_json::Value::as_object)
+            .ok_or_else(|| RaiseFault::Detail(raw_detail.to_string()))?;
+
+        // Every key the error body has, present whether the schema wrote it or
+        // not: a client reading `details` should not have to tell "no detail"
+        // from "no such key".
+        let key = |name: &str| {
+            message
+                .get(name)
+                .cloned()
+                .unwrap_or(serde_json::Value::Null)
+        };
+
+        Ok(RaisedResponse {
+            status: status as u16,
+            status_text: detail
+                .get("status_text")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_string),
+            headers: headers
+                .iter()
+                .filter_map(|(name, value)| Some((name.clone(), value.as_str()?.to_string())))
+                .collect(),
+            body: serde_json::json!({
+                "code": key("code"),
+                "message": key("message"),
+                "details": key("details"),
+                "hint": key("hint"),
+            }),
         })
     }
 
@@ -649,10 +741,16 @@ impl DatabaseError {
         let code = self.code.as_str();
         let message = self.message.as_str();
 
-        if let Some(raised) = self.raised_response() {
-            if let Ok(status) = StatusCode::from_u16(raised.status) {
-                return status;
+        match self.raised_response() {
+            Some(Ok(raised)) => {
+                if let Ok(status) = StatusCode::from_u16(raised.status) {
+                    return status;
+                }
             }
+            // A raise the schema wrote wrongly is the schema's fault, and a
+            // fault in the server's own data is a 500.
+            Some(Err(_)) => return StatusCode::INTERNAL_SERVER_ERROR,
+            None => {}
         }
 
         // `PT<nnn>` is a status code raised by the schema itself: a function

@@ -25,6 +25,12 @@ pub fn validate_token(token: &str, config: &JwtConfig) -> Result<AuthResult, Jwt
     let mut validation = Validation::new(Algorithm::HS256);
     validation.validate_exp = true;
     validation.validate_nbf = true;
+    // A token without `exp` does not expire, which is a thing a token is
+    // allowed to be: the claim is optional in RFC 7519 and PostgREST treats it
+    // so. The library requires it by default, which rejected every unexpiring
+    // token as unreadable -- and reported it as a key problem, which it is
+    // not.
+    validation.required_spec_claims.clear();
 
     if let Some(aud) = &config.audience {
         validation.set_audience(&[aud]);
@@ -82,9 +88,13 @@ pub struct Claims {
     /// Issued at
     #[serde(skip_serializing_if = "Option::is_none")]
     pub iat: Option<i64>,
-    /// Audience
+    /// Audience.
+    ///
+    /// Not narrowed to a string: the claim may be a list, or anything else a
+    /// client put there, and refusing to read the token because one claim is
+    /// shaped unexpectedly loses the rest of it.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub aud: Option<String>,
+    pub aud: Option<serde_json::Value>,
     /// Custom claims
     #[serde(flatten)]
     pub extra: HashMap<String, serde_json::Value>,

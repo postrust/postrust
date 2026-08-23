@@ -936,15 +936,13 @@ fn add_junction_relationships(
             })
             .collect();
 
-        let mut pk: Vec<&str> = junction_pk.iter().map(String::as_str).collect();
-        pk.sort_unstable();
-        if pk.len() != 2 {
-            continue;
-        }
+        let pk: Vec<&str> = junction_pk.iter().map(String::as_str).collect();
 
-        // The pair whose columns are exactly the primary key is the one that
-        // makes this a junction. Requiring the whole key is what separates a
-        // junction from a table that merely references two others.
+        // The pair whose columns are part of the primary key is what makes
+        // this a junction: keying on both of them is what says a row of it is
+        // one pairing. A junction may carry more in its key than the pair --
+        // `group_yard` keys on `(id, group_id, yard_id)` -- and requiring the
+        // key to be exactly the two columns missed those.
         for near in 0..outgoing.len() {
             for far in 0..outgoing.len() {
                 if near == far {
@@ -955,9 +953,8 @@ fn add_junction_relationships(
                 if near_rel.foreign_table() == far_rel.foreign_table() {
                     continue;
                 }
-                let mut covered = vec![near_local.as_str(), far_local.as_str()];
-                covered.sort_unstable();
-                if covered != pk {
+                let covered = [near_local.as_str(), far_local.as_str()];
+                if !covered.iter().all(|column| pk.contains(column)) {
                     continue;
                 }
 

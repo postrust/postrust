@@ -2778,18 +2778,31 @@ fn error_response(error: postrust_core::Error, verbatim_db_errors: bool) -> Resp
     // its status, its headers and its body. Nothing here is the API layer's to
     // decide, including whether to sanitise it -- the schema wrote it.
     if let postrust_core::Error::Database(db) = &error {
-        if let Some(raised) = db.raised_response() {
-            let mut builder = Response::builder()
-                .status(status)
-                .header("content-type", "application/json");
-            for (name, value) in &raised.headers {
-                builder = builder.header(name, value);
+        match db.raised_response() {
+            Some(Ok(raised)) => {
+                let mut builder = Response::builder()
+                    .status(status)
+                    .header("content-type", "application/json");
+                for (name, value) in &raised.headers {
+                    builder = builder.header(name, value);
+                }
+                return builder
+                    .body(Body::from(
+                        serde_json::to_vec(&raised.body).unwrap_or_default(),
+                    ))
+                    .unwrap_or_else(|_| Response::new(Body::empty()));
             }
-            return builder
-                .body(Body::from(
-                    serde_json::to_vec(&raised.body).unwrap_or_default(),
-                ))
-                .unwrap_or_else(|_| Response::new(Body::empty()));
+            // The schema meant to write a response and wrote something else.
+            // Reported as the fault it is, and reported the same way whether
+            // or not database errors are passed through, since this one is
+            // about the schema's own text rather than about the request.
+            Some(Err(fault)) => {
+                return error_response(
+                    postrust_core::Error::RaiseNotUnderstood(fault),
+                    verbatim_db_errors,
+                )
+            }
+            None => {}
         }
     }
 
@@ -2904,6 +2917,9 @@ fn sanitize_error_message(error: &postrust_core::Error) -> String {
         | Error::InvalidGucHeaders
         | Error::InvalidGucStatus
         | Error::InvalidMediaType(_)
+        // Says nothing about the schema beyond that one RAISE is malformed,
+        // which is what the author has to fix.
+        | Error::RaiseNotUnderstood(_)
         | Error::InvalidResourcePath => return error.to_string(),
         Error::InvalidPath(_) => "Invalid request path",
         // What the token failed on is the client's own token, so naming it
