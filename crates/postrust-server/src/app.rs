@@ -791,15 +791,20 @@ async fn execute_plan(
                 // than from the request, but it is quoted both ways all the
                 // same: as an identifier to read the column, and as a literal
                 // to drop that key from the properties.
+                // A mutation's rows come from a data-modifying CTE, which
+                // PostgreSQL allows only at the top level -- so the rendering
+                // wraps what follows the `WITH`, not the whole statement.
+                let (with_clause, inner) = split_leading_cte(&sql);
                 sql = format!(
-                    "SELECT json_build_object('type', 'FeatureCollection', 'features', \
-                     COALESCE(json_agg(json_build_object('type', 'Feature', 'geometry', \
-                     pgrst_geo.{column} - 'crs', 'properties', \
+                    "{with_clause}SELECT json_build_object('type', 'FeatureCollection', \
+                     'features', COALESCE(json_agg(json_build_object('type', 'Feature', \
+                     'geometry', pgrst_geo.{column} - 'crs', 'properties', \
                      to_jsonb(pgrst_geo) - '{key}')), '[]'::json))::text \
-                     AS pgrst_body FROM ({sql}) pgrst_geo",
+                     AS pgrst_body FROM ({inner}) pgrst_geo",
+                    with_clause = with_clause,
                     column = postrust_sql::escape_ident(column),
                     key = column.replace('\'', "''"),
-                    sql = sql
+                    inner = inner
                 );
             }
 
@@ -818,9 +823,10 @@ async fn execute_plan(
                 } else {
                     "pgrst_media".to_string()
                 };
+                let (with_clause, inner) = split_leading_cte(&sql);
                 sql = format!(
-                    "SELECT {}({})::text AS pgrst_body FROM ({}) pgrst_media",
-                    aggregate, argument, sql
+                    "{}SELECT {}({})::text AS pgrst_body FROM ({}) pgrst_media",
+                    with_clause, aggregate, argument, inner
                 );
                 debug!("Rendering {} via {}", media_type, aggregate);
             }
