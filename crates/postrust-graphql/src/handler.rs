@@ -512,6 +512,20 @@ fn create_object_type(obj: &TableObjectType, relationships: &[RelationshipField]
         object = object.description(desc);
     }
 
+    // A GraphQL object may not have two fields of one name, and a schema that
+    // tries to build one aborts the process rather than returning an error.
+    // Relationship names are derived from the table they point at, so a
+    // foreign key column named after its own target -- `pizza.crust`
+    // referencing `crust`, which is an ordinary way to write that schema --
+    // produces exactly that clash.
+    //
+    // The column wins. It is the table's own data, it is what a client's
+    // existing queries select, and dropping it to keep a derived name would
+    // lose something the schema actually says. The relationship is left out
+    // and said so, which is what Hasura does with the same clash: the
+    // metadata is marked inconsistent and the field is simply not there.
+    let mut taken: HashSet<String> = obj.fields.iter().map(|f| f.name.clone()).collect();
+
     for field in &obj.fields {
         let field_name = field.name.clone();
         let field_type = graphql_type_ref(&field.type_string());
@@ -549,6 +563,16 @@ fn create_object_type(obj: &TableObjectType, relationships: &[RelationshipField]
     // parent JSON before returning it, so these read from the parent value the
     // same way column fields do.
     for rel in relationships {
+        if !taken.insert(rel.name.clone()) {
+            tracing::warn!(
+                "{}: not exposing the relationship to \"{}\" as `{}` -- the table \
+                 already has a column of that name",
+                obj.name,
+                rel.target_type,
+                rel.name
+            );
+            continue;
+        }
         let field_name = rel.name.clone();
         let field_type = if rel.is_list {
             TypeRef::named_nn_list_nn(&rel.target_type)

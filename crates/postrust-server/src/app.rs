@@ -2736,7 +2736,12 @@ fn related_order_target(
     let rel = schema_cache
         .find_relationship(parent_qi, embedded.0, embedded.1, &parent_qi.schema)?
         .ok_or_else(|| {
-            schema_cache.relationship_not_found(parent_qi, embedded.0, embedded.1, &parent_qi.schema)
+            schema_cache.relationship_not_found(
+                parent_qi,
+                embedded.0,
+                embedded.1,
+                &parent_qi.schema,
+            )
         })?;
 
     // A resource that yields many rows per parent has no single value to order

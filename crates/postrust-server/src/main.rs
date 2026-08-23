@@ -94,10 +94,7 @@ async fn main() -> Result<()> {
     // not serving them makes a drop-in replacement fail its first health
     // check.
     app = app
-        .route(
-            "/healthz",
-            axum::routing::get(|| async { "OK" }),
-        )
+        .route("/healthz", axum::routing::get(|| async { "OK" }))
         .route(
             "/v1/version",
             axum::routing::get(|| async {
@@ -134,157 +131,167 @@ async fn main() -> Result<()> {
             exposed_schemas: config.db_schemas.clone(),
             ..SchemaConfig::default()
         };
-        let graphql_state = Arc::new(
-            GraphQLState::new(state.pool.clone(), schema_cache_arc.clone(), graphql_config)
-                .expect("Failed to build GraphQL schema"),
-        );
-
-        // Initialize subscription broker
-        if let Err(e) = graphql_state.init_subscriptions().await {
-            tracing::warn!("Failed to initialize subscription broker: {}. Subscriptions may not work until triggers are created.", e);
-        } else {
-            info!("GraphQL subscriptions enabled");
+        // A schema that cannot be built is a reason to serve without GraphQL,
+        // not a reason to exit. The REST surface, the admin UI and the health
+        // endpoint do not depend on it, and taking the process down with it
+        // turns one unrepresentable table into a server that will not start.
+        let built = GraphQLState::new(state.pool.clone(), schema_cache_arc.clone(), graphql_config);
+        if let Err(e) = &built {
+            tracing::error!(
+                "GraphQL schema could not be built, serving without it: {}",
+                e
+            );
         }
+        if let Ok(graphql_state) = built {
+            let graphql_state = Arc::new(graphql_state);
 
-        info!("GraphQL endpoint enabled at /api/graphql");
+            // Initialize subscription broker
+            if let Err(e) = graphql_state.init_subscriptions().await {
+                tracing::warn!("Failed to initialize subscription broker: {}. Subscriptions may not work until triggers are created.", e);
+            } else {
+                info!("GraphQL subscriptions enabled");
+            }
 
-        // Combined state for GraphQL routes (includes JWT config for auth)
-        #[derive(Clone)]
-        struct GraphQLAppState {
-            gql_state: Arc<GraphQLState>,
-            jwt_config: postrust_auth::JwtConfig,
-        }
+            info!("GraphQL endpoint enabled at /api/graphql");
 
-        let graphql_app_state = GraphQLAppState {
-            gql_state: graphql_state.clone(),
-            jwt_config: state.jwt_config.clone(),
-        };
+            // Combined state for GraphQL routes (includes JWT config for auth)
+            #[derive(Clone)]
+            struct GraphQLAppState {
+                gql_state: Arc<GraphQLState>,
+                jwt_config: postrust_auth::JwtConfig,
+            }
 
-        // Wrapper handler that creates context from request with proper auth
-        async fn handle_graphql(
-            AxumState(app_state): AxumState<GraphQLAppState>,
-            headers: HeaderMap,
-            req: GqlRequest,
-        ) -> Json<serde_json::Value> {
-            // Extract auth header and authenticate
-            let auth_header = headers.get("authorization").and_then(|v| v.to_str().ok());
+            let graphql_app_state = GraphQLAppState {
+                gql_state: graphql_state.clone(),
+                jwt_config: state.jwt_config.clone(),
+            };
 
-            let auth_result = match postrust_auth::authenticate(auth_header, &app_state.jwt_config)
-            {
-                Ok(auth) => auth,
-                Err(e) => {
-                    tracing::debug!("GraphQL auth failed: {}, using anon role", e);
-                    postrust_auth::AuthResult {
-                        role: app_state
-                            .jwt_config
-                            .anon_role
-                            .clone()
-                            .unwrap_or_else(|| "anon".to_string()),
-                        claims: std::collections::HashMap::new(),
+            // Wrapper handler that creates context from request with proper auth
+            async fn handle_graphql(
+                AxumState(app_state): AxumState<GraphQLAppState>,
+                headers: HeaderMap,
+                req: GqlRequest,
+            ) -> Json<serde_json::Value> {
+                // Extract auth header and authenticate
+                let auth_header = headers.get("authorization").and_then(|v| v.to_str().ok());
+
+                let auth_result =
+                    match postrust_auth::authenticate(auth_header, &app_state.jwt_config) {
+                        Ok(auth) => auth,
+                        Err(e) => {
+                            tracing::debug!("GraphQL auth failed: {}, using anon role", e);
+                            postrust_auth::AuthResult {
+                                role: app_state
+                                    .jwt_config
+                                    .anon_role
+                                    .clone()
+                                    .unwrap_or_else(|| "anon".to_string()),
+                                claims: std::collections::HashMap::new(),
+                            }
+                        }
+                    };
+
+                tracing::debug!(
+                    "GraphQL request authenticated as role: {}",
+                    auth_result.role
+                );
+
+                // Create SchemaCacheRef from the static Arc<SchemaCache>
+                let schema_cache_ref = postrust_core::schema_cache::SchemaCacheRef::from_static(
+                    (*app_state.gql_state.schema_cache).clone(),
+                );
+
+                // Session variables come from the verified token, never from the
+                // request's own headers. Hasura reads `X-Hasura-User-Id` off the
+                // wire because it has an admin secret to gate that on; here a raw
+                // header would let any caller name its own identity, and a policy
+                // reading a value the caller chose is not a policy. A client
+                // migrating from Hasura keeps sending the same JWT, and its
+                // `x-hasura-*` claims -- top level or under Hasura's own namespace
+                // -- are what a row-level security policy reads as
+                // `current_setting('hasura.user_id')`.
+                let session = hasura_session_from_claims(&auth_result.claims);
+
+                let gql_ctx = postrust_graphql::context::GraphQLContext::new(
+                    app_state.gql_state.pool.clone(),
+                    schema_cache_ref,
+                    auth_result,
+                )
+                .with_session(session);
+
+                let request = req
+                    .into_inner()
+                    .data(gql_ctx)
+                    .data(app_state.gql_state.pool.clone())
+                    .data(Arc::clone(&app_state.gql_state.broker));
+                let response = app_state.gql_state.schema.execute(request).await;
+                Json(postrust_graphql::hasura::envelope(response))
+            }
+
+            /// Collect `x-hasura-*` claims from a verified token.
+            ///
+            /// Hasura puts them under `https://hasura.io/jwt/claims` by default and
+            /// allows them at the top level; both spellings are read, and the
+            /// prefix is dropped so a policy names `hasura.user_id` rather than
+            /// `hasura.x-hasura-user-id`. `x-hasura-role` is left out: the role is
+            /// what the token was authenticated as, and re-reading it here would
+            /// let a claim override that decision.
+            fn hasura_session_from_claims(
+                claims: &std::collections::HashMap<String, serde_json::Value>,
+            ) -> std::collections::HashMap<String, String> {
+                const NAMESPACE: &str = "https://hasura.io/jwt/claims";
+                let mut session = std::collections::HashMap::new();
+
+                let mut take = |key: &str, value: &serde_json::Value| {
+                    let lowered = key.to_ascii_lowercase();
+                    let Some(name) = lowered.strip_prefix("x-hasura-") else {
+                        return;
+                    };
+                    if name == "role" || name.is_empty() {
+                        return;
+                    }
+                    // A claim may be a string, a number or a list of ids; the
+                    // setting is text either way, and a string keeps its own
+                    // spelling rather than gaining quotes.
+                    let rendered = match value {
+                        serde_json::Value::String(text) => text.clone(),
+                        other => other.to_string(),
+                    };
+                    session.insert(name.replace('-', "_"), rendered);
+                };
+
+                if let Some(serde_json::Value::Object(namespaced)) = claims.get(NAMESPACE) {
+                    for (key, value) in namespaced {
+                        take(key, value);
                     }
                 }
-            };
-
-            tracing::debug!(
-                "GraphQL request authenticated as role: {}",
-                auth_result.role
-            );
-
-            // Create SchemaCacheRef from the static Arc<SchemaCache>
-            let schema_cache_ref = postrust_core::schema_cache::SchemaCacheRef::from_static(
-                (*app_state.gql_state.schema_cache).clone(),
-            );
-
-            // Session variables come from the verified token, never from the
-            // request's own headers. Hasura reads `X-Hasura-User-Id` off the
-            // wire because it has an admin secret to gate that on; here a raw
-            // header would let any caller name its own identity, and a policy
-            // reading a value the caller chose is not a policy. A client
-            // migrating from Hasura keeps sending the same JWT, and its
-            // `x-hasura-*` claims -- top level or under Hasura's own namespace
-            // -- are what a row-level security policy reads as
-            // `current_setting('hasura.user_id')`.
-            let session = hasura_session_from_claims(&auth_result.claims);
-
-            let gql_ctx = postrust_graphql::context::GraphQLContext::new(
-                app_state.gql_state.pool.clone(),
-                schema_cache_ref,
-                auth_result,
-            )
-            .with_session(session);
-
-            let request = req
-                .into_inner()
-                .data(gql_ctx)
-                .data(app_state.gql_state.pool.clone())
-                .data(Arc::clone(&app_state.gql_state.broker));
-            let response = app_state.gql_state.schema.execute(request).await;
-            Json(postrust_graphql::hasura::envelope(response))
-        }
-
-        /// Collect `x-hasura-*` claims from a verified token.
-        ///
-        /// Hasura puts them under `https://hasura.io/jwt/claims` by default and
-        /// allows them at the top level; both spellings are read, and the
-        /// prefix is dropped so a policy names `hasura.user_id` rather than
-        /// `hasura.x-hasura-user-id`. `x-hasura-role` is left out: the role is
-        /// what the token was authenticated as, and re-reading it here would
-        /// let a claim override that decision.
-        fn hasura_session_from_claims(
-            claims: &std::collections::HashMap<String, serde_json::Value>,
-        ) -> std::collections::HashMap<String, String> {
-            const NAMESPACE: &str = "https://hasura.io/jwt/claims";
-            let mut session = std::collections::HashMap::new();
-
-            let mut take = |key: &str, value: &serde_json::Value| {
-                let lowered = key.to_ascii_lowercase();
-                let Some(name) = lowered.strip_prefix("x-hasura-") else {
-                    return;
-                };
-                if name == "role" || name.is_empty() {
-                    return;
-                }
-                // A claim may be a string, a number or a list of ids; the
-                // setting is text either way, and a string keeps its own
-                // spelling rather than gaining quotes.
-                let rendered = match value {
-                    serde_json::Value::String(text) => text.clone(),
-                    other => other.to_string(),
-                };
-                session.insert(name.replace('-', "_"), rendered);
-            };
-
-            if let Some(serde_json::Value::Object(namespaced)) = claims.get(NAMESPACE) {
-                for (key, value) in namespaced {
+                for (key, value) in claims {
                     take(key, value);
                 }
-            }
-            for (key, value) in claims {
-                take(key, value);
+
+                session
             }
 
-            session
+            // Add GraphQL routes with WebSocket support for subscriptions
+            let graphql_router = Router::new()
+                .route("/", post(handle_graphql))
+                .route("/", get(postrust_graphql::handler::graphql_playground))
+                .with_state(graphql_app_state);
+
+            // WebSocket handler needs separate state (just the GraphQL state)
+            let ws_router = Router::new()
+                .route("/ws", get(postrust_graphql::handler::graphql_ws_handler))
+                .with_state(graphql_state);
+
+            let graphql_app = graphql_router.merge(ws_router);
+            // `/v1/graphql` is where a Hasura client sends its queries, and it is
+            // the only address most of them can be told about: the endpoint is
+            // baked into generated clients and codegen configs. `/api/graphql`
+            // keeps working for anything already pointed at it.
+            app = app
+                .nest("/v1/graphql", graphql_app.clone())
+                .nest("/api/graphql", graphql_app);
         }
-
-        // Add GraphQL routes with WebSocket support for subscriptions
-        let graphql_router = Router::new()
-            .route("/", post(handle_graphql))
-            .route("/", get(postrust_graphql::handler::graphql_playground))
-            .with_state(graphql_app_state);
-
-        // WebSocket handler needs separate state (just the GraphQL state)
-        let ws_router = Router::new()
-            .route("/ws", get(postrust_graphql::handler::graphql_ws_handler))
-            .with_state(graphql_state);
-
-        let graphql_app = graphql_router.merge(ws_router);
-        // `/v1/graphql` is where a Hasura client sends its queries, and it is
-        // the only address most of them can be told about: the endpoint is
-        // baked into generated clients and codegen configs. `/api/graphql`
-        // keeps working for anything already pointed at it.
-        app = app
-            .nest("/v1/graphql", graphql_app.clone())
-            .nest("/api/graphql", graphql_app);
     }
 
     // PostgREST compatibility mode: also serve the REST surface at the root so
