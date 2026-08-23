@@ -135,12 +135,14 @@ pub enum Error {
         params: Vec<String>,
         /// A signature that does exist, where one does.
         candidate: Option<String>,
-        /// Whether a single unnamed `json` parameter was also considered.
+        /// The type of a single unnamed parameter that would also have
+        /// matched, spelled as the message spells it.
         ///
-        /// It is, over `POST`, where the whole body can be one argument --
-        /// and the message says so, since it widens what would have matched.
-        #[allow(dead_code)]
-        single_json: bool,
+        /// Over `POST` the whole body can be one argument, and which type it
+        /// could be is decided by the body's media type: `json/jsonb` for a
+        /// JSON body, `text`, `xml` or `bytea` for the others. Naming it says
+        /// what else was looked for besides the arguments themselves.
+        single_param: Option<String>,
     },
 
     #[error("Column not found: {0}")]
@@ -472,15 +474,23 @@ impl Error {
             Self::FunctionNotFound {
                 name,
                 params,
-                single_json,
+                single_param,
                 ..
             } => Some(serde_json::Value::String(format!(
-                "Searched for the function {} {}{}, but no matches were found in the schema cache.",
+                "Searched for the function {} {}, but no matches were found in the schema cache.",
                 name,
-                describe_params(params),
-                match single_json {
-                    true => " or with a single unnamed json/jsonb parameter",
-                    false => "",
+                match single_param.as_deref() {
+                    // A body that is one value carries no argument names, so
+                    // the only thing that could have matched is the parameter
+                    // that takes it.
+                    Some(other) if other != JSON_PARAM =>
+                        format!("with a single unnamed {} parameter", other),
+                    Some(_) => format!(
+                        "{} or with a single unnamed {} parameter",
+                        describe_params(params),
+                        JSON_PARAM
+                    ),
+                    None => describe_params(params),
                 }
             ))),
             _ => None,
@@ -507,9 +517,17 @@ impl Error {
                  overloading can be resolved"
                     .into(),
             ),
-            Self::FunctionNotFound { candidate, .. } => candidate
+            // A body that is one value names no arguments, so there is no
+            // near miss to point at: any function of that name would have
+            // done, and none of them takes this body.
+            Self::FunctionNotFound {
+                candidate,
+                single_param,
+                ..
+            } if !names_only_one_param(single_param.as_deref()) => candidate
                 .as_ref()
                 .map(|c| format!("Perhaps you meant to call the function {}", c)),
+            Self::FunctionNotFound { .. } => None,
             // The schemas a server exposes are part of its contract, not an
             // internal detail, so naming them is how the client is told what
             // to ask for instead.
@@ -527,6 +545,20 @@ impl Error {
 ///
 /// PostgREST words the no-argument case differently rather than printing an
 /// empty list, and the messages are matched verbatim by clients.
+/// How the message spells the type of a single unnamed JSON parameter.
+///
+/// It is the one media type that can also carry named arguments, so it reads
+/// as an alternative rather than as the only thing looked for.
+pub const JSON_PARAM: &str = "json/jsonb";
+
+/// Whether the request could only ever have matched one unnamed parameter.
+///
+/// True for a body that is one value -- text, xml or bytes -- which carries no
+/// argument names at all.
+pub fn names_only_one_param(single_param: Option<&str>) -> bool {
+    matches!(single_param, Some(other) if other != JSON_PARAM)
+}
+
 pub fn function_signature(name: &str, params: &[String]) -> String {
     match params.is_empty() {
         true => format!("{} without parameters", name),

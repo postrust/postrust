@@ -469,7 +469,16 @@ fn parse_routine_params(value: serde_json::Value) -> Vec<RoutineParam> {
                     .and_then(|n| n.as_str())
                     .unwrap_or_default()
                     .to_string(),
-                type_max_length: param_type.clone(),
+                // A parameter declared `char(4)` is stored as bare
+                // `character`, whose length is 1, so casting an argument to
+                // the declared type truncates it. PostgreSQL does not enforce
+                // a length on a function parameter at all, so the unbounded
+                // spelling is the honest one to cast to.
+                type_max_length: item
+                    .get("cast_type")
+                    .and_then(|t| t.as_str())
+                    .unwrap_or(&param_type)
+                    .to_string(),
                 param_type,
                 required: item
                     .get("required")
@@ -490,6 +499,22 @@ pub async fn load_routines(pool: &PgPool, schemas: &[String]) -> Result<RoutineM
 
     let rows = sqlx::query(
         r#"
+        -- What a type is once every domain over it is stripped away.
+        --
+        -- `RETURNS SETOF projects_domain` returns rows of `projects`, and a
+        -- domain is transparent to everything that matters here: whether the
+        -- result is composite, and which table's columns it has. Reading the
+        -- declared type alone finds a type name that names no table.
+        WITH RECURSIVE base_types AS (
+            SELECT oid, typbasetype, oid AS base_type FROM pg_catalog.pg_type
+            UNION
+            SELECT t.oid, b.typbasetype, b.oid AS base_type
+              FROM base_types t
+              JOIN pg_catalog.pg_type b ON b.oid = t.typbasetype
+        ),
+        resolved AS (
+            SELECT oid, base_type FROM base_types WHERE typbasetype = 0
+        )
         SELECT
             n.nspname as schema,
             p.proname as name,
@@ -514,6 +539,18 @@ pub async fn load_routines(pool: &PgPool, schemas: &[String]) -> Result<RoutineM
                     json_build_object(
                         'name', COALESCE(p.proargnames[i], ''),
                         'type', pg_catalog.format_type(p.proargtypes[i - 1], NULL),
+                        -- What an argument is cast to. `character` and `bit`
+                        -- name themselves without a length, and casting to
+                        -- either truncates to one character; a parameter's
+                        -- length is not enforced anyway, so the varying
+                        -- spelling is what the value should reach.
+                        'cast_type', CASE p.proargtypes[i - 1]
+                            WHEN 'character'::regtype   THEN 'character varying'
+                            WHEN 'character[]'::regtype THEN 'character varying[]'
+                            WHEN 'bit'::regtype         THEN 'bit varying'
+                            WHEN 'bit[]'::regtype       THEN 'bit varying[]'
+                            ELSE pg_catalog.format_type(p.proargtypes[i - 1], NULL)
+                        END,
                         'required', i <= (p.pronargs - p.pronargdefaults),
                         'variadic', p.provariadic <> 0 AND i = p.pronargs
                     ) ORDER BY i
@@ -521,16 +558,36 @@ pub async fn load_routines(pool: &PgPool, schemas: &[String]) -> Result<RoutineM
                 FROM generate_series(1, p.pronargs) AS i
             ), '[]'::json) as params,
             CASE
-                WHEN p.proretset THEN 'SETOF ' || pg_catalog.format_type(p.prorettype, NULL)
-                ELSE pg_catalog.format_type(p.prorettype, NULL)
+                WHEN p.proretset THEN 'SETOF ' || pg_catalog.format_type(rt.base_type, NULL)
+                ELSE pg_catalog.format_type(rt.base_type, NULL)
             END as return_type,
             p.proretset as returns_set,
-            (SELECT t.typtype::text FROM pg_catalog.pg_type t WHERE t.oid = p.prorettype)
+            (SELECT t.typtype::text FROM pg_catalog.pg_type t WHERE t.oid = rt.base_type)
                 as ret_typtype
         FROM pg_proc p
         JOIN pg_namespace n ON n.oid = p.pronamespace
+        JOIN resolved rt ON rt.oid = p.prorettype
         WHERE n.nspname = ANY($1)
           AND p.prokind IN ('f', 'p')
+          -- A parameter with no name cannot be given an argument by name, so
+          -- a function that has one is not callable over the API at all --
+          -- and leaving it in the cache makes it a candidate that no request
+          -- can ever match, and a hint that sends the client nowhere.
+          --
+          -- The exception is the single unnamed parameter that takes the
+          -- whole request body, which is how a function is called with one
+          -- json, text, xml or bytea argument and no name for it.
+          AND (
+            (SELECT count(*) FROM generate_series(1, p.pronargs) AS i
+              WHERE COALESCE(p.proargnames[i], '') = '') = 0
+            OR (
+              p.pronargs = 1
+              AND COALESCE(p.proargnames[1], '') = ''
+              AND p.proargtypes[0] IN ('bytea'::regtype, 'json'::regtype,
+                                       'jsonb'::regtype, 'text'::regtype,
+                                       'xml'::regtype)
+            )
+          )
         ORDER BY n.nspname, p.proname
         "#,
     )
@@ -586,6 +643,26 @@ pub async fn load_routines(pool: &PgPool, schemas: &[String]) -> Result<RoutineM
         };
 
         routines.entry(qi).or_default().push(routine);
+    }
+
+    // Overloads of one name in a fixed order: fewest parameters first, then by
+    // the parameters themselves. Catalogue order is whatever the planner
+    // happened to return, and it decides which signature a client is offered
+    // first when a call cannot be told apart -- an answer that should not
+    // change between two servers reading the same schema.
+    for overloads in routines.values_mut() {
+        overloads.sort_by(|a, b| {
+            let key = |r: &Routine| {
+                (
+                    r.params.len(),
+                    r.params
+                        .iter()
+                        .map(|p| (p.name.clone(), p.param_type.clone()))
+                        .collect::<Vec<_>>(),
+                )
+            };
+            key(a).cmp(&key(b))
+        });
     }
 
     Ok(routines)

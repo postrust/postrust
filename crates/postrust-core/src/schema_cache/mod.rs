@@ -17,7 +17,7 @@ pub use table::{Column, ColumnMap, ComputedColumn, Table, TablesMap};
 use crate::api_request::QualifiedIdentifier;
 use crate::error::{Error, Result};
 use sqlx::PgPool;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use tracing::info;
 
@@ -429,6 +429,91 @@ pub(crate) fn similarity(a: &str, b: &str) -> f64 {
         return 1.0;
     }
     1.0 - edit_distance(a, b) as f64 / longest as f64
+}
+
+/// The closest of `candidates` to `query`, or `None` if none is close enough.
+///
+/// Scored the way PostgREST scores its hints: cosine similarity over the
+/// character n-grams of both strings, three at a time and falling back to two
+/// where three finds nothing, with the ends marked so that a shared prefix
+/// counts for something. A Levenshtein ratio, which is the obvious thing to
+/// reach for, answers differently on the cases that matter -- it calls
+/// `(any_arg)` and `(name)` a third alike, because they are both short, where
+/// sharing no letter sequence at all is what a client needs to be told.
+///
+/// The floor applies to the similarity; among what clears it, the nearest by
+/// edit distance wins.
+pub(crate) fn closest<'a>(
+    candidates: impl IntoIterator<Item = &'a str> + Clone,
+    query: &str,
+    min_score: f64,
+) -> Option<&'a str> {
+    for size in [3usize, 2] {
+        let asked = grams(query, size);
+        let mut fitting: Vec<&str> = candidates
+            .clone()
+            .into_iter()
+            .filter(|candidate| cosine(&asked, &grams(candidate, size)) >= min_score)
+            .collect();
+
+        // Ranked by edit distance only among those the similarity admitted,
+        // which is why a short unrelated name never surfaces: it never got
+        // this far.
+        fitting.sort_by(|a, b| {
+            similarity(&normalize(b), &normalize(query))
+                .total_cmp(&similarity(&normalize(a), &normalize(query)))
+        });
+        if let Some(best) = fitting.first() {
+            return Some(best);
+        }
+    }
+    None
+}
+
+/// A string reduced to what a comparison should see.
+///
+/// Punctuation is dropped, so `(name)` and `name` are the same word; commas
+/// and spaces are kept, because a parameter list is compared as the list it
+/// is written as.
+fn normalize(value: &str) -> String {
+    value
+        .chars()
+        .flat_map(char::to_lowercase)
+        .filter(|c| c.is_alphanumeric() || *c == ',' || *c == ' ')
+        .collect()
+}
+
+/// How many times each run of `size` characters occurs, ends marked.
+fn grams(value: &str, size: usize) -> HashMap<String, usize> {
+    let mut padded: Vec<char> = std::iter::once('-')
+        .chain(normalize(value).chars())
+        .chain(std::iter::once('-'))
+        .collect();
+    while padded.len() < size {
+        padded.push('-');
+    }
+
+    let mut counts: HashMap<String, usize> = HashMap::new();
+    for window in padded.windows(size) {
+        *counts.entry(window.iter().collect()).or_insert(0) += 1;
+    }
+    counts
+}
+
+/// The cosine of the angle between two gram counts.
+fn cosine(a: &HashMap<String, usize>, b: &HashMap<String, usize>) -> f64 {
+    let magnitude = |counts: &HashMap<String, usize>| -> f64 {
+        counts.values().map(|n| (n * n) as f64).sum::<f64>().sqrt()
+    };
+    let (a_size, b_size) = (magnitude(a), magnitude(b));
+    if a_size == 0.0 || b_size == 0.0 {
+        return 0.0;
+    }
+    let shared: f64 = a
+        .iter()
+        .map(|(gram, count)| (count * b.get(gram).copied().unwrap_or(0)) as f64)
+        .sum();
+    shared / (a_size * b_size)
 }
 
 /// Levenshtein distance, computed one row at a time.

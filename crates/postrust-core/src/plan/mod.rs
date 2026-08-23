@@ -85,22 +85,29 @@ fn nearest_overload(
     supplied: &[String],
 ) -> Option<String> {
     // Looser than a name: these are lists, and one wrong entry in three should
-    // still find the signature that was meant.
+    // still find the signature that was meant. Revealing a parameter list is
+    // not a disclosure, either -- the client is trying to name it.
     const MIN_SIMILARITY: f64 = 0.33;
 
-    let sorted = |names: &mut Vec<String>| -> String {
+    // Compared as the parameter list is written -- parentheses included --
+    // because that is what the client sees and what it would have to change.
+    let listed = |names: &mut Vec<String>| -> String {
         names.sort();
-        names.join(", ")
+        format!("({})", names.join(", "))
     };
-    let asked = sorted(&mut supplied.to_vec());
+    let asked = listed(&mut supplied.to_vec());
 
-    routines
+    let candidates: Vec<String> = routines
         .iter()
-        .map(|routine| sorted(&mut routine.params.iter().map(|p| p.name.clone()).collect()))
-        .map(|params| (crate::schema_cache::similarity(&params, &asked), params))
-        .filter(|(score, _)| *score >= MIN_SIMILARITY)
-        .max_by(|(a, _), (b, _)| a.total_cmp(b))
-        .map(|(_, params)| format!("{}({})", qi, params))
+        .map(|routine| listed(&mut routine.params.iter().map(|p| p.name.clone()).collect()))
+        .collect();
+
+    crate::schema_cache::closest(
+        candidates.iter().map(String::as_str),
+        &asked,
+        MIN_SIMILARITY,
+    )
+    .map(|params| format!("{}{}", qi, params))
 }
 
 /// Check that every dotted filter, order or range names a resource that was
@@ -173,11 +180,41 @@ fn supplied_arguments(request: &ApiRequest) -> Vec<String> {
     // Over POST the arguments are the body's keys, and the query string holds
     // filters over the result. Reading only the query string there picked the
     // signature that takes nothing at all.
-    match &request.payload {
-        Some(Payload::ProcessedJson { keys, .. }) => return keys.iter().cloned().collect(),
-        Some(Payload::ProcessedUrlEncoded { data, .. }) => {
-            return data.iter().map(|(name, _)| name.clone()).collect()
+    //
+    // `?columns=` overrides them: it says which of the body's keys are
+    // arguments, so a body carrying more than the call needs still names one
+    // signature rather than none.
+    let is_post = matches!(
+        request.action,
+        Action::Db(DbAction::Routine {
+            invoke_method: crate::api_request::InvokeMethod::Inv,
+            ..
+        })
+    );
+    if is_post {
+        if let Some(columns) = &request.query_params.columns {
+            let mut names: Vec<String> = columns.iter().cloned().collect();
+            names.sort();
+            return names;
         }
+    }
+
+    // A name is reported and matched as a set, so the order the body or the
+    // query string happened to use is not part of it.
+    let sorted = |mut names: Vec<String>| -> Vec<String> {
+        names.sort();
+        names.dedup();
+        names
+    };
+
+    match &request.payload {
+        Some(Payload::ProcessedJson { keys, .. }) => return sorted(keys.iter().cloned().collect()),
+        Some(Payload::ProcessedUrlEncoded { data, .. }) => {
+            return sorted(data.iter().map(|(name, _)| name.clone()).collect())
+        }
+        // A raw body is one unnamed argument, so it names no parameter at all.
+        Some(Payload::RawJson(_)) | Some(Payload::RawPayload(_)) => return Vec::new(),
+        None if is_post => return Vec::new(),
         _ => {}
     }
 
@@ -204,6 +241,7 @@ fn supplied_arguments(request: &ApiRequest) -> Vec<String> {
             names.push(name.clone());
         }
     }
+    names.sort();
     names
 }
 
@@ -214,73 +252,143 @@ fn supplied_arguments(request: &ApiRequest) -> Vec<String> {
 /// PostgreSQL then rejects with a message about a function that does not
 /// exist, where the truth is that none of them matched.
 ///
-/// A signature fits when every argument names one of its parameters and every
-/// parameter it requires is supplied. Among those that fit, the one matching
-/// most of its parameters wins; where several match equally the call is
-/// ambiguous and saying so is more use than picking one.
+/// Two kinds of signature can answer a call. One names its parameters, and
+/// fits when the arguments supplied are exactly its required ones plus any of
+/// its optional ones. The other has a single parameter with no name, and takes
+/// the whole request body as that one argument -- so it fits whatever the body
+/// says, and only when the body's media type matches the parameter's type.
+///
+/// A named match always wins; the unnamed one is what a call falls back to. If
+/// nothing is left the function was not found, and if more than one remains at
+/// the same level the call is ambiguous -- saying so is more use than picking
+/// one.
 fn select_overload<'a>(
     routines: &'a [Routine],
     request: &ApiRequest,
 ) -> Result<Option<&'a Routine>> {
-    use crate::api_request::Payload;
-
-    // A body that is not named arguments -- a bare scalar, a raw payload --
-    // says nothing about which signature was meant, so there is nothing to
-    // choose on and the first is as good an answer as any.
-    if matches!(
-        request.payload,
-        Some(Payload::RawJson(_)) | Some(Payload::RawPayload(_))
-    ) {
-        return Ok(routines.first());
-    }
-
     let supplied = supplied_arguments(request);
-
-    let mut fitting: Vec<&Routine> = routines
-        .iter()
-        .filter(|routine| {
-            supplied
-                .iter()
-                .all(|name| routine.params.iter().any(|p| &p.name == name))
-                && routine
-                    .params
-                    .iter()
-                    .filter(|p| p.required)
-                    .all(|p| supplied.contains(&p.name))
+    let is_post = matches!(
+        request.action,
+        Action::Db(DbAction::Routine {
+            invoke_method: crate::api_request::InvokeMethod::Inv,
+            ..
         })
-        .collect();
+    );
 
-    let best = fitting
-        .iter()
-        .map(|routine| {
-            routine
-                .params
-                .iter()
-                .filter(|p| supplied.contains(&p.name))
-                .count()
-        })
-        .max();
+    let (named, unnamed): (Vec<&Routine>, Vec<&Routine>) =
+        routines
+            .iter()
+            .fold((Vec::new(), Vec::new()), |mut acc, r| {
+                if matches_params(r, &supplied, is_post, &request.content_media_type) {
+                    acc.0.push(r);
+                } else if takes_whole_body(r, is_post, &request.content_media_type) {
+                    acc.1.push(r);
+                }
+                acc
+            });
 
-    let Some(best) = best else {
-        return Ok(None);
+    let candidates = match named.is_empty() {
+        true => unnamed,
+        false => named,
     };
 
-    fitting.retain(|routine| {
+    match candidates.len() {
+        0 => Ok(None),
+        1 => Ok(candidates.first().copied()),
+        _ => Err(Error::AmbiguousFunction {
+            candidates: candidates.iter().map(|r| signature_of(r)).collect(),
+        }),
+    }
+}
+
+/// Whether a signature's parameters are exactly what the request supplied.
+///
+/// Required parameters must all be given and optional ones may be; an argument
+/// naming no parameter at all disqualifies the signature, which is what makes
+/// `add_them(a, b)` not answer a call passing `a`, `b` and `smthelse`.
+fn matches_params(
+    routine: &Routine,
+    supplied: &[String],
+    is_post: bool,
+    content: &crate::api_request::MediaType,
+) -> bool {
+    if routine.params.is_empty() {
+        // A body posted as text, xml or bytes is one unnamed argument. A
+        // signature taking nothing cannot receive it, however empty the
+        // argument list looks.
+        return supplied.is_empty() && !(is_post && is_raw_body_type(content));
+    }
+
+    let declares = |name: &String, required: bool| {
         routine
             .params
             .iter()
-            .filter(|p| supplied.contains(&p.name))
-            .count()
-            == best
-    });
+            .any(|p| &p.name == name && p.required == required)
+    };
 
-    if fitting.len() > 1 {
-        return Err(Error::AmbiguousFunction {
-            candidates: fitting.iter().map(|r| signature_of(r)).collect(),
-        });
+    routine
+        .params
+        .iter()
+        .filter(|p| p.required)
+        .all(|p| supplied.contains(&p.name))
+        && supplied
+            .iter()
+            .all(|name| declares(name, true) || declares(name, false))
+}
+
+/// Whether a signature is the single unnamed parameter that takes the body.
+///
+/// Only over `POST`, and only where the body's media type is the one that
+/// parameter's type can receive: a `json` parameter takes a JSON body, a
+/// `text` one a plain-text body, and so on. A GET has no body to pass.
+fn takes_whole_body(
+    routine: &Routine,
+    is_post: bool,
+    content: &crate::api_request::MediaType,
+) -> bool {
+    use crate::api_request::MediaType;
+
+    if !is_post {
+        return false;
     }
+    let [param] = routine.params.as_slice() else {
+        return false;
+    };
+    if !param.name.is_empty() {
+        return false;
+    }
+    matches!(
+        (content, param.param_type.as_str()),
+        (MediaType::ApplicationJson, "json" | "jsonb")
+            | (MediaType::TextPlain, "text")
+            | (MediaType::TextXml, "xml")
+            | (MediaType::OctetStream, "bytea")
+    )
+}
 
-    Ok(fitting.first().copied())
+/// The type a single unnamed parameter would have, for a body of this type.
+///
+/// `None` where no such parameter could take the body at all, which is every
+/// media type that is neither JSON nor one of the three that carry a single
+/// value.
+fn single_param_type(content: &crate::api_request::MediaType) -> Option<String> {
+    use crate::api_request::MediaType;
+    match content {
+        MediaType::ApplicationJson => Some(crate::error::JSON_PARAM.to_string()),
+        MediaType::TextPlain => Some("text".to_string()),
+        MediaType::TextXml => Some("xml".to_string()),
+        MediaType::OctetStream => Some("bytea".to_string()),
+        _ => None,
+    }
+}
+
+/// Media types whose body is one value rather than a set of named arguments.
+fn is_raw_body_type(content: &crate::api_request::MediaType) -> bool {
+    use crate::api_request::MediaType;
+    matches!(
+        content,
+        MediaType::TextPlain | MediaType::TextXml | MediaType::OctetStream
+    )
 }
 
 /// A function's signature as PostgREST prints it when naming candidates.
@@ -331,10 +439,16 @@ fn create_db_plan(
         DbAction::Routine { qi, invoke_method } => {
             let supplied = supplied_arguments(request);
 
-            // Over POST the whole body can be one unnamed `json` argument, so
-            // a signature taking that would also have matched. The message
-            // says which signatures were looked for, so it says so too.
-            let single_json = matches!(invoke_method, crate::api_request::InvokeMethod::Inv);
+            // Over POST the whole body can be one unnamed argument, and the
+            // body's media type decides which type that parameter could be.
+            // The message says which signatures were looked for, so it says
+            // so too.
+            let single_param = match invoke_method {
+                crate::api_request::InvokeMethod::Inv => {
+                    single_param_type(&request.content_media_type)
+                }
+                _ => None,
+            };
 
             // The name is reported as it was called, arguments and all, so the
             // client can see which signature was looked for.
@@ -342,7 +456,7 @@ fn create_db_plan(
                 name: qi.to_string(),
                 params: supplied.clone(),
                 candidate,
-                single_json,
+                single_param: single_param.clone(),
             };
 
             // Nothing of that name: the client most likely misspelled it, so

@@ -872,6 +872,18 @@ impl QueryBuilder {
                 let body_str = String::from_utf8_lossy(body);
                 frag.push_param(SqlParam::Text(body_str.to_string()));
             }
+            CallParams::SingleUnnamed { body, pg_type } => {
+                match body {
+                    Some(body) => frag.push_typed_param(
+                        SqlParam::Text(String::from_utf8_lossy(body).into_owned()),
+                        pg_type,
+                    ),
+                    // No body is that parameter's null. Casting it is what
+                    // tells PostgreSQL which signature is meant, where the
+                    // name carries more than one.
+                    None => frag.push(&format!("NULL::{}", pg_type)),
+                };
+            }
             CallParams::None => {}
         }
 

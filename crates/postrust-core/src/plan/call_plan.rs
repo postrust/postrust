@@ -42,6 +42,10 @@ pub struct CallPlan {
     /// as `text` leaves PostgreSQL unable to resolve any signature that isn't
     /// text -- `add_them(a => text, b => text) does not exist` -- so each one
     /// is cast to its declared type at call time.
+    ///
+    /// The type is the one an argument can be cast to without losing part of
+    /// itself: a `char(4)` parameter is stored as bare `character`, whose
+    /// length is one, and a parameter's length is not enforced anyway.
     #[serde(default)]
     pub param_types: Vec<(String, String)>,
     /// The names of the parameters declared `VARIADIC`.
@@ -62,6 +66,19 @@ pub enum CallParams {
     Positional(Vec<String>),
     /// Single JSON object passed as first argument
     SingleObject(bytes::Bytes),
+    /// The whole request body, as the one parameter the function does not name.
+    ///
+    /// `unnamed_json_param(json)` declares a parameter with no name, so no
+    /// argument can be addressed to it; what it takes is the body itself,
+    /// cast to the type it declares. An absent body is that parameter's
+    /// `NULL`, not a call with no arguments -- the function has one either
+    /// way.
+    SingleUnnamed {
+        /// The raw body, absent when the request had none.
+        body: Option<bytes::Bytes>,
+        /// The type the parameter declares, which the body is cast to.
+        pg_type: String,
+    },
     /// No parameters
     None,
 }
@@ -92,7 +109,7 @@ impl CallPlan {
             param_types: routine
                 .params
                 .iter()
-                .map(|p| (p.name.clone(), p.param_type.clone()))
+                .map(|p| (p.name.clone(), p.type_max_length.clone()))
                 .collect(),
             variadic_params: routine
                 .params
@@ -111,6 +128,23 @@ impl CallPlan {
 
 /// Extract call parameters from request.
 fn extract_call_params(request: &ApiRequest, routine: &Routine) -> Result<CallParams> {
+    // A parameter with no name cannot be given an argument by name. What such
+    // a function takes is the body itself, whatever the body says.
+    if let [param] = routine.params.as_slice() {
+        if param.name.is_empty() {
+            let body = match &request.payload {
+                Some(Payload::ProcessedJson { raw, .. })
+                | Some(Payload::RawJson(raw))
+                | Some(Payload::RawPayload(raw)) => Some(raw.clone()),
+                Some(Payload::ProcessedUrlEncoded { .. }) | None => None,
+            };
+            return Ok(CallParams::SingleUnnamed {
+                body,
+                pg_type: param.param_type.clone(),
+            });
+        }
+    }
+
     // Check for JSON body first
     if let Some(payload) = &request.payload {
         match payload {

@@ -394,7 +394,7 @@ async fn execute_plan(
             // been serialised as JSON.
             let media_handler = {
                 let schema_cache = state.schema_cache().await;
-                read_target(api_request, &schema_cache).and_then(|qi| {
+                read_target(api_request, Some(db_plan), &schema_cache).and_then(|qi| {
                     api_request.accept_media_types.iter().find_map(|media| {
                         schema_cache
                             .media_handler(&api_request.schema, media.content_type(), &qi)
@@ -572,7 +572,7 @@ async fn execute_plan(
             // two-query path only runs when the first produced nothing.
             let embed_parent = {
                 let schema_cache = state.schema_cache().await;
-                read_target(api_request, &schema_cache)
+                read_target(api_request, Some(db_plan), &schema_cache)
             };
             let embed_level = match embed_parent.clone() {
                 Some(parent_qi)
@@ -757,7 +757,7 @@ async fn execute_plan(
             // runs when none matched.
             let geojson_column = if media_handler.is_none() {
                 let schema_cache = state.schema_cache().await;
-                read_target(api_request, &schema_cache)
+                read_target(api_request, Some(db_plan), &schema_cache)
                     .filter(|_| {
                         api_request
                             .accept_media_types
@@ -986,7 +986,7 @@ async fn execute_plan(
             // single-query form did not handle.
             let two_query_parent = {
                 let schema_cache = state.schema_cache().await;
-                read_target(api_request, &schema_cache)
+                read_target(api_request, Some(db_plan), &schema_cache)
             };
             if let Some(parent_qi) = two_query_parent.filter(|_| !embed_level.saw_relations) {
                 let schema_cache = state.schema_cache().await;
@@ -1339,6 +1339,7 @@ fn unwrap_rpc_rows(
 /// The table a read targets, if the request is a read.
 fn read_target(
     api_request: &postrust_core::api_request::ApiRequest,
+    db_plan: Option<&DbActionPlan>,
     schema_cache: &postrust_core::SchemaCache,
 ) -> Option<postrust_core::api_request::QualifiedIdentifier> {
     use postrust_core::api_request::{Action, DbAction};
@@ -1352,9 +1353,20 @@ fn read_target(
         Action::Db(DbAction::RelationMut { qi, .. }) => Some(qi.clone()),
         // A function returning a table's rows embeds, and renders, exactly as
         // that table does.
-        Action::Db(DbAction::Routine { qi, .. }) => schema_cache
-            .routine_returned_table(qi)
-            .map(|table| table.qualified_identifier()),
+        //
+        // Which table that is was settled when the overload was chosen: a
+        // name may carry several signatures returning different things, and
+        // asking the cache again by name answers for whichever comes first.
+        // It also knows the answer for a return type this side cannot read
+        // off the name at all, such as a domain over a table.
+        Action::Db(DbAction::Routine { qi, .. }) => match db_plan {
+            Some(DbActionPlan::Call { read, .. }) => {
+                read.as_ref().map(|tree| tree.root.from.clone())
+            }
+            _ => schema_cache
+                .routine_returned_table(qi)
+                .map(|table| table.qualified_identifier()),
+        },
         _ => None,
     }
 }
@@ -1580,7 +1592,7 @@ fn add_embed_join_columns(
 ) -> Result<Vec<String>, postrust_core::Error> {
     use postrust_core::api_request::{Field, SelectItem};
 
-    let Some(parent_qi) = read_target(api_request, schema_cache) else {
+    let Some(parent_qi) = read_target(api_request, None, schema_cache) else {
         return Ok(Vec::new());
     };
 
@@ -2835,11 +2847,24 @@ fn sanitize_error_message(error: &postrust_core::Error) -> String {
         Error::TableNotFound { name, .. } | Error::NotFound(name) => {
             return format!("Could not find the table '{}' in the schema cache", name)
         }
-        Error::FunctionNotFound { name, params, .. } => {
+        Error::FunctionNotFound {
+            name,
+            params,
+            single_param,
+            ..
+        } => {
+            // A body that is one value carries no argument names, so there is
+            // no argument list to report -- naming the function is the whole
+            // of what was looked for.
+            let looked_for =
+                match postrust_core::error::names_only_one_param(single_param.as_deref()) {
+                    true => name.clone(),
+                    false => postrust_core::error::function_signature(name, params),
+                };
             return format!(
                 "Could not find the function {} in the schema cache",
-                postrust_core::error::function_signature(name, params)
-            )
+                looked_for
+            );
         }
         Error::UnacceptableSchema { requested, .. } => {
             return format!("Invalid schema: {}", requested)
