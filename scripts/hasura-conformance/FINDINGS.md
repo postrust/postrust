@@ -8,9 +8,14 @@ harness itself, divergences kept on purpose, and the gaps still open.
 
 | | status | same outcome | same data | full body |
 |---|---|---|---|---|
-| all (464) | 97.8% | 50.9% | **43.8%** | 13.6% |
-| reads (269) | 99.3% | 55.0% | 45.0% | 20.1% |
-| writes (195) | 95.9% | 45.1% | 42.1% | 4.6% |
+| all (464) | 97.8% | 55.4% | **48.3%** | 18.1% |
+| reads (269) | 99.3% | 57.2% | 47.2% | 22.3% |
+| writes (195) | 95.9% | 52.8% | 49.7% | 12.3% |
+
+The same-data figure over successive fixes: 34.1 → 41.8 (duplicate-field
+panic) → 43.8 (enum arguments read) → 44.2 (relationship predicates, aggregate
+result decoding) → 44.6 (scalar naming) → 48.3 (update operators, written-value
+casts, root type names).
 
 The third column is the one that matters to a client: the same query came back
 with the same rows.
@@ -18,8 +23,9 @@ with the same rows.
 **142 of the 464 cases cannot pass and are counted anyway.** They are the
 permission cases — Hasura answers `access-denied` from a rule that lives in
 metadata, and there is no metadata here. Excluding them the figure is
-144/322 = 44.7%, which is barely different, so the headline is not being held
-down by them. It is held down by the gaps listed further below.
+165/322 = 51.2%. The gap between the two is small, which is the useful thing
+to know: the headline is not being held down by the divergence chosen on
+purpose. It is held down by the gaps listed further below.
 
 Reported as measured, at four levels, because a single systemic gap otherwise
 sinks everything behind it. Two of those gaps were found exactly that way.
@@ -97,39 +103,64 @@ wrong one.
 
 ## Open, ordered by consequence
 
-1. **Relationship predicates are advertised and not resolved.**
-   `where: {articles: {title: {_eq: "x"}}}` needs an `EXISTS` against the
-   related table, and the builder has no table context. It refuses rather than
-   ignoring — a filter that quietly matches everything is worse than one that
-   fails — but the field is in the schema, so a client that type-checks still
-   fails at runtime. This is the largest single gap in `boolexp`.
+1. **Arguments on relationship fields.** `author { articles(where: ..., limit:
+   5, order_by: ...) { ... } }` — a nested selection takes no arguments at all,
+   so a client filtering or paginating an embedded list gets `Unknown argument
+   "where" on field "articles"`. Common in real queries and not only in the
+   corpus.
 
-2. **Aggregates return nothing.** The types generate and the field resolves,
-   but the selection walk in `resolve_aggregate` finds no children, so
-   `aggregate` comes back null and `nodes` empty. Every case in
-   `graphql_query/aggregations` fails on it. The corpus cases alias heavily
-   (`id_sum: id`, `articles: nodes`), which is the first thing to rule out.
+2. **Enum tables, and why they may stay open.** `colors_enum` in the corpus is
+   not a PostgreSQL enum: it is an ordinary table of allowed values, marked
+   `set_table_is_enum` in metadata, from which Hasura generates a GraphQL enum
+   and types every referencing column as it. 17 cases turn on it. There is no
+   reflection-based way to tell that table from any other — a text primary key
+   with a comment column is just a table — so this one needs configuration,
+   which is the model this project declined. Worth deciding explicitly rather
+   than leaving as a to-do.
 
-3. **Custom schemas.** `graphql_mutation/custom_schema` and
-   `graphql_query/custom_schema` are at zero. Hasura renames root fields
-   through `set_table_customization`; here a table outside the default schema
-   is prefixed with its schema name instead.
+3. **`on_conflict`.** Upserts are not expressible. Needs unique-constraint
+   names, which the schema cache does not collect: `Table` carries `pk_cols`
+   and nothing else, though `schema_cache/queries.rs` already reads `conname`
+   for foreign keys.
 
-4. **Enum tables.** `set_table_is_enum` turns a table into a GraphQL enum.
-   There is no equivalent, and no reflection-based way to know a table was
-   meant as one.
+4. **Nested aggregates.** `author { articles_aggregate { aggregate { count } } }`
+   — the aggregate exists only as a root field, not as a relationship field.
 
-5. **Introspection descriptions.** Table and column comments are already in the
+5. **Custom root field names.** Hasura renames roots through
+   `set_table_customization`; here a table outside the default schema is
+   prefixed with its schema name instead. Same configuration question as (2).
+
+6. **Introspection descriptions.** Table and column comments are already in the
    schema cache, so this is closer than its 0/5 suggests.
-
-6. **`_inc`, and the jsonb update operators** (`_append`, `_prepend`,
-   `_delete_key`, `_delete_elem`, `_delete_at_path`). `graphql_mutation/update/jsonb`
-   is at 14%.
 
 7. **Ordering across a relationship** is not offered at all, deliberately: a
    field the schema advertises and the resolver refuses is worse than one that
-   was never there. Item 1 is the same problem with the opposite decision
-   already made, and the two should end up consistent.
+   was never there. Now that relationship predicates resolve, the same
+   correlated subselect would serve ordering, and the two should end up
+   consistent.
+
+8. **Relationship predicates through a junction or a computed relationship**
+   are refused rather than resolved. Both need more than a pair of columns to
+   correlate on.
+
+## Fixed since the first run
+
+- **Relationship predicates** now resolve as a correlated `EXISTS`, in both
+  directions, with each nesting level aliased so a relationship followed twice
+  cannot correlate against itself. Column references are qualified for the same
+  reason.
+- **Aggregates** returned nothing because the result was cast to text and
+  `execute_query_on` decodes column zero as JSON, so every row was dropped by
+  the `.ok()` that guards it. The selection walk was never the problem, which
+  instrumenting it settled in a minute.
+- **Scalars carry their PostgreSQL names** — `jsonb`, `numeric`, `timestamptz`,
+  `geometry` — because `query ($x: jsonb!)` names a type. 56 cases were failing
+  on the spelling alone. Types this server knows nothing about keep their own
+  name rather than collapsing to String, which is what makes a PostGIS column
+  usable at all.
+- **Updates take all seven operators**, and written values are cast to their
+  column's type: a bound parameter arrives as text, and PostgreSQL will not
+  coerce text to `jsonb`, to an array, or to a user-defined type on assignment.
 
 ## Not measured
 
