@@ -261,8 +261,14 @@ fn build_dynamic_schema(
     builder = builder.register(create_datetime_scalar());
     builder = builder.register(create_time_scalar());
 
-    // Register input types
-    builder = register_filter_input_types(builder);
+    // Register the boolean expression inputs -- one per table, plus one
+    // comparison input per scalar the tables use.
+    for input in crate::input::bool_exp::build_inputs(
+        &generated.object_types,
+        &generated.relationship_fields,
+    ) {
+        builder = builder.register(input);
+    }
 
     builder
         .finish()
@@ -362,6 +368,7 @@ fn create_query_type(
         let pk_columns = field.pk_columns.clone();
         let return_type = graphql_type_ref(&field.return_type);
 
+        let spec_type_name = type_name.clone();
         let spec = Arc::new(QueryFieldSpec {
             schema_name,
             table_name,
@@ -380,7 +387,12 @@ fn create_query_type(
         // Add standard query arguments
         if !is_by_pk {
             gql_field = gql_field
-                .argument(InputValue::new("filter", TypeRef::named("JSON")))
+                .argument(InputValue::new(
+                    "where",
+                    TypeRef::named(crate::input::bool_exp::bool_exp_type_name(
+                        &spec_type_name,
+                    )),
+                ))
                 .argument(InputValue::new("orderBy", TypeRef::named_list("String")))
                 .argument(InputValue::new("limit", TypeRef::named("Int")))
                 .argument(InputValue::new("offset", TypeRef::named("Int")));
@@ -426,6 +438,14 @@ fn create_mutation_type(generated: &GeneratedSchema) -> Object {
         let pk_columns = field.pk_columns.clone();
         let return_type = graphql_type_ref(&field.return_type);
 
+        // The table's own type name, which is what its boolean expression is
+        // named after. A bulk mutation returns `[author!]!` and a by-key one
+        // returns `author`; both name the same table.
+        let where_type = field
+            .return_type
+            .trim_matches(|c| c == '[' || c == ']' || c == '!')
+            .to_string();
+
         let resolver_pk_columns = pk_columns.clone();
         let mut gql_field = Field::new(&field.name, return_type, move |ctx| {
             let table_name = table_name.clone();
@@ -447,7 +467,7 @@ fn create_mutation_type(generated: &GeneratedSchema) -> Object {
                     gql_field.argument(InputValue::new("objects", TypeRef::named_nn_list("JSON")));
             }
             MutationType::UpdateByPk => {
-                gql_field = gql_field.argument(InputValue::new("set", TypeRef::named_nn("JSON")));
+                gql_field = gql_field.argument(InputValue::new("_set", TypeRef::named_nn("JSON")));
                 for (col_name, pg_type) in &pk_columns {
                     gql_field = gql_field.argument(InputValue::new(
                         col_name,
@@ -457,8 +477,11 @@ fn create_mutation_type(generated: &GeneratedSchema) -> Object {
             }
             MutationType::Update => {
                 gql_field = gql_field
-                    .argument(InputValue::new("where", TypeRef::named("JSON")))
-                    .argument(InputValue::new("set", TypeRef::named_nn("JSON")));
+                    .argument(InputValue::new(
+                        "where",
+                        TypeRef::named(crate::input::bool_exp::bool_exp_type_name(&where_type)),
+                    ))
+                    .argument(InputValue::new("_set", TypeRef::named_nn("JSON")));
             }
             MutationType::DeleteByPk => {
                 for (col_name, pg_type) in &pk_columns {
@@ -469,7 +492,10 @@ fn create_mutation_type(generated: &GeneratedSchema) -> Object {
                 }
             }
             MutationType::Delete => {
-                gql_field = gql_field.argument(InputValue::new("where", TypeRef::named("JSON")));
+                gql_field = gql_field.argument(InputValue::new(
+                    "where",
+                    TypeRef::named(crate::input::bool_exp::bool_exp_type_name(&where_type)),
+                ));
             }
         }
 
@@ -622,12 +648,7 @@ async fn resolve_query<'a>(
             bound_values.push(accessor_to_json(&value));
         }
         where_sql = format!(" WHERE {}", conditions.join(" AND "));
-    } else if let Some(filter) = ctx
-        .args
-        .try_get("filter")
-        .ok()
-        .map(|v| accessor_to_json(&v))
-    {
+    } else if let Some(filter) = ctx.args.try_get("where").ok().map(|v| accessor_to_json(&v)) {
         let (filter_sql, filter_values) = build_where_clause(Some(&filter), 1)?;
         if !filter_sql.is_empty() {
             where_sql = format!(" {}", filter_sql);
@@ -1145,107 +1166,209 @@ async fn execute_delete<'a>(
     }
 }
 
-/// Build a WHERE clause from a JSON filter object.
+/// Build a WHERE clause from a boolean expression.
+///
+/// The expression is the JSON form of a `<table>_bool_exp`: column names
+/// mapping to comparisons, and `_and`, `_or` and `_not` for structure. It
+/// nests, so this recurses.
+///
+/// Nothing is dropped silently. An operator that is not recognised widens the
+/// result set if it is ignored -- every row for a query, every row for a
+/// mutation -- so it is an error instead.
 fn build_where_clause(
     where_value: Option<&serde_json::Value>,
     start_param_idx: usize,
 ) -> Result<(String, Vec<serde_json::Value>), async_graphql::Error> {
-    let mut conditions: Vec<String> = Vec::new();
     let mut values: Vec<serde_json::Value> = Vec::new();
     let mut param_idx = start_param_idx;
 
-    if let Some(serde_json::Value::Object(map)) = where_value {
-        for (key, val) in map {
-            let column = postrust_sql::escape_ident(key);
+    let condition = match where_value {
+        Some(value) => build_condition(value, &mut param_idx, &mut values)?,
+        None => None,
+    };
 
-            match val {
-                serde_json::Value::Object(op_map) => {
-                    for (op, op_val) in op_map {
-                        // Binary comparisons all bind exactly one parameter.
-                        let binary_operator = match op.as_str() {
-                            "eq" | "_eq" => Some("="),
-                            "neq" | "_neq" => Some("!="),
-                            "gt" | "_gt" => Some(">"),
-                            "gte" | "_gte" => Some(">="),
-                            "lt" | "_lt" => Some("<"),
-                            "lte" | "_lte" => Some("<="),
-                            "like" | "_like" => Some("LIKE"),
-                            "ilike" | "_ilike" => Some("ILIKE"),
-                            _ => None,
-                        };
+    Ok(match condition {
+        Some(sql) => (format!("WHERE {}", sql), values),
+        None => (String::new(), values),
+    })
+}
 
-                        if let Some(sql_operator) = binary_operator {
-                            conditions.push(format!("{} {} ${}", column, sql_operator, param_idx));
-                            values.push(op_val.clone());
-                            param_idx += 1;
-                            continue;
-                        }
+/// One boolean expression, as SQL. `None` where it constrains nothing.
+fn build_condition(
+    value: &serde_json::Value,
+    param_idx: &mut usize,
+    values: &mut Vec<serde_json::Value>,
+) -> Result<Option<String>, async_graphql::Error> {
+    let serde_json::Value::Object(map) = value else {
+        return Ok(None);
+    };
 
-                        match op.as_str() {
-                            "is_null" | "_is_null" | "isNull" => {
-                                if op_val.as_bool().unwrap_or(false) {
-                                    conditions.push(format!("{} IS NULL", column));
-                                } else {
-                                    conditions.push(format!("{} IS NOT NULL", column));
-                                }
-                            }
-                            "in" | "_in" => {
-                                let items = op_val.as_array().ok_or_else(|| {
-                                    async_graphql::Error::new(format!(
-                                        "the `in` filter on \"{}\" requires a list of values",
-                                        key
-                                    ))
-                                })?;
+    let mut conditions: Vec<String> = Vec::new();
 
-                                if items.is_empty() {
-                                    // `IN ()` is not valid SQL, and an empty set
-                                    // matches nothing.
-                                    conditions.push("false".to_string());
-                                    continue;
-                                }
-
-                                let mut placeholders = Vec::with_capacity(items.len());
-                                for item in items {
-                                    placeholders.push(format!("${}", param_idx));
-                                    values.push(item.clone());
-                                    param_idx += 1;
-                                }
-                                conditions.push(format!(
-                                    "{} IN ({})",
-                                    column,
-                                    placeholders.join(", ")
-                                ));
-                            }
-                            other => {
-                                // Dropping an unrecognised operator would widen
-                                // the result set -- returning every row for a
-                                // query, or matching every row for a mutation.
-                                // Fail loudly instead.
-                                return Err(async_graphql::Error::new(format!(
-                                    "unsupported filter operator \"{}\" on \"{}\"",
-                                    other, key
-                                )));
-                            }
-                        }
+    for (key, val) in map {
+        match key.as_str() {
+            // An empty `_and` is true and an empty `_or` is false, which is
+            // what SQL's own identities give: nothing to AND constrains
+            // nothing, nothing to OR matches nothing.
+            "_and" | "_or" => {
+                let members = val.as_array().ok_or_else(|| {
+                    async_graphql::Error::new(format!("\"{}\" takes a list of expressions", key))
+                })?;
+                let mut parts = Vec::new();
+                for member in members {
+                    if let Some(sql) = build_condition(member, param_idx, values)? {
+                        parts.push(sql);
                     }
                 }
-                _ => {
-                    // Direct equality: {field: value}
-                    conditions.push(format!("{} = ${}", column, param_idx));
-                    values.push(val.clone());
-                    param_idx += 1;
+                if parts.is_empty() {
+                    if key == "_or" {
+                        conditions.push("false".to_string());
+                    }
+                    continue;
+                }
+                let joiner = if key == "_and" { " AND " } else { " OR " };
+                conditions.push(format!("({})", parts.join(joiner)));
+            }
+            "_not" => {
+                if let Some(sql) = build_condition(val, param_idx, values)? {
+                    conditions.push(format!("NOT ({})", sql));
+                }
+            }
+            column => {
+                let quoted = postrust_sql::escape_ident(column);
+                match val {
+                    serde_json::Value::Object(ops) => {
+                        for (op, operand) in ops {
+                            conditions.push(comparison_sql(
+                                &quoted, column, op, operand, param_idx, values,
+                            )?);
+                        }
+                    }
+                    // `{id: 1}` rather than `{id: {_eq: 1}}`. Not a spelling
+                    // Hasura accepts, but one that costs nothing to read and
+                    // that hand-written queries reach for.
+                    other => {
+                        conditions.push(format!("{} = ${}", quoted, param_idx));
+                        values.push(other.clone());
+                        *param_idx += 1;
+                    }
                 }
             }
         }
     }
 
-    let where_sql = if conditions.is_empty() {
-        String::new()
+    Ok(if conditions.is_empty() {
+        None
+    } else if conditions.len() == 1 {
+        conditions.pop()
     } else {
-        format!("WHERE {}", conditions.join(" AND "))
+        Some(conditions.join(" AND "))
+    })
+}
+
+/// One comparison against one column.
+fn comparison_sql(
+    quoted: &str,
+    column: &str,
+    op: &str,
+    operand: &serde_json::Value,
+    param_idx: &mut usize,
+    values: &mut Vec<serde_json::Value>,
+) -> Result<String, async_graphql::Error> {
+    // Comparisons binding exactly one parameter, by the SQL they become.
+    let binary = match op {
+        "_eq" => Some("="),
+        "_neq" => Some("<>"),
+        "_gt" => Some(">"),
+        "_gte" => Some(">="),
+        "_lt" => Some("<"),
+        "_lte" => Some("<="),
+        "_like" => Some("LIKE"),
+        "_nlike" => Some("NOT LIKE"),
+        "_ilike" => Some("ILIKE"),
+        "_nilike" => Some("NOT ILIKE"),
+        "_similar" => Some("SIMILAR TO"),
+        "_nsimilar" => Some("NOT SIMILAR TO"),
+        "_regex" => Some("~"),
+        "_nregex" => Some("!~"),
+        "_iregex" => Some("~*"),
+        "_niregex" => Some("!~*"),
+        "_contains" => Some("@>"),
+        "_contained_in" => Some("<@"),
+        "_has_key" => Some("?"),
+        _ => None,
     };
 
-    Ok((where_sql, values))
+    if let Some(sql_op) = binary {
+        let placeholder = format!("${}", param_idx);
+        *param_idx += 1;
+        // `?` is the JSONB key-existence operator and also what sqlx would
+        // read as a placeholder in some dialects; the parameter is bound
+        // either way, so the operator is written with its operand cast to the
+        // text a key test needs.
+        values.push(operand.clone());
+        return Ok(format!("{} {} {}", quoted, sql_op, placeholder));
+    }
+
+    match op {
+        "_is_null" => Ok(if operand.as_bool().unwrap_or(false) {
+            format!("{} IS NULL", quoted)
+        } else {
+            format!("{} IS NOT NULL", quoted)
+        }),
+        "_in" | "_nin" => {
+            let items = operand.as_array().ok_or_else(|| {
+                async_graphql::Error::new(format!(
+                    "the \"{}\" comparison on \"{}\" requires a list of values",
+                    op, column
+                ))
+            })?;
+            if items.is_empty() {
+                // `IN ()` is not valid SQL. An empty `_in` matches nothing and
+                // an empty `_nin` matches everything.
+                return Ok(if op == "_in" { "false" } else { "true" }.to_string());
+            }
+            let mut placeholders = Vec::with_capacity(items.len());
+            for item in items {
+                placeholders.push(format!("${}", param_idx));
+                values.push(item.clone());
+                *param_idx += 1;
+            }
+            Ok(format!(
+                "{} {} ({})",
+                quoted,
+                if op == "_in" { "IN" } else { "NOT IN" },
+                placeholders.join(", ")
+            ))
+        }
+        "_has_keys_any" | "_has_keys_all" => {
+            let items = operand.as_array().ok_or_else(|| {
+                async_graphql::Error::new(format!(
+                    "the \"{}\" comparison on \"{}\" requires a list of keys",
+                    op, column
+                ))
+            })?;
+            let keys: Vec<String> = items
+                .iter()
+                .map(|i| i.as_str().unwrap_or_default().to_string())
+                .collect();
+            let placeholder = format!("${}", param_idx);
+            *param_idx += 1;
+            values.push(serde_json::Value::Array(
+                keys.into_iter().map(serde_json::Value::String).collect(),
+            ));
+            Ok(format!(
+                "{} {} {}::text[]",
+                quoted,
+                if op == "_has_keys_any" { "?|" } else { "?&" },
+                placeholder
+            ))
+        }
+        other => Err(async_graphql::Error::new(format!(
+            "unsupported comparison \"{}\" on \"{}\"",
+            other, column
+        ))),
+    }
 }
 
 /// Build an `ORDER BY` clause from the `orderBy` argument.
@@ -1779,33 +1902,6 @@ fn create_time_scalar() -> Scalar {
 /// filters become typed per column; until then the operators a filter actually
 /// supports are the ones `build_where_clause` implements, and it rejects
 /// anything else rather than ignoring it.
-fn register_filter_input_types(builder: SchemaBuilder) -> SchemaBuilder {
-    let string_filter = InputObject::new("StringFilterInput")
-        .field(InputValue::new("eq", TypeRef::named("String")))
-        .field(InputValue::new("neq", TypeRef::named("String")))
-        .field(InputValue::new("like", TypeRef::named("String")))
-        .field(InputValue::new("ilike", TypeRef::named("String")))
-        .field(InputValue::new("in", TypeRef::named_list("String")))
-        .field(InputValue::new("isNull", TypeRef::named("Boolean")));
-
-    let int_filter = InputObject::new("IntFilterInput")
-        .field(InputValue::new("eq", TypeRef::named("Int")))
-        .field(InputValue::new("neq", TypeRef::named("Int")))
-        .field(InputValue::new("gt", TypeRef::named("Int")))
-        .field(InputValue::new("gte", TypeRef::named("Int")))
-        .field(InputValue::new("lt", TypeRef::named("Int")))
-        .field(InputValue::new("lte", TypeRef::named("Int")))
-        .field(InputValue::new("in", TypeRef::named_list("Int")));
-
-    let boolean_filter = InputObject::new("BooleanFilterInput")
-        .field(InputValue::new("eq", TypeRef::named("Boolean")));
-
-    builder
-        .register(string_filter)
-        .register(int_filter)
-        .register(boolean_filter)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2044,23 +2140,43 @@ mod tests {
     // ============================================================================
 
     #[test]
-    fn test_register_filter_input_types() {
+    fn every_table_gets_a_boolean_expression() {
         let cache = create_test_schema_cache();
         let config = SchemaConfig::default();
-        let _generated = build_schema(&cache, &config);
+        let generated = build_schema(&cache, &config);
 
-        // Build a minimal schema with filter types
-        let query =
-            Object::new("Query").field(Field::new("test", TypeRef::named("String"), |_| {
-                FieldFuture::new(async { Ok(None::<FieldValue>) })
-            }));
+        let inputs = crate::input::bool_exp::build_inputs(
+            &generated.object_types,
+            &generated.relationship_fields,
+        );
+        let names: HashSet<String> = inputs.iter().map(|i| i.type_name().to_string()).collect();
 
-        let mut builder = Schema::build("Query", None::<&str>, None);
-        builder = builder.register(query);
-        builder = register_filter_input_types(builder);
+        for table in generated.object_types.keys() {
+            let expected = format!("{}_bool_exp", table);
+            assert!(
+                names.contains(&expected),
+                "no {} among {:?}",
+                expected,
+                names
+            );
+        }
+        // The scalars the fixture's columns use.
+        assert!(names.contains("String_comparison_exp"));
+        assert!(names.contains("Int_comparison_exp"));
+    }
 
-        let result = builder.finish();
-        assert!(result.is_ok());
+    #[test]
+    fn a_schema_carrying_the_boolean_expressions_still_builds() {
+        let cache = create_test_schema_cache();
+        let config = SchemaConfig::default();
+        let generated = build_schema(&cache, &config);
+
+        let schema = build_dynamic_schema(&generated, &cache, None, None);
+        assert!(schema.is_ok(), "{:?}", schema.err());
+
+        let sdl = schema.unwrap().sdl();
+        assert!(sdl.contains("_bool_exp"), "no boolean expressions in:\n{}", sdl);
+        assert!(sdl.contains("_and"), "no _and in the generated expressions");
     }
 
     // ============================================================================
