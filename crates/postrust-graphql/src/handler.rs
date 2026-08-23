@@ -270,6 +270,17 @@ fn build_dynamic_schema(
         builder = builder.register(input);
     }
 
+    // Ordering: one input per table, one column enum per table, and the single
+    // direction enum they all share.
+    let (order_inputs, order_enums) =
+        crate::input::order_by::build_inputs(&generated.object_types);
+    for input in order_inputs {
+        builder = builder.register(input);
+    }
+    for enum_type in order_enums {
+        builder = builder.register(enum_type);
+    }
+
     builder
         .finish()
         .map_err(|e| GraphQLError::SchemaError(e.to_string()))
@@ -393,7 +404,18 @@ fn create_query_type(
                         &spec_type_name,
                     )),
                 ))
-                .argument(InputValue::new("orderBy", TypeRef::named_list("String")))
+                .argument(InputValue::new(
+                    "order_by",
+                    TypeRef::named_nn_list(crate::input::order_by::order_by_type_name(
+                        &spec_type_name,
+                    )),
+                ))
+                .argument(InputValue::new(
+                    "distinct_on",
+                    TypeRef::named_nn_list(crate::input::order_by::select_column_type_name(
+                        &spec_type_name,
+                    )),
+                ))
                 .argument(InputValue::new("limit", TypeRef::named("Int")))
                 .argument(InputValue::new("offset", TypeRef::named("Int")));
         } else {
@@ -656,20 +678,45 @@ async fn resolve_query<'a>(
         }
     }
 
-    // Build the ORDER BY clause from the `orderBy` argument. Entries are
-    // `column`, `column.asc` or `column.desc`; the column is validated against
-    // the table so an unknown or crafted name cannot reach the SQL.
-    let order_sql = if is_by_pk {
-        String::new()
+    // A by-key query resolves to one row, so neither ordering nor distinct
+    // has anything to do.
+    let (order_sql, distinct_on) = if is_by_pk {
+        (String::new(), Vec::new())
     } else {
-        build_order_by_clause(ctx, &gql_ctx.schema_cache, schema_name, table_name).await?
+        (
+            build_order_by_clause(ctx, &gql_ctx.schema_cache, schema_name, table_name).await?,
+            build_distinct_on(ctx, &gql_ctx.schema_cache, schema_name, table_name).await?,
+        )
+    };
+
+    // PostgreSQL keeps the first row of each DISTINCT ON group in the query's
+    // own order, and picks arbitrarily where the order does not begin with the
+    // distinct columns. Prepending them keeps whatever the client asked for as
+    // the tiebreak instead of discarding it.
+    let (distinct_sql, order_sql) = if distinct_on.is_empty() {
+        (String::new(), order_sql)
+    } else {
+        let mut terms: Vec<String> = distinct_on.clone();
+        if let Some(rest) = order_sql.strip_prefix(" ORDER BY ") {
+            for term in rest.split(", ") {
+                let column = term.split_whitespace().next().unwrap_or(term);
+                if !distinct_on.iter().any(|d| d == column) {
+                    terms.push(term.to_string());
+                }
+            }
+        }
+        (
+            format!("DISTINCT ON ({}) ", distinct_on.join(", ")),
+            format!(" ORDER BY {}", terms.join(", ")),
+        )
     };
 
     // ORDER BY, LIMIT and OFFSET belong inside the subquery: applying them to
     // the outer `row_to_json` projection would leave the ordering of the rows
     // that survive the limit unspecified.
     let mut inner = format!(
-        "SELECT * FROM {}.{}{}{}",
+        "SELECT {}* FROM {}.{}{}{}",
+        distinct_sql,
         postrust_sql::escape_ident(schema_name),
         postrust_sql::escape_ident(table_name),
         where_sql,
@@ -1371,39 +1418,37 @@ fn comparison_sql(
     }
 }
 
-/// Build an `ORDER BY` clause from the `orderBy` argument.
+/// Build an `ORDER BY` clause from the `order_by` argument.
 ///
-/// Entries are `column`, `column.asc` or `column.desc`. Column names are
-/// checked against the table in the schema cache and then quoted, so a name
-/// that is unknown -- or crafted to inject SQL -- is rejected rather than
-/// interpolated. Returns an empty string when no ordering was requested.
+/// The argument is a list of single-column objects -- `[{name: asc}, {id:
+/// desc}]` -- and the list is ordered, which is why it is a list and not one
+/// object with several keys. Column names are checked against the table in the
+/// schema cache before being quoted, so a name that is unknown, or crafted to
+/// inject SQL, is rejected rather than interpolated. Returns an empty string
+/// when no ordering was requested.
 async fn build_order_by_clause(
     ctx: &ResolverContext<'_>,
     schema_cache: &postrust_core::schema_cache::SchemaCacheRef,
     schema_name: &str,
     table_name: &str,
 ) -> Result<String, async_graphql::Error> {
-    let Ok(order_arg) = ctx.args.try_get("orderBy") else {
+    let Ok(order_arg) = ctx.args.try_get("order_by") else {
         return Ok(String::new());
     };
 
-    let entries = match order_arg.list() {
-        Ok(list) => list
-            .iter()
-            .map(|item| item.string().map(|s| s.to_string()))
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(|_| async_graphql::Error::new("orderBy entries must be strings"))?,
-        // A bare string is accepted as a single-column ordering.
-        Err(_) => match order_arg.string() {
-            Ok(single) => vec![single.to_string()],
-            Err(_) => {
-                return Err(async_graphql::Error::new(
-                    "orderBy must be a string or a list of strings",
-                ))
-            }
-        },
+    let value = accessor_to_json(&order_arg);
+    // A single object is accepted as a one-entry list, which is what a client
+    // writing `order_by: {name: asc}` means and what Hasura reads it as.
+    let entries: Vec<&serde_json::Value> = match &value {
+        serde_json::Value::Array(items) => items.iter().collect(),
+        serde_json::Value::Object(_) => vec![&value],
+        serde_json::Value::Null => return Ok(String::new()),
+        _ => {
+            return Err(async_graphql::Error::new(
+                "order_by takes an object or a list of them",
+            ))
+        }
     };
-
     if entries.is_empty() {
         return Ok(String::new());
     }
@@ -1420,40 +1465,94 @@ async fn build_order_by_clause(
         .get_table(&qi)
         .ok_or_else(|| async_graphql::Error::new(format!("unknown table \"{}\"", table_name)))?;
 
-    let mut terms = Vec::with_capacity(entries.len());
+    let mut terms = Vec::new();
     for entry in entries {
-        let (column, direction) = match entry.split_once('.') {
-            Some((column, direction)) => (column, Some(direction)),
-            None => (entry.as_str(), None),
+        let serde_json::Value::Object(map) = entry else {
+            return Err(async_graphql::Error::new(
+                "each order_by entry is an object mapping a column to a direction",
+            ));
         };
-
-        if table.get_column(column).is_none() {
-            return Err(async_graphql::Error::new(format!(
-                "cannot order by unknown column \"{}\" on \"{}\"",
-                column, table_name
-            )));
-        }
-
-        let direction_sql = match direction.map(|d| d.to_ascii_lowercase()) {
-            None => "",
-            Some(d) if d == "asc" => " ASC",
-            Some(d) if d == "desc" => " DESC",
-            Some(other) => {
+        for (column, direction) in map {
+            if table.get_column(column).is_none() {
                 return Err(async_graphql::Error::new(format!(
-                    "invalid order direction \"{}\"; expected \"asc\" or \"desc\"",
-                    other
-                )))
+                    "cannot order by unknown column \"{}\" on \"{}\"",
+                    column, table_name
+                )));
             }
-        };
-
-        terms.push(format!(
-            "{}{}",
-            postrust_sql::escape_ident(column),
-            direction_sql
-        ));
+            let name = direction.as_str().unwrap_or_default();
+            let sql = crate::input::order_by::direction_sql(name).ok_or_else(|| {
+                async_graphql::Error::new(format!(
+                    "\"{}\" is not a sort direction; expected one of asc, desc, \
+                     asc_nulls_first, asc_nulls_last, desc_nulls_first, desc_nulls_last",
+                    name
+                ))
+            })?;
+            terms.push(format!(
+                "{} {}",
+                postrust_sql::escape_ident(column),
+                sql
+            ));
+        }
     }
 
+    if terms.is_empty() {
+        return Ok(String::new());
+    }
     Ok(format!(" ORDER BY {}", terms.join(", ")))
+}
+
+/// Build the `DISTINCT ON (...)` prefix from the `distinct_on` argument.
+///
+/// PostgreSQL requires the leftmost `ORDER BY` terms to match the distinct
+/// columns, and picks an arbitrary surviving row otherwise. The caller
+/// prepends these terms to whatever ordering was asked for rather than
+/// replacing it, so `distinct_on: [name]` with `order_by: [{id: desc}]` keeps
+/// the highest id per name instead of an unpredictable one.
+async fn build_distinct_on(
+    ctx: &ResolverContext<'_>,
+    schema_cache: &postrust_core::schema_cache::SchemaCacheRef,
+    schema_name: &str,
+    table_name: &str,
+) -> Result<Vec<String>, async_graphql::Error> {
+    let Ok(arg) = ctx.args.try_get("distinct_on") else {
+        return Ok(Vec::new());
+    };
+    let value = accessor_to_json(&arg);
+    let names: Vec<String> = match &value {
+        serde_json::Value::Array(items) => items
+            .iter()
+            .filter_map(|i| i.as_str().map(|s| s.to_string()))
+            .collect(),
+        serde_json::Value::String(one) => vec![one.clone()],
+        _ => Vec::new(),
+    };
+    if names.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let guard = schema_cache
+        .get()
+        .await
+        .map_err(|e| async_graphql::Error::new(e.to_string()))?;
+    let cache = guard
+        .as_ref()
+        .ok_or_else(|| async_graphql::Error::new("schema cache is not loaded"))?;
+    let qi = postrust_core::api_request::QualifiedIdentifier::new(schema_name, table_name);
+    let table = cache
+        .get_table(&qi)
+        .ok_or_else(|| async_graphql::Error::new(format!("unknown table \"{}\"", table_name)))?;
+
+    let mut quoted = Vec::with_capacity(names.len());
+    for name in names {
+        if table.get_column(&name).is_none() {
+            return Err(async_graphql::Error::new(format!(
+                "cannot take distinct on unknown column \"{}\" of \"{}\"",
+                name, table_name
+            )));
+        }
+        quoted.push(postrust_sql::escape_ident(&name));
+    }
+    Ok(quoted)
 }
 
 /// Build the SELECT-list expressions that embed relationships in one query.
