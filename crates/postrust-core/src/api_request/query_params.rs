@@ -496,13 +496,29 @@ pub fn value_is_filter(value: &str) -> bool {
 
 /// Parse filter value: `operator.value` or `not.operator.value`
 fn parse_filter_value(value: &str) -> Result<OpExpr> {
+    let whole = value;
     let (value, negated) = if let Some(rest) = value.strip_prefix("not.") {
         (rest, true)
     } else {
         (value, false)
     };
 
-    let operation = parse_operation(value)?;
+    let operation = parse_operation(value).map_err(|error| match error {
+        // Nothing in the value named an operator, so reading stopped at its
+        // first character -- and what a filter may begin with is a short,
+        // published list. Any other failure got further in and has more to say
+        // about where.
+        Error::InvalidQueryParam(_) => Error::UnparsableQuery {
+            kind: "filter",
+            text: whole.to_string(),
+            column: 1,
+            expected: format!(
+                "unexpected \"{}\" expecting \"not\" or operator (eq, gt, ...)",
+                whole.chars().next().unwrap_or_default()
+            ),
+        },
+        other => other,
+    })?;
     Ok(OpExpr { negated, operation })
 }
 
@@ -637,7 +653,7 @@ fn parse_operation(value: &str) -> Result<Operation> {
             "true" => IsValue::True,
             "false" => IsValue::False,
             "unknown" => IsValue::Unknown,
-            _ => return Err(Error::InvalidQueryParam(format!("is.{}", rest))),
+            _ => return Err(unreadable_is_value(rest)),
         };
         return Ok(Operation::Is(is_val));
     }
@@ -662,6 +678,42 @@ fn parse_operation(value: &str) -> Result<Operation> {
     }
 
     Err(Error::InvalidQueryParam(value.into()))
+}
+
+/// The five things `is.` accepts, and where reading one stopped.
+///
+/// Reading gets as far as the operand still could be one of them and reports
+/// the character that ruled the last one out -- `is.nil` fails on the `i`,
+/// having read `n` as the start of `null`, while `is.ok` fails on the `o`.
+/// That is where a client has to look, and it is the difference between a
+/// message about a typo and one about the whole request.
+fn unreadable_is_value(rest: &str) -> Error {
+    const VALUES: [&str; 5] = ["null", "not_null", "true", "false", "unknown"];
+
+    let lowered = rest.to_ascii_lowercase();
+    let read = VALUES
+        .iter()
+        .map(|value| {
+            lowered
+                .chars()
+                .zip(value.chars())
+                .take_while(|(a, b)| a == b)
+                .count()
+        })
+        .max()
+        .unwrap_or(0);
+
+    Error::UnparsableQuery {
+        kind: "filter",
+        text: format!("is.{}", rest),
+        // Counting from one, past the `is.` that was read before this.
+        column: 4 + read,
+        expected: format!(
+            "unexpected \"{}\" expecting isVal: ({})",
+            rest.chars().nth(read).unwrap_or_default(),
+            VALUES.join(", ")
+        ),
+    }
 }
 
 /// Parse IN list: `(a,b,c)` -> vec!["a", "b", "c"]

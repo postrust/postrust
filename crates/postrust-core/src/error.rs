@@ -28,6 +28,25 @@ pub enum Error {
     #[error("Invalid query parameter: {0}")]
     InvalidQueryParam(String),
 
+    /// A fragment of the query string the grammar could not read.
+    ///
+    /// Reported the way a parser reports: what was being read, the text as the
+    /// client wrote it, where reading stopped, and what would have been
+    /// accepted there. All four are the client's own input or the API's own
+    /// grammar, so none of it is a disclosure -- and without them the client
+    /// is told only that something in a URL it wrote is wrong.
+    #[error("\"failed to parse {kind} ({text})\" (line 1, column {column})")]
+    UnparsableQuery {
+        /// What was being read: `filter`, `logic tree`, `order`.
+        kind: &'static str,
+        /// The fragment, as it was written.
+        text: String,
+        /// Where reading stopped, counting from one.
+        column: usize,
+        /// What was found there and what would have been accepted.
+        expected: String,
+    },
+
     #[error("Invalid header: {0}")]
     InvalidHeader(&'static str),
 
@@ -292,6 +311,7 @@ impl Error {
             | Self::InvalidBody(_)
             | Self::MissingParameter(_)
             | Self::AmbiguousRequest(_)
+            | Self::UnparsableQuery { .. }
             | Self::UnknownColumn { .. }
             | Self::NotAnEmbeddedResource(_)
             | Self::RelatedOrderNotPossible { .. }
@@ -365,7 +385,7 @@ impl Error {
             // PGRST100 is the parse failure in PostgREST's taxonomy, covering
             // both the path and the query string; PGRST101 is a function
             // invoked with a method its volatility does not allow.
-            Self::InvalidQueryParam(_) => "PGRST100",
+            Self::InvalidQueryParam(_) | Self::UnparsableQuery { .. } => "PGRST100",
             // Not one of PostgREST's own: a malformed header is a request
             // that did not parse, which is what PGRST100 covers.
             Self::InvalidHeader(_) => "PGRST100",
@@ -487,6 +507,9 @@ impl Error {
                 invalid.join(", ")
             ))),
             Self::RaiseNotUnderstood(fault) => Some(serde_json::Value::String(fault.details())),
+            Self::UnparsableQuery { expected, .. } => {
+                Some(serde_json::Value::String(expected.clone()))
+            }
             Self::FunctionNotFound {
                 name,
                 params,

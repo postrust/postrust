@@ -447,8 +447,11 @@ pub(crate) fn similarity(a: &str, b: &str) -> f64 {
 /// `(any_arg)` and `(name)` a third alike, because they are both short, where
 /// sharing no letter sequence at all is what a client needs to be told.
 ///
-/// The floor applies to the similarity; among what clears it, the nearest by
-/// edit distance wins.
+/// The floor is strict, and applies to the similarity; among what clears it,
+/// the nearest by edit distance wins. A floor of zero therefore means "shares
+/// any sequence of characters at all", which is a real filter -- two strings
+/// with no run of two characters in common score nothing and never reach the
+/// ranking.
 pub(crate) fn closest<'a>(
     candidates: impl IntoIterator<Item = &'a str> + Clone,
     query: &str,
@@ -459,7 +462,7 @@ pub(crate) fn closest<'a>(
         let mut fitting: Vec<&str> = candidates
             .clone()
             .into_iter()
-            .filter(|candidate| cosine(&asked, &grams(candidate, size)) >= min_score)
+            .filter(|candidate| cosine(&asked, &grams(candidate, size)) > min_score)
             .collect();
 
         // Ranked by edit distance only among those the similarity admitted,

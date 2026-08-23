@@ -2947,6 +2947,9 @@ fn sanitize_error_message(error: &postrust_core::Error) -> String {
         | Error::InvalidGucHeaders
         | Error::InvalidGucStatus
         | Error::InvalidMediaType(_)
+        // Quotes the client's own URL back at it, and names the grammar the
+        // API publishes. Neither is the schema's.
+        | Error::UnparsableQuery { .. }
         // Says nothing about the schema beyond that one RAISE is malformed,
         // which is what the author has to fix.
         | Error::RaiseNotUnderstood(_)

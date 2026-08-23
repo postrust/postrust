@@ -84,10 +84,18 @@ fn nearest_overload(
     routines: &[crate::schema_cache::Routine],
     supplied: &[String],
 ) -> Option<String> {
-    // Looser than a name: these are lists, and one wrong entry in three should
-    // still find the signature that was meant. Revealing a parameter list is
-    // not a disclosure, either -- the client is trying to name it.
-    const MIN_SIMILARITY: f64 = 0.33;
+    // No floor at all, unlike a name: the nearest signature that shares any
+    // character sequence with what was asked for is offered. A client that got
+    // one parameter of three wrong is not close by any similarity measure --
+    // `(a, b)` against `(a, b, smthelse)` scores a third -- and naming a
+    // parameter list discloses nothing, since the client is trying to write
+    // one. A name is different: there a bad guess names an object the client
+    // did not know about, which is why that hint keeps its floor.
+    //
+    // Fitted against every hint the reference gives rather than reasoned from:
+    // a floor of a third answers seven of the eight correctly, which is
+    // exactly the kind of nearly-right that looks settled.
+    const MIN_SIMILARITY: f64 = 0.0;
 
     // Compared as the parameter list is written -- parentheses included --
     // because that is what the client sees and what it would have to change.
