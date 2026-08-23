@@ -117,6 +117,19 @@ pub enum Error {
     #[error("{0}")]
     InvalidJwt(String),
 
+    /// No key this server holds could decode the token.
+    ///
+    /// Its own code would be indistinguishable from any other decode failure,
+    /// so what separates it is the detail: the client is being told to look at
+    /// which key signed the token, not at the token's contents.
+    #[error("No suitable key or wrong key type")]
+    NoSuitableJwtKey,
+
+    /// The server is configured to read tokens and has nothing to read them
+    /// with. A fault in the deployment, not in the request.
+    #[error("Server lacks JWT secret")]
+    JwtSecretMissing,
+
     /// The token decoded, but a claim was missing, malformed or unsatisfied.
     #[error("{0}")]
     JwtClaim(String),
@@ -329,7 +342,10 @@ impl Error {
             }
 
             // 401 Unauthorized
-            Self::InvalidJwt(_) | Self::JwtClaim(_) | Self::MissingAuth => StatusCode::UNAUTHORIZED,
+            Self::InvalidJwt(_)
+            | Self::NoSuitableJwtKey
+            | Self::JwtClaim(_)
+            | Self::MissingAuth => StatusCode::UNAUTHORIZED,
 
             // 403 Forbidden
             Self::InsufficientPermissions(_) => StatusCode::FORBIDDEN,
@@ -363,7 +379,8 @@ impl Error {
             Self::InvalidRange(_) => StatusCode::RANGE_NOT_SATISFIABLE,
 
             // 500 Internal Server Error
-            Self::RaiseNotUnderstood(_)
+            Self::JwtSecretMissing
+            | Self::RaiseNotUnderstood(_)
             | Self::InvalidGucHeaders
             | Self::InvalidGucStatus
             | Self::SchemaCacheNotLoaded
@@ -401,7 +418,8 @@ impl Error {
             Self::AmbiguousFunction { .. } => "PGRST203",
             Self::AmbiguousRelationship { .. } => "PGRST201",
 
-            Self::InvalidJwt(_) => "PGRST301",
+            Self::InvalidJwt(_) | Self::NoSuitableJwtKey => "PGRST301",
+            Self::JwtSecretMissing => "PGRST300",
             Self::JwtClaim(_) => "PGRST303",
             Self::MissingAuth => "PGRST302",
             Self::InsufficientPermissions(_) => "PGRST203",
@@ -507,6 +525,9 @@ impl Error {
                 invalid.join(", ")
             ))),
             Self::RaiseNotUnderstood(fault) => Some(serde_json::Value::String(fault.details())),
+            Self::NoSuitableJwtKey => Some(serde_json::Value::String(
+                "No suitable key was found to decode the JWT".into(),
+            )),
             Self::UnparsableQuery { expected, .. } => {
                 Some(serde_json::Value::String(expected.clone()))
             }

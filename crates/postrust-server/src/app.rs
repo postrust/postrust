@@ -362,19 +362,17 @@ fn jwt_error(error: postrust_auth::JwtError) -> postrust_core::Error {
 
     match error {
         JwtError::MissingHeader => postrust_core::Error::MissingAuth,
-        JwtError::Expired => postrust_core::Error::JwtClaim("JWT expired".into()),
-        JwtError::NotYetValid => postrust_core::Error::JwtClaim("JWT not yet valid".into()),
-        JwtError::InvalidAudience => postrust_core::Error::JwtClaim("JWT not in audience".into()),
-        JwtError::MissingRole => postrust_core::Error::JwtClaim("Parsing claims failed".into()),
+        JwtError::SecretMissing => postrust_core::Error::JwtSecretMissing,
+        // Read, and found wanting: the token itself is intact, and what it
+        // claims is what was not accepted.
+        JwtError::Claim(fault) => postrust_core::Error::JwtClaim(fault.to_string()),
         JwtError::InvalidSignature => {
             postrust_core::Error::InvalidJwt("JWT cryptographic operation failed".into())
         }
         JwtError::InvalidHeaderFormat => {
             postrust_core::Error::InvalidJwt("Unsupported token type".into())
         }
-        JwtError::InvalidToken(_) => {
-            postrust_core::Error::InvalidJwt("No suitable key or wrong key type".into())
-        }
+        JwtError::NoSuitableKey => postrust_core::Error::NoSuitableJwtKey,
     }
 }
 
@@ -2866,9 +2864,21 @@ fn error_response(error: postrust_core::Error, verbatim_db_errors: bool) -> Resp
         .header("content-type", "application/json");
 
     // A 401 has to say what would satisfy it, or a client has no way to know
-    // it should be sending a token at all.
+    // it should be sending a token at all. Where a token *was* sent and was
+    // not accepted, the challenge says which -- `invalid_token` with the
+    // reason, so a client can tell "your key is wrong" from "your clock is"
+    // without parsing the body.
     if status == StatusCode::UNAUTHORIZED {
-        builder = builder.header("www-authenticate", "Bearer");
+        let challenge = match &error {
+            postrust_core::Error::InvalidJwt(_)
+            | postrust_core::Error::NoSuitableJwtKey
+            | postrust_core::Error::JwtClaim(_) => format!(
+                "Bearer error=\"invalid_token\", error_description=\"{}\"",
+                error
+            ),
+            _ => "Bearer".to_string(),
+        };
+        builder = builder.header("www-authenticate", challenge);
     }
 
     builder
@@ -2958,7 +2968,10 @@ fn sanitize_error_message(error: &postrust_core::Error) -> String {
         // What the token failed on is the client's own token, so naming it
         // costs nothing and is the only way it can tell a bad signature from
         // an expired one.
-        Error::InvalidJwt(_) | Error::JwtClaim(_) | Error::MissingAuth => return error.to_string(),
+        Error::InvalidJwt(_)
+        | Error::NoSuitableJwtKey
+        | Error::JwtClaim(_)
+        | Error::MissingAuth => return error.to_string(),
         Error::InsufficientPermissions(_) => "Forbidden",
 
         // A fixed policy message that reveals nothing about the request or the
