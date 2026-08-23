@@ -519,7 +519,11 @@ impl QueryBuilder {
 
     /// Build an ORDER BY term.
     fn build_order_term(term: &CoercibleOrderTerm) -> OrderExpr {
-        let mut order = if term.field.json_path.is_empty() {
+        // A computed field is a call, not a column, and ordering by its name
+        // asks for a column the table does not have. Everything that reads a
+        // field reference has to go through the same place, or the ones that
+        // do not silently mean something else.
+        let mut order = if term.field.json_path.is_empty() && term.field.computed.is_none() {
             OrderExpr::new(&term.field.name)
         } else {
             let mut frag = SqlFragment::new();
@@ -1253,6 +1257,21 @@ fn castable_type(pg_type: &str) -> Option<&str> {
         return None;
     }
 
+    // `character` and `bit` name themselves without their length, and casting
+    // to either truncates to one -- `'10101'::bit` is `bit(1)`. A value on its
+    // way into a `bit(5)` column has to arrive whole; the column enforces its
+    // own length when the row is written, which is where that belongs.
+    let unbounded = match pg_type {
+        "character" | "bpchar" => Some("varchar"),
+        "bit" => Some("varbit"),
+        "character[]" | "bpchar[]" | "_bpchar" => Some("_varchar"),
+        "bit[]" | "_bit" => Some("_varbit"),
+        _ => None,
+    };
+    if unbounded.is_some() {
+        return unbounded;
+    }
+
     let is_bare_name = pg_type
         .chars()
         .all(|c| c.is_ascii_alphanumeric() || c == '_');
@@ -1273,6 +1292,14 @@ mod tests {
         assert_eq!(castable_type("int4"), Some("int4"));
         assert_eq!(castable_type("timestamptz"), Some("timestamptz"));
         assert_eq!(castable_type("_text"), Some("_text"));
+    }
+
+    /// A length these types do not carry, and would truncate to if cast.
+    #[test]
+    fn castable_type_gives_the_unbounded_spelling_of_a_measured_type() {
+        assert_eq!(castable_type("character"), Some("varchar"));
+        assert_eq!(castable_type("bit"), Some("varbit"));
+        assert_eq!(castable_type("_bpchar"), Some("_varchar"));
     }
 
     #[test]

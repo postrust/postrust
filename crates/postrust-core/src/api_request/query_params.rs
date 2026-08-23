@@ -680,6 +680,36 @@ fn parse_operation(value: &str) -> Result<Operation> {
     Err(Error::InvalidQueryParam(value.into()))
 }
 
+/// The four modifiers an order term accepts, and where reading one stopped.
+///
+/// Reading gets as far as the word still could be one of them and reports the
+/// character that ruled the last one out, so `nullslasttt` fails on the tenth
+/// character rather than on the word.
+fn unreadable_order(term: &str, at: usize, part: &str) -> Error {
+    const MODIFIERS: [&str; 4] = ["asc", "desc", "nullsfirst", "nullslast"];
+
+    let read = MODIFIERS
+        .iter()
+        .map(|modifier| {
+            part.chars()
+                .zip(modifier.chars())
+                .take_while(|(a, b)| a == b)
+                .count()
+        })
+        .max()
+        .unwrap_or(0);
+
+    Error::UnparsableQuery {
+        kind: "order",
+        text: term.to_string(),
+        column: at + read + 1,
+        expected: format!(
+            "unexpected {:?} expecting \",\" or end of input",
+            part.chars().nth(read).unwrap_or_default()
+        ),
+    }
+}
+
 /// The five things `is.` accepts, and where reading one stopped.
 ///
 /// Reading gets as far as the operand still could be one of them and reports
@@ -846,14 +876,22 @@ fn parse_order_term(value: &str) -> Result<OrderTerm> {
     let mut direction = None;
     let mut nulls = None;
 
+    // Where each modifier starts within the term, so a word that is not one
+    // can be reported at the character that made it not one.
+    let mut at = field_name.len() + 1;
     for part in &parts[1..] {
         match *part {
             "asc" => direction = Some(OrderDirection::Asc),
             "desc" => direction = Some(OrderDirection::Desc),
             "nullsfirst" => nulls = Some(OrderNulls::First),
             "nullslast" => nulls = Some(OrderNulls::Last),
-            _ => {}
+            // Not one of the four. Ignoring it answered a request nobody made:
+            // `order=id.asc.nullslasttt` was read as `id.asc` and the typo
+            // silently changed nothing, so a client asking for nulls last got
+            // whatever the table happened to give it.
+            other => return Err(unreadable_order(value, at, other)),
         }
+        at += part.len() + 1;
     }
 
     // `clients(name)` orders by a column of an embedded resource rather than

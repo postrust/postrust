@@ -67,7 +67,10 @@ fn parse_csv_payload(body: Bytes) -> Result<Option<Payload>> {
         }
         let mut row = serde_json::Map::with_capacity(headers.len());
         for (name, (value, quoted)) in headers.iter().zip(record) {
-            let value = match value.is_empty() && !quoted {
+            // CSV has no null of its own, so the two spellings it is given are
+            // an unquoted empty field and the unquoted word NULL. Quoting
+            // either makes it the text it looks like.
+            let value = match !quoted && (value.is_empty() || value == "NULL") {
                 true => serde_json::Value::Null,
                 false => serde_json::Value::String(value),
             };

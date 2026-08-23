@@ -68,9 +68,13 @@ pub async fn load_tables(pool: &PgPool, schemas: &[String]) -> Result<TablesMap>
             -- off `table_type`, and a materialized view is a view that cannot
             -- be written to -- which is what the privilege lookups above
             -- already report, since it has no INSERT/UPDATE/DELETE grants.
+            -- A foreign table is a table: it has columns, it can be selected
+            -- from and written to, and which server stores the rows is not
+            -- the API's business. Leaving it out meant a schema that exposes
+            -- one answered "no such table".
             SELECT table_schema, table_name, table_type
               FROM information_schema.tables
-             WHERE table_type IN ('BASE TABLE', 'VIEW')
+             WHERE table_type IN ('BASE TABLE', 'VIEW', 'FOREIGN')
             UNION ALL
             SELECT n.nspname, c.relname, 'VIEW'
               FROM pg_class c
