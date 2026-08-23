@@ -403,17 +403,22 @@ impl EmbedPlan {
 
         let alias = postrust_sql::escape_ident(&format!("{}_j", child_alias));
 
+        // Cast to `jsonb`, as PostgREST does -- `COALESCE(json_agg(..),'[]')::jsonb`.
+        // Only visible where an embedded row is rendered as text rather than
+        // as part of a JSON body: `jsonb` normalises what `json` keeps
+        // verbatim, so a schema-declared handler that stringifies the whole
+        // row wrote `{"id":1}` where PostgREST wrote `{"id": 1}`.
         Ok(if self.is_list {
             // An empty array rather than null, so the shape does not depend on
             // whether the parent happens to have children.
             format!(
-                "COALESCE((SELECT json_agg(row_to_json({alias})) FROM ({inner}) {alias}), '[]'::json)",
+                "COALESCE((SELECT json_agg(row_to_json({alias})) FROM ({inner}) {alias}), '[]'::json)::jsonb",
                 alias = alias,
                 inner = inner
             )
         } else {
             format!(
-                "(SELECT row_to_json({alias}) FROM ({inner}) {alias})",
+                "(SELECT row_to_json({alias}) FROM ({inner}) {alias})::jsonb",
                 alias = alias,
                 inner = inner
             )

@@ -112,8 +112,15 @@ impl QueryBuilder {
         // the database's own rendering, which for a geometry is the GeoJSON
         // PostgREST returns. PostgREST gets it for free by building its whole
         // response in SQL; this is the same rendering, asked for by name.
+        //
+        // A column with a declared representation is already rendered by that
+        // -- the schema said how the value is written on the wire, and the
+        // generic fallback would render it some other way instead. A `bytea`
+        // with a base64 representation came out as `\x` and hex, which is
+        // PostgreSQL's rendering of bytes and not the schema's.
         let render_as_json = field.aggregate.is_none()
             && field.cast.is_none()
+            && field.field.transform.is_none()
             && field.field.json_path.is_empty()
             && !decodable_type(&field.field.ir_type);
         if render_as_json {
@@ -897,11 +904,25 @@ impl QueryBuilder {
             frag.push(" AS pgrst_scalar) pgrst_call");
         }
 
-        // Filters, ordering and paging over the returned rows.
+        // A function returning a table's rows is aliased to that table.
         //
-        // The call is left unaliased: a function returning a table's rows is
-        // referred to by that table's name, which is what an unqualified
-        // column in a filter resolves against.
+        // PostgreSQL names the range-table entry after the *function*, so
+        // `FROM test.search(...)` puts `search` in scope and not `items`. An
+        // unqualified column resolves either way, there being only one entry
+        // to resolve against -- which is why filters and ordering always
+        // worked and hid this. A computed column does not: it is a function of
+        // the whole row, written `test.always_true(items)`, and naming the row
+        // is the whole point of it. Unaliased, that is `column "items" does
+        // not exist` for a field the same request answers over the table
+        // itself.
+        if let Some(alias) = read.map(|tree| tree.root.from.name.as_str()) {
+            if !render_as_json && !alias.is_empty() {
+                frag.push(" AS ");
+                frag.push(&escape_ident(alias));
+            }
+        }
+
+        // Filters, ordering and paging over the returned rows.
         if let Some(tree) = read {
             for (i, clause) in tree.root.where_clauses.iter().enumerate() {
                 frag.push(if i == 0 { " WHERE " } else { " AND " });
@@ -1115,10 +1136,12 @@ fn push_qualified_field_ref(
     // name here is not -- so the call is written out.
     let column = match &field.computed {
         Some(computed) => format!(
-            "{}.{}({})",
+            "{}.{}({}::{}.{})",
             escape_ident(&computed.function.schema),
             escape_ident(&computed.function.name),
             escape_ident(&computed.relation),
+            escape_ident(&computed.row_type.schema),
+            escape_ident(&computed.row_type.name),
         ),
         None => match qualifier {
             Some(alias) => format!("{}.{}", escape_ident(alias), escape_ident(&field.name)),

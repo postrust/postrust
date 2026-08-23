@@ -234,6 +234,7 @@ fn build_select_fields(items: &[SelectItem], table: &Table) -> Result<Vec<Coerci
                 resolved.computed = computed.map(|computed| crate::plan::ComputedRef {
                     function: computed.function.clone(),
                     relation: table.name.clone(),
+                    row_type: table.qualified_identifier(),
                 });
 
                 fields.push(CoercibleSelectField {
@@ -324,9 +325,14 @@ fn build_where_clauses(request: &ApiRequest, table: &Table) -> Result<Vec<Coerci
         )));
     }
 
-    // Add logic trees
+    // Add logic trees.
+    //
+    // One made entirely of embedded resource names is about whether those
+    // embeds matched, which nothing here can answer -- the embeds are not in
+    // scope until they have been joined. It is applied out there instead.
+    let embeds = crate::api_request::embedded_names(&request.query_params.select);
     for (path, tree) in &request.query_params.logic {
-        if path.is_empty() {
+        if path.is_empty() && !tree.names_only(&embeds) {
             clauses.push(CoercibleLogicTree::from_logic_tree(tree, type_resolver));
         }
     }
@@ -388,6 +394,7 @@ fn attach_computed(field: &mut CoercibleField, table: &Table) {
         field.computed = Some(crate::plan::ComputedRef {
             function: computed.function.clone(),
             relation: table.name.clone(),
+            row_type: table.qualified_identifier(),
         });
     }
 }

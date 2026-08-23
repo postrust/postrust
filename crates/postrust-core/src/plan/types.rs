@@ -46,6 +46,15 @@ pub struct ComputedRef {
     pub function: QualifiedIdentifier,
     /// The relation whose row it takes, as it is named in the query.
     pub relation: String,
+    /// The type that row is, which is not always what the query can infer.
+    ///
+    /// A mutation reads its rows back out of a CTE, and a CTE's row is a
+    /// `record`: `computed_overload(record) is not unique` is PostgreSQL
+    /// declining to choose between the overload on `items` and the one on
+    /// `items2`, because nothing said which it had. Casting the row to the
+    /// relation's own type says so, and is a no-op everywhere it was already
+    /// unambiguous.
+    pub row_type: QualifiedIdentifier,
 }
 
 /// Whether a JSON path over a column of `pg_type` has to go through `to_jsonb`.
