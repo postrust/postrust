@@ -3,6 +3,7 @@
 //! Builds a dynamic GraphQL schema from the database schema cache,
 //! creating query and mutation types for each table.
 
+pub mod aggregate;
 pub mod object;
 pub mod relationship;
 

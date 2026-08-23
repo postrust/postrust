@@ -212,6 +212,14 @@ fn build_dynamic_schema(
         object_types.insert(type_name.clone(), table_obj);
     }
 
+    // Aggregate types: every table gets them, because every table has a count
+    // even when it has nothing to sum.
+    for (type_name, obj) in &generated.object_types {
+        for aggregate_type in create_aggregate_types(type_name, obj) {
+            object_types.insert(aggregate_type.type_name().to_string(), aggregate_type);
+        }
+    }
+
     // One mutation response per table that has any mutation, and only those:
     // an unreferenced type is still a type, and a read-only view would
     // otherwise contribute a response nothing can return.
@@ -386,6 +394,117 @@ fn create_mutation_response_type(base_name: &str) -> Object {
         ))
 }
 
+/// Build every aggregate type for one table.
+///
+/// Four kinds, and they nest: `<t>_aggregate` holds `aggregate` and `nodes`,
+/// `<t>_aggregate_fields` holds `count` and one field per function, and each
+/// function has a type of its own holding the columns it applies to.
+fn create_aggregate_types(base_name: &str, object: &TableObjectType) -> Vec<Object> {
+    use crate::schema::aggregate as agg;
+
+    let mut types = Vec::new();
+
+    // `<t>_aggregate`: the rows, and the numbers about them.
+    let fields_type = agg::aggregate_fields_type_name(base_name);
+    types.push(
+        Object::new(agg::aggregate_type_name(base_name))
+            .description(format!("Aggregates over {}, with the rows themselves.", base_name))
+            .field(Field::new(
+                "aggregate",
+                TypeRef::named(&fields_type),
+                |ctx| FieldFuture::new(async move { Ok(child_of(&ctx, "aggregate")) }),
+            ))
+            .field(Field::new(
+                "nodes",
+                TypeRef::named_nn_list_nn(base_name.to_string()),
+                |ctx| {
+                    FieldFuture::new(async move {
+                        let rows = match child_value(&ctx, "nodes") {
+                            Some(Value::List(items)) => items,
+                            _ => Vec::new(),
+                        };
+                        Ok(Some(FieldValue::list(rows.into_iter().map(FieldValue::value))))
+                    })
+                },
+            )),
+    );
+
+    // `<t>_aggregate_fields`: count, and one field per function.
+    let mut aggregate_fields = Object::new(&fields_type)
+        .description(format!("Aggregate functions over {}.", base_name))
+        .field(
+            Field::new("count", TypeRef::named_nn(TypeRef::INT), |ctx| {
+                FieldFuture::new(async move {
+                    Ok(Some(
+                        child_value(&ctx, "count").unwrap_or(Value::from(0)),
+                    )
+                    .map(FieldValue::value))
+                })
+            })
+            // `count(columns:)` counts the rows where those columns are not
+            // null, and `distinct` counts distinct values among them.
+            .argument(InputValue::new(
+                "columns",
+                TypeRef::named_nn_list(agg_select_column(base_name)),
+            ))
+            .argument(InputValue::new("distinct", TypeRef::named("Boolean"))),
+        );
+
+    for (function, returns, columns) in agg::functions_for(object) {
+        let function_type = agg::function_fields_type_name(base_name, function);
+        let mut per_column = Object::new(&function_type)
+            .description(format!("`{}` of each {} column it applies to.", function, base_name));
+        for column in &columns {
+            let column_name = column.clone();
+            let type_name = agg::field_type_for(object, column, returns);
+            per_column = per_column.field(Field::new(column, TypeRef::named(type_name), move |ctx| {
+                let column_name = column_name.clone();
+                FieldFuture::new(async move {
+                    Ok(child_value(&ctx, &column_name).map(FieldValue::value))
+                })
+            }));
+        }
+        types.push(per_column);
+
+        let owned = function.to_string();
+        aggregate_fields = aggregate_fields.field(Field::new(
+            function,
+            TypeRef::named(&function_type),
+            move |ctx| {
+                let owned = owned.clone();
+                FieldFuture::new(async move { Ok(child_of(&ctx, &owned)) })
+            },
+        ));
+    }
+
+    types.push(aggregate_fields);
+    types
+}
+
+/// The column enum a `count(columns:)` draws from.
+fn agg_select_column(base_name: &str) -> String {
+    crate::input::order_by::select_column_type_name(base_name)
+}
+
+/// One key of the parent object, as a value.
+fn child_value(ctx: &ResolverContext<'_>, key: &str) -> Option<Value> {
+    match ctx.parent_value.as_value() {
+        Some(Value::Object(map)) => map.get(&async_graphql::Name::new(key)).cloned(),
+        _ => None,
+    }
+}
+
+/// One key of the parent object, as a resolvable child.
+///
+/// `None` where the key is absent or null, which is what a client that did not
+/// ask for that aggregate should see.
+fn child_of<'a>(ctx: &ResolverContext<'_>, key: &str) -> Option<FieldValue<'a>> {
+    match child_value(ctx, key) {
+        None | Some(Value::Null) => None,
+        Some(value) => Some(FieldValue::value(value)),
+    }
+}
+
 fn create_object_type(obj: &TableObjectType, relationships: &[RelationshipField]) -> Object {
     let mut object = Object::new(&obj.name);
 
@@ -533,6 +652,49 @@ fn create_query_type(
         }
 
         query = query.field(gql_field);
+
+        // The same rows, with numbers about them. Same arguments as the list
+        // field, because `author_aggregate(where: ...)` counts the set the
+        // filter describes, not the whole table.
+        if !is_by_pk {
+            let agg_spec = Arc::new(AggregateSpec {
+                schema_name: field.schema_name.clone(),
+                table_name: field.table_name.clone(),
+                type_name: field.type_name.clone(),
+                max_rows,
+            });
+            let mut agg_field = Field::new(
+                crate::schema::aggregate::aggregate_type_name(&field.type_name),
+                TypeRef::named_nn(crate::schema::aggregate::aggregate_type_name(
+                    &field.type_name,
+                )),
+                move |ctx| {
+                    let agg_spec = Arc::clone(&agg_spec);
+                    FieldFuture::new(async move { resolve_aggregate(&ctx, &agg_spec).await })
+                },
+            );
+            agg_field = agg_field
+                .argument(InputValue::new(
+                    "where",
+                    TypeRef::named(crate::input::bool_exp::bool_exp_type_name(&spec_type_name)),
+                ))
+                .argument(InputValue::new(
+                    "order_by",
+                    TypeRef::named_nn_list(crate::input::order_by::order_by_type_name(
+                        &spec_type_name,
+                    )),
+                ))
+                .argument(InputValue::new(
+                    "distinct_on",
+                    TypeRef::named_nn_list(crate::input::order_by::select_column_type_name(
+                        &spec_type_name,
+                    )),
+                ))
+                .argument(InputValue::new("limit", TypeRef::named("Int")))
+                .argument(InputValue::new("offset", TypeRef::named("Int")))
+                .description(format!("Aggregates over {}.", field.table_name));
+            query = query.field(agg_field);
+        }
     }
 
     // Add introspection queries
@@ -699,6 +861,165 @@ struct QueryFieldSpec {
     pk_columns: Vec<(String, String)>,
     max_rows: Option<i64>,
     relationships: Arc<HashMap<String, Vec<RelationshipField>>>,
+}
+
+/// Everything an aggregate field's resolver needs.
+struct AggregateSpec {
+    schema_name: String,
+    table_name: String,
+    type_name: String,
+    max_rows: Option<i64>,
+}
+
+/// Resolve an aggregate field.
+///
+/// One pass over the selection decides what SQL to write: a client asking only
+/// for `count` should not pay for the rows, and one asking only for `nodes`
+/// should not pay for a second scan. Both halves read from the same filtered
+/// subquery, so `aggregate` describes exactly the set `nodes` came from.
+async fn resolve_aggregate<'a>(
+    ctx: &ResolverContext<'a>,
+    spec: &AggregateSpec,
+) -> Result<Option<FieldValue<'a>>, async_graphql::Error> {
+    use crate::schema::aggregate as agg;
+
+    let pool = ctx.data::<PgPool>()?;
+    let gql_ctx = ctx.data::<GraphQLContext>()?;
+
+    let mut bound_values: Vec<serde_json::Value> = Vec::new();
+    let mut where_sql = String::new();
+    if let Some(filter) = ctx.args.try_get("where").ok().map(|v| accessor_to_json(&v)) {
+        let (sql, values) = build_where_clause(Some(&filter), 1)?;
+        if !sql.is_empty() {
+            where_sql = format!(" {}", sql);
+            bound_values = values;
+        }
+    }
+
+    let order_sql = build_order_by_clause(
+        ctx,
+        &gql_ctx.schema_cache,
+        &spec.schema_name,
+        &spec.table_name,
+    )
+    .await?;
+
+    let requested_limit = ctx.args.try_get("limit").ok().and_then(|v| v.i64().ok());
+    let offset = ctx.args.try_get("offset").ok().and_then(|v| v.i64().ok());
+    let limit = match (requested_limit, spec.max_rows) {
+        (Some(requested), Some(ceiling)) => Some(requested.min(ceiling)),
+        (Some(requested), None) => Some(requested),
+        (None, ceiling) => ceiling,
+    };
+
+    let mut inner = format!(
+        "SELECT * FROM {}.{}{}{}",
+        postrust_sql::escape_ident(&spec.schema_name),
+        postrust_sql::escape_ident(&spec.table_name),
+        where_sql,
+        order_sql
+    );
+    if let Some(limit) = limit {
+        inner.push_str(&format!(" LIMIT {}", limit));
+    }
+    if let Some(offset) = offset {
+        inner.push_str(&format!(" OFFSET {}", offset));
+    }
+
+    // What the client actually asked for.
+    let mut wants_nodes = false;
+    let mut wanted: Vec<(String, Vec<String>)> = Vec::new();
+    let mut wants_count = false;
+    for selection in ctx.field().selection_set() {
+        match selection.name() {
+            "nodes" => wants_nodes = true,
+            "aggregate" => {
+                for function in selection.selection_set() {
+                    if function.name() == "count" {
+                        wants_count = true;
+                        continue;
+                    }
+                    let columns: Vec<String> = function
+                        .selection_set()
+                        .map(|c| c.name().to_string())
+                        .collect();
+                    if !columns.is_empty() {
+                        wanted.push((function.name().to_string(), columns));
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    let mut result = async_graphql::indexmap::IndexMap::new();
+
+    if wants_count || !wanted.is_empty() {
+        let mut parts = vec!["'count', count(*)".to_string()];
+        for (function, columns) in &wanted {
+            // The function name comes from the schema, not from the request:
+            // a selection can only name a field that was generated, so there
+            // is no path from client text to this identifier.
+            let sql_function = agg::NUMERIC_AGGREGATES
+                .iter()
+                .chain(agg::ORDERED_AGGREGATES.iter())
+                .find(|(name, _)| name == function)
+                .map(|(name, _)| *name)
+                .ok_or_else(|| {
+                    async_graphql::Error::new(format!("unknown aggregate \"{}\"", function))
+                })?;
+            let per_column: Vec<String> = columns
+                .iter()
+                .map(|column| {
+                    format!(
+                        "'{}', {}({})",
+                        column.replace('\'', "''"),
+                        sql_function,
+                        postrust_sql::escape_ident(column)
+                    )
+                })
+                .collect();
+            parts.push(format!(
+                "'{}', json_build_object({})",
+                sql_function,
+                per_column.join(", ")
+            ));
+        }
+
+        let sql = format!(
+            "SELECT json_build_object({})::text FROM ({}) AS pgrst_agg",
+            parts.join(", "),
+            inner
+        );
+        let mut conn = begin_with_role(pool, gql_ctx.role()).await?;
+        let rows = execute_query_on(&mut conn, &sql, &bound_values).await?;
+        conn.commit().await?;
+        if let Some(first) = rows.into_iter().next() {
+            if let Value::Object(map) = json_to_value(first) {
+                result.insert(
+                    async_graphql::Name::new("aggregate"),
+                    Value::Object(map),
+                );
+            }
+        }
+    }
+
+    if wants_nodes {
+        let sql = format!(
+            "SELECT row_to_json(pgrst_nodes)::text FROM ({}) AS pgrst_nodes",
+            inner
+        );
+        let mut conn = begin_with_role(pool, gql_ctx.role()).await?;
+        let rows = execute_query_on(&mut conn, &sql, &bound_values).await?;
+        conn.commit().await?;
+        result.insert(
+            async_graphql::Name::new("nodes"),
+            Value::List(rows.into_iter().map(json_to_value).collect()),
+        );
+    }
+
+    let _ = &spec.type_name;
+    Ok(Some(FieldValue::value(Value::Object(result))))
 }
 
 /// Resolve a query field.
