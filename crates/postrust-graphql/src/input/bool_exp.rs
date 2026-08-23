@@ -133,7 +133,18 @@ pub fn build_inputs(
             .field(InputValue::new("_or", TypeRef::named_nn_list(&bool_exp)))
             .field(InputValue::new("_not", TypeRef::named(&bool_exp)));
 
+        // Two fields of one name abort the process rather than returning an
+        // error, and a foreign key column named after its target -- the
+        // ordinary `pizza.crust references crust` -- produces exactly that
+        // clash. The column wins here for the same reason it wins in the
+        // object type: it is the table's own data, and the two have to agree
+        // about which fields exist.
+        let mut taken: HashSet<&str> = HashSet::new();
+
         for field in &object.fields {
+            if !taken.insert(field.name.as_str()) {
+                continue;
+            }
             let scalar = scalar_for(&field.graphql_type);
             input = input.field(InputValue::new(
                 &field.name,
@@ -146,6 +157,9 @@ pub fn build_inputs(
         // `where: {articles: {…}}` keeps the authors that have a matching
         // article.
         for relationship in relationship_fields.get(type_name).into_iter().flatten() {
+            if !taken.insert(relationship.name.as_str()) {
+                continue;
+            }
             input = input.field(InputValue::new(
                 &relationship.name,
                 TypeRef::named(bool_exp_type_name(&relationship.target_type)),
