@@ -211,6 +211,18 @@ impl QueryBuilder {
 
     /// Build a logic tree.
     fn build_logic_tree(tree: &CoercibleLogicTree) -> Result<SqlFragment> {
+        Self::build_logic_tree_in(None, tree)
+    }
+
+    /// The same, with every column qualified by a relation.
+    ///
+    /// An `UPDATE ... FROM` has the body's columns in scope alongside the
+    /// table's, so a bare column name in the `WHERE` is ambiguous exactly
+    /// when the request filters on a column it is also writing.
+    fn build_logic_tree_in(
+        qualifier: Option<&str>,
+        tree: &CoercibleLogicTree,
+    ) -> Result<SqlFragment> {
         match tree {
             CoercibleLogicTree::Expr {
                 negated,
@@ -222,8 +234,10 @@ impl QueryBuilder {
                     crate::api_request::LogicOperator::Or => " OR ",
                 };
 
-                let child_frags: Result<Vec<_>> =
-                    children.iter().map(Self::build_logic_tree).collect();
+                let child_frags: Result<Vec<_>> = children
+                    .iter()
+                    .map(|child| Self::build_logic_tree_in(qualifier, child))
+                    .collect();
 
                 let mut combined = SqlFragment::join(sep, child_frags?).parens();
 
@@ -235,7 +249,7 @@ impl QueryBuilder {
 
                 Ok(combined)
             }
-            CoercibleLogicTree::Stmt(filter) => Self::build_filter(filter),
+            CoercibleLogicTree::Stmt(filter) => Self::build_filter_in(qualifier, filter),
             CoercibleLogicTree::NullEmbed {
                 negated,
                 field_name,
@@ -303,6 +317,10 @@ impl QueryBuilder {
     }
 
     fn build_filter(filter: &CoercibleFilter) -> Result<SqlFragment> {
+        Self::build_filter_in(None, filter)
+    }
+
+    fn build_filter_in(qualifier: Option<&str>, filter: &CoercibleFilter) -> Result<SqlFragment> {
         let mut frag = SqlFragment::new();
 
         // Negation wraps the whole comparison. Placing `NOT` between the column
@@ -339,7 +357,7 @@ impl QueryBuilder {
                 frag.push(", ");
             }
         }
-        push_field_ref(&mut frag, &filter.field);
+        push_qualified_field_ref(&mut frag, qualifier, &filter.field);
         if to_tsvector.is_some() {
             frag.push(")");
         }
@@ -547,10 +565,24 @@ impl QueryBuilder {
                 frag.push("INSERT INTO ");
                 frag.push(&from_qi(&qi));
 
+                let object = body
+                    .as_ref()
+                    .map(|body| String::from_utf8_lossy(body).trim_start().starts_with('{'))
+                    .unwrap_or(true);
+
                 match (body, columns.is_empty()) {
-                    // A body naming no columns -- `{}` -- inserts a row of
-                    // defaults. There is no column list to write and no values
-                    // to read out of the body.
+                    // A body naming no columns inserts rows of defaults -- one
+                    // for `{}`, and one per element for an array, which is
+                    // none at all for `[]`. `SELECT` with no columns is what
+                    // says "a row, whatever the table's defaults are".
+                    (Some(body), true) if !object => {
+                        frag.push(" SELECT FROM (SELECT ");
+                        frag.push_param(String::from_utf8_lossy(body).into_owned());
+                        frag.push(
+                            "::json AS json_data) pgrst_payload, LATERAL \
+                             (SELECT FROM json_array_elements(pgrst_payload.json_data)) pgrst_body",
+                        );
+                    }
                     (_, true) => {
                         frag.push(" DEFAULT VALUES");
                     }
@@ -619,7 +651,17 @@ impl QueryBuilder {
                     }
                 }
 
-                push_returning(&mut frag, returning);
+                push_returning(&mut frag, &target.name, returning);
+
+                // Whether each row was inserted or merged into an existing
+                // one, which is the difference between 201 and 200 and is
+                // knowable only here: `xmax` is zero on a row this statement
+                // created and non-zero on one it updated.
+                if on_conflict.is_some() && !returning.is_empty() {
+                    frag.push(", (xmax = 0) AS ");
+                    frag.push(&escape_ident(INSERTED_COLUMN));
+                }
+
                 Ok(frag)
             }
 
@@ -671,11 +713,11 @@ impl QueryBuilder {
                         if i > 0 {
                             frag.push(" AND ");
                         }
-                        frag.append(Self::build_logic_tree(clause)?);
+                        frag.append(Self::build_logic_tree_in(Some(&target.name), clause)?);
                     }
                 }
 
-                push_returning(&mut frag, returning);
+                push_returning(&mut frag, &target.name, returning);
                 Ok(frag)
             }
 
@@ -703,7 +745,7 @@ impl QueryBuilder {
                     }
                 }
 
-                push_returning(&mut frag, returning);
+                push_returning(&mut frag, &target.name, returning);
                 Ok(frag)
             }
         }
@@ -859,6 +901,9 @@ impl QueryBuilder {
 /// what distinguishes `data->'1'` from `data->1` in PostgreSQL. Operands reach
 /// us already restricted to alphanumerics and underscores by the parser; the
 /// quote doubling is belt-and-braces so this stays safe if that ever loosens.
+/// The column that says whether a row was created or merged into.
+pub const INSERTED_COLUMN: &str = "pgrst_inserted";
+
 /// The columns a mutation writes, as a comma-separated identifier list.
 fn push_column_list(frag: &mut SqlFragment, columns: &[crate::plan::CoercibleField]) {
     for (i, column) in columns.iter().enumerate() {
@@ -928,8 +973,12 @@ fn push_json_body(
     frag.push(")) pgrst_body");
 }
 
-/// The `RETURNING` list, or nothing when there is none.
-fn push_returning(frag: &mut SqlFragment, returning: &[String]) {
+/// The `RETURNING` list, qualified by the relation being written.
+///
+/// `RETURNING` sees everything in the statement's scope, which for an
+/// `UPDATE ... FROM` includes the body -- and a bare column name there is
+/// ambiguous for every column the update writes.
+fn push_returning(frag: &mut SqlFragment, relation: &str, returning: &[String]) {
     if returning.is_empty() {
         return;
     }
@@ -938,6 +987,8 @@ fn push_returning(frag: &mut SqlFragment, returning: &[String]) {
         if i > 0 {
             frag.push(", ");
         }
+        frag.push(&escape_ident(relation));
+        frag.push(".");
         frag.push(&escape_ident(column));
     }
 }

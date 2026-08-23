@@ -10,13 +10,20 @@ use http::HeaderMap;
 pub fn parse_preferences(headers: &HeaderMap) -> Result<Preferences> {
     let mut prefs = Preferences::default();
 
-    let prefer = match headers.get("prefer") {
-        Some(v) => v.to_str().map_err(|_| Error::InvalidHeader("Prefer"))?,
-        None => return Ok(prefs),
-    };
+    // A client may send one `Prefer` header with a comma-separated list, or
+    // several headers, or both -- RFC 7240 allows all three and PostgREST's
+    // own suite uses more than one. Reading only the first drops the rest.
+    let mut seen_any = false;
+    for value in headers.get_all("prefer") {
+        let value = value.to_str().map_err(|_| Error::InvalidHeader("Prefer"))?;
+        seen_any = true;
+        for pref in value.split(',').map(|s| s.trim()) {
+            parse_preference(&mut prefs, pref);
+        }
+    }
 
-    for pref in prefer.split(',').map(|s| s.trim()) {
-        parse_preference(&mut prefs, pref);
+    if !seen_any {
+        return Ok(prefs);
     }
 
     // `handling=strict` asks to be told about preferences the server does not

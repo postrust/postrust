@@ -417,7 +417,21 @@ async fn execute_plan(
                 } if !is_upsert(api_request) => pk_cols.clone(),
                 _ => Vec::new(),
             };
-            let db_plan = &if location_keys.is_empty() {
+            // Whether the write created a row or merged into an existing one.
+            // The statement is the only place that can say, so the answer is
+            // carried out of it as a column and taken back out of the response.
+            let reports_inserted = matches!(
+                db_plan,
+                DbActionPlan::MutateRead {
+                    mutate: postrust_core::plan::MutatePlan::Insert {
+                        on_conflict: Some(_),
+                        ..
+                    },
+                    ..
+                }
+            );
+
+            let db_plan = &if location_keys.is_empty() && !reports_inserted {
                 db_plan.clone()
             } else {
                 let mut adjusted = db_plan.clone();
@@ -433,6 +447,14 @@ async fn execute_plan(
                                 &format!("{}{}", LOCATION_KEY_PREFIX, key),
                             ),
                         );
+                    }
+                    if reports_inserted {
+                        tree.root
+                            .select
+                            .push(postrust_core::plan::CoercibleSelectField::simple(
+                                postrust_core::query::INSERTED_COLUMN,
+                                "boolean",
+                            ));
                     }
                 }
                 adjusted
@@ -980,6 +1002,21 @@ async fn execute_plan(
                 }
             }
 
+            // Any row this statement created rather than merged into. Read
+            // before the column is taken back out of the response.
+            let created_a_row = reports_inserted
+                && json_rows.iter().any(|row| {
+                    row.get(postrust_core::query::INSERTED_COLUMN)
+                        == Some(&serde_json::Value::Bool(true))
+                });
+            if reports_inserted {
+                for row in json_rows.iter_mut() {
+                    if let Some(object) = row.as_object_mut() {
+                        object.remove(postrust_core::query::INSERTED_COLUMN);
+                    }
+                }
+            }
+
             // The created row's own address, taken from its key and then
             // removed from the body -- the client asked for a `?select=`, not
             // for the key.
@@ -1050,12 +1087,14 @@ async fn execute_plan(
             Ok(QueryResult {
                 status: match returns_void {
                     true => StatusCode::NO_CONTENT,
-                    false => mutation_status(db_plan, api_request).unwrap_or_else(|| {
-                        content_range
-                            .as_ref()
-                            .map(postrust_response::ContentRange::status)
-                            .unwrap_or(StatusCode::OK)
-                    }),
+                    false => {
+                        mutation_status(db_plan, api_request, created_a_row).unwrap_or_else(|| {
+                            content_range
+                                .as_ref()
+                                .map(postrust_response::ContentRange::status)
+                                .unwrap_or(StatusCode::OK)
+                        })
+                    }
                 },
                 rows,
                 singular,
@@ -1321,35 +1360,39 @@ fn wants_representation(api_request: &ApiRequest) -> bool {
 fn mutation_status(
     db_plan: &postrust_core::plan::DbActionPlan,
     api_request: &ApiRequest,
+    created_a_row: bool,
 ) -> Option<StatusCode> {
+    use postrust_core::api_request::PreferResolution;
     use postrust_core::plan::{DbActionPlan, MutatePlan};
-
-    use postrust_core::api_request::{Action, DbAction, Mutation};
 
     let DbActionPlan::MutateRead { mutate, .. } = db_plan else {
         return None;
     };
 
-    // A `PUT` is an upsert, planned as an insert but answered as an update:
-    // the client named the row it is writing, so nothing was created from its
-    // point of view whether or not a row existed before.
-    let is_upsert = matches!(
-        &api_request.action,
-        Action::Db(DbAction::RelationMut {
-            mutation: Mutation::SingleUpsert,
-            ..
-        })
+    let merging = matches!(
+        api_request.preferences.resolution,
+        Some(PreferResolution::MergeDuplicates)
     );
 
     Some(match mutate {
-        MutatePlan::Insert { .. } if !is_upsert => StatusCode::CREATED,
-        _ => {
-            if wants_representation(api_request) {
-                StatusCode::OK
-            } else {
-                StatusCode::NO_CONTENT
+        // A `PUT` names the row it is writing, so from the client's side
+        // nothing was discovered by the response -- it reports the outcome
+        // only where it asked to see the row.
+        MutatePlan::Insert { .. } if is_upsert(api_request) => {
+            match (wants_representation(api_request), created_a_row) {
+                (false, _) => StatusCode::NO_CONTENT,
+                (true, true) => StatusCode::CREATED,
+                (true, false) => StatusCode::OK,
             }
         }
+        // A `POST` that merged into every row it touched created nothing, and
+        // 201 would be a promise that something new is at the `Location`.
+        MutatePlan::Insert { .. } if merging && !created_a_row => StatusCode::OK,
+        MutatePlan::Insert { .. } => StatusCode::CREATED,
+        _ => match wants_representation(api_request) {
+            true => StatusCode::OK,
+            false => StatusCode::NO_CONTENT,
+        },
     })
 }
 

@@ -48,7 +48,17 @@ def send(c):
     # servers need one to parse them, and PostgREST's own default is JSON.
     if body and not any(h[0].lower() == "content-type" for h in c["headers"]):
         req.add_header("Content-Type", "application/json")
+    # `add_header` overwrites, so a case sending the same header twice --
+    # `Prefer: return=representation` and `Prefer: resolution=merge-duplicates`
+    # are separate headers in the spec suite -- would reach the server as only
+    # the last of them. Combining them into one comma-separated value is what
+    # RFC 7230 says a recipient may do, and it is the only spelling `urllib`
+    # can send.
+    combined = {}
     for name, value in c["headers"]:
+        key = name.lower()
+        combined[key] = f"{combined[key]}, {value}" if key in combined else value
+    for name, value in combined.items():
         req.add_header(name, value)
 
     rec = {k: c[k] for k in ("id", "spec", "method", "path", "mutating")}

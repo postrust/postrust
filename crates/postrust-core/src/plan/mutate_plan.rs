@@ -85,14 +85,25 @@ impl MutatePlan {
         let apply_defaults =
             request.preferences.missing == crate::api_request::PreferMissing::ApplyDefaults;
 
-        let on_conflict = request.query_params.on_conflict.as_ref().map(|cols| {
-            let resolution = request
-                .preferences
-                .resolution
-                .clone()
-                .unwrap_or(PreferResolution::MergeDuplicates);
-            (resolution, cols.clone())
-        });
+        // `Prefer: resolution=` says what to do about a duplicate; `on_conflict=`
+        // says which columns make one. Without the latter the answer is the
+        // primary key, which is what "duplicate" means when nothing else is
+        // said -- and without a resolution there is nothing to do about one.
+        let on_conflict = request
+            .preferences
+            .resolution
+            .clone()
+            .and_then(|resolution| {
+                let columns = request
+                    .query_params
+                    .on_conflict
+                    .clone()
+                    .unwrap_or_else(|| table.pk_cols.clone());
+                match columns.is_empty() {
+                    true => None,
+                    false => Some((resolution, columns)),
+                }
+            });
 
         Ok(Self::Insert {
             target: qi,
@@ -283,9 +294,23 @@ fn validate_put(request: &ApiRequest, table: &Table) -> Result<()> {
     }
 
     // The body may leave a key out -- the URL already said what it is -- but
-    // where it names one it has to be the same one.
+    // where it names one it has to be the same one. A body written as an
+    // array is checked element by element: `PUT` writes the row the URL names
+    // and no other, however many the body offers.
     if let Some(Payload::ProcessedJson { raw, .. }) = &request.payload {
-        if let Ok(serde_json::Value::Object(row)) = serde_json::from_slice(raw) {
+        let rows = match serde_json::from_slice(raw) {
+            Ok(serde_json::Value::Object(row)) => vec![row],
+            Ok(serde_json::Value::Array(rows)) => rows
+                .into_iter()
+                .filter_map(|row| match row {
+                    serde_json::Value::Object(row) => Some(row),
+                    _ => None,
+                })
+                .collect(),
+            _ => vec![],
+        };
+
+        for row in rows {
             for key in &table.pk_cols {
                 let Some(value) = row.get(key) else { continue };
                 let value = match value {

@@ -4,7 +4,7 @@
 
 mod builder;
 
-pub use builder::QueryBuilder;
+pub use builder::{QueryBuilder, INSERTED_COLUMN};
 
 use crate::error::Result;
 use crate::plan::{ActionPlan, DbActionPlan};
@@ -155,7 +155,7 @@ mod tests {
              FROM (SELECT $1::json AS json_data) pgrst_payload, \
              LATERAL (SELECT \"id\" FROM json_to_record(pgrst_payload.json_data) \
              AS _(\"id\" int8)) pgrst_body \
-             RETURNING \"id\") \
+             RETURNING \"items\".\"id\") \
              SELECT \"id\" FROM \"pgrst_mutation_result\""
         );
     }
