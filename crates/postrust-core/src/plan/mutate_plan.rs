@@ -88,8 +88,7 @@ impl MutatePlan {
         let columns = get_payload_columns(request, table, schema_cache)?;
         let body = get_body_bytes(request)?;
         let returning = get_returning_columns(request, table);
-        let apply_defaults =
-            request.preferences.missing == crate::api_request::PreferMissing::ApplyDefaults;
+        let apply_defaults = asked_for_defaults(request);
 
         // `Prefer: resolution=` says what to do about a duplicate; `on_conflict=`
         // says which columns make one. Without the latter the answer is the
@@ -135,8 +134,7 @@ impl MutatePlan {
         let body = get_body_bytes(request)?;
         let where_clauses = build_mutation_where(request, table)?;
         let returning = get_returning_columns(request, table);
-        let apply_defaults =
-            request.preferences.missing == crate::api_request::PreferMissing::ApplyDefaults;
+        let apply_defaults = asked_for_defaults(request);
 
         Ok(Self::Update {
             target: qi,
@@ -184,7 +182,7 @@ impl MutatePlan {
             where_clauses: vec![],
             returning,
             pk_cols: table.pk_cols.clone(),
-            apply_defaults: true,
+            apply_defaults: asked_for_defaults(request),
             reports_inserted: !table.is_view && !table.is_partitioned,
         })
     }
@@ -237,6 +235,7 @@ fn get_payload_columns(
         })?;
 
         let mut field = CoercibleField::simple(key, &column.nominal_type);
+        field.default = column.default.clone();
         // A schema that declared how one of its domains is written in JSON
         // also declared how one arrives: the value is read out of the body as
         // JSON and handed to that cast, rather than to PostgreSQL's own input
@@ -249,6 +248,19 @@ fn get_payload_columns(
     }
 
     Ok(columns)
+}
+
+/// Whether the request asked for a column it left out to take its default.
+///
+/// Read from what was actually sent rather than from the parsed field, which
+/// cannot say whether `missing=default` was requested or is merely the value
+/// the field holds when nothing was.
+fn asked_for_defaults(request: &ApiRequest) -> bool {
+    request
+        .preferences
+        .applied
+        .iter()
+        .any(|pref| pref == "missing=default")
 }
 
 /// Check that a `PUT` names exactly one row, and that its body agrees.

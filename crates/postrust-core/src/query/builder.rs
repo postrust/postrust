@@ -555,6 +555,7 @@ impl QueryBuilder {
                 where_clauses,
                 returning,
                 reports_inserted,
+                apply_defaults,
                 ..
             } => {
                 let qi = postrust_sql::identifier::QualifiedIdentifier::new(
@@ -599,7 +600,7 @@ impl QueryBuilder {
                             frag.push(&escape_ident(&column.name));
                         }
                         frag.push(" ");
-                        push_json_body(&mut frag, columns, body, false);
+                        push_json_body(&mut frag, columns, body, false, *apply_defaults);
 
                         // PUT names the row in the URL as well as in the body,
                         // and the two have to agree -- the conditions are
@@ -672,6 +673,7 @@ impl QueryBuilder {
                 body,
                 where_clauses,
                 returning,
+                apply_defaults,
                 ..
             } => {
                 let qi = postrust_sql::identifier::QualifiedIdentifier::new(
@@ -706,7 +708,7 @@ impl QueryBuilder {
                     frag.push(&escape_ident(&column.name));
                 }
                 frag.push(" ");
-                push_json_body(&mut frag, columns, body, true);
+                push_json_body(&mut frag, columns, body, true, *apply_defaults);
 
                 if !where_clauses.is_empty() {
                     frag.push(" WHERE ");
@@ -929,13 +931,56 @@ fn push_json_body(
     columns: &[crate::plan::CoercibleField],
     body: &bytes::Bytes,
     single: bool,
+    apply_defaults: bool,
 ) {
     let body = String::from_utf8_lossy(body).into_owned();
     let object = body.trim_start().starts_with('{');
 
+    // `Prefer: missing=default` asks for a column the body left out to take
+    // the value the table would have given it, rather than null. The defaults
+    // are merged underneath the body, so anything the body did name still
+    // wins -- which is why this is `defaults || body` and not the reverse.
+    let defaults: Vec<&crate::plan::CoercibleField> = match apply_defaults {
+        true => columns.iter().filter(|c| c.default.is_some()).collect(),
+        false => Vec::new(),
+    };
+    let merged = !defaults.is_empty();
+
     frag.push("FROM (SELECT ");
     frag.push_param(body);
-    frag.push("::json AS json_data) pgrst_payload, LATERAL (SELECT ");
+    frag.push(match merged {
+        true => "::jsonb AS json_data) pgrst_payload, ",
+        false => "::json AS json_data) pgrst_payload, ",
+    });
+
+    if merged {
+        let mut pairs = String::new();
+        for (i, column) in defaults.iter().enumerate() {
+            if i > 0 {
+                pairs.push_str(", ");
+            }
+            pairs.push_str(&format!(
+                "{}, {}",
+                postrust_sql::quote_literal(&column.name),
+                column.default.as_deref().unwrap_or("NULL")
+            ));
+        }
+        frag.push(match single || object {
+            true => "LATERAL (SELECT jsonb_build_object(",
+            false => "LATERAL (SELECT jsonb_agg(jsonb_build_object(",
+        });
+        frag.push(&pairs);
+        frag.push(match single || object {
+            true => ") || pgrst_payload.json_data AS val) pgrst_defaults, ",
+            false => {
+                ") || pgrst_element) AS val \
+                 FROM jsonb_array_elements(pgrst_payload.json_data) pgrst_element) \
+                 pgrst_defaults, "
+            }
+        });
+    }
+
+    frag.push("LATERAL (SELECT ");
     for (i, column) in columns.iter().enumerate() {
         if i > 0 {
             frag.push(", ");
@@ -957,9 +1002,11 @@ fn push_json_body(
     // update writes one set of values whatever it matches, so its body is one
     // object -- and a body that is not is an error PostgreSQL words better
     // than this could. An insert may be either, and the body says which.
-    frag.push(match single || object {
-        true => " FROM json_to_record(pgrst_payload.json_data) AS _(",
-        false => " FROM json_to_recordset(pgrst_payload.json_data) AS _(",
+    frag.push(match (merged, single || object) {
+        (false, true) => " FROM json_to_record(pgrst_payload.json_data) AS _(",
+        (false, false) => " FROM json_to_recordset(pgrst_payload.json_data) AS _(",
+        (true, true) => " FROM jsonb_to_record(pgrst_defaults.val) AS _(",
+        (true, false) => " FROM jsonb_to_recordset(pgrst_defaults.val) AS _(",
     });
     for (i, column) in columns.iter().enumerate() {
         if i > 0 {
