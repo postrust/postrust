@@ -143,7 +143,27 @@ async fn load_columns(
             -- and the domain is what a data representation is declared on.
             c.domain_name,
             c.character_maximum_length,
-            c.column_default,
+            -- An identity column has no `column_default`: `information_schema`
+            -- describes it as generated rather than defaulted. What it would
+            -- take if a row left it out is the next value of the sequence the
+            -- column owns, which is the answer `Prefer: missing=default`
+            -- needs.
+            COALESCE(
+                c.column_default,
+                (SELECT format('nextval(%L)', s.oid::regclass)
+                   FROM pg_class rel
+                   JOIN pg_namespace ns ON ns.oid = rel.relnamespace
+                   JOIN pg_attribute att ON att.attrelid = rel.oid
+                                        AND att.attname = c.column_name
+                                        AND att.attidentity = 'd'
+                   JOIN pg_depend dep ON dep.refobjid = rel.oid
+                                     AND dep.refobjsubid = att.attnum
+                                     AND dep.deptype = 'i'
+                   JOIN pg_class s ON s.oid = dep.objid AND s.relkind = 'S'
+                  WHERE ns.nspname = c.table_schema
+                    AND rel.relname = c.table_name
+                  LIMIT 1)
+            ) AS column_default,
             pg_catalog.col_description(
                 (quote_ident(c.table_schema) || '.' || quote_ident(c.table_name))::regclass,
                 c.ordinal_position
