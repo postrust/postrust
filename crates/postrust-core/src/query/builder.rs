@@ -923,7 +923,9 @@ fn push_json_body(
         frag.push(" ");
         frag.push(castable_type(&column.ir_type).unwrap_or("text"));
     }
-    frag.push(") pgrst_body");
+    // Two parentheses: one closes the column definition list, one the lateral
+    // subquery the alias names.
+    frag.push(")) pgrst_body");
 }
 
 /// The `RETURNING` list, or nothing when there is none.

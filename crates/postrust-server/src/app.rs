@@ -535,7 +535,12 @@ async fn execute_plan(
             let mut params = params;
             params.extend(embed_filters.params);
 
-            if !embed_level.expressions.is_empty() {
+            // Built whenever there were relations at all, not only when they
+            // produced expressions: `clients!inner()` contributes no column
+            // but does narrow the parent, and its predicate binds parameters
+            // that have already been appended -- left unapplied, the query is
+            // sent with more parameters than it uses.
+            if embed_level.saw_relations {
                 // `!inner` removes parent rows, so it has to be applied before
                 // the page is taken. Left where it is, the inner query's
                 // LIMIT would run first and the join would then trim an
