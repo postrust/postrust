@@ -206,6 +206,12 @@ impl SchemaCache {
     /// which overload was selected decides which table the result is shaped
     /// by -- and only the caller knows that.
     pub fn returned_table(&self, routine: &Routine) -> Option<&Table> {
+        // Only a row type names a table. Without this, a function returning
+        // `xml` is shaped by whatever relation happens to be called `xml` --
+        // and the fixtures have one, so this is not hypothetical.
+        if !routine.returns_composite {
+            return None;
+        }
         let type_name = routine.return_type.type_name()?;
         let candidate = match type_name.split_once('.') {
             Some((schema, name)) => QualifiedIdentifier::new(schema, name),

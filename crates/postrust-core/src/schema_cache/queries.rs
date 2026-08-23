@@ -557,13 +557,39 @@ pub async fn load_routines(pool: &PgPool, schemas: &[String]) -> Result<RoutineM
                 )
                 FROM generate_series(1, p.pronargs) AS i
             ), '[]'::json) as params,
+            -- The columns the function's rows have, where it names them:
+            -- `RETURNS TABLE(a text, b colour)` declares them as OUT
+            -- parameters, and they are the only account of the result's shape
+            -- -- there is no table to read it off. `proallargtypes` is a
+            -- plain 1-indexed array and lines up with `proargnames`.
+            COALESCE((
+                SELECT json_agg(
+                    json_build_object(
+                        'name', COALESCE(p.proargnames[i], ''),
+                        'type', pg_catalog.format_type(p.proallargtypes[i], NULL)
+                    ) ORDER BY i
+                )
+                FROM generate_series(
+                    1, COALESCE(array_length(p.proallargtypes, 1), 0)) AS i
+                WHERE p.proargmodes[i] IN ('o', 't', 'b')
+            ), '[]'::json) as out_params,
             CASE
                 WHEN p.proretset THEN 'SETOF ' || pg_catalog.format_type(rt.base_type, NULL)
                 ELSE pg_catalog.format_type(rt.base_type, NULL)
             END as return_type,
             p.proretset as returns_set,
             (SELECT t.typtype::text FROM pg_catalog.pg_type t WHERE t.oid = rt.base_type)
-                as ret_typtype
+                as ret_typtype,
+            -- A domain named after a media type says the value already is
+            -- that media type: `returns "image/png"` is a PNG, not a row to
+            -- serialise. Only a single value can be one, so a set-returning
+            -- function is not it.
+            (SELECT lower(dt.typname) FROM pg_catalog.pg_type dt
+              WHERE dt.oid = p.prorettype
+                AND dt.typbasetype <> 0
+                AND NOT p.proretset
+                AND (dt.typname ~ '^[A-Za-z0-9.-]+/[A-Za-z0-9.+-]+$'
+                     OR dt.typname = '*/*')) as media_type
         FROM pg_proc p
         JOIN pg_namespace n ON n.oid = p.pronamespace
         JOIN resolved rt ON rt.oid = p.prorettype
@@ -640,6 +666,12 @@ pub async fn load_routines(pool: &PgPool, schemas: &[String]) -> Result<RoutineM
             isolation_level: None,
             settings: vec![],
             is_procedure: row.get("is_procedure"),
+            media_type: row.get("media_type"),
+            output_columns: parse_routine_params(row.get("out_params"))
+                .into_iter()
+                .filter(|param| !param.name.is_empty())
+                .map(|param| (param.name, param.param_type))
+                .collect(),
         };
 
         routines.entry(qi).or_default().push(routine);

@@ -950,20 +950,28 @@ async fn execute_plan(
             // `Vec<PgRow>` staying alive alongside the whole `Vec<Value>`.
             // A rendered media type is a single value, not a row set: the
             // aggregate already produced the entire body.
-            if let Some(media_type) =
-                media_handler
-                    .as_ref()
-                    .map(|(m, _, _)| m.clone())
-                    .or_else(|| {
-                        geojson_column
-                            .as_ref()
-                            .map(|_| "application/geo+json".to_string())
-                    })
+            if let Some(media_type) = media_handler
+                .as_ref()
+                .map(|(m, _, _)| m.clone())
+                .or_else(|| {
+                    geojson_column
+                        .as_ref()
+                        .map(|_| "application/geo+json".to_string())
+                })
+                .or_else(|| declared_media_type(db_plan, api_request))
             {
                 use sqlx::Row;
+                // Read as bytes where the media type is not text: a value that
+                // is a PNG is not a string, and asking for one back gets
+                // nothing at all.
                 let body = rows
                     .first()
-                    .and_then(|row| row.try_get::<Option<String>, _>(0).ok())
+                    .and_then(|row| {
+                        row.try_get::<Option<String>, _>(0)
+                            .map(|text| text.map(String::into_bytes))
+                            .or_else(|_| row.try_get::<Option<Vec<u8>>, _>(0))
+                            .ok()
+                    })
                     .flatten()
                     .unwrap_or_default();
                 tx.commit()
@@ -2411,6 +2419,28 @@ fn build_embed_expressions(
     Ok(level)
 }
 
+/// The media type a function's own return type declares, where the client
+/// asked for it.
+///
+/// A function returning a domain named `text/plain` returns text, and the
+/// value is the whole response. It is still only returned that way to a client
+/// that asked: the same value serialised as JSON is a perfectly good answer to
+/// a request that did not.
+fn declared_media_type(
+    db_plan: &DbActionPlan,
+    api_request: &postrust_core::api_request::ApiRequest,
+) -> Option<String> {
+    let DbActionPlan::Call { call, .. } = db_plan else {
+        return None;
+    };
+    let declared = call.media_type.as_deref()?;
+    api_request
+        .accept_media_types
+        .iter()
+        .any(|accepted| accepted.content_type() == declared)
+        .then(|| declared.to_string())
+}
+
 /// Whether a selection produces any keys in the response.
 ///
 /// A relation contributes only what its own selection does, so `tasks()` and
@@ -2976,6 +3006,8 @@ mod tests {
 
     fn call_plan(name: &str, returns_set: bool) -> CallPlan {
         CallPlan {
+            output_columns: Vec::new(),
+            media_type: None,
             function: QualifiedIdentifier::new("public", name),
             params: CallParams::None,
             returns_scalar: !returns_set,

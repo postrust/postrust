@@ -48,6 +48,23 @@ pub struct CallPlan {
     /// length is one, and a parameter's length is not enforced anyway.
     #[serde(default)]
     pub param_types: Vec<(String, String)>,
+    /// The media type the function's value already is, where its return type
+    /// is a domain that says so.
+    ///
+    /// The result is that media type rather than something to serialise as
+    /// JSON, so it is returned verbatim -- but only where the client asked for
+    /// it, since a function whose value is a PNG is still a value a client may
+    /// want as JSON.
+    #[serde(default)]
+    pub media_type: Option<String>,
+    /// The columns the result has, where the function declares its own.
+    ///
+    /// `RETURNS TABLE(a text, b colour)` has no table to read the result's
+    /// shape from, so `SELECT *` is all that can be asked for -- and a column
+    /// of a type this process cannot decode comes back null. Knowing the
+    /// columns is what lets the database render those instead.
+    #[serde(default)]
+    pub output_columns: Vec<(String, String)>,
     /// The names of the parameters declared `VARIADIC`.
     ///
     /// Named notation spells one `VARIADIC v := ...`; `v => ...` finds no
@@ -111,6 +128,8 @@ impl CallPlan {
                 .iter()
                 .map(|p| (p.name.clone(), p.type_max_length.clone()))
                 .collect(),
+            media_type: routine.produced_media_type().map(str::to_string),
+            output_columns: routine.output_columns.clone(),
             variadic_params: routine
                 .params
                 .iter()
@@ -350,6 +369,8 @@ mod tests {
 
     fn make_routine() -> Routine {
         Routine {
+            output_columns: Vec::new(),
+            media_type: None,
             schema: "public".into(),
             name: "get_users".into(),
             description: None,

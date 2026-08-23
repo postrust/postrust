@@ -806,11 +806,8 @@ impl QueryBuilder {
                     frag.append(column);
                 }
             }
-            None => {
-                if !render_as_json {
-                    frag.push("*");
-                }
-            }
+            None if !render_as_json => push_declared_columns(&mut frag, plan),
+            None => {}
         }
         if !render_as_json {
             frag.push(" FROM ");
@@ -1108,6 +1105,37 @@ fn push_qualified_field_ref(
         frag.push(&column);
     }
     push_json_path(frag, &field.json_path);
+}
+
+/// Project the columns a function declares, rather than asking for `*`.
+///
+/// `*` is all a caller can write when the result has no table behind it, and
+/// it leaves a column of a type this process cannot decode to arrive as null.
+/// Naming the columns is what lets those be rendered by the database, exactly
+/// as a table's are. A function that declares none still gets `*`: there is
+/// nothing better to say.
+fn push_declared_columns(frag: &mut SqlFragment, plan: &crate::plan::CallPlan) {
+    if plan.output_columns.is_empty() {
+        frag.push("*");
+        return;
+    }
+
+    for (i, (name, pg_type)) in plan.output_columns.iter().enumerate() {
+        if i > 0 {
+            frag.push(", ");
+        }
+        match decodable_type(pg_type) {
+            true => {
+                frag.push(&escape_ident(name));
+            }
+            false => {
+                frag.push("to_jsonb(");
+                frag.push(&escape_ident(name));
+                frag.push(") AS ");
+                frag.push(&escape_ident(name));
+            }
+        }
+    }
 }
 
 /// The type a JSON path leaves on the left of a comparison.

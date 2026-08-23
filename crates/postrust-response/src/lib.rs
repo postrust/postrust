@@ -103,8 +103,17 @@ pub fn format_response(
     // A media type the schema renders itself: the database produced the whole
     // payload, so there is nothing here to serialise.
     if let Some((media_type, body)) = &result.raw_body {
-        let mut response = Response::new(result.status, body.clone().into_bytes());
-        response.set_content_type(media_type);
+        let mut response = Response::new(result.status, body.clone());
+        // Every media type the server names is UTF-8 except the ones that are
+        // not text at all: a stream of bytes has no encoding, and one the
+        // schema named itself is not this side's to characterise.
+        let charset = match media_type.as_str() {
+            "application/octet-stream" => "",
+            already if already.contains("charset=") => "",
+            text if text.starts_with("text/") || text.contains("json") => "; charset=utf-8",
+            _ => "",
+        };
+        response.set_content_type(&format!("{}{}", media_type, charset));
         if let Some(range) = &result.content_range {
             response.set_header("Content-Range", &range.to_string());
         }
@@ -371,7 +380,7 @@ pub struct QueryResult {
     /// Set when the request asked for a media type the schema declares its own
     /// renderer for. The value is the whole payload, so it replaces the usual
     /// JSON rendering rather than being wrapped in it.
-    pub raw_body: Option<(String, String)>,
+    pub raw_body: Option<(String, Vec<u8>)>,
 }
 
 /// Response formatting error.
