@@ -313,7 +313,7 @@ impl MutationField {
             schema_name: table.schema.clone(),
             mutation_type: MutationType::Insert,
             pk_columns: Vec::new(),
-            return_type: format!("[{}!]!", type_name),
+            return_type: format!("{}_mutation_response", type_name),
             description: Some(format!("Insert multiple {} records", table.name)),
         });
 
@@ -356,7 +356,7 @@ impl MutationField {
             schema_name: table.schema.clone(),
             mutation_type: MutationType::Update,
             pk_columns: Vec::new(),
-            return_type: format!("[{}!]!", type_name),
+            return_type: format!("{}_mutation_response", type_name),
             description: Some(format!("Update {} records", table.name)),
         });
 
@@ -401,7 +401,7 @@ impl MutationField {
             schema_name: table.schema.clone(),
             mutation_type: MutationType::Delete,
             pk_columns: Vec::new(),
-            return_type: format!("[{}!]!", type_name),
+            return_type: format!("{}_mutation_response", type_name),
             description: Some(format!("Delete {} records", table.name)),
         });
 

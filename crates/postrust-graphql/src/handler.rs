@@ -19,7 +19,7 @@ use axum::response::IntoResponse;
 use futures::stream::StreamExt;
 use postrust_core::schema_cache::SchemaCache;
 use sqlx::PgPool;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use tokio::sync::RwLock;
 use tracing::{debug, info, trace};
@@ -212,6 +212,24 @@ fn build_dynamic_schema(
         object_types.insert(type_name.clone(), table_obj);
     }
 
+    // One mutation response per table that has any mutation, and only those:
+    // an unreferenced type is still a type, and a read-only view would
+    // otherwise contribute a response nothing can return.
+    let mutable: HashSet<&str> = generated
+        .mutation_fields
+        .iter()
+        .map(|f| {
+            f.return_type
+                .trim_matches(|c| c == '[' || c == ']' || c == '!')
+        })
+        .collect();
+    for base_name in mutable {
+        object_types.insert(
+            mutation_response_type_name(base_name),
+            create_mutation_response_type(base_name),
+        );
+    }
+
     // Create query type. Resolvers need the relationship map to embed related
     // rows, so it is shared into each closure.
     let relationships = Arc::new(generated.relationship_fields.clone());
@@ -270,6 +288,34 @@ fn build_dynamic_schema(
         builder = builder.register(input);
     }
 
+    // A key as one object, for `update_x_by_pk(pk_columns: {...})`. Only the
+    // by-key update spells its key this way; the by-key query and delete take
+    // the columns as arguments, and both spellings are what a generated client
+    // already sends.
+    let mut key_inputs: HashMap<String, InputObject> = HashMap::new();
+    for field in &generated.mutation_fields {
+        if field.mutation_type != MutationType::UpdateByPk || field.pk_columns.is_empty() {
+            continue;
+        }
+        let base_name = field
+            .return_type
+            .trim_matches(|c| c == '[' || c == ']' || c == '!')
+            .trim_end_matches("_mutation_response");
+        let type_name = format!("{}_pk_columns_input", base_name);
+        let mut input = InputObject::new(&type_name)
+            .description(format!("The primary key of one {} row.", base_name));
+        for (column, pg_type) in &field.pk_columns {
+            input = input.field(InputValue::new(
+                column,
+                TypeRef::named_nn(pk_argument_type(pg_type)),
+            ));
+        }
+        key_inputs.insert(type_name, input);
+    }
+    for (_, input) in key_inputs {
+        builder = builder.register(input);
+    }
+
     // Ordering: one input per table, one column enum per table, and the single
     // direction enum they all share.
     let (order_inputs, order_enums) =
@@ -287,6 +333,59 @@ fn build_dynamic_schema(
 }
 
 /// Create an object type from a TableObjectType.
+/// The name of a table's mutation response type.
+pub fn mutation_response_type_name(base_name: &str) -> String {
+    format!("{}_mutation_response", base_name)
+}
+
+/// Build the `<table>_mutation_response` object.
+///
+/// Every bulk mutation answers with this rather than with the rows directly.
+/// `affected_rows` is the count PostgreSQL reports, which is not the length of
+/// `returning`: a client may ask for no rows back at all and still need to know
+/// how many were touched, and that is the usual case for a delete.
+fn create_mutation_response_type(base_name: &str) -> Object {
+    let response_name = mutation_response_type_name(base_name);
+    let row_type = base_name.to_string();
+
+    Object::new(&response_name)
+        .description(format!("The rows {} changed, and how many.", base_name))
+        .field(Field::new(
+            "affected_rows",
+            TypeRef::named_nn(TypeRef::INT),
+            |ctx| {
+                FieldFuture::new(async move {
+                    if let Some(Value::Object(map)) = ctx.parent_value.as_value() {
+                        if let Some(value) = map.get(&async_graphql::Name::new("affected_rows")) {
+                            return Ok(Some(FieldValue::value(value.clone())));
+                        }
+                    }
+                    Ok(Some(FieldValue::value(Value::from(0))))
+                })
+            },
+        ))
+        .field(Field::new(
+            "returning",
+            TypeRef::named_nn_list_nn(row_type),
+            |ctx| {
+                FieldFuture::new(async move {
+                    let rows = match ctx.parent_value.as_value() {
+                        Some(Value::Object(map)) => match map
+                            .get(&async_graphql::Name::new("returning"))
+                        {
+                            Some(Value::List(items)) => items.clone(),
+                            _ => Vec::new(),
+                        },
+                        _ => Vec::new(),
+                    };
+                    Ok(Some(FieldValue::list(
+                        rows.into_iter().map(FieldValue::value),
+                    )))
+                })
+            },
+        ))
+}
+
 fn create_object_type(obj: &TableObjectType, relationships: &[RelationshipField]) -> Object {
     let mut object = Object::new(&obj.name);
 
@@ -466,6 +565,7 @@ fn create_mutation_type(generated: &GeneratedSchema) -> Object {
         let where_type = field
             .return_type
             .trim_matches(|c| c == '[' || c == ']' || c == '!')
+            .trim_end_matches("_mutation_response")
             .to_string();
 
         let resolver_pk_columns = pk_columns.clone();
@@ -484,18 +584,22 @@ fn create_mutation_type(generated: &GeneratedSchema) -> Object {
         // it is meant to address exactly one row, and accepting `where` made it
         // an ordinary bulk mutation that happened to return the first result.
         match mutation_type {
-            MutationType::Insert | MutationType::InsertOne => {
+            MutationType::Insert => {
                 gql_field =
                     gql_field.argument(InputValue::new("objects", TypeRef::named_nn_list("JSON")));
             }
+            // A single insert takes `object`, not a one-element `objects`.
+            MutationType::InsertOne => {
+                gql_field =
+                    gql_field.argument(InputValue::new("object", TypeRef::named_nn("JSON")));
+            }
             MutationType::UpdateByPk => {
-                gql_field = gql_field.argument(InputValue::new("_set", TypeRef::named_nn("JSON")));
-                for (col_name, pg_type) in &pk_columns {
-                    gql_field = gql_field.argument(InputValue::new(
-                        col_name,
-                        TypeRef::named_nn(pk_argument_type(pg_type)),
+                gql_field = gql_field
+                    .argument(InputValue::new("_set", TypeRef::named("JSON")))
+                    .argument(InputValue::new(
+                        "pk_columns",
+                        TypeRef::named_nn(format!("{}_pk_columns_input", where_type)),
                     ));
-                }
             }
             MutationType::Update => {
                 gql_field = gql_field
@@ -838,6 +942,14 @@ async fn resolve_mutation<'a>(
                 .try_get("objects")
                 .ok()
                 .map(|v| accessor_to_json(&v))
+                .or_else(|| {
+                    // `insert_x_one(object: {...})` is one row spelled without
+                    // the list.
+                    ctx.args
+                        .try_get("object")
+                        .ok()
+                        .map(|v| serde_json::Value::Array(vec![accessor_to_json(&v)]))
+                })
                 .unwrap_or_else(|| serde_json::Value::Array(vec![]));
 
             execute_insert(
@@ -853,7 +965,7 @@ async fn resolve_mutation<'a>(
         MutationType::Update | MutationType::UpdateByPk => {
             let set_value = ctx
                 .args
-                .try_get("set")
+                .try_get("_set")
                 .ok()
                 .map(|v| accessor_to_json(&v))
                 .unwrap_or_else(|| serde_json::json!({}));
@@ -977,7 +1089,7 @@ async fn execute_insert<'a>(
 
     let mut conn = begin_with_role(pool, role).await?;
 
-    let mut inserted: Vec<FieldValue> = Vec::new();
+    let mut inserted: Vec<Value> = Vec::new();
 
     for obj in objects_array {
         if let serde_json::Value::Object(map) = obj {
@@ -1013,7 +1125,7 @@ async fn execute_insert<'a>(
             let row = query.fetch_one(&mut *conn).await?;
 
             if let Ok(json_val) = row.try_get::<serde_json::Value, _>(0) {
-                inserted.push(FieldValue::value(json_to_value(json_val)));
+                inserted.push(json_to_value(json_val));
             }
         }
     }
@@ -1022,17 +1134,30 @@ async fn execute_insert<'a>(
     // would end the transaction, and the role set on it, after the first row.
     conn.commit().await?;
 
-    // Return based on mutation type
-    match mutation_type {
-        MutationType::InsertOne => {
-            // Return single item
-            Ok(inserted.into_iter().next())
-        }
-        _ => {
-            // Return list
-            Ok(Some(FieldValue::list(inserted)))
-        }
+    Ok(mutation_result(
+        inserted,
+        mutation_type == MutationType::InsertOne,
+    ))
+}
+
+/// Shape a mutation's result for the field that asked for it.
+///
+/// A by-key mutation answers with the row, or with null where the key matched
+/// nothing. Every other mutation answers with the table's mutation response,
+/// which carries `affected_rows` alongside the rows themselves -- a client may
+/// ask for no rows back and still need the count, which is the usual case for
+/// a delete.
+fn mutation_result<'a>(rows: Vec<Value>, by_key: bool) -> Option<FieldValue<'a>> {
+    if by_key {
+        return rows.into_iter().next().map(FieldValue::value);
     }
+    let mut response = async_graphql::indexmap::IndexMap::new();
+    response.insert(
+        async_graphql::Name::new("affected_rows"),
+        Value::from(rows.len()),
+    );
+    response.insert(async_graphql::Name::new("returning"), Value::List(rows));
+    Some(FieldValue::value(Value::Object(response)))
 }
 
 /// Bind a JSON value to a sqlx query.
@@ -1134,19 +1259,18 @@ async fn execute_update<'a>(
 
     let rows = query.fetch_all(&mut *conn).await?;
 
-    let updated: Vec<FieldValue> = rows
+    let updated: Vec<Value> = rows
         .iter()
         .filter_map(|row| row.try_get::<serde_json::Value, _>(0).ok())
-        .map(|v| FieldValue::value(json_to_value(v)))
+        .map(json_to_value)
         .collect();
 
-    // Return based on mutation type
     conn.commit().await?;
 
-    match mutation_type {
-        MutationType::UpdateByPk => Ok(updated.into_iter().next()),
-        _ => Ok(Some(FieldValue::list(updated))),
-    }
+    Ok(mutation_result(
+        updated,
+        mutation_type == MutationType::UpdateByPk,
+    ))
 }
 
 /// Execute a delete mutation.
@@ -1198,19 +1322,19 @@ async fn execute_delete<'a>(
 
     let rows = query.fetch_all(&mut *conn).await?;
 
-    let deleted: Vec<FieldValue> = rows
+    let deleted: Vec<Value> = rows
         .iter()
         .filter_map(|row| row.try_get::<serde_json::Value, _>(0).ok())
-        .map(|v| FieldValue::value(json_to_value(v)))
+        .map(json_to_value)
         .collect();
 
     // Return based on mutation type
     conn.commit().await?;
 
-    match mutation_type {
-        MutationType::DeleteByPk => Ok(deleted.into_iter().next()),
-        _ => Ok(Some(FieldValue::list(deleted))),
-    }
+    Ok(mutation_result(
+        deleted,
+        mutation_type == MutationType::DeleteByPk,
+    ))
 }
 
 /// Build a WHERE clause from a boolean expression.
@@ -1796,18 +1920,35 @@ fn pk_where_from_args(
         )));
     }
 
+    // `update_x_by_pk` takes its key as one `pk_columns` object; the others
+    // take the key columns as arguments of their own. Both spellings are what
+    // a client was generated against, so both are read here.
+    let from_object = ctx
+        .args
+        .try_get("pk_columns")
+        .ok()
+        .map(|v| accessor_to_json(&v));
+
     let mut conditions = serde_json::Map::new();
     for (col_name, _) in pk_columns {
-        let value = ctx.args.try_get(col_name).map_err(|_| {
-            async_graphql::Error::new(format!(
-                "missing required primary key argument \"{}\"",
-                col_name
-            ))
-        })?;
-        conditions.insert(
-            col_name.clone(),
-            serde_json::json!({ "eq": accessor_to_json(&value) }),
-        );
+        let value = match &from_object {
+            Some(serde_json::Value::Object(map)) => map.get(col_name).cloned().ok_or_else(|| {
+                async_graphql::Error::new(format!(
+                    "pk_columns is missing the key column \"{}\"",
+                    col_name
+                ))
+            })?,
+            _ => {
+                let arg = ctx.args.try_get(col_name).map_err(|_| {
+                    async_graphql::Error::new(format!(
+                        "missing required primary key argument \"{}\"",
+                        col_name
+                    ))
+                })?;
+                accessor_to_json(&arg)
+            }
+        };
+        conditions.insert(col_name.clone(), serde_json::json!({ "_eq": value }));
     }
 
     Ok(serde_json::Value::Object(conditions))
