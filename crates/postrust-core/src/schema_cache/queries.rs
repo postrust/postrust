@@ -43,23 +43,39 @@ pub async fn load_tables(pool: &PgPool, schemas: &[String]) -> Result<TablesMap>
                   AND i.indisprimary),
                 ARRAY[]::text[]
             ) as pk_cols,
+            -- Being granted INSERT on a view does not make the view
+            -- insertable. A view is written through only where it is simple
+            -- enough for PostgreSQL to write through automatically, or where
+            -- an INSTEAD OF trigger says how -- `projects_view_without_triggers`
+            -- carries every grant and accepts nothing. Both halves have to
+            -- hold. A table has no row in `information_schema.views`, so the
+            -- grant is the whole answer there.
             EXISTS (
                 SELECT 1 FROM information_schema.table_privileges tp
                 WHERE tp.table_schema = t.table_schema
                   AND tp.table_name = t.table_name
                   AND tp.privilege_type = 'INSERT'
+            ) AND COALESCE(
+                v.is_insertable_into = 'YES' OR v.is_trigger_insertable_into = 'YES',
+                true
             ) as insertable,
             EXISTS (
                 SELECT 1 FROM information_schema.table_privileges tp
                 WHERE tp.table_schema = t.table_schema
                   AND tp.table_name = t.table_name
                   AND tp.privilege_type = 'UPDATE'
+            ) AND COALESCE(
+                v.is_updatable = 'YES' OR v.is_trigger_updatable = 'YES',
+                true
             ) as updatable,
             EXISTS (
                 SELECT 1 FROM information_schema.table_privileges tp
                 WHERE tp.table_schema = t.table_schema
                   AND tp.table_name = t.table_name
                   AND tp.privilege_type = 'DELETE'
+            ) AND COALESCE(
+                v.is_updatable = 'YES' OR v.is_trigger_deletable = 'YES',
+                true
             ) as deletable,
             COALESCE(k.is_partitioned, false) as is_partitioned
         FROM (
@@ -88,6 +104,8 @@ pub async fn load_tables(pool: &PgPool, schemas: &[String]) -> Result<TablesMap>
               JOIN pg_namespace n ON n.oid = c.relnamespace
              WHERE n.nspname = t.table_schema AND c.relname = t.table_name
         ) k ON true
+        LEFT JOIN information_schema.views v
+               ON v.table_schema = t.table_schema AND v.table_name = t.table_name
         WHERE t.table_schema = ANY($1)
           -- A partition is reached through the table it partitions, not on its
           -- own. `information_schema.tables` lists every one of them, so a

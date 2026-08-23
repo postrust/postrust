@@ -1004,23 +1004,14 @@ fn add_junction_relationships(
             continue;
         };
 
-        // The single-column keys out of the junction.
-        //
-        // This is not the right rule. `touched_files` joins
-        // `files(project_id, filename)` to `users_tasks(user_id, task_id)` and
-        // is as much a junction as any other; PostgREST embeds through both it
-        // and `car_models_car_dealers`, and this answers "no relationship" for
-        // a relationship that is plainly there. The primary-key test below is
-        // what actually separates a junction from a table that merely
-        // references two others, and it does not need this.
-        //
-        // It stays because the embed layer cannot yet express the join it
-        // would produce: `EmbedPlan` carries one `local_column` and one
-        // `foreign_column`, `EmbedJunction` one column per side, and
-        // `parent_keys` matches children to parents on a single scalar. Deriving
-        // the relationship without widening those would join a composite
-        // junction on the first column of each key and return rows that are
-        // wrong rather than absent -- and be much harder to notice.
+        // The keys out of the junction, however many columns each is written
+        // over. Requiring one column apiece looked like what separates a
+        // junction from a table that merely references two others, but it is
+        // not: `touched_files` joins `files(project_id, filename)` to
+        // `users_tasks(user_id, task_id)` and is as much a junction as any
+        // other. What separates them is the primary-key test below, which this
+        // duplicated and then over-applied -- so a composite junction was
+        // answered "no relationship" for a relationship that is plainly there.
         let outgoing: Vec<(&Relationship, Vec<(String, String)>)> = rels
             .iter()
             .filter(|r| matches!(r, Relationship::ForeignKey { table, .. } if table == junction_qi))
@@ -1028,9 +1019,9 @@ fn add_junction_relationships(
             .filter_map(|r| {
                 let mut columns = r.join_columns();
                 columns.dedup();
-                match columns.len() {
-                    1 => Some((r, columns)),
-                    _ => None,
+                match columns.is_empty() {
+                    true => None,
+                    false => Some((r, columns)),
                 }
             })
             .collect();

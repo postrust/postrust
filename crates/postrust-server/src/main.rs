@@ -261,6 +261,13 @@ async fn main() -> Result<()> {
                 .allow_headers(CorsAny)
                 .expose_headers(CorsAny),
         )
+        // Outermost, so it runs before the CORS layer -- which answers every
+        // OPTIONS itself and never calls what it wraps, so nothing downstream
+        // of it can say what a resource allows.
+        .layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            app::options_allow,
+        ))
         .with_state(state);
 
     // Start server

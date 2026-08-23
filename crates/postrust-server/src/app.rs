@@ -440,9 +440,7 @@ async fn execute_plan(
                                     // request did not reshape the rows, since
                                     // then the two are the same rows.
                                     handler.table.is_some()
-                                        || has_default_select(
-                                            &api_request.query_params.select,
-                                        ),
+                                        || has_default_select(&api_request.query_params.select),
                                     handler.base_type.clone(),
                                 )
                             })
@@ -787,16 +785,13 @@ async fn execute_plan(
                 // one predicate combining their existence tests. The read
                 // plan left the tree alone precisely so that it could be
                 // built here, where the embeds are in scope.
-                let embeds = postrust_core::api_request::embedded_names(
-                    &api_request.query_params.select,
-                );
+                let embeds =
+                    postrust_core::api_request::embedded_names(&api_request.query_params.select);
                 for (path, tree) in &api_request.query_params.logic {
                     if !path.is_empty() || !tree.names_only(&embeds) {
                         continue;
                     }
-                    if let Some(predicate) =
-                        embed_logic_predicate(tree, &embed_level.filterable)
-                    {
+                    if let Some(predicate) = embed_logic_predicate(tree, &embed_level.filterable) {
                         predicates.push(predicate);
                     }
                 }
@@ -855,12 +850,10 @@ async fn execute_plan(
                 let schema_cache = state.schema_cache().await;
                 let target = read_target(api_request, Some(db_plan), &schema_cache);
                 match target.as_ref().and_then(|qi| schema_cache.get_table(qi)) {
-                    Some(table) => {
-                        match geometry_key(table, &api_request.query_params.select) {
-                            Some(column) => Some(column),
-                            None => return Err(postrust_core::Error::MissingGeometryColumn),
-                        }
-                    }
+                    Some(table) => match geometry_key(table, &api_request.query_params.select) {
+                        Some(column) => Some(column),
+                        None => return Err(postrust_core::Error::MissingGeometryColumn),
+                    },
                     // Nothing this side can name a geometry column on -- a
                     // scalar function, say. Left to the database, which is
                     // where the answer was coming from anyway.
@@ -1313,12 +1306,15 @@ async fn execute_plan(
             // taken from the key, the bookkeeping columns removed. Built in
             // SQL it saw the row as the statement left it, and leaked
             // `pgrst_inserted` into a feature's properties.
-            let geojson_body = geojson_column.as_ref().filter(|_| !omit_body).map(|column| {
-                (
-                    "application/geo+json".to_string(),
-                    feature_collection(&rows, column),
-                )
-            });
+            let geojson_body = geojson_column
+                .as_ref()
+                .filter(|_| !omit_body)
+                .map(|column| {
+                    (
+                        "application/geo+json".to_string(),
+                        feature_collection(&rows, column),
+                    )
+                });
 
             // PostgREST reports the returned window on every successful data
             // response -- reads, mutations and RPC alike, but not on errors or
@@ -1401,23 +1397,6 @@ async fn execute_plan(
         ActionPlan::Info(info_plan) => {
             use postrust_core::plan::InfoPlan;
 
-            // What an OPTIONS is for: the methods this particular relation or
-            // function will answer. Derived from the relation itself rather
-            // than from the routing table, which offers every method on every
-            // path and so can only ever give the same answer.
-            let allow = {
-                let schema_cache = state.schema_cache().await;
-                Some(match info_plan {
-                    InfoPlan::OpenApiSpec => "OPTIONS,GET,HEAD".to_string(),
-                    // Asking what may be done with a table that is not there
-                    // is answered the same way as asking for the table: an
-                    // OPTIONS that reports methods for a relation nobody can
-                    // reach describes something that does not exist.
-                    InfoPlan::RelationInfo(qi) => relation_allow(schema_cache.require_table(qi)?),
-                    InfoPlan::RoutineInfo(qi) => routine_allow(schema_cache.get_routines(qi)),
-                })
-            };
-
             // Return appropriate metadata based on the info type
             let response_data = match info_plan {
                 InfoPlan::OpenApiSpec => {
@@ -1447,10 +1426,96 @@ async fn execute_plan(
             Ok(QueryResult {
                 status: StatusCode::OK,
                 rows: vec![response_data],
-                allow,
                 ..Default::default()
             })
         }
+    }
+}
+
+/// Answer an `OPTIONS` with the methods its resource actually has.
+///
+/// This runs outside the CORS layer because that layer answers every `OPTIONS`
+/// itself and never calls what it wraps -- `if parts.method == Method::OPTIONS`
+/// returns immediately, preflight or not. So an `OPTIONS` never reached the
+/// request handler at all: the body was empty because nothing built one, and
+/// `Allow` was missing because the code that knows the answer was never asked.
+///
+/// The CORS layer still writes the response, and this adds to it, so a
+/// preflight keeps every header it had.
+pub async fn options_allow(
+    State(state): State<Arc<AppState>>,
+    request: Request,
+    next: axum::middleware::Next,
+) -> Response {
+    if request.method() != http::Method::OPTIONS {
+        return next.run(request).await;
+    }
+
+    let verbatim_db_errors = state.config.compat_mode;
+
+    // Built here, from borrows, before anything is awaited: `axum::body::Body`
+    // is `Send` but not `Sync`, and `&T` is `Send` only where `T` is `Sync`, so
+    // a `&Request` held across an await makes the whole future not `Send` --
+    // which a middleware has to be.
+    let probe = probe_request(&request);
+    let allow = match probe {
+        Ok(probe) => resolve_allow(&state, probe).await,
+        Err(error) => Err(error),
+    };
+
+    let mut response = next.run(request).await;
+
+    match allow {
+        Ok(allow) => {
+            if let Ok(value) = http::HeaderValue::from_str(&allow) {
+                response.headers_mut().insert(http::header::ALLOW, value);
+            }
+            response
+        }
+        // Asking what may be done with a table that is not there is answered
+        // the same way as asking for the table.
+        Err(error) => error_response(error, verbatim_db_errors).into_response(),
+    }
+}
+
+/// The request again, with an empty body, for the parser to read.
+fn probe_request(request: &Request) -> Result<http::Request<bytes::Bytes>, postrust_core::Error> {
+    let mut builder = http::Request::builder()
+        .method(request.method().clone())
+        .uri(request.uri().clone());
+    for (name, value) in request.headers() {
+        builder = builder.header(name, value);
+    }
+    builder
+        .body(bytes::Bytes::new())
+        .map_err(|e| postrust_core::Error::Internal(e.to_string()))
+}
+
+/// What the resource this request names allows, or why it cannot say.
+///
+/// The path is resolved by the same parser the handler uses rather than by
+/// splitting on `/` here, so a percent-encoded table name, an `Accept-Profile`
+/// naming another schema, and the `/rpc/` prefix all mean what they mean
+/// everywhere else.
+async fn resolve_allow(
+    state: &AppState,
+    probe: http::Request<bytes::Bytes>,
+) -> Result<String, postrust_core::Error> {
+    use postrust_core::api_request::Action;
+
+    let api_request = parse_request(
+        &probe,
+        state.default_schema(),
+        state.schemas(),
+        state.config.db_max_rows,
+    )?;
+
+    let schema_cache = state.schema_cache().await;
+    match &api_request.action {
+        Action::RelationInfo(qi) => Ok(relation_allow(schema_cache.require_table(qi)?)),
+        Action::RoutineInfo { qi, .. } => Ok(routine_allow(schema_cache.get_routines(qi))),
+        // The schema description, which is read and nothing else.
+        _ => Ok("OPTIONS,GET,HEAD".to_string()),
     }
 }
 
@@ -2622,7 +2687,12 @@ fn build_embed_orders(
         let rel = schema_cache
             .find_relationship(parent_qi, embedded.0, embedded.1, &parent_qi.schema)?
             .ok_or_else(|| {
-                schema_cache.relationship_not_found(parent_qi, embedded.0, embedded.1, &parent_qi.schema)
+                schema_cache.relationship_not_found(
+                    parent_qi,
+                    embedded.0,
+                    embedded.1,
+                    &parent_qi.schema,
+                )
             })?;
 
         // A resource that yields many rows per parent has no single value to
@@ -2805,12 +2875,11 @@ fn build_embed_expressions(
         level.spread_columns.extend(nested.spread_columns);
         let nested_expressions = nested.expressions;
 
-        let child_table = schema_cache.get_table(
-            &postrust_core::api_request::QualifiedIdentifier::new(
+        let child_table =
+            schema_cache.get_table(&postrust_core::api_request::QualifiedIdentifier::new(
                 &plan.foreign_schema,
                 &plan.foreign_table,
-            ),
-        );
+            ));
 
         // The child's own columns. Empty means every column, which is what a
         // relation with no explicit selection asks for.

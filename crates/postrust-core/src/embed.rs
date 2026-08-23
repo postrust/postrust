@@ -59,10 +59,57 @@ pub struct EmbedPlan {
 pub struct EmbedJunction {
     pub schema: String,
     pub table: String,
-    /// Column on the junction matching the parent's own key.
-    pub parent_column: String,
-    /// Column on the junction matching the child's key.
-    pub child_column: String,
+    /// `(parent column, junction column)` for each column the parent joins on.
+    ///
+    /// Usually one. A junction may be keyed over several columns on each side
+    /// -- `touched_files` joins `files(project_id, filename)` to
+    /// `users_tasks(user_id, task_id)` -- and joining on the first of them
+    /// alone would relate rows that are not related.
+    pub parent_columns: Vec<(String, String)>,
+    /// `(junction column, child column)` for each column the child joins on.
+    pub child_columns: Vec<(String, String)>,
+}
+
+impl EmbedJunction {
+    /// The junction's join to the child, one equality per column pair.
+    fn child_join(&self, junction_alias: &str, child_alias: &str) -> String {
+        Self::equalities(&self.child_columns, junction_alias, child_alias, true)
+    }
+
+    /// The junction's correlation to one parent row, one equality per pair.
+    fn parent_correlation(&self, junction_alias: &str, parent_alias: &str) -> String {
+        Self::equalities(&self.parent_columns, junction_alias, parent_alias, false)
+    }
+
+    /// `junction.column = other.column` for each pair, joined with `AND`.
+    ///
+    /// `junction_first` says which half of the pair is the junction's, the two
+    /// lists running in opposite directions: the parent's own column comes
+    /// first on the way in, and the child's second on the way out.
+    fn equalities(
+        pairs: &[(String, String)],
+        junction_alias: &str,
+        other_alias: &str,
+        junction_first: bool,
+    ) -> String {
+        pairs
+            .iter()
+            .map(|(left, right)| {
+                let (junction_column, other_column) = match junction_first {
+                    true => (left, right),
+                    false => (right, left),
+                };
+                format!(
+                    "{}.{} = {}.{}",
+                    postrust_sql::escape_ident(junction_alias),
+                    postrust_sql::escape_ident(junction_column),
+                    postrust_sql::escape_ident(other_alias),
+                    postrust_sql::escape_ident(other_column),
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(" AND ")
+    }
 }
 
 impl EmbedPlan {
@@ -100,11 +147,15 @@ impl EmbedPlan {
             ..
         } = relationship
         {
-            let (local_column, parent_column) =
+            // The join itself is written from every column pair below. These
+            // two are the parent's and the child's first key column, which is
+            // what the batched path groups by -- and it refuses a junction
+            // keyed on more than one, rather than grouping by half a key.
+            let (local_column, _) =
                 junction.source_columns.first().cloned().ok_or_else(|| {
                     Error::EmbeddingError("junction has no source columns".into())
                 })?;
-            let (child_column, foreign_column) =
+            let (_, foreign_column) =
                 junction.target_columns.first().cloned().ok_or_else(|| {
                     Error::EmbeddingError("junction has no target columns".into())
                 })?;
@@ -121,8 +172,8 @@ impl EmbedPlan {
                 junction: Some(EmbedJunction {
                     schema: junction.table.schema.clone(),
                     table: junction.table.name.clone(),
-                    parent_column,
-                    child_column,
+                    parent_columns: junction.source_columns.clone(),
+                    child_columns: junction.target_columns.clone(),
                 }),
                 function: None,
             });
@@ -248,6 +299,18 @@ impl EmbedPlan {
     /// `limit` still bounds the rows scanned, not the rows per parent, so it is
     /// applied to the inner select exactly as the ungrouped form does.
     pub fn children_grouped_sql(&self, limit: Option<i64>, columns: &[String]) -> Result<String> {
+        if self
+            .junction
+            .as_ref()
+            .is_some_and(|j| j.parent_columns.len() > 1)
+        {
+            return Err(Error::EmbeddingError(format!(
+                "embedding \"{}\" this way is not supported: it joins through a junction \
+                 keyed on several columns, and grouping children by key needs a single one",
+                self.foreign_table,
+            )));
+        }
+
         if self.columns.len() > 1 {
             return Err(Error::EmbeddingError(format!(
                 "embedding \"{}\" this way is not supported: it joins on {} columns, and \
@@ -344,8 +407,7 @@ impl EmbedPlan {
                 Some(junction) => {
                     let junction_alias = format!("{}_j", child_alias);
                     format!(
-                        "SELECT {} FROM {}.{} AS {} JOIN {}.{} AS {} ON {}.{} = {}.{} \
-                         WHERE {}.{} = {}.{}",
+                        "SELECT {} FROM {}.{} AS {} JOIN {}.{} AS {} ON {} WHERE {}",
                         inner_select,
                         postrust_sql::escape_ident(&self.foreign_schema),
                         postrust_sql::escape_ident(&self.foreign_table),
@@ -353,14 +415,8 @@ impl EmbedPlan {
                         postrust_sql::escape_ident(&junction.schema),
                         postrust_sql::escape_ident(&junction.table),
                         postrust_sql::escape_ident(&junction_alias),
-                        postrust_sql::escape_ident(&junction_alias),
-                        postrust_sql::escape_ident(&junction.child_column),
-                        postrust_sql::escape_ident(child_alias),
-                        postrust_sql::escape_ident(&self.foreign_column),
-                        postrust_sql::escape_ident(&junction_alias),
-                        postrust_sql::escape_ident(&junction.parent_column),
-                        postrust_sql::escape_ident(parent_alias),
-                        postrust_sql::escape_ident(&self.local_column),
+                        junction.child_join(&junction_alias, child_alias),
+                        junction.parent_correlation(&junction_alias, parent_alias),
                     )
                 }
                 None => format!(
@@ -450,21 +506,15 @@ impl EmbedPlan {
             (None, Some(junction)) => {
                 let junction_alias = format!("{}_j", child_alias);
                 format!(
-                    "{}.{} AS {} JOIN {}.{} AS {} ON {}.{} = {}.{} WHERE {}.{} = {}.{}",
+                    "{}.{} AS {} JOIN {}.{} AS {} ON {} WHERE {}",
                     postrust_sql::escape_ident(&self.foreign_schema),
                     postrust_sql::escape_ident(&self.foreign_table),
                     postrust_sql::escape_ident(child_alias),
                     postrust_sql::escape_ident(&junction.schema),
                     postrust_sql::escape_ident(&junction.table),
                     postrust_sql::escape_ident(&junction_alias),
-                    postrust_sql::escape_ident(&junction_alias),
-                    postrust_sql::escape_ident(&junction.child_column),
-                    postrust_sql::escape_ident(child_alias),
-                    postrust_sql::escape_ident(&self.foreign_column),
-                    postrust_sql::escape_ident(&junction_alias),
-                    postrust_sql::escape_ident(&junction.parent_column),
-                    postrust_sql::escape_ident(parent_alias),
-                    postrust_sql::escape_ident(&self.local_column),
+                    junction.child_join(&junction_alias, child_alias),
+                    junction.parent_correlation(&junction_alias, parent_alias),
                 )
             }
             (None, None) => format!(
@@ -506,22 +556,15 @@ impl EmbedPlan {
                 Some(junction) => {
                     let junction_alias = format!("{}_j", child_alias);
                     format!(
-                        "EXISTS (SELECT 1 FROM {}.{} AS {} JOIN {}.{} AS {} ON {}.{} = {}.{} \
-                         WHERE {}.{} = {}.{}",
+                        "EXISTS (SELECT 1 FROM {}.{} AS {} JOIN {}.{} AS {} ON {} WHERE {}",
                         postrust_sql::escape_ident(&self.foreign_schema),
                         postrust_sql::escape_ident(&self.foreign_table),
                         postrust_sql::escape_ident(child_alias),
                         postrust_sql::escape_ident(&junction.schema),
                         postrust_sql::escape_ident(&junction.table),
                         postrust_sql::escape_ident(&junction_alias),
-                        postrust_sql::escape_ident(&junction_alias),
-                        postrust_sql::escape_ident(&junction.child_column),
-                        postrust_sql::escape_ident(child_alias),
-                        postrust_sql::escape_ident(&self.foreign_column),
-                        postrust_sql::escape_ident(&junction_alias),
-                        postrust_sql::escape_ident(&junction.parent_column),
-                        postrust_sql::escape_ident(parent_alias),
-                        postrust_sql::escape_ident(&self.local_column),
+                        junction.child_join(&junction_alias, child_alias),
+                        junction.parent_correlation(&junction_alias, parent_alias),
                     )
                 }
                 None => format!(
