@@ -686,6 +686,7 @@ fn create_query_type(
                 table_name: field.table_name.clone(),
                 type_name: field.type_name.clone(),
                 max_rows,
+                relationships: Arc::clone(&relationships),
             });
             let mut agg_field = Field::new(
                 crate::schema::aggregate::aggregate_type_name(&field.type_name),
@@ -893,6 +894,7 @@ struct AggregateSpec {
     table_name: String,
     type_name: String,
     max_rows: Option<i64>,
+    relationships: Arc<HashMap<String, Vec<RelationshipField>>>,
 }
 
 /// Resolve an aggregate field.
@@ -913,7 +915,18 @@ async fn resolve_aggregate<'a>(
     let mut bound_values: Vec<serde_json::Value> = Vec::new();
     let mut where_sql = String::new();
     if let Some(filter) = ctx.args.try_get("where").ok().map(|v| accessor_to_json(&v)) {
-        let (sql, values) = build_where_clause(Some(&filter), 1)?;
+        let guard = gql_ctx
+            .schema_cache
+            .get()
+            .await
+            .map_err(|e| async_graphql::Error::new(e.to_string()))?;
+        let cache = guard
+            .as_ref()
+            .ok_or_else(|| async_graphql::Error::new("schema cache is not loaded"))?;
+        let scope =
+            WhereScope::table(&spec.schema_name, &spec.table_name, &spec.type_name)
+                .with_resolution(cache, spec.relationships.as_ref());
+        let (sql, values) = build_where_clause(Some(&filter), 1, &scope)?;
         if !sql.is_empty() {
             where_sql = format!(" {}", sql);
             bound_values = values;
@@ -1120,7 +1133,17 @@ async fn resolve_query<'a>(
         }
         where_sql = format!(" WHERE {}", conditions.join(" AND "));
     } else if let Some(filter) = ctx.args.try_get("where").ok().map(|v| accessor_to_json(&v)) {
-        let (filter_sql, filter_values) = build_where_clause(Some(&filter), 1)?;
+        let guard = gql_ctx
+            .schema_cache
+            .get()
+            .await
+            .map_err(|e| async_graphql::Error::new(e.to_string()))?;
+        let cache = guard
+            .as_ref()
+            .ok_or_else(|| async_graphql::Error::new("schema cache is not loaded"))?;
+        let scope = WhereScope::table(schema_name, table_name, type_name)
+            .with_resolution(cache, relationships);
+        let (filter_sql, filter_values) = build_where_clause(Some(&filter), 1, &scope)?;
         if !filter_sql.is_empty() {
             where_sql = format!(" {}", filter_sql);
             bound_values = filter_values;
@@ -1587,7 +1610,9 @@ async fn execute_update<'a>(
     }
 
     // Build WHERE clause
-    let (where_sql, where_values) = build_where_clause(where_clause.as_ref(), param_idx)?;
+    let scope = WhereScope::table(schema_name, table_name, table_name);
+    let (where_sql, where_values) =
+        build_where_clause(where_clause.as_ref(), param_idx, &scope)?;
 
     // An absent or unrecognised `where` argument yields an empty clause, which
     // would update every row in the table. Refuse instead.
@@ -1656,7 +1681,8 @@ async fn execute_delete<'a>(
     let mut conn = begin_with_role(pool, role).await?;
 
     // Build WHERE clause
-    let (where_sql, where_values) = build_where_clause(where_clause.as_ref(), 1)?;
+    let scope = WhereScope::table(schema_name, table_name, table_name);
+    let (where_sql, where_values) = build_where_clause(where_clause.as_ref(), 1, &scope)?;
 
     // An absent or unrecognised `where` argument yields an empty clause, which
     // would delete every row in the table. Refuse instead.
@@ -1716,12 +1742,14 @@ async fn execute_delete<'a>(
 fn build_where_clause(
     where_value: Option<&serde_json::Value>,
     start_param_idx: usize,
+    scope: &WhereScope<'_>,
 ) -> Result<(String, Vec<serde_json::Value>), async_graphql::Error> {
     let mut values: Vec<serde_json::Value> = Vec::new();
     let mut param_idx = start_param_idx;
+    let mut alias_counter = 0usize;
 
     let condition = match where_value {
-        Some(value) => build_condition(value, &mut param_idx, &mut values)?,
+        Some(value) => build_condition(value, scope, &mut param_idx, &mut values, &mut alias_counter)?,
         None => None,
     };
 
@@ -1731,11 +1759,91 @@ fn build_where_clause(
     })
 }
 
+/// The table a boolean expression is being read against.
+///
+/// Column references are qualified with `sql_ref` so that a predicate over a
+/// relationship -- which becomes a correlated `EXISTS` against another table --
+/// can tell the two apart. Without the qualification a child column sharing a
+/// parent column's name would silently resolve to whichever PostgreSQL
+/// preferred.
+///
+/// `resolution` is absent where a caller has no schema cache to hand, which is
+/// how the mutation paths are called. A relationship predicate then reports
+/// that it cannot be resolved rather than being read as a column.
+pub struct WhereScope<'a> {
+    /// How to refer to this table's columns in SQL.
+    sql_ref: String,
+    /// The GraphQL type name, which is the key into the relationship map.
+    type_name: String,
+    resolution: Option<WhereResolution<'a>>,
+}
+
+/// What a scope needs to follow a relationship.
+struct WhereResolution<'a> {
+    cache: &'a SchemaCache,
+    relationships: &'a HashMap<String, Vec<RelationshipField>>,
+}
+
+impl<'a> WhereScope<'a> {
+    /// A scope over a table addressed by its qualified name.
+    pub fn table(schema: &str, table: &str, type_name: &str) -> Self {
+        Self {
+            sql_ref: format!(
+                "{}.{}",
+                postrust_sql::escape_ident(schema),
+                postrust_sql::escape_ident(table)
+            ),
+            type_name: type_name.to_string(),
+            resolution: None,
+        }
+    }
+
+    /// The same, able to follow relationships.
+    fn with_resolution(
+        mut self,
+        cache: &'a SchemaCache,
+        relationships: &'a HashMap<String, Vec<RelationshipField>>,
+    ) -> Self {
+        self.resolution = Some(WhereResolution {
+            cache,
+            relationships,
+        });
+        self
+    }
+
+    /// A scope over an aliased table, for the inside of an `EXISTS`.
+    fn aliased(alias: &str, type_name: &str, from: &WhereScope<'a>) -> Self {
+        Self {
+            sql_ref: postrust_sql::escape_ident(alias),
+            type_name: type_name.to_string(),
+            resolution: from.resolution.as_ref().map(|r| WhereResolution {
+                cache: r.cache,
+                relationships: r.relationships,
+            }),
+        }
+    }
+
+    fn column(&self, name: &str) -> String {
+        format!("{}.{}", self.sql_ref, postrust_sql::escape_ident(name))
+    }
+
+    fn relationship(&self, name: &str) -> Option<&'a RelationshipField> {
+        self.resolution
+            .as_ref()?
+            .relationships
+            .get(&self.type_name)?
+            .iter()
+            .find(|r| r.name == name)
+    }
+}
+
 /// One boolean expression, as SQL. `None` where it constrains nothing.
 fn build_condition(
     value: &serde_json::Value,
+    scope: &WhereScope<'_>,
     param_idx: &mut usize,
     values: &mut Vec<serde_json::Value>,
+    alias_counter: &mut usize,
 ) -> Result<Option<String>, async_graphql::Error> {
     let serde_json::Value::Object(map) = value else {
         return Ok(None);
@@ -1754,7 +1862,9 @@ fn build_condition(
                 })?;
                 let mut parts = Vec::new();
                 for member in members {
-                    if let Some(sql) = build_condition(member, param_idx, values)? {
+                    if let Some(sql) =
+                        build_condition(member, scope, param_idx, values, alias_counter)?
+                    {
                         parts.push(sql);
                     }
                 }
@@ -1768,12 +1878,28 @@ fn build_condition(
                 conditions.push(format!("({})", parts.join(joiner)));
             }
             "_not" => {
-                if let Some(sql) = build_condition(val, param_idx, values)? {
+                if let Some(sql) = build_condition(val, scope, param_idx, values, alias_counter)? {
                     conditions.push(format!("NOT ({})", sql));
                 }
             }
+            // A relationship is filtered by filtering the rows at its other
+            // end. `where: {articles: {title: {_eq: "x"}}}` keeps the authors
+            // that have such an article -- an `EXISTS` correlated back to the
+            // parent row, which is also what it means for a to-one
+            // relationship, where the subquery simply cannot match twice.
+            name if scope.relationship(name).is_some() => {
+                let relationship = scope.relationship(name).expect("just checked");
+                conditions.push(exists_sql(
+                    relationship,
+                    val,
+                    scope,
+                    param_idx,
+                    values,
+                    alias_counter,
+                )?);
+            }
             column => {
-                let quoted = postrust_sql::escape_ident(column);
+                let quoted = scope.column(column);
                 match val {
                     serde_json::Value::Object(ops) => {
                         for (op, operand) in ops {
@@ -1802,6 +1928,70 @@ fn build_condition(
     } else {
         Some(conditions.join(" AND "))
     })
+}
+
+/// A predicate over a relationship, as a correlated `EXISTS`.
+///
+/// Only a plain key join is expressible this way. A many-to-many through a
+/// junction and a computed relationship both need more than a pair of columns
+/// to correlate on, and saying so is the only honest answer -- reading the
+/// predicate as though it constrained nothing would return every parent row.
+fn exists_sql(
+    relationship: &RelationshipField,
+    child_expression: &serde_json::Value,
+    scope: &WhereScope<'_>,
+    param_idx: &mut usize,
+    values: &mut Vec<serde_json::Value>,
+    alias_counter: &mut usize,
+) -> Result<String, async_graphql::Error> {
+    let cache = scope
+        .resolution
+        .as_ref()
+        .map(|r| r.cache)
+        .ok_or_else(|| {
+            async_graphql::Error::new(format!(
+                "filtering on the relationship \"{}\" is not available here",
+                relationship.name
+            ))
+        })?;
+
+    let plan = postrust_core::embed::EmbedPlan::resolve(&relationship.relationship, cache)
+        .map_err(|e| async_graphql::Error::new(e.to_string()))?;
+
+    if plan.junction.is_some() || plan.function.is_some() || plan.columns.is_empty() {
+        return Err(async_graphql::Error::new(format!(
+            "filtering on \"{}\" is not supported: it is reached through a junction \
+             or a function rather than by a key",
+            relationship.name
+        )));
+    }
+
+    *alias_counter += 1;
+    let alias = format!("pgrst_rel_{}", alias_counter);
+    let child_scope = WhereScope::aliased(&alias, &relationship.target_type, scope);
+
+    let mut correlation = Vec::with_capacity(plan.columns.len());
+    for (parent_column, child_column) in &plan.columns {
+        correlation.push(format!(
+            "{} = {}",
+            scope.column(parent_column),
+            child_scope.column(child_column)
+        ));
+    }
+
+    let child_condition =
+        build_condition(child_expression, &child_scope, param_idx, values, alias_counter)?;
+    if let Some(sql) = child_condition {
+        correlation.push(format!("({})", sql));
+    }
+
+    Ok(format!(
+        "EXISTS (SELECT 1 FROM {}.{} AS {} WHERE {})",
+        postrust_sql::escape_ident(&plan.foreign_schema),
+        postrust_sql::escape_ident(&plan.foreign_table),
+        postrust_sql::escape_ident(&alias),
+        correlation.join(" AND ")
+    ))
 }
 
 /// One comparison against one column.
