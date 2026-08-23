@@ -97,7 +97,7 @@ impl UpdateField {
 pub struct InsertInput {
     /// Table being inserted into
     pub table_name: String,
-    /// GraphQL type name (e.g., "UsersInsertInput")
+    /// GraphQL type name (e.g., "users_insert_input")
     pub type_name: String,
     /// Fields that can be inserted
     pub fields: Vec<InsertField>,
@@ -106,7 +106,7 @@ pub struct InsertInput {
 impl InsertInput {
     /// Create an InsertInput from a table.
     pub fn from_table(table: &Table) -> Self {
-        let type_name = format!("{}InsertInput", to_pascal_case(&table.name));
+        let type_name = format!("{}_insert_input", table.name);
 
         let fields = table
             .columns
@@ -142,7 +142,7 @@ impl InsertInput {
 pub struct UpdateInput {
     /// Table being updated
     pub table_name: String,
-    /// GraphQL type name (e.g., "UsersSetInput")
+    /// GraphQL type name (e.g., "users_set_input")
     pub type_name: String,
     /// Fields that can be updated
     pub fields: Vec<UpdateField>,
@@ -151,7 +151,7 @@ pub struct UpdateInput {
 impl UpdateInput {
     /// Create an UpdateInput from a table.
     pub fn from_table(table: &Table) -> Self {
-        let type_name = format!("{}SetInput", to_pascal_case(&table.name));
+        let type_name = format!("{}_set_input", table.name);
 
         let fields = table
             .columns
@@ -244,19 +244,6 @@ impl InputValue {
             Self::Array(a) => serde_json::to_string(a).unwrap_or_default(),
         }
     }
-}
-
-/// Helper to convert snake_case to PascalCase.
-fn to_pascal_case(s: &str) -> String {
-    s.split('_')
-        .map(|word| {
-            let mut chars = word.chars();
-            match chars.next() {
-                Some(first) => first.to_uppercase().collect::<String>() + chars.as_str(),
-                None => String::new(),
-            }
-        })
-        .collect()
 }
 
 /// Check if a table is insertable based on its permissions.
@@ -454,7 +441,7 @@ mod tests {
         let input = InsertInput::from_table(&table);
 
         assert_eq!(input.table_name, "users");
-        assert_eq!(input.type_name, "UsersInsertInput");
+        assert_eq!(input.type_name, "users_insert_input");
         assert_eq!(input.fields.len(), 4);
     }
 
@@ -495,7 +482,7 @@ mod tests {
         let input = UpdateInput::from_table(&table);
 
         assert_eq!(input.table_name, "users");
-        assert_eq!(input.type_name, "UsersSetInput");
+        assert_eq!(input.type_name, "users_set_input");
         assert_eq!(input.fields.len(), 3); // Excludes PK
     }
 
@@ -595,10 +582,4 @@ mod tests {
     // PascalCase Tests
     // ============================================================================
 
-    #[test]
-    fn test_to_pascal_case() {
-        assert_eq!(to_pascal_case("users"), "Users");
-        assert_eq!(to_pascal_case("user_accounts"), "UserAccounts");
-        assert_eq!(to_pascal_case("my_table_name"), "MyTableName");
-    }
 }

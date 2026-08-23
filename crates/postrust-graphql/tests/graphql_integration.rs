@@ -810,10 +810,7 @@ async fn same_table_name_in_two_schemas_gets_distinct_fields() {
 
     // Both tables must be reachable: the default schema keeps the bare name,
     // the other is prefixed with its schema.
-    let other_field = format!(
-        "{}Widgets",
-        postrust_graphql::schema::object::to_camel_case(&other_schema)
-    );
+    let other_field = format!("{}_widgets", other_schema);
     let sdl = state.schema.sdl();
     assert!(
         sdl.contains("widgets"),

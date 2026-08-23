@@ -67,7 +67,12 @@ impl TableObjectType {
 
     /// Create a GraphQL ObjectType using an explicit base name.
     pub fn from_table_named(table: &Table, base_name: &str) -> Self {
-        let name = to_pascal_case(base_name);
+        // Named exactly like the table. A GraphQL type is conventionally
+        // PascalCase, but the schema a Hasura client was generated against
+        // spells this `author`, and a client cannot be told otherwise: the
+        // type name is in its generated types, its fragments and its cache
+        // keys.
+        let name = base_name.to_string();
         let fields = table
             .columns
             .values()
@@ -109,29 +114,6 @@ impl TableObjectType {
     /// Get primary key fields.
     pub fn pk_fields(&self) -> Vec<&GraphQLField> {
         self.fields.iter().filter(|f| f.is_pk).collect()
-    }
-}
-
-/// Convert a snake_case string to PascalCase.
-pub fn to_pascal_case(s: &str) -> String {
-    s.split('_')
-        .map(|word| {
-            let mut chars = word.chars();
-            match chars.next() {
-                Some(first) => first.to_uppercase().collect::<String>() + chars.as_str(),
-                None => String::new(),
-            }
-        })
-        .collect()
-}
-
-/// Convert a snake_case string to camelCase.
-pub fn to_camel_case(s: &str) -> String {
-    let pascal = to_pascal_case(s);
-    let mut chars = pascal.chars();
-    match chars.next() {
-        Some(first) => first.to_lowercase().collect::<String>() + chars.as_str(),
-        None => String::new(),
     }
 }
 
@@ -224,26 +206,11 @@ mod tests {
     }
 
     #[test]
-    fn test_to_pascal_case() {
-        assert_eq!(to_pascal_case("users"), "Users");
-        assert_eq!(to_pascal_case("user_accounts"), "UserAccounts");
-        assert_eq!(to_pascal_case("my_table_name"), "MyTableName");
-        assert_eq!(to_pascal_case(""), "");
-    }
-
-    #[test]
-    fn test_to_camel_case() {
-        assert_eq!(to_camel_case("user_id"), "userId");
-        assert_eq!(to_camel_case("my_field"), "myField");
-        assert_eq!(to_camel_case("name"), "name");
-    }
-
-    #[test]
     fn test_table_to_graphql_object_name() {
         let table = create_test_table();
         let obj = TableObjectType::from_table(&table);
 
-        assert_eq!(obj.name(), "Users"); // PascalCase
+        assert_eq!(obj.name(), "users"); // named exactly like the table
     }
 
     #[test]
@@ -337,6 +304,6 @@ mod tests {
         table.name = "user_accounts".into();
 
         let obj = TableObjectType::from_table(&table);
-        assert_eq!(obj.name(), "UserAccounts");
+        assert_eq!(obj.name(), "user_accounts");
     }
 }

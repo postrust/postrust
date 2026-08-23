@@ -7,7 +7,7 @@ pub mod object;
 pub mod relationship;
 
 use crate::input::mutation::{is_deletable, is_insertable, is_updatable};
-use crate::schema::object::{to_camel_case, to_pascal_case, TableObjectType};
+use crate::schema::object::TableObjectType;
 use crate::schema::relationship::RelationshipField;
 use postrust_core::schema_cache::{SchemaCache, Table};
 use std::collections::HashMap;
@@ -21,12 +21,6 @@ pub struct SchemaConfig {
     pub enable_mutations: bool,
     /// Whether to generate subscription types
     pub enable_subscriptions: bool,
-    /// Prefix for query fields (e.g., "all" -> "allUsers")
-    pub query_prefix: Option<String>,
-    /// Suffix for query fields (e.g., "Collection" -> "usersCollection")
-    pub query_suffix: Option<String>,
-    /// Whether to use camelCase for field names
-    pub use_camel_case: bool,
     /// Ceiling on rows a single query may return (`PGRST_MAX_ROWS`).
     ///
     /// Applied when a query supplies no `limit` of its own, and as an upper
@@ -40,9 +34,6 @@ impl Default for SchemaConfig {
             exposed_schemas: vec!["public".to_string()],
             enable_mutations: true,
             enable_subscriptions: false,
-            query_prefix: None,
-            query_suffix: None,
-            use_camel_case: true,
             max_rows: None,
         }
     }
@@ -204,27 +195,14 @@ pub struct QueryField {
 
 impl QueryField {
     /// Create a list query field (e.g., users), named after the table.
-    pub fn list(table: &Table, config: &SchemaConfig) -> Self {
-        Self::list_named(table, config, &table.name)
+    pub fn list(table: &Table) -> Self {
+        Self::list_named(table, &table.name)
     }
 
     /// Create a list query field using an explicit base name.
-    pub fn list_named(table: &Table, config: &SchemaConfig, base_name: &str) -> Self {
-        let type_name = to_pascal_case(base_name);
-        let field_name = if config.use_camel_case {
-            to_camel_case(base_name)
-        } else {
-            base_name.to_string()
-        };
-
-        let name = match (&config.query_prefix, &config.query_suffix) {
-            (Some(prefix), None) => format!("{}{}", prefix, to_pascal_case(&field_name)),
-            (None, Some(suffix)) => format!("{}{}", field_name, suffix),
-            (Some(prefix), Some(suffix)) => {
-                format!("{}{}{}", prefix, to_pascal_case(&field_name), suffix)
-            }
-            (None, None) => field_name,
-        };
+    pub fn list_named(table: &Table, base_name: &str) -> Self {
+        let type_name = base_name.to_string();
+        let name = base_name.to_string();
 
         Self {
             name,
@@ -240,23 +218,18 @@ impl QueryField {
     }
 
     /// Create a by-PK query field (e.g., userByPk), named after the table.
-    pub fn by_pk(table: &Table, config: &SchemaConfig) -> Option<Self> {
-        Self::by_pk_named(table, config, &table.name)
+    pub fn by_pk(table: &Table) -> Option<Self> {
+        Self::by_pk_named(table, &table.name)
     }
 
     /// Create a by-PK query field using an explicit base name.
-    pub fn by_pk_named(table: &Table, config: &SchemaConfig, base_name: &str) -> Option<Self> {
+    pub fn by_pk_named(table: &Table, base_name: &str) -> Option<Self> {
         if table.pk_cols.is_empty() {
             return None;
         }
 
-        let type_name = to_pascal_case(base_name);
-        let singular = singularize(base_name);
-        let field_name = if config.use_camel_case {
-            format!("{}ByPk", to_camel_case(&singular))
-        } else {
-            format!("{}_by_pk", singular)
-        };
+        let type_name = base_name.to_string();
+        let field_name = format!("{}_by_pk", base_name);
 
         // Carry the key columns and their types so the resolver can filter on
         // the real primary key.
@@ -271,7 +244,7 @@ impl QueryField {
             is_list: false,
             is_by_pk: true,
             pk_columns,
-            description: Some(format!("Get a single {} by primary key", singular)),
+            description: Some(format!("Get a single {} by primary key", base_name)),
         })
     }
 }
@@ -317,28 +290,23 @@ pub enum MutationType {
 
 impl MutationField {
     /// Create insert mutation fields for a table.
-    pub fn insert_fields(table: &Table, config: &SchemaConfig) -> Vec<Self> {
-        Self::insert_fields_named(table, config, &table.name)
+    pub fn insert_fields(table: &Table) -> Vec<Self> {
+        Self::insert_fields_named(table, &table.name)
     }
 
     /// As [`Self::insert_fields`], with an explicit base name for the generated
     /// field and type names.
-    pub fn insert_fields_named(table: &Table, config: &SchemaConfig, base_name: &str) -> Vec<Self> {
+    pub fn insert_fields_named(table: &Table, base_name: &str) -> Vec<Self> {
         if !is_insertable(table) {
             return vec![];
         }
 
-        let type_name = to_pascal_case(base_name);
-        let singular = singularize(base_name);
+        let type_name = base_name.to_string();
 
         let mut fields = vec![];
 
         // insert_users (batch insert)
-        let name = if config.use_camel_case {
-            format!("insert{}", to_pascal_case(base_name))
-        } else {
-            format!("insert_{}", base_name)
-        };
+        let name = format!("insert_{}", base_name);
         fields.push(Self {
             name,
             table_name: table.name.clone(),
@@ -350,11 +318,7 @@ impl MutationField {
         });
 
         // insert_user_one (single insert)
-        let name = if config.use_camel_case {
-            format!("insert{}One", to_pascal_case(&singular))
-        } else {
-            format!("insert_{}_one", singular)
-        };
+        let name = format!("insert_{}_one", base_name);
         fields.push(Self {
             name,
             table_name: table.name.clone(),
@@ -362,35 +326,30 @@ impl MutationField {
             mutation_type: MutationType::InsertOne,
             pk_columns: Vec::new(),
             return_type: type_name.clone(),
-            description: Some(format!("Insert a single {} record", singular)),
+            description: Some(format!("Insert a single {} record", base_name)),
         });
 
         fields
     }
 
     /// Create update mutation fields for a table.
-    pub fn update_fields(table: &Table, config: &SchemaConfig) -> Vec<Self> {
-        Self::update_fields_named(table, config, &table.name)
+    pub fn update_fields(table: &Table) -> Vec<Self> {
+        Self::update_fields_named(table, &table.name)
     }
 
     /// As [`Self::update_fields`], with an explicit base name for the generated
     /// field and type names.
-    pub fn update_fields_named(table: &Table, config: &SchemaConfig, base_name: &str) -> Vec<Self> {
+    pub fn update_fields_named(table: &Table, base_name: &str) -> Vec<Self> {
         if !is_updatable(table) {
             return vec![];
         }
 
-        let type_name = to_pascal_case(base_name);
-        let singular = singularize(base_name);
+        let type_name = base_name.to_string();
 
         let mut fields = vec![];
 
         // update_users (batch update)
-        let name = if config.use_camel_case {
-            format!("update{}", to_pascal_case(base_name))
-        } else {
-            format!("update_{}", base_name)
-        };
+        let name = format!("update_{}", base_name);
         fields.push(Self {
             name,
             table_name: table.name.clone(),
@@ -403,11 +362,7 @@ impl MutationField {
 
         // update_user_by_pk (single update by PK)
         if !table.pk_cols.is_empty() {
-            let name = if config.use_camel_case {
-                format!("update{}ByPk", to_pascal_case(&singular))
-            } else {
-                format!("update_{}_by_pk", singular)
-            };
+            let name = format!("update_{}_by_pk", base_name);
             fields.push(Self {
                 name,
                 table_name: table.name.clone(),
@@ -415,7 +370,7 @@ impl MutationField {
                 mutation_type: MutationType::UpdateByPk,
                 pk_columns: pk_columns_of(table),
                 return_type: type_name,
-                description: Some(format!("Update a single {} by primary key", singular)),
+                description: Some(format!("Update a single {} by primary key", base_name)),
             });
         }
 
@@ -423,28 +378,23 @@ impl MutationField {
     }
 
     /// Create delete mutation fields for a table.
-    pub fn delete_fields(table: &Table, config: &SchemaConfig) -> Vec<Self> {
-        Self::delete_fields_named(table, config, &table.name)
+    pub fn delete_fields(table: &Table) -> Vec<Self> {
+        Self::delete_fields_named(table, &table.name)
     }
 
     /// As [`Self::delete_fields`], with an explicit base name for the generated
     /// field and type names.
-    pub fn delete_fields_named(table: &Table, config: &SchemaConfig, base_name: &str) -> Vec<Self> {
+    pub fn delete_fields_named(table: &Table, base_name: &str) -> Vec<Self> {
         if !is_deletable(table) {
             return vec![];
         }
 
-        let type_name = to_pascal_case(base_name);
-        let singular = singularize(base_name);
+        let type_name = base_name.to_string();
 
         let mut fields = vec![];
 
         // delete_users (batch delete)
-        let name = if config.use_camel_case {
-            format!("delete{}", to_pascal_case(base_name))
-        } else {
-            format!("delete_{}", base_name)
-        };
+        let name = format!("delete_{}", base_name);
         fields.push(Self {
             name,
             table_name: table.name.clone(),
@@ -457,11 +407,7 @@ impl MutationField {
 
         // delete_user_by_pk (single delete by PK)
         if !table.pk_cols.is_empty() {
-            let name = if config.use_camel_case {
-                format!("delete{}ByPk", to_pascal_case(&singular))
-            } else {
-                format!("delete_{}_by_pk", singular)
-            };
+            let name = format!("delete_{}_by_pk", base_name);
             fields.push(Self {
                 name,
                 table_name: table.name.clone(),
@@ -469,7 +415,7 @@ impl MutationField {
                 mutation_type: MutationType::DeleteByPk,
                 pk_columns: pk_columns_of(table),
                 return_type: type_name,
-                description: Some(format!("Delete a single {} by primary key", singular)),
+                description: Some(format!("Delete a single {} by primary key", base_name)),
             });
         }
 
@@ -540,22 +486,16 @@ pub fn build_schema(schema_cache: &SchemaCache, config: &SchemaConfig) -> Genera
         let type_name = obj_type.name.clone();
 
         // Add query fields
-        query_fields.push(QueryField::list_named(table, config, &base_name));
-        if let Some(by_pk) = QueryField::by_pk_named(table, config, &base_name) {
+        query_fields.push(QueryField::list_named(table, &base_name));
+        if let Some(by_pk) = QueryField::by_pk_named(table, &base_name) {
             query_fields.push(by_pk);
         }
 
         // Add mutation fields if enabled
         if config.enable_mutations {
-            mutation_fields.extend(MutationField::insert_fields_named(
-                table, config, &base_name,
-            ));
-            mutation_fields.extend(MutationField::update_fields_named(
-                table, config, &base_name,
-            ));
-            mutation_fields.extend(MutationField::delete_fields_named(
-                table, config, &base_name,
-            ));
+            mutation_fields.extend(MutationField::insert_fields_named(table, &base_name));
+            mutation_fields.extend(MutationField::update_fields_named(table, &base_name));
+            mutation_fields.extend(MutationField::delete_fields_named(table, &base_name));
         }
 
         // Add relationship fields
@@ -588,20 +528,6 @@ pub fn build_schema(schema_cache: &SchemaCache, config: &SchemaConfig) -> Genera
         query_fields,
         mutation_fields,
         relationship_fields,
-    }
-}
-
-/// Simple singularization for field names.
-fn singularize(s: &str) -> String {
-    if let Some(stem) = s.strip_suffix("ies") {
-        format!("{}y", stem)
-    } else if s.ends_with("ses") || s.ends_with("xes") || s.ends_with("ches") || s.ends_with("shes")
-    {
-        s.strip_suffix("es").unwrap_or(s).to_string()
-    } else if s.ends_with('s') && !s.ends_with("ss") {
-        s.strip_suffix('s').unwrap_or(s).to_string()
-    } else {
-        s.to_string()
     }
 }
 
@@ -721,47 +647,21 @@ mod tests {
     #[test]
     fn test_query_field_list() {
         let table = create_test_table("users", true, true, true);
-        let config = SchemaConfig::default();
-        let field = QueryField::list(&table, &config);
+        let field = QueryField::list(&table);
 
         assert_eq!(field.name, "users");
-        assert_eq!(field.return_type, "[Users!]!");
+        assert_eq!(field.return_type, "[users!]!");
         assert!(field.is_list);
         assert!(!field.is_by_pk);
     }
 
     #[test]
-    fn test_query_field_list_with_prefix() {
-        let table = create_test_table("users", true, true, true);
-        let config = SchemaConfig {
-            query_prefix: Some("all".to_string()),
-            ..Default::default()
-        };
-        let field = QueryField::list(&table, &config);
-
-        assert_eq!(field.name, "allUsers");
-    }
-
-    #[test]
-    fn test_query_field_list_with_suffix() {
-        let table = create_test_table("users", true, true, true);
-        let config = SchemaConfig {
-            query_suffix: Some("Collection".to_string()),
-            ..Default::default()
-        };
-        let field = QueryField::list(&table, &config);
-
-        assert_eq!(field.name, "usersCollection");
-    }
-
-    #[test]
     fn test_query_field_by_pk() {
         let table = create_test_table("users", true, true, true);
-        let config = SchemaConfig::default();
-        let field = QueryField::by_pk(&table, &config).unwrap();
+        let field = QueryField::by_pk(&table).unwrap();
 
-        assert_eq!(field.name, "userByPk");
-        assert_eq!(field.return_type, "Users");
+        assert_eq!(field.name, "users_by_pk");
+        assert_eq!(field.return_type, "users");
         assert!(!field.is_list);
         assert!(field.is_by_pk);
     }
@@ -770,8 +670,7 @@ mod tests {
     fn test_query_field_by_pk_no_pk() {
         let mut table = create_test_table("users", true, true, true);
         table.pk_cols = vec![];
-        let config = SchemaConfig::default();
-        let field = QueryField::by_pk(&table, &config);
+        let field = QueryField::by_pk(&table);
 
         assert!(field.is_none());
     }
@@ -783,21 +682,19 @@ mod tests {
     #[test]
     fn test_mutation_field_insert() {
         let table = create_test_table("users", true, true, true);
-        let config = SchemaConfig::default();
-        let fields = MutationField::insert_fields(&table, &config);
+        let fields = MutationField::insert_fields(&table);
 
         assert_eq!(fields.len(), 2);
-        assert_eq!(fields[0].name, "insertUsers");
+        assert_eq!(fields[0].name, "insert_users");
         assert_eq!(fields[0].mutation_type, MutationType::Insert);
-        assert_eq!(fields[1].name, "insertUserOne");
+        assert_eq!(fields[1].name, "insert_users_one");
         assert_eq!(fields[1].mutation_type, MutationType::InsertOne);
     }
 
     #[test]
     fn test_mutation_field_insert_not_insertable() {
         let table = create_test_table("users", false, true, true);
-        let config = SchemaConfig::default();
-        let fields = MutationField::insert_fields(&table, &config);
+        let fields = MutationField::insert_fields(&table);
 
         assert!(fields.is_empty());
     }
@@ -805,21 +702,19 @@ mod tests {
     #[test]
     fn test_mutation_field_update() {
         let table = create_test_table("users", true, true, true);
-        let config = SchemaConfig::default();
-        let fields = MutationField::update_fields(&table, &config);
+        let fields = MutationField::update_fields(&table);
 
         assert_eq!(fields.len(), 2);
-        assert_eq!(fields[0].name, "updateUsers");
+        assert_eq!(fields[0].name, "update_users");
         assert_eq!(fields[0].mutation_type, MutationType::Update);
-        assert_eq!(fields[1].name, "updateUserByPk");
+        assert_eq!(fields[1].name, "update_users_by_pk");
         assert_eq!(fields[1].mutation_type, MutationType::UpdateByPk);
     }
 
     #[test]
     fn test_mutation_field_update_not_updatable() {
         let table = create_test_table("users", true, false, true);
-        let config = SchemaConfig::default();
-        let fields = MutationField::update_fields(&table, &config);
+        let fields = MutationField::update_fields(&table);
 
         assert!(fields.is_empty());
     }
@@ -827,21 +722,19 @@ mod tests {
     #[test]
     fn test_mutation_field_delete() {
         let table = create_test_table("users", true, true, true);
-        let config = SchemaConfig::default();
-        let fields = MutationField::delete_fields(&table, &config);
+        let fields = MutationField::delete_fields(&table);
 
         assert_eq!(fields.len(), 2);
-        assert_eq!(fields[0].name, "deleteUsers");
+        assert_eq!(fields[0].name, "delete_users");
         assert_eq!(fields[0].mutation_type, MutationType::Delete);
-        assert_eq!(fields[1].name, "deleteUserByPk");
+        assert_eq!(fields[1].name, "delete_users_by_pk");
         assert_eq!(fields[1].mutation_type, MutationType::DeleteByPk);
     }
 
     #[test]
     fn test_mutation_field_delete_not_deletable() {
         let table = create_test_table("users", true, true, false);
-        let config = SchemaConfig::default();
-        let fields = MutationField::delete_fields(&table, &config);
+        let fields = MutationField::delete_fields(&table);
 
         assert!(fields.is_empty());
     }
@@ -849,16 +742,6 @@ mod tests {
     // ============================================================================
     // Singularize Tests
     // ============================================================================
-
-    #[test]
-    fn test_singularize() {
-        assert_eq!(singularize("users"), "user");
-        assert_eq!(singularize("posts"), "post");
-        assert_eq!(singularize("categories"), "category");
-        assert_eq!(singularize("boxes"), "box");
-        assert_eq!(singularize("matches"), "match");
-        assert_eq!(singularize("class"), "class");
-    }
 
     // ============================================================================
     // Build Schema Tests
@@ -871,9 +754,9 @@ mod tests {
         let schema = build_schema(&cache, &config);
 
         assert_eq!(schema.object_types.len(), 3);
-        assert!(schema.get_object_type("Users").is_some());
-        assert!(schema.get_object_type("Posts").is_some());
-        assert!(schema.get_object_type("Comments").is_some());
+        assert!(schema.get_object_type("users").is_some());
+        assert!(schema.get_object_type("posts").is_some());
+        assert!(schema.get_object_type("comments").is_some());
     }
 
     #[test]
@@ -937,9 +820,9 @@ mod tests {
 
         let names = schema.type_names();
         assert_eq!(names.len(), 3);
-        assert!(names.contains(&"Users"));
-        assert!(names.contains(&"Posts"));
-        assert!(names.contains(&"Comments"));
+        assert!(names.contains(&"users"));
+        assert!(names.contains(&"posts"));
+        assert!(names.contains(&"comments"));
     }
 
     #[test]
@@ -982,7 +865,7 @@ mod tests {
         let config = SchemaConfig::default();
         let schema = build_schema(&cache, &config);
 
-        let users = schema.get_object_type("Users").unwrap();
+        let users = schema.get_object_type("users").unwrap();
         assert_eq!(users.table.name, "users");
     }
 
@@ -1004,6 +887,6 @@ mod tests {
 
         let fields = schema.get_mutation_fields("comments");
         // comments is only insertable
-        assert_eq!(fields.len(), 2); // insertComments + insertCommentOne
+        assert_eq!(fields.len(), 2); // insert_comments + insert_comments_one
     }
 }

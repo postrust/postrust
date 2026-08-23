@@ -1,6 +1,5 @@
 //! Relationship to GraphQL field conversion.
 
-use crate::schema::object::to_pascal_case;
 use postrust_core::schema_cache::Relationship;
 
 /// Extract constraint name from a Relationship.
@@ -51,7 +50,7 @@ impl RelationshipField {
             singularize(target_base_name)
         };
 
-        let target_type = to_pascal_case(target_base_name);
+        let target_type = target_base_name.to_string();
 
         let description = Some(format!(
             "Related {} via {}",
@@ -197,7 +196,7 @@ mod tests {
         let field = RelationshipField::from_relationship(&rel);
 
         assert_eq!(field.name, "user"); // Singular for M2O
-        assert_eq!(field.target_type, "Users");
+        assert_eq!(field.target_type, "users");
         assert!(!field.is_list); // Returns single object
     }
 
@@ -207,7 +206,7 @@ mod tests {
         let field = RelationshipField::from_relationship(&rel);
 
         assert_eq!(field.name, "orders"); // Plural for O2M
-        assert_eq!(field.target_type, "Orders");
+        assert_eq!(field.target_type, "orders");
         assert!(field.is_list); // Returns list
     }
 
@@ -217,7 +216,7 @@ mod tests {
         let field = RelationshipField::from_relationship(&rel);
 
         assert_eq!(field.name, "user_profile"); // Singular for O2O
-        assert_eq!(field.target_type, "UserProfiles");
+        assert_eq!(field.target_type, "user_profiles");
         assert!(!field.is_list); // Returns single object
     }
 
@@ -226,7 +225,7 @@ mod tests {
         let rel = create_o2m_relationship();
         let field = RelationshipField::from_relationship(&rel);
 
-        assert_eq!(field.type_string(), "[Orders!]!");
+        assert_eq!(field.type_string(), "[orders!]!");
     }
 
     #[test]
@@ -234,7 +233,7 @@ mod tests {
         let rel = create_m2o_relationship();
         let field = RelationshipField::from_relationship(&rel);
 
-        assert_eq!(field.type_string(), "Users");
+        assert_eq!(field.type_string(), "users");
     }
 
     #[test]
@@ -282,7 +281,7 @@ mod tests {
         let field = RelationshipField::from_relationship(&rel);
 
         assert_eq!(field.name, "tags"); // Plural for M2M
-        assert_eq!(field.target_type, "Tags");
+        assert_eq!(field.target_type, "tags");
         assert!(field.is_list);
     }
 }
