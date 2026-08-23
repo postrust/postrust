@@ -496,6 +496,10 @@ pub async fn load_routines(pool: &PgPool, schemas: &[String]) -> Result<RoutineM
             pg_catalog.obj_description(p.oid) as description,
             p.provolatile::text as volatility,
             p.provariadic <> 0 as has_variadic,
+            EXISTS (
+                SELECT 1 FROM unnest(COALESCE(p.proargmodes, '{}'::"char"[])) AS mode
+                 WHERE mode IN ('o', 't', 'b')
+            ) as has_out_params,
             p.prokind = 'p' as is_procedure,
             pg_get_function_identity_arguments(p.oid) as args,
             -- Input parameters, in declaration order. Built from the catalog
@@ -558,8 +562,14 @@ pub async fn load_routines(pool: &PgPool, schemas: &[String]) -> Result<RoutineM
         // is pseudo too but renders as a function-named null column, so it
         // counts as non-composite.
         let ret_typtype: Option<String> = row.get("ret_typtype");
+        // A named row type always expands. `record` expands only when the
+        // function declares its columns as `OUT` parameters or a `RETURNS
+        // TABLE` -- a bare `RETURNS record` has none, and PostgreSQL refuses
+        // to put one in a `FROM` clause without being told what they are.
+        let has_out_params: bool = row.get("has_out_params");
         let returns_composite = !matches!(return_type, RetType::Void)
-            && matches!(ret_typtype.as_deref(), Some("c") | Some("p"));
+            && (ret_typtype.as_deref() == Some("c")
+                || (ret_typtype.as_deref() == Some("p") && has_out_params));
 
         let routine = Routine {
             schema,

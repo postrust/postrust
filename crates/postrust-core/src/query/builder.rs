@@ -771,20 +771,28 @@ impl QueryBuilder {
         // A composite return -- OUT parameters, `RETURNS TABLE`, a row type --
         // already expands to its own columns, and wrapping it would bury them
         // under the function's name.
+        // A bare `record` is the other case: PostgreSQL will not put one in a
+        // `FROM` clause without being told its columns, but it will hand the
+        // value straight to `to_jsonb`, which reads the names off the record
+        // itself. That is where `returns_record()` gets `{"id": 1, ...}` from
+        // without anyone having declared what its columns are.
         let render_as_json = read.is_none()
             && !plan.returns_composite
             && plan
                 .return_type
                 .as_deref()
-                .map(|t| !decodable_type(t) && t != "record")
+                .map(|t| !decodable_type(t) || t == "record")
                 .unwrap_or(false);
 
         let mut frag = SqlFragment::new();
         frag.push("SELECT ");
         if render_as_json {
-            frag.push("to_jsonb(pgrst_scalar) AS ");
+            // Called in the select list rather than the `FROM`: a
+            // set-returning function there still yields a row per result, and
+            // a `record` needs no column list to be called this way.
+            frag.push("to_jsonb(pgrst_call.pgrst_scalar) AS ");
             frag.push(&escape_ident(&plan.function.name));
-            frag.push(" FROM ");
+            frag.push(" FROM (SELECT ");
             frag.push(&from_qi(&qi));
             frag.push("(");
         }
@@ -828,8 +836,17 @@ impl QueryBuilder {
                     if i > 0 {
                         frag.push(", ");
                     }
-                    frag.push(&escape_ident(name));
-                    frag.push(" => ");
+                    // A variadic parameter is passed as the whole tail, which
+                    // is what `VARIADIC` says; `v => array[...]` finds no
+                    // function, since no signature takes an array there.
+                    if plan.variadic_params.iter().any(|v| v == name) {
+                        frag.push("VARIADIC ");
+                        frag.push(&escape_ident(name));
+                        frag.push(" := ");
+                    } else {
+                        frag.push(&escape_ident(name));
+                        frag.push(" => ");
+                    }
                     match declared_type(name) {
                         Some(pg_type) => {
                             frag.push_typed_param(SqlParam::Text(value.clone()), &pg_type)
@@ -860,7 +877,7 @@ impl QueryBuilder {
 
         frag.push(")");
         if render_as_json {
-            frag.push(" AS pgrst_scalar");
+            frag.push(" AS pgrst_scalar) pgrst_call");
         }
 
         // Filters, ordering and paging over the returned rows.

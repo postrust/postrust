@@ -197,11 +197,19 @@ impl SchemaCache {
     /// path it was rendered against, so both spellings are tried -- and an
     /// unqualified one is looked for in the function's own schema.
     pub fn routine_returned_table(&self, qi: &QualifiedIdentifier) -> Option<&Table> {
-        let routine = self.get_routines(qi)?.first()?;
+        self.returned_table(self.get_routines(qi)?.first()?)
+    }
+
+    /// The same, for a routine already chosen.
+    ///
+    /// A name may carry several signatures returning different things, so
+    /// which overload was selected decides which table the result is shaped
+    /// by -- and only the caller knows that.
+    pub fn returned_table(&self, routine: &Routine) -> Option<&Table> {
         let type_name = routine.return_type.type_name()?;
         let candidate = match type_name.split_once('.') {
             Some((schema, name)) => QualifiedIdentifier::new(schema, name),
-            None => QualifiedIdentifier::new(&qi.schema, type_name),
+            None => QualifiedIdentifier::new(&routine.schema, type_name),
         };
         self.get_table(&candidate)
     }

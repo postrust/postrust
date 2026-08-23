@@ -222,9 +222,15 @@ fn select_overload<'a>(
     routines: &'a [Routine],
     request: &ApiRequest,
 ) -> Result<Option<&'a Routine>> {
-    // Arguments in a body are not inspected here. The payload is parsed
-    // further down, and a mismatch there is PostgreSQL's to report.
-    if request.payload.is_some() {
+    use crate::api_request::Payload;
+
+    // A body that is not named arguments -- a bare scalar, a raw payload --
+    // says nothing about which signature was meant, so there is nothing to
+    // choose on and the first is as good an answer as any.
+    if matches!(
+        request.payload,
+        Some(Payload::RawJson(_)) | Some(Payload::RawPayload(_))
+    ) {
         return Ok(routines.first());
     }
 
@@ -359,8 +365,13 @@ fn create_db_plan(
             // selected, filtered, ordered, paged and embedded on. That needs a
             // table to resolve columns against, so it applies exactly when the
             // function returns rows of one this cache knows.
+            //
+            // The table is the one *this* overload returns: a name may carry
+            // several signatures returning different things, and taking the
+            // first would shape the result of one call by the columns of
+            // another.
             let read = schema_cache
-                .routine_returned_table(qi)
+                .returned_table(routine)
                 .map(|table| ReadPlan::from_request(request, table, schema_cache))
                 .transpose()?
                 .map(ReadPlanTree::leaf);

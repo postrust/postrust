@@ -130,28 +130,28 @@ pub fn build_response_headers(
 ///
 /// `Err` when it is anything else, which is a fault in the function rather
 /// than in the request and is reported as one.
-pub fn parse_guc_headers(guc_headers: &str) -> Result<Vec<(String, String)>, ()> {
+pub fn parse_guc_headers(guc_headers: &str) -> Option<Vec<(String, String)>> {
     let Ok(serde_json::Value::Array(entries)) = serde_json::from_str(guc_headers) else {
-        return Err(());
+        return None;
     };
 
     let mut headers = Vec::with_capacity(entries.len());
     for entry in entries {
         let serde_json::Value::Object(fields) = entry else {
-            return Err(());
+            return None;
         };
         if fields.len() != 1 {
-            return Err(());
+            return None;
         }
         for (name, value) in fields {
             let serde_json::Value::String(value) = value else {
-                return Err(());
+                return None;
             };
             headers.push((name, value));
         }
     }
 
-    Ok(headers)
+    Some(headers)
 }
 
 #[cfg(test)]
@@ -240,7 +240,7 @@ mod tests {
             r#"["X: y"]"#,
             "not json",
         ] {
-            assert!(parse_guc_headers(bad).is_err(), "accepted {bad}");
+            assert!(parse_guc_headers(bad).is_none(), "accepted {bad}");
         }
     }
 }

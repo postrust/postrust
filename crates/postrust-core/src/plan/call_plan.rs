@@ -44,6 +44,13 @@ pub struct CallPlan {
     /// is cast to its declared type at call time.
     #[serde(default)]
     pub param_types: Vec<(String, String)>,
+    /// The names of the parameters declared `VARIADIC`.
+    ///
+    /// Named notation spells one `VARIADIC v := ...`; `v => ...` finds no
+    /// function at all, because the array is the whole of the variadic tail
+    /// rather than one value of it.
+    #[serde(default)]
+    pub variadic_params: Vec<String>,
 }
 
 /// How parameters are passed to the function.
@@ -87,6 +94,12 @@ impl CallPlan {
                 .iter()
                 .map(|p| (p.name.clone(), p.param_type.clone()))
                 .collect(),
+            variadic_params: routine
+                .params
+                .iter()
+                .filter(|p| p.variadic)
+                .map(|p| p.name.clone())
+                .collect(),
         })
     }
 
@@ -106,8 +119,37 @@ fn extract_call_params(request: &ApiRequest, routine: &Routine) -> Result<CallPa
                 let value: serde_json::Value =
                     serde_json::from_slice(raw).map_err(|e| Error::InvalidBody(e.to_string()))?;
 
+                // A call takes one set of arguments. A body written as an
+                // array offers several, and PostgREST reads the first --
+                // `LIMIT 1` over the record set it makes of the body.
+                let value = match value {
+                    serde_json::Value::Array(rows)
+                        if rows.first().is_some_and(serde_json::Value::is_object) =>
+                    {
+                        rows.into_iter().next().unwrap_or(serde_json::Value::Null)
+                    }
+                    other => other,
+                };
+
                 match value {
                     serde_json::Value::Object(map) => {
+                        // `?columns=` names which of the body's keys are
+                        // arguments, and a key the function does not declare
+                        // is not one -- the body may carry more than the call
+                        // needs.
+                        let map: serde_json::Map<String, serde_json::Value> = map
+                            .into_iter()
+                            .filter(|(name, _)| {
+                                request
+                                    .query_params
+                                    .columns
+                                    .as_ref()
+                                    .map(|columns| columns.contains(name))
+                                    .unwrap_or(true)
+                                    && routine.params.iter().any(|p| &p.name == name)
+                            })
+                            .collect();
+
                         // Named parameters from JSON object
                         let params: Vec<(String, String)> = map
                             .into_iter()
@@ -154,8 +196,14 @@ fn extract_call_params(request: &ApiRequest, routine: &Routine) -> Result<CallPa
                 }
             }
             Payload::ProcessedUrlEncoded { data, .. } => {
-                // Named parameters from form data
-                return Ok(CallParams::Named(data.clone()));
+                // A form body is named arguments like any other, repeats and
+                // all: the same name twice is one variadic argument or the
+                // last of them, never two arguments.
+                return Ok(named_arguments(
+                    data.iter()
+                        .map(|(name, value)| (name.clone(), value.clone())),
+                    routine,
+                ));
             }
             Payload::RawJson(raw) | Payload::RawPayload(raw) => {
                 return Ok(CallParams::SingleObject(raw.clone()));
@@ -206,6 +254,46 @@ fn extract_call_params(request: &ApiRequest, routine: &Routine) -> Result<CallPa
 
     // No parameters
     Ok(CallParams::None)
+}
+
+/// Group named arguments, collapsing repeats the way a call must.
+///
+/// A name given more than once is one argument, not two: for a variadic
+/// parameter every value goes into the array it takes, and for any other the
+/// last one wins -- repeating it cannot mean asking for two values where the
+/// signature has room for one. Names the function does not declare are left
+/// out; the body may carry more than the call needs.
+fn named_arguments(
+    supplied: impl IntoIterator<Item = (String, String)>,
+    routine: &Routine,
+) -> CallParams {
+    let mut grouped: Vec<(String, Vec<String>)> = Vec::new();
+    for (name, value) in supplied {
+        if !routine.params.iter().any(|p| p.name == name) {
+            continue;
+        }
+        match grouped.iter_mut().find(|(existing, _)| *existing == name) {
+            Some((_, values)) => values.push(value),
+            None => grouped.push((name, vec![value])),
+        }
+    }
+
+    let args: Vec<(String, String)> = grouped
+        .into_iter()
+        .map(|(name, values)| {
+            let variadic = routine.params.iter().any(|p| p.name == name && p.variadic);
+            let value = match variadic {
+                true => array_literal(&values),
+                false => values.last().cloned().unwrap_or_default(),
+            };
+            (name, value)
+        })
+        .collect();
+
+    match args.is_empty() {
+        true => CallParams::None,
+        false => CallParams::Named(args),
+    }
 }
 
 /// Render values as a PostgreSQL array literal.

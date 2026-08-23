@@ -1018,10 +1018,19 @@ async fn execute_plan(
                         .fetch_one(&mut *tx)
                         .await
                         .map_err(map_sqlx_error)?;
-                        (
-                            row.try_get::<Option<String>, _>(0).ok().flatten(),
-                            row.try_get::<Option<String>, _>(1).ok().flatten(),
-                        )
+                        // Empty is absent. Once any transaction on this
+                        // connection has defined a custom setting, PostgreSQL
+                        // keeps the name for the rest of the session and
+                        // reports it as `''` rather than null -- so a request
+                        // that set nothing would otherwise inherit "the empty
+                        // headers" from whichever request last set some.
+                        let setting = |index: usize| {
+                            row.try_get::<Option<String>, _>(index)
+                                .ok()
+                                .flatten()
+                                .filter(|value| !value.trim().is_empty())
+                        };
+                        (setting(0), setting(1))
                     }
                 };
 
@@ -1030,7 +1039,7 @@ async fn execute_plan(
             // schema, and saying so is more use than a header the client
             // cannot see or a status it cannot explain.
             if let Some(headers) = &guc_headers {
-                if postrust_response::parse_guc_headers(headers).is_err() {
+                if postrust_response::parse_guc_headers(headers).is_none() {
                     return Err(postrust_core::Error::InvalidGucHeaders);
                 }
             }
@@ -2935,6 +2944,7 @@ mod tests {
             volatility: "Volatile".into(),
             param_types: Vec::new(),
             returns_void: false,
+            variadic_params: Vec::new(),
         }
     }
 

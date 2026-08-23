@@ -235,7 +235,7 @@ fn add_common_headers(response: &mut Response, request: &ApiRequest, result: &Qu
     // A function's own headers, added rather than replaced: the shape of the
     // setting is an array precisely so that a name may repeat.
     if let Some(guc) = &result.guc_headers {
-        if let Ok(headers) = crate::headers::parse_guc_headers(guc) {
+        if let Some(headers) = crate::headers::parse_guc_headers(guc) {
             for (name, value) in headers {
                 response.append_header(&name, &value);
             }
