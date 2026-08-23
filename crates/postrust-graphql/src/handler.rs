@@ -1011,7 +1011,7 @@ async fn resolve_aggregate<'a>(
         }
 
         let sql = format!(
-            "SELECT json_build_object({})::text FROM ({}) AS pgrst_agg",
+            "SELECT json_build_object({}) FROM ({}) AS pgrst_agg",
             parts.join(", "),
             inner
         );
@@ -1030,7 +1030,7 @@ async fn resolve_aggregate<'a>(
 
     if wants_nodes {
         let sql = format!(
-            "SELECT row_to_json(pgrst_nodes)::text FROM ({}) AS pgrst_nodes",
+            "SELECT row_to_json(pgrst_nodes) FROM ({}) AS pgrst_nodes",
             inner
         );
         let mut conn = begin_with_session(pool, gql_ctx.role(), &gql_ctx.session_settings()).await?;
