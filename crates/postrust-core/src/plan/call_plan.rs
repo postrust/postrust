@@ -207,8 +207,18 @@ fn extract_call_params(request: &ApiRequest, routine: &Routine) -> Result<CallPa
                         let params: Vec<(String, String)> = map
                             .into_iter()
                             .map(|(k, v)| {
+                                // A `json` parameter takes the body's value as
+                                // the body wrote it: a JSON string is a JSON
+                                // string, and unquoting it first turns
+                                // `"{\"key\": 3}"` into an object the caller
+                                // did not pass -- or, for `"text"`, into
+                                // something that is not JSON at all.
+                                let takes_json = routine.params.iter().any(|p| {
+                                    p.name == k && matches!(p.param_type.as_str(), "json" | "jsonb")
+                                });
                                 // Extract string values without JSON quotes
                                 let value = match v {
+                                    ref value if takes_json => value.to_string(),
                                     serde_json::Value::String(s) => s,
                                     serde_json::Value::Null => String::new(),
                                     // A JSON array for a parameter the function
