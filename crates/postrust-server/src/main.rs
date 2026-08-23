@@ -56,7 +56,12 @@ async fn main() -> Result<()> {
     info!("Connected to database");
 
     // Load schema cache
-    let schema_cache = postrust_core::SchemaCache::load(&pool, &config.db_schemas).await?;
+    let schema_cache = postrust_core::SchemaCache::load_with_search_path(
+        &pool,
+        &config.db_schemas,
+        &config.db_extra_search_path,
+    )
+    .await?;
     info!("{}", schema_cache.summary());
 
     // Create app state

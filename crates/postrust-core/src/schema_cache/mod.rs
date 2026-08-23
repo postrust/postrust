@@ -46,7 +46,28 @@ pub struct SchemaCache {
 impl SchemaCache {
     /// Load schema cache from the database.
     pub async fn load(pool: &PgPool, schemas: &[String]) -> Result<Self> {
+        Self::load_with_search_path(pool, schemas, &[]).await
+    }
+
+    /// Load the cache, resolving functions along `extra_search_path` as well.
+    ///
+    /// A computed column's function is reached the way the database reaches
+    /// it, which is along the search path -- so it may live in a schema the
+    /// API does not expose. The table it reads must still be exposed.
+    pub async fn load_with_search_path(
+        pool: &PgPool,
+        schemas: &[String],
+        extra_search_path: &[String],
+    ) -> Result<Self> {
         info!("Loading schema cache for schemas: {:?}", schemas);
+
+        let function_schemas: Vec<String> = schemas
+            .iter()
+            .chain(extra_search_path)
+            .cloned()
+            .collect::<std::collections::BTreeSet<_>>()
+            .into_iter()
+            .collect();
 
         // Get PostgreSQL version
         let pg_version = queries::get_pg_version(pool).await?;
@@ -66,7 +87,7 @@ impl SchemaCache {
         // to, so resolving a field name has one place to look.
         let mut tables = tables;
         for (table, name, function, data_type) in
-            queries::load_computed_columns(pool, schemas).await?
+            queries::load_computed_columns(pool, schemas, &function_schemas).await?
         {
             if let Some(table) = tables.get_mut(&table) {
                 table.computed_columns.insert(
@@ -146,14 +167,29 @@ impl SchemaCache {
     /// Below it the "suggestion" would be noise, and would also say more about
     /// the schema than the client asked.
     fn similar_table(&self, qi: &QualifiedIdentifier) -> Option<String> {
-        const MIN_SIMILARITY: f64 = 0.75;
+        const MIN_SIMILARITY: f64 = 0.5;
+
+        // Scored by shared character n-grams rather than by edit distance.
+        // A Levenshtein ratio cannot tell `items` from `items3` as the table
+        // `itemsx` was meant to be -- both are one edit away, so both score
+        // 0.833 and the winner is whichever the map happened to yield last.
+        // Counting 3-grams separates them, because it notices that one
+        // candidate is the query's own length and the other is not: `items`
+        // scores 0.73 against `itemsx` and `items3` scores 0.67.
+        let asked = grams(&qi.name, 3);
 
         self.tables
             .keys()
             .filter(|candidate| candidate.schema == qi.schema)
-            .map(|candidate| (similarity(&candidate.name, &qi.name), candidate))
+            .map(|candidate| (cosine(&asked, &grams(&candidate.name, 3)), candidate))
             .filter(|(score, _)| *score >= MIN_SIMILARITY)
-            .max_by(|(a, _), (b, _)| a.total_cmp(b))
+            // Ties go to the shorter name, and then to the earlier one, so
+            // that the suggestion does not depend on iteration order.
+            .max_by(|(a, left), (b, right)| {
+                a.total_cmp(b)
+                    .then_with(|| right.name.len().cmp(&left.name.len()))
+                    .then_with(|| right.name.cmp(&left.name))
+            })
             .map(|(_, candidate)| candidate.to_string())
     }
 
@@ -288,18 +324,27 @@ impl SchemaCache {
         // a whole word -- `car_model_sales_202101` for `car_model_sales`.
         const MIN_SIMILARITY: f64 = 0.4;
 
-        let suggestion = self
+        let related: Vec<&str> = self
             .get_relationships(from, schema)
             .into_iter()
             .flatten()
             .map(|rel| rel.foreign_table().name.as_str())
-            // A relationship of exactly that name exists, so the name is not
-            // what went wrong -- the hint is.
-            .filter(|name| *name != to_name)
-            .map(|name| (similarity(name, to_name), name))
-            .filter(|(score, _)| *score >= MIN_SIMILARITY)
-            .max_by(|(a, _), (b, _)| a.total_cmp(b))
-            .map(|(_, name)| name.to_string());
+            .collect();
+
+        // A relationship of exactly that name exists, so the name is not what
+        // went wrong -- the hint is, and there is nothing to suggest. Dropping
+        // only the exact match and then offering the next-nearest name told a
+        // client that asked for `person!space` that it had perhaps meant
+        // `person_detail`, when what it had meant was `person` all along.
+        let suggestion = match related.contains(&to_name) {
+            true => None,
+            false => related
+                .iter()
+                .map(|name| (similarity(name, to_name), *name))
+                .filter(|(score, _)| *score >= MIN_SIMILARITY)
+                .max_by(|(a, _), (b, _)| a.total_cmp(b))
+                .map(|(_, name)| name.to_string()),
+        };
 
         Error::RelationshipNotFound {
             origin: from.name.clone(),
@@ -959,10 +1004,24 @@ fn add_junction_relationships(
             continue;
         };
 
-        // The single-column keys out of the junction. A junction joins two
-        // tables by one column each; a composite key to somewhere else is a
-        // different relationship that happens to share the table.
-        let outgoing: Vec<(&Relationship, (String, String))> = rels
+        // The single-column keys out of the junction.
+        //
+        // This is not the right rule. `touched_files` joins
+        // `files(project_id, filename)` to `users_tasks(user_id, task_id)` and
+        // is as much a junction as any other; PostgREST embeds through both it
+        // and `car_models_car_dealers`, and this answers "no relationship" for
+        // a relationship that is plainly there. The primary-key test below is
+        // what actually separates a junction from a table that merely
+        // references two others, and it does not need this.
+        //
+        // It stays because the embed layer cannot yet express the join it
+        // would produce: `EmbedPlan` carries one `local_column` and one
+        // `foreign_column`, `EmbedJunction` one column per side, and
+        // `parent_keys` matches children to parents on a single scalar. Deriving
+        // the relationship without widening those would join a composite
+        // junction on the first column of each key and return rows that are
+        // wrong rather than absent -- and be much harder to notice.
+        let outgoing: Vec<(&Relationship, Vec<(String, String)>)> = rels
             .iter()
             .filter(|r| matches!(r, Relationship::ForeignKey { table, .. } if table == junction_qi))
             .filter(|r| r.is_to_one())
@@ -970,7 +1029,7 @@ fn add_junction_relationships(
                 let mut columns = r.join_columns();
                 columns.dedup();
                 match columns.len() {
-                    1 => Some((r, columns.remove(0))),
+                    1 => Some((r, columns)),
                     _ => None,
                 }
             })
@@ -988,13 +1047,19 @@ fn add_junction_relationships(
                 if near == far {
                     continue;
                 }
-                let (near_rel, (near_local, near_foreign)) = &outgoing[near];
-                let (far_rel, (far_local, far_foreign)) = &outgoing[far];
+                let (near_rel, near_columns) = &outgoing[near];
+                let (far_rel, far_columns) = &outgoing[far];
                 if near_rel.foreign_table() == far_rel.foreign_table() {
                     continue;
                 }
-                let covered = [near_local.as_str(), far_local.as_str()];
-                if !covered.iter().all(|column| pk.contains(column)) {
+                // Every column either key is written over has to be part of
+                // the junction's own key: that is what says a row of it is one
+                // pairing and nothing more.
+                if !near_columns
+                    .iter()
+                    .chain(far_columns)
+                    .all(|(local, _)| pk.contains(&local.as_str()))
+                {
                     continue;
                 }
 
@@ -1011,9 +1076,17 @@ fn add_junction_relationships(
                             table: junction_qi.clone(),
                             constraint1: near_rel.constraint_name().to_string(),
                             constraint2: far_rel.constraint_name().to_string(),
-                            // Source to junction, then junction to target.
-                            source_columns: vec![(near_foreign.clone(), near_local.clone())],
-                            target_columns: vec![(far_local.clone(), far_foreign.clone())],
+                            // Source to junction, then junction to target,
+                            // each in the order the constraint declares so a
+                            // composite key joins column for column.
+                            source_columns: near_columns
+                                .iter()
+                                .map(|(local, foreign)| (foreign.clone(), local.clone()))
+                                .collect(),
+                            target_columns: far_columns
+                                .iter()
+                                .map(|(local, foreign)| (local.clone(), foreign.clone()))
+                                .collect(),
                         }),
                         table_is_view: false,
                         foreign_table_is_view: false,

@@ -108,20 +108,36 @@ impl Relationship {
                 cardinality: Cardinality::M2M(junction),
                 ..
             } => {
-                let side = |columns: &[(String, String)]| -> String {
-                    columns
-                        .iter()
-                        .map(|(_, far)| far.clone())
-                        .collect::<Vec<_>>()
-                        .join(", ")
-                };
+                // Both constraints belong to the junction table, so both are
+                // named with the junction's own columns. The two lists are
+                // oriented in opposite directions -- `source_columns` runs
+                // (source, through) and `target_columns` runs (through,
+                // target) -- so the junction's side is the second element of
+                // one and the first of the other. Taking the second of both
+                // described the far constraint with the column it points at
+                // rather than the column it is on:
+                // `whatev_jobs_project_id_1_fkey(id)` for a constraint that is
+                // on `project_id_1`.
+                let joined = |columns: Vec<String>| columns.join(", ");
                 format!(
                     "{} using {}({}) and {}({})",
                     junction.table.name,
                     junction.constraint1,
-                    side(&junction.source_columns),
+                    joined(
+                        junction
+                            .source_columns
+                            .iter()
+                            .map(|(_, through)| through.clone())
+                            .collect()
+                    ),
                     junction.constraint2,
-                    side(&junction.target_columns),
+                    joined(
+                        junction
+                            .target_columns
+                            .iter()
+                            .map(|(through, _)| through.clone())
+                            .collect()
+                    ),
                 )
             }
             Self::ForeignKey {

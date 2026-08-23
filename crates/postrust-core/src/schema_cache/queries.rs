@@ -82,12 +82,21 @@ pub async fn load_tables(pool: &PgPool, schemas: &[String]) -> Result<TablesMap>
              WHERE c.relkind = 'm'
         ) t
         LEFT JOIN LATERAL (
-            SELECT c.relkind = 'p' AS is_partitioned
+            SELECT c.relkind = 'p' AS is_partitioned,
+                   c.relispartition AS is_partition
               FROM pg_class c
               JOIN pg_namespace n ON n.oid = c.relnamespace
              WHERE n.nspname = t.table_schema AND c.relname = t.table_name
         ) k ON true
         WHERE t.table_schema = ANY($1)
+          -- A partition is reached through the table it partitions, not on its
+          -- own. `information_schema.tables` lists every one of them, so a
+          -- schema with a year of monthly partitions exposed twelve endpoints
+          -- PostgREST does not have -- and a request naming one was answered
+          -- as though the table were real, which made a missing relationship
+          -- read as a missing column. The partitioned parent itself
+          -- (`relkind = 'p'`) is not a partition and stays.
+          AND NOT COALESCE(k.is_partition, false)
         ORDER BY t.table_schema, t.table_name
         "#,
     )
@@ -896,9 +905,17 @@ pub async fn load_representations(
 /// exposes that. Only single-argument functions returning a single value
 /// qualify -- one returning `setof` another table is a computed *relationship*,
 /// which is embedded rather than selected.
+/// `function_schemas` is where the function itself may live: the exposed
+/// schemas plus whatever `db-extra-search-path` adds. The table has to be
+/// exposed -- it is the thing being read -- but the function need not be, and
+/// PostgREST resolves it along the search path. `always_false(test.items)`
+/// lives in `public`, so requiring the function to be in an exposed schema
+/// left `?always_false=is.false` answered "column does not exist" for a field
+/// PostgREST reads as a column.
 pub async fn load_computed_columns(
     pool: &PgPool,
     schemas: &[String],
+    function_schemas: &[String],
 ) -> Result<Vec<(QualifiedIdentifier, String, QualifiedIdentifier, String)>> {
     let rows = sqlx::query(
         r#"
@@ -916,11 +933,12 @@ pub async fn load_computed_columns(
            AND p.prokind = 'f'
            AND p.prorettype <> 'pg_catalog.trigger'::pg_catalog.regtype
            AND t.relkind = ANY (ARRAY['r', 'v', 'm', 'p', 'f'])
-           AND fn.nspname = ANY($1)
+           AND fn.nspname = ANY($2)
            AND tn.nspname = ANY($1)
         "#,
     )
     .bind(schemas)
+    .bind(function_schemas)
     .fetch_all(pool)
     .await
     .map_err(|e| Error::SchemaCacheLoadFailed(e.to_string()))?;

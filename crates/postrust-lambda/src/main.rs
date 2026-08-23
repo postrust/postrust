@@ -45,7 +45,11 @@ async fn handler(event: Request) -> Result<Response<Body>, Error> {
     let schema_cache = SCHEMA_CACHE
         .get_or_init(|| async {
             info!("Loading schema cache");
-            let cache = postrust_core::SchemaCache::load(pool, &config.db_schemas)
+            let cache = postrust_core::SchemaCache::load_with_search_path(
+                pool,
+                &config.db_schemas,
+                &config.db_extra_search_path,
+            )
                 .await
                 .expect("Failed to load schema cache");
             Arc::new(RwLock::new(cache))
