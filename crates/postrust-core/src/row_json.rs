@@ -75,10 +75,14 @@ pub fn row_to_json(row: &sqlx::postgres::PgRow) -> serde_json::Value {
                 .try_get::<chrono::DateTime<chrono::Utc>, _>(name)
                 .ok()
                 .map(|v| serde_json::Value::String(v.to_rfc3339())),
+            // ISO 8601, with `T` between the date and the time. `to_string`
+            // puts a space there, which is PostgreSQL's *display* format but
+            // not what it writes in JSON -- and a client parsing the result
+            // as a timestamp is parsing JSON.
             "TIMESTAMP" | "TIMESTAMP WITHOUT TIME ZONE" => row
                 .try_get::<chrono::NaiveDateTime, _>(name)
                 .ok()
-                .map(|v| serde_json::Value::String(v.to_string())),
+                .map(|v| serde_json::Value::String(v.format("%Y-%m-%dT%H:%M:%S%.f").to_string())),
             "DATE" => row
                 .try_get::<chrono::NaiveDate, _>(name)
                 .ok()
@@ -97,4 +101,32 @@ pub fn row_to_json(row: &sqlx::postgres::PgRow) -> serde_json::Value {
     }
 
     serde_json::Value::Object(map)
+}
+
+#[cfg(test)]
+mod tests {
+    /// The `T` is not decoration: `to_string` writes a space, which is
+    /// PostgreSQL's display format and not what it puts in JSON.
+    #[test]
+    fn a_timestamp_without_a_zone_is_written_in_iso_8601() {
+        let format = "%Y-%m-%dT%H:%M:%S%.f";
+
+        let with_fraction = chrono::NaiveDateTime::parse_from_str(
+            "2015-12-08 04:22:57.472738",
+            "%Y-%m-%d %H:%M:%S%.f",
+        )
+        .unwrap();
+        assert_eq!(
+            with_fraction.format(format).to_string(),
+            "2015-12-08T04:22:57.472738"
+        );
+
+        let whole_second =
+            chrono::NaiveDateTime::parse_from_str("2018-01-02 00:00:00", "%Y-%m-%d %H:%M:%S")
+                .unwrap();
+        assert_eq!(
+            whole_second.format(format).to_string(),
+            "2018-01-02T00:00:00"
+        );
+    }
 }
