@@ -2310,53 +2310,6 @@ impl EmbedFilters<'_> {
 
     /// The `WHERE` fragment for one embedded resource, or `None` if unfiltered.
     #[allow(clippy::result_large_err)] // consistent with the crate's error type
-    /// The `ORDER BY` an embedded resource was asked for, if any.
-    ///
-    /// `clients.order=name.desc` orders the rows inside the embed, which is a
-    /// property of the child's own subselect rather than of the parent.
-    fn order_for(&self, path: &[String], names: &[String]) -> Option<String> {
-        let terms: Vec<String> = self
-            .orders
-            .iter()
-            .filter(|(p, _)| p.as_slice() == path || p.as_slice() == names)
-            .flat_map(|(_, terms)| terms.iter())
-            .map(|term| {
-                use postrust_core::api_request::{OrderDirection, OrderNulls, OrderTerm};
-                let (field, direction, nulls) = match term {
-                    OrderTerm::Field {
-                        field,
-                        direction,
-                        nulls,
-                    }
-                    | OrderTerm::Relation {
-                        field,
-                        direction,
-                        nulls,
-                        ..
-                    } => (field, direction, nulls),
-                };
-
-                let mut rendered = postrust_sql::escape_ident(&field.name);
-                match direction {
-                    Some(OrderDirection::Desc) => rendered.push_str(" DESC"),
-                    Some(OrderDirection::Asc) => rendered.push_str(" ASC"),
-                    None => {}
-                }
-                match nulls {
-                    Some(OrderNulls::First) => rendered.push_str(" NULLS FIRST"),
-                    Some(OrderNulls::Last) => rendered.push_str(" NULLS LAST"),
-                    None => {}
-                }
-                rendered
-            })
-            .collect();
-
-        match terms.is_empty() {
-            true => None,
-            false => Some(terms.join(", ")),
-        }
-    }
-
     /// The row window an embedded resource was asked for.
     ///
     /// The server's own cap still applies, so an embed cannot be asked for
@@ -2750,6 +2703,150 @@ fn build_embed_orders(
     Ok(orders)
 }
 
+/// The relationship an `order=relation(column)` term names, ready to order by.
+///
+/// Resolving it is the same work whether the term sits at the top level or
+/// inside an embed, and it is the same mistake to skip: a relation term
+/// rendered as a bare column name orders by a column of the wrong table --
+/// silently, where the parent happens to have a column of that name, and with
+/// `column "cost" does not exist` where it does not.
+#[allow(clippy::result_large_err)] // consistent with the crate's error type
+fn related_order_target(
+    schema_cache: &postrust_core::SchemaCache,
+    parent_qi: &postrust_core::api_request::QualifiedIdentifier,
+    select: &[postrust_core::api_request::SelectItem],
+    relation: &str,
+    ctx: &mut EmbedFilters<'_>,
+) -> Result<
+    (
+        postrust_core::embed::EmbedPlan,
+        String,
+        postrust_core::api_request::QualifiedIdentifier,
+    ),
+    postrust_core::Error,
+> {
+    // `order=` names a resource this request embedded, by the name the
+    // response gives it -- so `pros:projects(*)` is ordered on as `pros`, and
+    // the table it came from is what the relationship is looked up by. A name
+    // the selection does not carry is not an embedded resource here, whether
+    // or not the schema has a table by that name.
+    let embedded = embedded_by_name(select, relation)
+        .ok_or_else(|| postrust_core::Error::NotAnEmbeddedResource(relation.to_string()))?;
+
+    let rel = schema_cache
+        .find_relationship(parent_qi, embedded.0, embedded.1, &parent_qi.schema)?
+        .ok_or_else(|| {
+            schema_cache.relationship_not_found(parent_qi, embedded.0, embedded.1, &parent_qi.schema)
+        })?;
+
+    // A resource that yields many rows per parent has no single value to order
+    // on, so there is nothing the request could mean.
+    if !rel.is_to_one() {
+        return Err(postrust_core::Error::RelatedOrderNotPossible {
+            origin: parent_qi.name.clone(),
+            relation: relation.to_string(),
+        });
+    }
+
+    let plan = postrust_core::embed::EmbedPlan::resolve(rel, schema_cache)?;
+    let child_alias = ctx.next_alias();
+    let child_qi = postrust_core::api_request::QualifiedIdentifier::new(
+        &plan.foreign_schema,
+        &plan.foreign_table,
+    );
+
+    Ok((plan, child_alias, child_qi))
+}
+
+/// The `ORDER BY` an embedded resource was asked for, if any.
+///
+/// `clients.order=name.desc` orders the rows inside the embed, which is a
+/// property of the child's own subselect rather than of the parent.
+/// `tasks.order=projects(id).desc` orders them by a column of a table the
+/// child embeds in turn -- so it is resolved against the child, and rendered
+/// as the same correlated subselect the top level uses.
+#[allow(clippy::result_large_err)] // consistent with the crate's error type
+#[allow(clippy::too_many_arguments)] // each names one part of where the embed sits
+fn embed_order_sql(
+    schema_cache: &postrust_core::SchemaCache,
+    child_qi: &postrust_core::api_request::QualifiedIdentifier,
+    child_select: &[postrust_core::api_request::SelectItem],
+    child_alias: &str,
+    ctx: &mut EmbedFilters<'_>,
+    path: &[String],
+    names: &[String],
+) -> Result<Option<String>, postrust_core::Error> {
+    use postrust_core::api_request::{OrderDirection, OrderNulls, OrderTerm};
+
+    let terms: Vec<OrderTerm> = ctx
+        .orders
+        .iter()
+        .filter(|(p, _)| p.as_slice() == path || p.as_slice() == names)
+        .flat_map(|(_, terms)| terms.iter().cloned())
+        .collect();
+
+    if terms.is_empty() {
+        return Ok(None);
+    }
+
+    let mut rendered = Vec::with_capacity(terms.len());
+    for term in &terms {
+        let (field, direction, nulls) = match term {
+            OrderTerm::Field {
+                field,
+                direction,
+                nulls,
+            }
+            | OrderTerm::Relation {
+                field,
+                direction,
+                nulls,
+                ..
+            } => (field, direction, nulls),
+        };
+
+        let mut sql = match term {
+            OrderTerm::Field { .. } => postrust_sql::escape_ident(&field.name),
+            OrderTerm::Relation { relation, .. } => {
+                let (plan, grandchild_alias, grandchild_qi) =
+                    related_order_target(schema_cache, child_qi, child_select, relation, ctx)?;
+
+                // The column belongs to the related table, so its type is read
+                // from there rather than from the child.
+                let pg_type = schema_cache
+                    .get_table(&grandchild_qi)
+                    .and_then(|table| table.get_column(&field.name))
+                    .map(|column| column.data_type.clone())
+                    .unwrap_or_default();
+                let coercible = postrust_core::plan::CoercibleField::from_field(field, &pg_type);
+                let column = postrust_core::query::QueryBuilder::qualified_column_sql(
+                    Some(&grandchild_alias),
+                    &coercible,
+                );
+
+                // The child is a real table alias at this level, so its alias
+                // is also the expression for its whole row.
+                plan.order_expression(child_alias, child_alias, &grandchild_alias, &column)
+            }
+        };
+
+        match direction {
+            Some(OrderDirection::Desc) => sql.push_str(" DESC"),
+            Some(OrderDirection::Asc) => sql.push_str(" ASC"),
+            None => {}
+        }
+        match nulls {
+            Some(OrderNulls::First) => sql.push_str(" NULLS FIRST"),
+            Some(OrderNulls::Last) => sql.push_str(" NULLS LAST"),
+            None => {}
+        }
+
+        rendered.push(sql);
+    }
+
+    Ok(Some(rendered.join(", ")))
+}
+
 #[allow(clippy::result_large_err)] // consistent with the crate's error type
 #[allow(clippy::too_many_arguments)] // each names one part of where the embed sits
 fn build_embed_expressions(
@@ -2925,7 +3022,15 @@ fn build_embed_expressions(
         }
 
         let inner_select = parts.join(", ");
-        let child_order = ctx.order_for(&child_path, &child_names);
+        let child_order = embed_order_sql(
+            schema_cache,
+            &child_qi,
+            child_select,
+            &child_alias,
+            ctx,
+            &child_path,
+            &child_names,
+        )?;
         let (child_limit, child_offset) = ctx.range_for(&child_path, &child_names);
         let expression = plan.embed_expression(
             parent_alias,

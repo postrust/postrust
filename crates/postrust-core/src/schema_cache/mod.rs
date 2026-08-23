@@ -129,6 +129,12 @@ impl SchemaCache {
         substitute_hidden_junctions(&tables, &view_columns, &mut relationships);
         add_view_relationships(&tables, &view_columns, &mut relationships);
 
+        // A view over a junction is a junction. It has no key of its own, so
+        // this runs only once the view's own relationships exist -- which is
+        // why the pass is here and not with the first one.
+        let view_keys = view_primary_keys(&primary_keys, &view_columns);
+        add_junction_relationships(&view_keys, &mut relationships);
+
         let media_handlers = queries::load_media_handlers(pool, schemas).await?;
         info!("Loaded {} media type handlers", media_handlers.len());
 
@@ -980,6 +986,57 @@ fn rename_cardinality(
             Cardinality::M2M(junction)
         }
     }
+}
+
+/// The key a view inherits from the table it selects from.
+///
+/// A view over a junction is a junction: `main_jobs` selects the columns of
+/// `jobs` that make it one, and PostgREST embeds `sites` through it and
+/// through `jobs` alike -- reporting both as candidates when the two cannot be
+/// told apart. A view has no key of its own, so the base table's is mapped
+/// through the names the view gives those columns.
+///
+/// Only where the view exposes every one of them: a key missing a column is
+/// not that key, and a junction is exactly the relation whose key *is* the
+/// pairing.
+fn view_primary_keys(
+    primary_keys: &std::collections::HashMap<QualifiedIdentifier, Vec<String>>,
+    view_columns: &[queries::ViewColumn],
+) -> std::collections::HashMap<QualifiedIdentifier, Vec<String>> {
+    use std::collections::HashMap;
+
+    // view -> base table -> base column -> the name the view gives it
+    let mut by_view: HashMap<
+        &QualifiedIdentifier,
+        HashMap<&QualifiedIdentifier, HashMap<&str, &str>>,
+    > = HashMap::new();
+    for column in view_columns {
+        by_view
+            .entry(&column.view)
+            .or_default()
+            .entry(&column.base)
+            .or_default()
+            .entry(column.base_column.as_str())
+            .or_insert(column.view_column.as_str());
+    }
+
+    let mut keys = HashMap::new();
+    for (view, bases) in by_view {
+        for (base, columns) in bases {
+            let Some(key) = primary_keys.get(base).filter(|key| !key.is_empty()) else {
+                continue;
+            };
+            let mapped: Option<Vec<String>> = key
+                .iter()
+                .map(|column| columns.get(column.as_str()).map(|name| name.to_string()))
+                .collect();
+            if let Some(mapped) = mapped {
+                keys.insert(view.clone(), mapped);
+            }
+        }
+    }
+
+    keys
 }
 
 /// Derive many-to-many relationships from junction tables.

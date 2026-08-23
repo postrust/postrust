@@ -54,16 +54,34 @@ cleanup() {
 }
 trap cleanup EXIT
 
-# `compat-key-order` is part of what is being measured, not an optimisation:
-# PostgREST returns object keys in the table's order and this server returns
-# them alphabetically without it. Invisible in JSON, since bodies are compared
-# as JSON -- but a CSV response puts its columns in key order, and there the
-# difference is the whole answer.
-if [ ! -x "$REPO_ROOT/target/release/postrust" ]; then
-    echo "error: target/release/postrust not found." >&2
-    echo "       cargo build --release -p postrust-server --features admin-ui,compat-key-order" >&2
-    exit 1
-fi
+# Built here rather than required to exist, because which features it was built
+# with is part of what is being measured and cannot be read off the file.
+#
+# `compat-key-order` is one of them: PostgREST returns object keys in select
+# order and this server returns them alphabetically without it. Invisible in
+# JSON, since bodies are compared as parsed JSON -- and the whole answer in
+# CSV, which puts its columns in key order.
+#
+# The trap this closes: `cargo test --workspace` rebuilds this same binary with
+# default features and overwrites it, so a build, then a test run, then a
+# conformance run silently measured a binary with neither feature. Nothing said
+# so; the binary was simply 1.1 MB smaller.
+say "Building the candidate"
+cargo build --release --manifest-path "$REPO_ROOT/Cargo.toml" \
+    -p postrust-server --features admin-ui,compat-key-order >&2
+
+# The server says so itself when compatibility mode is on without the feature,
+# so the log is checked once it starts. Belt and braces: the build above should
+# make it impossible, and this catches it if anything else replaces the binary
+# between here and there.
+assert_key_order() {
+    if grep -q "features compat-key-order" "$WORK/postrust.log" 2>/dev/null; then
+        echo "error: the candidate was built without compat-key-order." >&2
+        echo "       Its object keys will be alphabetical and every CSV column" >&2
+        echo "       order case will diverge for a reason that is not a bug." >&2
+        exit 1
+    fi
+}
 
 say "Fetching PostgREST $PGRST_VERSION fixtures and specs"
 if [ ! -d "$WORK/pgrst" ]; then
@@ -184,6 +202,7 @@ PGRST_SERVER_PORT="$CAND_PORT" PGRST_SERVER_HOST=127.0.0.1 \
 PGRST_COMPAT_MODE=true PGRST_LOG_LEVEL=warn \
     "$REPO_ROOT/target/release/postrust" >"$WORK/postrust.log" 2>&1 &
 sleep 9
+assert_key_order
 python3 "$HERE/run.py" "$WORK/cases.json" "http://localhost:$CAND_PORT" \
     "$WORK/cand.json" "$RESET_CMD >/dev/null 2>&1"
 

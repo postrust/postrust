@@ -79,6 +79,20 @@ runs both has to leave room for both. Recorded because the failure mode is
 silent until it is total — the first symptom was an unrelated-looking test
 failure.
 
+**`cargo test --workspace` silently strips the candidate's features.** It
+rebuilds the same `target/release/postrust` with default features and
+overwrites it, so *build, then test, then measure* measured a binary with
+neither `admin-ui` nor `compat-key-order`. Nothing said so. The only visible
+sign was the file shrinking by 1.1 MB:
+
+    built with features                    5,717,136
+    after cargo test --release --workspace 4,559,968
+
+This is the same class as the `db-extra-search-path` fault: the instrument
+quietly measuring something other than what it claims. The harness now builds
+the binary itself rather than requiring one to exist, and asserts against the
+server's own startup warning once it is up, so neither half can drift again.
+
 ## Part 2 — divergences kept on purpose
 
 **These cases fail by choice. Do not "fix" them without deciding to.**
@@ -123,19 +137,13 @@ under-performing.*
 
 ## Part 3 — known gaps, in the order worth doing them
 
-Real work, not corrections. Roughly 19 cases across five pieces.
-
-| # | gap | cases | needs | risk if left |
-|---|-----|-------|-------|--------------|
-| 1 | Ordering across an embed boundary | ~4 | resolve identifiers at the right nesting level | **silently wrong answers** |
-| 2 | Composite-key junctions | 4–5 | widen the embed path to tuple keys | missing embeds, loud |
-| 3 | Junctions through views | ~2 | derive junctions from views, not just tables | missing embeds, loud |
-| 4 | Parser error detail | ~3 | expectation sets in the query parser | poor diagnostics |
-| 5 | The OpenAPI document at `/` | 6 | a PostgREST-shaped generator | endpoint absent |
-
-Ordered by consequence rather than size: item 1 is first because it is the only
-one that answers wrongly instead of refusing, and item 5 is last because it is
-the only one that is a project rather than a change.
+| # | gap | cases | state |
+|---|-----|-------|-------|
+| 1 | Ordering across an embed boundary | ~4 | **done** |
+| 2 | Composite-key junctions | 4–5 | **done** |
+| 3 | Junctions through views | ~2 | **done** |
+| 4 | Parser error detail | ~3 | **done** for the logic tree; the select parser still answers generically |
+| 5 | The OpenAPI document at `/` | 6 | open — see below |
 
 ### 1. Ordering and filtering across an embed boundary — ~4 cases
 
@@ -220,20 +228,43 @@ for the three cases.
 
 ### 5. The OpenAPI document at `/` — 6 cases
 
-638 KB, 428 paths, 273 definitions, generated from every table, view, column
-and function in the schema, with `info` taken from the schema comment. Every
-column becomes a `rowFilter.<table>.<column>` parameter; every relation becomes
-a definition.
+Still open, and the only item here that is a project rather than a change.
+What the reference actually serves, measured:
 
-Bodies are compared as exact JSON, so a 95%-correct generator scores **zero on
-all six cases**. There is no partial credit to collect, and no way to land it
-incrementally against this measurement — which is the argument for treating it
-as a project with its own tests rather than as conformance work.
+    638 KB      428 paths      273 definitions      1035 parameters
 
-Note the admin surface already generates OpenAPI 3.0 via `utoipa`
-(`postrust-server/src/admin.rs`), which describes the admin endpoints and is
-not a starting point for this: PostgREST emits Swagger 2.0 describing the data
-API.
+The shape is regular, which is the argument for doing it and also the reason
+it cannot be done by halves:
+
+- **paths** — `/`, one per table and view with a method per operation the
+  relation supports, one per function under `/rpc/`;
+- **parameters** — 11 shared (`select`, `order`, `range`, `limit`,
+  `preferCount`, …), one `rowFilter.<table>.<column>` for every column of
+  every relation, one `body.<table>` for every writable one;
+- **definitions** — one per relation, a property per column.
+
+The detail is where the work is. A column carries PostgREST's own conventions,
+not just its type:
+
+    "id": {
+      "description": "Note:\nThis is a Primary Key.<pk/>",
+      "format": "int64",
+      "type": "integer"
+    }
+
+so matching means reproducing its type-to-(type, format) mapping, its
+`<pk/>`/`<fk/>` annotations, how a column comment is folded into the
+description, which columns count as `required`, and the same again for every
+function signature.
+
+**Bodies are compared as exact JSON, so a 95%-correct generator scores zero on
+all six cases.** There is no partial credit to collect and no way to land it
+incrementally against this measurement — which is why it belongs in its own
+change, with its own tests, rather than being started here and left half-built.
+
+The admin surface already emits OpenAPI 3.0 through `utoipa`
+(`postrust-server/src/admin.rs`). It is not a starting point: it describes the
+admin endpoints, and PostgREST emits Swagger 2.0 describing the data API.
 
 ## Part 4 — a note on where bugs hide
 

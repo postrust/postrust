@@ -965,17 +965,56 @@ fn parse_logic_param(op: LogicOperator, negated: bool, value: &str) -> Result<Lo
     // The group ends at the parenthesis that closes it, not at the last one in
     // the string: `and=(a.eq.1,b.eq.2))` is a well-formed group with a stray
     // character after it, and PostgREST reads it as one.
-    let inner =
-        balanced_group(value.trim()).ok_or_else(|| Error::InvalidQueryParam(value.into()))?;
+    let trimmed = value.trim();
+    let inner = balanced_group(trimmed).ok_or_else(|| Error::InvalidQueryParam(value.into()))?;
+
+    // Where a member is empty there is nothing to hand the filter parser, and
+    // "Invalid request" says only that something in a URL the client wrote is
+    // wrong. PostgREST names the character and what would have been accepted
+    // there, counting from the start of the tree as it spells it -- `or=(...)`
+    // is read as `or(...)`, so the `=` is not a column and the operator's own
+    // name is.
+    let members = split_top_level(inner);
+    for member in &members {
+        if !member.trim().is_empty() {
+            continue;
+        }
+        let at = offset_within(trimmed, member);
+        return Err(Error::UnparsableQuery {
+            kind: "logic tree",
+            text: trimmed.to_string(),
+            column: negated as usize * "not.".len()
+                + match op {
+                    LogicOperator::And => 3,
+                    LogicOperator::Or => 2,
+                }
+                + at
+                + 1,
+            expected: format!(
+                "unexpected \"{}\" expecting field name (* or [a..z0..9_$]), \
+                 negation operator (not) or logic operator (and, or)",
+                trimmed[at..].chars().next().unwrap_or_default()
+            ),
+        });
+    }
 
     Ok(LogicTree::Expr {
         negated,
         op,
-        children: split_top_level(inner)
+        children: members
             .into_iter()
             .map(parse_logic_child)
             .collect::<Result<Vec<_>>>()?,
     })
+}
+
+/// Where `part` begins inside `whole`, which it is a subslice of.
+///
+/// The split loses the positions and the message needs them; taking them from
+/// the pointers is exact where searching for the text would find the wrong
+/// occurrence of a repeated member.
+fn offset_within(whole: &str, part: &str) -> usize {
+    (part.as_ptr() as usize).saturating_sub(whole.as_ptr() as usize)
 }
 
 /// The contents of a parenthesised group at the head of `input`.
@@ -1616,6 +1655,39 @@ mod tests {
         assert!(parse_select("data->>-34").is_ok());
         assert!(parse_select("data->>34").is_ok());
         assert!(parse_select("data->>key").is_ok());
+    }
+    /// An empty member of a logic tree is reported the way PostgREST reports
+    /// it, which counts from the tree as it spells it: `or=(...)` is read as
+    /// `or(...)`, so the `=` is not a column and the operator's name is.
+    #[test]
+    fn an_empty_logic_tree_member_names_the_character_and_the_column() {
+        let error = parse_logic_param(LogicOperator::Or, false, "()").unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "\"failed to parse logic tree (())\" (line 1, column 4)"
+        );
+        match &error {
+            Error::UnparsableQuery { expected, .. } => assert_eq!(
+                expected,
+                "unexpected \")\" expecting field name (* or [a..z0..9_$]), \
+                 negation operator (not) or logic operator (and, or)"
+            ),
+            other => panic!("wrong variant: {:?}", other),
+        }
+
+        // `and` is a longer name, so the same shape reports one column later.
+        let error = parse_logic_param(LogicOperator::And, false, "()").unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "\"failed to parse logic tree (())\" (line 1, column 5)"
+        );
+
+        // A gap between two members is reported where the gap is.
+        let error = parse_logic_param(LogicOperator::Or, false, "(,)").unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "\"failed to parse logic tree ((,))\" (line 1, column 4)"
+        );
     }
 
 }
