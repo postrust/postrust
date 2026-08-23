@@ -993,12 +993,12 @@ fn push_json_body(
                 column.default.as_deref().unwrap_or("NULL")
             ));
         }
-        frag.push(match single || object {
+        frag.push(match object {
             true => "LATERAL (SELECT jsonb_build_object(",
             false => "LATERAL (SELECT jsonb_agg(jsonb_build_object(",
         });
         frag.push(&pairs);
-        frag.push(match single || object {
+        frag.push(match object {
             true => ") || pgrst_payload.json_data AS val) pgrst_defaults, ",
             false => {
                 ") || pgrst_element) AS val \
@@ -1026,11 +1026,13 @@ fn push_json_body(
             }
         }
     }
-    // `json_to_record` takes one object and `json_to_recordset` an array. An
-    // update writes one set of values whatever it matches, so its body is one
-    // object -- and a body that is not is an error PostgreSQL words better
-    // than this could. An insert may be either, and the body says which.
-    frag.push(match (merged, single || object) {
+    // `json_to_record` takes one object and `json_to_recordset` an array, and
+    // which one the body is is the body's own business -- an update written
+    // with a one-element array is still an update. What makes it single is the
+    // `LIMIT 1` below, not a claim about the body's shape: reading an array
+    // with `json_to_record` is an error about `populate_composite` that says
+    // nothing to the client that sent it.
+    frag.push(match (merged, object) {
         (false, true) => " FROM json_to_record(pgrst_payload.json_data) AS _(",
         (false, false) => " FROM json_to_recordset(pgrst_payload.json_data) AS _(",
         (true, true) => " FROM jsonb_to_record(pgrst_defaults.val) AS _(",
@@ -1044,9 +1046,16 @@ fn push_json_body(
         frag.push(" ");
         frag.push(castable_type(&column.ir_type).unwrap_or("text"));
     }
-    // Two parentheses: one closes the column definition list, one the lateral
-    // subquery the alias names.
-    frag.push(")) pgrst_body");
+    // One paren closes the column definition list; the `LIMIT 1` then applies
+    // to the lateral subquery, whose own paren closes after it.
+    //
+    // An update writes one set of values however many the body offers, so it
+    // takes the first. Without this an array body of two objects would update
+    // every matching row twice over.
+    frag.push(match single {
+        true => ") LIMIT 1) pgrst_body",
+        false => ")) pgrst_body",
+    });
 }
 
 /// The `RETURNING` list, qualified by the relation being written.
