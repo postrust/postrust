@@ -6,7 +6,11 @@ mod headers;
 pub use headers::parse_guc_headers;
 mod json;
 
-pub use headers::{build_response_headers, ContentRange};
+pub use headers::ContentRange;
+// Re-exported for the crates.io consumers the name is public API for. Allowed
+// here so that the re-export itself does not trip the deprecation it carries.
+#[allow(deprecated)]
+pub use headers::build_response_headers;
 pub use json::format_json_response;
 
 use http::{HeaderMap, HeaderValue, StatusCode};
@@ -273,6 +277,11 @@ fn add_common_headers(response: &mut Response, request: &ApiRequest, result: &Qu
         response.set_location(location);
     }
 
+    // Allow (for OPTIONS)
+    if let Some(allow) = &result.allow {
+        response.set_header("allow", allow);
+    }
+
     // Preference-Applied
     if let Some(applied) = postrust_core::api_request::preferences::preference_applied(
         &request.preferences,
@@ -371,6 +380,11 @@ pub struct QueryResult {
     pub content_range: Option<ContentRange>,
     /// Location header (for POST)
     pub location: Option<String>,
+    /// The methods an OPTIONS request is answering about.
+    ///
+    /// Only an OPTIONS sets this; every other response leaves it `None` and
+    /// sends no `Allow`, since the question was not asked.
+    pub allow: Option<String>,
     /// Custom headers from GUC
     pub guc_headers: Option<String>,
     /// Custom status from GUC

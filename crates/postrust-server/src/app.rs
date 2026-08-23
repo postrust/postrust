@@ -265,6 +265,13 @@ fn json_object<'a>(entries: impl IntoIterator<Item = (&'a String, &'a String)>) 
 /// The prefix given to primary key columns added only to build `Location`.
 const LOCATION_KEY_PREFIX: &str = "pgrst_location_";
 
+/// The column a media handler's statement carries its row count in.
+///
+/// Named like the other bookkeeping columns so it cannot collide with anything
+/// the request selected. Never reaches the client: the response body is the
+/// rendered value, read from the first column.
+const MEDIA_ROW_COUNT_COLUMN: &str = "pgrst_media_rows";
+
 /// Whether this request writes rows of a table.
 fn is_relation_mutation(api_request: &ApiRequest) -> bool {
     use postrust_core::api_request::{Action, DbAction};
@@ -420,7 +427,22 @@ async fn execute_plan(
                                         postrust_sql::escape_ident(&handler.aggregate.schema),
                                         postrust_sql::escape_ident(&handler.aggregate.name)
                                     ),
-                                    handler.table.is_some(),
+                                    // Applied to the table's own row, not to
+                                    // the derived one, whenever the derived
+                                    // row would be a worse description of it.
+                                    // A handler naming a table needs the row
+                                    // type by name; one taking `anyelement`
+                                    // needs the columns to still *be* what
+                                    // they are -- a handler calling
+                                    // `ST_AsGeoJSON` cannot find a geometry in
+                                    // a row whose geometry this side already
+                                    // rendered to jsonb. Only where the
+                                    // request did not reshape the rows, since
+                                    // then the two are the same rows.
+                                    handler.table.is_some()
+                                        || has_default_select(
+                                            &api_request.query_params.select,
+                                        ),
                                     handler.base_type.clone(),
                                 )
                             })
@@ -508,11 +530,18 @@ async fn execute_plan(
             // under names of our own so they cannot collide with anything the
             // request asked for, and are taken back out of the response once
             // the header is built.
+            //
+            // Only for `Prefer: return=headers-only`, which is the request
+            // that has no other way to learn where the row went. A client
+            // given the row back can read the key out of it, and PostgREST
+            // sends no `Location` there -- so neither does this. Deciding it
+            // here also means the key columns are never added to a select
+            // that had no use for them.
             let location_keys: Vec<String> = match db_plan {
                 DbActionPlan::MutateRead {
                     mutate: postrust_core::plan::MutatePlan::Insert { pk_cols, .. },
                     ..
-                } if !is_upsert(api_request) => pk_cols.clone(),
+                } if !is_upsert(api_request) && wants_location(api_request) => pk_cols.clone(),
                 _ => Vec::new(),
             };
             // Whether the write created a row or merged into an existing one.
@@ -753,6 +782,25 @@ async fn execute_plan(
                     });
                 }
 
+                // `or=(clientinfo.not.is.null,contact.not.is.null)` asks the
+                // same question of several embeds at once, and the answer is
+                // one predicate combining their existence tests. The read
+                // plan left the tree alone precisely so that it could be
+                // built here, where the embeds are in scope.
+                let embeds = postrust_core::api_request::embedded_names(
+                    &api_request.query_params.select,
+                );
+                for (path, tree) in &api_request.query_params.logic {
+                    if !path.is_empty() || !tree.names_only(&embeds) {
+                        continue;
+                    }
+                    if let Some(predicate) =
+                        embed_logic_predicate(tree, &embed_level.filterable)
+                    {
+                        predicates.push(predicate);
+                    }
+                }
+
                 if !predicates.is_empty() {
                     sql.push_str(" WHERE ");
                     sql.push_str(&predicates.join(" AND "));
@@ -837,10 +885,17 @@ async fn execute_plan(
                 } else {
                     "pgrst_media".to_string()
                 };
+                // `count(*)` alongside the handler: both are aggregates over
+                // the same set, and the rendered body is one value that has
+                // forgotten how many rows went into it. `Content-Range`
+                // describes the row set rather than the rendering, so the
+                // count has to be carried out of the same statement -- asking
+                // again afterwards would be a second snapshot.
                 let (with_clause, inner) = split_leading_cte(&sql);
                 sql = format!(
-                    "{}SELECT {}({})::text AS pgrst_body FROM ({}) pgrst_media",
-                    with_clause, aggregate, argument, inner
+                    "{}SELECT {}({})::text AS pgrst_body, count(*) AS {} \
+                     FROM ({}) pgrst_media",
+                    with_clause, aggregate, argument, MEDIA_ROW_COUNT_COLUMN, inner
                 );
                 debug!("Rendering {} via {}", media_type, aggregate);
             }
@@ -981,16 +1036,66 @@ async fn execute_plan(
                 // anything text-like that rendering *is* the value; for a
                 // `bytea` it is `\x` and hex, which describes the bytes
                 // rather than being them.
-                let body = rows
+                let mut body = rows
                     .first()
                     .and_then(|row| raw_column(row, &base_type))
                     .unwrap_or_default();
+
+                // PostgREST reads a handler's value as raw bytes in binary
+                // format, and a `jsonb` in binary format begins with a version
+                // byte -- which it forwards to the client. Its own suite
+                // records the result and marks it: "TODO SOH (start of
+                // heading) is being added to results".
+                //
+                // It is a bug, and the byte makes the body invalid JSON, so it
+                // is not something to do by default. Compatibility mode is
+                // where this server sets out to be PostgREST rather than to be
+                // right, and a client written against PostgREST's bytes gets
+                // PostgREST's bytes.
+                if state.config.compat_mode && base_type == "jsonb" {
+                    body.insert(0, 0x01);
+                }
+
+                // A rendered body is still a window on a result set, and
+                // PostgREST reports one. The row count comes from the
+                // aggregate's own statement where a handler rendered the rows;
+                // where the value is a function's media-type domain there was
+                // no aggregate, and the rows in hand are the answer.
+                let rendered_rows = match media_handler.is_some() {
+                    true => rows
+                        .first()
+                        .and_then(|row| {
+                            sqlx::Row::try_get::<i64, _>(row, MEDIA_ROW_COUNT_COLUMN).ok()
+                        })
+                        .unwrap_or_default(),
+                    false => rows.len() as i64,
+                };
+                let total = match (&api_request.preferences.count, &count_sql) {
+                    (Some(preference), Some(count_sql)) => {
+                        resolve_count(
+                            &mut tx,
+                            preference,
+                            count_sql,
+                            &params,
+                            api_request.max_rows,
+                        )
+                        .await?
+                    }
+                    _ => None,
+                };
+                let content_range = postrust_response::ContentRange::from_pagination(
+                    top_level_offset(api_request),
+                    rendered_rows,
+                    total,
+                );
+
                 tx.commit()
                     .await
                     .map_err(|e| postrust_core::Error::ConnectionPool(e.to_string()))?;
                 return Ok(QueryResult {
                     status: StatusCode::OK,
                     raw_body: Some((media_type, body)),
+                    content_range: Some(content_range),
                     ..QueryResult::default()
                 });
             }
@@ -1223,13 +1328,7 @@ async fn execute_plan(
             // overrides the `Range` header exactly as it does when the plan
             // resolves the range -- otherwise the reported window says 0 for a
             // request that plainly skipped rows.
-            let offset = api_request
-                .query_params
-                .ranges
-                .get("")
-                .map(|range| range.offset)
-                .filter(|offset| *offset != 0)
-                .unwrap_or(api_request.top_level_range.offset);
+            let offset = top_level_offset(api_request);
 
             // What a mutation reports is not a window on a result set. An
             // insert or a delete reports no window at all -- `*` -- because
@@ -1302,6 +1401,23 @@ async fn execute_plan(
         ActionPlan::Info(info_plan) => {
             use postrust_core::plan::InfoPlan;
 
+            // What an OPTIONS is for: the methods this particular relation or
+            // function will answer. Derived from the relation itself rather
+            // than from the routing table, which offers every method on every
+            // path and so can only ever give the same answer.
+            let allow = {
+                let schema_cache = state.schema_cache().await;
+                Some(match info_plan {
+                    InfoPlan::OpenApiSpec => "OPTIONS,GET,HEAD".to_string(),
+                    // Asking what may be done with a table that is not there
+                    // is answered the same way as asking for the table: an
+                    // OPTIONS that reports methods for a relation nobody can
+                    // reach describes something that does not exist.
+                    InfoPlan::RelationInfo(qi) => relation_allow(schema_cache.require_table(qi)?),
+                    InfoPlan::RoutineInfo(qi) => routine_allow(schema_cache.get_routines(qi)),
+                })
+            };
+
             // Return appropriate metadata based on the info type
             let response_data = match info_plan {
                 InfoPlan::OpenApiSpec => {
@@ -1331,9 +1447,61 @@ async fn execute_plan(
             Ok(QueryResult {
                 status: StatusCode::OK,
                 rows: vec![response_data],
+                allow,
                 ..Default::default()
             })
         }
+    }
+}
+
+/// The methods a relation answers, for the `Allow` of an OPTIONS.
+///
+/// Reading is always offered. Writing follows what the relation can actually
+/// do, which for a view is what its triggers give it: a view with only an
+/// INSERT trigger takes a POST and nothing else.
+///
+/// PUT is the exception that is not simply a permission. It replaces one row
+/// named by its primary key, so a relation without a primary key cannot
+/// answer it however writable it otherwise is -- which is why an auto-updatable
+/// view without a key offers POST, PATCH and DELETE but not PUT.
+///
+fn relation_allow(table: &postrust_core::schema_cache::Table) -> String {
+    let mut methods = vec!["OPTIONS", "GET", "HEAD"];
+
+    if table.insertable {
+        methods.push("POST");
+    }
+    if table.insertable && table.updatable && !table.pk_cols.is_empty() {
+        methods.push("PUT");
+    }
+    if table.updatable {
+        methods.push("PATCH");
+    }
+    if table.deletable {
+        methods.push("DELETE");
+    }
+
+    methods.join(",")
+}
+
+/// The methods a function answers, for the `Allow` of an OPTIONS.
+///
+/// A volatile function may change data, so it is reachable only by POST. One
+/// that cannot can also be read, and is offered under GET and HEAD as well.
+/// An overloaded name is readable when any of its overloads is.
+fn routine_allow(routines: Option<&Vec<postrust_core::schema_cache::Routine>>) -> String {
+    let readable = routines.is_some_and(|routines| {
+        routines.iter().any(|routine| {
+            !matches!(
+                routine.volatility,
+                postrust_core::schema_cache::FuncVolatility::Volatile
+            )
+        })
+    });
+
+    match readable {
+        true => "OPTIONS,GET,HEAD,POST".to_string(),
+        false => "OPTIONS,POST".to_string(),
     }
 }
 
@@ -1409,6 +1577,55 @@ fn read_target(
     }
 }
 
+/// One `?or=` or `?and=` over embedded resources, as a `WHERE` fragment.
+///
+/// Every leaf asks whether an embed matched, which is an existence test, and
+/// the tree is what combines them. `None` where any leaf asks something else,
+/// since half a condition is worse than none.
+fn embed_logic_predicate(
+    tree: &postrust_core::api_request::LogicTree,
+    filterable: &[(String, String)],
+) -> Option<String> {
+    use postrust_core::api_request::{IsValue, LogicOperator, LogicTree, Operation};
+
+    match tree {
+        LogicTree::Expr {
+            negated,
+            op,
+            children,
+        } => {
+            let rendered = children
+                .iter()
+                .map(|child| embed_logic_predicate(child, filterable))
+                .collect::<Option<Vec<String>>>()?;
+            let joined = rendered.join(match op {
+                LogicOperator::And => " AND ",
+                LogicOperator::Or => " OR ",
+            });
+            Some(match negated {
+                true => format!("NOT ({joined})"),
+                false => format!("({joined})"),
+            })
+        }
+        LogicTree::Stmt(filter) => {
+            let (_, exists) = filterable
+                .iter()
+                .find(|(name, _)| name == &filter.field.name)?;
+            // `is.null` asks for parents the embed did not match, so the
+            // existence test is the negation of it.
+            let negated = match &filter.op_expr.operation {
+                Operation::Is(IsValue::Null) => filter.op_expr.negated,
+                Operation::Is(IsValue::NotNull) => !filter.op_expr.negated,
+                _ => return None,
+            };
+            Some(match negated {
+                true => exists.clone(),
+                false => format!("NOT {exists}"),
+            })
+        }
+    }
+}
+
 /// Round a geometry's numbers to nine decimal places.
 ///
 /// Not cosmetic: nine is what `ST_AsGeoJSON` emits by default, and a geometry
@@ -1445,6 +1662,21 @@ fn round_coordinates(value: &mut serde_json::Value) {
 /// own text rendering. For text, xml or json that rendering is the value. For
 /// `bytea` it is `\x` followed by hex, which is a description of the bytes
 /// and not the bytes, so it is decoded back.
+/// Where the response's window starts.
+///
+/// An explicit top-level `?offset=` if there is one, and the range taken from
+/// the `Range` header otherwise. Both the JSON path and the rendered-media
+/// path report a `Content-Range` and must agree on where it begins.
+fn top_level_offset(api_request: &ApiRequest) -> i64 {
+    api_request
+        .query_params
+        .ranges
+        .get("")
+        .map(|range| range.offset)
+        .filter(|offset| *offset != 0)
+        .unwrap_or(api_request.top_level_range.offset)
+}
+
 fn raw_column(row: &sqlx::postgres::PgRow, base_type: &str) -> Option<Vec<u8>> {
     use sqlx::{Row, ValueRef};
 
@@ -1739,6 +1971,19 @@ fn wants_representation(api_request: &ApiRequest) -> bool {
     matches!(
         api_request.preferences.representation,
         postrust_core::api_request::PreferRepresentation::Full
+    )
+}
+
+/// Whether a created row's address is worth reporting.
+///
+/// `Prefer: return=headers-only` asks for exactly that and nothing else, and
+/// is the only request PostgREST answers with a `Location`. A caller taking
+/// the row back reads the key out of the body; a caller wanting neither asked
+/// for a minimal response and gets one.
+fn wants_location(api_request: &ApiRequest) -> bool {
+    matches!(
+        api_request.preferences.representation,
+        postrust_core::api_request::PreferRepresentation::HeadersOnly
     )
 }
 
@@ -2560,6 +2805,13 @@ fn build_embed_expressions(
         level.spread_columns.extend(nested.spread_columns);
         let nested_expressions = nested.expressions;
 
+        let child_table = schema_cache.get_table(
+            &postrust_core::api_request::QualifiedIdentifier::new(
+                &plan.foreign_schema,
+                &plan.foreign_table,
+            ),
+        );
+
         // The child's own columns. Empty means every column, which is what a
         // relation with no explicit selection asks for.
         let mut parts: Vec<String> = Vec::new();
@@ -2571,14 +2823,21 @@ fn build_embed_expressions(
                 }
                 SelectItem::Field { field, alias, .. } => {
                     let column = postrust_sql::escape_ident(&field.name);
-                    match alias {
-                        Some(alias) => parts.push(format!(
-                            "{} AS {}",
-                            column,
-                            postrust_sql::escape_ident(alias)
-                        )),
-                        None => parts.push(column),
-                    }
+                    // A schema that declared how one of its domains is written
+                    // on the wire meant it wherever the value appears, and an
+                    // embedded row is the same value in a different place.
+                    let rendered = child_table
+                        .as_ref()
+                        .and_then(|table| table.get_column(&field.name))
+                        .and_then(|c| schema_cache.representation(c.representation_type(), "json"))
+                        .map(|function| format!("{}({})", function, column))
+                        .unwrap_or_else(|| column.clone());
+                    let name = alias.as_deref().unwrap_or(&field.name);
+                    parts.push(format!(
+                        "{} AS {}",
+                        rendered,
+                        postrust_sql::escape_ident(name)
+                    ));
                 }
                 // Handled as an expression, not a column.
                 SelectItem::Relation { .. } | SelectItem::SpreadRelation { .. } => {}

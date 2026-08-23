@@ -168,7 +168,13 @@ pub fn preference_applied(prefs: &Preferences, relevance: PreferenceScope) -> Op
         values.extend(asked("return="));
     }
     values.extend(asked("count="));
-    values.extend(asked("tx="));
+    // `tx=` is deliberately absent. Ending the transaction the client's way
+    // is something PostgREST does only where `db-tx-end` is configured to let
+    // the request decide; by default the preference is not honoured, and so
+    // is not reported. There is no such setting here and nothing reads
+    // `Preferences::transaction`, which makes the answer the same one for a
+    // stronger reason: a rollback that was asked for and never happened must
+    // not come back described as applied.
     values.extend(asked("handling="));
     values.extend(asked("timezone="));
     // `max-affected` only has an effect under strict handling, so leniently
@@ -285,6 +291,33 @@ mod tests {
         assert_eq!(
             preference_applied(&prefs, PreferenceScope::read()).as_deref(),
             Some("count=exact")
+        );
+    }
+
+    /// A preference nothing here acts on is not reported as applied, however
+    /// plainly it was asked for. `tx=rollback` is parsed and then ignored --
+    /// the transaction commits either way -- so a client told the preference
+    /// was applied would believe its write had been undone.
+    #[test]
+    fn preference_applied_leaves_out_a_transaction_end_nothing_honours() {
+        let headers = headers_with_prefer("tx=rollback");
+        let prefs = parse_preferences(&headers).unwrap();
+
+        assert_eq!(
+            preference_applied(&prefs, PreferenceScope::read()),
+            None,
+            "tx= must not be reported while the transaction always commits"
+        );
+
+        let headers = headers_with_prefer("return=representation, tx=commit");
+        let prefs = parse_preferences(&headers).unwrap();
+        let writing = PreferenceScope {
+            representation: true,
+            ..PreferenceScope::read()
+        };
+        assert_eq!(
+            preference_applied(&prefs, writing).as_deref(),
+            Some("return=representation")
         );
     }
 

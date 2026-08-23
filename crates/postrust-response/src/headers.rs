@@ -71,6 +71,24 @@ impl fmt::Display for ContentRange {
 }
 
 /// Build response headers based on request and result.
+///
+/// # Deprecated
+///
+/// Nothing in this workspace calls this. The headers a response actually
+/// carries are built by `add_common_headers`, and the two have already drifted:
+/// `Allow` is sent for an OPTIONS by that path and not by this one, and the
+/// `Content-Range` a rendered media type reports is likewise decided there.
+/// Keeping a second implementation means every header fix has to be made
+/// twice, and the one that is missed is the one nobody is calling.
+///
+/// Deprecated rather than removed because this crate is published to
+/// crates.io, so the name is public API somebody outside this repository may
+/// be using. It will be removed in a future breaking release.
+#[deprecated(
+    since = "0.4.0",
+    note = "unused within the workspace and drifted from the live header path; \
+            responses are built by postrust_response::format_response"
+)]
 pub fn build_response_headers(
     request: &ApiRequest,
     content_type: &str,
