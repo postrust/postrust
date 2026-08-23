@@ -192,6 +192,14 @@ pub async fn graphql_playground() -> impl axum::response::IntoResponse {
     ))
 }
 
+/// The scalar at the bottom of a type, past any list wrapping.
+fn leaf_scalar_name(graphql_type: &crate::types::GraphQLType) -> String {
+    match graphql_type {
+        crate::types::GraphQLType::List(inner) => leaf_scalar_name(inner),
+        other => other.to_string(),
+    }
+}
+
 /// Build the dynamic async-graphql schema from our generated schema.
 fn build_dynamic_schema(
     generated: &GeneratedSchema,
@@ -279,13 +287,29 @@ fn build_dynamic_schema(
     }
 
     // Register scalar types
-    builder = builder.register(create_bigint_scalar());
-    builder = builder.register(create_bigdecimal_scalar());
-    builder = builder.register(create_json_scalar());
-    builder = builder.register(create_uuid_scalar());
-    builder = builder.register(create_date_scalar());
-    builder = builder.register(create_datetime_scalar());
-    builder = builder.register(create_time_scalar());
+    // Every scalar the generated types actually name, rather than a fixed
+    // list. A `geometry` column, a `raster` column and a database enum each
+    // become a scalar under their own PostgreSQL name, because that is the
+    // name a client's query declares its variables with -- and a scalar the
+    // schema mentions but never registers makes the whole schema unbuildable.
+    let mut scalar_names: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    for object in generated.object_types.values() {
+        for field in &object.fields {
+            scalar_names.insert(leaf_scalar_name(&field.graphql_type));
+        }
+    }
+    // Used as an argument type in its own right, whether or not any column is
+    // one: `objects`, `_set` and the mutation inputs are still JSON.
+    scalar_names.insert("JSON".to_string());
+
+    for name in scalar_names {
+        if matches!(name.as_str(), "Int" | "Float" | "String" | "Boolean" | "ID") {
+            continue;
+        }
+        builder = builder.register(
+            Scalar::new(&name).description(format!("The PostgreSQL `{}` type.", name)),
+        );
+    }
 
     // Register the boolean expression inputs -- one per table, plus one
     // comparison input per scalar the tables use.
@@ -2030,12 +2054,18 @@ fn comparison_sql(
     if let Some(sql_op) = binary {
         let placeholder = format!("${}", param_idx);
         *param_idx += 1;
-        // `?` is the JSONB key-existence operator and also what sqlx would
-        // read as a placeholder in some dialects; the parameter is bound
-        // either way, so the operator is written with its operand cast to the
-        // text a key test needs.
         values.push(operand.clone());
-        return Ok(format!("{} {} {}", quoted, sql_op, placeholder));
+        // A bound parameter arrives as text, and PostgreSQL will infer a type
+        // for it from the operator only where one is unambiguous. `@>` is
+        // defined over several pairs of types, so `jsonb @> text` is not an
+        // operator at all and the comparison fails outright. The containment
+        // and key operators say what they were given.
+        let cast = match op {
+            "_contains" | "_contained_in" => "::jsonb",
+            "_has_key" => "::text",
+            _ => "",
+        };
+        return Ok(format!("{} {} {}{}", quoted, sql_op, placeholder, cast));
     }
 
     match op {
@@ -2655,45 +2685,6 @@ fn json_to_value(json: serde_json::Value) -> Value {
     }
 }
 
-/// Create BigInt scalar type.
-fn create_bigint_scalar() -> Scalar {
-    Scalar::new("BigInt")
-        .description("64-bit integer")
-        .specified_by_url("https://spec.graphql.org/draft/#sec-Int")
-}
-
-/// Create BigDecimal scalar type.
-fn create_bigdecimal_scalar() -> Scalar {
-    Scalar::new("BigDecimal").description("Arbitrary precision decimal number")
-}
-
-/// Create JSON scalar type.
-fn create_json_scalar() -> Scalar {
-    Scalar::new("JSON")
-        .description("Arbitrary JSON value")
-        .specified_by_url("https://spec.graphql.org/draft/#sec-Scalars")
-}
-
-/// Create UUID scalar type.
-fn create_uuid_scalar() -> Scalar {
-    Scalar::new("UUID").description("UUID string")
-}
-
-/// Create Date scalar type.
-fn create_date_scalar() -> Scalar {
-    Scalar::new("Date").description("ISO 8601 date string (YYYY-MM-DD)")
-}
-
-/// Create DateTime scalar type.
-fn create_datetime_scalar() -> Scalar {
-    Scalar::new("DateTime").description("ISO 8601 datetime string")
-}
-
-/// Create Time scalar type.
-fn create_time_scalar() -> Scalar {
-    Scalar::new("Time").description("ISO 8601 time string (HH:MM:SS)")
-}
-
 /// Register filter input types.
 ///
 /// These are currently unreachable: the `filter` and `where` arguments are
@@ -2929,11 +2920,34 @@ mod tests {
     // ============================================================================
 
     #[test]
-    fn test_create_scalars() {
-        let _bigint = create_bigint_scalar();
-        let _json = create_json_scalar();
-        let _uuid = create_uuid_scalar();
-        let _datetime = create_datetime_scalar();
+    fn a_scalar_is_named_the_way_a_client_declares_it() {
+        use crate::types::{pg_type_to_graphql, GraphQLType};
+
+        // These names appear in the client's own queries -- `query ($x:
+        // jsonb!)` names a type that has to exist under exactly that
+        // spelling -- so they are asserted rather than left to the Display
+        // impl.
+        assert_eq!(pg_type_to_graphql("jsonb").to_string(), "jsonb");
+        assert_eq!(pg_type_to_graphql("json").to_string(), "json");
+        assert_eq!(pg_type_to_graphql("int8").to_string(), "bigint");
+        assert_eq!(pg_type_to_graphql("numeric").to_string(), "numeric");
+        assert_eq!(pg_type_to_graphql("timestamptz").to_string(), "timestamptz");
+        assert_eq!(pg_type_to_graphql("timestamp").to_string(), "timestamp");
+        assert_eq!(pg_type_to_graphql("uuid").to_string(), "uuid");
+
+        // A type this server knows nothing about keeps its own name, which is
+        // how a PostGIS column and a database enum both become usable.
+        assert_eq!(pg_type_to_graphql("geometry").to_string(), "geometry");
+        assert_eq!(
+            pg_type_to_graphql("colors_enum"),
+            GraphQLType::Custom("colors_enum".to_string())
+        );
+
+        // And the leaf of an array is what gets registered, not the array.
+        assert_eq!(
+            leaf_scalar_name(&pg_type_to_graphql("_text")),
+            "String".to_string()
+        );
     }
 
     // ============================================================================

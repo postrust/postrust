@@ -81,9 +81,9 @@ fn comparison_input(scalar: &str) -> InputObject {
             input = input.field(InputValue::new(*op, TypeRef::named("String")));
         }
     }
-    if scalar == "JSON" {
+    if scalar == "jsonb" || scalar == "json" {
         for op in JSON {
-            input = input.field(InputValue::new(*op, TypeRef::named("JSON")));
+            input = input.field(InputValue::new(*op, TypeRef::named(scalar)));
         }
         input = input.field(InputValue::new("_has_key", TypeRef::named("String")));
         input = input.field(InputValue::new("_has_keys_any", TypeRef::named_list("String")));
@@ -96,13 +96,13 @@ fn comparison_input(scalar: &str) -> InputObject {
 /// The scalar a column is compared against.
 ///
 /// An array column is compared against its element type: `_contains` on a
-/// `text[]` takes text, not a list of lists. A column of a type with no
-/// scalar of its own is compared as a string, which is what the SQL cast in
-/// the resolver does with it anyway.
+/// `text[]` takes text, not a list of lists. Everything else compares as
+/// itself, including the types that carry their own PostgreSQL name -- a
+/// `geometry` column takes a `geometry`, and a client that declares
+/// `$area: geometry!` is naming the type this produces.
 fn scalar_for(graphql_type: &GraphQLType) -> String {
     match graphql_type {
         GraphQLType::List(inner) => scalar_for(inner),
-        GraphQLType::Custom(_) => "String".to_string(),
         other => other.to_string(),
     }
 }
@@ -197,8 +197,8 @@ mod tests {
     }
 
     #[test]
-    fn a_type_with_no_scalar_of_its_own_is_compared_as_text() {
+    fn a_type_with_its_own_name_compares_as_itself() {
         let custom = GraphQLType::Custom("geography".to_string());
-        assert_eq!(scalar_for(&custom), "String");
+        assert_eq!(scalar_for(&custom), "geography");
     }
 }

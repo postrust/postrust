@@ -81,10 +81,13 @@ pub fn is_numeric(graphql_type: &GraphQLType) -> bool {
 /// matters in practice: `max(details)` on a `jsonb` column is an error, not an
 /// empty result.
 pub fn is_ordered(graphql_type: &GraphQLType) -> bool {
-    !matches!(
-        graphql_type,
-        GraphQLType::Json | GraphQLType::List(_) | GraphQLType::Custom(_)
-    )
+    match graphql_type {
+        GraphQLType::Json | GraphQLType::List(_) => false,
+        // A named type orders unless PostgreSQL has no operator class for it.
+        // `json` has none -- `max(details)` is an error, not an empty result.
+        GraphQLType::Custom(name) => !matches!(name.as_str(), "json" | "raster"),
+        _ => true,
+    }
 }
 
 /// The columns each aggregate function applies to, for one table.
@@ -174,6 +177,8 @@ mod tests {
         // `max(details)` on a jsonb column is an error in PostgreSQL, so the
         // field is not offered rather than offered and failing.
         assert!(!is_ordered(&GraphQLType::Json));
+        assert!(!is_ordered(&GraphQLType::Custom("json".to_string())));
+        assert!(is_ordered(&GraphQLType::Custom("timestamp".to_string())));
         assert!(is_ordered(&GraphQLType::String));
         assert!(is_ordered(&GraphQLType::DateTime));
     }

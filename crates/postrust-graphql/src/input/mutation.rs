@@ -391,7 +391,7 @@ mod tests {
 
         assert_eq!(field.name, "created_at");
         assert!(!field.required); // Has default
-        assert_eq!(field.type_string(), "DateTime");
+        assert_eq!(field.type_string(), "timestamptz");
     }
 
     #[test]
