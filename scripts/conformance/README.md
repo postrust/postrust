@@ -4,12 +4,17 @@ Measures how closely Postrust's HTTP surface matches PostgREST's, using
 PostgREST's own test fixtures and its own test cases.
 
 ```bash
-cargo build --release -p postrust-server --features admin-ui
+cargo build --release -p postrust-server --features admin-ui,compat-key-order
 scripts/conformance/conformance.sh
 ```
 
 Takes about ten minutes, most of it restoring fixture data between mutating
 cases.
+
+[FINDINGS.md](FINDINGS.md) records what the runs have turned up: faults found
+in this harness itself, divergences kept on purpose, and the gaps still open.
+Read it before treating a failing case as a bug — some of them are failing
+because PostgREST is wrong and this server is not.
 
 ## Why this isn't just "run PostgREST's tests"
 

@@ -54,9 +54,14 @@ cleanup() {
 }
 trap cleanup EXIT
 
+# `compat-key-order` is part of what is being measured, not an optimisation:
+# PostgREST returns object keys in the table's order and this server returns
+# them alphabetically without it. Invisible in JSON, since bodies are compared
+# as JSON -- but a CSV response puts its columns in key order, and there the
+# difference is the whole answer.
 if [ ! -x "$REPO_ROOT/target/release/postrust" ]; then
     echo "error: target/release/postrust not found." >&2
-    echo "       cargo build --release -p postrust-server --features admin-ui" >&2
+    echo "       cargo build --release -p postrust-server --features admin-ui,compat-key-order" >&2
     exit 1
 fi
 
