@@ -2390,6 +2390,10 @@ fn accessor_to_json(accessor: &ValueAccessor<'_>) -> serde_json::Value {
             .unwrap_or(serde_json::Value::Null)
     } else if let Ok(s) = accessor.string() {
         serde_json::Value::String(s.to_string())
+    } else if let Ok(name) = accessor.enum_name() {
+        // An enum value is not a string to `string()`, and falling through to
+        // null made every `order_by: {name: asc}` read as an empty direction.
+        serde_json::Value::String(name.to_string())
     } else if let Ok(list) = accessor.list() {
         serde_json::Value::Array(list.iter().map(|v| accessor_to_json(&v)).collect())
     } else if let Ok(obj) = accessor.object() {
