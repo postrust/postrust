@@ -42,6 +42,13 @@ pub struct Routine {
     /// wire.
     #[serde(default)]
     pub media_type: Option<String>,
+    /// The type that media-type domain is a domain over.
+    ///
+    /// A `bytea` renders as `\x` followed by hex when this side cannot name
+    /// its type, and that rendering is a description of the bytes rather than
+    /// the bytes. See [`Self::media_type`].
+    #[serde(default)]
+    pub media_base_type: Option<String>,
     /// The columns a `RETURNS TABLE` function's rows have, as `(name, type)`.
     ///
     /// A function returning rows of a table is shaped by that table, whose
@@ -166,6 +173,7 @@ mod tests {
         let mut routine = Routine {
             output_columns: Vec::new(),
             media_type: None,
+            media_base_type: None,
             schema: "public".into(),
             name: "get_users".into(),
             description: None,

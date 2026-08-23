@@ -780,7 +780,11 @@ impl QueryBuilder {
         // value straight to `to_jsonb`, which reads the names off the record
         // itself. That is where `returns_record()` gets `{"id": 1, ...}` from
         // without anyone having declared what its columns are.
+        // A function whose return type is a media-type domain has already
+        // produced the response body. Wrapping it in JSON would make the
+        // response a JSON string *about* a PNG rather than the PNG.
         let render_as_json = read.is_none()
+            && plan.media_type.is_none()
             && !plan.returns_composite
             && plan
                 .return_type

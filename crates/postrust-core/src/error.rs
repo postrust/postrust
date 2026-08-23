@@ -188,6 +188,14 @@ pub enum Error {
     #[error("Could not parse JSON in the \"RAISE SQLSTATE 'PGRST'\" error")]
     RaiseNotUnderstood(RaiseFault),
 
+    /// `Accept: application/geo+json` on rows that carry no geometry.
+    ///
+    /// PostGIS raises this from `ST_AsGeoJSON` on a record with no geometry
+    /// column, and it is a database error rather than one of PostgREST's own
+    /// -- so it keeps the SQLSTATE it came with.
+    #[error("geometry column is missing")]
+    MissingGeometryColumn,
+
     #[error("Column not found: {0}")]
     ColumnNotFound(String),
 
@@ -336,7 +344,8 @@ impl Error {
             | Self::MaxAffectedExceeded(_)
             | Self::InvalidPlan(_)
             | Self::EmbeddingError(_)
-            | Self::AggregatesNotAllowed => StatusCode::BAD_REQUEST,
+            | Self::AggregatesNotAllowed
+            | Self::MissingGeometryColumn => StatusCode::BAD_REQUEST,
 
             // The request names something real, but not which one of it.
             Self::AmbiguousFunction { .. } | Self::AmbiguousRelationship { .. } => {
@@ -429,6 +438,7 @@ impl Error {
             Self::NotFound(_) => "PGRST205",
             Self::TableNotFound { .. } => "PGRST205",
             Self::FunctionNotFound { .. } => "PGRST202",
+            Self::MissingGeometryColumn => "22023",
             Self::ColumnNotFound(_) => "PGRST204",
             Self::RelationshipNotFound { .. } => "PGRST200",
             Self::NotAnEmbeddedResource(_) => "PGRST108",

@@ -713,6 +713,57 @@ impl MediaType {
             Self::Plan { .. } => "application/vnd.pgrst.plan+json",
         }
     }
+
+    /// The type's full name, parameters included.
+    ///
+    /// [`Self::content_type`] answers what a response body *is*, which never
+    /// needs the parameters. Naming a type back to a client does: a plan is
+    /// not the same request as a plan for CSV with `analyze` on, and a client
+    /// told only `application/vnd.pgrst.plan+json` has not been told which of
+    /// its requests was refused.
+    pub fn to_mime(&self) -> String {
+        match self {
+            Self::SingularJson {
+                strip_nulls: true, ..
+            } => "application/vnd.pgrst.object+json;nulls=stripped".to_string(),
+            Self::ArrayJson { strip_nulls: true } => {
+                "application/vnd.pgrst.array+json;nulls=stripped".to_string()
+            }
+            // Without the parameter there is nothing to distinguish it from
+            // plain JSON, which is the name it is known by.
+            Self::ArrayJson { strip_nulls: false } => "application/json".to_string(),
+            Self::Plan {
+                base,
+                format,
+                options,
+            } => {
+                let mut mime = format!(
+                    "application/vnd.pgrst.plan+{}; for=\"{}\"",
+                    match format {
+                        PlanFormat::Json => "json",
+                        PlanFormat::Text => "text",
+                    },
+                    base.to_mime()
+                );
+                if !options.is_empty() {
+                    let named: Vec<&str> = options
+                        .iter()
+                        .map(|option| match option {
+                            PlanOption::Analyze => "analyze",
+                            PlanOption::Verbose => "verbose",
+                            PlanOption::Settings => "settings",
+                            PlanOption::Buffers => "buffers",
+                            PlanOption::Wal => "wal",
+                        })
+                        .collect();
+                    mime.push_str("; options=");
+                    mime.push_str(&named.join("|"));
+                }
+                mime
+            }
+            other => other.content_type().to_string(),
+        }
+    }
 }
 
 /// EXPLAIN plan format.

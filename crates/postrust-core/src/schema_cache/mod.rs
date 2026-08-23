@@ -232,19 +232,43 @@ impl SchemaCache {
     ///
     /// A handler declared for the table itself wins over one taking
     /// `anyelement`, which is the schema-wide fallback.
-    pub fn media_handler(
-        &self,
+    /// A schema may also declare a handler for `*/*`, which renders whatever
+    /// was asked for. What comes back is the handler and the media type the
+    /// response should be labelled with -- not always the one requested, since
+    /// `*/*` is not a type a response can claim to be. PostgREST resolves it
+    /// to `application/octet-stream`, which is what a body of unnamed bytes
+    /// is, and this follows it.
+    /// A handler declared for one table renders that table as it is, so it
+    /// only applies to a request that asked for the table as it is:
+    /// `?select=id` is a different shape from the one the handler was written
+    /// against, and running it over that shape produces either nonsense or an
+    /// error. PostgREST guards both table-specific lookups on the selection
+    /// being the default one, and `default_select` is that guard.
+    pub fn media_handler<'a>(
+        &'a self,
         schema: &str,
-        media_type: &str,
+        media_type: &'a str,
         table: &QualifiedIdentifier,
-    ) -> Option<&MediaHandler> {
-        let candidates = self
-            .media_handlers
-            .get(&(schema.to_string(), media_type.to_string()))?;
-        candidates
-            .iter()
-            .find(|h| h.table.as_ref() == Some(table))
-            .or_else(|| candidates.iter().find(|h| h.table.is_none()))
+        default_select: bool,
+    ) -> Option<(&'a MediaHandler, &'a str)> {
+        let named = |media: &str| {
+            let candidates = self
+                .media_handlers
+                .get(&(schema.to_string(), media.to_string()))?;
+            candidates
+                .iter()
+                .find(|h| default_select && h.table.as_ref() == Some(table))
+                .or_else(|| candidates.iter().find(|h| h.table.is_none()))
+        };
+
+        match named(media_type) {
+            Some(handler) => Some((handler, media_type)),
+            // `*/*` is declared on a table, so it is a table lookup too.
+            None if default_select => {
+                named("*/*").map(|handler| (handler, "application/octet-stream"))
+            }
+            None => None,
+        }
     }
 
     /// The error to report when no relationship connects two resources.

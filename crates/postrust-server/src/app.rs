@@ -103,14 +103,6 @@ async fn process_request(
         api_request.payload = payload;
     }
 
-    // `application/vnd.pgrst.plan` asks for the query plan instead of the
-    // result. It is off unless a server turns it on -- it says a great deal
-    // about the schema and the data -- and a server that has not is required
-    // to say so rather than answer with something else.
-    if let Some(plan) = requested_plan(&api_request) {
-        return Err(postrust_core::Error::InvalidMediaType(plan));
-    }
-
     // A body that names different columns row by row cannot be written by one
     // statement. Skipped when `?columns=` says which columns to write, since
     // then the rows are free to differ.
@@ -127,6 +119,19 @@ async fn process_request(
         return Err(postrust_core::Error::InvalidBody(
             "Empty or invalid json".into(),
         ));
+    }
+
+    // `application/vnd.pgrst.plan` asks for the query plan instead of the
+    // result. It is off unless a server turns it on -- it says a great deal
+    // about the schema and the data -- and a server that has not is required
+    // to say so rather than answer with something else.
+    //
+    // Checked after the body, not before it: a request that could not be read
+    // at all has not got as far as asking for anything, and PostgREST answers
+    // it with what is wrong with the request rather than with what the server
+    // declines to serve.
+    if let Some(plan) = requested_plan(&api_request) {
+        return Err(postrust_core::Error::InvalidMediaType(plan));
     }
 
     // Get schema cache
@@ -178,17 +183,20 @@ async fn process_request(
 /// A request that would also take JSON gets JSON; one that will take only the
 /// plan is refused, and the message names what it asked for.
 fn requested_plan(api_request: &ApiRequest) -> Option<String> {
-    let accepted: Vec<&str> = api_request
+    use postrust_core::api_request::MediaType;
+
+    // Named back with their parameters, since that is what was asked for: a
+    // plan for CSV and a plan for JSON are different requests, and a client
+    // told only that "application/vnd.pgrst.plan+json" is unavailable has not
+    // been told which of its requests was refused.
+    let accepted: Vec<String> = api_request
         .accept_media_types
         .iter()
-        .map(|media| media.content_type())
+        .filter(|media| matches!(media, MediaType::Plan { .. }))
+        .map(MediaType::to_mime)
         .collect();
 
-    match accepted
-        .iter()
-        .all(|media| media.starts_with("application/vnd.pgrst.plan"))
-        && !accepted.is_empty()
-    {
+    match accepted.len() == api_request.accept_media_types.len() && !accepted.is_empty() {
         true => Some(accepted.join(", ")),
         false => None,
     }
@@ -398,21 +406,50 @@ async fn execute_plan(
                 read_target(api_request, Some(db_plan), &schema_cache).and_then(|qi| {
                     api_request.accept_media_types.iter().find_map(|media| {
                         schema_cache
-                            .media_handler(&api_request.schema, media.content_type(), &qi)
-                            .map(|handler| {
+                            .media_handler(
+                                &api_request.schema,
+                                media.content_type(),
+                                &qi,
+                                has_default_select(&api_request.query_params.select),
+                            )
+                            .map(|(handler, resolved)| {
                                 (
-                                    media.content_type().to_string(),
+                                    resolved.to_string(),
                                     format!(
                                         "{}.{}",
                                         postrust_sql::escape_ident(&handler.aggregate.schema),
                                         postrust_sql::escape_ident(&handler.aggregate.name)
                                     ),
                                     handler.table.is_some(),
+                                    handler.base_type.clone(),
                                 )
                             })
                     })
                 })
             };
+
+            // Content negotiation. A media type is rendered by a builtin, by a
+            // handler the schema declared, or by the function's own return
+            // type -- and a request that names only types nothing here can
+            // render has not been answered by serving it JSON under a
+            // `Content-Type` it never asked for. PostgREST refuses it, naming
+            // everything that was asked for.
+            if media_handler.is_none()
+                && declared_media_type(db_plan, api_request).is_none()
+                && !api_request
+                    .accept_media_types
+                    .iter()
+                    .any(renders_without_a_handler)
+            {
+                return Err(postrust_core::Error::InvalidMediaType(
+                    api_request
+                        .accept_media_types
+                        .iter()
+                        .map(postrust_core::api_request::MediaType::to_mime)
+                        .collect::<Vec<_>>()
+                        .join(", "),
+                ));
+            }
 
             // Carry the parent's whole row out of the inner query when a
             // computed relationship needs it as an argument. It has to be
@@ -420,7 +457,7 @@ async fn execute_plan(
             // reference to the table yields its composite type, whereas the
             // derived table it becomes one level up yields a `record`.
             let needs_parent_row = added_join_columns.iter().any(|c| c == PARENT_ROW_COLUMN)
-                || matches!(&media_handler, Some((_, _, true)));
+                || matches!(&media_handler, Some((_, _, true, _)));
             let db_plan = &if needs_parent_row {
                 let mut adjusted = db_plan.clone();
                 // A function's result is a relation too, named after the
@@ -618,6 +655,7 @@ async fn execute_plan(
                     &schema_cache,
                     parent_qi,
                     &tree.root.order,
+                    &api_request.query_params.select,
                     &mut embed_filters,
                 )?;
             }
@@ -756,59 +794,35 @@ async fn execute_plan(
             // table's geometry column and whose properties are the rest. A
             // schema-declared handler overrides it, which is why this only
             // runs when none matched.
-            let geojson_column = if media_handler.is_none() {
+            //
+            // Asking for GeoJSON from rows that carry no geometry is an error
+            // rather than a plain JSON body: the client asked for features,
+            // and a list of objects with no geometry is not features.
+            let wants_geojson = media_handler.is_none()
+                && api_request
+                    .accept_media_types
+                    .iter()
+                    .any(|m| matches!(m, postrust_core::api_request::MediaType::GeoJson));
+            let geojson_column = if wants_geojson {
                 let schema_cache = state.schema_cache().await;
-                read_target(api_request, Some(db_plan), &schema_cache)
-                    .filter(|_| {
-                        api_request
-                            .accept_media_types
-                            .iter()
-                            .any(|m| matches!(m, postrust_core::api_request::MediaType::GeoJson))
-                    })
-                    .and_then(|qi| {
-                        schema_cache.get_table(&qi).and_then(|table| {
-                            table
-                                .columns
-                                .values()
-                                .find(|c| {
-                                    matches!(c.nominal_type.as_str(), "geometry" | "geography")
-                                })
-                                .map(|c| c.name.clone())
-                        })
-                    })
+                let target = read_target(api_request, Some(db_plan), &schema_cache);
+                match target.as_ref().and_then(|qi| schema_cache.get_table(qi)) {
+                    Some(table) => {
+                        match geometry_key(table, &api_request.query_params.select) {
+                            Some(column) => Some(column),
+                            None => return Err(postrust_core::Error::MissingGeometryColumn),
+                        }
+                    }
+                    // Nothing this side can name a geometry column on -- a
+                    // scalar function, say. Left to the database, which is
+                    // where the answer was coming from anyway.
+                    None => None,
+                }
             } else {
                 None
             };
 
-            if let Some(column) = &geojson_column {
-                // The geometry column already arrives as jsonb, since a
-                // user-defined type is rendered by the database. For a
-                // geometry that rendering is GeoJSON with a `crs` key, and
-                // dropping that key is exactly `ST_AsGeoJSON` -- which also
-                // means this needs no PostGIS function in scope.
-                //
-                // The name is a real column's, read from the catalogue rather
-                // than from the request, but it is quoted both ways all the
-                // same: as an identifier to read the column, and as a literal
-                // to drop that key from the properties.
-                // A mutation's rows come from a data-modifying CTE, which
-                // PostgreSQL allows only at the top level -- so the rendering
-                // wraps what follows the `WITH`, not the whole statement.
-                let (with_clause, inner) = split_leading_cte(&sql);
-                sql = format!(
-                    "{with_clause}SELECT json_build_object('type', 'FeatureCollection', \
-                     'features', COALESCE(json_agg(json_build_object('type', 'Feature', \
-                     'geometry', pgrst_geo.{column} - 'crs', 'properties', \
-                     to_jsonb(pgrst_geo) - '{key}')), '[]'::json))::text \
-                     AS pgrst_body FROM ({inner}) pgrst_geo",
-                    with_clause = with_clause,
-                    column = postrust_sql::escape_ident(column),
-                    key = column.replace('\'', "''"),
-                    inner = inner
-                );
-            }
-
-            if let Some((media_type, aggregate, over_row)) = &media_handler {
+            if let Some((media_type, aggregate, over_row, _)) = &media_handler {
                 // The aggregate takes the table's own row type. A derived
                 // table yields `record`, which will not cast to it, so where
                 // the handler names a table the aggregate is applied to the
@@ -957,29 +971,19 @@ async fn execute_plan(
             // `Vec<PgRow>` staying alive alongside the whole `Vec<Value>`.
             // A rendered media type is a single value, not a row set: the
             // aggregate already produced the entire body.
-            if let Some(media_type) = media_handler
+            if let Some((media_type, base_type)) = media_handler
                 .as_ref()
-                .map(|(m, _, _)| m.clone())
-                .or_else(|| {
-                    geojson_column
-                        .as_ref()
-                        .map(|_| "application/geo+json".to_string())
-                })
+                .map(|(m, _, _, base)| (m.clone(), base.clone()))
                 .or_else(|| declared_media_type(db_plan, api_request))
             {
-                use sqlx::Row;
-                // Read as bytes where the media type is not text: a value that
-                // is a PNG is not a string, and asking for one back gets
-                // nothing at all.
+                // The value's type is a domain this side has no mapping for,
+                // so it arrives as PostgreSQL's text rendering of it. For
+                // anything text-like that rendering *is* the value; for a
+                // `bytea` it is `\x` and hex, which describes the bytes
+                // rather than being them.
                 let body = rows
                     .first()
-                    .and_then(|row| {
-                        row.try_get::<Option<String>, _>(0)
-                            .map(|text| text.map(String::into_bytes))
-                            .or_else(|_| row.try_get::<Option<Vec<u8>>, _>(0))
-                            .ok()
-                    })
-                    .flatten()
+                    .and_then(|row| raw_column(row, &base_type))
                     .unwrap_or_default();
                 tx.commit()
                     .await
@@ -1198,6 +1202,19 @@ async fn execute_plan(
             let affected = json_rows.len();
             let rows = if omit_body { Vec::new() } else { json_rows };
 
+            // `application/geo+json` is a rendering of these same rows, done
+            // here rather than in SQL so that everything a mutation reports
+            // has already happened to them: the status derived, the location
+            // taken from the key, the bookkeeping columns removed. Built in
+            // SQL it saw the row as the statement left it, and leaked
+            // `pgrst_inserted` into a feature's properties.
+            let geojson_body = geojson_column.as_ref().filter(|_| !omit_body).map(|column| {
+                (
+                    "application/geo+json".to_string(),
+                    feature_collection(&rows, column),
+                )
+            });
+
             // PostgREST reports the returned window on every successful data
             // response -- reads, mutations and RPC alike, but not on errors or
             // OPTIONS. Without an exact count the total is unknown, which
@@ -1278,6 +1295,7 @@ async fn execute_plan(
                 location,
                 content_range,
                 guc_headers,
+                raw_body: geojson_body,
                 ..Default::default()
             })
         }
@@ -1389,6 +1407,185 @@ fn read_target(
         },
         _ => None,
     }
+}
+
+/// Round a geometry's numbers to nine decimal places.
+///
+/// Not cosmetic: nine is what `ST_AsGeoJSON` emits by default, and a geometry
+/// read through the type's own rendering carries every digit the double has.
+/// Nine decimal places of latitude is under a tenth of a millimetre, so the
+/// digits past it describe floating-point representation rather than any
+/// place on the earth.
+fn round_coordinates(value: &mut serde_json::Value) {
+    match value {
+        serde_json::Value::Array(items) => items.iter_mut().for_each(round_coordinates),
+        serde_json::Value::Object(fields) => fields.values_mut().for_each(round_coordinates),
+        serde_json::Value::Number(number) => {
+            let Some(float) = number.as_f64() else { return };
+            if float.fract() == 0.0 {
+                return;
+            }
+            // Through the decimal text rather than by arithmetic: scaling by a
+            // power of ten and rounding back reintroduces exactly the digits
+            // this is meant to drop.
+            if let Ok(rounded) = format!("{float:.9}").parse::<f64>() {
+                if let Some(rounded) = serde_json::Number::from_f64(rounded) {
+                    *number = rounded;
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+/// The first column of a row, as the bytes the client should receive.
+///
+/// A media type the schema declared is carried by a domain, and a domain is a
+/// type this side has no decoder for -- so the value arrives as PostgreSQL's
+/// own text rendering. For text, xml or json that rendering is the value. For
+/// `bytea` it is `\x` followed by hex, which is a description of the bytes
+/// and not the bytes, so it is decoded back.
+fn raw_column(row: &sqlx::postgres::PgRow, base_type: &str) -> Option<Vec<u8>> {
+    use sqlx::{Row, ValueRef};
+
+    let value = row.try_get_raw(0).ok()?;
+    if value.is_null() {
+        return None;
+    }
+    let bytes = value.as_bytes().ok()?.to_vec();
+    if base_type != "bytea" {
+        return Some(bytes);
+    }
+    // Text or binary, depending on whether this connection asked for a format
+    // it could name -- so the `\x` rendering is decoded where it appears and
+    // the bytes are passed through where they do not.
+    let Some(hex) = bytes.strip_prefix(b"\\x") else {
+        return Some(bytes);
+    };
+    hex.chunks(2)
+        .map(|pair| {
+            let digits = std::str::from_utf8(pair).ok()?;
+            u8::from_str_radix(digits, 16).ok()
+        })
+        .collect::<Option<Vec<u8>>>()
+        .or(Some(bytes))
+}
+
+/// Whether the selection is the one a table has when none was asked for.
+///
+/// A handler declared for a table renders the table's own rows, so it applies
+/// only where the request did not reshape them. `?select=*` is that shape
+/// written out; `?select=id` and any embed are not.
+fn has_default_select(select: &[postrust_core::api_request::SelectItem]) -> bool {
+    use postrust_core::api_request::SelectItem;
+
+    match select {
+        [] => true,
+        [SelectItem::Field { field, alias, .. }] => field.name == "*" && alias.is_none(),
+        _ => false,
+    }
+}
+
+/// Whether this server renders the type itself, with nothing declared for it.
+fn renders_without_a_handler(media: &postrust_core::api_request::MediaType) -> bool {
+    use postrust_core::api_request::MediaType;
+
+    matches!(
+        media,
+        MediaType::ApplicationJson
+            | MediaType::Any
+            | MediaType::TextCsv
+            | MediaType::GeoJson
+            | MediaType::SingularJson { .. }
+            | MediaType::ArrayJson { .. }
+            | MediaType::OpenApi
+    )
+}
+
+/// Render rows as a GeoJSON `FeatureCollection`.
+///
+/// The geometry arrives already rendered: a user-defined type is rendered by
+/// the database, and what PostGIS renders a geometry as is GeoJSON -- with a
+/// `crs` key, which a feature's geometry does not carry. Everything else on
+/// the row is the feature's properties, the geometry excepted, since a
+/// feature's geometry is not also one of its properties.
+fn feature_collection(rows: &[serde_json::Value], column: &str) -> Vec<u8> {
+    let features: Vec<serde_json::Value> = rows
+        .iter()
+        .map(|row| {
+            let mut properties = row.clone();
+            let geometry = properties
+                .as_object_mut()
+                .and_then(|fields| fields.remove(column))
+                .map(|mut geometry| {
+                    if let Some(fields) = geometry.as_object_mut() {
+                        fields.remove("crs");
+                    }
+                    round_coordinates(&mut geometry);
+                    geometry
+                })
+                .unwrap_or(serde_json::Value::Null);
+            serde_json::json!({
+                "type": "Feature",
+                "geometry": geometry,
+                "properties": properties,
+            })
+        })
+        .collect();
+    serde_json::to_vec(&serde_json::json!({
+        "type": "FeatureCollection",
+        "features": features,
+    }))
+    .unwrap_or_default()
+}
+
+/// The key under which a GeoJSON feature's geometry is read.
+///
+/// A table may carry more than one geometry column, and `?select=` is what
+/// says which of them the request is about: `select=id,name,range_area` asks
+/// for a collection of areas, not for whichever geometry the catalogue
+/// happens to list first. The name wanted is the one the response uses, so an
+/// aliased column is found under its alias -- which is also the key that has
+/// to come back out of `properties`, since a feature's geometry is not also
+/// one of its properties.
+///
+/// `None` means the rows carry no geometry at all, which is not a GeoJSON
+/// response with something missing from it but a request that cannot be
+/// answered.
+fn geometry_key(
+    table: &postrust_core::schema_cache::Table,
+    select: &[postrust_core::api_request::SelectItem],
+) -> Option<String> {
+    use postrust_core::api_request::SelectItem;
+
+    let is_geometry = |name: &str| {
+        table
+            .get_column(name)
+            .is_some_and(|c| matches!(c.nominal_type.as_str(), "geometry" | "geography"))
+    };
+
+    // `*` and a named column can both appear in one selection, and a column
+    // named outright is the one meant even so: `select=*,range_area` is a
+    // request about areas.
+    let mut selects_every_column = select.is_empty();
+    for item in select {
+        if let SelectItem::Field { field, alias, .. } = item {
+            if field.name == "*" {
+                selects_every_column = true;
+            } else if is_geometry(&field.name) {
+                return Some(alias.clone().unwrap_or_else(|| field.name.clone()));
+            }
+        }
+    }
+
+    if !selects_every_column {
+        return None;
+    }
+    table
+        .columns
+        .values()
+        .find(|c| matches!(c.nominal_type.as_str(), "geometry" | "geography"))
+        .map(|c| c.name.clone())
 }
 
 /// Whether any part of the selection, at any depth, asks for an aggregate.
@@ -2124,6 +2321,31 @@ fn flatten_spreads(
     }
 }
 
+/// The relation an embed names, found by the name the response uses.
+fn embedded_by_name<'a>(
+    select: &'a [postrust_core::api_request::SelectItem],
+    name: &str,
+) -> Option<(&'a str, Option<&'a str>)> {
+    use postrust_core::api_request::SelectItem;
+
+    select.iter().find_map(|item| match item {
+        SelectItem::Relation {
+            relation,
+            alias,
+            hint,
+            ..
+        } if alias.as_deref().unwrap_or(relation) == name => {
+            Some((relation.as_str(), hint.as_deref()))
+        }
+        // A spread has no alias -- nothing is being named -- so it answers to
+        // the relation's own name.
+        SelectItem::SpreadRelation { relation, hint, .. } if relation == name => {
+            Some((relation.as_str(), hint.as_deref()))
+        }
+        _ => None,
+    })
+}
+
 /// Build the `ORDER BY` expressions for terms naming an embedded resource.
 ///
 /// `order=clients(name)` orders by a column the parent does not have, so each
@@ -2134,6 +2356,7 @@ fn build_embed_orders(
     schema_cache: &postrust_core::SchemaCache,
     parent_qi: &postrust_core::api_request::QualifiedIdentifier,
     order: &[postrust_core::plan::CoercibleOrderTerm],
+    select: &[postrust_core::api_request::SelectItem],
     ctx: &mut EmbedFilters<'_>,
 ) -> Result<Vec<String>, postrust_core::Error> {
     let mut orders = Vec::new();
@@ -2143,10 +2366,18 @@ fn build_embed_orders(
             continue;
         };
 
+        // `order=` names a resource this request embedded, by the name the
+        // response gives it -- so `pros:projects(*)` is ordered on as `pros`,
+        // and the table it came from is what the relationship is looked up
+        // by. A name the selection does not carry is not an embedded resource
+        // here, whether or not the schema has a table by that name.
+        let embedded = embedded_by_name(select, relation)
+            .ok_or_else(|| postrust_core::Error::NotAnEmbeddedResource(relation.clone()))?;
+
         let rel = schema_cache
-            .find_relationship(parent_qi, relation, None, &parent_qi.schema)?
+            .find_relationship(parent_qi, embedded.0, embedded.1, &parent_qi.schema)?
             .ok_or_else(|| {
-                schema_cache.relationship_not_found(parent_qi, relation, None, &parent_qi.schema)
+                schema_cache.relationship_not_found(parent_qi, embedded.0, embedded.1, &parent_qi.schema)
             })?;
 
         // A resource that yields many rows per parent has no single value to
@@ -2441,16 +2672,23 @@ fn build_embed_expressions(
 fn declared_media_type(
     db_plan: &DbActionPlan,
     api_request: &postrust_core::api_request::ApiRequest,
-) -> Option<String> {
+) -> Option<(String, String)> {
     let DbActionPlan::Call { call, .. } = db_plan else {
         return None;
     };
     let declared = call.media_type.as_deref()?;
+    let base = call.media_base_type.clone().unwrap_or_default();
+    // A function declaring `*/*` says it will render whatever was asked for,
+    // so every request is one it answers -- and what it answers with is bytes,
+    // which on the wire is called `application/octet-stream`.
+    if declared == "*/*" {
+        return Some(("application/octet-stream".to_string(), base));
+    }
     api_request
         .accept_media_types
         .iter()
         .any(|accepted| accepted.content_type() == declared)
-        .then(|| declared.to_string())
+        .then(|| (declared.to_string(), base))
 }
 
 /// Whether a selection produces any keys in the response.
@@ -2971,6 +3209,10 @@ fn sanitize_error_message(error: &postrust_core::Error) -> String {
         | Error::InvalidGucHeaders
         | Error::InvalidGucStatus
         | Error::InvalidMediaType(_)
+        // Says only that the rows the request asked for carry no geometry,
+        // which is about the request's own shape and is what the client has
+        // to change.
+        | Error::MissingGeometryColumn
         // Quotes the client's own URL back at it, and names the grammar the
         // API publishes. Neither is the schema's.
         | Error::UnparsableQuery { .. }
@@ -3038,6 +3280,7 @@ mod tests {
         CallPlan {
             output_columns: Vec::new(),
             media_type: None,
+            media_base_type: None,
             function: QualifiedIdentifier::new("public", name),
             params: CallParams::None,
             returns_scalar: !returns_set,

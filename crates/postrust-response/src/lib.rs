@@ -114,9 +114,11 @@ pub fn format_response(
             _ => "",
         };
         response.set_content_type(&format!("{}{}", media_type, charset));
-        if let Some(range) = &result.content_range {
-            response.set_header("Content-Range", &range.to_string());
-        }
+        // The body being rendered by something other than this side does not
+        // change what else the response has to say: where the created row is,
+        // which preference was honoured, what the function set. Only the body
+        // was somebody else's to write.
+        add_common_headers(&mut response, request, result);
         return Ok(response);
     }
 

@@ -284,8 +284,28 @@ fn parse_accept(headers: &http::HeaderMap) -> Result<Vec<MediaType>> {
 fn parse_media_type(s: &str) -> MediaType {
     let mut parts = s.split(';').map(str::trim);
     let base = parts.next().unwrap_or(s);
-    let parameters: Vec<&str> = parts.collect();
-    let given = |parameter: &str| parameters.contains(&parameter);
+    // A parameter value may be quoted -- `for="application/json"` -- because
+    // it is itself a media type and carries a `/`. The quotes delimit it and
+    // are not part of it.
+    let parameters: Vec<(String, &str)> = parts
+        .filter_map(|part| part.split_once('='))
+        .map(|(key, value)| {
+            (
+                key.trim().to_ascii_lowercase(),
+                value.trim().trim_matches('"'),
+            )
+        })
+        .collect();
+    let param = |name: &str| {
+        parameters
+            .iter()
+            .find(|(key, _)| key == name)
+            .map(|(_, value)| *value)
+    };
+    let given = |parameter: &str| match parameter.split_once('=') {
+        Some((name, value)) => param(name) == Some(value),
+        None => false,
+    };
 
     match base {
         "application/json" => MediaType::ApplicationJson,
@@ -297,6 +317,37 @@ fn parse_media_type(s: &str) -> MediaType {
         "application/x-www-form-urlencoded" => MediaType::UrlEncoded,
         "application/octet-stream" => MediaType::OctetStream,
         "*/*" => MediaType::Any,
+        // A plan is a plan *for* something, and that something is a media
+        // type in its own right: read the same way, and named back the same
+        // way. `for="application/vnd.pgrst.object"` is how the client says
+        // "the plan for the query that would answer a singular request", and
+        // it comes back out as `application/vnd.pgrst.object+json` because
+        // that is the name that type has.
+        s if s.starts_with("application/vnd.pgrst.plan") => {
+            let format = match s.ends_with("+json") {
+                true => PlanFormat::Json,
+                false => PlanFormat::Text,
+            };
+            let requested = param("options").unwrap_or_default();
+            // Named in a fixed order rather than the order they were asked
+            // for, so that one set of options has one name.
+            let options = [
+                ("analyze", PlanOption::Analyze),
+                ("verbose", PlanOption::Verbose),
+                ("settings", PlanOption::Settings),
+                ("buffers", PlanOption::Buffers),
+                ("wal", PlanOption::Wal),
+            ]
+            .into_iter()
+            .filter(|(name, _)| requested.split('|').any(|asked| asked == *name))
+            .map(|(_, option)| option)
+            .collect();
+            MediaType::Plan {
+                base: Box::new(parse_media_type(param("for").unwrap_or("application/json"))),
+                format,
+                options,
+            }
+        }
         s if s.starts_with("application/vnd.pgrst.object") => MediaType::SingularJson {
             nullable: given("nulls=null"),
             strip_nulls: given("nulls=stripped"),
@@ -365,6 +416,36 @@ fn extract_cookies(headers: &http::HeaderMap) -> indexmap::IndexMap<String, Stri
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A plan is named back with everything that made it that plan.
+    ///
+    /// The cases are PostgREST's own doctests for `decodeMediaType`, read
+    /// back out through `toMime`.
+    #[test]
+    fn a_plan_media_type_is_named_back_in_full() {
+        let named = |s: &str| parse_media_type(s).to_mime();
+
+        assert_eq!(
+            named("application/vnd.pgrst.plan+json"),
+            "application/vnd.pgrst.plan+json; for=\"application/json\""
+        );
+        // The `for` type is read as a media type, so it is named by the name
+        // that type has rather than the one the client wrote.
+        assert_eq!(
+            named("application/vnd.pgrst.plan+json; for=\"application/vnd.pgrst.object\""),
+            "application/vnd.pgrst.plan+json; for=\"application/vnd.pgrst.object+json\""
+        );
+        assert_eq!(
+            named("application/vnd.pgrst.plan; for=\"text/csv\""),
+            "application/vnd.pgrst.plan+text; for=\"text/csv\""
+        );
+        // Options come back in a fixed order, not the order they were asked
+        // for, and anything unrecognised is not an option.
+        assert_eq!(
+            named("application/vnd.pgrst.plan+json; options=verbose|analyze|nonsense"),
+            "application/vnd.pgrst.plan+json; for=\"application/json\"; options=analyze|verbose"
+        );
+    }
 
     #[test]
     fn test_parse_resource() {

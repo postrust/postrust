@@ -593,7 +593,18 @@ pub async fn load_routines(pool: &PgPool, schemas: &[String]) -> Result<RoutineM
                 AND dt.typbasetype <> 0
                 AND NOT p.proretset
                 AND (dt.typname ~ '^[A-Za-z0-9.-]+/[A-Za-z0-9.+-]+$'
-                     OR dt.typname = '*/*')) as media_type
+                     OR dt.typname = '*/*')) as media_type,
+            -- What that domain is a domain *over*. A value whose type this
+            -- side does not recognise arrives as PostgreSQL's text rendering
+            -- of it, and a `bytea` renders as `\x` and hex -- which is a
+            -- description of the bytes, not the bytes. Knowing the base type
+            -- is what tells the two apart.
+            (SELECT lower(bt.typname) FROM pg_catalog.pg_type dt
+               JOIN pg_catalog.pg_type bt ON bt.oid = dt.typbasetype
+              WHERE dt.oid = p.prorettype
+                AND NOT p.proretset
+                AND (dt.typname ~ '^[A-Za-z0-9.-]+/[A-Za-z0-9.+-]+$'
+                     OR dt.typname = '*/*')) as media_base_type
         FROM pg_proc p
         JOIN pg_namespace n ON n.oid = p.pronamespace
         JOIN resolved rt ON rt.oid = p.prorettype
@@ -671,6 +682,7 @@ pub async fn load_routines(pool: &PgPool, schemas: &[String]) -> Result<RoutineM
             settings: vec![],
             is_procedure: row.get("is_procedure"),
             media_type: row.get("media_type"),
+            media_base_type: row.get("media_base_type"),
             output_columns: parse_routine_params(row.get("out_params"))
                 .into_iter()
                 .filter(|param| !param.name.is_empty())
@@ -730,12 +742,14 @@ pub async fn load_media_handlers(pool: &PgPool, schemas: &[String]) -> Result<Me
             n.nspname    AS agg_schema,
             p.proname    AS agg_name,
             t.typname    AS media_type,
+            bt.typname   AS media_base_type,
             argn.nspname AS arg_schema,
             argc.relname AS arg_table
         FROM pg_aggregate a
         JOIN pg_proc p       ON p.oid = a.aggfnoid
         JOIN pg_namespace n  ON n.oid = p.pronamespace
         JOIN pg_type t       ON t.oid = a.aggtranstype
+        JOIN pg_type bt      ON bt.oid = t.typbasetype
         LEFT JOIN pg_type argt      ON argt.oid = p.proargtypes[0]
         LEFT JOIN pg_class argc     ON argc.oid = argt.typrelid
         LEFT JOIN pg_namespace argn ON argn.oid = argc.relnamespace
@@ -767,6 +781,7 @@ pub async fn load_media_handlers(pool: &PgPool, schemas: &[String]) -> Result<Me
             .push(MediaHandler {
                 aggregate: QualifiedIdentifier::new(agg_schema, row.get::<String, _>("agg_name")),
                 table,
+                base_type: row.get("media_base_type"),
             });
     }
 

@@ -57,6 +57,10 @@ pub struct CallPlan {
     /// want as JSON.
     #[serde(default)]
     pub media_type: Option<String>,
+    /// The type that domain is a domain over -- what says whether the value
+    /// is bytes or text.
+    #[serde(default)]
+    pub media_base_type: Option<String>,
     /// The columns the result has, where the function declares its own.
     ///
     /// `RETURNS TABLE(a text, b colour)` has no table to read the result's
@@ -128,7 +132,8 @@ impl CallPlan {
                 .iter()
                 .map(|p| (p.name.clone(), p.type_max_length.clone()))
                 .collect(),
-            media_type: routine.produced_media_type().map(str::to_string),
+            media_type: routine.media_type.clone(),
+            media_base_type: routine.media_base_type.clone(),
             output_columns: routine.output_columns.clone(),
             variadic_params: routine
                 .params
@@ -381,6 +386,7 @@ mod tests {
         Routine {
             output_columns: Vec::new(),
             media_type: None,
+            media_base_type: None,
             schema: "public".into(),
             name: "get_users".into(),
             description: None,

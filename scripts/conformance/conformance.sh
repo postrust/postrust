@@ -34,6 +34,15 @@ DB_IMAGE="${CONFORMANCE_DB_IMAGE:-postgis/postgis:16-3.4}"
 SCHEMA=test
 ANON_ROLE=postgrest_test_anonymous
 JWT_SECRET=reallyreallyreallyreallyverysafe
+# PostgREST's own suite runs each spec under its own configuration; this
+# harness runs one server for all of them, so the setting has to be the union
+# of what the specs ask for. `extensions` is where the fixtures install PostGIS
+# and isn, and without it on the path *both* servers answer 42883 to every
+# request that touches them -- which reads as agreement while measuring
+# nothing. The third entry is a schema whose name is mostly punctuation, and it
+# is here because ExtraSearchPathSpec puts it there.
+EXTRA_SEARCH_PATH='public, extensions, EXTRA "@/\#~_-'
+
 
 mkdir -p "$WORK"
 say() { printf '\n==> %s\n' "$*"; }
@@ -126,6 +135,19 @@ write_reset_assets
 say "Extracting request cases from the spec suite"
 python3 "$HERE/extract.py" "$WORK/pgrst/test/spec/Feature" "$WORK/cases.json"
 
+# A probe run: only the specs named, so a change can be measured in minutes
+# rather than in an hour. Point CONFORMANCE_WORK somewhere of its own when
+# using this -- a filtered `ref.json` must not be mistaken for a full one.
+if [ -n "${CONFORMANCE_SPECS:-}" ]; then
+    python3 - "$WORK/cases.json" "$CONFORMANCE_SPECS" <<'FILTER'
+import json, re, sys
+path, pattern = sys.argv[1], sys.argv[2]
+cases = [c for c in json.load(open(path)) if re.search(pattern, c["spec"])]
+json.dump(cases, open(path, "w"))
+print("  filtered to %d cases matching %s" % (len(cases), pattern))
+FILTER
+fi
+
 # The reference run is the expensive half and its answers only change when
 # PostgREST's version or the fixtures do, so a previous one can be reused
 # while iterating on the candidate. Set CONFORMANCE_REUSE_REF=1 to do that.
@@ -137,6 +159,7 @@ else
     docker run -d --name "$REF" --network "$NET" -p "$REF_PORT:3000" \
         -e PGRST_DB_URI="postgres://postgres:postgres@$DB:5432/pgrst_conf" \
         -e PGRST_DB_SCHEMAS="$SCHEMA" -e PGRST_DB_ANON_ROLE="$ANON_ROLE" \
+        -e PGRST_DB_EXTRA_SEARCH_PATH="$EXTRA_SEARCH_PATH" \
         -e PGRST_JWT_SECRET="$JWT_SECRET" -e PGRST_SERVER_PORT=3000 \
         "postgrest/postgrest:$PGRST_VERSION" >/dev/null
     sleep 9
@@ -151,6 +174,7 @@ pkill -f 'target/release/postrust' 2>/dev/null || true
 sleep 2
 DATABASE_URL="postgres://postgres:postgres@localhost:$DB_PORT/pgrst_conf" \
 PGRST_DB_SCHEMAS="$SCHEMA" PGRST_DB_ANON_ROLE="$ANON_ROLE" PGRST_JWT_SECRET="$JWT_SECRET" \
+PGRST_DB_EXTRA_SEARCH_PATH="$EXTRA_SEARCH_PATH" \
 PGRST_SERVER_PORT="$CAND_PORT" PGRST_SERVER_HOST=127.0.0.1 \
 PGRST_COMPAT_MODE=true PGRST_LOG_LEVEL=warn \
     "$REPO_ROOT/target/release/postrust" >"$WORK/postrust.log" 2>&1 &

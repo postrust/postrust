@@ -156,6 +156,21 @@ def match_paren(src, start):
     return -1
 
 
+def unescape(text):
+    """Resolve the Haskell string escapes a raw regex capture leaves behind."""
+    out = []
+    i = 0
+    while i < len(text):
+        if text[i] == "\\" and i + 1 < len(text):
+            nxt = text[i + 1]
+            out.append({"n": "\n", "t": "\t", "\\": "\\", '"': '"'}.get(nxt, nxt))
+            i += 2
+        else:
+            out.append(text[i])
+            i += 1
+    return "".join(out)
+
+
 def parse_headers(chunk, binds):
     """Return list of [name, value], or None if some entry can't be resolved."""
     inner = chunk.strip()[1:-1].strip()
@@ -166,7 +181,13 @@ def parse_headers(chunk, binds):
     residue = inner
 
     for hname, hvalue in HDR_PAIR.findall(inner):
-        headers.append([hname, hvalue])
+        # The regex keeps a Haskell string literal's escapes, so a header
+        # written `"...for=\\"application/json\\""` arrived with the
+        # backslashes still in it. PostgREST's media-type parser then failed on
+        # the `\\` and fell back to defaults -- and since the candidate got the
+        # same mangled header, the two agreed on answering a question neither
+        # had been asked.
+        headers.append([unescape(hname), unescape(hvalue)])
     residue = HDR_PAIR.sub("", residue)
 
     for token in INLINE_JWT.findall(residue):
@@ -229,7 +250,7 @@ for dirpath, _, files in os.walk(SPEC_ROOT):
                 if not mime:
                     stats["unresolved_headers"] += 1
                     continue
-                headers = [["Accept", mime.group(1)]]
+                headers = [["Accept", unescape(mime.group(1))]]
                 j = skip_ws(src, end)
 
             elif j < len(src) and src[j] == "[" and not src.startswith("[json|", j):

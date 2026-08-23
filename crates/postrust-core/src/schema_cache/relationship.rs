@@ -405,6 +405,9 @@ pub struct MediaHandler {
     /// The table it renders, or `None` when it takes `anyelement` and so
     /// renders any of them.
     pub table: Option<QualifiedIdentifier>,
+    /// The type the handler's media-type domain is a domain over, which is
+    /// what says whether its output is bytes or text.
+    pub base_type: String,
 }
 
 /// Media handlers by (schema, media type).
