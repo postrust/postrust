@@ -1163,14 +1163,13 @@ async fn execute_plan(
             Ok(QueryResult {
                 status: match returns_void {
                     true => StatusCode::NO_CONTENT,
-                    false => {
-                        mutation_status(db_plan, api_request, created_a_row).unwrap_or_else(|| {
+                    false => mutation_status(db_plan, api_request, created_a_row, reports_inserted)
+                        .unwrap_or_else(|| {
                             content_range
                                 .as_ref()
                                 .map(postrust_response::ContentRange::status)
                                 .unwrap_or(StatusCode::OK)
-                        })
-                    }
+                        }),
                 },
                 rows,
                 singular,
@@ -1442,6 +1441,11 @@ fn mutation_status(
     db_plan: &postrust_core::plan::DbActionPlan,
     api_request: &ApiRequest,
     created_a_row: bool,
+    // Whether the statement was in a position to say. A write with no conflict
+    // clause could only have created rows, and one on a relation that will not
+    // give up `xmax` cannot tell either way -- in both cases there is nothing
+    // to report but the creation.
+    could_have_merged: bool,
 ) -> Option<StatusCode> {
     use postrust_core::api_request::PreferResolution;
     use postrust_core::plan::{DbActionPlan, MutatePlan};
@@ -1460,7 +1464,10 @@ fn mutation_status(
         // nothing was discovered by the response -- it reports the outcome
         // only where it asked to see the row.
         MutatePlan::Insert { .. } if is_upsert(api_request) => {
-            match (wants_representation(api_request), created_a_row) {
+            match (
+                wants_representation(api_request),
+                created_a_row || !could_have_merged,
+            ) {
                 (false, _) => StatusCode::NO_CONTENT,
                 (true, true) => StatusCode::CREATED,
                 (true, false) => StatusCode::OK,
@@ -1468,7 +1475,9 @@ fn mutation_status(
         }
         // A `POST` that merged into every row it touched created nothing, and
         // 201 would be a promise that something new is at the `Location`.
-        MutatePlan::Insert { .. } if merging && !created_a_row => StatusCode::OK,
+        MutatePlan::Insert { .. } if merging && could_have_merged && !created_a_row => {
+            StatusCode::OK
+        }
         MutatePlan::Insert { .. } => StatusCode::CREATED,
         _ => match wants_representation(api_request) {
             true => StatusCode::OK,

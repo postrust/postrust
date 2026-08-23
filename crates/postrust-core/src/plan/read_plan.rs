@@ -131,6 +131,15 @@ impl ReadPlan {
         plan.from = QualifiedIdentifier::unqualified(crate::query::MUTATION_RESULT);
         plan.from_alias = None;
         plan.where_clauses.clear();
+
+        // A computed field is a function of the row it is read from, and the
+        // rows here are the statement's result rather than the table's.
+        for field in plan.select.iter_mut() {
+            if let Some(computed) = field.field.computed.as_mut() {
+                computed.relation = crate::query::MUTATION_RESULT.to_string();
+            }
+        }
+
         Ok(plan)
     }
 
