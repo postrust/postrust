@@ -87,7 +87,7 @@ impl MutatePlan {
     ) -> Result<Self> {
         let columns = get_payload_columns(request, table, schema_cache)?;
         let body = get_body_bytes(request)?;
-        let returning = get_returning_columns(request, table);
+        let returning = get_returning_columns(request, table, true);
         let apply_defaults = asked_for_defaults(request);
 
         // `Prefer: resolution=` says what to do about a duplicate; `on_conflict=`
@@ -133,7 +133,7 @@ impl MutatePlan {
         let columns = get_payload_columns(request, table, schema_cache)?;
         let body = get_body_bytes(request)?;
         let where_clauses = build_mutation_where(request, table)?;
-        let returning = get_returning_columns(request, table);
+        let returning = get_returning_columns(request, table, false);
         let apply_defaults = asked_for_defaults(request);
 
         Ok(Self::Update {
@@ -149,7 +149,7 @@ impl MutatePlan {
     /// Create a DELETE plan.
     fn create_delete(request: &ApiRequest, table: &Table, qi: QualifiedIdentifier) -> Result<Self> {
         let where_clauses = build_mutation_where(request, table)?;
-        let returning = get_returning_columns(request, table);
+        let returning = get_returning_columns(request, table, false);
 
         Ok(Self::Delete {
             target: qi,
@@ -169,7 +169,7 @@ impl MutatePlan {
 
         let columns = get_payload_columns(request, table, schema_cache)?;
         let body = get_body_bytes(request)?;
-        let returning = get_returning_columns(request, table);
+        let returning = get_returning_columns(request, table, true);
 
         // Upsert uses PK for conflict
         let on_conflict = Some((PreferResolution::MergeDuplicates, table.pk_cols.clone()));
@@ -347,14 +347,74 @@ fn get_body_bytes(request: &ApiRequest) -> Result<Option<bytes::Bytes>> {
     }
 }
 
-/// Get returning columns.
-fn get_returning_columns(_request: &ApiRequest, table: &Table) -> Vec<String> {
-    // Every column, always. What the client asked for is decided by the read
-    // that runs over the result -- `?select=` may name computed fields and
-    // embedded resources, neither of which a `RETURNING` list can express --
-    // and the primary key is needed for the `Location` header whether or not
-    // the client asked to see it.
-    table.column_names().map(|s| s.to_string()).collect()
+/// The columns a mutation has to return.
+///
+/// `RETURNING` runs with the caller's privileges, so asking for a column the
+/// role may write but not read fails the whole statement. A role granted
+/// `INSERT` on an audit table and nothing else is an ordinary arrangement, and
+/// returning every column made it impossible to insert into one.
+///
+/// So: only what the response will actually read. That is the selected
+/// columns, whatever the result is ordered by, and the key a `Location` header
+/// is built from. A caller wanting no representation reads nothing, and the
+/// list is then empty.
+///
+/// The exceptions return the whole row, because they need it: `*` says so, and
+/// a computed field is a function of the row rather than of any column.
+fn get_returning_columns(request: &ApiRequest, table: &Table, creates: bool) -> Vec<String> {
+    use crate::api_request::SelectItem;
+
+    let everything = || -> Vec<String> { table.column_names().map(str::to_string).collect() };
+
+    let mut wanted: Vec<String> = Vec::new();
+
+    // `headers-only` reads no columns but still needs the key.
+    if request.preferences.representation.needs_body() {
+        if request.query_params.select.is_empty() {
+            return everything();
+        }
+        for item in &request.query_params.select {
+            match item {
+                SelectItem::Field { field, .. } => {
+                    if field.name == "*" || table.computed_columns.contains_key(&field.name) {
+                        return everything();
+                    }
+                    wanted.push(field.name.clone());
+                }
+                // An embed joins on a column of this row, and that column was
+                // added to the selection before planning began.
+                SelectItem::Relation { .. } | SelectItem::SpreadRelation { .. } => {}
+            }
+        }
+        // Ordering the returned rows by a column means reading that column,
+        // whether or not the client asked to see it. A term naming an
+        // embedded resource orders by something this statement cannot return
+        // at all.
+        for (path, terms) in &request.query_params.order {
+            if !path.is_empty() {
+                continue;
+            }
+            for term in terms {
+                if let crate::api_request::OrderTerm::Field { field, .. } = term {
+                    wanted.push(field.name.clone());
+                }
+            }
+        }
+    }
+
+    // The created row's own address is built from its key, whether or not the
+    // client asked to see it.
+    if creates {
+        wanted.extend(table.pk_cols.iter().cloned());
+    }
+
+    // A name that is not a column of this table cannot be returned from it;
+    // where it is anything real -- a JSON path, an alias -- the read resolves
+    // it against what did come back.
+    wanted.retain(|name| table.get_column(name).is_some());
+    wanted.sort();
+    wanted.dedup();
+    wanted
 }
 
 /// Build WHERE clauses for mutations.
@@ -373,6 +433,16 @@ fn build_mutation_where(request: &ApiRequest, table: &Table) -> Result<Vec<Coerc
         clauses.push(CoercibleLogicTree::Stmt(CoercibleFilter::from_filter(
             filter, &pg_type,
         )));
+    }
+
+    // `?or=(...)` names rows exactly as a plain filter does, and a mutation
+    // that reads only the plain ones has no `WHERE` at all -- so
+    // `DELETE /entities?or=(id.eq.1,id.eq.2)` deleted every row in the table.
+    // A request that names two rows must never touch a third.
+    for (path, tree) in &request.query_params.logic {
+        if path.is_empty() {
+            clauses.push(CoercibleLogicTree::from_logic_tree(tree, type_resolver));
+        }
     }
 
     Ok(clauses)

@@ -420,6 +420,13 @@ impl SchemaCache {
                     .iter()
                     .map(|r| (r.cardinality_name().to_string(), r.describe()))
                     .collect(),
+                // What the client would have to write instead. The details
+                // say which relationships were found; this says how to ask for
+                // one of them, which is the part it can act on.
+                disambiguated: matches
+                    .iter()
+                    .map(|r| format!("{}!{}", to_name, r.disambiguator()))
+                    .collect(),
             }),
         }
     }

@@ -105,6 +105,8 @@ pub enum Error {
         target: String,
         /// Each candidate as `(cardinality, description)`.
         candidates: Vec<(String, String)>,
+        /// How the client would name each candidate: `big_projects!jobs`.
+        disambiguated: Vec<String>,
     },
 
     // ========================================================================
@@ -476,6 +478,7 @@ impl Error {
                 origin,
                 target,
                 candidates,
+                ..
             } => Some(serde_json::Value::Array(
                 candidates
                     .iter()
@@ -577,6 +580,20 @@ impl Error {
                  overloading can be resolved"
                     .into(),
             ),
+            Self::AmbiguousRelationship {
+                target,
+                disambiguated,
+                ..
+            } => Some(format!(
+                "Try changing '{}' to one of the following: {}. Find the desired relationship in \
+                 the 'details' key.",
+                target,
+                disambiguated
+                    .iter()
+                    .map(|name| format!("'{}'", name))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )),
             Self::RaiseNotUnderstood(fault) => Some(fault.hint().into()),
             // A body that is one value names no arguments, so there is no
             // near miss to point at: any function of that name would have

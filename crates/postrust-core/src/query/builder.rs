@@ -1058,13 +1058,25 @@ fn push_json_body(
     });
 }
 
+/// The column a mutation returns when the response reads none of its own.
+///
+/// It exists to be counted, never to be read: the body is empty in every case
+/// that produces it.
+pub const AFFECTED_COLUMN: &str = "pgrst_affected";
+
 /// The `RETURNING` list, qualified by the relation being written.
 ///
 /// `RETURNING` sees everything in the statement's scope, which for an
 /// `UPDATE ... FROM` includes the body -- and a bare column name there is
 /// ambiguous for every column the update writes.
 fn push_returning(frag: &mut SqlFragment, relation: &str, returning: &[String]) {
+    // A statement whose result nothing reads still has to say how many rows it
+    // touched, and the count is the number of rows it returns. A constant is
+    // what says "one row per row affected" without naming a column the caller
+    // may not be allowed to read.
     if returning.is_empty() {
+        frag.push(" RETURNING 1 AS ");
+        frag.push(&escape_ident(AFFECTED_COLUMN));
         return;
     }
     frag.push(" RETURNING ");

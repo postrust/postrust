@@ -143,6 +143,19 @@ INLINE_JWT = re.compile(r'authHeaderJWT\s+"([^"]*)"')
 INLINE_JWT_GEN = re.compile(r'authHeaderJWT\s*\$\s*generateJWT\s*\[json\|(.*?)\|\]', re.S)
 
 
+def match_paren(src, start):
+    """Index just past the `)` closing the `(` at `start`, or -1."""
+    depth = 0
+    for k in range(start, len(src)):
+        if src[k] == "(":
+            depth += 1
+        elif src[k] == ")":
+            depth -= 1
+            if depth == 0:
+                return k + 1
+    return -1
+
+
 def parse_headers(chunk, binds):
     """Return list of [name, value], or None if some entry can't be resolved."""
     inner = chunk.strip()[1:-1].strip()
@@ -202,7 +215,24 @@ for dirpath, _, files in os.walk(SPEC_ROOT):
             headers, body = [], None
             j = skip_ws(src, i)
 
-            if j < len(src) and src[j] == "[" and not src.startswith("[json|", j):
+            # `request methodGet "/x" (acceptHdrs "text/csv") ""` passes its
+            # headers as a call rather than a list. Reading only the list form
+            # dropped the header and replayed the request without it -- against
+            # both servers, so it showed up as agreement on a request neither
+            # was asked to answer.
+            if src.startswith("(acceptHdrs", j):
+                end = match_paren(src, j)
+                if end < 0:
+                    stats["unresolved_headers"] += 1
+                    continue
+                mime = re.search(r'"((?:[^"\\]|\\.)*)"', src[j:end])
+                if not mime:
+                    stats["unresolved_headers"] += 1
+                    continue
+                headers = [["Accept", mime.group(1)]]
+                j = skip_ws(src, end)
+
+            elif j < len(src) and src[j] == "[" and not src.startswith("[json|", j):
                 end = match_bracket(src, j)
                 if end < 0:
                     continue

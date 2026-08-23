@@ -121,6 +121,16 @@ pub fn format_response(
     }
 
     if result.omit_body {
+        // Asking for a single object is a constraint on the statement, not on
+        // the payload: a caller that named one row and changed five has not
+        // had its request answered, however little of it it wanted back.
+        if let MediaType::SingularJson { nullable, .. } = &media_type {
+            match (result.affected, nullable) {
+                (1, _) | (0, true) => {}
+                (0, false) => return Err(FormatError::NotFound),
+                _ => return Err(FormatError::MultipleRows),
+            }
+        }
         let mut response = Response::new(result.status, bytes::Bytes::new());
         add_common_headers(&mut response, request, result);
         return Ok(response);
@@ -369,6 +379,13 @@ pub struct QueryResult {
     /// response carries headers and a status but no payload, where an empty
     /// row set would otherwise render as `[]`.
     pub omit_body: bool,
+    /// How many rows the statement affected.
+    ///
+    /// Distinct from `rows.len()`, which is empty when no representation was
+    /// asked for. How many rows a write touched is a fact about the write, and
+    /// a caller that asked for exactly one object is owed an answer about it
+    /// whether or not it wanted the object back.
+    pub affected: usize,
     /// Whether the result should be rendered as a single (un-arrayed) value.
     ///
     /// Set for PostgREST-compatibility RPC responses where the underlying

@@ -100,6 +100,30 @@ impl Relationship {
     /// what a client needs to write the hint that disambiguates it.
     pub fn describe(&self) -> String {
         match self {
+            // A junction is described by the table it joins through and the
+            // two constraints that make it one -- there is no single
+            // constraint to name, and the empty string that came out instead
+            // told a client nothing about which relationship it had found.
+            Self::ForeignKey {
+                cardinality: Cardinality::M2M(junction),
+                ..
+            } => {
+                let side = |columns: &[(String, String)]| -> String {
+                    columns
+                        .iter()
+                        .map(|(_, far)| far.clone())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                };
+                format!(
+                    "{} using {}({}) and {}({})",
+                    junction.table.name,
+                    junction.constraint1,
+                    side(&junction.source_columns),
+                    junction.constraint2,
+                    side(&junction.target_columns),
+                )
+            }
             Self::ForeignKey {
                 table,
                 foreign_table,
@@ -126,6 +150,24 @@ impl Relationship {
                     foreign
                 )
             }
+            Self::Computed { function, .. } => function.name.clone(),
+        }
+    }
+
+    /// The `!hint` that picks this relationship out from its rivals.
+    ///
+    /// The constraint for a foreign key, the junction table for a
+    /// many-to-many: whichever name is the one a client would have to write to
+    /// mean this relationship and no other.
+    pub fn disambiguator(&self) -> String {
+        match self {
+            Self::ForeignKey {
+                cardinality: Cardinality::M2M(junction),
+                ..
+            } => junction.table.name.clone(),
+            Self::ForeignKey {
+                constraint_name, ..
+            } => constraint_name.clone(),
             Self::Computed { function, .. } => function.name.clone(),
         }
     }

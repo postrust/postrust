@@ -160,8 +160,11 @@ async fn process_request(
     // with some other number of rows.
     let response = format_response(&api_request, &result).map_err(|e| match e {
         postrust_response::FormatError::MultipleRows | postrust_response::FormatError::NotFound => {
+            // How many rows there were, not how many were kept: a write the
+            // caller wanted no representation from still touched them, and
+            // that count is what the client got wrong.
             postrust_core::Error::NotSingular {
-                rows: result.rows.len(),
+                rows: result.rows.len().max(result.affected),
             }
         }
         other => postrust_core::Error::Internal(other.to_string()),
@@ -1183,6 +1186,10 @@ async fn execute_plan(
             // A mutation returns the affected rows only when the caller asked
             // for them; otherwise the body is empty whatever the status.
             let omit_body = is_mutation(db_plan) && !wants_representation(api_request);
+            // Taken before the rows are dropped: how many a write touched is
+            // still the answer to `Content-Range` and to a request for a
+            // single object.
+            let affected = json_rows.len();
             let rows = if omit_body { Vec::new() } else { json_rows };
 
             // PostgREST reports the returned window on every successful data
@@ -1215,7 +1222,7 @@ async fn execute_plan(
                 }
                 Some(Mutation::Update) => Some(postrust_response::ContentRange::new(
                     0,
-                    rows.len() as i64 - 1,
+                    affected as i64 - 1,
                     total,
                 )),
                 None => Some(postrust_response::ContentRange::from_pagination(
@@ -1261,6 +1268,7 @@ async fn execute_plan(
                 rows,
                 singular,
                 omit_body: omit_body || returns_void,
+                affected,
                 location,
                 content_range,
                 guc_headers,

@@ -14,6 +14,7 @@ pub use types::*;
 
 use crate::error::{Error, Result};
 use http::{Method, Request};
+use percent_encoding::percent_decode_str;
 use std::collections::{HashMap, HashSet};
 
 /// Parse an HTTP request into an ApiRequest.
@@ -107,6 +108,17 @@ fn parse_resource(path: &str) -> Result<Resource> {
         return Ok(Resource::Schema);
     }
 
+    // A name is the name the schema gave it, not the encoding a URL had to use
+    // to carry it: `/%D9%85%D9%88%D8%A7%D8%B1%D8%AF` addresses a table called
+    // `موارد`. Looking the encoded form up finds nothing, and says so using
+    // the escape sequence rather than the name.
+    let decoded = |segment: &str| -> String {
+        percent_decode_str(segment)
+            .decode_utf8()
+            .map(|name| name.into_owned())
+            .unwrap_or_else(|_| segment.to_string())
+    };
+
     if let Some(func_name) = path.strip_prefix("rpc/") {
         if func_name.is_empty() {
             return Err(Error::InvalidPath("Empty function name".into()));
@@ -114,7 +126,7 @@ fn parse_resource(path: &str) -> Result<Resource> {
         if func_name.contains('/') {
             return Err(Error::InvalidResourcePath);
         }
-        return Ok(Resource::Routine(func_name.to_string()));
+        return Ok(Resource::Routine(decoded(func_name)));
     }
 
     // A table is named by one segment. More than one names nothing at all --
@@ -125,7 +137,7 @@ fn parse_resource(path: &str) -> Result<Resource> {
         return Err(Error::InvalidResourcePath);
     }
 
-    Ok(Resource::Relation(path.to_string()))
+    Ok(Resource::Relation(decoded(path)))
 }
 
 /// Parse the schema from Accept-Profile or Content-Profile headers.
@@ -240,12 +252,22 @@ fn parse_accept(headers: &http::HeaderMap) -> Result<Vec<MediaType>> {
         let accept_str = accept
             .to_str()
             .map_err(|_| Error::InvalidHeader("Accept"))?;
-        // Simple parsing - full implementation would handle quality factors
+        // A quality factor orders the list and says nothing about the type,
+        // so it is dropped. The other parameters are not decoration: `;nulls=
+        // stripped` is part of what `application/vnd.pgrst.array+json` *is*,
+        // and cutting the entry at the semicolon threw it away along with the
+        // `q=`.
         let types: Vec<MediaType> = accept_str
             .split(',')
-            .map(|s| s.trim())
-            .map(|s| s.split(';').next().unwrap_or(s).trim())
-            .map(parse_media_type)
+            .map(str::trim)
+            .map(|entry| {
+                let kept: Vec<&str> = entry
+                    .split(';')
+                    .map(str::trim)
+                    .filter(|part| !part.starts_with("q="))
+                    .collect();
+                parse_media_type(&kept.join(";"))
+            })
             .collect();
         if types.is_empty() {
             return Ok(vec![MediaType::ApplicationJson]);
@@ -255,9 +277,17 @@ fn parse_accept(headers: &http::HeaderMap) -> Result<Vec<MediaType>> {
     Ok(vec![MediaType::ApplicationJson])
 }
 
-/// Parse a single media type string.
+/// Parse a single media type, parameters included.
+///
+/// Only the vendored types read their parameters; for everything else the
+/// name alone is the type, so `application/json;charset=utf-8` is still JSON.
 fn parse_media_type(s: &str) -> MediaType {
-    match s {
+    let mut parts = s.split(';').map(str::trim);
+    let base = parts.next().unwrap_or(s);
+    let parameters: Vec<&str> = parts.collect();
+    let given = |parameter: &str| parameters.contains(&parameter);
+
+    match base {
         "application/json" => MediaType::ApplicationJson,
         "application/geo+json" => MediaType::GeoJson,
         "text/csv" => MediaType::TextCsv,
@@ -268,11 +298,11 @@ fn parse_media_type(s: &str) -> MediaType {
         "application/octet-stream" => MediaType::OctetStream,
         "*/*" => MediaType::Any,
         s if s.starts_with("application/vnd.pgrst.object") => MediaType::SingularJson {
-            nullable: s.contains("nulls=null"),
-            strip_nulls: s.contains("nulls=stripped"),
+            nullable: given("nulls=null"),
+            strip_nulls: given("nulls=stripped"),
         },
         s if s.starts_with("application/vnd.pgrst.array") => MediaType::ArrayJson {
-            strip_nulls: s.contains("nulls=stripped"),
+            strip_nulls: given("nulls=stripped"),
         },
         other => MediaType::Other(other.to_string()),
     }
@@ -284,8 +314,7 @@ fn parse_content_type(headers: &http::HeaderMap) -> Result<MediaType> {
         let ct_str = ct
             .to_str()
             .map_err(|_| Error::InvalidHeader("Content-Type"))?;
-        let media_type = ct_str.split(';').next().unwrap_or(ct_str).trim();
-        return Ok(parse_media_type(media_type));
+        return Ok(parse_media_type(ct_str.trim()));
     }
     Ok(MediaType::ApplicationJson)
 }
