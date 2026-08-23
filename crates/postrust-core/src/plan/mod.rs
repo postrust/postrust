@@ -73,6 +73,36 @@ pub fn create_action_plan(request: &ApiRequest, schema_cache: &SchemaCache) -> R
     }
 }
 
+/// The overload whose parameters most resemble the ones supplied.
+///
+/// Compared as one string of sorted names -- `a, b, c` -- because what a
+/// client gets wrong is usually one name out of several, and comparing the
+/// lists as a whole is what notices that. `None` when nothing is close enough
+/// to be worth saying; a bad guess is worse than silence.
+fn nearest_overload(
+    qi: &QualifiedIdentifier,
+    routines: &[crate::schema_cache::Routine],
+    supplied: &[String],
+) -> Option<String> {
+    // Looser than a name: these are lists, and one wrong entry in three should
+    // still find the signature that was meant.
+    const MIN_SIMILARITY: f64 = 0.33;
+
+    let sorted = |names: &mut Vec<String>| -> String {
+        names.sort();
+        names.join(", ")
+    };
+    let asked = sorted(&mut supplied.to_vec());
+
+    routines
+        .iter()
+        .map(|routine| sorted(&mut routine.params.iter().map(|p| p.name.clone()).collect()))
+        .map(|params| (crate::schema_cache::similarity(&params, &asked), params))
+        .filter(|(score, _)| *score >= MIN_SIMILARITY)
+        .max_by(|(a, _), (b, _)| a.total_cmp(b))
+        .map(|(_, params)| format!("{}({})", qi, params))
+}
+
 /// Check that every dotted filter, order or range names a resource that was
 /// embedded.
 ///
@@ -309,25 +339,18 @@ fn create_db_plan(
                 single_json,
             };
 
+            // Nothing of that name: the client most likely misspelled it, so
+            // the nearest name in the schema is worth offering.
             let routines = schema_cache
                 .get_routines(qi)
-                .ok_or_else(|| not_found(None))?;
+                .ok_or_else(|| not_found(schema_cache.similar_routine(qi)))?;
 
             let routine = select_overload(routines, request)?.ok_or_else(|| {
-                // The name exists but nothing takes these arguments, so an
-                // overload that does exist is worth naming.
-                let candidate = routines.first().map(|r| {
-                    format!(
-                        "{}({})",
-                        qi,
-                        r.params
-                            .iter()
-                            .map(|p| p.name.clone())
-                            .collect::<Vec<_>>()
-                            .join(", ")
-                    )
-                });
-                not_found(candidate)
+                // The name exists but nothing takes these arguments, so the
+                // overload whose parameters most resemble the ones supplied is
+                // the one to offer -- not simply the first, which says nothing
+                // about what the client asked for.
+                not_found(nearest_overload(qi, routines, &supplied))
             })?;
 
             let call_plan = CallPlan::from_request(request, routine)?;

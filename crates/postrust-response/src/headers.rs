@@ -121,19 +121,37 @@ pub fn build_response_headers(
     headers
 }
 
-/// Parse GUC headers from database response.
-#[allow(dead_code)] // Reserved for GUC-driven response headers (`response.headers`); not yet wired.
-pub fn parse_guc_headers(guc_headers: &str) -> Vec<(String, String)> {
-    // Format: "header1: value1\nheader2: value2"
-    guc_headers
-        .lines()
-        .filter_map(|line| {
-            let mut parts = line.splitn(2, ':');
-            let key = parts.next()?.trim().to_string();
-            let value = parts.next()?.trim().to_string();
-            Some((key, value))
-        })
-        .collect()
+/// Parse the `response.headers` setting a function may have set.
+///
+/// PostgREST's shape: a JSON array of objects, each with exactly one key and
+/// a string value. An array rather than one object because a response may
+/// carry the same header twice -- two `Set-Cookie`s, say -- which an object
+/// cannot express.
+///
+/// `Err` when it is anything else, which is a fault in the function rather
+/// than in the request and is reported as one.
+pub fn parse_guc_headers(guc_headers: &str) -> Result<Vec<(String, String)>, ()> {
+    let Ok(serde_json::Value::Array(entries)) = serde_json::from_str(guc_headers) else {
+        return Err(());
+    };
+
+    let mut headers = Vec::with_capacity(entries.len());
+    for entry in entries {
+        let serde_json::Value::Object(fields) = entry else {
+            return Err(());
+        };
+        if fields.len() != 1 {
+            return Err(());
+        }
+        for (name, value) in fields {
+            let serde_json::Value::String(value) = value else {
+                return Err(());
+            };
+            headers.push((name, value));
+        }
+    }
+
+    Ok(headers)
 }
 
 #[cfg(test)]
@@ -194,11 +212,35 @@ mod tests {
 
     #[test]
     fn test_parse_guc_headers() {
-        let guc = "X-Custom-Header: value1\nX-Another: value2";
-        let headers = parse_guc_headers(guc);
+        let guc = r#"[{"X-Custom-Header": "value1"}, {"X-Another": "value2"}]"#;
+        let headers = parse_guc_headers(guc).unwrap();
 
         assert_eq!(headers.len(), 2);
         assert_eq!(headers[0], ("X-Custom-Header".into(), "value1".into()));
         assert_eq!(headers[1], ("X-Another".into(), "value2".into()));
+    }
+
+    /// The same header twice is the reason it is an array.
+    #[test]
+    fn guc_headers_may_repeat_a_name() {
+        let guc = r#"[{"Set-Cookie": "a=1"}, {"Set-Cookie": "b=2"}]"#;
+        let headers = parse_guc_headers(guc).unwrap();
+
+        assert_eq!(headers.len(), 2);
+        assert!(headers.iter().all(|(name, _)| name == "Set-Cookie"));
+    }
+
+    /// Anything else is a fault in the function that set it.
+    #[test]
+    fn guc_headers_must_be_single_key_objects_of_strings() {
+        for bad in [
+            r#"{"X": "y"}"#,
+            r#"[{"X": "y", "Z": "w"}]"#,
+            r#"[{"X": 1}]"#,
+            r#"["X: y"]"#,
+            "not json",
+        ] {
+            assert!(parse_guc_headers(bad).is_err(), "accepted {bad}");
+        }
     }
 }

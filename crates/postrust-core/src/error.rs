@@ -209,6 +209,17 @@ pub enum Error {
     #[error("Payload values do not match URL in primary key column(s)")]
     PutMatchingPk,
 
+    /// A function set `response.headers` to something that is not headers.
+    #[error(
+        "response.headers guc must be a JSON array composed of objects with a single key and a \
+         string value"
+    )]
+    InvalidGucHeaders,
+
+    /// A function set `response.status` to something that is not a status.
+    #[error("response.status guc must be a valid status code")]
+    InvalidGucStatus,
+
     /// A mutation touched more rows than `Prefer: max-affected` allowed.
     ///
     /// The preference is a guard against a filter that turned out to match
@@ -317,7 +328,9 @@ impl Error {
             Self::InvalidRange(_) => StatusCode::RANGE_NOT_SATISFIABLE,
 
             // 500 Internal Server Error
-            Self::SchemaCacheNotLoaded
+            Self::InvalidGucHeaders
+            | Self::InvalidGucStatus
+            | Self::SchemaCacheNotLoaded
             | Self::SchemaCacheLoadFailed(_)
             | Self::ConnectionPool(_)
             | Self::Internal(_)
@@ -369,6 +382,8 @@ impl Error {
             Self::PutLimitNotAllowed => "PGRST114",
             Self::PutMatchingPk => "PGRST115",
             Self::MaxAffectedExceeded(_) => "PGRST124",
+            Self::InvalidGucHeaders => "PGRST111",
+            Self::InvalidGucStatus => "PGRST112",
             Self::RelatedOrderNotPossible { .. } => "PGRST118",
             Self::InvalidPreferences(_) => "PGRST122",
 

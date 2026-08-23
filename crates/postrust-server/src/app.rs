@@ -236,6 +236,21 @@ fn split_leading_cte(sql: &str) -> (String, &str) {
     (String::new(), sql)
 }
 
+/// Render a map of strings as a JSON object.
+///
+/// PostgreSQL will not accept every header name as a setting name -- a `-` is
+/// not allowed in one from version 14 -- so the whole map goes into a single
+/// setting as JSON and a function picks out what it wants with `->>`.
+fn json_object<'a>(entries: impl IntoIterator<Item = (&'a String, &'a String)>) -> String {
+    serde_json::Value::Object(
+        entries
+            .into_iter()
+            .map(|(name, value)| (name.clone(), serde_json::Value::String(value.clone())))
+            .collect(),
+    )
+    .to_string()
+}
+
 /// The prefix given to primary key columns added only to build `Location`.
 const LOCATION_KEY_PREFIX: &str = "pgrst_location_";
 
@@ -845,71 +860,78 @@ async fn execute_plan(
                     .map_err(map_sqlx_error)?;
             }
 
-            // The request's schema comes first on the search path, then the
-            // schemas configured as extra. Without this, anything an exposed
-            // object refers to by bare name -- the domain behind a media type
-            // handler, a type from an extension -- fails to resolve, because
-            // the pool's connection carries whatever search path it was opened
-            // with.
+            // Everything the request tells the database about itself, in
+            // one statement.
+            //
+            // These are `SET LOCAL` by another spelling -- `set_config(k, v,
+            // true)` -- and a function or an RLS policy reads them back with
+            // `current_setting`. Sent as one `SELECT` rather than one
+            // statement each, which is a round trip per setting otherwise, and
+            // there are eight of them before a request has done any work.
+            //
+            // The order is PostgREST's: the settings a role carries, then the
+            // role, then everything about the request. The role goes on after
+            // its own settings so that a `GRANT SET ON PARAMETER` on the
+            // authenticator still applies when they are set.
             {
                 let mut path = vec![api_request.schema.clone()];
                 path.extend(state.config.db_extra_search_path.iter().cloned());
-                let rendered = path
+                let search_path = path
                     .iter()
                     .map(|s| postrust_sql::escape_ident(s))
                     .collect::<Vec<_>>()
                     .join(", ");
-                sqlx::query(&format!("SET LOCAL search_path TO {}", rendered))
-                    .execute(&mut *tx)
-                    .await
-                    .map_err(map_sqlx_error)?;
-            }
 
-            // `Prefer: timezone` is applied to the session, so every value
-            // the database renders -- and every `now()` a function calls --
-            // sees it. An unknown zone is PostgreSQL's to reject, and it does,
-            // with a message naming the value the client sent.
-            if let Some(timezone) = &api_request.preferences.timezone {
-                sqlx::query("SELECT set_config('timezone', $1, true)")
-                    .bind(timezone)
-                    .execute(&mut *tx)
-                    .await
-                    .map_err(map_sqlx_error)?;
-            }
+                // The claims carry the role, as PostgREST's do: a policy
+                // reading `request.jwt.claims` finds the role it is running as
+                // whether or not the token named one.
+                let mut claims: serde_json::Map<String, serde_json::Value> = auth
+                    .claims
+                    .iter()
+                    .map(|(k, v)| (k.clone(), v.clone()))
+                    .collect();
+                claims.insert(
+                    "role".to_string(),
+                    serde_json::Value::String(auth.role.clone()),
+                );
 
-            // Set role
-            sqlx::query(&format!(
-                "SET LOCAL ROLE {}",
-                postrust_sql::escape_ident(&auth.role)
-            ))
-            .execute(&mut *tx)
-            .await
-            .map_err(|e| {
-                postrust_core::Error::Database(postrust_core::error::DatabaseError {
-                    code: "42501".into(),
-                    message: e.to_string(),
-                    details: None,
-                    hint: None,
-                    constraint: None,
-                    table: None,
-                    column: None,
-                })
-            })?;
+                let mut settings: Vec<(String, String)> = vec![
+                    ("search_path".to_string(), search_path),
+                    ("role".to_string(), auth.role.clone()),
+                    (
+                        "request.jwt.claims".to_string(),
+                        serde_json::Value::Object(claims).to_string(),
+                    ),
+                    ("request.method".to_string(), api_request.method.clone()),
+                    ("request.path".to_string(), api_request.path.clone()),
+                    (
+                        "request.headers".to_string(),
+                        json_object(&api_request.headers),
+                    ),
+                    (
+                        "request.cookies".to_string(),
+                        json_object(&api_request.cookies),
+                    ),
+                ];
 
-            // Set claims as GUC
-            for (key, value) in &auth.claims {
-                let guc_key = format!("request.jwt.claims.{}", key);
-                let guc_value = match value {
-                    serde_json::Value::String(s) => s.clone(),
-                    other => other.to_string(),
-                };
+                // `Prefer: timezone` is applied to the session, so every value
+                // the database renders -- and every `now()` a function calls --
+                // sees it. An unknown zone is PostgreSQL's to reject, and it
+                // does, with a message naming the value the client sent.
+                if let Some(timezone) = &api_request.preferences.timezone {
+                    settings.push(("timezone".to_string(), timezone.clone()));
+                }
 
-                sqlx::query("SELECT set_config($1, $2, true)")
-                    .bind(&guc_key)
-                    .bind(&guc_value)
-                    .execute(&mut *tx)
-                    .await
-                    .ok(); // Ignore errors for individual claims
+                let calls = (0..settings.len())
+                    .map(|i| format!("set_config(${}, ${}, true)", i * 2 + 1, i * 2 + 2))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                let sql = format!("SELECT {}", calls);
+                let mut query = sqlx::query(&sql);
+                for (name, value) in &settings {
+                    query = query.bind(name).bind(value);
+                }
+                query.execute(&mut *tx).await.map_err(map_sqlx_error)?;
             }
 
             // Execute main query with bound parameters
@@ -978,6 +1000,51 @@ async fn execute_plan(
                 )
                 .await?;
             }
+
+            // A function can set the response's status and headers, and only
+            // it knows whether it did -- so the settings are read back after
+            // it has run, on the same transaction. Reads cannot set them
+            // without a function of their own having run, which is what a
+            // call or a mutation is.
+            let (guc_headers, guc_status) =
+                match is_mutation(db_plan) || matches!(db_plan, DbActionPlan::Call { .. }) {
+                    false => (None, None),
+                    true => {
+                        use sqlx::Row;
+                        let row = sqlx::query(
+                            "SELECT current_setting('response.headers', true), \
+                         current_setting('response.status', true)",
+                        )
+                        .fetch_one(&mut *tx)
+                        .await
+                        .map_err(map_sqlx_error)?;
+                        (
+                            row.try_get::<Option<String>, _>(0).ok().flatten(),
+                            row.try_get::<Option<String>, _>(1).ok().flatten(),
+                        )
+                    }
+                };
+
+            // Both are the function's own words, so both are checked before
+            // they reach the response: a malformed one is a fault in the
+            // schema, and saying so is more use than a header the client
+            // cannot see or a status it cannot explain.
+            if let Some(headers) = &guc_headers {
+                if postrust_response::parse_guc_headers(headers).is_err() {
+                    return Err(postrust_core::Error::InvalidGucHeaders);
+                }
+            }
+            let guc_status = match guc_status {
+                None => None,
+                Some(status) => Some(
+                    status
+                        .trim()
+                        .parse::<u16>()
+                        .ok()
+                        .and_then(|code| StatusCode::from_u16(code).ok())
+                        .ok_or(postrust_core::Error::InvalidGucStatus)?,
+                ),
+            };
 
             // The count runs on the same transaction and so under the same
             // snapshot as the page it describes.
@@ -1052,7 +1119,7 @@ async fn execute_plan(
             // shape for something that returns nothing.
             let returns_void = matches!(
                 db_plan,
-                DbActionPlan::Call { call, .. } if call.return_type.as_deref() == Some("void")
+                DbActionPlan::Call { call, .. } if call.returns_void
             );
 
             // `Prefer: max-affected` guards against a filter that turned out
@@ -1161,21 +1228,27 @@ async fn execute_plan(
             }
 
             Ok(QueryResult {
-                status: match returns_void {
-                    true => StatusCode::NO_CONTENT,
-                    false => mutation_status(db_plan, api_request, created_a_row, reports_inserted)
-                        .unwrap_or_else(|| {
-                            content_range
-                                .as_ref()
-                                .map(postrust_response::ContentRange::status)
-                                .unwrap_or(StatusCode::OK)
-                        }),
+                // A status the function set outright wins: it knows things
+                // about the outcome that the request's shape cannot say.
+                status: match (guc_status, returns_void) {
+                    (Some(status), _) => status,
+                    (None, true) => StatusCode::NO_CONTENT,
+                    (None, false) => {
+                        mutation_status(db_plan, api_request, created_a_row, reports_inserted)
+                            .unwrap_or_else(|| {
+                                content_range
+                                    .as_ref()
+                                    .map(postrust_response::ContentRange::status)
+                                    .unwrap_or(StatusCode::OK)
+                            })
+                    }
                 },
                 rows,
                 singular,
                 omit_body: omit_body || returns_void,
                 location,
                 content_range,
+                guc_headers,
                 ..Default::default()
             })
         }
@@ -2794,6 +2867,8 @@ fn sanitize_error_message(error: &postrust_core::Error) -> String {
         | Error::PutLimitNotAllowed
         | Error::PutMatchingPk
         | Error::MaxAffectedExceeded(_)
+        | Error::InvalidGucHeaders
+        | Error::InvalidGucStatus
         | Error::InvalidMediaType(_)
         | Error::InvalidResourcePath => return error.to_string(),
         Error::InvalidPath(_) => "Invalid request path",
@@ -2859,6 +2934,7 @@ mod tests {
             returns_composite: false,
             volatility: "Volatile".into(),
             param_types: Vec::new(),
+            returns_void: false,
         }
     }
 

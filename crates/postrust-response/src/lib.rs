@@ -3,6 +3,7 @@
 //! Handles content negotiation and response formatting for JSON, CSV, and other formats.
 
 mod headers;
+pub use headers::parse_guc_headers;
 mod json;
 
 pub use headers::{build_response_headers, ContentRange};
@@ -47,6 +48,19 @@ impl Response {
     }
 
     /// Set a header.
+    /// Add a header without replacing one of the same name.
+    ///
+    /// A response may legitimately carry two `Set-Cookie`s, which `set_header`
+    /// -- being a replace -- cannot express.
+    pub fn append_header(&mut self, name: &str, value: &str) {
+        if let (Ok(name), Ok(value)) = (
+            http::header::HeaderName::from_bytes(name.as_bytes()),
+            HeaderValue::from_str(value),
+        ) {
+            self.headers.append(name, value);
+        }
+    }
+
     pub fn set_header(&mut self, name: &str, value: &str) {
         if let Ok(v) = HeaderValue::from_str(value) {
             self.headers.insert(
@@ -218,6 +232,16 @@ fn strip_nulls(value: serde_json::Value) -> serde_json::Value {
 
 /// Add common response headers.
 fn add_common_headers(response: &mut Response, request: &ApiRequest, result: &QueryResult) {
+    // A function's own headers, added rather than replaced: the shape of the
+    // setting is an array precisely so that a name may repeat.
+    if let Some(guc) = &result.guc_headers {
+        if let Ok(headers) = crate::headers::parse_guc_headers(guc) {
+            for (name, value) in headers {
+                response.append_header(&name, &value);
+            }
+        }
+    }
+
     // Content-Range
     if let Some(range) = &result.content_range {
         response.set_content_range(range);

@@ -272,6 +272,22 @@ impl SchemaCache {
         }
     }
 
+    /// The exposed function whose name is closest to one that does not exist.
+    ///
+    /// Only when the name itself is wrong: an existing name whose arguments do
+    /// not match is a different mistake, and the overloads answer it better.
+    pub fn similar_routine(&self, qi: &QualifiedIdentifier) -> Option<String> {
+        const MIN_SIMILARITY: f64 = 0.75;
+
+        self.routines
+            .keys()
+            .filter(|candidate| candidate.schema == qi.schema)
+            .map(|candidate| (similarity(&candidate.name, &qi.name), candidate))
+            .filter(|(score, _)| *score >= MIN_SIMILARITY)
+            .max_by(|(a, _), (b, _)| a.total_cmp(b))
+            .map(|(_, candidate)| candidate.to_string())
+    }
+
     /// Find a relationship between two tables by name.
     ///
     /// `hint` is the `!hint` of `person_detail!message_sender_fkey(name)`,
@@ -399,7 +415,7 @@ impl SchemaCache {
 ///
 /// Edit distance over the longer of the two, which is enough to tell a typo
 /// from a different word.
-fn similarity(a: &str, b: &str) -> f64 {
+pub(crate) fn similarity(a: &str, b: &str) -> f64 {
     let longest = a.chars().count().max(b.chars().count());
     if longest == 0 {
         return 1.0;

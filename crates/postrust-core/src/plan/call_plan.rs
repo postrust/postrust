@@ -22,6 +22,13 @@ pub struct CallPlan {
     pub return_type: Option<String>,
     /// Whether the function is set-returning
     pub returns_set: bool,
+    /// Whether the function returns nothing at all.
+    ///
+    /// A `void` function has no result to report, which is 204 rather than a
+    /// body of `null` -- and `RetType::Void` has no type name, so asking for
+    /// one would never find it.
+    #[serde(default)]
+    pub returns_void: bool,
     /// Whether the return type is composite (row type or `record`): its
     /// columns are real output columns, never the function-name wrapper.
     #[serde(default)]
@@ -72,6 +79,7 @@ impl CallPlan {
             returns_scalar,
             return_type: routine.return_type.type_name().map(str::to_string),
             returns_set: routine.return_type.is_set_returning(),
+            returns_void: matches!(routine.return_type, crate::schema_cache::RetType::Void),
             returns_composite: routine.returns_composite,
             volatility: format!("{:?}", routine.volatility),
             param_types: routine
