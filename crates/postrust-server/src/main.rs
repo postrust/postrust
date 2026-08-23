@@ -86,6 +86,25 @@ async fn main() -> Result<()> {
     // Build main router
     let mut app: Router<Arc<AppState>> = Router::new().nest("/api", api_router);
 
+    // Two endpoints every Hasura deployment has, and that the things around a
+    // deployment reach for without being asked to: `/healthz` is what a load
+    // balancer, a Kubernetes probe and `docker-compose` healthchecks are
+    // already configured to poll, and `/v1/version` is what a client library
+    // calls to decide which features to use. Serving them costs nothing and
+    // not serving them makes a drop-in replacement fail its first health
+    // check.
+    app = app
+        .route(
+            "/healthz",
+            axum::routing::get(|| async { "OK" }),
+        )
+        .route(
+            "/v1/version",
+            axum::routing::get(|| async {
+                Json(serde_json::json!({ "version": env!("CARGO_PKG_VERSION") }))
+            }),
+        );
+
     // Add custom routes (health checks, webhooks, etc.)
     app = app.nest("/_", custom::custom_router());
     info!("Custom routes enabled at /_");
@@ -93,7 +112,7 @@ async fn main() -> Result<()> {
     // Add admin routes and GraphQL endpoint if feature is enabled
     #[cfg(feature = "admin-ui")]
     {
-        use async_graphql_axum::{GraphQLRequest as GqlRequest, GraphQLResponse as GqlResponse};
+        use async_graphql_axum::GraphQLRequest as GqlRequest;
         use axum::extract::State as AxumState;
         use axum::http::HeaderMap;
         use postrust_graphql::handler::GraphQLState;
@@ -108,6 +127,11 @@ async fn main() -> Result<()> {
         let graphql_config = SchemaConfig {
             enable_subscriptions: true,
             max_rows: config.db_max_rows,
+            // The GraphQL schema was built for `public` whatever the server
+            // was told to expose, so a table in any other schema of
+            // `PGRST_DB_SCHEMAS` was reachable over REST and invisible over
+            // GraphQL.
+            exposed_schemas: config.db_schemas.clone(),
             ..SchemaConfig::default()
         };
         let graphql_state = Arc::new(
@@ -141,7 +165,7 @@ async fn main() -> Result<()> {
             AxumState(app_state): AxumState<GraphQLAppState>,
             headers: HeaderMap,
             req: GqlRequest,
-        ) -> GqlResponse {
+        ) -> Json<serde_json::Value> {
             // Extract auth header and authenticate
             let auth_header = headers.get("authorization").and_then(|v| v.to_str().ok());
 
@@ -182,7 +206,8 @@ async fn main() -> Result<()> {
                 .data(gql_ctx)
                 .data(app_state.gql_state.pool.clone())
                 .data(Arc::clone(&app_state.gql_state.broker));
-            app_state.gql_state.schema.execute(request).await.into()
+            let response = app_state.gql_state.schema.execute(request).await;
+            Json(postrust_graphql::hasura::envelope(response))
         }
 
         // Add GraphQL routes with WebSocket support for subscriptions
@@ -196,7 +221,14 @@ async fn main() -> Result<()> {
             .route("/ws", get(postrust_graphql::handler::graphql_ws_handler))
             .with_state(graphql_state);
 
-        app = app.nest("/api/graphql", graphql_router.merge(ws_router));
+        let graphql_app = graphql_router.merge(ws_router);
+        // `/v1/graphql` is where a Hasura client sends its queries, and it is
+        // the only address most of them can be told about: the endpoint is
+        // baked into generated clients and codegen configs. `/api/graphql`
+        // keeps working for anything already pointed at it.
+        app = app
+            .nest("/v1/graphql", graphql_app.clone())
+            .nest("/api/graphql", graphql_app);
     }
 
     // PostgREST compatibility mode: also serve the REST surface at the root so

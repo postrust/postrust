@@ -14,6 +14,7 @@ pub mod subscription;
 
 pub mod context;
 pub mod handler;
+pub mod hasura;
 
 // Re-exports
 pub use error::GraphQLError;
