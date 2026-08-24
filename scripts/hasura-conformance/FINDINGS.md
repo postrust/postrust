@@ -107,13 +107,19 @@ wrong one.
    one item, not the several it looked like, and closing computed relationships
    is what made that clear: the function is `fetch_articles_plain` and the
    field Hasura exposes is `get_articles`, because `add_computed_field` named
-   it. Same for a computed field's name (`upper_name` for a function called
-   `automatic_comment_in_db_upper_name`, which is why
-   `graphql_introspection/descriptions` sits at 0/5 while every description it
-   reports is correct), for custom root field names, and for relationship names
-   below. Reflection cannot recover a name nobody wrote down. Roughly 25 cases
-   across four groups turn on it, and it is one decision about configuration
-   rather than four pieces of work.
+   it. Same for a computed field's name, for custom root field names, and for
+   relationship names. Reflection cannot recover a name nobody wrote down, and
+   roughly 25 cases across four groups turn on it.
+
+   `PGRST_GRAPHQL_NAMES` now takes them — table base names, relationship names,
+   computed field names — so a migrated schema can say what its client already
+   sends. **The harness does not use it**, and the figures above are therefore
+   the unconfigured ones. Generating a names document from each group's own
+   metadata would close most of those cases and would also be a fair
+   measurement, since it is what a migration actually does; it needs the
+   column-to-constraint mapping Hasura's relationship commands imply, which is
+   a database query per group rather than a read of the fixture. Worth doing,
+   and worth labelling clearly when it is.
 
 2. **`sum_float` and one `json` type are not resolved** in
    `graphql_query/computed_fields`, and neither reproduces against a
@@ -151,6 +157,16 @@ wrong one.
    more than a pair of columns to correlate on. The computed-relationship half
    of this is now resolved, by argument rather than by columns.
 
+9. **Nested inserts.** `insert_article(objects: [{title: "x", author: {data:
+   {name: "y"}}}])` writes the parent and the child in one mutation. The
+   relationship is read as a column and answers `column "author" of relation
+   "article" does not exist`. `graphql_mutation/insert/nested` is 16 cases.
+
+10. **A mutation's `returning` has no computed fields.** It selects
+    `row_to_json(t.*)`, which is the table's row and not the functions of it,
+    so a computed field asked for after an insert comes back null rather than
+    computed.
+
 ## Fixed since the first run
 
 - **Relationship predicates** now resolve as a correlated `EXISTS`, in both
@@ -174,6 +190,10 @@ wrong one.
   ordering happens before it. `EmbedPlan::embed_expression` already took all
   four for the REST surface; the GraphQL side had no way to say any of them.
 - **Computed columns are fields**, at the root and inside an embed.
+- **Names can be given** where the schema cannot carry them, through
+  `PGRST_GRAPHQL_NAMES`: table base names, relationship names (keyed by
+  constraint, or by function for a computed relationship), and computed field
+  names. Only names -- no permissions, no tracking.
 - **Computed relationships resolve** — a function returning `setof` a table,
   named by its function rather than by the table it returns, filterable and
   pageable like any other embed, and usable in a predicate. They had been in
