@@ -607,7 +607,7 @@ fn create_object_type(obj: &TableObjectType, relationships: &[RelationshipField]
             TypeRef::named(&rel.target_type)
         };
 
-        let gql_field = Field::new(&rel.name, field_type, move |ctx| {
+        let mut gql_field = Field::new(&rel.name, field_type, move |ctx| {
             let field_name = field_name.clone();
             FieldFuture::new(async move {
                 if let Some(Value::Object(map)) = ctx.parent_value.as_value() {
@@ -619,6 +619,28 @@ fn create_object_type(obj: &TableObjectType, relationships: &[RelationshipField]
                 Ok(None)
             })
         });
+
+        // The same arguments the root field takes. An embedded list is a list
+        // like any other: a client showing the five most recent articles of an
+        // author has nowhere else to say so, and without these the only way to
+        // narrow one is to fetch all of it and discard the rest in the client.
+        // A to-one relationship is left alone -- there is nothing to order or
+        // page through when the answer is one row.
+        if rel.is_list {
+            gql_field = gql_field
+                .argument(InputValue::new(
+                    "where",
+                    TypeRef::named(crate::input::bool_exp::bool_exp_type_name(&rel.target_type)),
+                ))
+                .argument(InputValue::new(
+                    "order_by",
+                    TypeRef::named_nn_list(crate::input::order_by::order_by_type_name(
+                        &rel.target_type,
+                    )),
+                ))
+                .argument(InputValue::new("limit", TypeRef::named("Int")))
+                .argument(InputValue::new("offset", TypeRef::named("Int")));
+        }
 
         let gql_field = if let Some(desc) = &rel.description {
             gql_field.description(desc)
@@ -1257,15 +1279,24 @@ async fn resolve_query<'a>(
             .await
             .map_err(|e| async_graphql::Error::new(e.to_string()))?;
         match guard.as_ref() {
-            Some(cache) => build_embed_expressions(
-                cache,
-                relationships,
-                type_name,
-                "src",
-                ctx.field(),
-                max_rows,
-                &mut 0,
-            )?,
+            Some(cache) => {
+                // Parameters bound inside an embed continue the outer query's
+                // numbering: sqlx binds by position, so the values only have
+                // to be pushed in the order their placeholders were handed
+                // out.
+                let mut param_idx = bound_values.len() + 1;
+                build_embed_expressions(
+                    cache,
+                    relationships,
+                    type_name,
+                    "src",
+                    ctx.field(),
+                    max_rows,
+                    &mut 0,
+                    &mut param_idx,
+                    &mut bound_values,
+                )?
+            }
             None => Vec::new(),
         }
     };
@@ -1963,6 +1994,23 @@ impl<'a> WhereScope<'a> {
         self
     }
 
+    /// A scope over an aliased table, able to follow relationships.
+    fn for_alias(
+        alias: &str,
+        type_name: &str,
+        cache: &'a SchemaCache,
+        relationships: &'a HashMap<String, Vec<RelationshipField>>,
+    ) -> Self {
+        Self {
+            sql_ref: postrust_sql::escape_ident(alias),
+            type_name: type_name.to_string(),
+            resolution: Some(WhereResolution {
+                cache,
+                relationships,
+            }),
+        }
+    }
+
     /// A scope over an aliased table, for the inside of an `EXISTS`.
     fn aliased(alias: &str, type_name: &str, from: &WhereScope<'a>) -> Self {
         Self {
@@ -2399,6 +2447,63 @@ async fn build_distinct_on(
 /// The GraphQL mirror of the REST builder: each requested relationship becomes a
 /// correlated subselect yielding JSON, so the whole selection comes back from
 /// the parent query instead of one query per relationship per level.
+/// Render `order_by` terms against a table, qualified with an alias.
+///
+/// The root field's ordering reads its argument from the resolver context and
+/// needs the schema cache asynchronously; an embed already holds both, so this
+/// takes the value directly. Columns are checked against the table before they
+/// are quoted, so an unknown or crafted name is refused rather than
+/// interpolated.
+fn order_terms(
+    order: &serde_json::Value,
+    schema_cache: &SchemaCache,
+    schema_name: &str,
+    table_name: &str,
+    alias: &str,
+) -> Result<Option<String>, async_graphql::Error> {
+    let entries: Vec<&serde_json::Value> = match order {
+        serde_json::Value::Array(items) => items.iter().collect(),
+        serde_json::Value::Object(_) => vec![order],
+        _ => return Ok(None),
+    };
+
+    let qi = postrust_core::api_request::QualifiedIdentifier::new(schema_name, table_name);
+    let table = schema_cache
+        .get_table(&qi)
+        .ok_or_else(|| async_graphql::Error::new(format!("unknown table \"{}\"", table_name)))?;
+
+    let mut terms = Vec::new();
+    for entry in entries {
+        let serde_json::Value::Object(map) = entry else {
+            continue;
+        };
+        for (column, direction) in map {
+            if table.get_column(column).is_none() {
+                return Err(async_graphql::Error::new(format!(
+                    "cannot order by unknown column \"{}\" on \"{}\"",
+                    column, table_name
+                )));
+            }
+            let name = direction.as_str().unwrap_or_default();
+            let sql = crate::input::order_by::direction_sql(name).ok_or_else(|| {
+                async_graphql::Error::new(format!("\"{}\" is not a sort direction", name))
+            })?;
+            terms.push(format!(
+                "{}.{} {}",
+                postrust_sql::escape_ident(alias),
+                postrust_sql::escape_ident(column),
+                sql
+            ));
+        }
+    }
+
+    Ok(if terms.is_empty() {
+        None
+    } else {
+        Some(terms.join(", "))
+    })
+}
+
 fn build_embed_expressions(
     schema_cache: &SchemaCache,
     relationships: &HashMap<String, Vec<RelationshipField>>,
@@ -2407,6 +2512,8 @@ fn build_embed_expressions(
     selection: async_graphql::SelectionField<'_>,
     max_rows: Option<i64>,
     alias_counter: &mut usize,
+    param_idx: &mut usize,
+    values: &mut Vec<serde_json::Value>,
 ) -> Result<Vec<(String, String)>, async_graphql::Error> {
     let Some(available) = relationships.get(type_name) else {
         return Ok(Vec::new());
@@ -2433,7 +2540,61 @@ fn build_embed_expressions(
             field,
             max_rows,
             alias_counter,
+            param_idx,
+            values,
         )?;
+
+        // The arguments written on the embed itself.
+        let arguments: HashMap<String, serde_json::Value> = field
+            .arguments()
+            .map(|args| {
+                args.into_iter()
+                    .map(|(name, value)| {
+                        (
+                            name.to_string(),
+                            value.into_json().unwrap_or(serde_json::Value::Null),
+                        )
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        let child_where = match arguments.get("where") {
+            Some(expression) if !expression.is_null() => {
+                let child_scope = WhereScope::for_alias(
+                    &child_alias,
+                    &rel.target_type,
+                    schema_cache,
+                    relationships,
+                );
+                let mut nested_alias = 0usize;
+                build_condition(expression, &child_scope, param_idx, values, &mut nested_alias)?
+            }
+            _ => None,
+        };
+
+        let child_order = match arguments.get("order_by") {
+            Some(order) if !order.is_null() => order_terms(
+                order,
+                schema_cache,
+                &plan.foreign_schema,
+                &plan.foreign_table,
+                &child_alias,
+            )?,
+            _ => None,
+        };
+
+        // A limit written on the embed is what the client asked for; the
+        // configured ceiling still applies as an upper bound, the same way it
+        // does at the top level.
+        let child_limit = match arguments.get("limit").and_then(|v| v.as_i64()) {
+            Some(requested) => match max_rows {
+                Some(ceiling) => Some(requested.min(ceiling)),
+                None => Some(requested),
+            },
+            None => max_rows,
+        };
+        let child_offset = arguments.get("offset").and_then(|v| v.as_i64()).unwrap_or(0);
 
         // Leaf fields are columns; anything that resolved to a relationship is
         // an expression instead.
@@ -2467,10 +2628,10 @@ fn build_embed_expressions(
                 &postrust_sql::escape_ident(parent_alias),
                 &child_alias,
                 &parts.join(", "),
-                max_rows,
-                0,
-                None,
-                None,
+                child_limit,
+                child_offset,
+                child_where.as_deref(),
+                child_order.as_deref(),
             )
             .map_err(|e| async_graphql::Error::new(e.to_string()))?;
 
