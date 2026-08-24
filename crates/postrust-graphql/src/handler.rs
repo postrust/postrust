@@ -680,6 +680,37 @@ fn create_object_type(obj: &TableObjectType, relationships: &[RelationshipField]
         };
 
         object = object.field(gql_field);
+
+        // `author { articles_aggregate { aggregate { count } } }` -- the count
+        // of a row's children without fetching them, which is the query behind
+        // every "12 comments" beside a post. Only for a relationship to many:
+        // counting one row is not a question anyone asks.
+        if rel.is_list {
+            let aggregate_field = format!("{}_aggregate", rel.name);
+            if taken.insert(aggregate_field.clone()) {
+                let key = aggregate_field.clone();
+                object = object.field(
+                    Field::new(
+                        &aggregate_field,
+                        TypeRef::named_nn(crate::schema::aggregate::aggregate_type_name(
+                            &rel.target_type,
+                        )),
+                        move |ctx| {
+                            let key = key.clone();
+                            FieldFuture::new(async move {
+                                // Absent where the parent has no children at
+                                // all; the aggregate type's own resolvers read
+                                // a missing key as zero and an empty list.
+                                Ok(Some(FieldValue::value(
+                                    child_value(&ctx, &key).unwrap_or(Value::Null),
+                                )))
+                            })
+                        },
+                    )
+                    .description(format!("Aggregates over {}.", rel.name)),
+                );
+            }
+        }
     }
 
     object
@@ -2999,6 +3030,97 @@ fn computed_projections(
     projections
 }
 
+/// The SELECT list for a nested aggregate.
+///
+/// `articles_aggregate { aggregate { count } nodes { title } }` becomes one
+/// row per parent, correlated the way any embed is. Both halves are aggregates
+/// over the same correlated set, so they go in one select list rather than two
+/// queries -- `count(*)` and `json_agg(...)` read the same rows.
+fn nested_aggregate_select(
+    selection: async_graphql::SelectionField<'_>,
+    child_alias: &str,
+) -> String {
+    use crate::schema::aggregate as agg;
+
+    let mut parts: Vec<String> = Vec::new();
+
+    for child in selection.selection_set() {
+        match child.name() {
+            "aggregate" => {
+                let mut fields = vec!["'count', count(*)".to_string()];
+                for function in child.selection_set() {
+                    if function.name() == "count" {
+                        continue;
+                    }
+                    let sql_function = agg::NUMERIC_AGGREGATES
+                        .iter()
+                        .chain(agg::ORDERED_AGGREGATES.iter())
+                        .find(|(name, _)| *name == function.name())
+                        .map(|(name, _)| *name);
+                    let Some(sql_function) = sql_function else {
+                        continue;
+                    };
+                    let columns: Vec<String> = function
+                        .selection_set()
+                        .map(|column| {
+                            format!(
+                                "'{}', {}({}.{})",
+                                column.name().replace('\'', "''"),
+                                sql_function,
+                                postrust_sql::escape_ident(child_alias),
+                                postrust_sql::escape_ident(column.name())
+                            )
+                        })
+                        .collect();
+                    if !columns.is_empty() {
+                        fields.push(format!(
+                            "'{}', json_build_object({})",
+                            sql_function,
+                            columns.join(", ")
+                        ));
+                    }
+                }
+                parts.push(format!(
+                    "json_build_object({}) AS {}",
+                    fields.join(", "),
+                    postrust_sql::escape_ident("aggregate")
+                ));
+            }
+            "nodes" => {
+                let columns: Vec<String> = child
+                    .selection_set()
+                    .map(|column| {
+                        format!(
+                            "'{}', {}.{}",
+                            column.name().replace('\'', "''"),
+                            postrust_sql::escape_ident(child_alias),
+                            postrust_sql::escape_ident(column.name())
+                        )
+                    })
+                    .collect();
+                let row = if columns.is_empty() {
+                    format!("row_to_json({})", postrust_sql::escape_ident(child_alias))
+                } else {
+                    format!("json_build_object({})", columns.join(", "))
+                };
+                parts.push(format!(
+                    "COALESCE(json_agg({}), '[]'::json) AS {}",
+                    row,
+                    postrust_sql::escape_ident("nodes")
+                ));
+            }
+            _ => {}
+        }
+    }
+
+    if parts.is_empty() {
+        // A selection of nothing but `__typename`. One row, no columns, is not
+        // valid SQL; a count nobody reads is.
+        parts.push("count(*) AS pgrst_empty".to_string());
+    }
+    parts.join(", ")
+}
+
 /// Render `order_by` terms against a table, qualified with an alias.
 ///
 /// The root field's ordering reads its argument from the resolver context and
@@ -3075,6 +3197,41 @@ fn build_embed_expressions(
     let mut expressions = Vec::new();
 
     for field in selection.selection_set() {
+        // `<relationship>_aggregate` is the same embed with an aggregate
+        // select list, so it is resolved here rather than by a resolver of its
+        // own -- the correlation is what makes it a per-parent answer.
+        let aggregate_of = field
+            .name()
+            .strip_suffix("_aggregate")
+            .and_then(|name| available.iter().find(|r| r.name == name && r.is_list));
+
+        if let Some(rel) = aggregate_of {
+            let plan = postrust_core::embed::EmbedPlan::resolve(&rel.relationship, schema_cache)
+                .map_err(|e| async_graphql::Error::new(e.to_string()))?;
+            *alias_counter += 1;
+            let child_alias = format!("a{}", alias_counter);
+
+            // One row per parent rather than a list of them: the aggregate is
+            // the answer, not the rows it read.
+            let mut one_row = plan.clone();
+            one_row.is_list = false;
+
+            let expression = one_row
+                .embed_expression(
+                    parent_alias,
+                    &postrust_sql::escape_ident(parent_alias),
+                    &child_alias,
+                    &nested_aggregate_select(field, &child_alias),
+                    None,
+                    0,
+                    None,
+                    None,
+                )
+                .map_err(|e| async_graphql::Error::new(e.to_string()))?;
+            expressions.push((field.name().to_string(), expression));
+            continue;
+        }
+
         let Some(rel) = available.iter().find(|r| r.name == field.name()) else {
             continue;
         };
@@ -3162,7 +3319,11 @@ fn build_embed_expressions(
         for sub in field.selection_set() {
             let name = sub.name();
             let is_relationship = child_relationships
-                .map(|rels| rels.iter().any(|r| r.name == name))
+                .map(|rels| {
+                    rels.iter().any(|r| {
+                        r.name == name || (r.is_list && format!("{}_aggregate", r.name) == name)
+                    })
+                })
                 .unwrap_or(false);
             if is_relationship {
                 continue;
