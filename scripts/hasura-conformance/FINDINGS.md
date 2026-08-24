@@ -8,9 +8,9 @@ harness itself, divergences kept on purpose, and the gaps still open.
 
 | | status | same outcome | same data | full body |
 |---|---|---|---|---|
-| all (464) | 97.8% | 55.8% | **48.9%** | 20.3% |
+| all (464) | 97.8% | 56.5% | **49.4%** | 21.1% |
 | reads (269) | 99.3% | 57.2% | 47.6% | 25.3% |
-| writes (195) | 95.9% | 53.8% | 50.8% | 13.3% |
+| writes (195) | 95.9% | 55.4% | 51.8% | 15.4% |
 
 **The candidate is configured.** Each group's fixtures are converted into a
 `PGRST_GRAPHQL_NAMES` document by `scripts/hasura-names.py` and given to the
@@ -23,7 +23,8 @@ The same-data figure over successive fixes: 34.1 → 41.8 (duplicate-field
 panic) → 43.8 (enum arguments read) → 44.2 (relationship predicates, aggregate
 result decoding) → 44.6 (scalar naming) → 48.3 (update operators, written-value
 casts, root type names) → 49.1 (embed arguments, computed columns) → 48.9
-(names given, and see immediately below).
+(names given, and see immediately below) → 49.4 (nested inserts, embeds in
+`returning`).
 
 The third column is the one that matters to a client: the same query came back
 with the same rows.
@@ -31,7 +32,7 @@ with the same rows.
 **142 of the 464 cases cannot pass and are counted anyway.** They are the
 permission cases — Hasura answers `access-denied` from a rule that lives in
 metadata, and there is no metadata here. Excluding them the figure is
-**178/322 = 55.3%**, up from 165/322 = 51.2% before the names were given.
+**180/322 = 55.9%**, up from 165/322 = 51.2% before the names were given.
 
 That gap is worth understanding, because the headline did not move while the
 figure behind it moved four points. 49 of those 142 permission cases "agree"
@@ -184,15 +185,18 @@ wrong one.
    more than a pair of columns to correlate on. The computed-relationship half
    of this is now resolved, by argument rather than by columns.
 
-9. **Nested inserts.** `insert_article(objects: [{title: "x", author: {data:
-   {name: "y"}}}])` writes the parent and the child in one mutation. The
-   relationship is read as a column and answers `column "author" of relation
-   "article" does not exist`. `graphql_mutation/insert/nested` is 16 cases.
+9. **What is left of nested inserts** (6/16). The write itself works in both
+   directions and counts every row it touches. What the remaining cases need is
+   other features reached through a nested object: `on_conflict` inside nested
+   data, a computed field taking arguments, a nested aggregate, and a
+   one-to-one where the child's key *is* the parent's -- which needs the parent
+   written first and the key pushed down, the opposite of the ordinary to-one
+   rule.
 
-10. **A mutation's `returning` has no computed fields.** It selects
-    `row_to_json(t.*)`, which is the table's row and not the functions of it,
-    so a computed field asked for after an insert comes back null rather than
-    computed.
+10. **A relationship in a `delete`'s `returning`** keeps the plain columns.
+    The rows are gone by the time they could be read again, so there is nothing
+    to embed. Reporting the columns that were deleted is the honest answer, but
+    it is not Hasura's.
 
 ## Fixed since the first run
 
@@ -217,6 +221,14 @@ wrong one.
   ordering happens before it. `EmbedPlan::embed_expression` already took all
   four for the REST surface; the GraphQL side had no way to say any of them.
 - **Computed columns are fields**, at the root and inside an embed.
+- **A parent and its children are written in one mutation**, in either
+  direction, in one transaction, with `affected_rows` counting every row
+  written rather than every row returned.
+- **A mutation's `returning` carries relationships and computed fields**, by
+  reading the written rows again through the projection a query uses. Before
+  this, a non-null list field asked for beside the columns had no value and the
+  mutation answered as though it had failed -- after writing its rows
+  correctly, which is worse than failing.
 - **Names can be given** where the schema cannot carry them, through
   `PGRST_GRAPHQL_NAMES`: table base names, relationship names (keyed by
   constraint, or by function for a computed relationship), and computed field
