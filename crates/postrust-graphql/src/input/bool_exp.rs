@@ -185,17 +185,26 @@ fn scalar_for(graphql_type: &GraphQLType) -> String {
     }
 }
 
-/// Every input type the boolean expressions need, ready to register.
+/// Every input type the boolean expressions need, ready to register, and every
+/// scalar those inputs name.
 ///
-/// Returns the comparison inputs first and the table expressions after, though
-/// registration order does not matter to the schema builder -- the types refer
-/// to each other by name and are resolved once the whole set is present. That
-/// is also what makes a recursive `_and: [author_bool_exp!]` expressible at
-/// all.
+/// The second half is not a convenience. A comparison input names scalars its
+/// own table may not have a column of -- a cast from a geometry names
+/// `geography`, a raster comparison names `geometry` -- and a type the schema
+/// mentions and never registers makes the whole schema unbuildable. Reading
+/// the names off what was actually generated is the only way that cannot drift
+/// from the truth; twice it was patched case by case, and twice it broke again
+/// one operator later.
+///
+/// The inputs come back with the comparisons first and the table expressions
+/// after, though registration order does not matter to the schema builder --
+/// the types refer to each other by name and are resolved once the whole set
+/// is present, which is also what makes a recursive `_and: [author_bool_exp!]`
+/// expressible at all.
 pub fn build_inputs(
     object_types: &HashMap<String, TableObjectType>,
     relationship_fields: &HashMap<String, Vec<RelationshipField>>,
-) -> Vec<InputObject> {
+) -> (Vec<InputObject>, HashSet<String>) {
     let mut scalars: HashSet<String> = HashSet::new();
     let mut inputs = Vec::new();
 
@@ -256,6 +265,13 @@ pub fn build_inputs(
         scalars.insert("geometry".to_string());
     }
 
+    // Every scalar named by anything generated here, which is more than the
+    // scalars the columns are: a comparison may name another shape's type.
+    let mut named: HashSet<String> = scalars.clone();
+    if scalars.contains("raster") {
+        named.insert("geometry".to_string());
+    }
+
     let mut comparisons: Vec<InputObject> =
         scalars.iter().map(|s| comparison_input(s)).collect();
 
@@ -314,7 +330,7 @@ pub fn build_inputs(
         );
     }
     comparisons.extend(inputs);
-    comparisons
+    (comparisons, named)
 }
 
 #[cfg(test)]

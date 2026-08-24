@@ -326,6 +326,14 @@ fn build_dynamic_schema(
     // become a scalar under their own PostgreSQL name, because that is the
     // name a client's query declares its variables with -- and a scalar the
     // schema mentions but never registers makes the whole schema unbuildable.
+    let (bool_exp_inputs, bool_exp_scalars) = crate::input::bool_exp::build_inputs(
+        &generated.object_types,
+        &generated.relationship_fields,
+    );
+    for input in bool_exp_inputs {
+        builder = builder.register(input);
+    }
+
     let mut scalar_names: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
     for object in generated.object_types.values() {
         for field in &object.fields {
@@ -335,13 +343,12 @@ fn build_dynamic_schema(
     // Used as an argument type in its own right, whether or not any column is
     // one: `objects`, `_set` and the mutation inputs are still JSON.
     scalar_names.insert("JSON".to_string());
-    // A raster is compared against a shape, so the raster comparisons name
-    // `geometry` even where no column is one. A type the schema mentions and
-    // never registers makes the whole schema unbuildable -- which is what a
-    // table with a raster column and no geometry column did.
-    if scalar_names.contains("raster") {
-        scalar_names.insert("geometry".to_string());
-    }
+    // Every scalar the boolean expressions name, which is more than the
+    // scalars the columns are: a cast from a geometry names `geography`, and a
+    // raster comparison names `geometry`. Taken from what was generated rather
+    // than listed here, because a list here is a second place to keep in step
+    // and it fell out of step twice.
+    scalar_names.extend(bool_exp_scalars);
 
     for name in scalar_names {
         if matches!(name.as_str(), "Int" | "Float" | "String" | "Boolean" | "ID") {
@@ -360,12 +367,6 @@ fn build_dynamic_schema(
 
     // Register the boolean expression inputs -- one per table, plus one
     // comparison input per scalar the tables use.
-    for input in crate::input::bool_exp::build_inputs(
-        &generated.object_types,
-        &generated.relationship_fields,
-    ) {
-        builder = builder.register(input);
-    }
 
     // A key as one object, for `update_x_by_pk(pk_columns: {...})`. Only the
     // by-key update spells its key this way; the by-key query and delete take
@@ -4572,7 +4573,7 @@ mod tests {
         let config = SchemaConfig::default();
         let generated = build_schema(&cache, &config);
 
-        let inputs = crate::input::bool_exp::build_inputs(
+        let (inputs, _) = crate::input::bool_exp::build_inputs(
             &generated.object_types,
             &generated.relationship_fields,
         );
