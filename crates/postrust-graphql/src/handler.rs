@@ -452,7 +452,7 @@ fn build_dynamic_schema(
     // Ordering: one input per table, one column enum per table, and the single
     // direction enum they all share.
     let (order_inputs, order_enums) =
-        crate::input::order_by::build_inputs(&generated.object_types);
+        crate::input::order_by::build_inputs(&generated.object_types, &generated.relationship_fields);
     for input in order_inputs {
         builder = builder.register(input);
     }
@@ -1177,6 +1177,8 @@ async fn resolve_aggregate<'a>(
         &gql_ctx.schema_cache,
         &spec.schema_name,
         &spec.table_name,
+        &spec.type_name,
+        spec.relationships.as_ref(),
     )
     .await?;
 
@@ -1440,7 +1442,15 @@ async fn resolve_query<'a>(
         (String::new(), Vec::new())
     } else {
         (
-            build_order_by_clause(ctx, &gql_ctx.schema_cache, schema_name, table_name).await?,
+            build_order_by_clause(
+                ctx,
+                &gql_ctx.schema_cache,
+                schema_name,
+                table_name,
+                type_name,
+                relationships,
+            )
+            .await?,
             build_distinct_on(ctx, &gql_ctx.schema_cache, schema_name, table_name).await?,
         )
     };
@@ -3031,6 +3041,8 @@ async fn build_order_by_clause(
     schema_cache: &postrust_core::schema_cache::SchemaCacheRef,
     schema_name: &str,
     table_name: &str,
+    type_name: &str,
+    relationships: &HashMap<String, Vec<RelationshipField>>,
 ) -> Result<String, async_graphql::Error> {
     let Ok(order_arg) = ctx.args.try_get("order_by") else {
         return Ok(String::new());
@@ -3066,20 +3078,68 @@ async fn build_order_by_clause(
         .ok_or_else(|| async_graphql::Error::new(format!("unknown table \"{}\"", table_name)))?;
 
     let mut terms = Vec::new();
+    let mut alias_counter = 0usize;
+    let reference = format!(
+        "{}.{}",
+        postrust_sql::escape_ident(schema_name),
+        postrust_sql::escape_ident(table_name)
+    );
     for entry in entries {
-        let serde_json::Value::Object(map) = entry else {
-            return Err(async_graphql::Error::new(
-                "each order_by entry is an object mapping a column to a direction",
-            ));
-        };
-        for (column, direction) in map {
-            if table.get_column(column).is_none() {
+        order_terms_into(
+            entry,
+            cache,
+            relationships,
+            type_name,
+            table,
+            &reference,
+            &mut alias_counter,
+            &mut terms,
+        )?;
+    }
+
+    if terms.is_empty() {
+        return Ok(String::new());
+    }
+    Ok(format!(" ORDER BY {}", terms.join(", ")))
+}
+
+/// Collect the `ORDER BY` terms one entry contributes.
+///
+/// A key whose value is a direction is a column of this table. A key whose
+/// value is an object is something the row points at, and ordering by it is a
+/// correlated subselect: one related row contributes its column, and many
+/// contribute an aggregate. That is the whole difference between the two
+/// sides, and PostgreSQL will take a scalar subquery anywhere a column goes.
+#[allow(clippy::too_many_arguments)]
+fn order_terms_into(
+    entry: &serde_json::Value,
+    cache: &SchemaCache,
+    relationships: &HashMap<String, Vec<RelationshipField>>,
+    type_name: &str,
+    table: &postrust_core::schema_cache::Table,
+    reference: &str,
+    alias_counter: &mut usize,
+    terms: &mut Vec<String>,
+) -> Result<(), async_graphql::Error> {
+    let serde_json::Value::Object(map) = entry else {
+        return Err(async_graphql::Error::new(
+            "each order_by entry is an object mapping a column to a direction",
+        ));
+    };
+    let available: &[RelationshipField] = relationships
+        .get(type_name)
+        .map(|r| r.as_slice())
+        .unwrap_or(&[]);
+
+    for (key, value) in map {
+        // A direction: this table's own column.
+        if let Some(name) = value.as_str() {
+            if table.get_column(key).is_none() {
                 return Err(async_graphql::Error::new(format!(
                     "cannot order by unknown column \"{}\" on \"{}\"",
-                    column, table_name
+                    key, table.name
                 )));
             }
-            let name = direction.as_str().unwrap_or_default();
             let sql = crate::input::order_by::direction_sql(name).ok_or_else(|| {
                 async_graphql::Error::new(format!(
                     "\"{}\" is not a sort direction; expected one of asc, desc, \
@@ -3087,18 +3147,187 @@ async fn build_order_by_clause(
                     name
                 ))
             })?;
-            terms.push(format!(
-                "{} {}",
-                postrust_sql::escape_ident(column),
-                sql
+            terms.push(format!("{}.{} {}", reference, postrust_sql::escape_ident(key), sql));
+            continue;
+        }
+
+        // An aggregate of the rows that point here.
+        if let Some(rel) = key
+            .strip_suffix("_aggregate")
+            .and_then(|name| available.iter().find(|r| r.name == name && r.is_list))
+        {
+            aggregate_order_terms(value, rel, cache, reference, alias_counter, terms)?;
+            continue;
+        }
+
+        // A column of the row this one points at.
+        if let Some(rel) = available.iter().find(|r| r.name == *key && !r.is_list) {
+            let plan = postrust_core::embed::EmbedPlan::resolve(&rel.relationship, cache)
+                .map_err(|e| async_graphql::Error::new(e.to_string()))?;
+            if plan.columns.is_empty() {
+                return Err(async_graphql::Error::new(format!(
+                    "cannot order by \"{}\": it is not reached by a key",
+                    key
+                )));
+            }
+            *alias_counter += 1;
+            let alias = format!("pgrst_ord_{}", alias_counter);
+            let quoted_alias = postrust_sql::escape_ident(&alias);
+            let correlation = plan
+                .columns
+                .iter()
+                .map(|(local, foreign)| {
+                    format!(
+                        "{} = {}.{}",
+                        format_args!("{}.{}", reference, postrust_sql::escape_ident(local)),
+                        quoted_alias,
+                        postrust_sql::escape_ident(foreign)
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join(" AND ");
+
+            let target_qi = postrust_core::api_request::QualifiedIdentifier::new(
+                &plan.foreign_schema,
+                &plan.foreign_table,
+            );
+            let Some(target) = cache.get_table(&target_qi) else {
+                return Err(async_graphql::Error::new(format!(
+                    "unknown table \"{}\"",
+                    plan.foreign_table
+                )));
+            };
+
+            // The related row's own terms, then wrapped one at a time: a
+            // subquery yields one value, so each term is its own subselect.
+            let mut nested = Vec::new();
+            order_terms_into(
+                value,
+                cache,
+                relationships,
+                &rel.target_type,
+                target,
+                &quoted_alias,
+                alias_counter,
+                &mut nested,
+            )?;
+            for term in nested {
+                let (expression, direction) = term
+                    .rsplit_once(' ')
+                    .map(|(e, d)| (e.to_string(), d.to_string()))
+                    .unwrap_or((term.clone(), String::new()));
+                terms.push(format!(
+                    "(SELECT {} FROM {}.{} AS {} WHERE {}) {}",
+                    expression,
+                    postrust_sql::escape_ident(&plan.foreign_schema),
+                    postrust_sql::escape_ident(&plan.foreign_table),
+                    quoted_alias,
+                    correlation,
+                    direction
+                ));
+            }
+            continue;
+        }
+
+        return Err(async_graphql::Error::new(format!(
+            "cannot order by \"{}\" on \"{}\"",
+            key, table.name
+        )));
+    }
+    Ok(())
+}
+
+/// The `ORDER BY` terms for an aggregate of a row's children.
+fn aggregate_order_terms(
+    value: &serde_json::Value,
+    rel: &RelationshipField,
+    cache: &SchemaCache,
+    reference: &str,
+    alias_counter: &mut usize,
+    terms: &mut Vec<String>,
+) -> Result<(), async_graphql::Error> {
+    let serde_json::Value::Object(spec) = value else {
+        return Err(async_graphql::Error::new(
+            "ordering by an aggregate takes an object, such as {count: desc}",
+        ));
+    };
+    let plan = postrust_core::embed::EmbedPlan::resolve(&rel.relationship, cache)
+        .map_err(|e| async_graphql::Error::new(e.to_string()))?;
+    if plan.columns.is_empty() {
+        return Err(async_graphql::Error::new(format!(
+            "cannot order by an aggregate of \"{}\": it is not reached by a key",
+            rel.name
+        )));
+    }
+
+    *alias_counter += 1;
+    let alias = postrust_sql::escape_ident(&format!("pgrst_ord_{}", alias_counter));
+    let correlation = plan
+        .columns
+        .iter()
+        .map(|(local, foreign)| {
+            format!(
+                "{}.{} = {}.{}",
+                reference,
+                postrust_sql::escape_ident(local),
+                alias,
+                postrust_sql::escape_ident(foreign)
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(" AND ");
+
+    // `{count: desc}` is one term; `{max: {id: desc}}` is one per column.
+    let mut wanted: Vec<(String, String)> = Vec::new();
+    for (function, argument) in spec {
+        if function == "count" {
+            let name = argument.as_str().unwrap_or_default();
+            let Some(direction) = crate::input::order_by::direction_sql(name) else {
+                return Err(async_graphql::Error::new(format!(
+                    "\"{}\" is not a sort direction",
+                    name
+                )));
+            };
+            wanted.push(("count(*)".to_string(), direction.to_string()));
+            continue;
+        }
+        let serde_json::Value::Object(columns) = argument else {
+            continue;
+        };
+        for (column, direction) in columns {
+            let name = direction.as_str().unwrap_or_default();
+            let Some(direction) = crate::input::order_by::direction_sql(name) else {
+                return Err(async_graphql::Error::new(format!(
+                    "\"{}\" is not a sort direction",
+                    name
+                )));
+            };
+            // The function comes from the generated input, not from the
+            // request: a client can only name one that was offered.
+            wanted.push((
+                format!(
+                    "{}({}.{})",
+                    function,
+                    alias,
+                    postrust_sql::escape_ident(column)
+                ),
+                direction.to_string(),
             ));
         }
     }
 
-    if terms.is_empty() {
-        return Ok(String::new());
+    for (expression, direction) in wanted {
+        terms.push(format!(
+            "(SELECT {} FROM {}.{} AS {} WHERE {}) {}",
+            expression,
+            postrust_sql::escape_ident(&plan.foreign_schema),
+            postrust_sql::escape_ident(&plan.foreign_table),
+            alias,
+            correlation,
+            direction
+        ));
     }
-    Ok(format!(" ORDER BY {}", terms.join(", ")))
+    Ok(())
 }
 
 /// Build the `DISTINCT ON (...)` prefix from the `distinct_on` argument.
