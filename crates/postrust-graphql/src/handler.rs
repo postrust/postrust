@@ -2645,6 +2645,8 @@ fn build_where_clause(
 /// how the mutation paths are called. A relationship predicate then reports
 /// that it cannot be resolved rather than being read as a column.
 pub struct WhereScope<'a> {
+    /// The table itself, for the comparisons that need a column's type.
+    qualified: postrust_core::api_request::QualifiedIdentifier,
     /// How to refer to this table's columns in SQL.
     sql_ref: String,
     /// How to refer to this table's *row*, which is what a function taking the
@@ -2666,6 +2668,7 @@ impl<'a> WhereScope<'a> {
     /// A scope over a table addressed by its qualified name.
     pub fn table(schema: &str, table: &str, type_name: &str) -> Self {
         Self {
+            qualified: postrust_core::api_request::QualifiedIdentifier::new(schema, table),
             sql_ref: format!(
                 "{}.{}",
                 postrust_sql::escape_ident(schema),
@@ -2698,6 +2701,7 @@ impl<'a> WhereScope<'a> {
         relationships: &'a HashMap<String, Vec<RelationshipField>>,
     ) -> Self {
         Self {
+            qualified: postrust_core::api_request::QualifiedIdentifier::new("", ""),
             sql_ref: postrust_sql::escape_ident(alias),
             row_ref: postrust_sql::escape_ident(alias),
             type_name: type_name.to_string(),
@@ -2711,6 +2715,7 @@ impl<'a> WhereScope<'a> {
     /// A scope over an aliased table, for the inside of an `EXISTS`.
     fn aliased(alias: &str, type_name: &str, from: &WhereScope<'a>) -> Self {
         Self {
+            qualified: from.qualified.clone(),
             sql_ref: postrust_sql::escape_ident(alias),
             row_ref: postrust_sql::escape_ident(alias),
             type_name: type_name.to_string(),
@@ -2723,6 +2728,15 @@ impl<'a> WhereScope<'a> {
 
     fn column(&self, name: &str) -> String {
         format!("{}.{}", self.sql_ref, postrust_sql::escape_ident(name))
+    }
+
+    /// The PostgreSQL type of one of this table's columns, where it can be
+    /// found. A spatial comparison needs it: the same function takes a
+    /// geometry or a geography and the operand has to be cast to match.
+    fn column_type(&self, name: &str) -> Option<String> {
+        let cache = self.resolution.as_ref()?.cache;
+        let table = cache.get_table(&self.qualified)?;
+        table.get_column(name).map(|c| c.nominal_type.clone())
     }
 
     fn relationship(&self, name: &str) -> Option<&'a RelationshipField> {
@@ -2800,9 +2814,16 @@ fn build_condition(
                 let quoted = scope.column(column);
                 match val {
                     serde_json::Value::Object(ops) => {
+                        let column_type = scope.column_type(column);
                         for (op, operand) in ops {
                             conditions.push(comparison_sql(
-                                &quoted, column, op, operand, param_idx, values,
+                                &quoted,
+                                column,
+                                column_type.as_deref(),
+                                op,
+                                operand,
+                                param_idx,
+                                values,
                             )?);
                         }
                     }
@@ -2917,15 +2938,128 @@ fn exists_sql(
     ))
 }
 
-/// One comparison against one column.
-fn comparison_sql(
+/// One spatial comparison, as a PostGIS call.
+///
+/// The operand arrives as GeoJSON, which is what Hasura accepts and what a
+/// client sends, so it is parsed by `ST_GeomFromGeoJSON` rather than bound as
+/// a shape. The cast that follows is the column's own type: the same function
+/// takes a geometry or a geography and picking the wrong one is not an
+/// overload PostGIS has.
+#[allow(clippy::too_many_arguments)]
+fn postgis_sql(
     quoted: &str,
-    column: &str,
+    column_type: Option<&str>,
+    function: &str,
     op: &str,
     operand: &serde_json::Value,
     param_idx: &mut usize,
     values: &mut Vec<serde_json::Value>,
 ) -> Result<String, async_graphql::Error> {
+    let is_geography = column_type == Some("geography");
+    let mut shape = |value: &serde_json::Value, param_idx: &mut usize| -> String {
+        let placeholder = format!("${}", param_idx);
+        *param_idx += 1;
+        values.push(value.clone());
+        match is_geography {
+            true => format!("ST_GeomFromGeoJSON({})::geography", placeholder),
+            false => format!("ST_GeomFromGeoJSON({})", placeholder),
+        }
+    };
+
+    match op {
+        // `{distance, from}`: the shape and how far from it.
+        "_st_d_within" | "_st_3d_d_within" => {
+            let serde_json::Value::Object(spec) = operand else {
+                return Err(async_graphql::Error::new(format!(
+                    "\"{}\" takes {{distance, from}}",
+                    op
+                )));
+            };
+            let Some(from) = spec.get("from") else {
+                return Err(async_graphql::Error::new(format!(
+                    "\"{}\" needs a shape to measure from",
+                    op
+                )));
+            };
+            let Some(distance) = spec.get("distance") else {
+                return Err(async_graphql::Error::new(format!(
+                    "\"{}\" needs a distance",
+                    op
+                )));
+            };
+            let from_sql = shape(from, param_idx);
+            let distance_sql = format!("${}", param_idx);
+            *param_idx += 1;
+            values.push(distance.clone());
+            Ok(format!(
+                "{}({}, {}, {}::float8)",
+                function, quoted, from_sql, distance_sql
+            ))
+        }
+        // A raster against another raster, bound as one rather than parsed.
+        "_st_intersects_rast" => {
+            let placeholder = format!("${}", param_idx);
+            *param_idx += 1;
+            values.push(operand.clone());
+            Ok(format!("{}({}, {}::raster)", function, quoted, placeholder))
+        }
+        // A raster against a shape, in one band or in any.
+        "_st_intersects_geom_nband" | "_st_intersects_nband_geom" => {
+            let serde_json::Value::Object(spec) = operand else {
+                return Err(async_graphql::Error::new(format!(
+                    "\"{}\" takes an object",
+                    op
+                )));
+            };
+            let Some(geometry) = spec.get("geommin") else {
+                return Err(async_graphql::Error::new(format!(
+                    "\"{}\" needs a shape",
+                    op
+                )));
+            };
+            let band = spec.get("nband").filter(|v| !v.is_null());
+            let geometry_sql = shape(geometry, param_idx);
+            Ok(match band {
+                None => format!("{}({}, {})", function, quoted, geometry_sql),
+                Some(band) => {
+                    let placeholder = format!("${}", param_idx);
+                    *param_idx += 1;
+                    values.push(band.clone());
+                    // `ST_Intersects(raster, nband, geometry)` is the spelling
+                    // with a band; the argument order is PostGIS's, not the
+                    // input's.
+                    format!(
+                        "{}({}, {}::int, {})",
+                        function, quoted, placeholder, geometry_sql
+                    )
+                }
+            })
+        }
+        // Everything else is the relation between this shape and one other.
+        _ => {
+            let other = shape(operand, param_idx);
+            Ok(format!("{}({}, {})", function, quoted, other))
+        }
+    }
+}
+
+/// One comparison against one column.
+#[allow(clippy::too_many_arguments)]
+fn comparison_sql(
+    quoted: &str,
+    column: &str,
+    column_type: Option<&str>,
+    op: &str,
+    operand: &serde_json::Value,
+    param_idx: &mut usize,
+    values: &mut Vec<serde_json::Value>,
+) -> Result<String, async_graphql::Error> {
+    // A spatial relation is a function of two shapes rather than an operator
+    // between them, so it is written before the operator table is consulted.
+    if let Some(function) = crate::input::bool_exp::postgis_function(op) {
+        return postgis_sql(quoted, column_type, function, op, operand, param_idx, values);
+    }
+
     // Comparisons binding exactly one parameter, by the SQL they become.
     let binary = match op {
         "_eq" => Some("="),

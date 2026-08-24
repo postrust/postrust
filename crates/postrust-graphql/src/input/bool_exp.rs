@@ -47,6 +47,43 @@ const TEXT: &[&str] = &[
 /// Containment and key tests, for `json` and `jsonb` columns only.
 const JSON: &[&str] = &["_contains", "_contained_in"];
 
+/// Spatial relations taking one other shape, for `geometry` columns.
+///
+/// PostGIS names them `ST_Contains` and so on; Hasura spells each in the same
+/// lower-cased shape as every other comparison, and a client sends what Hasura
+/// spelled.
+const GEOMETRY: &[&str] = &[
+    "_st_contains",
+    "_st_crosses",
+    "_st_equals",
+    "_st_intersects",
+    "_st_3d_intersects",
+    "_st_overlaps",
+    "_st_touches",
+    "_st_within",
+];
+
+/// The PostGIS function behind each of those, and behind the ones that take
+/// more than a shape.
+pub fn postgis_function(operator: &str) -> Option<&'static str> {
+    Some(match operator {
+        "_st_contains" => "ST_Contains",
+        "_st_crosses" => "ST_Crosses",
+        "_st_equals" => "ST_Equals",
+        "_st_intersects" => "ST_Intersects",
+        "_st_3d_intersects" => "ST_3DIntersects",
+        "_st_overlaps" => "ST_Overlaps",
+        "_st_touches" => "ST_Touches",
+        "_st_within" => "ST_Within",
+        "_st_d_within" => "ST_DWithin",
+        "_st_3d_d_within" => "ST_3DDWithin",
+        "_st_intersects_rast" => "ST_Intersects",
+        "_st_intersects_geom_nband" => "ST_Intersects",
+        "_st_intersects_nband_geom" => "ST_Intersects",
+        _ => return None,
+    })
+}
+
 /// The name of the comparison input for a scalar.
 pub fn comparison_type_name(scalar: &str) -> String {
     format!("{}_comparison_exp", scalar)
@@ -80,6 +117,40 @@ fn comparison_input(scalar: &str) -> InputObject {
         for op in TEXT {
             input = input.field(InputValue::new(*op, TypeRef::named("String")));
         }
+    }
+    // A shape is compared by how it lies against another shape, not by
+    // ordering: `_gt` on a polygon means nothing, and PostGIS answers every
+    // real question with a function instead.
+    if scalar == "geometry" || scalar == "geography" {
+        if scalar == "geometry" {
+            for op in GEOMETRY {
+                input = input.field(InputValue::new(*op, TypeRef::named("geometry")));
+            }
+        } else {
+            input = input.field(InputValue::new("_st_intersects", TypeRef::named("geography")));
+        }
+        input = input.field(InputValue::new(
+            "_st_d_within",
+            TypeRef::named(format!("st_d_within_{}_input", scalar)),
+        ));
+        if scalar == "geometry" {
+            input = input.field(InputValue::new(
+                "_st_3d_d_within",
+                TypeRef::named("st_d_within_geometry_input"),
+            ));
+        }
+    }
+    if scalar == "raster" {
+        input = input
+            .field(InputValue::new("_st_intersects_rast", TypeRef::named("raster")))
+            .field(InputValue::new(
+                "_st_intersects_geom_nband",
+                TypeRef::named("st_intersects_geom_nband_input"),
+            ))
+            .field(InputValue::new(
+                "_st_intersects_nband_geom",
+                TypeRef::named("st_intersects_nband_geom_input"),
+            ));
     }
     if scalar == "jsonb" || scalar == "json" {
         for op in JSON {
@@ -171,6 +242,40 @@ pub fn build_inputs(
 
     let mut comparisons: Vec<InputObject> =
         scalars.iter().map(|s| comparison_input(s)).collect();
+
+    // The comparisons that take more than one value need an input of their
+    // own. Registered only where a column of that shape exists, so a schema
+    // without PostGIS carries none of them.
+    if scalars.contains("geometry") || scalars.contains("geography") {
+        for shape in ["geometry", "geography"] {
+            if !scalars.contains(shape) {
+                continue;
+            }
+            comparisons.push(
+                InputObject::new(format!("st_d_within_{}_input", shape))
+                    .description("Within a distance of another shape.")
+                    .field(InputValue::new(
+                        "distance",
+                        TypeRef::named_nn(TypeRef::FLOAT),
+                    ))
+                    .field(InputValue::new("from", TypeRef::named_nn(shape))),
+            );
+        }
+    }
+    if scalars.contains("raster") {
+        comparisons.push(
+            InputObject::new("st_intersects_geom_nband_input")
+                .description("Intersecting a shape, optionally in one band.")
+                .field(InputValue::new("geommin", TypeRef::named_nn("geometry")))
+                .field(InputValue::new("nband", TypeRef::named(TypeRef::INT))),
+        );
+        comparisons.push(
+            InputObject::new("st_intersects_nband_geom_input")
+                .description("Intersecting a shape in a given band.")
+                .field(InputValue::new("nband", TypeRef::named_nn(TypeRef::INT)))
+                .field(InputValue::new("geommin", TypeRef::named_nn("geometry"))),
+        );
+    }
     comparisons.extend(inputs);
     comparisons
 }
