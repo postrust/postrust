@@ -8,8 +8,8 @@ harness itself, divergences kept on purpose, and the gaps still open.
 
 | | status | same outcome | same data | full body |
 |---|---|---|---|---|
-| all (464) | 97.6% | 57.8% | **50.6%** | 24.1% |
-| **excluding the 142 permission cases (322)** | | | **60.6%** | |
+| all (464) | 97.8% | 58.8% | **51.5%** | 25.4% |
+| **excluding the 142 permission cases (322)** | | | **62.4%** | |
 
 **The candidate is configured.** Each group's fixtures are converted into a
 `PGRST_GRAPHQL_NAMES` document by `scripts/hasura-names.py` and given to the
@@ -25,9 +25,9 @@ casts, root type names) → 49.1 (embed arguments, computed columns) → 48.9
 (names given, and see immediately below) → 49.4 (nested inserts, embeds in
 `returning`) → 49.4 (nested aggregates: the field exists now, and the cases
 that ask for it need permissions or a further feature besides) → 49.4
-(upserts) → 50.6 (enum tables). The figure excluding the permission cases,
-which is the one worth reading, went 51.2 → 55.3 → 55.9 → 58.4 → 60.6 over the
-same span.
+(upserts) → 50.6 (enum tables) → 51.5 (ordering by a related row or an
+aggregate). The figure excluding the permission cases, which is the one worth
+reading, went 51.2 → 55.3 → 55.9 → 58.4 → 60.6 → 62.4 over the same span.
 
 The third column is the one that matters to a client: the same query came back
 with the same rows.
@@ -35,7 +35,7 @@ with the same rows.
 **142 of the 464 cases cannot pass and are counted anyway.** They are the
 permission cases — Hasura answers `access-denied` from a rule that lives in
 metadata, and there is no metadata here. Excluding them the figure is
-**195/322 = 60.6%**, up from 165/322 = 51.2% before the names were given.
+**201/322 = 62.4%**, up from 165/322 = 51.2% before the names were given.
 
 That gap is worth understanding, because the headline did not move while the
 figure behind it moved four points. 49 of those 142 permission cases "agree"
@@ -171,19 +171,14 @@ wrong one.
    nested-insert cases that is about upserting rather than about another
    feature.
 
-5. **Ordering a parent by an aggregate of its children.**
-   `order_by: {articles_aggregate: {count: desc}}` — most-commented first, and
-   the last piece of the nested aggregate. The field is in the object type now
-   but not in the ordering input, which needs an aggregate order-by input per
-   table and a correlated subselect in the `ORDER BY`.
+5. **PostGIS comparisons.** `_st_d_within`, `_st_intersects_geom_nband`,
+   `_st_intersects_rast` and the rest are not offered on `geometry`,
+   `geography` or `raster` columns, so eight cases across `boolexp/postgis`
+   and `boolexp/raster` are refused at validation. The comparison inputs are
+   generated per scalar already; these are more entries for three of them.
 
 6. **The comment on a computed field's function** is not carried by the schema
    cache, so a computed field's description is always null.
-
-7. **Ordering across a relationship** is not offered at the root, deliberately:
-   a field the schema advertises and the resolver refuses is worse than one
-   that was never there. An embedded list now takes its own `order_by`, so what
-   is left is ordering a parent by a child's column.
 
 8. **Relationship predicates through a junction** are refused rather than
    resolved: reaching the child means going through a third table, which is
@@ -231,6 +226,11 @@ wrong one.
   ordering happens before it. `EmbedPlan::embed_expression` already took all
   four for the REST surface; the GraphQL side had no way to say any of them.
 - **Computed columns are fields**, at the root and inside an embed.
+- **Ordering by a related row's column, or by an aggregate of a row's
+  children.** `order_by: {author: {name: asc}}` and
+  `order_by: {articles_aggregate: {count: desc}}`, both as correlated
+  subselects, both nesting. `graphql_query/order_by` went 3/14 to 9/14 and
+  `order_by_nulls` to 7/7.
 - **Enum tables.** A table marked as a set of allowed values becomes a GraphQL
   enum built from its rows, with a `comment` column as each member's
   description, and every column with a foreign key to it is typed as that enum.
