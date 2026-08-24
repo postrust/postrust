@@ -8,8 +8,8 @@ harness itself, divergences kept on purpose, and the gaps still open.
 
 | | status | same outcome | same data | full body |
 |---|---|---|---|---|
-| all (464) | 97.8% | 60.6% | **52.6%** | 26.5% |
-| **excluding the 142 permission cases (322)** | | | **64.0%** | |
+| all (464) | 97.8% | 61.0% | **53.0%** | 26.9% |
+| **excluding the 142 permission cases (322)** | | | **64.6%** | |
 
 **The candidate is configured.** Each group's fixtures are converted into a
 `PGRST_GRAPHQL_NAMES` document by `scripts/hasura-names.py` and given to the
@@ -26,9 +26,9 @@ casts, root type names) → 49.1 (embed arguments, computed columns) → 48.9
 `returning`) → 49.4 (nested aggregates: the field exists now, and the cases
 that ask for it need permissions or a further feature besides) → 49.4
 (upserts) → 50.6 (enum tables) → 51.5 (ordering by a related row or an
-aggregate) → 52.6 (PostGIS comparisons). The figure excluding the permission
-cases, which is the one worth reading, went 51.2 → 55.3 → 55.9 → 58.4 → 60.6 →
-62.4 → 64.0 over the same span.
+aggregate) → 52.6 (PostGIS comparisons) → 53.0 (`_cast`). The figure
+excluding the permission cases, which is the one worth reading, went 51.2 →
+55.3 → 55.9 → 58.4 → 60.6 → 62.4 → 64.0 → 64.6 over the same span.
 
 The third column is the one that matters to a client: the same query came back
 with the same rows.
@@ -36,7 +36,7 @@ with the same rows.
 **142 of the 464 cases cannot pass and are counted anyway.** They are the
 permission cases — Hasura answers `access-denied` from a rule that lives in
 metadata, and there is no metadata here. Excluding them the figure is
-**206/322 = 64.0%**, up from 165/322 = 51.2% before the names were given.
+**208/322 = 64.6%**, up from 165/322 = 51.2% before the names were given.
 
 That gap is worth understanding, because the headline did not move while the
 figure behind it moved four points. 49 of those 142 permission cases "agree"
@@ -79,14 +79,19 @@ server. Every fault in the instrument either invents work or hides it.
 
 ## Real faults, found the same way
 
-- **A raster column with no geometry column beside it broke the schema.** The
-  raster comparisons take a shape, so they name `geometry` whether or not any
-  column is one, and a type the schema mentions and never registers makes the
-  whole schema unbuildable. The whole raster group went from one passing to
-  none on the commit that added the operators those cases needed: the feature
-  was right and the schema it produced was not buildable. Caught because the
-  server says what failed and serves without GraphQL rather than exiting, so
-  the symptom was five 404s rather than a dead process.
+- **A comparison naming a type no column has broke the schema, three commits
+  running.** The raster comparisons name `geometry`; a cast from a geometry
+  names `geography`. A type the schema mentions and never registers makes the
+  whole schema unbuildable, so a table with a raster column and no geometry
+  column took its whole group down -- and the fix, applied by hand, broke again
+  one operator later, that time across 95 of 464 cases.
+
+  Patched twice, then fixed: `build_inputs` reports the scalars it actually
+  named, and those are what get registered. There is no second list to keep in
+  step, which is the only version of this that cannot drift. Both times the
+  symptom was cases with no response rather than a wrong one, and both times
+  the server said what had failed and kept serving -- which is why it was five
+  404s and then 95, rather than a dead process.
 
 Both of these were invisible to the unit tests and immediately obvious to the
 harness, and both had the same signature: no response at all rather than a
@@ -181,11 +186,11 @@ wrong one.
    nested-insert cases that is about upserting rather than about another
    feature.
 
-5. **`_cast`.** `where: {geom_col: {_cast: {geography: {_st_d_within: ...}}}}`
-   compares a geometry column as a geography, and is six of the eight cases
-   left in `boolexp/postgis` -- the relations themselves work now
-   (`boolexp/raster` is 5/5). It is a comparison that changes the type of the
-   column before comparing, which none of the others do.
+5. **Typed mutation inputs.** `objects` and `_set` are `JSON`, so a client
+   declaring `$set: author_set_input!` names a type that does not exist. The
+   generated types are already there in `input/mutation.rs` and unused. This is
+   the last piece of the mutation surface that a client cannot generate types
+   from.
 
 6. **The comment on a computed field's function** is not carried by the schema
    cache, so a computed field's description is always null.
@@ -236,6 +241,10 @@ wrong one.
   ordering happens before it. `EmbedPlan::embed_expression` already took all
   four for the REST surface; the GraphQL side had no way to say any of them.
 - **Computed columns are fields**, at the root and inside an embed.
+- **`_cast`.** A geometry column compared as a geography, and back -- the
+  question a sphere answers and a plane does not. It changes what is being
+  compared rather than comparing, so it recurses into the comparison builder
+  with a different column expression and a different type.
 - **PostGIS comparisons.** The spatial relations on the columns they apply to,
   with GeoJSON operands parsed by `ST_GeomFromGeoJSON` and cast to the column's
   own type -- `ST_DWithin` takes a geometry or a geography and picking the
