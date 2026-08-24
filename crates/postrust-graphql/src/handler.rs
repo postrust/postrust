@@ -1992,6 +1992,10 @@ fn build_where_clause(
 pub struct WhereScope<'a> {
     /// How to refer to this table's columns in SQL.
     sql_ref: String,
+    /// How to refer to this table's *row*, which is what a function taking the
+    /// row is passed. A qualified name reads as a column reference there, so
+    /// this is the bare alias.
+    row_ref: String,
     /// The GraphQL type name, which is the key into the relationship map.
     type_name: String,
     resolution: Option<WhereResolution<'a>>,
@@ -2012,6 +2016,7 @@ impl<'a> WhereScope<'a> {
                 postrust_sql::escape_ident(schema),
                 postrust_sql::escape_ident(table)
             ),
+            row_ref: postrust_sql::escape_ident(table),
             type_name: type_name.to_string(),
             resolution: None,
         }
@@ -2039,6 +2044,7 @@ impl<'a> WhereScope<'a> {
     ) -> Self {
         Self {
             sql_ref: postrust_sql::escape_ident(alias),
+            row_ref: postrust_sql::escape_ident(alias),
             type_name: type_name.to_string(),
             resolution: Some(WhereResolution {
                 cache,
@@ -2051,6 +2057,7 @@ impl<'a> WhereScope<'a> {
     fn aliased(alias: &str, type_name: &str, from: &WhereScope<'a>) -> Self {
         Self {
             sql_ref: postrust_sql::escape_ident(alias),
+            row_ref: postrust_sql::escape_ident(alias),
             type_name: type_name.to_string(),
             resolution: from.resolution.as_ref().map(|r| WhereResolution {
                 cache: r.cache,
@@ -2194,10 +2201,10 @@ fn exists_sql(
     let plan = postrust_core::embed::EmbedPlan::resolve(&relationship.relationship, cache)
         .map_err(|e| async_graphql::Error::new(e.to_string()))?;
 
-    if plan.junction.is_some() || plan.function.is_some() || plan.columns.is_empty() {
+    if plan.junction.is_some() || (plan.function.is_none() && plan.columns.is_empty()) {
         return Err(async_graphql::Error::new(format!(
             "filtering on \"{}\" is not supported: it is reached through a junction \
-             or a function rather than by a key",
+             rather than by a key",
             relationship.name
         )));
     }
@@ -2206,25 +2213,50 @@ fn exists_sql(
     let alias = format!("pgrst_rel_{}", alias_counter);
     let child_scope = WhereScope::aliased(&alias, &relationship.target_type, scope);
 
-    let mut correlation = Vec::with_capacity(plan.columns.len());
-    for (parent_column, child_column) in &plan.columns {
-        correlation.push(format!(
-            "{} = {}",
-            scope.column(parent_column),
-            child_scope.column(child_column)
-        ));
-    }
+    // A computed relationship is correlated by argument -- the function takes
+    // the parent row -- where a key relationship is correlated by columns.
+    let (source, mut correlation) = match &plan.function {
+        Some(function) => (
+            format!(
+                "{}.{}({})",
+                postrust_sql::escape_ident(&function.schema),
+                postrust_sql::escape_ident(&function.name),
+                scope.row_ref
+            ),
+            Vec::new(),
+        ),
+        None => {
+            let mut columns = Vec::with_capacity(plan.columns.len());
+            for (parent_column, child_column) in &plan.columns {
+                columns.push(format!(
+                    "{} = {}",
+                    scope.column(parent_column),
+                    child_scope.column(child_column)
+                ));
+            }
+            (
+                format!(
+                    "{}.{}",
+                    postrust_sql::escape_ident(&plan.foreign_schema),
+                    postrust_sql::escape_ident(&plan.foreign_table)
+                ),
+                columns,
+            )
+        }
+    };
 
     let child_condition =
         build_condition(child_expression, &child_scope, param_idx, values, alias_counter)?;
     if let Some(sql) = child_condition {
         correlation.push(format!("({})", sql));
     }
+    if correlation.is_empty() {
+        correlation.push("true".to_string());
+    }
 
     Ok(format!(
-        "EXISTS (SELECT 1 FROM {}.{} AS {} WHERE {})",
-        postrust_sql::escape_ident(&plan.foreign_schema),
-        postrust_sql::escape_ident(&plan.foreign_table),
+        "EXISTS (SELECT 1 FROM {} AS {} WHERE {})",
+        source,
         postrust_sql::escape_ident(&alias),
         correlation.join(" AND ")
     ))
@@ -2712,8 +2744,9 @@ fn build_embed_expressions(
         let expression = plan
             .embed_expression(
                 parent_alias,
-                // GraphQL does not expose computed relationships, so the row
-                // expression is never read; the alias is the honest value.
+                // A computed relationship is correlated by argument rather
+                // than by a key: the function takes the parent row, and an
+                // alias names that row.
                 &postrust_sql::escape_ident(parent_alias),
                 &child_alias,
                 &parts.join(", "),

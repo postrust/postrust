@@ -42,12 +42,15 @@ impl RelationshipField {
     pub fn from_relationship_named(rel: &Relationship, target_base_name: &str) -> Self {
         let is_list = !rel.is_to_one();
 
-        // Generate field name from the target's base name, so a relationship
-        // into a non-default schema is named consistently with its type.
-        let name = if is_list {
-            pluralize(target_base_name)
-        } else {
-            singularize(target_base_name)
+        // A computed relationship is named by its function, not by the table
+        // it returns. Two functions may return the same table, so the table's
+        // name would not tell them apart -- and where the schema also has a
+        // foreign key to that table, the derived name is already taken. This
+        // is the same rule the REST surface resolves embeds by.
+        let name = match rel {
+            Relationship::Computed { function, .. } => function.name.clone(),
+            _ if is_list => pluralize(target_base_name),
+            _ => singularize(target_base_name),
         };
 
         let target_type = target_base_name.to_string();
