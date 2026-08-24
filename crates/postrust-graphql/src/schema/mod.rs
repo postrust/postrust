@@ -22,6 +22,11 @@ pub struct SchemaConfig {
     pub enable_mutations: bool,
     /// Whether to generate subscription types
     pub enable_subscriptions: bool,
+    /// Names given rather than derived.
+    ///
+    /// Empty by default, which is every name derived from the schema exactly
+    /// as before.
+    pub names: crate::names::NameOverrides,
     /// Ceiling on rows a single query may return (`PGRST_MAX_ROWS`).
     ///
     /// Applied when a query supplies no `limit` of its own, and as an upper
@@ -33,6 +38,7 @@ impl Default for SchemaConfig {
     fn default() -> Self {
         Self {
             exposed_schemas: vec!["public".to_string()],
+            names: crate::names::NameOverrides::default(),
             enable_mutations: true,
             enable_subscriptions: false,
             max_rows: None,
@@ -99,6 +105,25 @@ fn pk_columns_of(table: &Table) -> Vec<(String, String)> {
         .collect()
 }
 
+/// The key a relationship is named by in the overrides.
+///
+/// A foreign key relationship is keyed by its constraint, which names exactly
+/// one relationship even where two of them point at the same table. A computed
+/// relationship has no constraint, so it is keyed by its function -- the same
+/// thing the REST surface resolves an embed by. A many-to-many has two
+/// constraints rather than one and so has no single key; it falls back to the
+/// target table, which is what its derived name uses anyway.
+fn relationship_key(rel: &postrust_core::schema_cache::Relationship) -> String {
+    use postrust_core::schema_cache::Relationship;
+    match rel {
+        Relationship::Computed { function, .. } => function.name.clone(),
+        _ => match rel.constraint_name() {
+            "" => rel.foreign_table().name.clone(),
+            constraint => constraint.to_string(),
+        },
+    }
+}
+
 /// Base name used to derive a table's GraphQL type and field names.
 ///
 /// Tables in the default schema keep their bare name, so a single-schema
@@ -107,6 +132,11 @@ fn pk_columns_of(table: &Table) -> Vec<(String, String)> {
 /// `users` table in both `public` and `api` would generate the same type and
 /// field names and one would silently replace the other.
 fn base_name_for(table: &Table, config: &SchemaConfig) -> String {
+    // A name that was given is the answer; the rest of this is what to call a
+    // table nobody named.
+    if let Some(given) = config.names.base_name(&table.schema, &table.name) {
+        return given.to_string();
+    }
     if table.schema == config.default_schema() {
         table.name.clone()
     } else {
@@ -483,7 +513,7 @@ pub fn build_schema(schema_cache: &SchemaCache, config: &SchemaConfig) -> Genera
             .clone();
 
         // Create object type
-        let obj_type = TableObjectType::from_table_named(table, &base_name);
+        let obj_type = TableObjectType::from_table_named(table, &base_name, &config.names);
         let type_name = obj_type.name.clone();
 
         // Add query fields
@@ -511,7 +541,15 @@ pub fn build_schema(schema_cache: &SchemaCache, config: &SchemaConfig) -> Genera
                         let foreign = rel.foreign_table();
                         let target_base =
                             base_names.get(&(foreign.schema.clone(), foreign.name.clone()))?;
-                        Some(RelationshipField::from_relationship_named(rel, target_base))
+                        Some(RelationshipField::from_relationship_named(
+                            rel,
+                            target_base,
+                            config.names.relationship(
+                                &table.schema,
+                                &table.name,
+                                &relationship_key(rel),
+                            ),
+                        ))
                     })
                     .collect()
             })

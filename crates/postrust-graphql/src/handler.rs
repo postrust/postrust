@@ -64,6 +64,7 @@ impl GraphQLState {
                 None
             },
             config.max_rows,
+            Arc::new(config.names.clone()),
         )?;
 
         Ok(Self {
@@ -94,6 +95,7 @@ impl GraphQLState {
                 None
             },
             self.config.max_rows,
+            Arc::new(self.config.names.clone()),
         )?;
         Ok(())
     }
@@ -206,6 +208,7 @@ fn build_dynamic_schema(
     _schema_cache: &SchemaCache,
     subscription_fields: Option<&[SubField]>,
     max_rows: Option<i64>,
+    names: Arc<crate::names::NameOverrides>,
 ) -> Result<Schema, GraphQLError> {
     // Create object types for each table
     let mut object_types: HashMap<String, Object> = HashMap::new();
@@ -249,7 +252,12 @@ fn build_dynamic_schema(
     // Create query type. Resolvers need the relationship map to embed related
     // rows, so it is shared into each closure.
     let relationships = Arc::new(generated.relationship_fields.clone());
-    let query = create_query_type(generated, max_rows, Arc::clone(&relationships));
+    let query = create_query_type(
+        generated,
+        max_rows,
+        Arc::clone(&relationships),
+        Arc::clone(&names),
+    );
 
     // Create mutation type
     let mutation = if !generated.mutation_fields.is_empty() {
@@ -659,6 +667,7 @@ fn create_query_type(
     generated: &GeneratedSchema,
     max_rows: Option<i64>,
     relationships: Arc<HashMap<String, Vec<RelationshipField>>>,
+    names: Arc<crate::names::NameOverrides>,
 ) -> Object {
     let mut query = Object::new("query_root");
 
@@ -679,6 +688,7 @@ fn create_query_type(
             pk_columns: pk_columns.clone(),
             max_rows,
             relationships: Arc::clone(&relationships),
+            names: Arc::clone(&names),
         });
 
         let mut gql_field = Field::new(&field.name, return_type, move |ctx| {
@@ -736,6 +746,7 @@ fn create_query_type(
                 type_name: field.type_name.clone(),
                 max_rows,
                 relationships: Arc::clone(&relationships),
+                names: Arc::clone(&names),
             });
             let mut agg_field = Field::new(
                 crate::schema::aggregate::aggregate_type_name(&field.type_name),
@@ -953,6 +964,7 @@ struct QueryFieldSpec {
     pk_columns: Vec<(String, String)>,
     max_rows: Option<i64>,
     relationships: Arc<HashMap<String, Vec<RelationshipField>>>,
+    names: Arc<crate::names::NameOverrides>,
 }
 
 /// Everything an aggregate field's resolver needs.
@@ -962,6 +974,7 @@ struct AggregateSpec {
     type_name: String,
     max_rows: Option<i64>,
     relationships: Arc<HashMap<String, Vec<RelationshipField>>>,
+    names: Arc<crate::names::NameOverrides>,
 }
 
 /// Resolve an aggregate field.
@@ -1016,8 +1029,53 @@ async fn resolve_aggregate<'a>(
         (None, ceiling) => ceiling,
     };
 
+    // A computed field asked for under `nodes` is a function of the row and so
+    // is not in `*`, exactly as at the root.
+    let computed_sql = {
+        let guard = gql_ctx
+            .schema_cache
+            .get()
+            .await
+            .map_err(|e| async_graphql::Error::new(e.to_string()))?;
+        let nodes = ctx
+            .field()
+            .selection_set()
+            .find(|selection| selection.name() == "nodes");
+        match (guard.as_ref(), nodes) {
+            (Some(cache), Some(nodes)) => {
+                let qi = postrust_core::api_request::QualifiedIdentifier::new(
+                    &spec.schema_name,
+                    &spec.table_name,
+                );
+                match cache.get_table(&qi) {
+                    Some(table) => {
+                        let qualified = format!(
+                            "{}.{}",
+                            postrust_sql::escape_ident(&spec.schema_name),
+                            postrust_sql::escape_ident(&spec.table_name)
+                        );
+                        let projections = computed_projections(
+                            table,
+                            nodes,
+                            &format!("{}.*", qualified),
+                            spec.names.as_ref(),
+                        );
+                        if projections.is_empty() {
+                            String::new()
+                        } else {
+                            format!(", {}", projections.join(", "))
+                        }
+                    }
+                    None => String::new(),
+                }
+            }
+            _ => String::new(),
+        }
+    };
+
     let mut inner = format!(
-        "SELECT * FROM {}.{}{}{}",
+        "SELECT *{} FROM {}.{}{}{}",
+        computed_sql,
         postrust_sql::escape_ident(&spec.schema_name),
         postrust_sql::escape_ident(&spec.table_name),
         where_sql,
@@ -1268,30 +1326,22 @@ async fn resolve_query<'a>(
                 let qi =
                     postrust_core::api_request::QualifiedIdentifier::new(schema_name, table_name);
                 match cache.get_table(&qi) {
-                    Some(table) => computed_projections(
-                        table,
-                        ctx.field(),
-                        &format!("{}.*", qualified),
-                    ),
+                    Some(table) => {
+                        let _ = &qualified;
+                        computed_projections(table, ctx.field(), "src", spec.names.as_ref())
+                    }
                     None => Vec::new(),
                 }
             }
             None => Vec::new(),
         }
     };
-    let computed_sql = if computed.is_empty() {
-        String::new()
-    } else {
-        format!(", {}", computed.join(", "))
-    };
-
     // ORDER BY, LIMIT and OFFSET belong inside the subquery: applying them to
     // the outer `row_to_json` projection would leave the ordering of the rows
     // that survive the limit unspecified.
     let mut inner = format!(
-        "SELECT {}*{} FROM {}.{}{}{}",
+        "SELECT {}* FROM {}.{}{}{}",
         distinct_sql,
-        computed_sql,
         postrust_sql::escape_ident(schema_name),
         postrust_sql::escape_ident(table_name),
         where_sql,
@@ -1331,16 +1381,28 @@ async fn resolve_query<'a>(
                     &mut 0,
                     &mut param_idx,
                     &mut bound_values,
+                    spec.names.as_ref(),
                 )?
             }
             None => Vec::new(),
         }
     };
 
-    let inner = if embed_expressions.is_empty() {
+    // A computed column is a function of the row, and the row it is a function
+    // of is the table's -- not the subquery's. Projecting it inside the
+    // subquery gave `src` an extra column, which is what made a computed
+    // relationship beside it fail with `cannot cast type record to author`: a
+    // subquery alias is only passable as a composite value while its columns
+    // are exactly the table's. So both live out here, where `src` still is
+    // one.
+    let inner = if embed_expressions.is_empty() && computed.is_empty() {
         inner
     } else {
         let mut projection = String::from("src.*");
+        for expression in &computed {
+            projection.push_str(", ");
+            projection.push_str(expression);
+        }
         for (field_name, expression) in &embed_expressions {
             projection.push_str(", ");
             projection.push_str(expression);
@@ -2526,6 +2588,7 @@ fn computed_projections(
     table: &postrust_core::schema_cache::Table,
     selection: async_graphql::SelectionField<'_>,
     row_reference: &str,
+    names: &crate::names::NameOverrides,
 ) -> Vec<String> {
     let mut projections = Vec::new();
     for field in selection.selection_set() {
@@ -2534,7 +2597,12 @@ fn computed_projections(
         if table.get_column(name).is_some() {
             continue;
         }
-        let Some(computed) = table.get_computed_column(name) else {
+        // The field may be exposed under a name that was given rather than
+        // the function's own, so the call is looked up from either side.
+        let function = names
+            .computed_source(&table.schema, &table.name, name)
+            .unwrap_or(name);
+        let Some(computed) = table.get_computed_column(function) else {
             continue;
         };
         projections.push(format!(
@@ -2615,6 +2683,7 @@ fn build_embed_expressions(
     alias_counter: &mut usize,
     param_idx: &mut usize,
     values: &mut Vec<serde_json::Value>,
+    names: &crate::names::NameOverrides,
 ) -> Result<Vec<(String, String)>, async_graphql::Error> {
     let Some(available) = relationships.get(type_name) else {
         return Ok(Vec::new());
@@ -2643,6 +2712,7 @@ fn build_embed_expressions(
             alias_counter,
             param_idx,
             values,
+            names,
         )?;
 
         // The arguments written on the embed itself.
@@ -2718,7 +2788,12 @@ fn build_embed_expressions(
             // child's alias rather than the table.
             let computed = child_table
                 .filter(|t| t.get_column(name).is_none())
-                .and_then(|t| t.get_computed_column(name));
+                .and_then(|t| {
+                    let function = names
+                        .computed_source(&t.schema, &t.name, name)
+                        .unwrap_or(name);
+                    t.get_computed_column(function)
+                });
             match computed {
                 Some(definition) => parts.push(format!(
                     "{}.{}({}.*) AS {}",
@@ -3294,7 +3369,7 @@ mod tests {
         let config = SchemaConfig::default();
         let generated = build_schema(&cache, &config);
 
-        let result = build_dynamic_schema(&generated, &cache, None, None);
+        let result = build_dynamic_schema(&generated, &cache, None, None, Arc::new(Default::default()));
         if let Err(ref e) = result {
             eprintln!("Schema build error: {:?}", e);
         }
@@ -3314,7 +3389,7 @@ mod tests {
         let config = SchemaConfig::default();
         let generated = build_schema(&cache, &config);
 
-        let _query = create_query_type(&generated, None, Arc::new(HashMap::new()));
+        let _query = create_query_type(&generated, None, Arc::new(HashMap::new()), Arc::new(Default::default()));
     }
 
     #[test]
@@ -3397,7 +3472,7 @@ mod tests {
         let config = SchemaConfig::default();
         let generated = build_schema(&cache, &config);
 
-        let schema = build_dynamic_schema(&generated, &cache, None, None);
+        let schema = build_dynamic_schema(&generated, &cache, None, None, Arc::new(Default::default()));
         assert!(schema.is_ok(), "{:?}", schema.err());
 
         let sdl = schema.unwrap().sdl();
@@ -3423,7 +3498,7 @@ mod tests {
         assert!(!sub_fields.is_empty(), "Should have subscription fields");
 
         // Build schema with subscriptions
-        let result = build_dynamic_schema(&generated, &cache, Some(&sub_fields), None);
+        let result = build_dynamic_schema(&generated, &cache, Some(&sub_fields), None, Arc::new(Default::default()));
         assert!(result.is_ok(), "Schema with subscriptions should build");
     }
 

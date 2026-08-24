@@ -31,7 +31,7 @@ impl RelationshipField {
     /// Create a GraphQL field from a database relationship.
     pub fn from_relationship(rel: &Relationship) -> Self {
         let base_name = rel.foreign_table().name.clone();
-        Self::from_relationship_named(rel, &base_name)
+        Self::from_relationship_named(rel, &base_name, None)
     }
 
     /// Create a GraphQL field using an explicit base name for the target.
@@ -39,7 +39,11 @@ impl RelationshipField {
     /// The base name must match the one the target table's object type was
     /// generated with, otherwise the field would reference a type that was
     /// never registered.
-    pub fn from_relationship_named(rel: &Relationship, target_base_name: &str) -> Self {
+    pub fn from_relationship_named(
+        rel: &Relationship,
+        target_base_name: &str,
+        given_name: Option<&str>,
+    ) -> Self {
         let is_list = !rel.is_to_one();
 
         // A computed relationship is named by its function, not by the table
@@ -47,10 +51,16 @@ impl RelationshipField {
         // name would not tell them apart -- and where the schema also has a
         // foreign key to that table, the derived name is already taken. This
         // is the same rule the REST surface resolves embeds by.
-        let name = match rel {
-            Relationship::Computed { function, .. } => function.name.clone(),
-            _ if is_list => pluralize(target_base_name),
-            _ => singularize(target_base_name),
+        let name = match given_name {
+            // Hasura's relationships are named in metadata rather than derived,
+            // and where a schema was migrated from one, the name a client
+            // already sends is whatever was written there.
+            Some(given) => given.to_string(),
+            None => match rel {
+                Relationship::Computed { function, .. } => function.name.clone(),
+                _ if is_list => pluralize(target_base_name),
+                _ => singularize(target_base_name),
+            },
         };
 
         let target_type = target_base_name.to_string();

@@ -196,6 +196,54 @@ RUST_LOG="postrust=debug,sqlx=info"
 | `PGRST_MAX_ROWS` | Maximum rows returned by a single request. Caps requests that specify no `limit`, and bounds larger ones. Alias: `PGRST_DB_MAX_ROWS` | unset (unlimited) |
 | `PGRST_MAX_BODY_SIZE` | Maximum request body (bytes) | `10485760` |
 
+## GraphQL Names
+
+| Variable | Description | Default |
+|----------|-------------|---------|
+| `PGRST_GRAPHQL_NAMES` | Names for tables, relationships and computed fields that the schema cannot supply. A JSON document, or a path to a file holding one. | unset (every name derived) |
+
+Almost everything in the generated GraphQL API is derived: a table's name gives
+its root fields, a foreign key gives a relationship, a function gives a
+computed field. Hasura derives none of it — every one of those names is written
+into metadata by a person, and reflection cannot recover a name nobody wrote
+down. This is where those names go when a schema is migrated from one.
+
+```json
+{
+  "public.author": {
+    "name": "Author",
+    "relationships": {
+      "article_author_id_fkey": "posts",
+      "fetch_articles_plain": "get_articles"
+    },
+    "computed_fields": { "author_upper_name": "upper_name" }
+  }
+}
+```
+
+- **`name`** replaces the base name every root field and type is built from, so
+  `Author`, `Author_by_pk`, `insert_Author`, `Author_bool_exp` and the rest all
+  follow from this one entry.
+- **`relationships`** is keyed by *constraint* name, or by *function* name for a
+  computed relationship, because a constraint names exactly one relationship
+  even where two of them point at the same table. The name being replaced would
+  not: that is what this is for.
+- **`computed_fields`** is keyed by the function behind the field.
+
+Keys are `schema.table`, so a table in the default schema is still
+`public.author`. A table absent from the document is exposed exactly as before.
+Set the variable to the document itself, or to a path:
+
+```bash
+PGRST_GRAPHQL_NAMES='{"public.author": {"name": "Author"}}'
+PGRST_GRAPHQL_NAMES="/etc/postrust/graphql-names.json"
+```
+
+This is a lookup table, not a metadata model. It grants no permissions and
+tracks no tables; a name is all it can change. A document that cannot be read
+or parsed stops the server rather than being ignored — serving derived names
+instead would answer every request under a name the client does not send.
+
 ## Example Configurations
 
 ### Development

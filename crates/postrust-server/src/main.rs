@@ -121,6 +121,27 @@ async fn main() -> Result<()> {
         // Create GraphQL state with subscriptions enabled
         let schema_cache_snapshot = state.schema_cache.read().await.clone();
         let schema_cache_arc = Arc::new(schema_cache_snapshot);
+        // Names Hasura keeps in metadata and a schema cannot carry. Absent,
+        // every name is derived exactly as before.
+        let graphql_names = match std::env::var("PGRST_GRAPHQL_NAMES") {
+            Ok(value) => match postrust_graphql::names::NameOverrides::parse(&value) {
+                Ok(names) => {
+                    if !names.is_empty() {
+                        info!("GraphQL names given for {} tables", names.len());
+                    }
+                    names
+                }
+                Err(e) => {
+                    // Serving the derived names instead would answer every
+                    // request under a name the client does not send, which
+                    // reads as a broken server rather than a bad setting.
+                    tracing::error!("PGRST_GRAPHQL_NAMES: {}", e);
+                    return Err(anyhow::anyhow!("PGRST_GRAPHQL_NAMES: {}", e));
+                }
+            },
+            Err(_) => postrust_graphql::names::NameOverrides::default(),
+        };
+
         let graphql_config = SchemaConfig {
             enable_subscriptions: true,
             max_rows: config.db_max_rows,
@@ -129,6 +150,7 @@ async fn main() -> Result<()> {
             // `PGRST_DB_SCHEMAS` was reachable over REST and invisible over
             // GraphQL.
             exposed_schemas: config.db_schemas.clone(),
+            names: graphql_names,
             ..SchemaConfig::default()
         };
         // A schema that cannot be built is a reason to serve without GraphQL,

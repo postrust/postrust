@@ -62,7 +62,7 @@ impl TableObjectType {
     /// the name must be disambiguated (for example when the same table name
     /// appears in more than one exposed schema).
     pub fn from_table(table: &Table) -> Self {
-        Self::from_table_named(table, &table.name)
+        Self::from_table_named(table, &table.name, &crate::names::NameOverrides::default())
     }
 
     /// Create a GraphQL ObjectType using an explicit base name.
@@ -82,7 +82,11 @@ impl TableObjectType {
         }
     }
 
-    pub fn from_table_named(table: &Table, base_name: &str) -> Self {
+    pub fn from_table_named(
+        table: &Table,
+        base_name: &str,
+        names: &crate::names::NameOverrides,
+    ) -> Self {
         // Named exactly like the table. A GraphQL type is conventionally
         // PascalCase, but the schema a Hasura client was generated against
         // spells this `author`, and a client cannot be told otherwise: the
@@ -101,11 +105,16 @@ impl TableObjectType {
         let mut computed: Vec<(&String, &postrust_core::schema_cache::ComputedColumn)> =
             table.computed_columns.iter().collect();
         computed.sort_by_key(|(name, _)| (*name).clone());
-        for (name, definition) in computed {
-            if fields.iter().any(|f| &f.name == name) {
+        for (function, definition) in computed {
+            // A computed field is named in Hasura's metadata rather than after
+            // its function, so a migrated schema says which is which.
+            let exposed = names
+                .computed_field(&table.schema, &table.name, function)
+                .unwrap_or(function);
+            if fields.iter().any(|f| f.name == exposed) {
                 continue;
             }
-            fields.push(Self::computed_field(name, definition));
+            fields.push(Self::computed_field(exposed, definition));
         }
 
         Self {
