@@ -8,8 +8,8 @@ harness itself, divergences kept on purpose, and the gaps still open.
 
 | | status | same outcome | same data | full body |
 |---|---|---|---|---|
-| all (464) | 97.8% | 57.1% | **49.4%** | 22.8% |
-| **excluding the 142 permission cases (322)** | | | **58.4%** | |
+| all (464) | 97.6% | 57.8% | **50.6%** | 24.1% |
+| **excluding the 142 permission cases (322)** | | | **60.6%** | |
 
 **The candidate is configured.** Each group's fixtures are converted into a
 `PGRST_GRAPHQL_NAMES` document by `scripts/hasura-names.py` and given to the
@@ -25,8 +25,9 @@ casts, root type names) → 49.1 (embed arguments, computed columns) → 48.9
 (names given, and see immediately below) → 49.4 (nested inserts, embeds in
 `returning`) → 49.4 (nested aggregates: the field exists now, and the cases
 that ask for it need permissions or a further feature besides) → 49.4
-(upserts). The figure excluding the permission cases, which is the one worth
-reading, went 51.2 → 55.3 → 55.9 → 58.4 over the same span.
+(upserts) → 50.6 (enum tables). The figure excluding the permission cases,
+which is the one worth reading, went 51.2 → 55.3 → 55.9 → 58.4 → 60.6 over the
+same span.
 
 The third column is the one that matters to a client: the same query came back
 with the same rows.
@@ -34,7 +35,7 @@ with the same rows.
 **142 of the 464 cases cannot pass and are counted anyway.** They are the
 permission cases — Hasura answers `access-denied` from a rule that lives in
 metadata, and there is no metadata here. Excluding them the figure is
-**188/322 = 58.4%**, up from 165/322 = 51.2% before the names were given.
+**195/322 = 60.6%**, up from 165/322 = 51.2% before the names were given.
 
 That gap is worth understanding, because the headline did not move while the
 figure behind it moved four points. 49 of those 142 permission cases "agree"
@@ -157,14 +158,12 @@ wrong one.
    `json`, and a scalar computed column, both work. Something narrower about
    the fixture is responsible and it has not been found yet.
 
-3. **Enum tables, and why they may stay open.** `colors_enum` in the corpus is
-   not a PostgreSQL enum: it is an ordinary table of allowed values, marked
-   `set_table_is_enum` in metadata, from which Hasura generates a GraphQL enum
-   and types every referencing column as it. 17 cases turn on it. There is no
-   reflection-based way to tell that table from any other — a text primary key
-   with a comment column is just a table — so this one needs configuration,
-   which is the model this project declined. Worth deciding explicitly rather
-   than leaving as a to-do.
+3. **What is left of the enum tables.** They work: a marked table's rows are a
+   generated enum and referencing columns are typed as it
+   (`graphql_query/enums` 0/10 → 6/10, `graphql_mutation/enums` 1/6 → 5/6).
+   What remains is the metadata API around them — `v1/set_table_is_enum` is
+   four cases of turning the flag on and off through `/v1/query`, which is the
+   contract this server does not offer.
 
 4. **`on_conflict` inside a nested insert.** The top-level upsert works;
    `{author: {data: {...}, on_conflict: {...}}}` does not, because the nested
@@ -232,6 +231,12 @@ wrong one.
   ordering happens before it. `EmbedPlan::embed_expression` already took all
   four for the REST surface; the GraphQL side had no way to say any of them.
 - **Computed columns are fields**, at the root and inside an embed.
+- **Enum tables.** A table marked as a set of allowed values becomes a GraphQL
+  enum built from its rows, with a `comment` column as each member's
+  description, and every column with a foreign key to it is typed as that enum.
+  The values are read once at startup, since rows are not schema. This was the
+  item filed as "needs a decision"; the decision was that the flag belongs
+  beside the names, in the one document a migration already converts.
 - **Upserts.** `on_conflict: {constraint: author_name_key, update_columns:
   [bio]}` writes the row or updates the one already there, and an empty
   `update_columns` is `DO NOTHING` -- `affected_rows: 0` and an empty
