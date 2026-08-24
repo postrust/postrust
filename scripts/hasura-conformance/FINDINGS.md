@@ -8,7 +8,7 @@ harness itself, divergences kept on purpose, and the gaps still open.
 
 | | status | same outcome | same data | full body |
 |---|---|---|---|---|
-| all (464) | 97.8% | 56.5% | **49.4%** | 21.1% |
+| all (464) | 97.8% | 56.9% | **49.4%** | 21.1% |
 | reads (269) | 99.3% | 57.2% | 47.6% | 25.3% |
 | writes (195) | 95.9% | 55.4% | 51.8% | 15.4% |
 
@@ -24,7 +24,8 @@ panic) → 43.8 (enum arguments read) → 44.2 (relationship predicates, aggrega
 result decoding) → 44.6 (scalar naming) → 48.3 (update operators, written-value
 casts, root type names) → 49.1 (embed arguments, computed columns) → 48.9
 (names given, and see immediately below) → 49.4 (nested inserts, embeds in
-`returning`).
+`returning`) → 49.4 (nested aggregates: the field exists now, and the cases
+that ask for it need permissions or a further feature besides).
 
 The third column is the one that matters to a client: the same query came back
 with the same rows.
@@ -169,8 +170,11 @@ wrong one.
    and nothing else, though `schema_cache/queries.rs` already reads `conname`
    for foreign keys.
 
-5. **Nested aggregates.** `author { articles_aggregate { aggregate { count } } }`
-   — the aggregate exists only as a root field, not as a relationship field.
+5. **Ordering a parent by an aggregate of its children.**
+   `order_by: {articles_aggregate: {count: desc}}` — most-commented first, and
+   the last piece of the nested aggregate. The field is in the object type now
+   but not in the ordering input, which needs an aggregate order-by input per
+   table and a correlated subselect in the `ORDER BY`.
 
 6. **The comment on a computed field's function** is not carried by the schema
    cache, so a computed field's description is always null.
@@ -193,7 +197,12 @@ wrong one.
    written first and the key pushed down, the opposite of the ordinary to-one
    rule.
 
-10. **A relationship in a `delete`'s `returning`** keeps the plain columns.
+10. **Tracked functions as root fields.** Hasura exposes a tracked function as
+    `multi` and `multi_aggregate` beside the tables. Several introspection
+    cases compare the whole root field list, so they fail on the absence rather
+    than on anything they query.
+
+11. **A relationship in a `delete`'s `returning`** keeps the plain columns.
     The rows are gone by the time they could be read again, so there is nothing
     to embed. Reporting the columns that were deleted is the honest answer, but
     it is not Hasura's.
@@ -221,6 +230,12 @@ wrong one.
   ordering happens before it. `EmbedPlan::embed_expression` already took all
   four for the REST surface; the GraphQL side had no way to say any of them.
 - **Computed columns are fields**, at the root and inside an embed.
+- **A row's children can be counted without fetching them**:
+  `articles_aggregate { aggregate { count } nodes { … } }` is the same embed
+  with an aggregate select list, one row per parent, both halves in one pass.
+  Worth noting what this did *not* move: the cases in the corpus that ask for a
+  nested aggregate are permission cases, or ask for a tracked function as a
+  root field beside it, so the field existing was necessary and not sufficient.
 - **A parent and its children are written in one mutation**, in either
   direction, in one transaction, with `affected_rows` counting every row
   written rather than every row returned.
