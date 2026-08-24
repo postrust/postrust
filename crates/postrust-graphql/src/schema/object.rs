@@ -66,6 +66,22 @@ impl TableObjectType {
     }
 
     /// Create a GraphQL ObjectType using an explicit base name.
+    /// A field for a computed column.
+    ///
+    /// A function of one argument of the table's own row type, which
+    /// PostgreSQL lets a query read as though it were a column. Always
+    /// nullable: the function decides, and nothing in the catalogue says it
+    /// cannot return null.
+    fn computed_field(name: &str, computed: &postrust_core::schema_cache::ComputedColumn) -> GraphQLField {
+        GraphQLField {
+            name: name.to_string(),
+            description: None,
+            graphql_type: pg_type_to_graphql(&computed.data_type),
+            nullable: true,
+            is_pk: false,
+        }
+    }
+
     pub fn from_table_named(table: &Table, base_name: &str) -> Self {
         // Named exactly like the table. A GraphQL type is conventionally
         // PascalCase, but the schema a Hasura client was generated against
@@ -73,11 +89,24 @@ impl TableObjectType {
         // type name is in its generated types, its fragments and its cache
         // keys.
         let name = base_name.to_string();
-        let fields = table
+        // Columns first, then the computed ones. A computed column named
+        // after a real one is left out for the same reason a relationship is:
+        // two fields of one name abort the schema build, and the column is the
+        // table's own data.
+        let mut fields: Vec<GraphQLField> = table
             .columns
             .values()
             .map(GraphQLField::from_column)
             .collect();
+        let mut computed: Vec<(&String, &postrust_core::schema_cache::ComputedColumn)> =
+            table.computed_columns.iter().collect();
+        computed.sort_by_key(|(name, _)| (*name).clone());
+        for (name, definition) in computed {
+            if fields.iter().any(|f| &f.name == name) {
+                continue;
+            }
+            fields.push(Self::computed_field(name, definition));
+        }
 
         Self {
             table: table.clone(),

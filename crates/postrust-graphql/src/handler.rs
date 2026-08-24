@@ -1250,12 +1250,48 @@ async fn resolve_query<'a>(
         )
     };
 
+    // A computed column is a function of the row rather than part of it, so
+    // it is not in `*` and is named only when it was asked for.
+    let computed = {
+        let guard = gql_ctx
+            .schema_cache
+            .get()
+            .await
+            .map_err(|e| async_graphql::Error::new(e.to_string()))?;
+        let qualified = format!(
+            "{}.{}",
+            postrust_sql::escape_ident(schema_name),
+            postrust_sql::escape_ident(table_name)
+        );
+        match guard.as_ref() {
+            Some(cache) => {
+                let qi =
+                    postrust_core::api_request::QualifiedIdentifier::new(schema_name, table_name);
+                match cache.get_table(&qi) {
+                    Some(table) => computed_projections(
+                        table,
+                        ctx.field(),
+                        &format!("{}.*", qualified),
+                    ),
+                    None => Vec::new(),
+                }
+            }
+            None => Vec::new(),
+        }
+    };
+    let computed_sql = if computed.is_empty() {
+        String::new()
+    } else {
+        format!(", {}", computed.join(", "))
+    };
+
     // ORDER BY, LIMIT and OFFSET belong inside the subquery: applying them to
     // the outer `row_to_json` projection would leave the ordering of the rows
     // that survive the limit unspecified.
     let mut inner = format!(
-        "SELECT {}* FROM {}.{}{}{}",
+        "SELECT {}*{} FROM {}.{}{}{}",
         distinct_sql,
+        computed_sql,
         postrust_sql::escape_ident(schema_name),
         postrust_sql::escape_ident(table_name),
         where_sql,
@@ -2447,6 +2483,39 @@ async fn build_distinct_on(
 /// The GraphQL mirror of the REST builder: each requested relationship becomes a
 /// correlated subselect yielding JSON, so the whole selection comes back from
 /// the parent query instead of one query per relationship per level.
+/// The SELECT-list entries for any computed columns the selection asks for.
+///
+/// A computed column is a function of one argument of the table's own row
+/// type, so it is not in `*` and has to be named. PostgreSQL's functional
+/// notation reads `upper_name(author.*)` and `author.upper_name` as the same
+/// call; the explicit form is written here because it says which function is
+/// being called.
+fn computed_projections(
+    table: &postrust_core::schema_cache::Table,
+    selection: async_graphql::SelectionField<'_>,
+    row_reference: &str,
+) -> Vec<String> {
+    let mut projections = Vec::new();
+    for field in selection.selection_set() {
+        let name = field.name();
+        // A real column wins, and is already in `*`.
+        if table.get_column(name).is_some() {
+            continue;
+        }
+        let Some(computed) = table.get_computed_column(name) else {
+            continue;
+        };
+        projections.push(format!(
+            "{}.{}({}) AS {}",
+            postrust_sql::escape_ident(&computed.function.schema),
+            postrust_sql::escape_ident(&computed.function.name),
+            row_reference,
+            postrust_sql::escape_ident(name)
+        ));
+    }
+    projections
+}
+
 /// Render `order_by` terms against a table, qualified with an alias.
 ///
 /// The root field's ordering reads its argument from the resolver context and
@@ -2599,14 +2668,34 @@ fn build_embed_expressions(
         // Leaf fields are columns; anything that resolved to a relationship is
         // an expression instead.
         let child_relationships = relationships.get(&rel.target_type);
+        let child_qi = postrust_core::api_request::QualifiedIdentifier::new(
+            &plan.foreign_schema,
+            &plan.foreign_table,
+        );
+        let child_table = schema_cache.get_table(&child_qi);
         let mut parts: Vec<String> = Vec::new();
         for sub in field.selection_set() {
             let name = sub.name();
             let is_relationship = child_relationships
                 .map(|rels| rels.iter().any(|r| r.name == name))
                 .unwrap_or(false);
-            if !is_relationship {
-                parts.push(postrust_sql::escape_ident(name));
+            if is_relationship {
+                continue;
+            }
+            // A computed column inside an embed is the same call, against the
+            // child's alias rather than the table.
+            let computed = child_table
+                .filter(|t| t.get_column(name).is_none())
+                .and_then(|t| t.get_computed_column(name));
+            match computed {
+                Some(definition) => parts.push(format!(
+                    "{}.{}({}.*) AS {}",
+                    postrust_sql::escape_ident(&definition.function.schema),
+                    postrust_sql::escape_ident(&definition.function.name),
+                    postrust_sql::escape_ident(&child_alias),
+                    postrust_sql::escape_ident(name)
+                )),
+                None => parts.push(postrust_sql::escape_ident(name)),
             }
         }
         if parts.is_empty() && nested.is_empty() {
