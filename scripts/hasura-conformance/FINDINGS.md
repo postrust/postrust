@@ -8,8 +8,8 @@ harness itself, divergences kept on purpose, and the gaps still open.
 
 | | status | same outcome | same data | full body |
 |---|---|---|---|---|
-| all (464) | 97.8% | 61.0% | **53.0%** | 26.9% |
-| **excluding the 142 permission cases (322)** | | | **64.6%** | |
+| all (464) | 97.8% | 60.6% | **52.6%** | 26.7% |
+| **excluding the 142 permission cases (322)** | | | **64.0%** | |
 
 **The candidate is configured.** Each group's fixtures are converted into a
 `PGRST_GRAPHQL_NAMES` document by `scripts/hasura-names.py` and given to the
@@ -26,9 +26,10 @@ casts, root type names) → 49.1 (embed arguments, computed columns) → 48.9
 `returning`) → 49.4 (nested aggregates: the field exists now, and the cases
 that ask for it need permissions or a further feature besides) → 49.4
 (upserts) → 50.6 (enum tables) → 51.5 (ordering by a related row or an
-aggregate) → 52.6 (PostGIS comparisons) → 53.0 (`_cast`). The figure
-excluding the permission cases, which is the one worth reading, went 51.2 →
-55.3 → 55.9 → 58.4 → 60.6 → 62.4 → 64.0 → 64.6 over the same span.
+aggregate) → 52.6 (PostGIS comparisons) → 53.0 (`_cast`) → 52.6 (typed mutation
+inputs, which cost two cases; see below). The figure excluding the permission
+cases, which is the one worth reading, went 51.2 → 55.3 → 55.9 → 58.4 → 60.6 →
+62.4 → 64.0 → 64.6 → 64.0 over the same span.
 
 The third column is the one that matters to a client: the same query came back
 with the same rows.
@@ -36,7 +37,7 @@ with the same rows.
 **142 of the 464 cases cannot pass and are counted anyway.** They are the
 permission cases — Hasura answers `access-denied` from a rule that lives in
 metadata, and there is no metadata here. Excluding them the figure is
-**208/322 = 64.6%**, up from 165/322 = 51.2% before the names were given.
+**206/322 = 64.0%**, up from 165/322 = 51.2% before the names were given.
 
 That gap is worth understanding, because the headline did not move while the
 figure behind it moved four points. 49 of those 142 permission cases "agree"
@@ -186,11 +187,14 @@ wrong one.
    nested-insert cases that is about upserting rather than about another
    feature.
 
-5. **Typed mutation inputs.** `objects` and `_set` are `JSON`, so a client
-   declaring `$set: author_set_input!` names a type that does not exist. The
-   generated types are already there in `input/mutation.rs` and unused. This is
-   the last piece of the mutation surface that a client cannot generate types
-   from.
+5. **The two cases typing the mutation inputs cost.** `objects` and `_set`
+   were `JSON`, which accepted a relationship under whatever name the request
+   used; they are generated types now, so a relationship this server named
+   differently is refused by validation rather than reaching a resolver that
+   would also have failed. The change is kept: a client can generate types from
+   the mutation surface for the first time, and both cases are the naming gap
+   in item 1 wearing a different error. Recorded because the number went down
+   and a reader is owed the reason.
 
 6. **The comment on a computed field's function** is not carried by the schema
    cache, so a computed field's description is always null.
@@ -241,6 +245,11 @@ wrong one.
   ordering happens before it. `EmbedPlan::embed_expression` already took all
   four for the REST surface; the GraphQL side had no way to say any of them.
 - **Computed columns are fields**, at the root and inside an embed.
+- **Typed mutation inputs.** `<table>_insert_input`, `_set_input` and
+  `_inc_input`, with `obj_rel`/`arr_rel` inputs carrying nested writes and
+  their own `on_conflict` -- so a nested row is upserted exactly as a top-level
+  one is. Every field optional, because which columns the database insists on
+  is the database's answer.
 - **`_cast`.** A geometry column compared as a geography, and back -- the
   question a sphere answers and a plane does not. It changes what is being
   compared rather than comparing, so it recurses into the comparison builder
