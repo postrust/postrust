@@ -335,6 +335,13 @@ fn build_dynamic_schema(
     // Used as an argument type in its own right, whether or not any column is
     // one: `objects`, `_set` and the mutation inputs are still JSON.
     scalar_names.insert("JSON".to_string());
+    // A raster is compared against a shape, so the raster comparisons name
+    // `geometry` even where no column is one. A type the schema mentions and
+    // never registers makes the whole schema unbuildable -- which is what a
+    // table with a raster column and no geometry column did.
+    if scalar_names.contains("raster") {
+        scalar_names.insert("geometry".to_string());
+    }
 
     for name in scalar_names {
         if matches!(name.as_str(), "Int" | "Float" | "String" | "Boolean" | "ID") {
