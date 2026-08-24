@@ -103,19 +103,23 @@ wrong one.
 
 ## Open, ordered by consequence
 
-1. **Computed relationships.** A function returning `setof` a table is a
-   relationship, not a column, and only the scalar-returning kind is exposed —
-   `author { get_articles { ... } }` is an unknown field. This is most of what
-   is left in `computed_fields`, and `postrust_core::embed::EmbedPlan` already
-   models the function form, so the machinery is there and unused.
+1. **Names Hasura takes from metadata rather than from the schema.** This is
+   one item, not the several it looked like, and closing computed relationships
+   is what made that clear: the function is `fetch_articles_plain` and the
+   field Hasura exposes is `get_articles`, because `add_computed_field` named
+   it. Same for a computed field's name (`upper_name` for a function called
+   `automatic_comment_in_db_upper_name`, which is why
+   `graphql_introspection/descriptions` sits at 0/5 while every description it
+   reports is correct), for custom root field names, and for relationship names
+   below. Reflection cannot recover a name nobody wrote down. Roughly 25 cases
+   across four groups turn on it, and it is one decision about configuration
+   rather than four pieces of work.
 
-2. **Two more names Hasura takes from metadata rather than the schema.** A
-   computed field is named by the metadata command that adds it (`upper_name`),
-   where here it is named after the function (`automatic_comment_in_db_upper_name`),
-   which is what puts `graphql_introspection/descriptions` at 0/5 despite the
-   descriptions themselves being right. Custom root field names are the same
-   question. These belong with relationship naming below: structural to
-   reflecting instead of configuring, not gaps to close one at a time.
+2. **`sum_float` and one `json` type are not resolved** in
+   `graphql_query/computed_fields`, and neither reproduces against a
+   hand-written schema with the same shape — a computed column returning
+   `json`, and a scalar computed column, both work. Something narrower about
+   the fixture is responsible and it has not been found yet.
 
 3. **Enum tables, and why they may stay open.** `colors_enum` in the corpus is
    not a PostgreSQL enum: it is an ordinary table of allowed values, marked
@@ -142,9 +146,10 @@ wrong one.
    that was never there. An embedded list now takes its own `order_by`, so what
    is left is ordering a parent by a child's column.
 
-8. **Relationship predicates through a junction or a computed relationship**
-   are refused rather than resolved. Both need more than a pair of columns to
-   correlate on.
+8. **Relationship predicates through a junction** are refused rather than
+   resolved: reaching the child means going through a third table, which is
+   more than a pair of columns to correlate on. The computed-relationship half
+   of this is now resolved, by argument rather than by columns.
 
 ## Fixed since the first run
 
@@ -169,6 +174,12 @@ wrong one.
   ordering happens before it. `EmbedPlan::embed_expression` already took all
   four for the REST surface; the GraphQL side had no way to say any of them.
 - **Computed columns are fields**, at the root and inside an embed.
+- **Computed relationships resolve** — a function returning `setof` a table,
+  named by its function rather than by the table it returns, filterable and
+  pageable like any other embed, and usable in a predicate. They had been in
+  the relationship list all along, named after the target table, colliding with
+  the foreign key of the same name and dropped as a duplicate; the error even
+  suggested the field they had been mistaken for.
 
 ## Not measured
 
