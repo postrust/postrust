@@ -8,9 +8,8 @@ harness itself, divergences kept on purpose, and the gaps still open.
 
 | | status | same outcome | same data | full body |
 |---|---|---|---|---|
-| all (464) | 97.8% | 56.9% | **49.4%** | 21.1% |
-| reads (269) | 99.3% | 57.2% | 47.6% | 25.3% |
-| writes (195) | 95.9% | 55.4% | 51.8% | 15.4% |
+| all (464) | 97.8% | 57.1% | **49.4%** | 22.8% |
+| **excluding the 142 permission cases (322)** | | | **58.4%** | |
 
 **The candidate is configured.** Each group's fixtures are converted into a
 `PGRST_GRAPHQL_NAMES` document by `scripts/hasura-names.py` and given to the
@@ -25,7 +24,9 @@ result decoding) → 44.6 (scalar naming) → 48.3 (update operators, written-va
 casts, root type names) → 49.1 (embed arguments, computed columns) → 48.9
 (names given, and see immediately below) → 49.4 (nested inserts, embeds in
 `returning`) → 49.4 (nested aggregates: the field exists now, and the cases
-that ask for it need permissions or a further feature besides).
+that ask for it need permissions or a further feature besides) → 49.4
+(upserts). The figure excluding the permission cases, which is the one worth
+reading, went 51.2 → 55.3 → 55.9 → 58.4 over the same span.
 
 The third column is the one that matters to a client: the same query came back
 with the same rows.
@@ -33,7 +34,7 @@ with the same rows.
 **142 of the 464 cases cannot pass and are counted anyway.** They are the
 permission cases — Hasura answers `access-denied` from a rule that lives in
 metadata, and there is no metadata here. Excluding them the figure is
-**180/322 = 55.9%**, up from 165/322 = 51.2% before the names were given.
+**188/322 = 58.4%**, up from 165/322 = 51.2% before the names were given.
 
 That gap is worth understanding, because the headline did not move while the
 figure behind it moved four points. 49 of those 142 permission cases "agree"
@@ -165,10 +166,11 @@ wrong one.
    which is the model this project declined. Worth deciding explicitly rather
    than leaving as a to-do.
 
-4. **`on_conflict`.** Upserts are not expressible. Needs unique-constraint
-   names, which the schema cache does not collect: `Table` carries `pk_cols`
-   and nothing else, though `schema_cache/queries.rs` already reads `conname`
-   for foreign keys.
+4. **`on_conflict` inside a nested insert.** The top-level upsert works;
+   `{author: {data: {...}, on_conflict: {...}}}` does not, because the nested
+   object has no `on_conflict` argument declared. This is the last of the
+   nested-insert cases that is about upserting rather than about another
+   feature.
 
 5. **Ordering a parent by an aggregate of its children.**
    `order_by: {articles_aggregate: {count: desc}}` — most-commented first, and
@@ -230,6 +232,13 @@ wrong one.
   ordering happens before it. `EmbedPlan::embed_expression` already took all
   four for the REST surface; the GraphQL side had no way to say any of them.
 - **Computed columns are fields**, at the root and inside an embed.
+- **Upserts.** `on_conflict: {constraint: author_name_key, update_columns:
+  [bio]}` writes the row or updates the one already there, and an empty
+  `update_columns` is `DO NOTHING` -- `affected_rows: 0` and an empty
+  `returning`. The blocker was never the SQL: the schema cache carried
+  `pk_cols` and nothing else, so there was no way to name which uniqueness was
+  being resolved against. Unique constraints are loaded now, each a member of a
+  generated enum with the columns it covers as its description.
 - **A row's children can be counted without fetching them**:
   `articles_aggregate { aggregate { count } nodes { … } }` is the same embed
   with an aggregate select list, one row per parent, both halves in one pass.
