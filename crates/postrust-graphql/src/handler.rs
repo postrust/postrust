@@ -252,6 +252,23 @@ fn build_dynamic_schema(
     // Create query type. Resolvers need the relationship map to embed related
     // rows, so it is shared into each closure.
     let relationships = Arc::new(generated.relationship_fields.clone());
+    // (schema, table) -> GraphQL type name. A nested insert is handed a table
+    // by a relationship and has to find that table's relationships in turn,
+    // and the map they live in is keyed by type name -- which is not always
+    // the table's name, since a second schema prefixes it and a name may have
+    // been given.
+    let type_names: Arc<HashMap<(String, String), String>> = Arc::new(
+        generated
+            .object_types
+            .iter()
+            .map(|(type_name, object)| {
+                (
+                    (object.table.schema.clone(), object.table.name.clone()),
+                    type_name.clone(),
+                )
+            })
+            .collect(),
+    );
     let query = create_query_type(
         generated,
         max_rows,
@@ -261,7 +278,13 @@ fn build_dynamic_schema(
 
     // Create mutation type
     let mutation = if !generated.mutation_fields.is_empty() {
-        Some(create_mutation_type(generated))
+        Some(create_mutation_type(
+            generated,
+            Arc::clone(&relationships),
+            Arc::clone(&type_names),
+            Arc::clone(&names),
+            max_rows,
+        ))
     } else {
         None
     };
@@ -813,7 +836,13 @@ fn with_update_operators(field: Field) -> Field {
 }
 
 /// Create the Mutation type with all mutation fields.
-fn create_mutation_type(generated: &GeneratedSchema) -> Object {
+fn create_mutation_type(
+    generated: &GeneratedSchema,
+    relationships: Arc<HashMap<String, Vec<RelationshipField>>>,
+    type_names: Arc<HashMap<(String, String), String>>,
+    names: Arc<crate::names::NameOverrides>,
+    max_rows: Option<i64>,
+) -> Object {
     let mut mutation = Object::new("mutation_root");
 
     for field in &generated.mutation_fields {
@@ -833,12 +862,29 @@ fn create_mutation_type(generated: &GeneratedSchema) -> Object {
             .to_string();
 
         let resolver_pk_columns = pk_columns.clone();
+        let field_relationships = Arc::clone(&relationships);
+        let field_type_names = Arc::clone(&type_names);
+        let field_names = Arc::clone(&names);
         let mut gql_field = Field::new(&field.name, return_type, move |ctx| {
             let table_name = table_name.clone();
             let schema_name = schema_name.clone();
             let pk_columns = resolver_pk_columns.clone();
+            let relationships = Arc::clone(&field_relationships);
+            let type_names = Arc::clone(&field_type_names);
+            let names = Arc::clone(&field_names);
             FieldFuture::new(async move {
-                resolve_mutation(&ctx, &schema_name, &table_name, mutation_type, &pk_columns).await
+                resolve_mutation(
+                    &ctx,
+                    &schema_name,
+                    &table_name,
+                    mutation_type,
+                    &pk_columns,
+                    &relationships,
+                    &type_names,
+                    &names,
+                    max_rows,
+                )
+                .await
             })
         });
 
@@ -1462,12 +1508,17 @@ async fn resolve_query<'a>(
 }
 
 /// Resolve a mutation field.
+#[allow(clippy::too_many_arguments)]
 async fn resolve_mutation<'a>(
     ctx: &ResolverContext<'a>,
     schema_name: &str,
     table_name: &str,
     mutation_type: MutationType,
     pk_columns: &[(String, String)],
+    relationships: &Arc<HashMap<String, Vec<RelationshipField>>>,
+    type_names: &Arc<HashMap<(String, String), String>>,
+    names: &Arc<crate::names::NameOverrides>,
+    max_rows: Option<i64>,
 ) -> Result<Option<FieldValue<'a>>, async_graphql::Error> {
     let pool = ctx.data::<PgPool>()?;
     let gql_ctx = ctx.data::<GraphQLContext>()?;
@@ -1494,14 +1545,27 @@ async fn resolve_mutation<'a>(
                 })
                 .unwrap_or_else(|| serde_json::Value::Array(vec![]));
 
+            let guard = gql_ctx
+                .schema_cache
+                .get()
+                .await
+                .map_err(|e| async_graphql::Error::new(e.to_string()))?;
+            let cache = guard
+                .as_ref()
+                .ok_or_else(|| async_graphql::Error::new("schema cache is not loaded"))?;
+            let context = InsertContext {
+                cache,
+                relationships: relationships.as_ref(),
+                type_names: type_names.as_ref(),
+            };
+
             execute_insert(
                 pool,
                 schema_name,
                 table_name,
                 gql_ctx.role(),
                 objects,
-                column_types_of(&gql_ctx.schema_cache, schema_name, table_name).await,
-                mutation_type,
+                &context,
             )
             .await?
         }
@@ -1543,7 +1607,6 @@ async fn resolve_mutation<'a>(
                 operators,
                 column_types_of(&gql_ctx.schema_cache, schema_name, table_name).await,
                 where_clause,
-                mutation_type,
             )
             .await?
         }
@@ -1560,13 +1623,52 @@ async fn resolve_mutation<'a>(
                 table_name,
                 gql_ctx.role(),
                 where_clause,
-                mutation_type,
             )
             .await?
         }
     };
 
-    Ok(result)
+    // A relationship or a computed field asked for beside the written columns
+    // is not in `RETURNING`, so the rows are read again through the projection
+    // an ordinary query uses -- and only when the selection asks for something
+    // that needs it.
+    let type_name = type_names
+        .get(&(schema_name.to_string(), table_name.to_string()))
+        .cloned()
+        .unwrap_or_else(|| table_name.to_string());
+
+    let by_key = matches!(
+        mutation_type,
+        MutationType::InsertOne | MutationType::UpdateByPk | MutationType::DeleteByPk
+    );
+    let returning = if by_key {
+        Some(ctx.field())
+    } else {
+        ctx.field()
+            .selection_set()
+            .find(|selection| selection.name() == "returning")
+    };
+
+    let result = match returning {
+        Some(returning) if !result.is_empty() => {
+            reread_returning(
+                pool,
+                gql_ctx,
+                schema_name,
+                table_name,
+                &type_name,
+                result,
+                returning,
+                relationships.as_ref(),
+                names.as_ref(),
+                max_rows,
+            )
+            .await?
+        }
+        _ => result,
+    };
+
+    Ok(mutation_result(result, by_key))
 }
 
 /// Begin a transaction with the request's role applied.
@@ -1678,18 +1780,325 @@ async fn column_types_of(
     }
 }
 
+/// Insert one row, and any rows nested inside it.
+///
+/// Hasura writes a parent and its children in one mutation:
+///
+/// ```graphql
+/// insert_article(objects: [{title: "x", author: {data: {name: "y"}}}])
+/// ```
+///
+/// Which row goes first follows from which side holds the key. A relationship
+/// to one row is reached through a column of *this* table, so the related row
+/// is inserted first and its key is what this row's column is set to. A
+/// relationship to many rows is reached through a column of *theirs*, so this
+/// row goes first and each child's column is set from it.
+///
+/// Everything runs in the transaction the caller opened, so a child that
+/// cannot be written takes the parent with it -- which is what writing them in
+/// one mutation means.
+fn insert_row<'life>(
+    conn: &'life mut sqlx::PgConnection,
+    schema_name: &'life str,
+    table_name: &'life str,
+    object: serde_json::Map<String, serde_json::Value>,
+    context: &'life InsertContext<'life>,
+) -> std::pin::Pin<
+    Box<dyn std::future::Future<Output = Result<serde_json::Value, async_graphql::Error>> + Send + 'life>,
+> {
+    Box::pin(async move {
+        use sqlx::Row;
+
+        let qi = postrust_core::api_request::QualifiedIdentifier::new(schema_name, table_name);
+        let table = context
+            .cache
+            .get_table(&qi)
+            .ok_or_else(|| async_graphql::Error::new(format!("unknown table \"{}\"", table_name)))?;
+        let column_types: HashMap<String, String> = table
+            .columns
+            .values()
+            .map(|c| (c.name.clone(), c.nominal_type.clone()))
+            .collect();
+
+        // A key that is a relationship rather than a column is a nested write.
+        let type_name = context.type_names.get(&(schema_name.to_string(), table_name.to_string()));
+        let relationships: &[RelationshipField] = type_name
+            .and_then(|name| context.relationships.get(name))
+            .map(|r| r.as_slice())
+            .unwrap_or(&[]);
+
+        let mut columns = serde_json::Map::new();
+        let mut to_one: Vec<(&RelationshipField, serde_json::Value)> = Vec::new();
+        let mut to_many: Vec<(&RelationshipField, serde_json::Value)> = Vec::new();
+
+        for (key, value) in object {
+            match relationships.iter().find(|r| r.name == key) {
+                None => {
+                    columns.insert(key, value);
+                }
+                Some(relationship) => {
+                    // `{data: {...}}` for one row, `{data: [{...}]}` for many.
+                    let data = match &value {
+                        serde_json::Value::Object(map) => {
+                            map.get("data").cloned().unwrap_or(value.clone())
+                        }
+                        other => other.clone(),
+                    };
+                    if relationship.is_list {
+                        to_many.push((relationship, data));
+                    } else {
+                        to_one.push((relationship, data));
+                    }
+                }
+            }
+        }
+
+        // The rows this one points at, first: this row's own column carries
+        // their key.
+        for (relationship, data) in to_one {
+            let plan =
+                postrust_core::embed::EmbedPlan::resolve(&relationship.relationship, context.cache)
+                    .map_err(|e| async_graphql::Error::new(e.to_string()))?;
+            let serde_json::Value::Object(child) = data else {
+                return Err(async_graphql::Error::new(format!(
+                    "\"{}\" takes an object to insert",
+                    relationship.name
+                )));
+            };
+            let written = insert_row(
+                conn,
+                &plan.foreign_schema,
+                &plan.foreign_table,
+                child,
+                context,
+            )
+            .await?;
+            for (local, foreign) in &plan.columns {
+                if let Some(value) = written.get(foreign) {
+                    columns.insert(local.clone(), value.clone());
+                }
+            }
+        }
+
+        let names: Vec<&str> = columns.keys().map(|k| k.as_str()).collect();
+        let written = if names.is_empty() {
+            // Every column defaulted. `DEFAULT VALUES` is how SQL says that;
+            // an empty column list is a syntax error.
+            let sql = format!(
+                "INSERT INTO {}.{} DEFAULT VALUES RETURNING row_to_json({}.{}.*)",
+                postrust_sql::escape_ident(schema_name),
+                postrust_sql::escape_ident(table_name),
+                postrust_sql::escape_ident(schema_name),
+                postrust_sql::escape_ident(table_name)
+            );
+            sqlx::query(&sql).fetch_one(&mut *conn).await?
+        } else {
+            let placeholders: Vec<String> = names
+                .iter()
+                .enumerate()
+                .map(|(i, column)| format!("${}{}", i + 1, write_cast(&column_types, column)))
+                .collect();
+            let sql = format!(
+                "INSERT INTO {}.{} ({}) VALUES ({}) RETURNING row_to_json({}.{}.*)",
+                postrust_sql::escape_ident(schema_name),
+                postrust_sql::escape_ident(table_name),
+                names
+                    .iter()
+                    .map(|c| postrust_sql::escape_ident(c))
+                    .collect::<Vec<_>>()
+                    .join(", "),
+                placeholders.join(", "),
+                postrust_sql::escape_ident(schema_name),
+                postrust_sql::escape_ident(table_name)
+            );
+            trace!("Executing INSERT SQL: {}", sql);
+            let mut query = sqlx::query(&sql);
+            for column in &names {
+                if let Some(value) = columns.get(*column) {
+                    query = bind_json_value(query, value);
+                }
+            }
+            query.fetch_one(&mut *conn).await?
+        };
+
+        let row: serde_json::Value = written.try_get(0).unwrap_or(serde_json::Value::Null);
+
+        // Then the rows that point at this one, which need its key.
+        for (relationship, data) in to_many {
+            let plan =
+                postrust_core::embed::EmbedPlan::resolve(&relationship.relationship, context.cache)
+                    .map_err(|e| async_graphql::Error::new(e.to_string()))?;
+            let children = match data {
+                serde_json::Value::Array(items) => items,
+                serde_json::Value::Object(map) => vec![serde_json::Value::Object(map)],
+                serde_json::Value::Null => Vec::new(),
+                _ => {
+                    return Err(async_graphql::Error::new(format!(
+                        "\"{}\" takes objects to insert",
+                        relationship.name
+                    )))
+                }
+            };
+            for child in children {
+                let serde_json::Value::Object(mut child) = child else {
+                    continue;
+                };
+                for (local, foreign) in &plan.columns {
+                    if let Some(value) = row.get(local) {
+                        child.insert(foreign.clone(), value.clone());
+                    }
+                }
+                insert_row(
+                    conn,
+                    &plan.foreign_schema,
+                    &plan.foreign_table,
+                    child,
+                    context,
+                )
+                .await?;
+            }
+        }
+
+        Ok(row)
+    })
+}
+
+/// What a nested insert needs to follow a relationship.
+struct InsertContext<'a> {
+    cache: &'a SchemaCache,
+    relationships: &'a HashMap<String, Vec<RelationshipField>>,
+    /// (schema, table) -> the GraphQL type name, which keys the relationship
+    /// map. A table's type is not always its name: a second schema prefixes
+    /// it, and a name may have been given.
+    type_names: &'a HashMap<(String, String), String>,
+}
+
+/// Re-read written rows so that a mutation's `returning` can carry
+/// relationships and computed fields.
+///
+/// `RETURNING row_to_json(t.*)` gives the table's own columns and nothing
+/// else, so a relationship asked for beside them had no value to resolve --
+/// and a non-null list field with no value is an error, which meant a mutation
+/// that had written its rows correctly answered as though it had failed. The
+/// write is not in doubt; only the shape of the answer is.
+///
+/// So the rows are read again by their primary key, through the same
+/// projection an ordinary query uses. One extra round trip, and only when the
+/// selection actually asks for something `RETURNING` cannot give.
+#[allow(clippy::too_many_arguments)]
+async fn reread_returning(
+    pool: &PgPool,
+    gql_ctx: &GraphQLContext,
+    schema_name: &str,
+    table_name: &str,
+    type_name: &str,
+    rows: Vec<Value>,
+    returning: async_graphql::SelectionField<'_>,
+    relationships: &HashMap<String, Vec<RelationshipField>>,
+    names: &crate::names::NameOverrides,
+    max_rows: Option<i64>,
+) -> Result<Vec<Value>, async_graphql::Error> {
+    let guard = gql_ctx
+        .schema_cache
+        .get()
+        .await
+        .map_err(|e| async_graphql::Error::new(e.to_string()))?;
+    let Some(cache) = guard.as_ref() else {
+        return Ok(rows);
+    };
+    let qi = postrust_core::api_request::QualifiedIdentifier::new(schema_name, table_name);
+    let Some(table) = cache.get_table(&qi) else {
+        return Ok(rows);
+    };
+    if table.pk_cols.is_empty() {
+        // Nothing to identify the rows by. The columns are still right.
+        return Ok(rows);
+    }
+
+    let mut param_idx = 1usize;
+    let mut values: Vec<serde_json::Value> = Vec::new();
+    let mut alias_counter = 0usize;
+    let embeds = build_embed_expressions(
+        cache,
+        relationships,
+        type_name,
+        "src",
+        returning,
+        max_rows,
+        &mut alias_counter,
+        &mut param_idx,
+        &mut values,
+        names,
+    )?;
+    let computed = computed_projections(table, returning, "src", names);
+    if embeds.is_empty() && computed.is_empty() {
+        return Ok(rows);
+    }
+
+    // One row per key written, in the order they were written.
+    let mut conditions = Vec::with_capacity(rows.len());
+    for row in &rows {
+        let mut parts = Vec::with_capacity(table.pk_cols.len());
+        for column in &table.pk_cols {
+            let Value::Object(map) = row else {
+                return Ok(rows);
+            };
+            let Some(value) = map.get(&async_graphql::Name::new(column)) else {
+                return Ok(rows);
+            };
+            parts.push(format!(
+                "{} = ${}",
+                postrust_sql::escape_ident(column),
+                param_idx
+            ));
+            values.push(value_to_json(value));
+            param_idx += 1;
+        }
+        conditions.push(format!("({})", parts.join(" AND ")));
+    }
+    if conditions.is_empty() {
+        return Ok(rows);
+    }
+
+    let mut projection = String::from("src.*");
+    for expression in &computed {
+        projection.push_str(", ");
+        projection.push_str(expression);
+    }
+    for (name, expression) in &embeds {
+        projection.push_str(", ");
+        projection.push_str(expression);
+        projection.push_str(" AS ");
+        projection.push_str(&postrust_sql::escape_ident(name));
+    }
+
+    let sql = format!(
+        "SELECT row_to_json(pgrst_r) FROM (SELECT {} FROM (SELECT * FROM {}.{} WHERE {}) AS src) AS pgrst_r",
+        projection,
+        postrust_sql::escape_ident(schema_name),
+        postrust_sql::escape_ident(table_name),
+        conditions.join(" OR ")
+    );
+
+    let mut conn = begin_with_session(pool, gql_ctx.role(), &gql_ctx.session_settings()).await?;
+    let reread = execute_query_on(&mut conn, &sql, &values).await?;
+    conn.commit().await?;
+
+    if reread.is_empty() {
+        return Ok(rows);
+    }
+    Ok(reread.into_iter().map(json_to_value).collect())
+}
+
 /// Execute an insert mutation.
-async fn execute_insert<'a>(
+async fn execute_insert(
     pool: &PgPool,
     schema_name: &str,
     table_name: &str,
     role: &str,
     objects: serde_json::Value,
-    column_types: HashMap<String, String>,
-    mutation_type: MutationType,
-) -> Result<Option<FieldValue<'a>>, async_graphql::Error> {
-    use sqlx::Row;
-
+    context: &InsertContext<'_>,
+) -> Result<Vec<Value>, async_graphql::Error> {
     trace!("Insert mutation for {}: {:?}", table_name, objects);
 
     // Handle both array and single object
@@ -1711,56 +2120,21 @@ async fn execute_insert<'a>(
 
     let mut inserted: Vec<Value> = Vec::new();
 
-    for obj in objects_array {
-        if let serde_json::Value::Object(map) = obj {
-            // Build INSERT query
-            let columns: Vec<&str> = map.keys().map(|k| k.as_str()).collect();
-            let placeholders: Vec<String> = columns
-                .iter()
-                .enumerate()
-                .map(|(i, column)| format!("${}{}", i + 1, write_cast(&column_types, column)))
-                .collect();
-
-            let sql = format!(
-                "INSERT INTO {}.{} ({}) VALUES ({}) RETURNING row_to_json({}.{}.*)",
-                postrust_sql::escape_ident(schema_name),
-                postrust_sql::escape_ident(table_name),
-                columns
-                    .iter()
-                    .map(|c| postrust_sql::escape_ident(c))
-                    .collect::<Vec<_>>()
-                    .join(", "),
-                placeholders.join(", "),
-                postrust_sql::escape_ident(schema_name),
-                postrust_sql::escape_ident(table_name)
-            );
-
-            trace!("Executing INSERT SQL: {}", sql);
-
-            // Build query with parameters
-            let mut query = sqlx::query(&sql);
-            for col in &columns {
-                if let Some(val) = map.get(*col) {
-                    query = bind_json_value(query, val);
-                }
-            }
-
-            let row = query.fetch_one(&mut *conn).await?;
-
-            if let Ok(json_val) = row.try_get::<serde_json::Value, _>(0) {
-                inserted.push(json_to_value(json_val));
-            }
-        }
+    for object in objects_array {
+        let serde_json::Value::Object(map) = object else {
+            return Err(async_graphql::Error::new("each object to insert is an object"));
+        };
+        let row = insert_row(&mut conn, schema_name, table_name, map, context).await?;
+        inserted.push(json_to_value(row));
     }
 
-    // Commit once every object has been inserted: committing inside the loop
-    // would end the transaction, and the role set on it, after the first row.
+    // Commit once every object has been written, nested rows included:
+    // committing inside the loop would end the transaction, and the role set
+    // on it, after the first row -- and would leave a half-written parent
+    // behind when a child fails.
     conn.commit().await?;
 
-    Ok(mutation_result(
-        inserted,
-        mutation_type == MutationType::InsertOne,
-    ))
+    Ok(inserted)
 }
 
 /// Shape a mutation's result for the field that asked for it.
@@ -1806,7 +2180,7 @@ fn bind_json_value<'q>(
 }
 
 /// Execute an update mutation.
-async fn execute_update<'a>(
+async fn execute_update(
     pool: &PgPool,
     schema_name: &str,
     table_name: &str,
@@ -1814,8 +2188,7 @@ async fn execute_update<'a>(
     operators: Vec<(&'static str, serde_json::Value)>,
     column_types: HashMap<String, String>,
     where_clause: Option<serde_json::Value>,
-    mutation_type: MutationType,
-) -> Result<Option<FieldValue<'a>>, async_graphql::Error> {
+) -> Result<Vec<Value>, async_graphql::Error> {
     use sqlx::Row;
 
     trace!("Update mutation for {}: {:?}", table_name, operators);
@@ -1940,21 +2313,17 @@ async fn execute_update<'a>(
 
     conn.commit().await?;
 
-    Ok(mutation_result(
-        updated,
-        mutation_type == MutationType::UpdateByPk,
-    ))
+    Ok(updated)
 }
 
 /// Execute a delete mutation.
-async fn execute_delete<'a>(
+async fn execute_delete(
     pool: &PgPool,
     schema_name: &str,
     table_name: &str,
     role: &str,
     where_clause: Option<serde_json::Value>,
-    mutation_type: MutationType,
-) -> Result<Option<FieldValue<'a>>, async_graphql::Error> {
+) -> Result<Vec<Value>, async_graphql::Error> {
     use sqlx::Row;
 
     trace!("Delete mutation for {}", table_name);
@@ -2005,10 +2374,7 @@ async fn execute_delete<'a>(
     // Return based on mutation type
     conn.commit().await?;
 
-    Ok(mutation_result(
-        deleted,
-        mutation_type == MutationType::DeleteByPk,
-    ))
+    Ok(deleted)
 }
 
 /// Build a WHERE clause from a boolean expression.
@@ -3114,7 +3480,6 @@ fn accessor_to_json(accessor: &ValueAccessor<'_>) -> serde_json::Value {
 }
 
 /// Convert async-graphql Value to JSON.
-#[allow(dead_code)]
 fn value_to_json(value: &Value) -> serde_json::Value {
     match value {
         Value::Null => serde_json::Value::Null,
@@ -3398,7 +3763,7 @@ mod tests {
         let config = SchemaConfig::default();
         let generated = build_schema(&cache, &config);
 
-        let _mutation = create_mutation_type(&generated);
+        let _mutation = create_mutation_type(&generated, Arc::new(HashMap::new()), Arc::new(HashMap::new()), Arc::new(Default::default()), None);
     }
 
     // ============================================================================
