@@ -8,14 +8,14 @@ harness itself, divergences kept on purpose, and the gaps still open.
 
 | | status | same outcome | same data | full body |
 |---|---|---|---|---|
-| all (464) | 97.8% | 55.4% | **48.3%** | 18.1% |
-| reads (269) | 99.3% | 57.2% | 47.2% | 22.3% |
+| all (464) | 97.8% | 56.2% | **49.1%** | 19.0% |
+| reads (269) | 99.3% | 58.7% | 48.7% | 23.8% |
 | writes (195) | 95.9% | 52.8% | 49.7% | 12.3% |
 
 The same-data figure over successive fixes: 34.1 → 41.8 (duplicate-field
 panic) → 43.8 (enum arguments read) → 44.2 (relationship predicates, aggregate
 result decoding) → 44.6 (scalar naming) → 48.3 (update operators, written-value
-casts, root type names).
+casts, root type names) → 49.1 (embed arguments, computed columns).
 
 The third column is the one that matters to a client: the same query came back
 with the same rows.
@@ -103,13 +103,21 @@ wrong one.
 
 ## Open, ordered by consequence
 
-1. **Arguments on relationship fields.** `author { articles(where: ..., limit:
-   5, order_by: ...) { ... } }` — a nested selection takes no arguments at all,
-   so a client filtering or paginating an embedded list gets `Unknown argument
-   "where" on field "articles"`. Common in real queries and not only in the
-   corpus.
+1. **Computed relationships.** A function returning `setof` a table is a
+   relationship, not a column, and only the scalar-returning kind is exposed —
+   `author { get_articles { ... } }` is an unknown field. This is most of what
+   is left in `computed_fields`, and `postrust_core::embed::EmbedPlan` already
+   models the function form, so the machinery is there and unused.
 
-2. **Enum tables, and why they may stay open.** `colors_enum` in the corpus is
+2. **Two more names Hasura takes from metadata rather than the schema.** A
+   computed field is named by the metadata command that adds it (`upper_name`),
+   where here it is named after the function (`automatic_comment_in_db_upper_name`),
+   which is what puts `graphql_introspection/descriptions` at 0/5 despite the
+   descriptions themselves being right. Custom root field names are the same
+   question. These belong with relationship naming below: structural to
+   reflecting instead of configuring, not gaps to close one at a time.
+
+3. **Enum tables, and why they may stay open.** `colors_enum` in the corpus is
    not a PostgreSQL enum: it is an ordinary table of allowed values, marked
    `set_table_is_enum` in metadata, from which Hasura generates a GraphQL enum
    and types every referencing column as it. 17 cases turn on it. There is no
@@ -118,26 +126,21 @@ wrong one.
    which is the model this project declined. Worth deciding explicitly rather
    than leaving as a to-do.
 
-3. **`on_conflict`.** Upserts are not expressible. Needs unique-constraint
+4. **`on_conflict`.** Upserts are not expressible. Needs unique-constraint
    names, which the schema cache does not collect: `Table` carries `pk_cols`
    and nothing else, though `schema_cache/queries.rs` already reads `conname`
    for foreign keys.
 
-4. **Nested aggregates.** `author { articles_aggregate { aggregate { count } } }`
+5. **Nested aggregates.** `author { articles_aggregate { aggregate { count } } }`
    — the aggregate exists only as a root field, not as a relationship field.
 
-5. **Custom root field names.** Hasura renames roots through
-   `set_table_customization`; here a table outside the default schema is
-   prefixed with its schema name instead. Same configuration question as (2).
+6. **The comment on a computed field's function** is not carried by the schema
+   cache, so a computed field's description is always null.
 
-6. **Introspection descriptions.** Table and column comments are already in the
-   schema cache, so this is closer than its 0/5 suggests.
-
-7. **Ordering across a relationship** is not offered at all, deliberately: a
-   field the schema advertises and the resolver refuses is worse than one that
-   was never there. Now that relationship predicates resolve, the same
-   correlated subselect would serve ordering, and the two should end up
-   consistent.
+7. **Ordering across a relationship** is not offered at the root, deliberately:
+   a field the schema advertises and the resolver refuses is worse than one
+   that was never there. An embedded list now takes its own `order_by`, so what
+   is left is ordering a parent by a child's column.
 
 8. **Relationship predicates through a junction or a computed relationship**
    are refused rather than resolved. Both need more than a pair of columns to
@@ -161,6 +164,11 @@ wrong one.
 - **Updates take all seven operators**, and written values are cast to their
   column's type: a bound parameter arrives as text, and PostgreSQL will not
   coerce text to `jsonb`, to an array, or to a user-defined type on assignment.
+- **An embedded list takes `where`, `order_by`, `limit` and `offset`**, applied
+  inside the child's own subselect so the limit bounds rows per parent and the
+  ordering happens before it. `EmbedPlan::embed_expression` already took all
+  four for the REST surface; the GraphQL side had no way to say any of them.
+- **Computed columns are fields**, at the root and inside an embed.
 
 ## Not measured
 
