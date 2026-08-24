@@ -105,23 +105,38 @@ fn pk_columns_of(table: &Table) -> Vec<(String, String)> {
         .collect()
 }
 
-/// The key a relationship is named by in the overrides.
+/// Every key a relationship may be named under, most specific first.
 ///
-/// A foreign key relationship is keyed by its constraint, which names exactly
-/// one relationship even where two of them point at the same table. A computed
-/// relationship has no constraint, so it is keyed by its function -- the same
-/// thing the REST surface resolves an embed by. A many-to-many has two
-/// constraints rather than one and so has no single key; it falls back to the
-/// target table, which is what its derived name uses anyway.
-fn relationship_key(rel: &postrust_core::schema_cache::Relationship) -> String {
+/// More than one, because there is more than one way to identify the same
+/// relationship and a document may be written by hand or converted from
+/// Hasura's metadata, which uses a different one. A constraint names exactly
+/// one relationship even where two of them point at the same table; a computed
+/// relationship has no constraint and is named by its function; and Hasura
+/// names both directions by a column -- the foreign key column on this table
+/// for a relationship to one row, and `table.column` on the far side for a
+/// relationship to many. All of them are accepted, so a converted document
+/// needs no database to turn a column into the constraint that carries it.
+fn relationship_keys(rel: &postrust_core::schema_cache::Relationship) -> Vec<String> {
     use postrust_core::schema_cache::Relationship;
-    match rel {
-        Relationship::Computed { function, .. } => function.name.clone(),
-        _ => match rel.constraint_name() {
-            "" => rel.foreign_table().name.clone(),
-            constraint => constraint.to_string(),
-        },
+
+    if let Relationship::Computed { function, .. } = rel {
+        return vec![function.name.clone()];
     }
+
+    let mut keys = Vec::new();
+    match rel.constraint_name() {
+        "" => {}
+        constraint => keys.push(constraint.to_string()),
+    }
+    if rel.is_one_to_many() {
+        // The children point here, so the column that points is theirs.
+        if let Some(column) = rel.single_foreign_column() {
+            keys.push(format!("{}.{}", rel.foreign_table().name, column));
+        }
+    } else if let Some(column) = rel.single_local_column() {
+        keys.push(column.to_string());
+    }
+    keys
 }
 
 /// Base name used to derive a table's GraphQL type and field names.
@@ -544,11 +559,9 @@ pub fn build_schema(schema_cache: &SchemaCache, config: &SchemaConfig) -> Genera
                         Some(RelationshipField::from_relationship_named(
                             rel,
                             target_base,
-                            config.names.relationship(
-                                &table.schema,
-                                &table.name,
-                                &relationship_key(rel),
-                            ),
+                            relationship_keys(rel).iter().find_map(|key| {
+                                config.names.relationship(&table.schema, &table.name, key)
+                            }),
                         ))
                     })
                     .collect()

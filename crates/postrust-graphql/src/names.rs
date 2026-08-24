@@ -124,19 +124,32 @@ impl NameOverrides {
         self.table(schema, table)?.name.as_deref()
     }
 
-    /// The name given to a relationship, by its constraint or function.
+    /// The name given to a relationship, by its constraint, column or
+    /// function.
+    ///
+    /// Falls back to `computed_fields` because Hasura has one command for
+    /// both: `add_computed_field` covers a function returning a value and a
+    /// function returning rows, and which it is cannot be told from the
+    /// metadata -- only from the database. A converter should not have to
+    /// connect to one to put an entry in the right map, so either map answers.
     pub fn relationship(&self, schema: &str, table: &str, source: &str) -> Option<&str> {
-        self.table(schema, table)?
+        let names = self.table(schema, table)?;
+        names
             .relationships
             .get(source)
+            .or_else(|| names.computed_fields.get(source))
             .map(String::as_str)
     }
 
     /// The name given to a computed field, by its function.
+    ///
+    /// Reads both maps, for the reason [`Self::relationship`] gives.
     pub fn computed_field(&self, schema: &str, table: &str, function: &str) -> Option<&str> {
-        self.table(schema, table)?
+        let names = self.table(schema, table)?;
+        names
             .computed_fields
             .get(function)
+            .or_else(|| names.relationships.get(function))
             .map(String::as_str)
     }
 
@@ -148,9 +161,11 @@ impl NameOverrides {
     /// because a table has a handful of computed fields, not thousands, and a
     /// second map would be one more thing to keep in step.
     pub fn computed_source(&self, schema: &str, table: &str, field: &str) -> Option<&str> {
-        self.table(schema, table)?
+        let names = self.table(schema, table)?;
+        names
             .computed_fields
             .iter()
+            .chain(names.relationships.iter())
             .find(|(_, exposed)| exposed.as_str() == field)
             .map(|(function, _)| function.as_str())
     }
@@ -192,6 +207,33 @@ mod tests {
             Some("author_upper_name")
         );
         assert_eq!(names.computed_source("public", "author", "nothing"), None);
+    }
+
+    #[test]
+    fn a_computed_field_is_found_in_either_map() {
+        // Hasura has one command for both, and which one an entry belongs in
+        // cannot be told from its metadata.
+        let names = NameOverrides::parse(
+            r#"{"public.author": {"computed_fields": {"fetch_articles_plain": "get_articles"}}}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            names.relationship("public", "author", "fetch_articles_plain"),
+            Some("get_articles")
+        );
+
+        let other = NameOverrides::parse(
+            r#"{"public.author": {"relationships": {"author_upper_name": "upper_name"}}}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            other.computed_field("public", "author", "author_upper_name"),
+            Some("upper_name")
+        );
+        assert_eq!(
+            other.computed_source("public", "author", "upper_name"),
+            Some("author_upper_name")
+        );
     }
 
     #[test]

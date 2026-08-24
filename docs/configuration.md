@@ -239,6 +239,28 @@ PGRST_GRAPHQL_NAMES='{"public.author": {"name": "Author"}}'
 PGRST_GRAPHQL_NAMES="/etc/postrust/graphql-names.json"
 ```
 
+### Converting from Hasura
+
+Nobody should write this by hand for a migration — Hasura already has every one
+of these names, and `scripts/hasura-names.py` reads them out:
+
+```bash
+scripts/hasura-names.py --url http://localhost:8080 --admin-secret "$SECRET" > graphql-names.json
+scripts/hasura-names.py --metadata-dir ./metadata > graphql-names.json
+scripts/hasura-names.py --file metadata.json > graphql-names.json
+```
+
+It emits only the names that differ from what this server derives on its own,
+so the document is the exceptions rather than the whole schema — usually a
+short file. It converts names and nothing else: permissions, tracked-table
+lists, actions, remote schemas and event triggers are the metadata model rather
+than names, and this server does not have one.
+
+Relationships can be keyed by constraint name, by the foreign key column, or by
+`table.column` on the far side. That is what lets the converter work from the
+metadata alone: Hasura names a relationship by its column, and turning a column
+into the constraint that carries it would otherwise need a database connection.
+
 This is a lookup table, not a metadata model. It grants no permissions and
 tracks no tables; a name is all it can change. A document that cannot be read
 or parsed stops the server rather than being ignored — serving derived names
