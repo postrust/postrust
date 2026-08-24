@@ -103,6 +103,67 @@ def tables_from_document(document):
     return tables
 
 
+def tables_from_commands(paths):
+    """Fold a sequence of metadata commands into table entries.
+
+    A schema is not always an exported document. Migrations, a test suite's
+    fixtures and anything scripted against `/v1/query` are a list of commands
+    instead -- `create_array_relationship`, `add_computed_field`,
+    `set_table_customization` -- applied in order. Folding them gives the same
+    shape an export would have had.
+    """
+    entries = {}
+
+    def entry_for(table):
+        schema, name = qualified(table)
+        return entries.setdefault(
+            (schema, name),
+            {"table": {"schema": schema, "name": name}},
+        )
+
+    for path in paths:
+        document = load_yaml(path)
+        if document is None:
+            continue
+        commands = []
+        for item in document if isinstance(document, list) else [document]:
+            if not isinstance(item, dict):
+                continue
+            if item.get("type") == "bulk":
+                commands += [a for a in (item.get("args") or []) if isinstance(a, dict)]
+            else:
+                commands.append(item)
+
+        for command in commands:
+            # The source-aware spellings mean the same thing here.
+            kind = (command.get("type") or "")
+            if kind.startswith("pg_"):
+                kind = kind[len("pg_"):]
+            args = command.get("args") or {}
+            if not isinstance(args, dict) or "table" not in args:
+                continue
+            entry = entry_for(args["table"])
+
+            if kind in ("create_object_relationship", "create_array_relationship"):
+                field = ("object_relationships" if kind.endswith("object_relationship")
+                         else "array_relationships")
+                entry.setdefault(field, []).append(
+                    {"name": args.get("name"), "using": args.get("using")}
+                )
+            elif kind == "add_computed_field":
+                entry.setdefault("computed_fields", []).append(
+                    {"name": args.get("name"), "definition": args.get("definition")}
+                )
+            elif kind in ("track_table", "set_table_customization", "add_existing_table_or_view"):
+                configuration = args.get("configuration")
+                if isinstance(configuration, dict):
+                    # A later customization replaces an earlier one, which is
+                    # what applying them in order means.
+                    entry["configuration"] = configuration
+
+    return list(entries.values())
+
+
 def qualified(table):
     """Hasura writes a table as a name or as {schema, name}."""
     if isinstance(table, str):
@@ -214,6 +275,47 @@ def convert(tables):
         if custom_name and custom_name != table:
             given["name"] = custom_name
 
+        # Hasura names each root separately -- `select: Authors`,
+        # `select_by_pk: Author`, `select_aggregate: AuthorAgg`. This server
+        # derives all of them from one base name, so a set that agrees on one
+        # converts and a set that does not is reported rather than guessed at.
+        roots = configuration.get("custom_root_fields") or {}
+        if roots and "name" not in given:
+            def strip_suffix(value, suffix):
+                return value[: -len(suffix)] if value.endswith(suffix) else None
+
+            def strip_prefix(value, prefix):
+                return value[len(prefix):] if value.startswith(prefix) else None
+
+            implied = {
+                "select": lambda v: v,
+                "select_by_pk": lambda v: strip_suffix(v, "_by_pk"),
+                "select_aggregate": lambda v: strip_suffix(v, "_aggregate"),
+                "insert": lambda v: strip_prefix(v, "insert_"),
+                "update": lambda v: strip_prefix(v, "update_"),
+                "delete": lambda v: strip_prefix(v, "delete_"),
+            }
+            bases = {implied[root](value) for root, value in roots.items()
+                     if root in implied and isinstance(value, str)}
+            bases.discard(None)
+            if len(bases) == 1:
+                base = bases.pop()
+                if base != table:
+                    given["name"] = base
+            elif bases:
+                print(
+                    f"note: {key} names its roots separately ({', '.join(sorted(roots))}); "
+                    f"this server derives them from one base name, so they are left alone",
+                    file=sys.stderr,
+                )
+
+        if configuration.get("custom_column_names"):
+            print(
+                f"note: {key} renames columns, which this server does not; "
+                f"those fields keep their database names",
+                file=sys.stderr,
+            )
+
         relationships = {}
         for kind, field in (("object", "object_relationships"),
                             ("array", "array_relationships")):
@@ -265,11 +367,15 @@ def main():
     source.add_argument("--url", help="a running graphql-engine")
     source.add_argument("--metadata-dir", help="a metadata directory the CLI manages")
     source.add_argument("--file", help="an exported metadata document (JSON or YAML)")
+    source.add_argument("--commands", nargs="+", metavar="FILE",
+                        help="YAML files of metadata commands, applied in order")
     parser.add_argument("--admin-secret", default=os.environ.get("HASURA_GRAPHQL_ADMIN_SECRET"))
     args = parser.parse_args()
 
     if args.url:
         tables = tables_from_document(export_from_engine(args.url, args.admin_secret))
+    elif args.commands:
+        tables = tables_from_commands(args.commands)
     elif args.metadata_dir:
         tables = tables_from_metadata_dir(args.metadata_dir)
     else:
@@ -282,7 +388,11 @@ def main():
         tables = tables_from_document(document)
 
     if not tables:
-        die("no tables found in that metadata")
+        # An empty document is a legitimate answer for a schema that renames
+        # nothing, and a caller generating one per group should not have to
+        # special-case it.
+        print("{}")
+        return
 
     names = convert(tables)
     print(json.dumps(names, indent=2, sort_keys=True))

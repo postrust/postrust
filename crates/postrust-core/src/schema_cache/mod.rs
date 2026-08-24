@@ -86,7 +86,7 @@ impl SchemaCache {
         // Functions that read as columns. Attached to the tables they belong
         // to, so resolving a field name has one place to look.
         let mut tables = tables;
-        for (table, name, function, data_type) in
+        for (table, name, function, data_type, description) in
             queries::load_computed_columns(pool, schemas, &function_schemas).await?
         {
             if let Some(table) = tables.get_mut(&table) {
@@ -95,6 +95,7 @@ impl SchemaCache {
                     ComputedColumn {
                         function,
                         data_type,
+                        description,
                     },
                 );
             }

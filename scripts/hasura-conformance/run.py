@@ -168,8 +168,10 @@ def main():
                 continue
             # The schema cache is read once at startup and the GraphQL schema
             # is built from a snapshot of it, so new tables are invisible to a
-            # process that was already running when they were created.
-            shell(args.restart_cmd)
+            # process that was already running when they were created. The
+            # restart also picks up this group's names, which are per-group for
+            # the same reason the database is.
+            shell((args.restart_cmd or "").format(group=slug))
 
         cases = by_group[name]
         reads = [c for c in cases if not c["mutating"]]

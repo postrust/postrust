@@ -934,14 +934,15 @@ pub async fn load_computed_columns(
     pool: &PgPool,
     schemas: &[String],
     function_schemas: &[String],
-) -> Result<Vec<(QualifiedIdentifier, String, QualifiedIdentifier, String)>> {
+) -> Result<Vec<(QualifiedIdentifier, String, QualifiedIdentifier, String, Option<String>)>> {
     let rows = sqlx::query(
         r#"
         SELECT tn.nspname AS table_schema,
                t.relname  AS table_name,
                fn.nspname AS function_schema,
                p.proname  AS function_name,
-               pg_catalog.format_type(p.prorettype, null) AS return_type
+               pg_catalog.format_type(p.prorettype, null) AS return_type,
+               pg_catalog.obj_description(p.oid, 'pg_proc') AS description
           FROM pg_proc p
           JOIN pg_namespace fn ON fn.oid = p.pronamespace
           JOIN pg_class t ON t.reltype = p.proargtypes[0]
@@ -975,6 +976,7 @@ pub async fn load_computed_columns(
                     row.get::<String, _>("function_name"),
                 ),
                 row.get::<String, _>("return_type"),
+                row.get::<Option<String>, _>("description"),
             )
         })
         .collect())

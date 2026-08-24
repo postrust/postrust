@@ -179,6 +179,41 @@ docker cp "$WORK/truncate.sql" "$DB:/truncate.sql" >/dev/null
 say "Extracting cases from the corpus"
 "$PYTHON" "$HERE/extract.py" "$CORPUS" "$WORK/cases.json"
 
+# A group's fixtures name its relationships and computed fields, and those
+# names are the largest single divergence measured here -- not because anything
+# is unimplemented, but because reflection cannot recover a name nobody wrote
+# down. A migration converts them; so does this, from the same metadata, with
+# scripts/hasura-names.py.
+#
+# This makes the run measure a *configured* server rather than a bare one.
+# That is the fair comparison -- it is what migrating actually involves -- but
+# it is a different measurement, and the report says which one it is.
+say "Converting each group's names"
+mkdir -p "$WORK/names"
+"$PYTHON" - "$WORK/cases.json" "$CORPUS/queries" "$WORK/names" "$REPO_ROOT/scripts/hasura-names.py" <<'PY'
+import json, os, subprocess, sys
+cases, queries, out_dir, converter = sys.argv[1:5]
+with open(cases) as fh:
+    groups = json.load(fh)["groups"]
+named = 0
+for group in groups:
+    slug = group["dir"].replace("/", "__")
+    setup = [os.path.join(queries, rel) for rel in group["setup"]]
+    if not setup:
+        continue
+    result = subprocess.run([sys.executable, converter, "--commands", *setup],
+                            capture_output=True, text=True)
+    if result.returncode != 0:
+        print(f"  {group['dir']}: {result.stderr.strip()[:120]}", flush=True)
+        continue
+    document = result.stdout.strip() or "{}"
+    with open(os.path.join(out_dir, f"{slug}.json"), "w") as fh:
+        fh.write(document)
+    if document != "{}":
+        named += 1
+print(f"{named} of {len(groups)} groups name something the schema does not carry")
+PY
+
 # --- reference -------------------------------------------------------------
 #
 # The expensive half, and its answers only change when Hasura's version or the
@@ -232,7 +267,11 @@ create_databases
 # `sh -c`, which does not inherit shell functions.
 cat > "$WORK/restart.sh" <<SH
 #!/bin/bash
+# \$1 is the group, which selects the names converted from its own fixtures.
 pkill -f 'target/release/postrust' 2>/dev/null || true
+NAMES="$WORK/names/\$1.json"
+[ -f "\$NAMES" ] || NAMES=""
+PGRST_GRAPHQL_NAMES="\$NAMES" \
 DATABASE_URL="postgres://postgres:postgres@localhost:$DB_PORT/$DATA_DB" \
 PGRST_DB_SCHEMAS="$DB_SCHEMAS" PGRST_DB_ANON_ROLE=postgres \
 PGRST_DB_EXTRA_SEARCH_PATH="public,extensions" \
@@ -271,9 +310,14 @@ RESTORE_CMD="docker exec -e PGPASSWORD=postgres $DB psql -q -U postgres -d $DATA
     --base "http://localhost:$CAND_PORT" --mode cand \
     --admin-secret "$ADMIN_SECRET" \
     --restore-cmd "$RESTORE_CMD" \
-    --restart-cmd "$WORK/restart.sh" \
+    --restart-cmd "$WORK/restart.sh {group}" \
     --data-reset-cmd "docker exec -e PGPASSWORD=postgres $DB psql -q -U postgres -d $DATA_DB -v ON_ERROR_STOP=1 -f /truncate.sql -f /data-{group}.sql"
 
 say "Report"
-"$PYTHON" "$HERE/report.py" "$WORK/ref.json" "$WORK/cand.json" "$WORK/diff.json" \
-    | tee "$WORK/report.txt"
+{
+    echo "Names converted from each group's own metadata and given to the candidate"
+    echo "(scripts/hasura-names.py). This measures a configured server, which is what"
+    echo "migrating involves -- not a bare one."
+    echo
+    "$PYTHON" "$HERE/report.py" "$WORK/ref.json" "$WORK/cand.json" "$WORK/diff.json"
+} | tee "$WORK/report.txt"

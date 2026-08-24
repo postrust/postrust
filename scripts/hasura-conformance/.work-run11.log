@@ -1,0 +1,98 @@
+
+==> Fetching the Hasura v2.50.1 test corpus
+
+==> Starting the fixture database
+WARNING: The requested image's platform (linux/amd64) does not match the detected host platform (linux/arm64/v8) and no specific platform was requested
+
+==> Extracting cases from the corpus
+468 cases in 61 groups (270 read, 198 write), 376 files
+  skipped    7  needs add_collection_to_allowlist, create_query_collection
+  skipped   13  needs add_inherited_role
+  skipped    3  needs add_inherited_role, add_remote_schema
+  skipped    2  needs add_inherited_role, create_action, set_custom_types
+  skipped   72  needs add_remote_schema
+  skipped    1  needs add_remote_schema, create_action, set_custom_types
+  skipped    1  needs add_remote_schema, create_remote_relationship
+  skipped    8  needs create_action, create_query_collection, set_custom_types
+  skipped   45  needs create_action, set_custom_types
+  skipped   26  no fixtures found
+
+==> Converting each group's names
+  actions/introspection: /Library/Developer/CommandLineTools/usr/bin/python3: can't open file '/Users/bhanu/Documents/projects/postrust/scripts/h
+  actions/introspection/function_return_type: /Library/Developer/CommandLineTools/usr/bin/python3: can't open file '/Users/bhanu/Documents/projects/postrust/scripts/h
+  apollo_federation: /Library/Developer/CommandLineTools/usr/bin/python3: can't open file '/Users/bhanu/Documents/projects/postrust/scripts/h
+  compression: /Library/Developer/CommandLineTools/usr/bin/python3: can't open file '/Users/bhanu/Documents/projects/postrust/scripts/h
+  graphql_introspection: /Library/Developer/CommandLineTools/usr/bin/python3: can't open file '/Users/bhanu/Documents/projects/postrust/scripts/h
+  graphql_introspection/custom_table_name: /Library/Developer/CommandLineTools/usr/bin/python3: can't open file '/Users/bhanu/Documents/projects/postrust/scripts/h
+  graphql_introspection/descriptions: /Library/Developer/CommandLineTools/usr/bin/python3: can't open file '/Users/bhanu/Documents/projects/postrust/scripts/h
+  graphql_introspection/disable_introspection: /Library/Developer/CommandLineTools/usr/bin/python3: can't open file '/Users/bhanu/Documents/projects/postrust/scripts/h
+  graphql_introspection/nullable_object_relationship: /Library/Developer/CommandLineTools/usr/bin/python3: can't open file '/Users/bhanu/Documents/projects/postrust/scripts/h
+  graphql_mutation/custom_schema: /Library/Developer/CommandLineTools/usr/bin/python3: can't open file '/Users/bhanu/Documents/projects/postrust/scripts/h
+  graphql_mutation/custom_schema/custom_table_name: /Library/Developer/CommandLineTools/usr/bin/python3: can't open file '/Users/bhanu/Documents/projects/postrust/scripts/h
+  graphql_mutation/delete/basic: /Library/Developer/CommandLineTools/usr/bin/python3: can't open file '/Users/bhanu/Documents/projects/postrust/scripts/h
+  graphql_mutation/delete/constraints: /Library/Developer/CommandLineTools/usr/bin/python3: can't open file '/Users/bhanu/Documents/projects/postrust/scripts/h
+  graphql_mutation/delete/permissions: /Library/Developer/CommandLineTools/usr/bin/python3: can't open file '/Users/bhanu/Documents/projects/postrust/scripts/h
+  graphql_mutation/enums: /Library/Developer/CommandLineTools/usr/bin/python3: can't open file '/Users/bhanu/Documents/projects/postrust/scripts/h
+  graphql_mutation/functions: /Library/Developer/CommandLineTools/usr/bin/python3: can't open file '/Users/bhanu/Documents/projects/postrust/scripts/h
+  graphql_mutation/insert/basic: /Library/Developer/CommandLineTools/usr/bin/python3: can't open file '/Users/bhanu/Documents/projects/postrust/scripts/h
+  graphql_mutation/insert/constraints: /Library/Developer/CommandLineTools/usr/bin/python3: can't open file '/Users/bhanu/Documents/projects/postrust/scripts/h
+  graphql_mutation/insert/geojson: /Library/Developer/CommandLineTools/usr/bin/python3: can't open file '/Users/bhanu/Documents/projects/postrust/scripts/h
+  graphql_mutation/insert/nested: /Library/Developer/CommandLineTools/usr/bin/python3: can't open file '/Users/bhanu/Documents/projects/postrust/scripts/h
+  graphql_mutation/insert/nullprefixcolumn: /Library/Developer/CommandLineTools/usr/bin/python3: can't open file '/Users/bhanu/Documents/projects/postrust/scripts/h
+  graphql_mutation/insert/onconflict: /Library/Developer/CommandLineTools/usr/bin/python3: can't open file '/Users/bhanu/Documents/projects/postrust/scripts/h
+  graphql_mutation/insert/permissions: /Library/Developer/CommandLineTools/usr/bin/python3: can't open file '/Users/bhanu/Documents/projects/postrust/scripts/h
+  graphql_mutation/insert/views: /Library/Developer/CommandLineTools/usr/bin/python3: can't open file '/Users/bhanu/Documents/projects/postrust/scripts/h
+  graphql_mutation/transactions: /Library/Developer/CommandLineTools/usr/bin/python3: can't open file '/Users/bhanu/Documents/projects/postrust/scripts/h
+  graphql_mutation/update/basic: /Library/Developer/CommandLineTools/usr/bin/python3: can't open file '/Users/bhanu/Documents/projects/postrust/scripts/h
+  graphql_mutation/update/jsonb: /Library/Developer/CommandLineTools/usr/bin/python3: can't open file '/Users/bhanu/Documents/projects/postrust/scripts/h
+  graphql_mutation/update/permissions: /Library/Developer/CommandLineTools/usr/bin/python3: can't open file '/Users/bhanu/Documents/projects/postrust/scripts/h
+  graphql_query/agg_perm: /Library/Developer/CommandLineTools/usr/bin/python3: can't open file '/Users/bhanu/Documents/projects/postrust/scripts/h
+  graphql_query/aggregations: /Library/Developer/CommandLineTools/usr/bin/python3: can't open file '/Users/bhanu/Documents/projects/postrust/scripts/h
+  graphql_query/basic: /Library/Developer/CommandLineTools/usr/bin/python3: can't open file '/Users/bhanu/Documents/projects/postrust/scripts/h
+  graphql_query/boolexp/basic: /Library/Developer/CommandLineTools/usr/bin/python3: can't open file '/Users/bhanu/Documents/projects/postrust/scripts/h
+  graphql_query/boolexp/jsonb: /Library/Developer/CommandLineTools/usr/bin/python3: can't open file '/Users/bhanu/Documents/projects/postrust/scripts/h
+  graphql_query/boolexp/ltree: /Library/Developer/CommandLineTools/usr/bin/python3: can't open file '/Users/bhanu/Documents/projects/postrust/scripts/h
+  graphql_query/boolexp/postgis: /Library/Developer/CommandLineTools/usr/bin/python3: can't open file '/Users/bhanu/Documents/projects/postrust/scripts/h
+  graphql_query/boolexp/raster: /Library/Developer/CommandLineTools/usr/bin/python3: can't open file '/Users/bhanu/Documents/projects/postrust/scripts/h
+  graphql_query/boolexp/search: /Library/Developer/CommandLineTools/usr/bin/python3: can't open file '/Users/bhanu/Documents/projects/postrust/scripts/h
+  graphql_query/caching: /Library/Developer/CommandLineTools/usr/bin/python3: can't open file '/Users/bhanu/Documents/projects/postrust/scripts/h
+  graphql_query/computed_fields: /Library/Developer/CommandLineTools/usr/bin/python3: can't open file '/Users/bhanu/Documents/projects/postrust/scripts/h
+  graphql_query/computed_fields_row_permission_bypass: /Library/Developer/CommandLineTools/usr/bin/python3: can't open file '/Users/bhanu/Documents/projects/postrust/scripts/h
+  graphql_query/custom_schema: /Library/Developer/CommandLineTools/usr/bin/python3: can't open file '/Users/bhanu/Documents/projects/postrust/scripts/h
+  graphql_query/custom_schema/custom_table_name: /Library/Developer/CommandLineTools/usr/bin/python3: can't open file '/Users/bhanu/Documents/projects/postrust/scripts/h
+  graphql_query/enums: /Library/Developer/CommandLineTools/usr/bin/python3: can't open file '/Users/bhanu/Documents/projects/postrust/scripts/h
+  graphql_query/functions/permissions: /Library/Developer/CommandLineTools/usr/bin/python3: can't open file '/Users/bhanu/Documents/projects/postrust/scripts/h
+  graphql_query/limits: /Library/Developer/CommandLineTools/usr/bin/python3: can't open file '/Users/bhanu/Documents/projects/postrust/scripts/h
+  graphql_query/offset: /Library/Developer/CommandLineTools/usr/bin/python3: can't open file '/Users/bhanu/Documents/projects/postrust/scripts/h
+  graphql_query/order_by: /Library/Developer/CommandLineTools/usr/bin/python3: can't open file '/Users/bhanu/Documents/projects/postrust/scripts/h
+  graphql_query/order_by_nulls: /Library/Developer/CommandLineTools/usr/bin/python3: can't open file '/Users/bhanu/Documents/projects/postrust/scripts/h
+  graphql_query/permissions: /Library/Developer/CommandLineTools/usr/bin/python3: can't open file '/Users/bhanu/Documents/projects/postrust/scripts/h
+  graphql_query/root_col_perm: /Library/Developer/CommandLineTools/usr/bin/python3: can't open file '/Users/bhanu/Documents/projects/postrust/scripts/h
+  graphql_validation: /Library/Developer/CommandLineTools/usr/bin/python3: can't open file '/Users/bhanu/Documents/projects/postrust/scripts/h
+  subscriptions/basic: /Library/Developer/CommandLineTools/usr/bin/python3: can't open file '/Users/bhanu/Documents/projects/postrust/scripts/h
+  unauthorized_role: /Library/Developer/CommandLineTools/usr/bin/python3: can't open file '/Users/bhanu/Documents/projects/postrust/scripts/h
+  v1/computed_fields: /Library/Developer/CommandLineTools/usr/bin/python3: can't open file '/Users/bhanu/Documents/projects/postrust/scripts/h
+  v1/metadata: /Library/Developer/CommandLineTools/usr/bin/python3: can't open file '/Users/bhanu/Documents/projects/postrust/scripts/h
+  v1/run_sql: /Library/Developer/CommandLineTools/usr/bin/python3: can't open file '/Users/bhanu/Documents/projects/postrust/scripts/h
+  v1/set_table_configuration: /Library/Developer/CommandLineTools/usr/bin/python3: can't open file '/Users/bhanu/Documents/projects/postrust/scripts/h
+  v1/set_table_custom_fields: /Library/Developer/CommandLineTools/usr/bin/python3: can't open file '/Users/bhanu/Documents/projects/postrust/scripts/h
+  v1/set_table_is_enum: /Library/Developer/CommandLineTools/usr/bin/python3: can't open file '/Users/bhanu/Documents/projects/postrust/scripts/h
+  v1/set_table_is_enum/set_and_delayed_reload: /Library/Developer/CommandLineTools/usr/bin/python3: can't open file '/Users/bhanu/Documents/projects/postrust/scripts/h
+  v1/track_table: /Library/Developer/CommandLineTools/usr/bin/python3: can't open file '/Users/bhanu/Documents/projects/postrust/scripts/h
+0 of 61 groups name something the schema does not carry
+
+==> Reusing the recorded Hasura v2.50.1 responses
+
+==> Replaying against Postrust (candidate)
+NOTICE:  database "hge_conf" does not exist, skipping
+NOTICE:  database "hge_conf_meta" does not exist, skipping
+  [1/61] actions/introspection: 2 read, 0 write  (8s)
+  [2/61] actions/introspection/function_return_type: 1 read, 0 write  (14s)
+  [3/61] apollo_federation: 3 read, 0 write  (23s)
+  [4/61] compression: 1 read, 0 write  (28s)
+  [5/61] graphql_introspection: 4 read, 0 write  (37s)
+  [6/61] graphql_introspection/custom_table_name: 1 read, 0 write  (41s)
+  [7/61] graphql_introspection/descriptions: 5 read, 0 write  (46s)
+  [8/61] graphql_introspection/disable_introspection: 3 read, 0 write  (50s)
+  [9/61] graphql_introspection/nullable_object_relationship: 1 read, 0 write  (55s)
+scripts/hasura-conformance/conformance.sh: line 55: 73701 Terminated: 15          "$PYTHON" "$HERE/run.py" "$WORK/cases.json" "$WORK/cand.json" --base "http://localhost:$CAND_PORT" --mode cand --admin-secret "$ADMIN_SECRET" --restore-cmd "$RESTORE_CMD" --restart-cmd "$WORK/restart.sh {group}" --data-reset-cmd "docker exec -e PGPASSWORD=postgres $DB psql -q -U postgres -d $DATA_DB -v ON_ERROR_STOP=1 -f /truncate.sql -f /data-{group}.sql"

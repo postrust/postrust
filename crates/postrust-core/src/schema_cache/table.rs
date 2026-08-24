@@ -91,6 +91,14 @@ pub struct ComputedColumn {
     pub function: QualifiedIdentifier,
     /// What it returns.
     pub data_type: String,
+    /// The comment on the function, which is the field's description.
+    ///
+    /// A column's description comes from a comment on the column; a computed
+    /// column has no column to comment on, so it comes from the function --
+    /// which is where a schema author would write it and where Hasura reads
+    /// it from.
+    #[serde(default)]
+    pub description: Option<String>,
 }
 
 /// A table column.

@@ -75,7 +75,7 @@ impl TableObjectType {
     fn computed_field(name: &str, computed: &postrust_core::schema_cache::ComputedColumn) -> GraphQLField {
         GraphQLField {
             name: name.to_string(),
-            description: None,
+            description: computed.description.clone(),
             graphql_type: pg_type_to_graphql(&computed.data_type),
             nullable: true,
             is_pk: false,
