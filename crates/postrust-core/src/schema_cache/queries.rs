@@ -141,6 +141,7 @@ pub async fn load_tables(pool: &PgPool, schemas: &[String]) -> Result<TablesMap>
             updatable: row.get("updatable"),
             deletable: row.get("deletable"),
             pk_cols: pk_cols.clone(),
+            unique_constraints: Vec::new(),
             columns: load_columns(pool, &schema, &name, &pk_cols).await?,
             computed_columns: Default::default(),
         };
@@ -1140,6 +1141,60 @@ pub async fn load_view_columns(pool: &PgPool, schemas: &[String]) -> Result<Vec<
 /// table may sit in a schema which is not exposed -- the junction behind two
 /// public views. Loading the key alone keeps it out of the API surface while
 /// still letting the relationship be derived.
+/// Every unique constraint, by the table it belongs to.
+///
+/// Returned as `(constraint name, columns)`. The primary key is one of them:
+/// PostgreSQL treats it as a unique constraint and `ON CONFLICT ON CONSTRAINT`
+/// accepts it, which is what an upsert on a table's key needs.
+///
+/// Only constraints, not bare unique indexes. `ON CONFLICT ON CONSTRAINT`
+/// takes a constraint name, and a unique index created without one has no name
+/// to give it.
+pub async fn load_unique_constraints(
+    pool: &PgPool,
+    schemas: &[String],
+) -> Result<HashMap<QualifiedIdentifier, Vec<(String, Vec<String>)>>> {
+    let rows = sqlx::query(
+        r#"
+        SELECT
+            n.nspname AS table_schema,
+            c.relname AS table_name,
+            con.conname AS constraint_name,
+            (SELECT array_agg(a.attname ORDER BY k.ord)
+               FROM unnest(con.conkey) WITH ORDINALITY AS k(attnum, ord)
+               JOIN pg_attribute a
+                 ON a.attrelid = c.oid AND a.attnum = k.attnum) AS columns
+        FROM pg_constraint con
+        JOIN pg_class c     ON c.oid = con.conrelid
+        JOIN pg_namespace n ON n.oid = c.relnamespace
+        WHERE con.contype IN ('p', 'u')
+          AND n.nspname = ANY($1)
+        "#,
+    )
+    .bind(schemas)
+    .fetch_all(pool)
+    .await
+    .map_err(|e| Error::SchemaCacheLoadFailed(e.to_string()))?;
+
+    let mut by_table: HashMap<QualifiedIdentifier, Vec<(String, Vec<String>)>> = HashMap::new();
+    for row in rows {
+        let Some(columns): Option<Vec<String>> = row.get("columns") else {
+            continue;
+        };
+        by_table
+            .entry(QualifiedIdentifier::new(
+                row.get::<String, _>("table_schema"),
+                row.get::<String, _>("table_name"),
+            ))
+            .or_default()
+            .push((row.get::<String, _>("constraint_name"), columns));
+    }
+    for constraints in by_table.values_mut() {
+        constraints.sort();
+    }
+    Ok(by_table)
+}
+
 pub async fn load_primary_keys(
     pool: &PgPool,
     schemas: &[String],

@@ -382,6 +382,53 @@ fn build_dynamic_schema(
         builder = builder.register(input);
     }
 
+    // Upserts. A table with no unique constraint has no conflict to resolve,
+    // and a GraphQL enum may not be empty, so it gets none of these types
+    // rather than an unusable set of them.
+    for (type_name, object) in &generated.object_types {
+        if object.table.unique_constraints.is_empty() || object.fields.is_empty() {
+            continue;
+        }
+
+        let mut constraints = Enum::new(format!("{}_constraint", type_name)).description(format!(
+            "A uniqueness of {} that an insert may conflict with.",
+            type_name
+        ));
+        for (name, columns) in &object.table.unique_constraints {
+            constraints = constraints.item(
+                EnumItem::new(name).description(format!("unique ({})", columns.join(", "))),
+            );
+        }
+
+        let mut updatable = Enum::new(format!("{}_update_column", type_name))
+            .description(format!("A column of {} an upsert may write.", type_name));
+        for field in &object.fields {
+            updatable = updatable.item(EnumItem::new(&field.name));
+        }
+
+        let on_conflict = InputObject::new(format!("{}_on_conflict", type_name))
+            .description(format!("What to do when an insert into {} conflicts.", type_name))
+            .field(InputValue::new(
+                "constraint",
+                TypeRef::named_nn(format!("{}_constraint", type_name)),
+            ))
+            // An empty list is `DO NOTHING`, which is how Hasura spells "leave
+            // the row that is already there alone".
+            .field(InputValue::new(
+                "update_columns",
+                TypeRef::named_nn_list_nn(format!("{}_update_column", type_name)),
+            ))
+            .field(InputValue::new(
+                "where",
+                TypeRef::named(crate::input::bool_exp::bool_exp_type_name(type_name)),
+            ));
+
+        builder = builder
+            .register(constraints)
+            .register(updatable)
+            .register(on_conflict);
+    }
+
     // Ordering: one input per table, one column enum per table, and the single
     // direction enum they all share.
     let (order_inputs, order_enums) =
@@ -876,6 +923,15 @@ fn create_mutation_type(
 ) -> Object {
     let mut mutation = Object::new("mutation_root");
 
+    // Only a table with a unique constraint has a conflict to name, and only
+    // those got the types for it.
+    let has_conflict_target: HashSet<String> = generated
+        .object_types
+        .iter()
+        .filter(|(_, object)| !object.table.unique_constraints.is_empty())
+        .map(|(type_name, _)| type_name.clone())
+        .collect();
+
     for field in &generated.mutation_fields {
         let table_name = field.table_name.clone();
         let schema_name = field.schema_name.clone();
@@ -925,14 +981,20 @@ fn create_mutation_type(
         // it is meant to address exactly one row, and accepting `where` made it
         // an ordinary bulk mutation that happened to return the first result.
         match mutation_type {
-            MutationType::Insert => {
-                gql_field =
-                    gql_field.argument(InputValue::new("objects", TypeRef::named_nn_list("JSON")));
-            }
-            // A single insert takes `object`, not a one-element `objects`.
-            MutationType::InsertOne => {
-                gql_field =
-                    gql_field.argument(InputValue::new("object", TypeRef::named_nn("JSON")));
+            MutationType::Insert | MutationType::InsertOne => {
+                gql_field = if mutation_type == MutationType::Insert {
+                    gql_field.argument(InputValue::new("objects", TypeRef::named_nn_list("JSON")))
+                } else {
+                    // A single insert takes `object`, not a one-element
+                    // `objects`.
+                    gql_field.argument(InputValue::new("object", TypeRef::named_nn("JSON")))
+                };
+                if has_conflict_target.contains(&where_type) {
+                    gql_field = gql_field.argument(InputValue::new(
+                        "on_conflict",
+                        TypeRef::named(format!("{}_on_conflict", where_type)),
+                    ));
+                }
             }
             MutationType::UpdateByPk => {
                 gql_field = gql_field.argument(InputValue::new(
@@ -1585,6 +1647,12 @@ async fn resolve_mutation<'a>(
                 .as_ref()
                 .ok_or_else(|| async_graphql::Error::new("schema cache is not loaded"))?;
             let context = InsertContext {
+                on_conflict: ctx
+                    .args
+                    .try_get("on_conflict")
+                    .ok()
+                    .map(|v| accessor_to_json(&v))
+                    .filter(|v| !v.is_null()),
                 cache,
                 relationships: relationships.as_ref(),
                 type_names: type_names.as_ref(),
@@ -1905,12 +1973,18 @@ fn insert_row<'life>(
                     relationship.name
                 )));
             };
+            let nested = InsertContext {
+                on_conflict: None,
+                cache: context.cache,
+                relationships: context.relationships,
+                type_names: context.type_names,
+            };
             let written = insert_row(
                 conn,
                 &plan.foreign_schema,
                 &plan.foreign_table,
                 child,
-                context,
+                &nested,
                 written_count,
             )
             .await?;
@@ -1921,18 +1995,72 @@ fn insert_row<'life>(
             }
         }
 
+        // `ON CONFLICT` says which uniqueness is being resolved against and
+        // what to do about it. An empty `update_columns` is `DO NOTHING`,
+        // which is how a client says "leave the row that is already there".
+        let conflict_sql = match &context.on_conflict {
+            Some(serde_json::Value::Object(spec)) => {
+                let constraint = spec.get("constraint").and_then(|v| v.as_str());
+                let Some(constraint) = constraint else {
+                    return Err(async_graphql::Error::new(
+                        "on_conflict needs a constraint to resolve against",
+                    ));
+                };
+                if !table
+                    .unique_constraints
+                    .iter()
+                    .any(|(name, _)| name == constraint)
+                {
+                    return Err(async_graphql::Error::new(format!(
+                        "\"{}\" is not a unique constraint of \"{}\"",
+                        constraint, table_name
+                    )));
+                }
+                let updates: Vec<&str> = spec
+                    .get("update_columns")
+                    .and_then(|v| v.as_array())
+                    .map(|items| items.iter().filter_map(|i| i.as_str()).collect())
+                    .unwrap_or_default();
+
+                if updates.is_empty() {
+                    format!(
+                        " ON CONFLICT ON CONSTRAINT {} DO NOTHING",
+                        postrust_sql::escape_ident(constraint)
+                    )
+                } else {
+                    let assignments: Vec<String> = updates
+                        .iter()
+                        .map(|column| {
+                            format!(
+                                "{} = EXCLUDED.{}",
+                                postrust_sql::escape_ident(column),
+                                postrust_sql::escape_ident(column)
+                            )
+                        })
+                        .collect();
+                    format!(
+                        " ON CONFLICT ON CONSTRAINT {} DO UPDATE SET {}",
+                        postrust_sql::escape_ident(constraint),
+                        assignments.join(", ")
+                    )
+                }
+            }
+            _ => String::new(),
+        };
+
         let names: Vec<&str> = columns.keys().map(|k| k.as_str()).collect();
         let written = if names.is_empty() {
             // Every column defaulted. `DEFAULT VALUES` is how SQL says that;
             // an empty column list is a syntax error.
             let sql = format!(
-                "INSERT INTO {}.{} DEFAULT VALUES RETURNING row_to_json({}.{}.*)",
+                "INSERT INTO {}.{} DEFAULT VALUES{} RETURNING row_to_json({}.{}.*)",
                 postrust_sql::escape_ident(schema_name),
                 postrust_sql::escape_ident(table_name),
+                conflict_sql,
                 postrust_sql::escape_ident(schema_name),
                 postrust_sql::escape_ident(table_name)
             );
-            sqlx::query(&sql).fetch_one(&mut *conn).await?
+            sqlx::query(&sql).fetch_optional(&mut *conn).await?
         } else {
             let placeholders: Vec<String> = names
                 .iter()
@@ -1940,7 +2068,7 @@ fn insert_row<'life>(
                 .map(|(i, column)| format!("${}{}", i + 1, write_cast(&column_types, column)))
                 .collect();
             let sql = format!(
-                "INSERT INTO {}.{} ({}) VALUES ({}) RETURNING row_to_json({}.{}.*)",
+                "INSERT INTO {}.{} ({}) VALUES ({}){} RETURNING row_to_json({}.{}.*)",
                 postrust_sql::escape_ident(schema_name),
                 postrust_sql::escape_ident(table_name),
                 names
@@ -1949,6 +2077,7 @@ fn insert_row<'life>(
                     .collect::<Vec<_>>()
                     .join(", "),
                 placeholders.join(", "),
+                conflict_sql,
                 postrust_sql::escape_ident(schema_name),
                 postrust_sql::escape_ident(table_name)
             );
@@ -1959,9 +2088,14 @@ fn insert_row<'life>(
                     query = bind_json_value(query, value);
                 }
             }
-            query.fetch_one(&mut *conn).await?
+            query.fetch_optional(&mut *conn).await?
         };
 
+        // `DO NOTHING` writes nothing and returns nothing, which is the answer
+        // rather than an error: the row that was already there stays.
+        let Some(written) = written else {
+            return Ok(serde_json::Value::Null);
+        };
         let row: serde_json::Value = written.try_get(0).unwrap_or(serde_json::Value::Null);
         *written_count += 1;
 
@@ -1990,12 +2124,18 @@ fn insert_row<'life>(
                         child.insert(foreign.clone(), value.clone());
                     }
                 }
+                let nested = InsertContext {
+                    on_conflict: None,
+                    cache: context.cache,
+                    relationships: context.relationships,
+                    type_names: context.type_names,
+                };
                 insert_row(
                     conn,
                     &plan.foreign_schema,
                     &plan.foreign_table,
                     child,
-                    context,
+                    &nested,
                     written_count,
                 )
                 .await?;
@@ -2008,6 +2148,10 @@ fn insert_row<'life>(
 
 /// What a nested insert needs to follow a relationship.
 struct InsertContext<'a> {
+    /// What to do when the top-level row conflicts. Nested rows do not carry
+    /// one yet -- `on_conflict` inside `data` is its own argument, and reading
+    /// it would mean nothing without the type to declare it.
+    on_conflict: Option<serde_json::Value>,
     cache: &'a SchemaCache,
     relationships: &'a HashMap<String, Vec<RelationshipField>>,
     /// (schema, table) -> the GraphQL type name, which keys the relationship
@@ -2169,7 +2313,12 @@ async fn execute_insert(
             return Err(async_graphql::Error::new("each object to insert is an object"));
         };
         let row = insert_row(&mut conn, schema_name, table_name, map, context, &mut written).await?;
-        inserted.push(json_to_value(row));
+        // A row `DO NOTHING` left alone is not in `returning` and is not in
+        // `affected_rows` either: nothing was written, and the row that was
+        // already there is not this mutation's to report.
+        if !row.is_null() {
+            inserted.push(json_to_value(row));
+        }
     }
 
     // Commit once every object has been written, nested rows included:
@@ -3774,6 +3923,7 @@ mod tests {
             updatable: true,
             deletable: true,
             pk_cols: vec!["id".into()],
+            unique_constraints: Vec::new(),
             columns,
             computed_columns: Default::default(),
             is_partitioned: false,

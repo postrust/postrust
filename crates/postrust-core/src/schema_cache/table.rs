@@ -30,6 +30,13 @@ pub struct Table {
     pub deletable: bool,
     /// Primary key column names
     pub pk_cols: Vec<String>,
+    /// Unique constraints, as `(name, columns)`, the primary key among them.
+    ///
+    /// Named because `ON CONFLICT ON CONSTRAINT` takes a name: an upsert has
+    /// to say which uniqueness it is resolving against, and a table may have
+    /// several.
+    #[serde(default)]
+    pub unique_constraints: Vec<(String, Vec<String>)>,
     /// Columns indexed by name
     pub columns: ColumnMap,
     /// Computed columns, indexed by name.
@@ -185,6 +192,7 @@ mod tests {
             updatable: true,
             deletable: true,
             pk_cols: vec!["id".into()],
+            unique_constraints: Vec::new(),
             columns: IndexMap::new(),
             computed_columns: Default::default(),
             is_partitioned: false,

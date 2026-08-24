@@ -47,7 +47,15 @@ fn code_for(error: &ServerError) -> &'static str {
     }
 
     let message = error.message.to_ascii_lowercase();
-    if message.contains("permission") || message.contains("not allowed") {
+    // Validation is tested first: a rejected enum value says "enumeration type
+    // ... does not contain the value", which mentions no constraint but reads
+    // as one to a later test that only looks for the word.
+    if message.contains("invalid value for argument")
+        || message.contains("does not contain the value")
+        || message.contains("is not defined by operation")
+    {
+        "validation-failed"
+    } else if message.contains("permission") || message.contains("not allowed") {
         "permission-error"
     } else if message.contains("violates") || message.contains("constraint") {
         "constraint-violation"

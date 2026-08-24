@@ -424,6 +424,7 @@ mod tests {
             updatable: true,
             deletable: true,
             pk_cols: vec!["id".into()],
+            unique_constraints: Vec::new(),
             columns,
             computed_columns: Default::default(),
             is_partitioned: false,
