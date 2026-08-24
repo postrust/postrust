@@ -3061,6 +3061,49 @@ fn comparison_sql(
     param_idx: &mut usize,
     values: &mut Vec<serde_json::Value>,
 ) -> Result<String, async_graphql::Error> {
+    // `_cast` is not a comparison but a change of what is being compared: the
+    // column becomes another type and the comparisons inside it apply to that.
+    // A geometry and a geography answer different questions about the same
+    // shape -- one on a plane, one on a sphere -- and this is how a client asks
+    // for the other without the schema carrying two columns.
+    if op == "_cast" {
+        let serde_json::Value::Object(casts) = operand else {
+            return Err(async_graphql::Error::new(
+                "_cast takes an object naming the type to compare as",
+            ));
+        };
+        let mut conditions = Vec::new();
+        for (target, comparisons) in casts {
+            if !matches!(target.as_str(), "geometry" | "geography") {
+                return Err(async_graphql::Error::new(format!(
+                    "cannot compare \"{}\" as \"{}\"",
+                    column, target
+                )));
+            }
+            let serde_json::Value::Object(ops) = comparisons else {
+                continue;
+            };
+            let cast = format!("{}::{}", quoted, target);
+            for (nested_op, nested_operand) in ops {
+                conditions.push(comparison_sql(
+                    &cast,
+                    column,
+                    Some(target),
+                    nested_op,
+                    nested_operand,
+                    param_idx,
+                    values,
+                )?);
+            }
+        }
+        let mut conditions = conditions;
+        return Ok(match conditions.len() {
+            0 => "true".to_string(),
+            1 => conditions.pop().expect("just counted"),
+            _ => format!("({})", conditions.join(" AND ")),
+        });
+    }
+
     // A spatial relation is a function of two shapes rather than an operator
     // between them, so it is written before the operator table is consulted.
     if let Some(function) = crate::input::bool_exp::postgis_function(op) {

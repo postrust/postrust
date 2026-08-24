@@ -133,6 +133,13 @@ fn comparison_input(scalar: &str) -> InputObject {
             "_st_d_within",
             TypeRef::named(format!("st_d_within_{}_input", scalar)),
         ));
+        // A geometry and a geography answer different questions about the same
+        // shape -- one on a plane, one on a sphere -- so a client asks for the
+        // other by casting the column rather than by keeping two of them.
+        input = input.field(InputValue::new(
+            "_cast",
+            TypeRef::named(format!("{}_cast_exp", scalar)),
+        ));
         if scalar == "geometry" {
             input = input.field(InputValue::new(
                 "_st_3d_d_within",
@@ -240,6 +247,15 @@ pub fn build_inputs(
         inputs.push(input);
     }
 
+    // A cast from one shape names the other's comparison input, so a schema
+    // with only one of them still needs both.
+    if scalars.contains("geometry") {
+        scalars.insert("geography".to_string());
+    }
+    if scalars.contains("geography") {
+        scalars.insert("geometry".to_string());
+    }
+
     let mut comparisons: Vec<InputObject> =
         scalars.iter().map(|s| comparison_input(s)).collect();
 
@@ -261,6 +277,27 @@ pub fn build_inputs(
                     .field(InputValue::new("from", TypeRef::named_nn(shape))),
             );
         }
+    }
+    // What each shape may be compared as.
+    if scalars.contains("geometry") {
+        comparisons.push(
+            InputObject::new("geometry_cast_exp")
+                .description("Compare a geometry column as another type.")
+                .field(InputValue::new(
+                    "geography",
+                    TypeRef::named(comparison_type_name("geography")),
+                )),
+        );
+    }
+    if scalars.contains("geography") {
+        comparisons.push(
+            InputObject::new("geography_cast_exp")
+                .description("Compare a geography column as another type.")
+                .field(InputValue::new(
+                    "geometry",
+                    TypeRef::named(comparison_type_name("geometry")),
+                )),
+        );
     }
     if scalars.contains("raster") {
         comparisons.push(
