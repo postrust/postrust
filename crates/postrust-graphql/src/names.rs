@@ -56,6 +56,21 @@ pub struct TableNames {
     /// Computed field names, keyed by the function behind them.
     #[serde(default)]
     pub computed_fields: HashMap<String, String>,
+
+    /// Whether this table is a set of allowed values rather than a set of
+    /// rows.
+    ///
+    /// The one thing here that is not a name, and it is here for the same
+    /// reason the names are: nothing in the schema says it. A table with a
+    /// text primary key and a comment column is an ordinary table -- being an
+    /// enumeration is a decision someone made about it, which Hasura records
+    /// as `set_table_is_enum` and which reflection cannot recover.
+    ///
+    /// Marked so, its rows become the members of a GraphQL enum and every
+    /// column with a foreign key to it is typed as that enum instead of as
+    /// text.
+    #[serde(default, rename = "enum")]
+    pub is_enum: bool,
 }
 
 /// Every name given, keyed by `schema.table`.
@@ -117,6 +132,23 @@ impl NameOverrides {
 
     fn table(&self, schema: &str, table: &str) -> Option<&TableNames> {
         self.tables.get(&format!("{}.{}", schema, table))
+    }
+
+    /// Whether a table was marked as a set of allowed values.
+    pub fn is_enum(&self, schema: &str, table: &str) -> bool {
+        self.table(schema, table).map(|t| t.is_enum).unwrap_or(false)
+    }
+
+    /// Every table marked as one, as `(schema, table)`.
+    pub fn enum_tables(&self) -> Vec<(String, String)> {
+        self.tables
+            .iter()
+            .filter(|(_, names)| names.is_enum)
+            .filter_map(|(key, _)| {
+                key.split_once('.')
+                    .map(|(schema, table)| (schema.to_string(), table.to_string()))
+            })
+            .collect()
     }
 
     /// The base name given to a table, if one was.
@@ -233,6 +265,20 @@ mod tests {
         assert_eq!(
             other.computed_source("public", "author", "upper_name"),
             Some("author_upper_name")
+        );
+    }
+
+    #[test]
+    fn a_table_can_be_marked_as_a_set_of_values() {
+        let names = NameOverrides::parse(
+            r#"{"public.colors": {"enum": true}, "public.author": {"name": "Author"}}"#,
+        )
+        .unwrap();
+        assert!(names.is_enum("public", "colors"));
+        assert!(!names.is_enum("public", "author"));
+        assert_eq!(
+            names.enum_tables(),
+            vec![("public".to_string(), "colors".to_string())]
         );
     }
 

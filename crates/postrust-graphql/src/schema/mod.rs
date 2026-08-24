@@ -22,6 +22,15 @@ pub struct SchemaConfig {
     pub enable_mutations: bool,
     /// Whether to generate subscription types
     pub enable_subscriptions: bool,
+    /// The members of each enum table, keyed by `schema.table`, as
+    /// `(value, comment)`.
+    ///
+    /// These are rows rather than schema, so they cannot come from the schema
+    /// cache: they are read once at startup, for the tables the configuration
+    /// marks. A table marked as an enum whose values are absent is exposed as
+    /// an ordinary table -- an empty GraphQL enum is not a legal type, and
+    /// refusing to start over a table with no rows in it would be worse.
+    pub enum_values: HashMap<String, Vec<(String, Option<String>)>>,
     /// Names given rather than derived.
     ///
     /// Empty by default, which is every name derived from the schema exactly
@@ -38,6 +47,7 @@ impl Default for SchemaConfig {
     fn default() -> Self {
         Self {
             exposed_schemas: vec!["public".to_string()],
+            enum_values: HashMap::new(),
             names: crate::names::NameOverrides::default(),
             enable_mutations: true,
             enable_subscriptions: false,
@@ -170,6 +180,9 @@ pub struct GeneratedSchema {
     pub mutation_fields: Vec<MutationField>,
     /// Relationship fields for each type
     pub relationship_fields: HashMap<String, Vec<RelationshipField>>,
+    /// GraphQL enums generated from enum tables: type name to
+    /// `(member, description)`.
+    pub enum_types: HashMap<String, Vec<(String, Option<String>)>>,
 }
 
 impl GeneratedSchema {
@@ -575,12 +588,97 @@ pub fn build_schema(schema_cache: &SchemaCache, config: &SchemaConfig) -> Genera
         object_types.insert(type_name, obj_type);
     }
 
+    // A table marked as a set of allowed values becomes a GraphQL enum, and
+    // every column with a foreign key to it is typed as that enum rather than
+    // as text. The values are rows, so they were read at startup rather than
+    // reflected.
+    let mut enum_types: HashMap<String, Vec<(String, Option<String>)>> = HashMap::new();
+    let mut enum_type_of: HashMap<(String, String), String> = HashMap::new();
+
+    for (schema_name, table_name) in config.names.enum_tables() {
+        let Some(base) = base_names.get(&(schema_name.clone(), table_name.clone())) else {
+            continue;
+        };
+        let key = format!("{}.{}", schema_name, table_name);
+        let members: Vec<(String, Option<String>)> = config
+            .enum_values
+            .get(&key)
+            .map(|values| {
+                values
+                    .iter()
+                    .filter(|(value, _)| is_graphql_name(value))
+                    .cloned()
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        if members.is_empty() {
+            // No rows, or none whose value is a legal GraphQL name. An empty
+            // enum is not a legal type, so the table stays an ordinary one.
+            tracing::warn!(
+                "{}.{} is marked as an enumeration but has no values that can name an \
+                 enum member; exposing it as an ordinary table",
+                schema_name,
+                table_name
+            );
+            continue;
+        }
+
+        let type_name = format!("{}_enum", base);
+        enum_type_of.insert((schema_name.clone(), table_name.clone()), type_name.clone());
+        enum_types.insert(type_name, members);
+    }
+
+    // Retype the columns that point at one.
+    if !enum_type_of.is_empty() {
+        for (type_name, relationships) in &relationship_fields {
+            for relationship in relationships {
+                if relationship.is_list {
+                    continue;
+                }
+                let foreign = relationship.relationship.foreign_table();
+                let Some(enum_type) =
+                    enum_type_of.get(&(foreign.schema.clone(), foreign.name.clone()))
+                else {
+                    continue;
+                };
+                let Some(column) = relationship.relationship.single_local_column() else {
+                    continue;
+                };
+                if let Some(object) = object_types.get_mut(type_name) {
+                    for field in &mut object.fields {
+                        if field.name == column {
+                            field.graphql_type =
+                                crate::types::GraphQLType::Custom(enum_type.clone());
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     GeneratedSchema {
         object_types,
         query_fields,
         mutation_fields,
         relationship_fields,
+        enum_types,
     }
+}
+
+/// Whether a value can name a GraphQL enum member.
+///
+/// `[_A-Za-z][_0-9A-Za-z]*`, which is what the specification allows. A value
+/// that cannot is left out rather than mangled into one: a client asking for
+/// `light blue` should be told there is no such member, not handed
+/// `light_blue` and left to wonder which row it means.
+fn is_graphql_name(value: &str) -> bool {
+    let mut chars = value.chars();
+    match chars.next() {
+        Some(first) if first == '_' || first.is_ascii_alphabetic() => {}
+        _ => return false,
+    }
+    chars.all(|c| c == '_' || c.is_ascii_alphanumeric())
 }
 
 #[cfg(test)]

@@ -340,6 +340,12 @@ fn build_dynamic_schema(
         if matches!(name.as_str(), "Int" | "Float" | "String" | "Boolean" | "ID") {
             continue;
         }
+        // An enum table's type is an enum, not a scalar. It reaches this list
+        // because a column typed as one names it, and registering both would
+        // define the same type twice.
+        if generated.enum_types.contains_key(&name) {
+            continue;
+        }
         builder = builder.register(
             Scalar::new(&name).description(format!("The PostgreSQL `{}` type.", name)),
         );
@@ -427,6 +433,20 @@ fn build_dynamic_schema(
             .register(constraints)
             .register(updatable)
             .register(on_conflict);
+    }
+
+    // The enums generated from enum tables.
+    for (type_name, members) in &generated.enum_types {
+        let mut generated_enum = Enum::new(type_name)
+            .description(format!("The values {} allows.", type_name));
+        for (value, comment) in members {
+            let item = EnumItem::new(value);
+            generated_enum = generated_enum.item(match comment {
+                Some(description) => item.description(description),
+                None => item,
+            });
+        }
+        builder = builder.register(generated_enum);
     }
 
     // Ordering: one input per table, one column enum per table, and the single

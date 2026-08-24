@@ -154,12 +154,16 @@ def tables_from_commands(paths):
                 entry.setdefault("computed_fields", []).append(
                     {"name": args.get("name"), "definition": args.get("definition")}
                 )
+            elif kind == "set_table_is_enum":
+                entry["is_enum"] = bool(args.get("is_enum", True))
             elif kind in ("track_table", "set_table_customization", "add_existing_table_or_view"):
                 configuration = args.get("configuration")
                 if isinstance(configuration, dict):
                     # A later customization replaces an earlier one, which is
                     # what applying them in order means.
                     entry["configuration"] = configuration
+                if "is_enum" in args:
+                    entry["is_enum"] = bool(args["is_enum"])
 
     return list(entries.values())
 
@@ -270,6 +274,12 @@ def convert(tables):
         # Root field names. Hasura's customization names each root separately;
         # this server derives all of them from one base name, so a set that
         # shares a stem is converted and anything else is reported.
+        # Not a name, and here for the same reason the names are: nothing in
+        # the schema says a table is a set of allowed values rather than a set
+        # of rows.
+        if entry.get("is_enum"):
+            given["enum"] = True
+
         configuration = entry.get("configuration") or {}
         custom_name = configuration.get("custom_name")
         if custom_name and custom_name != table:

@@ -142,6 +142,68 @@ async fn main() -> Result<()> {
             Err(_) => postrust_graphql::names::NameOverrides::default(),
         };
 
+        // An enum table's members are rows, not schema, so they are read here
+        // rather than reflected. Once, at startup: the values of a set of
+        // allowed values are not expected to change under a running server,
+        // and a GraphQL enum is part of the schema a client generated against.
+        let mut graphql_enum_values: std::collections::HashMap<
+            String,
+            Vec<(String, Option<String>)>,
+        > = std::collections::HashMap::new();
+        {
+            let cache = state.schema_cache.read().await;
+            for (schema, table) in graphql_names.enum_tables() {
+                let qi = postrust_core::api_request::QualifiedIdentifier::new(&schema, &table);
+                let Some(definition) = cache.get_table(&qi) else {
+                    tracing::warn!("{}.{} is marked as an enumeration but was not found", schema, table);
+                    continue;
+                };
+                // One column identifies a member. A composite key names no
+                // single value, so there is nothing to call the member.
+                let [key_column] = definition.pk_cols.as_slice() else {
+                    tracing::warn!(
+                        "{}.{} is marked as an enumeration but its primary key is not one column",
+                        schema,
+                        table
+                    );
+                    continue;
+                };
+                // Hasura's convention, and a useful one: a `comment` column
+                // describes each value.
+                let comment = if definition.get_column("comment").is_some() {
+                    format!("{}::text", postrust_sql::escape_ident("comment"))
+                } else {
+                    "NULL::text".to_string()
+                };
+                let sql = format!(
+                    "SELECT {}::text, {} FROM {}.{} ORDER BY 1",
+                    postrust_sql::escape_ident(key_column),
+                    comment,
+                    postrust_sql::escape_ident(&schema),
+                    postrust_sql::escape_ident(&table)
+                );
+                match sqlx::query_as::<_, (Option<String>, Option<String>)>(&sql)
+                    .fetch_all(&state.pool)
+                    .await
+                {
+                    Ok(rows) => {
+                        graphql_enum_values.insert(
+                            format!("{}.{}", schema, table),
+                            rows.into_iter()
+                                .filter_map(|(value, comment)| value.map(|v| (v, comment)))
+                                .collect(),
+                        );
+                    }
+                    Err(e) => tracing::warn!(
+                        "cannot read the values of {}.{}: {}",
+                        schema,
+                        table,
+                        e
+                    ),
+                }
+            }
+        }
+
         let graphql_config = SchemaConfig {
             enable_subscriptions: true,
             max_rows: config.db_max_rows,
@@ -150,6 +212,7 @@ async fn main() -> Result<()> {
             // `PGRST_DB_SCHEMAS` was reachable over REST and invisible over
             // GraphQL.
             exposed_schemas: config.db_schemas.clone(),
+            enum_values: graphql_enum_values,
             names: graphql_names,
             ..SchemaConfig::default()
         };
