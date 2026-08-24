@@ -396,6 +396,108 @@ fn build_dynamic_schema(
         builder = builder.register(input);
     }
 
+    // What a mutation writes. `objects` and `_set` were `JSON`, which accepts
+    // anything and lets a client generate nothing: no completion, no codegen,
+    // and a misspelled column reaching the database instead of being caught
+    // before the request was sent. The same argument that made `where` a real
+    // type applies unchanged.
+    for (type_name, object) in &generated.object_types {
+        let table = &object.table;
+        // Only real columns are written. A computed field is a function of the
+        // row and a relationship is handled separately below.
+        let writable: Vec<&crate::schema::object::GraphQLField> = object
+            .fields
+            .iter()
+            .filter(|field| table.get_column(&field.name).is_some())
+            .collect();
+        if writable.is_empty() {
+            continue;
+        }
+
+        let relationships = generated
+            .relationship_fields
+            .get(type_name)
+            .map(|r| r.as_slice())
+            .unwrap_or(&[]);
+        let conflict_type = match table.unique_constraints.is_empty() {
+            true => None,
+            false => Some(format!("{}_on_conflict", type_name)),
+        };
+
+        if crate::input::mutation::is_insertable(table) {
+            let mut insert = InputObject::new(format!("{}_insert_input", type_name))
+                .description(format!("The columns of a new {} row.", type_name));
+            let mut taken: HashSet<&str> = HashSet::new();
+            for field in &writable {
+                // Every column optional: which ones the database insists on is
+                // the database's answer, and a column that is NOT NULL with a
+                // default does not have to be given.
+                taken.insert(field.name.as_str());
+                insert = insert.field(InputValue::new(
+                    &field.name,
+                    TypeRef::named(leaf_scalar_name(&field.graphql_type)),
+                ));
+            }
+            // A nested write: the rows to insert beside this one.
+            for relationship in relationships {
+                if !taken.insert(relationship.name.as_str()) {
+                    continue;
+                }
+                let suffix = match relationship.is_list {
+                    true => "arr_rel_insert_input",
+                    false => "obj_rel_insert_input",
+                };
+                insert = insert.field(InputValue::new(
+                    &relationship.name,
+                    TypeRef::named(format!("{}_{}", relationship.target_type, suffix)),
+                ));
+            }
+            builder = builder.register(insert);
+
+            // How this table is written as somebody else's nested row. Both
+            // shapes carry an `on_conflict`, which is what makes a nested
+            // upsert expressible.
+            let data_type = format!("{}_insert_input", type_name);
+            let mut object_rel = InputObject::new(format!("{}_obj_rel_insert_input", type_name))
+                .description(format!("One {} row written beside its parent.", type_name))
+                .field(InputValue::new("data", TypeRef::named_nn(&data_type)));
+            let mut array_rel = InputObject::new(format!("{}_arr_rel_insert_input", type_name))
+                .description(format!("{} rows written beside their parent.", type_name))
+                .field(InputValue::new(
+                    "data",
+                    TypeRef::named_nn_list_nn(&data_type),
+                ));
+            if let Some(conflict) = &conflict_type {
+                object_rel =
+                    object_rel.field(InputValue::new("on_conflict", TypeRef::named(conflict)));
+                array_rel =
+                    array_rel.field(InputValue::new("on_conflict", TypeRef::named(conflict)));
+            }
+            builder = builder.register(object_rel).register(array_rel);
+        }
+
+        if crate::input::mutation::is_updatable(table) {
+            let mut set = InputObject::new(format!("{}_set_input", type_name))
+                .description(format!("Columns of {} to replace.", type_name));
+            let mut numeric = InputObject::new(format!("{}_inc_input", type_name))
+                .description(format!("Columns of {} to add to.", type_name));
+            let mut any_numeric = false;
+            for field in &writable {
+                let scalar = leaf_scalar_name(&field.graphql_type);
+                set = set.field(InputValue::new(&field.name, TypeRef::named(&scalar)));
+                if crate::schema::aggregate::is_numeric(&field.graphql_type) {
+                    any_numeric = true;
+                    numeric = numeric.field(InputValue::new(&field.name, TypeRef::named(&scalar)));
+                }
+            }
+            builder = builder.register(set);
+            // A table with nothing to add to gets no type for adding to it.
+            if any_numeric {
+                builder = builder.register(numeric);
+            }
+        }
+    }
+
     // Upserts. A table with no unique constraint has no conflict to resolve,
     // and a GraphQL enum may not be empty, so it gets none of these types
     // rather than an unusable set of them.
@@ -930,10 +1032,21 @@ fn create_query_type(
 /// the resolver says so instead of the schema. Making `_set` non-null would
 /// have been expressible and wrong: an update that only increments a counter
 /// never sends one.
-fn with_update_operators(field: Field) -> Field {
+fn with_update_operators(field: Field, base_name: &str, has_numeric: bool) -> Field {
+    let mut field = field.argument(InputValue::new(
+        "_set",
+        TypeRef::named(format!("{}_set_input", base_name)),
+    ));
+    if has_numeric {
+        field = field.argument(InputValue::new(
+            "_inc",
+            TypeRef::named(format!("{}_inc_input", base_name)),
+        ));
+    }
     field
-        .argument(InputValue::new("_set", TypeRef::named("JSON")))
-        .argument(InputValue::new("_inc", TypeRef::named("JSON")))
+        // The jsonb operators keep an untyped argument: each takes a value of
+        // a different shape per column -- a key, an index, a path -- and the
+        // type that would say so is one per operator per table.
         .argument(InputValue::new("_append", TypeRef::named("JSON")))
         .argument(InputValue::new("_prepend", TypeRef::named("JSON")))
         .argument(InputValue::new("_delete_key", TypeRef::named("JSON")))
@@ -953,6 +1066,20 @@ fn create_mutation_type(
 
     // Only a table with a unique constraint has a conflict to name, and only
     // those got the types for it.
+    // Which tables have something to add to, since `_inc` is only offered
+    // where there is.
+    let has_numeric_column: HashSet<String> = generated
+        .object_types
+        .iter()
+        .filter(|(_, object)| {
+            object.fields.iter().any(|field| {
+                object.table.get_column(&field.name).is_some()
+                    && crate::schema::aggregate::is_numeric(&field.graphql_type)
+            })
+        })
+        .map(|(type_name, _)| type_name.clone())
+        .collect();
+
     let has_conflict_target: HashSet<String> = generated
         .object_types
         .iter()
@@ -1010,12 +1137,17 @@ fn create_mutation_type(
         // an ordinary bulk mutation that happened to return the first result.
         match mutation_type {
             MutationType::Insert | MutationType::InsertOne => {
+                let insert_input = format!("{}_insert_input", where_type);
                 gql_field = if mutation_type == MutationType::Insert {
-                    gql_field.argument(InputValue::new("objects", TypeRef::named_nn_list("JSON")))
+                    gql_field.argument(InputValue::new(
+                        "objects",
+                        TypeRef::named_nn_list_nn(&insert_input),
+                    ))
                 } else {
                     // A single insert takes `object`, not a one-element
                     // `objects`.
-                    gql_field.argument(InputValue::new("object", TypeRef::named_nn("JSON")))
+                    gql_field
+                        .argument(InputValue::new("object", TypeRef::named_nn(&insert_input)))
                 };
                 if has_conflict_target.contains(&where_type) {
                     gql_field = gql_field.argument(InputValue::new(
@@ -1029,7 +1161,11 @@ fn create_mutation_type(
                     "pk_columns",
                     TypeRef::named_nn(format!("{}_pk_columns_input", where_type)),
                 ));
-                gql_field = with_update_operators(gql_field);
+                gql_field = with_update_operators(
+                    gql_field,
+                    &where_type,
+                    has_numeric_column.contains(&where_type),
+                );
             }
             MutationType::Update => {
                 gql_field = gql_field
@@ -1039,7 +1175,11 @@ fn create_mutation_type(
                             &where_type,
                         )),
                     ));
-                gql_field = with_update_operators(gql_field);
+                gql_field = with_update_operators(
+                    gql_field,
+                    &where_type,
+                    has_numeric_column.contains(&where_type),
+                );
             }
             MutationType::DeleteByPk => {
                 for (col_name, pg_type) in &pk_columns {
@@ -1974,8 +2114,9 @@ fn insert_row<'life>(
             .unwrap_or(&[]);
 
         let mut columns = serde_json::Map::new();
-        let mut to_one: Vec<(&RelationshipField, serde_json::Value)> = Vec::new();
-        let mut to_many: Vec<(&RelationshipField, serde_json::Value)> = Vec::new();
+        type Nested<'r> = (&'r RelationshipField, serde_json::Value, Option<serde_json::Value>);
+        let mut to_one: Vec<Nested> = Vec::new();
+        let mut to_many: Vec<Nested> = Vec::new();
 
         for (key, value) in object {
             match relationships.iter().find(|r| r.name == key) {
@@ -1983,17 +2124,20 @@ fn insert_row<'life>(
                     columns.insert(key, value);
                 }
                 Some(relationship) => {
-                    // `{data: {...}}` for one row, `{data: [{...}]}` for many.
-                    let data = match &value {
-                        serde_json::Value::Object(map) => {
-                            map.get("data").cloned().unwrap_or(value.clone())
-                        }
-                        other => other.clone(),
+                    // `{data: {...}}` for one row, `{data: [{...}]}` for many,
+                    // and an `on_conflict` beside either -- a nested row is
+                    // upserted the same way a top-level one is.
+                    let (data, conflict) = match &value {
+                        serde_json::Value::Object(map) => (
+                            map.get("data").cloned().unwrap_or(value.clone()),
+                            map.get("on_conflict").cloned().filter(|v| !v.is_null()),
+                        ),
+                        other => (other.clone(), None),
                     };
                     if relationship.is_list {
-                        to_many.push((relationship, data));
+                        to_many.push((relationship, data, conflict));
                     } else {
-                        to_one.push((relationship, data));
+                        to_one.push((relationship, data, conflict));
                     }
                 }
             }
@@ -2001,7 +2145,7 @@ fn insert_row<'life>(
 
         // The rows this one points at, first: this row's own column carries
         // their key.
-        for (relationship, data) in to_one {
+        for (relationship, data, conflict) in to_one {
             let plan =
                 postrust_core::embed::EmbedPlan::resolve(&relationship.relationship, context.cache)
                     .map_err(|e| async_graphql::Error::new(e.to_string()))?;
@@ -2012,7 +2156,7 @@ fn insert_row<'life>(
                 )));
             };
             let nested = InsertContext {
-                on_conflict: None,
+                on_conflict: conflict,
                 cache: context.cache,
                 relationships: context.relationships,
                 type_names: context.type_names,
@@ -2138,7 +2282,7 @@ fn insert_row<'life>(
         *written_count += 1;
 
         // Then the rows that point at this one, which need its key.
-        for (relationship, data) in to_many {
+        for (relationship, data, conflict) in to_many {
             let plan =
                 postrust_core::embed::EmbedPlan::resolve(&relationship.relationship, context.cache)
                     .map_err(|e| async_graphql::Error::new(e.to_string()))?;
@@ -2163,7 +2307,7 @@ fn insert_row<'life>(
                     }
                 }
                 let nested = InsertContext {
-                    on_conflict: None,
+                    on_conflict: conflict.clone(),
                     cache: context.cache,
                     relationships: context.relationships,
                     type_names: context.type_names,
@@ -2186,9 +2330,8 @@ fn insert_row<'life>(
 
 /// What a nested insert needs to follow a relationship.
 struct InsertContext<'a> {
-    /// What to do when the top-level row conflicts. Nested rows do not carry
-    /// one yet -- `on_conflict` inside `data` is its own argument, and reading
-    /// it would mean nothing without the type to declare it.
+    /// What to do when this row conflicts. A nested row carries its own, from
+    /// the `on_conflict` beside its `data`.
     on_conflict: Option<serde_json::Value>,
     cache: &'a SchemaCache,
     relationships: &'a HashMap<String, Vec<RelationshipField>>,
