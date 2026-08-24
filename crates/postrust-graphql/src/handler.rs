@@ -1528,7 +1528,7 @@ async fn resolve_mutation<'a>(
         table_name, mutation_type
     );
 
-    let result = match mutation_type {
+    let (result, affected) = match mutation_type {
         MutationType::Insert | MutationType::InsertOne => {
             let objects = ctx
                 .args
@@ -1608,7 +1608,11 @@ async fn resolve_mutation<'a>(
                 column_types_of(&gql_ctx.schema_cache, schema_name, table_name).await,
                 where_clause,
             )
-            .await?
+            .await
+            .map(|rows| {
+                let count = rows.len();
+                (rows, count)
+            })?
         }
         MutationType::Delete | MutationType::DeleteByPk => {
             let where_clause = if mutation_type == MutationType::DeleteByPk {
@@ -1624,7 +1628,11 @@ async fn resolve_mutation<'a>(
                 gql_ctx.role(),
                 where_clause,
             )
-            .await?
+            .await
+            .map(|rows| {
+                let count = rows.len();
+                (rows, count)
+            })?
         }
     };
 
@@ -1668,7 +1676,7 @@ async fn resolve_mutation<'a>(
         _ => result,
     };
 
-    Ok(mutation_result(result, by_key))
+    Ok(mutation_result(result, affected, by_key))
 }
 
 /// Begin a transaction with the request's role applied.
@@ -1803,6 +1811,7 @@ fn insert_row<'life>(
     table_name: &'life str,
     object: serde_json::Map<String, serde_json::Value>,
     context: &'life InsertContext<'life>,
+    written_count: &'life mut usize,
 ) -> std::pin::Pin<
     Box<dyn std::future::Future<Output = Result<serde_json::Value, async_graphql::Error>> + Send + 'life>,
 > {
@@ -1871,6 +1880,7 @@ fn insert_row<'life>(
                 &plan.foreign_table,
                 child,
                 context,
+                written_count,
             )
             .await?;
             for (local, foreign) in &plan.columns {
@@ -1922,6 +1932,7 @@ fn insert_row<'life>(
         };
 
         let row: serde_json::Value = written.try_get(0).unwrap_or(serde_json::Value::Null);
+        *written_count += 1;
 
         // Then the rows that point at this one, which need its key.
         for (relationship, data) in to_many {
@@ -1954,6 +1965,7 @@ fn insert_row<'life>(
                     &plan.foreign_table,
                     child,
                     context,
+                    written_count,
                 )
                 .await?;
             }
@@ -2098,7 +2110,7 @@ async fn execute_insert(
     role: &str,
     objects: serde_json::Value,
     context: &InsertContext<'_>,
-) -> Result<Vec<Value>, async_graphql::Error> {
+) -> Result<(Vec<Value>, usize), async_graphql::Error> {
     trace!("Insert mutation for {}: {:?}", table_name, objects);
 
     // Handle both array and single object
@@ -2119,12 +2131,13 @@ async fn execute_insert(
     let mut conn = begin_with_role(pool, role).await?;
 
     let mut inserted: Vec<Value> = Vec::new();
+    let mut written = 0usize;
 
     for object in objects_array {
         let serde_json::Value::Object(map) = object else {
             return Err(async_graphql::Error::new("each object to insert is an object"));
         };
-        let row = insert_row(&mut conn, schema_name, table_name, map, context).await?;
+        let row = insert_row(&mut conn, schema_name, table_name, map, context, &mut written).await?;
         inserted.push(json_to_value(row));
     }
 
@@ -2134,7 +2147,7 @@ async fn execute_insert(
     // behind when a child fails.
     conn.commit().await?;
 
-    Ok(inserted)
+    Ok((inserted, written))
 }
 
 /// Shape a mutation's result for the field that asked for it.
@@ -2144,14 +2157,18 @@ async fn execute_insert(
 /// which carries `affected_rows` alongside the rows themselves -- a client may
 /// ask for no rows back and still need the count, which is the usual case for
 /// a delete.
-fn mutation_result<'a>(rows: Vec<Value>, by_key: bool) -> Option<FieldValue<'a>> {
+///
+/// The count is passed in rather than taken from the rows, because a nested
+/// insert writes more rows than it returns: two articles each carrying a new
+/// author is four rows written and two returned, and four is the answer.
+fn mutation_result<'a>(rows: Vec<Value>, affected: usize, by_key: bool) -> Option<FieldValue<'a>> {
     if by_key {
         return rows.into_iter().next().map(FieldValue::value);
     }
     let mut response = async_graphql::indexmap::IndexMap::new();
     response.insert(
         async_graphql::Name::new("affected_rows"),
-        Value::from(rows.len()),
+        Value::from(affected),
     );
     response.insert(async_graphql::Name::new("returning"), Value::List(rows));
     Some(FieldValue::value(Value::Object(response)))
