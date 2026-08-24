@@ -8,14 +8,22 @@ harness itself, divergences kept on purpose, and the gaps still open.
 
 | | status | same outcome | same data | full body |
 |---|---|---|---|---|
-| all (464) | 97.8% | 56.2% | **49.1%** | 19.0% |
-| reads (269) | 99.3% | 58.7% | 48.7% | 23.8% |
-| writes (195) | 95.9% | 52.8% | 49.7% | 12.3% |
+| all (464) | 97.8% | 55.8% | **48.9%** | 20.3% |
+| reads (269) | 99.3% | 57.2% | 47.6% | 25.3% |
+| writes (195) | 95.9% | 53.8% | 50.8% | 13.3% |
+
+**The candidate is configured.** Each group's fixtures are converted into a
+`PGRST_GRAPHQL_NAMES` document by `scripts/hasura-names.py` and given to the
+server, because the names Hasura writes into metadata are not recoverable from
+a schema and a migration converts them. 20 of the 61 groups name something.
+The bare, unconfigured figure was 48.9% too -- see below, because the reason
+those two agree is not that the names did nothing.
 
 The same-data figure over successive fixes: 34.1 → 41.8 (duplicate-field
 panic) → 43.8 (enum arguments read) → 44.2 (relationship predicates, aggregate
 result decoding) → 44.6 (scalar naming) → 48.3 (update operators, written-value
-casts, root type names) → 49.1 (embed arguments, computed columns).
+casts, root type names) → 49.1 (embed arguments, computed columns) → 48.9
+(names given, and see immediately below).
 
 The third column is the one that matters to a client: the same query came back
 with the same rows.
@@ -23,9 +31,19 @@ with the same rows.
 **142 of the 464 cases cannot pass and are counted anyway.** They are the
 permission cases — Hasura answers `access-denied` from a rule that lives in
 metadata, and there is no metadata here. Excluding them the figure is
-165/322 = 51.2%. The gap between the two is small, which is the useful thing
-to know: the headline is not being held down by the divergence chosen on
-purpose. It is held down by the gaps listed further below.
+**178/322 = 55.3%**, up from 165/322 = 51.2% before the names were given.
+
+That gap is worth understanding, because the headline did not move while the
+figure behind it moved four points. 49 of those 142 permission cases "agree"
+only in the sense that both servers answer with errors — Hasura because
+permission is denied, this server because the query names a field it does not
+have. Giving it the names makes those queries valid here, so it answers with
+data where Hasura still denies, and the case flips from agreeing to differing.
+Real fidelity went up; a category that was passing for the wrong reason stopped.
+
+Which is the argument for reading the second number rather than the first. The
+headline counts 142 cases whose only route to agreement is failing in the same
+breath as the reference, and improving the server can only make that worse.
 
 Reported as measured, at four levels, because a single systemic gap otherwise
 sinks everything behind it. Two of those gaps were found exactly that way.
@@ -111,15 +129,24 @@ wrong one.
    relationship names. Reflection cannot recover a name nobody wrote down, and
    roughly 25 cases across four groups turn on it.
 
-   `PGRST_GRAPHQL_NAMES` now takes them — table base names, relationship names,
-   computed field names — so a migrated schema can say what its client already
-   sends. **The harness does not use it**, and the figures above are therefore
-   the unconfigured ones. Generating a names document from each group's own
-   metadata would close most of those cases and would also be a fair
-   measurement, since it is what a migration actually does; it needs the
-   column-to-constraint mapping Hasura's relationship commands imply, which is
-   a database query per group rather than a read of the fixture. Worth doing,
-   and worth labelling clearly when it is.
+   `PGRST_GRAPHQL_NAMES` takes them — table base names, relationship names,
+   computed field names — and `scripts/hasura-names.py` converts them out of a
+   running engine, a metadata directory, an exported document, or a list of
+   commands. The harness now does this per group, so the figures above are the
+   configured ones.
+
+   What it closed: the computed-field names (`graphql_query/computed_fields`
+   went 6/11 to 8/11) and, with the function comment now carried,
+   `graphql_introspection/descriptions` began to answer.
+
+   What it cannot close, by design: Hasura names each root separately —
+   `select: Authors`, `select_by_pk: Author`, `select_aggregate: AuthorAgg` —
+   where this server derives all of them from one base name. A set that agrees
+   on a base converts; the `custom_schema` groups do not agree on one and are
+   left alone rather than guessed at. Column renaming (`custom_column_names`)
+   is not done at all. Together those are the remaining ~10 cases of this item,
+   and closing them means per-root names and column aliasing, which is a larger
+   change than a lookup table.
 
 2. **`sum_float` and one `json` type are not resolved** in
    `graphql_query/computed_fields`, and neither reproduces against a
