@@ -8,8 +8,8 @@ harness itself, divergences kept on purpose, and the gaps still open.
 
 | | status | same outcome | same data | full body |
 |---|---|---|---|---|
-| all (464) | 97.8% | 58.8% | **51.5%** | 25.4% |
-| **excluding the 142 permission cases (322)** | | | **62.4%** | |
+| all (464) | 97.8% | 60.6% | **52.6%** | 26.5% |
+| **excluding the 142 permission cases (322)** | | | **64.0%** | |
 
 **The candidate is configured.** Each group's fixtures are converted into a
 `PGRST_GRAPHQL_NAMES` document by `scripts/hasura-names.py` and given to the
@@ -26,8 +26,9 @@ casts, root type names) → 49.1 (embed arguments, computed columns) → 48.9
 `returning`) → 49.4 (nested aggregates: the field exists now, and the cases
 that ask for it need permissions or a further feature besides) → 49.4
 (upserts) → 50.6 (enum tables) → 51.5 (ordering by a related row or an
-aggregate). The figure excluding the permission cases, which is the one worth
-reading, went 51.2 → 55.3 → 55.9 → 58.4 → 60.6 → 62.4 over the same span.
+aggregate) → 52.6 (PostGIS comparisons). The figure excluding the permission
+cases, which is the one worth reading, went 51.2 → 55.3 → 55.9 → 58.4 → 60.6 →
+62.4 → 64.0 over the same span.
 
 The third column is the one that matters to a client: the same query came back
 with the same rows.
@@ -35,7 +36,7 @@ with the same rows.
 **142 of the 464 cases cannot pass and are counted anyway.** They are the
 permission cases — Hasura answers `access-denied` from a rule that lives in
 metadata, and there is no metadata here. Excluding them the figure is
-**201/322 = 62.4%**, up from 165/322 = 51.2% before the names were given.
+**206/322 = 64.0%**, up from 165/322 = 51.2% before the names were given.
 
 That gap is worth understanding, because the headline did not move while the
 figure behind it moved four points. 49 of those 142 permission cases "agree"
@@ -77,6 +78,15 @@ server. Every fault in the instrument either invents work or hides it.
   both shapes give 468.
 
 ## Real faults, found the same way
+
+- **A raster column with no geometry column beside it broke the schema.** The
+  raster comparisons take a shape, so they name `geometry` whether or not any
+  column is one, and a type the schema mentions and never registers makes the
+  whole schema unbuildable. The whole raster group went from one passing to
+  none on the commit that added the operators those cases needed: the feature
+  was right and the schema it produced was not buildable. Caught because the
+  server says what failed and serves without GraphQL rather than exiting, so
+  the symptom was five 404s rather than a dead process.
 
 Both of these were invisible to the unit tests and immediately obvious to the
 harness, and both had the same signature: no response at all rather than a
@@ -171,11 +181,11 @@ wrong one.
    nested-insert cases that is about upserting rather than about another
    feature.
 
-5. **PostGIS comparisons.** `_st_d_within`, `_st_intersects_geom_nband`,
-   `_st_intersects_rast` and the rest are not offered on `geometry`,
-   `geography` or `raster` columns, so eight cases across `boolexp/postgis`
-   and `boolexp/raster` are refused at validation. The comparison inputs are
-   generated per scalar already; these are more entries for three of them.
+5. **`_cast`.** `where: {geom_col: {_cast: {geography: {_st_d_within: ...}}}}`
+   compares a geometry column as a geography, and is six of the eight cases
+   left in `boolexp/postgis` -- the relations themselves work now
+   (`boolexp/raster` is 5/5). It is a comparison that changes the type of the
+   column before comparing, which none of the others do.
 
 6. **The comment on a computed field's function** is not carried by the schema
    cache, so a computed field's description is always null.
@@ -226,6 +236,10 @@ wrong one.
   ordering happens before it. `EmbedPlan::embed_expression` already took all
   four for the REST surface; the GraphQL side had no way to say any of them.
 - **Computed columns are fields**, at the root and inside an embed.
+- **PostGIS comparisons.** The spatial relations on the columns they apply to,
+  with GeoJSON operands parsed by `ST_GeomFromGeoJSON` and cast to the column's
+  own type -- `ST_DWithin` takes a geometry or a geography and picking the
+  wrong one is not an overload PostGIS has. `boolexp/raster` went 1/5 to 5/5.
 - **Ordering by a related row's column, or by an aggregate of a row's
   children.** `order_by: {author: {name: asc}}` and
   `order_by: {articles_aggregate: {count: desc}}`, both as correlated
