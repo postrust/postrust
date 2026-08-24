@@ -138,13 +138,18 @@ fn relationship_keys(rel: &postrust_core::schema_cache::Relationship) -> Vec<Str
         "" => {}
         constraint => keys.push(constraint.to_string()),
     }
-    if rel.is_one_to_many() {
-        // The children point here, so the column that points is theirs.
-        if let Some(column) = rel.single_foreign_column() {
-            keys.push(format!("{}.{}", rel.foreign_table().name, column));
+    // The column that carries the key, on whichever side carries it. A
+    // one-to-one may have it on either, and two relationships between the same
+    // pair of tables can share the local column while differing in the far one
+    // -- so the more specific spelling is offered first and the bare column
+    // last.
+    if let Some(column) = rel.single_foreign_column() {
+        keys.push(format!("{}.{}", rel.foreign_table().name, column));
+    }
+    if !rel.is_one_to_many() {
+        if let Some(column) = rel.single_local_column() {
+            keys.push(column.to_string());
         }
-    } else if let Some(column) = rel.single_local_column() {
-        keys.push(column.to_string());
     }
     keys
 }
