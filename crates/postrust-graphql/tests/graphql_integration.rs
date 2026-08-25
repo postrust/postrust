@@ -1210,6 +1210,7 @@ async fn create_related_schema(pool: &PgPool, schema: &str) {
         ),
         format!(
             "CREATE TABLE {}.books (id SERIAL PRIMARY KEY, title TEXT NOT NULL, \
+             in_print BOOLEAN NOT NULL DEFAULT true, \
              author_id INTEGER NOT NULL REFERENCES {}.authors(id))",
             schema, schema
         ),
@@ -1223,8 +1224,8 @@ async fn create_related_schema(pool: &PgPool, schema: &str) {
             schema
         ),
         format!(
-            "INSERT INTO {}.books (title, author_id) VALUES \
-             ('a-one', 1), ('a-two', 1), ('g-one', 2)",
+            "INSERT INTO {}.books (title, in_print, author_id) VALUES \
+             ('a-one', true, 1), ('a-two', false, 1), ('g-one', true, 2)",
             schema
         ),
         format!(
@@ -1375,6 +1376,116 @@ async fn relationship_fields_appear_in_the_schema() {
             .collect::<Vec<_>>()
             .join("\n")
     );
+
+    drop_schema(&pool, &schema).await;
+}
+
+#[tokio::test]
+#[ignore = "requires PostgreSQL"]
+async fn a_predicate_over_an_aggregate_selects_by_how_many_children() {
+    let pool = connect().await;
+    let schema = unique_schema_name("aggpred");
+    create_related_schema(&pool, &schema).await;
+
+    let state = build_state(&pool, &schema, None, false).await;
+
+    // ada has two books, grace one, lonely none.
+    let data = execute_ok(
+        &state,
+        &pool,
+        &schema,
+        "{ authors(where: {books_aggregate: {count: {predicate: {_gte: 2}}}}, \
+         order_by: [{id: asc}]) { id } }",
+    )
+    .await;
+    assert_eq!(ids_of(&data, "authors"), vec![1]);
+
+    // An author with no books at all: `count` over no rows is zero, which is
+    // the whole reason this is a scalar subselect and not an EXISTS.
+    let data = execute_ok(
+        &state,
+        &pool,
+        &schema,
+        "{ authors(where: {books_aggregate: {count: {predicate: {_eq: 0}}}}) { id } }",
+    )
+    .await;
+    assert_eq!(ids_of(&data, "authors"), vec![3]);
+
+    drop_schema(&pool, &schema).await;
+}
+
+#[tokio::test]
+#[ignore = "requires PostgreSQL"]
+async fn a_predicate_over_an_aggregate_narrows_what_it_counts() {
+    let pool = connect().await;
+    let schema = unique_schema_name("aggpredf");
+    create_related_schema(&pool, &schema).await;
+
+    let state = build_state(&pool, &schema, None, false).await;
+
+    // ada has two books and one of them is in print; grace's one is.
+    let data = execute_ok(
+        &state,
+        &pool,
+        &schema,
+        "{ authors(where: {books_aggregate: {count: \
+         {filter: {in_print: {_eq: true}}, predicate: {_gte: 2}}}}) { id } }",
+    )
+    .await;
+    assert_eq!(ids_of(&data, "authors"), Vec::<i64>::new());
+
+    // `bool_and` is true only where every book is in print, which is grace.
+    let data = execute_ok(
+        &state,
+        &pool,
+        &schema,
+        "{ authors(where: {books_aggregate: \
+         {bool_and: {arguments: in_print, predicate: {_eq: true}}}}, \
+         order_by: [{id: asc}]) { id } }",
+    )
+    .await;
+    assert_eq!(ids_of(&data, "authors"), vec![2]);
+
+    // `bool_or` is true where any of them is: ada and grace, not lonely --
+    // over no rows the fold is null, which is not true.
+    let data = execute_ok(
+        &state,
+        &pool,
+        &schema,
+        "{ authors(where: {books_aggregate: \
+         {bool_or: {arguments: in_print, predicate: {_eq: true}}}}, \
+         order_by: [{id: asc}]) { id } }",
+    )
+    .await;
+    assert_eq!(ids_of(&data, "authors"), vec![1, 2]);
+
+    drop_schema(&pool, &schema).await;
+}
+
+#[tokio::test]
+#[ignore = "requires PostgreSQL"]
+async fn count_answers_each_alias_with_what_that_alias_asked_for() {
+    let pool = connect().await;
+    let schema = unique_schema_name("aggcount");
+    create_widgets_schema(&pool, &schema).await;
+
+    let state = build_state(&pool, &schema, None, false).await;
+    // Four widgets, in two categories.
+    let data = execute_ok(
+        &state,
+        &pool,
+        &schema,
+        "{ widgets_aggregate { aggregate { \
+         count \
+         named: count(columns: [category]) \
+         categories: count(columns: [category], distinct: true) \
+         } } }",
+    )
+    .await;
+    let aggregate = &data["widgets_aggregate"]["aggregate"];
+    assert_eq!(aggregate["count"], serde_json::json!(4));
+    assert_eq!(aggregate["named"], serde_json::json!(4));
+    assert_eq!(aggregate["categories"], serde_json::json!(2));
 
     drop_schema(&pool, &schema).await;
 }

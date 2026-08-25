@@ -129,6 +129,12 @@ async fn main() -> Result<()> {
                     if !names.is_empty() {
                         info!("GraphQL names given for {} tables", names.len());
                     }
+                    if names.placed_functions() > 0 {
+                        info!(
+                            "GraphQL roots given for {} functions",
+                            names.placed_functions()
+                        );
+                    }
                     names
                 }
                 Err(e) => {

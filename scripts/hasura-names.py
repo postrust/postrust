@@ -68,10 +68,15 @@ def export_from_engine(url, secret):
 
 
 def tables_from_metadata_dir(directory):
-    """The CLI keeps one file per table under databases/<source>/tables/."""
+    """The CLI keeps one file per table under databases/<source>/tables/.
+
+    Functions sit beside them under `functions/`, in the same shape.
+    """
     tables = []
+    functions = []
     for root, _, filenames in os.walk(directory):
-        if os.path.basename(root) != "tables":
+        holds = os.path.basename(root)
+        if holds not in ("tables", "functions"):
             continue
         for filename in sorted(filenames):
             if not filename.endswith((".yaml", ".yml")):
@@ -80,31 +85,39 @@ def tables_from_metadata_dir(directory):
             # `tables.yaml` is a list of includes or of tables; a per-table file
             # is one mapping.
             for entry in document if isinstance(document, list) else [document]:
-                if isinstance(entry, dict) and "table" in entry:
+                if not isinstance(entry, dict):
+                    continue
+                if holds == "tables" and "table" in entry:
                     tables.append(entry)
-    return tables
+                elif holds == "functions" and "function" in entry:
+                    functions.append(entry)
+    return tables, functions
 
 
 def tables_from_document(document):
     """Walk an exported document, whichever version it is."""
     tables = []
+    functions = []
     if not isinstance(document, dict):
-        return tables
+        return tables, functions
 
     # v3: {metadata: {sources: [{tables: [...]}]}} or the bare {sources: [...]}
     metadata = document.get("metadata", document)
     for source in metadata.get("sources", []) or []:
         tables.extend(source.get("tables", []) or [])
+        functions.extend(source.get("functions", []) or [])
 
     # v2: {tables: [...]} at the top level.
     if not tables:
         tables.extend(metadata.get("tables", []) or [])
+    if not functions:
+        functions.extend(metadata.get("functions", []) or [])
 
-    return tables
+    return tables, functions
 
 
 def tables_from_commands(paths):
-    """Fold a sequence of metadata commands into table entries.
+    """Fold a sequence of metadata commands into table and function entries.
 
     A schema is not always an exported document. Migrations, a test suite's
     fixtures and anything scripted against `/v1/query` are a list of commands
@@ -113,6 +126,7 @@ def tables_from_commands(paths):
     shape an export would have had.
     """
     entries = {}
+    functions = []
 
     def entry_for(table):
         schema, name = qualified(table)
@@ -140,7 +154,17 @@ def tables_from_commands(paths):
             if kind.startswith("pg_"):
                 kind = kind[len("pg_"):]
             args = command.get("args") or {}
-            if not isinstance(args, dict) or "table" not in args:
+            if not isinstance(args, dict):
+                continue
+            # A tracked function is not about a table, so it is collected
+            # before the table entries are.
+            if kind == "track_function":
+                functions.append({
+                    "function": args.get("function") or args.get("name"),
+                    "configuration": args.get("configuration"),
+                })
+                continue
+            if "table" not in args:
                 continue
             entry = entry_for(args["table"])
 
@@ -167,7 +191,7 @@ def tables_from_commands(paths):
                 if "is_enum" in args:
                     entry["is_enum"] = bool(args["is_enum"])
 
-    return list(entries.values())
+    return list(entries.values()), functions
 
 
 def qualified(table):
@@ -487,6 +511,34 @@ def convert(tables):
     return names
 
 
+def convert_functions(functions):
+    """What metadata says about a function that reflection cannot derive.
+
+    Only one thing so far: which root it is exposed on. This server places a
+    function by its volatility, which is what the catalogue records; Hasura
+    lets `track_function` override it, and a VOLATILE function tracked with
+    `exposed_as: query` is a decision no schema remembers.
+
+    A function whose placement matches what volatility would give is left out,
+    for the same reason a derived name is -- but that cannot be checked here
+    without a database, so what is written down is every `exposed_as` metadata
+    actually carries.
+    """
+    given = {}
+    for entry in functions:
+        schema, name = qualified(entry.get("function"))
+        if not name:
+            continue
+        configuration = entry.get("configuration")
+        if not isinstance(configuration, dict):
+            continue
+        exposed = configuration.get("exposed_as")
+        if exposed not in ("query", "mutation"):
+            continue
+        given[f"{schema}.{name}"] = {"exposed_as": exposed}
+    return given
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__,
                                      formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -500,11 +552,13 @@ def main():
     args = parser.parse_args()
 
     if args.url:
-        tables = tables_from_document(export_from_engine(args.url, args.admin_secret))
+        tables, functions = tables_from_document(
+            export_from_engine(args.url, args.admin_secret)
+        )
     elif args.commands:
-        tables = tables_from_commands(args.commands)
+        tables, functions = tables_from_commands(args.commands)
     elif args.metadata_dir:
-        tables = tables_from_metadata_dir(args.metadata_dir)
+        tables, functions = tables_from_metadata_dir(args.metadata_dir)
     else:
         with open(args.file) as fh:
             head = fh.read()
@@ -512,9 +566,9 @@ def main():
             document = json.loads(head)
         except json.JSONDecodeError:
             document = load_yaml(args.file)
-        tables = tables_from_document(document)
+        tables, functions = tables_from_document(document)
 
-    if not tables:
+    if not tables and not functions:
         # An empty document is a legitimate answer for a schema that renames
         # nothing, and a caller generating one per group should not have to
         # special-case it.
@@ -522,12 +576,23 @@ def main():
         return
 
     names = convert(tables)
-    print(json.dumps(names, indent=2, sort_keys=True))
+    placed = convert_functions(functions)
+    # The sectioned shape only where there is a second section to write. The
+    # flat one came first, is still read, and is shorter for the schemas that
+    # need nothing but names.
+    document = {"tables": names, "functions": placed} if placed else names
+    print(json.dumps(document, indent=2, sort_keys=True))
     print(
         f"note: {len(names)} of {len(tables)} tables need a name written down; "
         f"the rest are what this server derives anyway",
         file=sys.stderr,
     )
+    if placed:
+        print(
+            f"note: {len(placed)} function(s) are exposed on a root their "
+            f"volatility would not put them on",
+            file=sys.stderr,
+        )
 
 
 main()

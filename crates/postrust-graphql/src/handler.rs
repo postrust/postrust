@@ -19,7 +19,7 @@ use axum::response::IntoResponse;
 use futures::stream::StreamExt;
 use postrust_core::schema_cache::SchemaCache;
 use sqlx::PgPool;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
 use tokio::sync::RwLock;
 use tracing::{debug, info, trace};
@@ -770,6 +770,95 @@ fn build_dynamic_schema(
         }
     }
 
+    // What a predicate over a related set may ask. Registered only for the
+    // tables something points at with a to-many relationship, which is the
+    // only place the field naming them exists.
+    {
+        use crate::input::bool_exp as be;
+        let mut targets: BTreeSet<&str> = BTreeSet::new();
+        for relationships in generated.relationship_fields.values() {
+            for relationship in relationships {
+                if relationship.is_list {
+                    targets.insert(relationship.target_type.as_str());
+                }
+            }
+        }
+        for target in targets {
+            let Some(object) = generated.object_types.get(target) else {
+                continue;
+            };
+            // A boolean column is what `bool_and` and `bool_or` fold, and a
+            // GraphQL enum may not be empty -- so a table with none gets
+            // neither the aggregates nor the enum naming their columns.
+            let booleans: Vec<&str> = object
+                .fields
+                .iter()
+                .filter(|field| {
+                    object.table.get_column(&field.name).is_some()
+                        && matches!(field.graphql_type, crate::types::GraphQLType::Boolean)
+                })
+                .map(|field| field.name.as_str())
+                .collect();
+
+            let mut over = InputObject::new(be::aggregate_bool_exp_type_name(target)).description(
+                format!("A question about the whole set of related {} rows.", target),
+            );
+            for function in be::AGGREGATE_PREDICATES {
+                if function != "count" && booleans.is_empty() {
+                    continue;
+                }
+                over = over.field(InputValue::new(
+                    function,
+                    TypeRef::named(be::aggregate_bool_exp_function(target, function)),
+                ));
+
+                // `count` may be told which columns to count, as the field
+                // itself may; `bool_and` folds exactly one.
+                let (arguments, predicate) = match function {
+                    "count" => (
+                        TypeRef::named_nn_list(crate::input::order_by::select_column_type_name(
+                            target,
+                        )),
+                        be::comparison_type_name("Int"),
+                    ),
+                    _ => (
+                        TypeRef::named_nn(be::aggregate_bool_exp_columns(target, function)),
+                        be::comparison_type_name("Boolean"),
+                    ),
+                };
+                let mut input = InputObject::new(be::aggregate_bool_exp_function(target, function))
+                    .description(format!(
+                        "`{}` over the related {} rows, and what it has to be.",
+                        function, target
+                    ))
+                    .field(InputValue::new("arguments", arguments))
+                    .field(InputValue::new("distinct", TypeRef::named("Boolean")))
+                    .field(InputValue::new(
+                        "filter",
+                        TypeRef::named(be::bool_exp_type_name(target)),
+                    ))
+                    .field(InputValue::new("predicate", TypeRef::named_nn(predicate)));
+                if function == "count" {
+                    input = input.description(format!(
+                        "How many related {} rows there have to be.",
+                        target
+                    ));
+                }
+                builder = builder.register(input);
+
+                if function != "count" {
+                    let mut columns = Enum::new(be::aggregate_bool_exp_columns(target, function))
+                        .description(format!("A boolean column of {}.", target));
+                    for name in &booleans {
+                        columns = columns.item(EnumItem::new(*name));
+                    }
+                    builder = builder.register(columns);
+                }
+            }
+            builder = builder.register(over);
+        }
+    }
+
     // Upserts. A table with no unique constraint has no conflict to resolve,
     // and a GraphQL enum may not be empty, so it gets none of these types
     // rather than an unusable set of them.
@@ -955,9 +1044,14 @@ fn create_aggregate_types(base_name: &str, object: &TableObjectType) -> Vec<Obje
         .description(format!("Aggregate functions over {}.", base_name))
         .field(
             Field::new("count", TypeRef::named_nn(TypeRef::INT), |ctx| {
+                // Read under the name it was asked for, not under `count`.
+                // Two counts of different things sit in one selection --
+                // `count` beside `distinct_authors: count(columns: [author_id],
+                // distinct: true)` -- and they are different numbers.
+                let key = ctx.ctx.field().alias().unwrap_or("count").to_string();
                 FieldFuture::new(async move {
                     Ok(Some(FieldValue::value(
-                        child_value(&ctx, "count").unwrap_or(Value::from(0)),
+                        child_value(&ctx, &key).unwrap_or(Value::from(0)),
                     )))
                 })
             })
@@ -1973,36 +2067,59 @@ async fn resolve_aggregate<'a>(
         inner.push_str(&format!(" OFFSET {}", offset));
     }
 
-    // What the client actually asked for.
+    // What the client actually asked for. Two selections of one aggregate are
+    // one entry: `sum { id }` beside `totals: sum { views }` reads the same
+    // object under two names, so the columns are the union of what both named
+    // and the object is built once.
     let mut wants_nodes = false;
-    let mut wanted: Vec<(String, Vec<String>)> = Vec::new();
-    let mut wants_count = false;
+    let mut wanted: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    // `count` is different: each occurrence may count something else, so each
+    // is answered under the name it was asked for.
+    let mut counts: Vec<(String, String)> = Vec::new();
     for selection in ctx.field().selection_set() {
         match selection.name() {
             "nodes" => wants_nodes = true,
             "aggregate" => {
                 for function in selection.selection_set() {
                     if function.name() == "count" {
-                        wants_count = true;
+                        counts.push((
+                            function.alias().unwrap_or("count").to_string(),
+                            count_expression(
+                                function,
+                                (&spec.schema_name, &spec.table_name),
+                                None,
+                                spec.names.as_ref(),
+                            ),
+                        ));
                         continue;
                     }
-                    let columns: Vec<String> = function
-                        .selection_set()
-                        .map(|c| c.name().to_string())
-                        .collect();
-                    if !columns.is_empty() {
-                        wanted.push((function.name().to_string(), columns));
+                    let columns = wanted.entry(function.name().to_string()).or_default();
+                    for column in function.selection_set() {
+                        let name = column.name().to_string();
+                        if !columns.contains(&name) {
+                            columns.push(name);
+                        }
                     }
                 }
             }
             _ => {}
         }
     }
+    wanted.retain(|_, columns| !columns.is_empty());
 
     let mut result = async_graphql::indexmap::IndexMap::new();
 
-    if wants_count || !wanted.is_empty() {
-        let mut parts = vec!["'count', count(*)".to_string()];
+    if !counts.is_empty() || !wanted.is_empty() {
+        // `count` is answered whether or not it was asked for: the aggregate
+        // type's own resolver reads a missing key as zero, and a client that
+        // asked for nothing else still gets a number rather than a null.
+        let mut parts = match counts.iter().any(|(key, _)| key == "count") {
+            true => Vec::new(),
+            false => vec!["'count', count(*)".to_string()],
+        };
+        for (key, expression) in &counts {
+            parts.push(format!("'{}', {}", key.replace('\'', "''"), expression));
+        }
         for (function, columns) in &wanted {
             // The function name comes from the schema, not from the request:
             // a selection can only name a field that was generated, so there
@@ -4475,6 +4592,29 @@ fn build_condition(
                     alias_counter,
                 )?);
             }
+            // A question about the whole related set rather than about any
+            // one row of it. `where: {articles_aggregate: {count: {predicate:
+            // {_gt: 2}}}}` keeps the authors with more than two articles,
+            // which no `EXISTS` over one article can say.
+            name if scope.column_type(name).is_none()
+                && name
+                    .strip_suffix("_aggregate")
+                    .and_then(|rel| scope.relationship(rel))
+                    .is_some_and(|rel| rel.is_list) =>
+            {
+                let relationship = name
+                    .strip_suffix("_aggregate")
+                    .and_then(|rel| scope.relationship(rel))
+                    .expect("just checked");
+                conditions.push(aggregate_predicate_sql(
+                    relationship,
+                    val,
+                    scope,
+                    param_idx,
+                    values,
+                    alias_counter,
+                )?);
+            }
             column => {
                 let quoted = scope.column(column);
                 match val {
@@ -4608,6 +4748,193 @@ fn exists_sql(
         postrust_sql::escape_ident(&alias),
         correlation.join(" AND ")
     ))
+}
+
+/// A predicate over an aggregate of a related set, as SQL.
+///
+/// `{count: {predicate: {_gt: 2}, filter: {...}}}` becomes a scalar subselect
+/// correlated back to the parent row, compared the way any column is:
+///
+/// ```text
+/// (SELECT count(*) FROM "public"."article" AS pgrst_rel_1
+///   WHERE "author"."id" = pgrst_rel_1."author_id" AND (...)) > $1
+/// ```
+///
+/// A scalar subselect rather than an `EXISTS`, because the answer is a number
+/// or a truth value and not whether a row is there -- and because over no rows
+/// at all `count` is zero and `bool_and` is null, which is what SQL says and
+/// what a client asking "no articles" is relying on.
+fn aggregate_predicate_sql(
+    relationship: &RelationshipField,
+    expression: &serde_json::Value,
+    scope: &WhereScope<'_>,
+    param_idx: &mut usize,
+    values: &mut Vec<serde_json::Value>,
+    alias_counter: &mut usize,
+) -> Result<String, async_graphql::Error> {
+    let serde_json::Value::Object(over) = expression else {
+        return Ok("true".to_string());
+    };
+
+    let cache = scope.resolution.as_ref().map(|r| r.cache).ok_or_else(|| {
+        async_graphql::Error::new(format!(
+            "filtering on the relationship \"{}\" is not available here",
+            relationship.name
+        ))
+    })?;
+    let plan = postrust_core::embed::EmbedPlan::resolve(&relationship.relationship, cache)
+        .map_err(|e| async_graphql::Error::new(e.to_string()))?;
+    if plan.junction.is_some() || (plan.function.is_none() && plan.columns.is_empty()) {
+        return Err(async_graphql::Error::new(format!(
+            "aggregating over \"{}\" is not supported: it is reached through a junction \
+             rather than by a key",
+            relationship.name
+        )));
+    }
+
+    let mut conditions: Vec<String> = Vec::new();
+    for (function, spec) in over {
+        if spec.is_null() {
+            continue;
+        }
+        let serde_json::Value::Object(spec) = spec else {
+            continue;
+        };
+        let Some(predicate) = spec.get("predicate").filter(|p| !p.is_null()) else {
+            return Err(validation_error(&format!(
+                "\"{}\" over \"{}\" needs a predicate",
+                function, relationship.name
+            )));
+        };
+
+        *alias_counter += 1;
+        let alias = format!("pgrst_agg_{}", alias_counter);
+        let child_scope = WhereScope::aliased(
+            &plan.foreign_schema,
+            &plan.foreign_table,
+            &alias,
+            &relationship.target_type,
+            scope,
+        );
+
+        // Correlated the way an `EXISTS` over the same relationship is: by
+        // the key, or by handing the parent row to the function.
+        let (source, mut correlation) = match &plan.function {
+            Some(routine) => (
+                format!(
+                    "{}.{}({})",
+                    postrust_sql::escape_ident(&routine.schema),
+                    postrust_sql::escape_ident(&routine.name),
+                    scope.row_ref
+                ),
+                Vec::new(),
+            ),
+            None => {
+                let mut columns = Vec::with_capacity(plan.columns.len());
+                for (parent_column, child_column) in &plan.columns {
+                    columns.push(format!(
+                        "{} = {}",
+                        scope.column(parent_column),
+                        child_scope.column(child_column)
+                    ));
+                }
+                (
+                    format!(
+                        "{}.{}",
+                        postrust_sql::escape_ident(&plan.foreign_schema),
+                        postrust_sql::escape_ident(&plan.foreign_table)
+                    ),
+                    columns,
+                )
+            }
+        };
+        // `filter` narrows what is aggregated, and is an ordinary boolean
+        // expression over the child.
+        if let Some(filter) = spec.get("filter").filter(|f| !f.is_null()) {
+            if let Some(sql) =
+                build_condition(filter, &child_scope, param_idx, values, alias_counter)?
+            {
+                correlation.push(format!("({})", sql));
+            }
+        }
+        if correlation.is_empty() {
+            correlation.push("true".to_string());
+        }
+
+        let arguments = spec.get("arguments").filter(|a| !a.is_null());
+        let distinct = matches!(spec.get("distinct"), Some(serde_json::Value::Bool(true)));
+        let (aggregate, operand_type) = match function.as_str() {
+            "count" => {
+                let columns: Vec<String> = match arguments {
+                    Some(serde_json::Value::Array(items)) => items
+                        .iter()
+                        .filter_map(|item| item.as_str())
+                        .map(|column| child_scope.column(column))
+                        .collect(),
+                    Some(serde_json::Value::String(one)) => vec![child_scope.column(one)],
+                    _ => Vec::new(),
+                };
+                let counted = match columns.len() {
+                    0 => "*".to_string(),
+                    1 => columns.into_iter().next().unwrap_or_default(),
+                    _ => format!("({})", columns.join(", ")),
+                };
+                let counted = match distinct && counted != "*" {
+                    true => format!("DISTINCT {}", counted),
+                    false => counted,
+                };
+                (format!("count({})", counted), "integer")
+            }
+            "bool_and" | "bool_or" => {
+                let Some(column) = arguments.and_then(|a| a.as_str()) else {
+                    return Err(validation_error(&format!(
+                        "\"{}\" over \"{}\" needs the column to fold",
+                        function, relationship.name
+                    )));
+                };
+                (
+                    format!("{}({})", function, child_scope.column(column)),
+                    "boolean",
+                )
+            }
+            other => {
+                return Err(validation_error(&format!(
+                    "\"{}\" is not an aggregate a predicate can be written over",
+                    other
+                )))
+            }
+        };
+
+        let subselect = format!(
+            "(SELECT {} FROM {} AS {} WHERE {})",
+            aggregate,
+            source,
+            postrust_sql::escape_ident(&alias),
+            correlation.join(" AND ")
+        );
+        let serde_json::Value::Object(operators) = predicate else {
+            return Err(validation_error(&format!(
+                "the predicate on \"{}\" is not a comparison",
+                function
+            )));
+        };
+        for (operator, operand) in operators {
+            conditions.push(comparison_sql(
+                &subselect,
+                function,
+                Some(operand_type),
+                operator,
+                operand,
+                param_idx,
+                values,
+            )?);
+        }
+    }
+
+    Ok(match conditions.is_empty() {
+        true => "true".to_string(),
+        false => format!("({})", conditions.join(" AND ")),
+    })
 }
 
 /// One spatial comparison, as a PostGIS call.
@@ -5630,6 +5957,66 @@ fn computed_column_call(
     Ok(format!("{}({})", function, passed.join(", ")))
 }
 
+/// The `count(...)` a selection asked for.
+///
+/// `count` alone is `count(*)`, which counts rows. `count(columns: [a])` is
+/// `count("a")`, which counts the rows where `a` is not null -- a different
+/// number, and the one the client asked for. `distinct: true` counts the
+/// distinct values among them, and several columns are counted as the row
+/// they make, which is how PostgreSQL counts more than one thing at once.
+///
+/// The column names come from the generated enum, so a selection can only
+/// name a column the table has; what it may not know is the column's own name
+/// where the schema exposes it under another.
+fn count_expression(
+    field: async_graphql::SelectionField<'_>,
+    table: (&str, &str),
+    alias: Option<&str>,
+    names: &crate::names::NameOverrides,
+) -> String {
+    let arguments = embed_arguments(field);
+    let requested = match arguments.get("columns") {
+        Some(serde_json::Value::Array(items)) => items
+            .iter()
+            .filter_map(|item| item.as_str())
+            .collect::<Vec<_>>(),
+        Some(serde_json::Value::String(one)) => vec![one.as_str()],
+        _ => Vec::new(),
+    };
+    if requested.is_empty() {
+        return "count(*)".to_string();
+    }
+    let columns: Vec<String> = requested
+        .into_iter()
+        .map(|column| {
+            let (schema, name) = table;
+            let source = column_for(names, schema, name, column);
+            match alias {
+                Some(alias) => format!(
+                    "{}.{}",
+                    postrust_sql::escape_ident(alias),
+                    postrust_sql::escape_ident(source)
+                ),
+                None => postrust_sql::escape_ident(source),
+            }
+        })
+        .collect();
+    // One column counts itself; several count the row they make, since
+    // `count(a, b)` is not a call PostgreSQL has.
+    let counted = match columns.len() {
+        1 => columns.into_iter().next().unwrap_or_default(),
+        _ => format!("({})", columns.join(", ")),
+    };
+    let distinct = matches!(
+        arguments.get("distinct"),
+        Some(serde_json::Value::Bool(true))
+    );
+    match distinct {
+        true => format!("count(DISTINCT {})", counted),
+        false => format!("count({})", counted),
+    }
+}
+
 /// The SELECT list for a nested aggregate.
 ///
 /// `articles_aggregate { aggregate { count } nodes { title } }` becomes one
@@ -5657,9 +6044,21 @@ fn nested_aggregate_select(
     for child in selection.selection_set() {
         match child.name() {
             "aggregate" => {
-                let mut fields = vec!["'count', count(*)".to_string()];
+                let of_table = child_table
+                    .map(|table| (table.schema.as_str(), table.name.as_str()))
+                    .unwrap_or(("", ""));
+                // Each `count` is answered under the name it was asked for,
+                // since two of them may count different things. Every other
+                // aggregate is one object read under however many names, so
+                // its columns are the union of what all of them named.
+                let mut counts: Vec<(String, String)> = Vec::new();
+                let mut wanted: BTreeMap<&str, Vec<String>> = BTreeMap::new();
                 for function in child.selection_set() {
                     if function.name() == "count" {
+                        counts.push((
+                            function.alias().unwrap_or("count").to_string(),
+                            count_expression(function, of_table, Some(child_alias), names),
+                        ));
                         continue;
                     }
                     let sql_function = agg::NUMERIC_AGGREGATES
@@ -5670,15 +6069,33 @@ fn nested_aggregate_select(
                     let Some(sql_function) = sql_function else {
                         continue;
                     };
-                    let columns: Vec<String> = function
-                        .selection_set()
+                    let columns = wanted.entry(sql_function).or_default();
+                    for column in function.selection_set() {
+                        let name = column.name().to_string();
+                        if !columns.contains(&name) {
+                            columns.push(name);
+                        }
+                    }
+                }
+                // Answered whether or not it was asked for, for the reason
+                // the root aggregate answers it.
+                let mut fields = match counts.iter().any(|(key, _)| key == "count") {
+                    true => Vec::new(),
+                    false => vec!["'count', count(*)".to_string()],
+                };
+                for (key, expression) in &counts {
+                    fields.push(format!("'{}', {}", key.replace('\'', "''"), expression));
+                }
+                for (sql_function, named) in &wanted {
+                    let columns: Vec<String> = named
+                        .iter()
                         .map(|column| {
                             let source = child_table
-                                .map(|table| table_column_for(names, table, column.name()))
-                                .unwrap_or_else(|| column.name());
+                                .map(|table| table_column_for(names, table, column))
+                                .unwrap_or(column.as_str());
                             format!(
                                 "'{}', {}({}.{})",
-                                column.name().replace('\'', "''"),
+                                column.replace('\'', "''"),
                                 sql_function,
                                 postrust_sql::escape_ident(child_alias),
                                 postrust_sql::escape_ident(source)

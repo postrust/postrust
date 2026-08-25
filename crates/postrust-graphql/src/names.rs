@@ -135,6 +135,24 @@ pub struct Comments {
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct NameOverrides {
     tables: HashMap<String, TableNames>,
+    functions: HashMap<String, FunctionNames>,
+}
+
+/// The document in its sectioned shape.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+struct Sections {
+    #[serde(default)]
+    tables: HashMap<String, TableNames>,
+    #[serde(default)]
+    functions: HashMap<String, FunctionNames>,
+}
+
+/// What metadata says about one function, beyond what the catalogue knows.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct FunctionNames {
+    /// The root this function is exposed on: `query` or `mutation`.
+    #[serde(default)]
+    pub exposed_as: Option<String>,
 }
 
 impl NameOverrides {
@@ -159,8 +177,39 @@ impl NameOverrides {
                 .map_err(|e| format!("cannot read GraphQL names from \"{}\": {}", trimmed, e))?
         };
 
-        let tables: HashMap<String, TableNames> = serde_json::from_str(&document)
+        // Two shapes, and which one this is can be told from the keys: a
+        // table key is `schema.table` and always has a dot, so `tables` and
+        // `functions` at the top level cannot be tables and can only be the
+        // sections they name. The flat shape came first and stays valid.
+        let parsed: serde_json::Value = serde_json::from_str(&document)
             .map_err(|e| format!("GraphQL names are not valid JSON: {}", e))?;
+        let sectioned = parsed
+            .as_object()
+            .is_some_and(|map| map.contains_key("tables") || map.contains_key("functions"));
+
+        let (tables, functions): (HashMap<String, TableNames>, HashMap<String, FunctionNames>) =
+            match sectioned {
+                true => {
+                    let document: Sections = serde_json::from_value(parsed)
+                        .map_err(|e| format!("GraphQL names are not valid JSON: {}", e))?;
+                    (document.tables, document.functions)
+                }
+                false => (
+                    serde_json::from_value(parsed)
+                        .map_err(|e| format!("GraphQL names are not valid JSON: {}", e))?,
+                    HashMap::new(),
+                ),
+            };
+
+        for key in functions.keys() {
+            if !key.contains('.') {
+                return Err(format!(
+                    "\"{}\" does not name a function; keys are \"schema.function\", \
+                     so a function in the default schema is still \"public.{}\"",
+                    key, key
+                ));
+            }
+        }
 
         for (key, names) in &tables {
             if !key.contains('.') {
@@ -175,17 +224,36 @@ impl NameOverrides {
             }
         }
 
-        Ok(Self { tables })
+        Ok(Self { tables, functions })
     }
 
     /// Whether any name was given at all.
     pub fn is_empty(&self) -> bool {
-        self.tables.is_empty()
+        self.tables.is_empty() && self.functions.is_empty()
+    }
+
+    /// Which root a function was placed on, if metadata said.
+    ///
+    /// `query` or `mutation`. Reflection places a function by its volatility,
+    /// which is the only thing the catalogue records; Hasura lets metadata
+    /// override it -- `track_function` with `configuration: {exposed_as:
+    /// query}` puts a VOLATILE function on the query root, which is a thing a
+    /// person decided and no schema remembers.
+    pub fn exposed_as(&self, schema: &str, function: &str) -> Option<&str> {
+        self.functions
+            .get(&format!("{}.{}", schema, function))?
+            .exposed_as
+            .as_deref()
     }
 
     /// How many tables were named, for the line the server logs at startup.
     pub fn len(&self) -> usize {
         self.tables.len()
+    }
+
+    /// How many functions were placed, for the same line.
+    pub fn placed_functions(&self) -> usize {
+        self.functions.len()
     }
 
     fn table(&self, schema: &str, table: &str) -> Option<&TableNames> {
@@ -426,6 +494,34 @@ mod tests {
         let names = NameOverrides::parse(SAMPLE).unwrap();
         assert_eq!(names.base_name("public", "article"), None);
         assert_eq!(names.relationship("other", "author", "anything"), None);
+    }
+
+    /// The sectioned shape, told apart from the flat one by a key that
+    /// cannot be a table: a table key always carries a dot.
+    #[test]
+    fn a_function_can_be_placed_on_a_root() {
+        let names = NameOverrides::parse(
+            r#"{"tables": {"public.author": {"name": "Authors"}},
+                "functions": {"public.volatile_func1": {"exposed_as": "query"}}}"#,
+        )
+        .unwrap();
+        assert_eq!(names.base_name("public", "author"), Some("Authors"));
+        assert_eq!(names.exposed_as("public", "volatile_func1"), Some("query"));
+        assert_eq!(names.exposed_as("public", "something_else"), None);
+    }
+
+    #[test]
+    fn the_flat_shape_is_still_read() {
+        let names = NameOverrides::parse(SAMPLE).unwrap();
+        assert!(!names.is_empty());
+        assert_eq!(names.exposed_as("public", "anything"), None);
+    }
+
+    #[test]
+    fn a_function_key_names_its_schema() {
+        let error = NameOverrides::parse(r#"{"functions": {"volatile_func1": {}}}"#)
+            .expect_err("a bare function name is not a key");
+        assert!(error.contains("schema.function"), "{}", error);
     }
 
     #[test]

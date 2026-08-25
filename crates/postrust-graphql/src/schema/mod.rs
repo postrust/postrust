@@ -1012,10 +1012,19 @@ pub fn build_schema(schema_cache: &SchemaCache, config: &SchemaConfig) -> Genera
                     .iter()
                     .find(|param| is_session_argument(param))
                     .map(|param| param.name.clone()),
-                volatile: matches!(
-                    routine.volatility,
-                    postrust_core::schema_cache::FuncVolatility::Volatile
-                ),
+                // Placed by what PostgreSQL says it does, unless metadata
+                // said otherwise: `track_function` with `configuration:
+                // {exposed_as: query}` puts a VOLATILE function on the query
+                // root, which is a decision a person made and no catalogue
+                // remembers.
+                volatile: match config.names.exposed_as(&routine.schema, &routine.name) {
+                    Some("query") => false,
+                    Some("mutation") => true,
+                    _ => matches!(
+                        routine.volatility,
+                        postrust_core::schema_cache::FuncVolatility::Volatile
+                    ),
+                },
                 description: routine.description.clone(),
             });
         }

@@ -200,7 +200,7 @@ RUST_LOG="postrust=debug,sqlx=info"
 
 | Variable | Description | Default |
 |----------|-------------|---------|
-| `PGRST_GRAPHQL_NAMES` | Names for tables, columns, root fields, relationships and computed fields that the schema cannot supply. A JSON document, or a path to a file holding one. | unset (every name derived) |
+| `PGRST_GRAPHQL_NAMES` | Names for tables, columns, root fields, relationships and computed fields that the schema cannot supply, and which root a function is exposed on. A JSON document, or a path to a file holding one. | unset (every name derived) |
 
 Almost everything in the generated GraphQL API is derived: a table's name gives
 its root fields, a foreign key gives a relationship, a function gives a
@@ -265,6 +265,33 @@ down. This is where those names go when a schema is migrated from one.
 
 Keys are `schema.table`, so a table in the default schema is still
 `public.author`. A table absent from the document is exposed exactly as before.
+
+### Where a function is exposed
+
+A function that answers with rows of a table is a root field, and which root it
+goes on follows from what PostgreSQL says it does: `VOLATILE` may write, so it
+is a mutation; `STABLE` and `IMMUTABLE` may not, so they are queries. Hasura
+lets metadata override that, and a `VOLATILE` function tracked with
+`exposed_as: query` is a decision a person made that no catalogue remembers.
+
+Written down, the document grows a second section — and the table names move
+into one of their own, which is the only shape change. The flat document above
+is still read:
+
+```json
+{
+  "tables": {
+    "public.author": { "name": "Authors" }
+  },
+  "functions": {
+    "public.volatile_func1": { "exposed_as": "query" }
+  }
+}
+```
+
+Keys are `schema.function`. `exposed_as` is `query` or `mutation`; a function
+absent from the section is placed by its volatility as before.
+
 Set the variable to the document itself, or to a path:
 
 ```bash
@@ -290,9 +317,9 @@ word is carried as `name`, because it names the generated *types* as well and a
 client reads those too; whatever the word cannot account for is written down
 root by root.
 
-It converts names and descriptions and nothing else: permissions,
-tracked-table lists, actions, remote schemas and event triggers are the
-metadata model rather than names, and this server does not have one.
+It converts names, descriptions and function placement, and nothing else:
+permissions, tracked-table lists, actions, remote schemas and event triggers
+are the metadata model rather than names, and this server does not have one.
 
 Relationships can be keyed by constraint name, by the foreign key column, or by
 `table.column` on the far side. That is what lets the converter work from the

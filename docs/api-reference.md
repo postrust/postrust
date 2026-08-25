@@ -493,6 +493,24 @@ by validation rather than by the database.
 | `ltree` | `_ancestor` `_descendant` `_matches` `_matches_fulltext` and their `_any` forms |
 | PostGIS | `_st_contains` `_st_crosses` `_st_equals` `_st_intersects` `_st_overlaps` `_st_touches` `_st_within` `_st_d_within` `_st_3d_d_within` `_cast: { geography: … }` |
 
+A question can also be asked about a whole related set rather than about any
+one row of it:
+
+```graphql
+{
+  authors(where: { books_aggregate: { count: { predicate: { _gt: 2 } } } }) {
+    name
+  }
+}
+```
+
+`count` takes the same `columns` and `distinct` the aggregate field does, and a
+`filter` narrowing what is counted; `bool_and` and `bool_or` fold one boolean
+column, named under `arguments`. Each takes a `predicate`, which is an ordinary
+comparison against the number or the truth value the aggregate produced. Over no
+related rows at all `count` is zero and the folds are null, which is how
+"authors with no books" is written.
+
 Combine them with `_and`, `_or` and `_not`, and follow a relationship by naming
 it:
 
@@ -564,6 +582,23 @@ query {
 
 `nodes` is a rows selection like any other: it takes relationships and computed
 fields, not only columns.
+
+`count` counts rows. `count(columns: [category])` counts the rows where those
+columns are not null, and `distinct: true` counts the distinct values among
+them — so a selection may ask for several counts at once, each under its own
+name:
+
+```graphql
+{
+  widgets_aggregate {
+    aggregate {
+      count
+      named: count(columns: [category])
+      categories: count(columns: [category], distinct: true)
+    }
+  }
+}
+```
 
 ### Computed fields
 
@@ -757,10 +792,11 @@ body, not a transport failure.
 
 Hasura keeps some names in metadata rather than in the database: what a
 relationship is called, what a computed field is called, what a table's type is
-called. Reflection cannot recover a name nobody wrote down, so they are given
-to the server through `PGRST_GRAPHQL_NAMES`, and `scripts/hasura-names.py`
-converts them out of an existing Hasura deployment. See
-[Configuration](./configuration.md#graphql-names).
+called — and which root a function is exposed on, which its volatility would
+otherwise decide. Reflection cannot recover a decision nobody wrote down, so
+they are given to the server through `PGRST_GRAPHQL_NAMES`, and
+`scripts/hasura-names.py` converts them out of an existing Hasura deployment.
+See [Configuration](./configuration.md#graphql-names).
 
 ### Type Mapping
 

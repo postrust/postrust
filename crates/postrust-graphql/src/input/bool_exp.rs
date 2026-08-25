@@ -139,6 +139,38 @@ pub fn bool_exp_type_name(base_name: &str) -> String {
     format!("{}_bool_exp", base_name)
 }
 
+/// The name of a table's aggregate boolean expression input.
+///
+/// `where: {articles_aggregate: {count: {predicate: {_gt: 2}}}}` -- the
+/// authors with more than two articles. The question is about the set of
+/// related rows rather than about any one of them, which is why it is a type
+/// of its own rather than another field of the child's filter.
+pub fn aggregate_bool_exp_type_name(base_name: &str) -> String {
+    format!("{}_aggregate_bool_exp", base_name)
+}
+
+/// The name of one aggregate's own input inside that.
+pub fn aggregate_bool_exp_function(base_name: &str, function: &str) -> String {
+    format!("{}_aggregate_bool_exp_{}", base_name, function)
+}
+
+/// The name of the enum naming the columns `bool_and` and `bool_or` may take.
+///
+/// Spelled as Hasura spells it, which is long because it says where it came
+/// from: the select-column enum, narrowed to one aggregate of one table.
+pub fn aggregate_bool_exp_columns(base_name: &str, function: &str) -> String {
+    format!(
+        "{}_select_column_{}_aggregate_bool_exp_{}_arguments_columns",
+        base_name, base_name, function
+    )
+}
+
+/// The aggregates a predicate may be written over.
+///
+/// `count` over any table; `bool_and` and `bool_or` only where there is a
+/// boolean column for them to fold, since a GraphQL enum may not be empty.
+pub const AGGREGATE_PREDICATES: [&str; 3] = ["bool_and", "bool_or", "count"];
+
 /// Build the comparison input for one scalar type.
 ///
 /// `_is_null` takes a Boolean whatever the column is, and the list-valued
@@ -319,10 +351,10 @@ pub fn build_inputs(
         // clash. The column wins here for the same reason it wins in the
         // object type: it is the table's own data, and the two have to agree
         // about which fields exist.
-        let mut taken: HashSet<&str> = HashSet::new();
+        let mut taken: HashSet<String> = HashSet::new();
 
         for field in &object.fields {
-            if !taken.insert(field.name.as_str()) {
+            if !taken.insert(field.name.clone()) {
                 continue;
             }
             let scalar = scalar_for(&field.graphql_type);
@@ -337,13 +369,39 @@ pub fn build_inputs(
         // `where: {articles: {…}}` keeps the authors that have a matching
         // article.
         for relationship in relationship_fields.get(type_name).into_iter().flatten() {
-            if !taken.insert(relationship.name.as_str()) {
+            if !taken.insert(relationship.name.clone()) {
                 continue;
             }
             input = input.field(InputValue::new(
                 &relationship.name,
                 TypeRef::named(bool_exp_type_name(&relationship.target_type)),
             ));
+        }
+
+        // And by asking something about the whole set: `where:
+        // {articles_aggregate: {count: {predicate: {_gt: 2}}}}` keeps the
+        // authors with more than two articles, which no filter on one article
+        // can express. Only a relationship to many -- there is nothing to
+        // aggregate over one row.
+        for relationship in relationship_fields.get(type_name).into_iter().flatten() {
+            if !relationship.is_list {
+                continue;
+            }
+            let name = format!("{}_aggregate", relationship.name);
+            if object.fields.iter().any(|field| field.name == name) {
+                continue;
+            }
+            if !taken.insert(name.clone()) {
+                continue;
+            }
+            input = input.field(InputValue::new(
+                &name,
+                TypeRef::named(aggregate_bool_exp_type_name(&relationship.target_type)),
+            ));
+            // `count`'s predicate is an `Int` comparison whether or not any
+            // column is one, and a type the schema names and never registers
+            // makes the whole schema unbuildable.
+            scalars.insert("Int".to_string());
         }
 
         inputs.push(input);
