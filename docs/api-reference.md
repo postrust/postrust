@@ -3,10 +3,11 @@
 Complete reference for the Postrust REST and GraphQL APIs.
 
 > **Note on paths.** By default the REST API is served under `/api` (e.g.
-> `GET /api/users`, `POST /api/rpc/my_func`) and GraphQL under `/api/graphql`.
-> The endpoints below are shown as root-level paths — these work as-is when
-> [compatibility mode](configuration.md#compatibility-settings)
+> `GET /api/users`, `POST /api/rpc/my_func`) and GraphQL under `/v1/graphql`.
+> The REST endpoints below are shown as root-level paths — these work as-is
+> when [compatibility mode](configuration.md#compatibility-settings)
 > (`PGRST_COMPAT_MODE=true`) is enabled; otherwise prefix them with `/api`.
+> GraphQL is served at `/v1/graphql` either way.
 
 ## Endpoints
 
@@ -40,10 +41,14 @@ top-level array for set-returning ones.
 
 | Method | Endpoint | Description |
 |--------|----------|-------------|
-| `GET` | `/api/graphql` | GraphQL Playground |
-| `POST` | `/api/graphql` | Execute GraphQL query/mutation |
+| `POST` | `/v1/graphql` | Execute a query or mutation |
+| `GET` | `/v1/graphql` | GraphQL Playground |
+| `GET` | `/v1/graphql/ws` | Subscriptions over WebSocket |
+| `POST` | `/api/graphql` | The same surface, under the REST prefix |
 
-GraphQL is always served under `/api/graphql`, including in compatibility mode.
+GraphQL is served at both addresses whether or not compatibility mode is on.
+`/v1/graphql` is the one a Hasura client can be told about. See
+[GraphQL API](#graphql-api) for the schema it serves.
 
 ### Schema
 
@@ -391,291 +396,328 @@ Accept: application/openapi+json
 
 ## GraphQL API
 
-Postrust provides a full GraphQL API that mirrors the REST API functionality. The GraphQL schema is dynamically generated from the database schema.
+Postrust serves a GraphQL API generated from the database schema, in the
+dialect Hasura speaks. A client generated against Hasura -- its queries, its
+codegen output, its endpoint -- points at this server unchanged.
 
-### GraphQL Playground
+### Endpoints
 
-Access the interactive GraphQL Playground by visiting `/graphql` in your browser:
+| Method | Endpoint | Description |
+|--------|----------|-------------|
+| `POST` | `/v1/graphql` | Execute a query or mutation |
+| `GET` | `/v1/graphql` | GraphQL Playground |
+| `GET` | `/v1/graphql/ws` | Subscriptions over WebSocket |
+| `POST` | `/api/graphql` | The same surface, for anything already pointed here |
 
-```
-http://localhost:3000/api/graphql
-```
+`/v1/graphql` is where a Hasura client sends its queries and, for most
+generated clients, the only address they can be told about.
 
-### Query Structure
+### Shape of the schema
 
-The GraphQL schema provides:
+For a table `author`, with a to-many relationship `articles`:
 
-- **Query type**: Read operations for all exposed tables
-- **Mutation type**: Create/Update/Delete operations for all mutable tables
-- **Object types**: One per table with fields for each column
-- **Relationship fields**: Nested objects for foreign key relationships
-- **Filter inputs**: Type-safe filtering matching REST operators
-- **Order/Pagination**: Sorting and pagination arguments
+| Root field | What it answers |
+|---|---|
+| `author(where:, order_by:, distinct_on:, limit:, offset:)` | the rows |
+| `author_by_pk(id: 1)` | one row, or null |
+| `author_aggregate(where: …)` | `aggregate { count sum { … } }` and `nodes { … }` |
+| `insert_author(objects:, on_conflict:)` | `affected_rows` and `returning { … }` |
+| `insert_author_one(object:, on_conflict:)` | the row written |
+| `update_author(where:, _set:, _inc:, …)` | `affected_rows` and `returning { … }` |
+| `update_author_by_pk(pk_columns: {id: 1}, _set:)` | the row written |
+| `delete_author(where:)` | `affected_rows` and `returning { … }` |
+| `delete_author_by_pk(id: 1)` | the row removed |
+
+The root types are named `query_root` and `mutation_root`.
 
 ### Queries
 
-#### List Query
-
-Query all rows from a table:
-
 ```graphql
 query {
-  users {
+  author(
+    where: { name: { _ilike: "%rust%" } }
+    order_by: [{ created_at: desc_nulls_last }, { name: asc }]
+    limit: 10
+    offset: 20
+  ) {
     id
     name
-    email
-    createdAt
+    articles(where: { published: { _eq: true } }, limit: 5) {
+      id
+      title
+    }
+    articles_aggregate {
+      aggregate {
+        count
+      }
+    }
   }
 }
 ```
 
-#### Query by Primary Key
-
-Query a single row by primary key:
-
-```graphql
-query {
-  userByPk(id: 1) {
-    id
-    name
-    email
-  }
-}
-```
+An embedded list takes the same four arguments the root field does, applied
+inside the child's own subselect -- so the limit bounds rows per parent and the
+ordering happens before it.
 
 #### Filtering
 
-Apply filters using typed filter inputs:
+`where` takes a generated `<table>_bool_exp`. Every comparison is named for the
+type it applies to, so an unknown operator or an ill-typed operand is refused
+by validation rather than by the database.
+
+| Group | Operators |
+|---|---|
+| Any column | `_eq` `_neq` `_gt` `_gte` `_lt` `_lte` `_in` `_nin` `_is_null` |
+| Text | `_like` `_nlike` `_ilike` `_nilike` `_similar` `_nsimilar` `_regex` `_iregex` `_nregex` `_niregex` |
+| `json`/`jsonb` | `_contains` `_contained_in` `_has_key` `_has_keys_any` `_has_keys_all` `_jsonb_path_exists` `_jsonb_path_match` `_cast: { String: … }` |
+| `ltree` | `_ancestor` `_descendant` `_matches` `_matches_fulltext` and their `_any` forms |
+| PostGIS | `_st_contains` `_st_crosses` `_st_equals` `_st_intersects` `_st_overlaps` `_st_touches` `_st_within` `_st_d_within` `_st_3d_d_within` `_cast: { geography: … }` |
+
+Combine them with `_and`, `_or` and `_not`, and follow a relationship by naming
+it:
 
 ```graphql
 query {
-  users(filter: {
-    status: { eq: "active" },
-    age: { gte: 18 }
-  }) {
+  article(
+    where: {
+      _or: [
+        { author: { name: { _eq: "Ada" } } }
+        { _and: [{ views: { _gt: 100 } }, { published: { _eq: true } }] }
+      ]
+    }
+  ) {
     id
-    name
-  }
-}
-```
-
-Filter operators:
-
-| Operator | Description |
-|----------|-------------|
-| `eq` | Equal |
-| `neq` | Not equal |
-| `gt` | Greater than |
-| `gte` | Greater than or equal |
-| `lt` | Less than |
-| `lte` | Less than or equal |
-| `like` | SQL LIKE pattern |
-| `ilike` | Case-insensitive LIKE |
-| `in` | Value in list |
-| `isNull` | Is null check |
-
-#### Combining Filters
-
-Use `and`, `or`, and `not` for complex conditions:
-
-```graphql
-query {
-  users(filter: {
-    or: [
-      { status: { eq: "active" } },
-      { role: { eq: "admin" } }
-    ]
-  }) {
-    id
-    name
+    title
   }
 }
 ```
 
 #### Ordering
 
-Sort results with `orderBy`:
+`order_by` takes a **list** of single-key objects, because ordering is ordered:
+`{name: asc, id: desc}` is one object whose two keys have no defined
+precedence, and the client that wrote it meant name first.
+
+The direction is an enum: `asc`, `desc`, `asc_nulls_first`, `asc_nulls_last`,
+`desc_nulls_first`, `desc_nulls_last`. A direction given as null is no
+direction, which is how a client makes an ordering optional.
+
+You can order by a related row's column, or by an aggregate of a row's
+children:
 
 ```graphql
 query {
-  users(orderBy: ["createdAt_DESC", "name_ASC"]) {
-    id
+  author(
+    order_by: [
+      { articles_aggregate: { count: desc } }
+      { contact: { phone: asc } }
+    ]
+  ) {
     name
-    createdAt
   }
 }
 ```
 
-#### Pagination
-
-Limit and offset results:
+#### Aggregates
 
 ```graphql
 query {
-  users(limit: 10, offset: 20) {
-    id
-    name
-  }
-}
-```
-
-#### Nested Relationships
-
-Query related data through foreign keys:
-
-```graphql
-query {
-  orders {
-    id
-    total
-    status
-    customer {
-      name
-      email
+  article_aggregate(where: { author_id: { _eq: 1 } }) {
+    aggregate {
+      count
+      count_distinct: count(columns: [author_id], distinct: true)
+      sum { views }
+      avg { views }
+      max { published_on }
+      min { published_on }
+      stddev { views }
+      variance { views }
     }
-    items {
-      quantity
-      product {
-        name
-        price
-      }
+    nodes {
+      id
+      title
+      author { name }
     }
   }
 }
 ```
+
+`nodes` is a rows selection like any other: it takes relationships and computed
+fields, not only columns.
 
 ### Mutations
 
 #### Insert
 
-Insert one or more rows:
-
 ```graphql
 mutation {
-  insertUsers(objects: [
-    { name: "John", email: "john@example.com" },
-    { name: "Jane", email: "jane@example.com" }
-  ]) {
-    id
-    name
-    email
+  insert_author(
+    objects: [
+      { name: "Ada", articles: { data: [{ title: "On the Analytical Engine" }] } }
+      { name: "Grace" }
+    ]
+    on_conflict: { constraint: author_name_key, update_columns: [bio] }
+  ) {
+    affected_rows
+    returning {
+      id
+      name
+      articles { id title }
+    }
   }
 }
 ```
 
-Insert a single row:
+A nested object writes the related row in the same transaction, in either
+direction, and `affected_rows` counts every row written rather than every row
+returned. An empty `update_columns` is `DO NOTHING`.
 
-```graphql
-mutation {
-  insertUsersOne(object: { name: "John", email: "john@example.com" }) {
-    id
-    name
-  }
-}
-```
+`insert_author_one(object: {...})` is the same thing spelled for one row, and
+answers with the row rather than with a mutation response.
 
 #### Update
 
-Update rows matching a filter:
-
 ```graphql
 mutation {
-  updateUsers(
-    where: { status: { eq: "pending" } },
-    set: { status: "active" }
+  update_article(
+    where: { author: { name: { _eq: "Ada" } } }
+    _set: { published: true }
+    _inc: { views: 1 }
   ) {
-    id
-    name
-    status
+    affected_rows
+    returning { id title views }
   }
 }
 ```
 
-Update by primary key:
+| Operator | Effect |
+|---|---|
+| `_set` | replace the column |
+| `_inc` | add to a numeric column |
+| `_append` / `_prepend` | concatenate onto a `jsonb` column |
+| `_delete_key` | remove a key |
+| `_delete_elem` | remove an array element by index |
+| `_delete_at_path` | remove at a path, given as a list of keys |
 
-```graphql
-mutation {
-  updateUsersByPk(
-    id: 1,
-    set: { name: "Updated Name" }
-  ) {
-    id
-    name
-  }
-}
-```
+`update_article_by_pk(pk_columns: {id: 1}, _set: {...})` addresses one row. An
+update that changes nothing changes no rows and says so.
 
 #### Delete
 
-Delete rows matching a filter:
-
 ```graphql
 mutation {
-  deleteUsers(where: { status: { eq: "deleted" } }) {
-    id
-    name
+  delete_article(where: { published: { _eq: false } }) {
+    affected_rows
+    returning {
+      id
+      title
+      author { name }
+    }
   }
 }
 ```
 
-Delete by primary key:
+`returning` can carry relationships: the delete runs in a CTE and the
+projection reads from it, while the rows it points at are still there.
+
+#### One mutation is one transaction
+
+A mutation may name several root fields, and they are resolved one after
+another inside a single transaction. If any of them fails, none of them
+happened.
 
 ```graphql
 mutation {
-  deleteUsersByPk(id: 1) {
-    id
-    name
-  }
+  insert_order(objects: { customer_id: 1 }) { affected_rows }
+  insert_order_line(objects: { order_id: 1, sku: "X" }) { affected_rows }
 }
 ```
+
+### Errors
+
+Errors come back in Hasura's envelope, which client code branches on: there is
+no `data` key at all on failure, and `extensions.code` is the machine-readable
+half.
+
+```json
+{
+  "errors": [
+    {
+      "message": "duplicate key value violates unique constraint \"author_name_key\"",
+      "extensions": { "path": "$", "code": "constraint-violation" }
+    }
+  ]
+}
+```
+
+The status is 200 for all of it. A GraphQL error is a value in the response
+body, not a transport failure.
+
+### Names the schema cannot carry
+
+Hasura keeps some names in metadata rather than in the database: what a
+relationship is called, what a computed field is called, what a table's type is
+called. Reflection cannot recover a name nobody wrote down, so they are given
+to the server through `PGRST_GRAPHQL_NAMES`, and `scripts/hasura-names.py`
+converts them out of an existing Hasura deployment. See
+[Configuration](./configuration.md#graphql-names).
 
 ### Type Mapping
 
-PostgreSQL types are mapped to GraphQL types:
+Scalars keep their PostgreSQL names, because `query ($x: jsonb!)` names a type
+and a client that declares one is naming this.
 
 | PostgreSQL | GraphQL |
 |------------|---------|
 | `integer`, `int4`, `int2`, `smallint` | `Int` |
-| `bigint`, `int8` | `BigInt` |
+| `bigint`, `int8` | `bigint` |
 | `real`, `float4`, `float8`, `double precision` | `Float` |
-| `numeric`, `decimal` | `BigDecimal` |
+| `numeric`, `decimal` | `numeric` |
 | `boolean` | `Boolean` |
 | `text`, `varchar`, `char` | `String` |
-| `json`, `jsonb` | `JSON` |
-| `uuid` | `UUID` |
-| `timestamp`, `timestamptz` | `DateTime` |
-| `date` | `Date` |
-| `time`, `timetz` | `Time` |
+| `citext` | `citext` |
+| `json`, `jsonb` | `json`, `jsonb` |
+| `uuid` | `uuid` |
+| `timestamp`, `timestamptz` | `timestamp`, `timestamptz` |
+| `date`, `time`, `timetz` | `date`, `time`, `timetz` |
+| `geometry`, `geography` | `geometry`, `geography` -- GeoJSON in both directions |
+| `ltree` | `ltree` |
+| a type this server knows nothing about | a scalar of that name |
 | `_type` (arrays) | `[InnerType]` |
+
+A table marked as an enumeration in `PGRST_GRAPHQL_NAMES` becomes a GraphQL
+enum built from its rows, and every column with a foreign key to it is typed as
+that enum.
 
 ### Authentication
 
 GraphQL requests use the same JWT authentication as REST:
 
 ```bash
-curl -X POST http://localhost:3000/api/graphql \
+curl -X POST http://localhost:3000/v1/graphql \
   -H "Authorization: Bearer eyJhbGciOiJIUzI1NiIs..." \
   -H "Content-Type: application/json" \
-  -d '{"query": "{ users { id name } }"}'
+  -d '{"query": "{ author { id name } }"}'
 ```
 
-The JWT role is used for PostgreSQL Row-Level Security, just like REST requests.
+The JWT role is used for PostgreSQL row-level security, just as for REST. The
+`x-hasura-*` claims of a verified token become `SET LOCAL` settings, so a
+policy reading `current_setting('hasura.user_id')` sees what a Hasura
+permission rule would have seen. Session variables come from the token, never
+from request headers: honouring the header would let any caller name its own
+identity.
 
 ### Introspection
 
-The GraphQL schema supports full introspection:
+The schema supports full introspection, which is what a codegen tool reads:
 
 ```graphql
 query {
   __schema {
+    queryType { name }
     types {
       name
-      fields {
-        name
-        type {
-          name
-        }
-      }
+      fields { name type { name kind } }
     }
   }
 }
@@ -685,12 +727,13 @@ query {
 
 | Feature | REST | GraphQL |
 |---------|------|---------|
-| Endpoint | Multiple (`/users`, `/orders`) | Single (`/graphql`) |
+| Endpoint | Multiple (`/users`, `/orders`) | Single (`/v1/graphql`) |
 | Field selection | `?select=id,name` | Query fields |
-| Filtering | `?status=eq.active` | `filter: { status: { eq: "active" } }` |
+| Filtering | `?status=eq.active` | `where: { status: { _eq: "active" } }` |
 | Relationships | `?select=*,customer(*)` | Nested fields |
 | Pagination | `?limit=10&offset=20` | `limit: 10, offset: 20` |
 | Multiple resources | Multiple requests | Single query |
+| Multiple writes | Multiple requests | One transaction |
 | Response shape | Fixed | Matches query |
 
 ## Admin UI
