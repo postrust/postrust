@@ -425,6 +425,7 @@ For a table `author`, with a to-many relationship `articles`:
 | `insert_author_one(object:, on_conflict:)` | the row written |
 | `update_author(where:, _set:, _inc:, …)` | `affected_rows` and `returning { … }` |
 | `update_author_by_pk(pk_columns: {id: 1}, _set:)` | the row written |
+| `update_author_many(updates: [{where, _set, …}])` | one mutation response per update |
 | `delete_author(where:)` | `affected_rows` and `returning { … }` |
 | `delete_author_by_pk(id: 1)` | the row removed |
 
@@ -601,6 +602,24 @@ mutation {
 
 `update_article_by_pk(pk_columns: {id: 1}, _set: {...})` addresses one row. An
 update that changes nothing changes no rows and says so.
+
+`update_article_many(updates: [...])` applies several updates, each with its
+own filter, in the order given, and answers with one mutation response per
+entry. They share a transaction, so this is not the same as sending them one at
+a time:
+
+```graphql
+mutation {
+  update_article_many(
+    updates: [
+      { where: { id: { _eq: 1 } }, _set: { title: "First" } }
+      { where: { author_id: { _eq: 2 } }, _inc: { views: 1 } }
+    ]
+  ) {
+    affected_rows
+  }
+}
+```
 
 #### Delete
 

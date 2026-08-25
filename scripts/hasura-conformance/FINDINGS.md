@@ -8,10 +8,10 @@ harness itself, divergences kept on purpose, and the gaps still open.
 
 | | status | same outcome | same data | full body |
 |---|---|---|---|---|
-| all (464) | 97.8% | 67.2% | **61.9%** | 37.9% |
-| **excluding the 142 permission cases (322)** | | | **80.4%** | |
+| all (464) | 97.8% | 69.0% | **64.9%** | 40.9% |
+| **excluding the 142 permission cases (322)** | | | **84.8%** | |
 
-Of the 287 cases the third column counts, **176 agree about data and 111 agree
+Of the 301 cases the third column counts, **190 agree about data and 111 agree
 only because both servers answered with errors.** A further 111 are cases where
 Hasura refused and this server answered -- which is where a mutual-refusal case
 goes the moment this server gains the field it was missing.
@@ -22,17 +22,20 @@ every case lost went from `errors -> errors` to `errors -> data`, and nothing
 else did. The report prints the split, because a headline that mixes the two is
 not readable as progress.
 
-**176 is the figure that tracks the work.** It counts the cases where the same
+**190 is the figure that tracks the work.** It counts the cases where the same
 query came back with the same rows, which is the only thing a client can feel.
+Against it, **42 cases where Hasura answered with data and this server did not
+match it** -- down from 95.
 
 **The candidate is configured.** Each group's fixtures are converted into a
 `PGRST_GRAPHQL_NAMES` document by `scripts/hasura-names.py` and given to the
 server, because the names Hasura writes into metadata are not recoverable from
-a schema and a migration converts them. 20 of the 61 groups name something.
+a schema and a migration converts them. 25 of the 61 groups name something.
 
 Twenty-nine groups agree completely, among them every boolean-expression group
-except `basic`, both ordering groups, both update groups, GeoJSON writes,
-aggregates, transactions and deletes.
+except `basic`, both ordering groups, all three update groups, deletes, GeoJSON
+writes, aggregates, transactions, both `custom_schema` groups and
+`graphql_introspection/descriptions`.
 
 The same-data figure over successive fixes: 34.1 → 41.8 (duplicate-field
 panic) → 43.8 (enum arguments read) → 44.2 (relationship predicates, aggregate
@@ -49,18 +52,18 @@ as root fields; see the split above for why this reads as a loss) → 61.0
 (aggregate `nodes` as rows, the jsonb comparisons, unused variables, four
 orderings, null relationships, GeoJSON through variables) → 61.9 (relationships
 in a delete's `returning`, relationship predicates in a write, `_delete_at_path`,
-written-value casts, one transaction per mutation).
+one transaction per mutation) → 63.6 (per-root names and column renaming) →
+64.9 (metadata descriptions, `update_x_many`, sorted roots).
 
-Read as real agreement rather than as the headline, that is 137 → 167 → 176
-over the last three runs, against 95 → 65 → 56 cases where Hasura answered with
-data and this server did not match it. The figure excluding the permission
-cases went 51.2 → 55.3 → 55.9 → 58.4 → 60.6 → 62.4 → 64.0 → 64.6 → 64.0 → 66.8
-→ 67.4 → 67.4 → 78.0 → **80.4**.
+Read as real agreement rather than as the headline, that is 137 → 167 → 176 →
+184 → 190 over the last five runs. The figure excluding the permission cases
+went 51.2 → 55.3 → 55.9 → 58.4 → 60.6 → 62.4 → 64.0 → 64.6 → 64.0 → 66.8 →
+67.4 → 67.4 → 78.0 → 80.4 → 82.9 → **84.8**.
 
 **142 of the 464 cases cannot pass and are counted anyway.** They are the cases
 Hasura answers `access-denied` to, from a rule that lives in metadata, and
-there is no metadata here. Excluding them the figure is **259/322 = 80.4%**,
-and every one of the 176 real agreements is inside that 322.
+there is no metadata here. Excluding them the figure is **273/322 = 84.8%**,
+and every one of the 190 real agreements is inside that 322.
 
 That gap is worth understanding, because the headline moves less than the work
 behind it. Many of those permission cases "agree" only in the sense that both
@@ -164,37 +167,7 @@ wrong one.
 
 ## Open, ordered by consequence
 
-1. **Names Hasura takes from metadata rather than from the schema.** This is
-   one item, not the several it looked like: the function is
-   `fetch_articles_plain` and the field Hasura exposes is `get_articles`,
-   because `add_computed_field` named it. Same for a computed field's name, for
-   relationship names, for custom root field names and for column names.
-   Reflection cannot recover a name nobody wrote down.
-
-   `PGRST_GRAPHQL_NAMES` takes the ones it can — table base names,
-   relationship names, computed field names — and `scripts/hasura-names.py`
-   converts them out of a running engine, a metadata directory, an exported
-   document, or a list of commands. The harness does this per group, so the
-   figures above are the configured ones.
-
-   What is left is the two Hasura keeps that this does not carry:
-
-   - **Per-root names.** Hasura names each root separately — `select: Authors`,
-     `select_by_pk: Author`, `select_aggregate: AuthorAgg` — where this server
-     derives all of them from one base name. A set that agrees on a base
-     converts; the `custom_schema` groups do not agree on one and are left
-     alone rather than guessed at.
-   - **Column renaming.** `custom_column_names` maps `id` to `AuthorId`, and
-     nothing here does. This is the larger of the two: a renamed column has to
-     be translated in the projection, in `where`, in `order_by`, in
-     `distinct_on`, in the insert and update inputs and in every embed, which
-     is a boundary rather than a lookup.
-
-   Together they are roughly 14 cases, in `graphql_mutation/custom_schema`,
-   `graphql_query/custom_schema`, `graphql_introspection/custom_table_name`,
-   `v1/set_table_configuration` and `v1/set_table_custom_fields`.
-
-2. **A computed field can take arguments.** `locations_distance("from" json,
+1. **A computed field can take arguments.** `locations_distance("from" json,
    locations_row locations)` is a computed field whose row is one argument and
    whose caller supplies the other. The schema cache carries a computed
    column's function, its return type and its comment, and not its arguments,
@@ -202,44 +175,34 @@ wrong one.
    `json` type is not resolved": the scalar is unregistered because no *column*
    is a json, and the argument that names it is invisible.
 
-3. **What is left of the enum tables.** They work: a marked table's rows are a
+2. **What is left of the enum tables.** They work: a marked table's rows are a
    generated enum and referencing columns are typed as it. What remains is the
    metadata API around them — `v1/set_table_is_enum` is four cases of turning
    the flag on and off through `/v1/query`, which is the contract this server
    does not offer.
 
-4. **`on_conflict` inside a nested insert.** The top-level upsert works;
+3. **`on_conflict` inside a nested insert.** The top-level upsert works;
    `{author: {data: {...}, on_conflict: {...}}}` does not, because the nested
    object has no `on_conflict` argument declared.
 
-5. **A one-to-one whose child key *is* the parent's.** `insert_author_one(object:
+4. **A one-to-one whose child key *is* the parent's.** `insert_author_one(object:
    {name: …, detail_fk: {data: {phone: …}}})` where `detail.id` references
    `author.id`: the parent has to be written first and its key pushed down,
-   which is the opposite of the ordinary to-one rule. The manual relationships
-   beside it (`detail_manual`) are item 1.
+   which is the opposite of the ordinary to-one rule.
 
-6. **Variable validation.** Hasura refuses a variable declared as one type and
+5. **Variable validation.** Hasura refuses a variable declared as one type and
    used where another is expected, and a null passed for a non-nullable one;
    this server answers data for several of those. Probed by hand, async-graphql
    does refuse the plain cases -- `$limit: String` used as an `Int` is caught
    -- so what the corpus exercises is narrower than "no validation" and has not
    been pinned down.
 
-7. **The two cases typing the mutation inputs cost.** `objects` and `_set`
-   were `JSON`, which accepted a relationship under whatever name the request
-   used; they are generated types now, so a relationship this server named
-   differently is refused by validation rather than reaching a resolver that
-   would also have failed. The change is kept: a client can generate types from
-   the mutation surface for the first time, and both cases are the naming gap
-   in item 1 wearing a different error. Recorded because the number went down
-   and a reader is owed the reason.
-
-8. **Relationship predicates through a junction** are refused rather than
+6. **Relationship predicates through a junction** are refused rather than
    resolved: reaching the child means going through a third table, which is
    more than a pair of columns to correlate on. The computed-relationship half
    of this is resolved, by argument rather than by columns.
 
-9. **Function permissions and the session argument.** All six of the corpus's
+7. **Function permissions and the session argument.** All six of the corpus's
    functions are exposed. What is left in that group is Hasura's own two
    decisions about them: a function is unavailable to a role until
    `create_function_permission` grants it -- which is the permission model, not
@@ -247,20 +210,34 @@ wrong one.
    from session variables rather than taken from the client, where here it is
    an ordinary argument the client must pass.
 
-10. **A batched request.** A body that is a JSON *array* of operations is
-    answered by Hasura with an array of responses. Three cases in
-    `graphql_query/basic` use it, and the harness does not extract them, so
-    this is unmeasured rather than failing -- recorded because it is a contract
-    a client can depend on and this server does not offer it.
+8. **A batched request.** A body that is a JSON *array* of operations is
+   answered by Hasura with an array of responses. Three cases in
+   `graphql_query/basic` use it, and the harness does not extract them, so
+   this is unmeasured rather than failing -- recorded because it is a contract
+   a client can depend on and this server does not offer it.
 
-11. **`update_x_many`.** Hasura exposes a root field taking a list of
-    `{where, _set}` pairs, applied in order in one transaction. Not in the
-    corpus's assertions, but in its introspection.
+9. **`count(columns: [...], distinct: true)`.** The argument is declared and
+   ignored: every `count` is `count(*)`. The corpus case that uses it passes
+   because the two answers happen to agree on its data, which is worth writing
+   down before someone reads that as coverage.
 
-12. **Actions and Apollo federation** are subsystems rather than gaps:
+10. **A manual relationship** -- one Hasura maps column by column rather than
+    by a foreign key -- has no constraint to key a name by, so
+    `PGRST_GRAPHQL_NAMES` cannot carry its name and the converter says so
+    rather than guessing. Two cases in `graphql_mutation/insert/nested`.
+
+11. **Actions and Apollo federation** are subsystems rather than gaps:
     `actions/*` describes handlers Hasura calls out to over HTTP, and
     `apollo_federation` describes the `_service`/`_entities` surface a
     federated gateway composes. Five cases between them.
+
+12. **The two cases typing the mutation inputs cost.** `objects` and `_set`
+    were `JSON`, which accepted a relationship under whatever name the request
+    used; they are generated types now, so a relationship this server named
+    differently is refused by validation rather than reaching a resolver that
+    would also have failed. The change is kept: a client can generate types
+    from the mutation surface for the first time. Recorded because the number
+    went down and a reader is owed the reason.
 
 ## Fixed since the first run
 
@@ -438,6 +415,33 @@ wrong one.
   `columns and relationships of "x"`, `A computed field, executes function
   "f"`. A schema with no comments in it documents itself the way the one it
   replaces did.
+
+- **The names Hasura keeps that a schema cannot**, in full: per-root names for
+  the cases a base name cannot reach (`select_by_pk: Article` beside `select:
+  Articles`), and column renaming. The second reaches everywhere -- a renamed
+  column appears in the projection, in `where`, in `order_by`, in
+  `distinct_on`, in the key arguments, in both mutation inputs, in
+  `on_conflict.update_columns` and in every embed and aggregate -- and each of
+  those is now a place that asks what column a field name means. The rename
+  goes in the projection *over* the subquery, never inside it, so the row a
+  computed field is passed is still the table's own composite; `RETURNING`
+  keeps the table's names for the same reason, since a nested insert reads the
+  parent's key out of it. `graphql_query/custom_schema` 0/2 → 2/2 and
+  `graphql_mutation/custom_schema` 0/4 → 4/4, and nothing regressed: 8 gained,
+  0 lost.
+- **The descriptions Hasura keeps in metadata** -- for the table, each column,
+  each root field and each computed field. An empty comment is not silence: it
+  means the field has no description, which is how the corpus hides one the
+  database has. Beside it, a converter bug this found: a custom root field may
+  be written as a bare name or as `{name, comment}`, and only the first shape
+  was read.
+- **`update_x_many`**, which applies several updates each with its own filter,
+  in one transaction. And root fields introspect in name order, which is
+  Hasura's order and does not depend on which table this server read first.
+  `_schema` -- a field returning the string "Postrust GraphQL Schema", on every
+  query root and in every generated client's types -- is gone; the empty-schema
+  placeholder it was holding up is now called `no_queries_available`, which is
+  what Hasura calls its own.
 
 ## Not measured
 
