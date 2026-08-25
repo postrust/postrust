@@ -3585,21 +3585,28 @@ fn comparison_sql(
         };
         let mut conditions = Vec::new();
         for (target, comparisons) in casts {
-            if !matches!(target.as_str(), "geometry" | "geography") {
-                return Err(async_graphql::Error::new(format!(
-                    "cannot compare \"{}\" as \"{}\"",
-                    column, target
-                )));
-            }
+            // The GraphQL name of what is being compared as, and the
+            // PostgreSQL type behind it. `String` is the one that differs:
+            // a document compared as text is compared as `text`.
+            let pg_type = match target.as_str() {
+                "geometry" | "geography" => target.as_str(),
+                "String" => "text",
+                _ => {
+                    return Err(async_graphql::Error::new(format!(
+                        "cannot compare \"{}\" as \"{}\"",
+                        column, target
+                    )))
+                }
+            };
             let serde_json::Value::Object(ops) = comparisons else {
                 continue;
             };
-            let cast = format!("{}::{}", quoted, target);
+            let cast = format!("{}::{}", quoted, pg_type);
             for (nested_op, nested_operand) in ops {
                 conditions.push(comparison_sql(
                     &cast,
                     column,
-                    Some(target),
+                    Some(pg_type),
                     nested_op,
                     nested_operand,
                     param_idx,
@@ -3645,6 +3652,24 @@ fn comparison_sql(
         return Ok(format!("{} {} {}::{}", quoted, operator, placeholder, cast));
     }
 
+    // The path language is a query over the document rather than a comparison
+    // against one, so it is a function of the column and the path: `_exists`
+    // asks whether the path selects anything, `_match` whether the predicate
+    // it ends in holds.
+    if let Some(function) = match op {
+        "_jsonb_path_exists" => Some("jsonb_path_exists"),
+        "_jsonb_path_match" => Some("jsonb_path_match"),
+        _ => None,
+    } {
+        let placeholder = format!("${}", param_idx);
+        *param_idx += 1;
+        values.push(operand.clone());
+        return Ok(format!(
+            "{}({}, {}::jsonpath)",
+            function, quoted, placeholder
+        ));
+    }
+
     // Comparisons binding exactly one parameter, by the SQL they become.
     let binary = match op {
         "_eq" => Some("="),
@@ -3672,7 +3697,18 @@ fn comparison_sql(
     if let Some(sql_op) = binary {
         let placeholder = format!("${}", param_idx);
         *param_idx += 1;
-        values.push(operand.clone());
+        // A containment operand is a whole document, and `"latest"` is one --
+        // a JSON string, which is not the same text as `latest`. Binding the
+        // bare string answered `invalid input syntax for type json`, so what
+        // goes over the wire is the value as it is written in JSON.
+        values.push(match op {
+            "_contains" | "_contained_in" => match operand {
+                serde_json::Value::String(_) | serde_json::Value::Number(_)
+                | serde_json::Value::Bool(_) => serde_json::Value::String(operand.to_string()),
+                other => other.clone(),
+            },
+            _ => operand.clone(),
+        });
         // A bound parameter arrives as text and PostgreSQL infers a type for
         // it from the operator, which works only while the inference is
         // unambiguous. `jsonb @> text` is not an operator at all; and `id =

@@ -63,6 +63,10 @@ fn code_for(error: &ServerError) -> &'static str {
         || message.contains("cannot query field")
         || message.contains("expected")
         || message.contains("unknown field")
+        // Everything the variable rules say. A document that names a variable
+        // it never declared is refused before a resolver runs, so calling it a
+        // database error sends a client looking in the wrong place.
+        || message.starts_with("variable \"")
     {
         "validation-failed"
     } else {
@@ -181,5 +185,177 @@ mod tests {
     fn a_constraint_message_is_coded_as_one() {
         let error = ServerError::new("duplicate key value violates unique constraint", None);
         assert_eq!(code_for(&error), "constraint-violation");
+    }
+}
+
+/// Drop variable definitions the document never uses.
+///
+/// The specification's "All Variables Used" rule makes
+/// `query ($tags: jsonb) { article(where: {tags: {_contains: "latest"}}) { id } }`
+/// an invalid document, and async-graphql refuses it. Hasura executes it. A
+/// client that has been sending that query for years -- because a filter was
+/// edited and the declaration was left behind -- gets an answer from the server
+/// it is migrating off and an error from this one, which is the kind of
+/// difference a migration discovers in production.
+///
+/// So the document is parsed here, the unused declarations are removed, and
+/// what validation sees has nothing to complain about. Every other rule still
+/// runs: this makes one specific refusal go away, not validation in general.
+/// A document that does not parse is handed on untouched, so the parse error is
+/// reported by the executor with its own position rather than by this.
+pub fn allow_unused_variables(mut request: async_graphql::Request) -> async_graphql::Request {
+    use async_graphql::parser::types::{
+        DocumentOperations, ExecutableDocument, Selection, SelectionSet,
+    };
+    use async_graphql::Name;
+    // The executable `Value`, which has a `Variable` case; `async_graphql::Value`
+    // is the constant one a variable has already been substituted into.
+    use async_graphql_value::Value;
+
+    let Ok(mut doc): Result<ExecutableDocument, _> =
+        async_graphql::parser::parse_query(&request.query)
+    else {
+        return request;
+    };
+
+    fn from_value(value: &Value, used: &mut std::collections::HashSet<Name>) {
+        match value {
+            Value::Variable(name) => {
+                used.insert(name.clone());
+            }
+            Value::List(items) => items.iter().for_each(|item| from_value(item, used)),
+            Value::Object(fields) => {
+                fields.values().for_each(|field| from_value(field, used))
+            }
+            _ => {}
+        }
+    }
+
+    fn from_selection_set(set: &SelectionSet, used: &mut std::collections::HashSet<Name>) {
+        for selection in &set.items {
+            let (directives, arguments, nested) = match &selection.node {
+                Selection::Field(field) => (
+                    &field.node.directives,
+                    Some(&field.node.arguments),
+                    Some(&field.node.selection_set),
+                ),
+                Selection::FragmentSpread(spread) => (&spread.node.directives, None, None),
+                Selection::InlineFragment(fragment) => (
+                    &fragment.node.directives,
+                    None,
+                    Some(&fragment.node.selection_set),
+                ),
+            };
+            for directive in directives {
+                for (_, value) in &directive.node.arguments {
+                    from_value(&value.node, used);
+                }
+            }
+            for (_, value) in arguments.into_iter().flatten() {
+                from_value(&value.node, used);
+            }
+            if let Some(nested) = nested {
+                from_selection_set(&nested.node, used);
+            }
+        }
+    }
+
+    // Every variable named anywhere in the document, rather than per operation.
+    // Over-counting only keeps a declaration that would have been kept before,
+    // and a variable declared by one operation and used by another is exactly
+    // the case this is here to stop refusing.
+    let mut used = std::collections::HashSet::new();
+    for (_, operation) in doc.operations.iter() {
+        for directive in &operation.node.directives {
+            for (_, value) in &directive.node.arguments {
+                from_value(&value.node, &mut used);
+            }
+        }
+        from_selection_set(&operation.node.selection_set.node, &mut used);
+    }
+    for fragment in doc.fragments.values() {
+        from_selection_set(&fragment.node.selection_set.node, &mut used);
+    }
+
+    let mut dropped = false;
+    let mut prune = |operation: &mut async_graphql::Positioned<
+        async_graphql::parser::types::OperationDefinition,
+    >| {
+        let before = operation.node.variable_definitions.len();
+        operation
+            .node
+            .variable_definitions
+            .retain(|definition| used.contains(&definition.node.name.node));
+        dropped |= operation.node.variable_definitions.len() != before;
+    };
+    match &mut doc.operations {
+        DocumentOperations::Single(operation) => prune(operation),
+        DocumentOperations::Multiple(operations) => {
+            operations.values_mut().for_each(prune)
+        }
+    }
+
+    if dropped {
+        request.set_parsed_query(doc);
+    }
+    request
+}
+
+#[cfg(test)]
+mod unused_variable_tests {
+    use super::*;
+
+    fn declarations(query: &str) -> Vec<String> {
+        let request = allow_unused_variables(async_graphql::Request::new(query));
+        // A request whose declarations were all used is handed on with nothing
+        // parsed, so what the executor sees is the source text.
+        let mut request = request;
+        let doc = request.parsed_query().expect("the query parses");
+        doc.operations
+            .iter()
+            .flat_map(|(_, operation)| operation.node.variable_definitions.iter())
+            .map(|definition| definition.node.name.node.to_string())
+            .collect()
+    }
+
+    #[test]
+    fn a_variable_nothing_names_is_dropped() {
+        assert_eq!(
+            declarations("query ($tags: jsonb) { article(where: {id: {_eq: 1}}) { id } }"),
+            Vec::<String>::new()
+        );
+    }
+
+    #[test]
+    fn a_variable_an_argument_names_is_kept() {
+        assert_eq!(
+            declarations("query ($id: Int) { article(where: {id: {_eq: $id}}) { id } }"),
+            vec!["id".to_string()]
+        );
+    }
+
+    #[test]
+    fn a_variable_named_inside_a_list_is_kept() {
+        assert_eq!(
+            declarations("query ($id: Int) { article(where: {_or: [{id: {_eq: $id}}]}) { id } }"),
+            vec!["id".to_string()]
+        );
+    }
+
+    #[test]
+    fn a_variable_only_a_fragment_names_is_kept() {
+        assert_eq!(
+            declarations(
+                "query ($n: Int) { author { ...rows } } \
+                 fragment rows on author { articles(limit: $n) { id } }"
+            ),
+            vec!["n".to_string()]
+        );
+    }
+
+    #[test]
+    fn a_document_that_does_not_parse_is_left_alone() {
+        let request = allow_unused_variables(async_graphql::Request::new("query ("));
+        assert_eq!(request.query, "query (");
     }
 }

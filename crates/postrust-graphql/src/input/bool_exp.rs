@@ -212,6 +212,21 @@ fn comparison_input(scalar: &str) -> InputObject {
         input = input.field(InputValue::new("_has_key", TypeRef::named("String")));
         input = input.field(InputValue::new("_has_keys_any", TypeRef::named_list("String")));
         input = input.field(InputValue::new("_has_keys_all", TypeRef::named_list("String")));
+        // A document has no `LIKE`, and the text it renders as does. Casting
+        // is how a client asks the pattern question of a column whose type
+        // cannot answer it.
+        input = input.field(InputValue::new(
+            "_cast",
+            TypeRef::named(format!("{}_cast_exp", scalar)),
+        ));
+    }
+    if scalar == "jsonb" {
+        // The path language, which is a query over the document rather than a
+        // comparison against one: `_exists` asks whether the path selects
+        // anything, `_match` whether the predicate it ends in holds.
+        input = input
+            .field(InputValue::new("_jsonb_path_exists", TypeRef::named("String")))
+            .field(InputValue::new("_jsonb_path_match", TypeRef::named("String")));
     }
 
     input
@@ -323,6 +338,14 @@ pub fn build_inputs(
         named.insert("ltxtquery".to_string());
     }
 
+    // A document casts to the text it renders as, so a schema carrying one
+    // needs the text comparisons even where no column is text. Added after
+    // `named`, because `String` is a built-in and registering it as a scalar
+    // of our own is a duplicate the schema refuses to build with.
+    if scalars.contains("jsonb") || scalars.contains("json") {
+        scalars.insert("String".to_string());
+    }
+
     let mut comparisons: Vec<InputObject> =
         scalars.iter().map(|s| comparison_input(s)).collect();
 
@@ -365,6 +388,18 @@ pub fn build_inputs(
                     TypeRef::named(comparison_type_name("geometry")),
                 )),
         );
+    }
+    for document in ["jsonb", "json"] {
+        if scalars.contains(document) {
+            comparisons.push(
+                InputObject::new(format!("{}_cast_exp", document))
+                    .description(format!("Compare a {} column as another type.", document))
+                    .field(InputValue::new(
+                        "String",
+                        TypeRef::named(comparison_type_name("String")),
+                    )),
+            );
+        }
     }
     if scalars.contains("raster") {
         comparisons.push(

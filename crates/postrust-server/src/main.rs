@@ -304,11 +304,12 @@ async fn main() -> Result<()> {
                 )
                 .with_session(session);
 
-                let request = req
-                    .into_inner()
-                    .data(gql_ctx)
-                    .data(app_state.gql_state.pool.clone())
-                    .data(Arc::clone(&app_state.gql_state.broker));
+                let request = postrust_graphql::hasura::allow_unused_variables(
+                    req.into_inner(),
+                )
+                .data(gql_ctx)
+                .data(app_state.gql_state.pool.clone())
+                .data(Arc::clone(&app_state.gql_state.broker));
                 let response = app_state.gql_state.schema.execute(request).await;
                 Json(postrust_graphql::hasura::envelope(response))
             }

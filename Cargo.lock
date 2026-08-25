@@ -2401,6 +2401,7 @@ version = "0.4.0"
 dependencies = [
  "async-graphql",
  "async-graphql-axum",
+ "async-graphql-value",
  "axum",
  "base64",
  "bytes",
