@@ -262,11 +262,19 @@ def derived_relationship_name(entry, kind, bases):
     if kind == "object":
         # The object side names the table it points at, which the metadata
         # does not carry -- only the column carrying the key. `author_id`
-        # pointing at `author` is the ordinary spelling and the only one that
+        # pointing at `author` is the ordinary spelling, and the only one that
         # can be checked without a database.
+        #
+        # `None` where it cannot be checked, which the caller reads as "write
+        # the name down". A column that is not `<table>_id` -- `parent_id` on a
+        # self-reference -- points at a table this cannot name, and guessing
+        # that the derived name matches is how `parent` came to be left out of
+        # a document that needed it.
         if isinstance(on, str) and on.endswith("_id"):
             target = on[: -len("_id")]
-            return singularize(bases.get(f"public.{target}", target))
+            base = bases.get(f"public.{target}")
+            if base is not None:
+                return singularize(base)
     return None
 
 

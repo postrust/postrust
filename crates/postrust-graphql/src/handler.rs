@@ -1078,6 +1078,8 @@ fn create_object_type(obj: &TableObjectType, relationships: &[RelationshipField]
         let field_name = rel.name.clone();
         let field_type = if rel.is_list {
             TypeRef::named_nn_list_nn(&rel.target_type)
+        } else if always_present(rel, &obj.table) {
+            TypeRef::named_nn(&rel.target_type)
         } else {
             TypeRef::named(&rel.target_type)
         };
@@ -5543,6 +5545,38 @@ fn order_terms(
     } else {
         Some(terms.join(", "))
     })
+}
+
+/// Whether a to-one relationship always has a row at the other end.
+///
+/// It does when this row's own key columns cannot be null: a foreign key
+/// guarantees a matching row for every value, so a `NOT NULL` key is a
+/// relationship that cannot be absent, and the field is non-null. A client
+/// generating types then gets `author` rather than `author | null`, which is
+/// what the schema actually promises.
+///
+/// Only where a foreign key says so. A computed relationship is a function
+/// call, and a one-to-one reached through the *child's* key is a row that may
+/// simply not exist.
+fn always_present(rel: &RelationshipField, table: &postrust_core::schema_cache::Table) -> bool {
+    use postrust_core::schema_cache::{Cardinality, Relationship};
+    let Relationship::ForeignKey { cardinality, .. } = &rel.relationship else {
+        return false;
+    };
+    match cardinality {
+        Cardinality::M2O { .. } => {}
+        Cardinality::O2O {
+            is_parent: false, ..
+        } => {}
+        _ => return false,
+    }
+    let columns = cardinality.columns();
+    !columns.is_empty()
+        && columns.iter().all(|(local, _)| {
+            table
+                .get_column(local)
+                .is_some_and(|column| !column.nullable)
+        })
 }
 
 /// Whether the row at the other end of a relationship carries the key.
