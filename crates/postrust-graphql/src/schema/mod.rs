@@ -246,6 +246,48 @@ pub struct FunctionField {
     pub description: Option<String>,
 }
 
+/// What a computed relationship's function takes from the caller.
+///
+/// Everything but the parent row, which is what makes it a relationship, and
+/// the session, which is the server's to supply. Read from the routine rather
+/// than from the relationship because the relationship loader knows only which
+/// argument is the row -- the rest are the same parameters any function has,
+/// and they are already loaded.
+fn caller_arguments(
+    relationship: &postrust_core::schema_cache::Relationship,
+    schema_cache: &SchemaCache,
+) -> Vec<(String, String, bool)> {
+    use postrust_core::schema_cache::Relationship;
+    let Relationship::Computed {
+        function,
+        row_argument,
+        ..
+    } = relationship
+    else {
+        return Vec::new();
+    };
+    let Some(row_argument) = row_argument else {
+        return Vec::new();
+    };
+    schema_cache
+        .routines
+        .get(function)
+        .into_iter()
+        .flatten()
+        .find(|routine| routine.name == function.name)
+        .map(|routine| {
+            routine
+                .params
+                .iter()
+                .filter(|param| &param.name != row_argument)
+                .filter(|param| !is_session_argument(param))
+                .filter(|param| !param.name.is_empty())
+                .map(|param| (param.name.clone(), param.param_type.clone(), param.required))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 /// Whether a parameter is the one Hasura fills from the session.
 ///
 /// Recognised by name and type, which is the only thing the database records:
@@ -730,13 +772,15 @@ pub fn build_schema(schema_cache: &SchemaCache, config: &SchemaConfig) -> Genera
                         let foreign = rel.foreign_table();
                         let target_base =
                             base_names.get(&(foreign.schema.clone(), foreign.name.clone()))?;
-                        Some(RelationshipField::from_relationship_named(
+                        let mut field = RelationshipField::from_relationship_named(
                             rel,
                             target_base,
                             relationship_keys(rel).iter().find_map(|key| {
                                 config.names.relationship(&table.schema, &table.name, key)
                             }),
-                        ))
+                        );
+                        field.arguments = caller_arguments(rel, schema_cache);
+                        Some(field)
                     })
                     .collect()
             })

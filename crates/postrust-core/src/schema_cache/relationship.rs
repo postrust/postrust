@@ -38,6 +38,14 @@ pub enum Relationship {
         to_one: bool,
         /// Whether this is self-referential
         is_self: bool,
+        /// The name of the parameter that takes the parent's row.
+        ///
+        /// Usually the only one, and then the call is positional. A function
+        /// that also takes a search term or the caller's session has the row
+        /// somewhere among its parameters and is called by name, which is why
+        /// the name is kept rather than the position.
+        #[serde(default)]
+        row_argument: Option<String>,
     },
 }
 

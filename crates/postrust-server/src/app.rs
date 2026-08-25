@@ -3046,6 +3046,9 @@ fn build_embed_expressions(
             child_offset,
             child_where.as_deref(),
             child_order.as_deref(),
+            // Positionally, with the parent row and nothing else: this surface
+            // has no session to supply and no place to write an argument.
+            None,
         )?;
 
         if is_spread {

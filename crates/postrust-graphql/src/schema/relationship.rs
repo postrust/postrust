@@ -25,6 +25,13 @@ pub struct RelationshipField {
     pub relationship: Relationship,
     /// Description for the field.
     pub description: Option<String>,
+    /// The arguments a computed relationship's function takes from the caller,
+    /// as `(name, PostgreSQL type, required)`.
+    ///
+    /// Neither the parent row nor the session is among them: the first is what
+    /// makes it a relationship and the second is the server's to supply.
+    /// Empty for every relationship reached by a key.
+    pub arguments: Vec<(String, String, bool)>,
 }
 
 impl RelationshipField {
@@ -77,6 +84,7 @@ impl RelationshipField {
             is_list,
             relationship: rel.clone(),
             description,
+            arguments: Vec::new(),
         }
     }
 

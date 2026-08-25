@@ -52,6 +52,9 @@ pub struct EmbedPlan {
     /// parent row is the argument -- so the columns above are empty and the
     /// relationship can only be expressed as a call correlated to the parent.
     pub function: Option<crate::api_request::QualifiedIdentifier>,
+    /// The name of the parameter that takes the parent's row, where the
+    /// function has more than one and the call has to be written by name.
+    pub row_argument: Option<String>,
 }
 
 /// The table a many-to-many relationship is joined through.
@@ -126,6 +129,7 @@ impl EmbedPlan {
             function,
             foreign_table,
             to_one,
+            row_argument,
             ..
         } = relationship
         {
@@ -139,6 +143,7 @@ impl EmbedPlan {
                 columns: Vec::new(),
                 junction: None,
                 function: Some(function.clone()),
+                row_argument: row_argument.clone(),
             });
         }
 
@@ -169,6 +174,7 @@ impl EmbedPlan {
                 // A junction always yields a set: that is what it is for.
                 is_list: true,
                 columns: Vec::new(),
+                row_argument: None,
                 junction: Some(EmbedJunction {
                     schema: junction.table.schema.clone(),
                     table: junction.table.name.clone(),
@@ -216,6 +222,7 @@ impl EmbedPlan {
             columns,
             junction: None,
             function: None,
+            row_argument: None,
         })
     }
 
@@ -382,6 +389,9 @@ impl EmbedPlan {
         // belongs to the child's own subselect -- and has to be applied before
         // the child's own limit, or the limit takes an unsorted window.
         order_by: Option<&str>,
+        // The whole argument list of a computed relationship's function, where
+        // the parent row is not the only thing it takes.
+        function_arguments: Option<&str>,
     ) -> Result<String> {
         // The child table is aliased rather than referred to by name. A
         // self-referential relationship would otherwise make the correlation
@@ -396,7 +406,11 @@ impl EmbedPlan {
                 inner_select,
                 postrust_sql::escape_ident(&function.schema),
                 postrust_sql::escape_ident(&function.name),
-                parent_row,
+                // The parent row alone, unless the caller wrote the whole
+                // argument list: a function with more than the row -- a search
+                // term, the caller's session -- is called by name, and only the
+                // caller knows what to put in those.
+                function_arguments.unwrap_or(parent_row),
                 postrust_sql::escape_ident(child_alias),
             ),
             None => match &self.junction {
@@ -474,6 +488,7 @@ impl EmbedPlan {
         offset: i64,
         child_where: Option<&str>,
         order_by: Option<&str>,
+        function_arguments: Option<&str>,
     ) -> Result<String> {
         let inner = self.correlated_rows(
             parent_alias,
@@ -484,6 +499,7 @@ impl EmbedPlan {
             offset,
             child_where,
             order_by,
+            function_arguments,
         )?;
 
         let alias = postrust_sql::escape_ident(&format!("{}_j", child_alias));
@@ -535,6 +551,7 @@ impl EmbedPlan {
         offset: i64,
         child_where: Option<&str>,
         order_by: Option<&str>,
+        function_arguments: Option<&str>,
     ) -> Result<String> {
         let child = postrust_sql::escape_ident(child_alias);
         let rows = self.correlated_rows(
@@ -546,6 +563,7 @@ impl EmbedPlan {
             offset,
             child_where,
             order_by,
+            function_arguments,
         )?;
         let alias = postrust_sql::escape_ident(&format!("{}_a", child_alias));
         Ok(format!(

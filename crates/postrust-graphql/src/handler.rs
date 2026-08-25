@@ -680,6 +680,35 @@ fn build_dynamic_schema(
         builder = builder.register(args);
     }
 
+    // The same for a computed relationship's function, which takes its
+    // arguments where it is embedded rather than at the root. Named after the
+    // type and the field, since two tables may reach the same function and one
+    // table may reach two.
+    for (type_name, relationships) in &generated.relationship_fields {
+        for relationship in relationships {
+            if relationship.arguments.is_empty() {
+                continue;
+            }
+            let mut args =
+                InputObject::new(computed_args_type_name(type_name, &relationship.name))
+                    .description(format!(
+                        "Arguments to {}, beside the row it is asked of.",
+                        relationship.name
+                    ));
+            for (name, pg_type, required) in &relationship.arguments {
+                let scalar = crate::types::pg_type_to_graphql(pg_type).to_string();
+                args = args.field(InputValue::new(
+                    name,
+                    match required {
+                        true => TypeRef::named_nn(scalar),
+                        false => TypeRef::named(scalar),
+                    },
+                ));
+            }
+            builder = builder.register(args);
+        }
+    }
+
     // Upserts. A table with no unique constraint has no conflict to resolve,
     // and a GraphQL enum may not be empty, so it gets none of these types
     // rather than an unusable set of them.
@@ -1067,6 +1096,16 @@ fn create_object_type(obj: &TableObjectType, relationships: &[RelationshipField]
         // narrow one is to fetch all of it and discard the rest in the client.
         // A to-one relationship is left alone -- there is nothing to order or
         // page through when the answer is one row.
+        // A computed relationship's function may take more than the row --
+        // "the articles of this author matching a search" -- and `args` is
+        // where the caller writes them, so a term called `limit` cannot shadow
+        // the one that pages the result.
+        if !rel.arguments.is_empty() {
+            gql_field = gql_field.argument(InputValue::new(
+                "args",
+                TypeRef::named_nn(computed_args_type_name(&obj.name, &rel.name)),
+            ));
+        }
         if rel.is_list {
             gql_field = gql_field
                 .argument(InputValue::new(
@@ -1138,6 +1177,19 @@ fn create_object_type(obj: &TableObjectType, relationships: &[RelationshipField]
                     .argument(InputValue::new("offset", TypeRef::named("Int")))
                     .description(format!("Aggregates over {}.", rel.name)),
                 ));
+                // Counting the rows a function answers with means calling it,
+                // so the aggregate takes whatever the function takes.
+                if !rel.arguments.is_empty() {
+                    let last = fields.len() - 1;
+                    let (name, field) = fields.remove(last);
+                    fields.push((
+                        name,
+                        field.argument(InputValue::new(
+                            "args",
+                            TypeRef::named_nn(computed_args_type_name(&obj.name, &rel.name)),
+                        )),
+                    ));
+                }
             }
         }
     }
@@ -1974,10 +2026,16 @@ async fn resolve_query<'a>(
     // anything else, because they sit in the FROM clause and every other
     // parameter is numbered after them.
     let source = match &spec.call {
+        // Aliased rather than named. A whole-row reference -- what a computed
+        // field is passed -- can only be written as a bare name, and
+        // `"public"."author"` is not one: PostgreSQL reads it as a column of a
+        // table called `public`. An alias no column can share is a name that
+        // works in both positions.
         None => format!(
-            "{}.{}",
+            "{}.{} AS {}",
             postrust_sql::escape_ident(schema_name),
-            postrust_sql::escape_ident(table_name)
+            postrust_sql::escape_ident(table_name),
+            postrust_sql::escape_ident(READ_ROW)
         ),
         Some(call) => {
             let given = ctx
@@ -2050,11 +2108,7 @@ async fn resolve_query<'a>(
     // How a column of the source is referred to: a table by its qualified
     // name, a function's rows by the alias above.
     let source_ref = match &spec.call {
-        None => format!(
-            "{}.{}",
-            postrust_sql::escape_ident(schema_name),
-            postrust_sql::escape_ident(table_name)
-        ),
+        None => postrust_sql::escape_ident(READ_ROW),
         Some(_) => postrust_sql::escape_ident(table_name),
     };
 
@@ -2099,6 +2153,7 @@ async fn resolve_query<'a>(
             .ok_or_else(|| async_graphql::Error::new("schema cache is not loaded"))?;
         let scope = match &spec.call {
             None => WhereScope::table(schema_name, table_name, type_name, spec.names.as_ref())
+                .under_alias(READ_ROW)
                 .with_resolution(cache, relationships),
             // A function's rows are the table's rows, so they are renamed the
             // same way; only how they are reached differs.
@@ -2879,6 +2934,13 @@ const UPDATE_OPERATORS: [&str; 7] = [
     "_delete_at_path",
 ];
 
+/// What a read table is called inside its own query.
+///
+/// See [`WRITTEN_ROW`]: the row a query passes to a computed field has to be
+/// named, and a table's qualified name is not a name a row can be written
+/// under.
+const READ_ROW: &str = "pgrst_src";
+
 /// What a written table is called inside its own statement.
 ///
 /// See [`WhereScope::under_alias`]: the row a statement returns has to be
@@ -3092,7 +3154,13 @@ fn insert_row<'life>(
                         ),
                         other => (other.clone(), None),
                     };
-                    if relationship.is_list {
+                    // Which row goes first follows from which side holds the
+                    // key, not from how many rows there are. A one-to-one
+                    // whose child key *is* the parent's -- `author_detail.id`
+                    // referencing `author.id` -- is one row either way, and
+                    // the parent still has to be written before there is a key
+                    // to give it.
+                    if child_holds_the_key(&relationship.relationship) {
                         to_many.push((relationship, data, conflict));
                     } else {
                         to_one.push((relationship, data, conflict));
@@ -4996,29 +5064,73 @@ fn aggregate_order_terms(
     };
     let plan = postrust_core::embed::EmbedPlan::resolve(&rel.relationship, cache)
         .map_err(|e| async_graphql::Error::new(e.to_string()))?;
-    if plan.columns.is_empty() {
+    if plan.columns.is_empty() && plan.function.is_none() {
         return Err(async_graphql::Error::new(format!(
             "cannot order by an aggregate of \"{}\": it is not reached by a key",
+            rel.name
+        )));
+    }
+    // A computed relationship whose function takes more than the row cannot be
+    // ordered by here: there is nowhere in `order_by` to write the arguments.
+    if plan.function.is_some() && !rel.arguments.is_empty() {
+        return Err(async_graphql::Error::new(format!(
+            "cannot order by an aggregate of \"{}\": it takes arguments, and an \
+             ordering has nowhere to write them",
             rel.name
         )));
     }
 
     *alias_counter += 1;
     let alias = postrust_sql::escape_ident(&format!("pgrst_ord_{}", alias_counter));
-    let correlation = plan
-        .columns
-        .iter()
-        .map(|(local, foreign)| {
-            format!(
-                "{}.{} = {}.{}",
-                reference,
-                postrust_sql::escape_ident(local),
-                alias,
-                postrust_sql::escape_ident(foreign)
+    // A computed relationship is correlated by argument -- the function takes
+    // the parent row -- where a key relationship is correlated by columns.
+    let (source, correlation) = match &plan.function {
+        Some(function) => {
+            let session = plan.row_argument.as_ref().and_then(|row_argument| {
+                computed_session_argument(cache, function, row_argument)
+                    .map(|session| (row_argument.clone(), session))
+            });
+            let call = match session {
+                Some((row_argument, session)) => format!(
+                    "{} => {}, {} => {}",
+                    postrust_sql::escape_ident(&row_argument),
+                    reference,
+                    postrust_sql::escape_ident(&session),
+                    SESSION_ARGUMENT
+                ),
+                None => reference.to_string(),
+            };
+            (
+                format!(
+                    "{}.{}({})",
+                    postrust_sql::escape_ident(&function.schema),
+                    postrust_sql::escape_ident(&function.name),
+                    call
+                ),
+                "true".to_string(),
             )
-        })
-        .collect::<Vec<_>>()
-        .join(" AND ");
+        }
+        None => (
+            format!(
+                "{}.{}",
+                postrust_sql::escape_ident(&plan.foreign_schema),
+                postrust_sql::escape_ident(&plan.foreign_table)
+            ),
+            plan.columns
+                .iter()
+                .map(|(local, foreign)| {
+                    format!(
+                        "{}.{} = {}.{}",
+                        reference,
+                        postrust_sql::escape_ident(local),
+                        alias,
+                        postrust_sql::escape_ident(foreign)
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join(" AND "),
+        ),
+    };
 
     // `{count: desc}` is one term; `{max: {id: desc}}` is one per column.
     let mut wanted: Vec<(String, String)> = Vec::new();
@@ -5069,13 +5181,8 @@ fn aggregate_order_terms(
 
     for (expression, direction) in wanted {
         terms.push(format!(
-            "(SELECT {} FROM {}.{} AS {} WHERE {}) {}",
-            expression,
-            postrust_sql::escape_ident(&plan.foreign_schema),
-            postrust_sql::escape_ident(&plan.foreign_table),
-            alias,
-            correlation,
-            direction
+            "(SELECT {} FROM {} AS {} WHERE {}) {}",
+            expression, source, alias, correlation, direction
         ));
     }
     Ok(())
@@ -5403,6 +5510,127 @@ fn order_terms(
     })
 }
 
+/// Whether the row at the other end of a relationship carries the key.
+///
+/// If it does, this row is written first and its key is pushed down; if this
+/// row's own column carries it, the other row is written first and its key is
+/// read back. Cardinality alone does not answer it: a one-to-one is one row in
+/// either direction, and which side holds the foreign key is the whole
+/// difference between the two orders.
+fn child_holds_the_key(relationship: &postrust_core::schema_cache::Relationship) -> bool {
+    use postrust_core::schema_cache::{Cardinality, Relationship};
+    match relationship {
+        Relationship::ForeignKey { cardinality, .. } => match cardinality {
+            Cardinality::M2O { .. } => false,
+            Cardinality::O2O { is_parent, .. } => *is_parent,
+            _ => true,
+        },
+        Relationship::Computed { .. } => true,
+    }
+}
+
+/// The name of a function's session parameter, if it has one.
+fn computed_session_argument(
+    cache: &SchemaCache,
+    function: &postrust_core::api_request::QualifiedIdentifier,
+    row_argument: &str,
+) -> Option<String> {
+    let _ = row_argument;
+    cache
+        .routines
+        .get(function)
+        .into_iter()
+        .flatten()
+        .find(|routine| routine.name == function.name)?
+        .params
+        .iter()
+        .find(|param| {
+            param.name == "hasura_session"
+                && matches!(param.param_type.as_str(), "json" | "jsonb")
+        })
+        .map(|param| param.name.clone())
+}
+
+/// The name of the input holding a computed relationship's own arguments.
+fn computed_args_type_name(type_name: &str, field: &str) -> String {
+    format!("{}_{}_args", type_name, field)
+}
+
+/// The argument list a computed relationship's function is called with.
+///
+/// `None` where the parent row is the only thing it takes -- the ordinary case,
+/// and the positional call the REST surface writes. Anything else is written by
+/// name: the row, the session where the function asks for one, and whatever the
+/// client put under `args`.
+fn computed_arguments(
+    relationship: &RelationshipField,
+    plan: &postrust_core::embed::EmbedPlan,
+    parent_row: &str,
+    given: Option<&serde_json::Value>,
+    param_idx: &mut usize,
+    values: &mut Vec<serde_json::Value>,
+    schema_cache: &SchemaCache,
+) -> Result<Option<String>, async_graphql::Error> {
+    let (Some(function), Some(row_argument)) = (&plan.function, &plan.row_argument) else {
+        return Ok(None);
+    };
+    let session = schema_cache
+        .routines
+        .get(function)
+        .into_iter()
+        .flatten()
+        .find(|routine| routine.name == function.name)
+        .and_then(|routine| {
+            routine
+                .params
+                .iter()
+                .find(|param| {
+                    param.name == "hasura_session"
+                        && matches!(param.param_type.as_str(), "json" | "jsonb")
+                })
+                .map(|param| param.name.clone())
+        });
+    if relationship.arguments.is_empty() && session.is_none() {
+        return Ok(None);
+    }
+
+    let mut passed = vec![format!(
+        "{} => {}",
+        postrust_sql::escape_ident(row_argument),
+        parent_row
+    )];
+    if let Some(session) = session {
+        passed.push(format!(
+            "{} => {}",
+            postrust_sql::escape_ident(&session),
+            SESSION_ARGUMENT
+        ));
+    }
+    for (name, pg_type, required) in &relationship.arguments {
+        match given.and_then(|given| given.get(name)) {
+            None if *required => {
+                return Err(async_graphql::Error::new(format!(
+                    "{} needs the argument \"{}\"",
+                    relationship.name, name
+                )))
+            }
+            // Left out is left out, so the function's own default applies.
+            None => continue,
+            Some(value) => {
+                passed.push(format!(
+                    "{} => ${}::{}",
+                    postrust_sql::escape_ident(name),
+                    param_idx,
+                    pg_type
+                ));
+                *param_idx += 1;
+                values.push(value.clone());
+            }
+        }
+    }
+    Ok(Some(passed.join(", ")))
+}
+
 /// The arguments written on an embedded field, as JSON.
 fn embed_arguments(
     field: async_graphql::SelectionField<'_>,
@@ -5555,6 +5783,15 @@ fn build_embed_expressions(
                 names,
             )?;
 
+            let call = computed_arguments(
+                rel,
+                &plan,
+                &postrust_sql::escape_ident(parent_alias),
+                arguments.get("args"),
+                param_idx,
+                values,
+                schema_cache,
+            )?;
             let expression = plan
                 .aggregate_expression(
                     parent_alias,
@@ -5565,6 +5802,7 @@ fn build_embed_expressions(
                     child_offset,
                     child_where.as_deref(),
                     child_order.as_deref(),
+                    call.as_deref(),
                 )
                 .map_err(|e| async_graphql::Error::new(e.to_string()))?;
             expressions.push((field.name().to_string(), expression));
@@ -5680,6 +5918,15 @@ fn build_embed_expressions(
             ));
         }
 
+        let computed_call_arguments = computed_arguments(
+            rel,
+            &plan,
+            &postrust_sql::escape_ident(parent_alias),
+            arguments.get("args"),
+            param_idx,
+            values,
+            schema_cache,
+        )?;
         let expression = plan
             .embed_expression(
                 parent_alias,
@@ -5693,6 +5940,7 @@ fn build_embed_expressions(
                 child_offset,
                 child_where.as_deref(),
                 child_order.as_deref(),
+                computed_call_arguments.as_deref(),
             )
             .map_err(|e| async_graphql::Error::new(e.to_string()))?;
 

@@ -427,18 +427,29 @@ async fn load_computed_relationships(
             t.relname   AS table_name,
             fn.nspname  AS foreign_table_schema,
             f.relname   AS foreign_table_name,
-            (NOT p.proretset) OR p.prorows = 1 AS to_one
+            (NOT p.proretset) OR p.prorows = 1 AS to_one,
+            (SELECT p.proargnames[i]
+               FROM generate_series(1, p.pronargs) AS i
+              WHERE p.proargtypes[i - 1] = argt.oid
+              LIMIT 1) AS row_argument
         FROM pg_proc p
         JOIN pg_namespace pn ON pn.oid = p.pronamespace
-        -- the single argument is a table's composite type
-        JOIN pg_type argt ON argt.oid = p.proargtypes[0]
+        -- one argument is a table's composite type. Usually the only one, and
+        -- then the call is positional; a function that also takes a search
+        -- term or the caller's session has it somewhere among the rest, and is
+        -- called by name.
+        JOIN pg_type argt ON argt.oid = ANY (p.proargtypes::oid[])
         JOIN pg_class t   ON t.oid = argt.typrelid
         JOIN pg_namespace tn ON tn.oid = t.relnamespace
         -- and the return type is a table as well
         JOIN pg_type rett ON rett.oid = p.prorettype
         JOIN pg_class f   ON f.oid = rett.typrelid
         JOIN pg_namespace fn ON fn.oid = f.relnamespace
-        WHERE p.pronargs = 1
+        -- Every argument named, since one that is not cannot be given by name
+        -- and a call with more than the row has to be.
+        WHERE (p.pronargs = 1 OR (SELECT count(*)
+                                    FROM generate_series(1, p.pronargs) AS i
+                                   WHERE COALESCE(p.proargnames[i], '') = '') = 0)
           AND pn.nspname = ANY($1)
           AND tn.nspname = ANY($1)
           AND fn.nspname = ANY($1)
@@ -475,6 +486,7 @@ async fn load_computed_relationships(
                 table_alias: table,
                 to_one: row.get("to_one"),
                 is_self,
+                row_argument: row.get::<Option<String>, _>("row_argument"),
             });
     }
 
