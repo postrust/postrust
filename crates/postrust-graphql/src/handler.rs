@@ -2112,6 +2112,28 @@ async fn resolve_mutation<'a>(
         table_name, mutation_type
     );
 
+    // A relationship or a computed field asked for beside the written columns
+    // is not in `RETURNING`, so the rows are read again through the projection
+    // an ordinary query uses -- and only when the selection asks for something
+    // that needs it. A delete cannot do that afterwards and builds it into the
+    // statement instead, which is why this is settled before the statement is.
+    let type_name = type_names
+        .get(&(schema_name.to_string(), table_name.to_string()))
+        .cloned()
+        .unwrap_or_else(|| table_name.to_string());
+
+    let by_key = matches!(
+        mutation_type,
+        MutationType::InsertOne | MutationType::UpdateByPk | MutationType::DeleteByPk
+    );
+    let returning = if by_key {
+        Some(ctx.field())
+    } else {
+        ctx.field()
+            .selection_set()
+            .find(|selection| selection.name() == "returning")
+    };
+
     let (result, affected) = match mutation_type {
         MutationType::Insert | MutationType::InsertOne => {
             let objects = ctx
@@ -2191,12 +2213,14 @@ async fn resolve_mutation<'a>(
 
             execute_update(
                 pool,
+                gql_ctx,
                 schema_name,
                 table_name,
-                gql_ctx.role(),
+                &type_name,
                 operators,
                 column_types_of(&gql_ctx.schema_cache, schema_name, table_name).await,
                 where_clause,
+                relationships.as_ref(),
             )
             .await
             .map(|rows| {
@@ -2213,10 +2237,15 @@ async fn resolve_mutation<'a>(
 
             execute_delete(
                 pool,
+                gql_ctx,
                 schema_name,
                 table_name,
-                gql_ctx.role(),
+                &type_name,
                 where_clause,
+                returning,
+                relationships.as_ref(),
+                names.as_ref(),
+                max_rows,
             )
             .await
             .map(|rows| {
@@ -2226,29 +2255,12 @@ async fn resolve_mutation<'a>(
         }
     };
 
-    // A relationship or a computed field asked for beside the written columns
-    // is not in `RETURNING`, so the rows are read again through the projection
-    // an ordinary query uses -- and only when the selection asks for something
-    // that needs it.
-    let type_name = type_names
-        .get(&(schema_name.to_string(), table_name.to_string()))
-        .cloned()
-        .unwrap_or_else(|| table_name.to_string());
-
-    let by_key = matches!(
+    let is_delete = matches!(
         mutation_type,
-        MutationType::InsertOne | MutationType::UpdateByPk | MutationType::DeleteByPk
+        MutationType::Delete | MutationType::DeleteByPk
     );
-    let returning = if by_key {
-        Some(ctx.field())
-    } else {
-        ctx.field()
-            .selection_set()
-            .find(|selection| selection.name() == "returning")
-    };
-
     let result = match returning {
-        Some(returning) if !result.is_empty() => {
+        Some(returning) if !result.is_empty() && !is_delete => {
             reread_returning(
                 pool,
                 gql_ctx,
@@ -3123,20 +3135,24 @@ fn bind_json_value<'q>(
 }
 
 /// Execute an update mutation.
+#[allow(clippy::too_many_arguments)] // the predicate needs the schema it reads
 async fn execute_update(
     pool: &PgPool,
+    gql_ctx: &GraphQLContext,
     schema_name: &str,
     table_name: &str,
-    role: &str,
+    type_name: &str,
     operators: Vec<(&'static str, serde_json::Value)>,
     column_types: HashMap<String, String>,
     where_clause: Option<serde_json::Value>,
+    relationships: &HashMap<String, Vec<RelationshipField>>,
 ) -> Result<Vec<Value>, async_graphql::Error> {
     use sqlx::Row;
 
     trace!("Update mutation for {}: {:?}", table_name, operators);
 
-    let mut conn = begin_with_role(pool, role).await?;
+    let mut conn =
+        begin_with_session(pool, gql_ctx.role(), &gql_ctx.session_settings()).await?;
 
     // Build the SET clause. Each operator writes a column in terms of itself
     // except `_set`, which replaces it -- `_inc` adds, the jsonb operators
@@ -3186,8 +3202,21 @@ async fn execute_update(
                 "_prepend" => format!("{} = {}::jsonb || {}", quoted, placeholder, quoted),
                 "_delete_key" => format!("{} = {} - {}::text", quoted, quoted, placeholder),
                 "_delete_elem" => format!("{} = {} - {}::int", quoted, quoted, placeholder),
+                // A path is a list of keys, and one parameter carrying
+                // `["name","last"]` is a JSON array -- which PostgreSQL reads
+                // as an array literal and refuses, `malformed array literal`.
+                // The elements are bound one at a time into an `ARRAY[...]`,
+                // the same way the key-existence comparisons take theirs.
                 "_delete_at_path" => {
-                    format!("{} = {} #- {}::text[]", quoted, quoted, placeholder)
+                    let Some(steps) = value.as_array() else {
+                        return Err(async_graphql::Error::new(format!(
+                            "\"_delete_at_path\" on \"{}\" takes a list of keys",
+                            column
+                        )));
+                    };
+                    let path = sql_array(steps, "text[]", &mut param_idx, &mut set_values);
+                    set_parts.push(format!("{} = {} #- {}", quoted, quoted, path));
+                    continue;
                 }
                 other => {
                     return Err(async_graphql::Error::new(format!(
@@ -3213,16 +3242,28 @@ async fn execute_update(
         }
     }
 
+    // An update that changes nothing changes no rows. Refusing it looks like
+    // the stricter answer and is the wrong one: a client building `_set` from
+    // a form the user submitted unchanged sends an empty object, and the
+    // honest report of what happened is that nothing did.
     if set_parts.is_empty() {
-        return Err(async_graphql::Error::new(format!(
-            "update on \"{}\" changes nothing; give it _set, _inc or one of \
-             the jsonb operators",
-            table_name
-        )));
+        return Ok(Vec::new());
     }
 
-    // Build WHERE clause
-    let scope = WhereScope::table(schema_name, table_name, table_name).under_alias(WRITTEN_ROW);
+    // Build WHERE clause. It can follow a relationship, the same way a query's
+    // can: `update_article(where: {author: {name: {_eq: "x"}}})` names the
+    // rows by something they point at rather than by a column of their own.
+    let guard = gql_ctx
+        .schema_cache
+        .get()
+        .await
+        .map_err(|e| async_graphql::Error::new(e.to_string()))?;
+    let cache = guard
+        .as_ref()
+        .ok_or_else(|| async_graphql::Error::new("schema cache is not loaded"))?;
+    let scope = WhereScope::table(schema_name, table_name, type_name)
+        .under_alias(WRITTEN_ROW)
+        .with_resolution(cache, relationships);
     let (where_sql, where_values) =
         build_where_clause(where_clause.as_ref(), param_idx, &scope)?;
 
@@ -3275,22 +3316,44 @@ async fn execute_update(
 }
 
 /// Execute a delete mutation.
+#[allow(clippy::too_many_arguments)] // the projection needs the schema it reads
 async fn execute_delete(
     pool: &PgPool,
+    gql_ctx: &GraphQLContext,
     schema_name: &str,
     table_name: &str,
-    role: &str,
+    type_name: &str,
     where_clause: Option<serde_json::Value>,
+    returning: Option<async_graphql::SelectionField<'_>>,
+    relationships: &HashMap<String, Vec<RelationshipField>>,
+    names: &crate::names::NameOverrides,
+    max_rows: Option<i64>,
 ) -> Result<Vec<Value>, async_graphql::Error> {
     use sqlx::Row;
 
     trace!("Delete mutation for {}", table_name);
 
-    let mut conn = begin_with_role(pool, role).await?;
+    let guard = gql_ctx
+        .schema_cache
+        .get()
+        .await
+        .map_err(|e| async_graphql::Error::new(e.to_string()))?;
+    let cache = guard
+        .as_ref()
+        .ok_or_else(|| async_graphql::Error::new("schema cache is not loaded"))?;
+    let qi = postrust_core::api_request::QualifiedIdentifier::new(schema_name, table_name);
+    let column_types = cache
+        .get_table(&qi)
+        .map(column_types_of_table)
+        .unwrap_or_default();
 
-    // Build WHERE clause
-    let scope = WhereScope::table(schema_name, table_name, table_name).under_alias(WRITTEN_ROW);
-    let (where_sql, where_values) = build_where_clause(where_clause.as_ref(), 1, &scope)?;
+    // Build WHERE clause. It can follow a relationship -- `delete_article(where:
+    // {author: {id: {_eq: 2}}})` is the article-by-author delete anyone writes
+    // -- so the scope is given the schema to resolve one with.
+    let scope = WhereScope::table(schema_name, table_name, type_name)
+        .under_alias(WRITTEN_ROW)
+        .with_resolution(cache, relationships);
+    let (where_sql, mut values) = build_where_clause(where_clause.as_ref(), 1, &scope)?;
 
     // An absent or unrecognised `where` argument yields an empty clause, which
     // would delete every row in the table. Refuse instead.
@@ -3302,22 +3365,73 @@ async fn execute_delete(
         )));
     }
 
-    let sql = format!(
-        "DELETE FROM {}.{} AS {} {} RETURNING {}",
-        postrust_sql::escape_ident(schema_name),
-        postrust_sql::escape_ident(table_name),
-        postrust_sql::escape_ident(WRITTEN_ROW),
-        where_sql,
-        row_json(&postrust_sql::escape_ident(WRITTEN_ROW), &Default::default())
-    );
+    // A relationship or computed field asked for in `returning` cannot be read
+    // afterwards -- the rows are gone by then, which is why this used to answer
+    // the plain columns and then fail on a non-null list. Inside one statement
+    // the deleted rows are still a table: the delete goes in a CTE and the
+    // projection reads from it, while the rows it points at are still there.
+    let mut projection = String::new();
+    if let Some(returning) = returning {
+        let mut param_idx = values.len() + 1;
+        let mut alias_counter = 0usize;
+        let embeds = build_embed_expressions(
+            cache,
+            relationships,
+            type_name,
+            "src",
+            returning,
+            max_rows,
+            &mut alias_counter,
+            &mut param_idx,
+            &mut values,
+            names,
+        )?;
+        let computed = cache
+            .get_table(&qi)
+            .map(|table| computed_projections(table, returning, "src", names))
+            .unwrap_or_default();
+        for expression in &computed {
+            projection.push_str(", ");
+            projection.push_str(expression);
+        }
+        for (name, expression) in &embeds {
+            projection.push_str(", ");
+            projection.push_str(expression);
+            projection.push_str(" AS ");
+            projection.push_str(&postrust_sql::escape_ident(name));
+        }
+    }
+
+    let written = postrust_sql::escape_ident(WRITTEN_ROW);
+    let sql = if projection.is_empty() {
+        format!(
+            "DELETE FROM {}.{} AS {} {} RETURNING {}",
+            postrust_sql::escape_ident(schema_name),
+            postrust_sql::escape_ident(table_name),
+            written,
+            where_sql,
+            row_json(&written, &column_types)
+        )
+    } else {
+        format!(
+            "WITH pgrst_deleted AS (DELETE FROM {}.{} AS {} {} RETURNING {}.*) \
+             SELECT {} FROM (SELECT src.*{} FROM pgrst_deleted AS src) AS pgrst_r",
+            postrust_sql::escape_ident(schema_name),
+            postrust_sql::escape_ident(table_name),
+            written,
+            where_sql,
+            written,
+            row_json("pgrst_r", &column_types),
+            projection
+        )
+    };
 
     trace!("Executing DELETE SQL: {}", sql);
 
-    // Build query with parameters
+    let mut conn =
+        begin_with_session(pool, gql_ctx.role(), &gql_ctx.session_settings()).await?;
     let mut query = sqlx::query(&sql);
-
-    // Bind WHERE values
-    for val in &where_values {
+    for val in &values {
         query = bind_json_value(query, val);
     }
 
@@ -3329,7 +3443,6 @@ async fn execute_delete(
         .map(json_to_value)
         .collect();
 
-    // Return based on mutation type
     conn.commit().await?;
 
     Ok(deleted)
@@ -3735,9 +3848,22 @@ fn postgis_sql(
             let distance_sql = format!("${}", param_idx);
             *param_idx += 1;
             values.push(distance.clone());
+            // On a sphere the answer depends on which sphere: `ST_DWithin`
+            // over geography measures on the spheroid by default and on a
+            // perfect sphere when told not to, and the two disagree by enough
+            // to change which rows come back. Geometry has no such argument.
+            let spheroid = match (is_geography, spec.get("use_spheroid")) {
+                (true, Some(use_spheroid)) if !use_spheroid.is_null() => {
+                    let placeholder = format!("${}", param_idx);
+                    *param_idx += 1;
+                    values.push(use_spheroid.clone());
+                    format!(", {}::boolean", placeholder)
+                }
+                _ => String::new(),
+            };
             Ok(format!(
-                "{}({}, {}, {}::float8)",
-                function, quoted, from_sql, distance_sql
+                "{}({}, {}, {}::float8{})",
+                function, quoted, from_sql, distance_sql, spheroid
             ))
         }
         // A raster against another raster, bound as one rather than parsed.
@@ -3987,12 +4113,20 @@ fn comparison_sql(
                 Some(pg_type) => format!("::{}", pg_type),
                 None => String::new(),
             },
-            // A parameter arrives as `text`, and `citext = text` is decided by
-            // resolving the citext down to text -- so `_eq: "clarke"` against a
-            // case-insensitive column answered case-sensitively. The operand
-            // has to say it is a citext for the citext operator to be the one
-            // chosen.
-            _ if column_type == Some("citext") => "::citext".to_string(),
+            // A parameter arrives as `text`, and PostgreSQL then resolves the
+            // operator by taking the *column* down to text where it can --
+            // which is the wrong operator, and sometimes no operator at all.
+            // `citext = text` compares case-sensitively against a
+            // case-insensitive column; `uuid = text` does not exist. So a
+            // written value names the type it is being compared against.
+            //
+            // Only a string: a number bound with a cast is sent as binary into
+            // a parameter PostgreSQL has inferred as text, which is the
+            // `invalid byte sequence for encoding "UTF8"` this used to answer.
+            _ if operand.is_string() => match column_type {
+                Some(pg_type) => format!("::{}", pg_type),
+                None => String::new(),
+            },
             _ => String::new(),
         };
         return Ok(format!("{} {} {}{}", quoted, sql_op, placeholder, cast));
@@ -4020,9 +4154,8 @@ fn comparison_sql(
             for item in items {
                 // Cast only a null, for the reason the binary comparisons
                 // give: a cast makes PostgreSQL infer the parameter as text.
-                let cast = match (item.is_null(), column_type) {
+                let cast = match (item.is_null() || item.is_string(), column_type) {
                     (true, Some(pg_type)) => format!("::{}", pg_type),
-                    (_, Some("citext")) => "::citext".to_string(),
                     _ => String::new(),
                 };
                 placeholders.push(format!("${}{}", param_idx, cast));

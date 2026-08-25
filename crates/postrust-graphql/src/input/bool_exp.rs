@@ -360,15 +360,22 @@ pub fn build_inputs(
             if !scalars.contains(shape) {
                 continue;
             }
-            comparisons.push(
-                InputObject::new(format!("st_d_within_{}_input", shape))
-                    .description("Within a distance of another shape.")
-                    .field(InputValue::new(
-                        "distance",
-                        TypeRef::named_nn(TypeRef::FLOAT),
-                    ))
-                    .field(InputValue::new("from", TypeRef::named_nn(shape))),
-            );
+            let mut within = InputObject::new(format!("st_d_within_{}_input", shape))
+                .description("Within a distance of another shape.")
+                .field(InputValue::new(
+                    "distance",
+                    TypeRef::named_nn(TypeRef::FLOAT),
+                ))
+                .field(InputValue::new("from", TypeRef::named_nn(shape)));
+            // On a sphere the answer depends on which sphere. A plane has no
+            // such question, so only the geography form carries it.
+            if shape == "geography" {
+                within = within.field(
+                    InputValue::new("use_spheroid", TypeRef::named(TypeRef::BOOLEAN))
+                        .default_value(true),
+                );
+            }
+            comparisons.push(within);
         }
     }
     // What each shape may be compared as.
