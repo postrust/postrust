@@ -325,7 +325,7 @@ impl QueryField {
             is_list: true,
             is_by_pk: false,
             pk_columns: Vec::new(),
-            description: Some(format!("Query {} records", table.name)),
+            description: Some(format!("fetch data from the table: \"{}\"", table.name)),
         }
     }
 
@@ -356,7 +356,10 @@ impl QueryField {
             is_list: false,
             is_by_pk: true,
             pk_columns,
-            description: Some(format!("Get a single {} by primary key", base_name)),
+            description: Some(format!(
+                "fetch data from the table: \"{}\" using primary key columns",
+                table.name
+            )),
         })
     }
 }
@@ -426,7 +429,7 @@ impl MutationField {
             mutation_type: MutationType::Insert,
             pk_columns: Vec::new(),
             return_type: format!("{}_mutation_response", type_name),
-            description: Some(format!("Insert multiple {} records", table.name)),
+            description: Some(format!("insert data into the table: \"{}\"", table.name)),
         });
 
         // insert_user_one (single insert)
@@ -438,7 +441,10 @@ impl MutationField {
             mutation_type: MutationType::InsertOne,
             pk_columns: Vec::new(),
             return_type: type_name.clone(),
-            description: Some(format!("Insert a single {} record", base_name)),
+            description: Some(format!(
+                "insert a single row into the table: \"{}\"",
+                table.name
+            )),
         });
 
         fields
@@ -469,7 +475,7 @@ impl MutationField {
             mutation_type: MutationType::Update,
             pk_columns: Vec::new(),
             return_type: format!("{}_mutation_response", type_name),
-            description: Some(format!("Update {} records", table.name)),
+            description: Some(format!("update data of the table: \"{}\"", table.name)),
         });
 
         // update_user_by_pk (single update by PK)
@@ -482,7 +488,10 @@ impl MutationField {
                 mutation_type: MutationType::UpdateByPk,
                 pk_columns: pk_columns_of(table),
                 return_type: type_name,
-                description: Some(format!("Update a single {} by primary key", base_name)),
+                description: Some(format!(
+                    "update single row of the table: \"{}\"",
+                    table.name
+                )),
             });
         }
 
@@ -514,7 +523,7 @@ impl MutationField {
             mutation_type: MutationType::Delete,
             pk_columns: Vec::new(),
             return_type: format!("{}_mutation_response", type_name),
-            description: Some(format!("Delete {} records", table.name)),
+            description: Some(format!("delete data from the table: \"{}\"", table.name)),
         });
 
         // delete_user_by_pk (single delete by PK)
@@ -527,7 +536,10 @@ impl MutationField {
                 mutation_type: MutationType::DeleteByPk,
                 pk_columns: pk_columns_of(table),
                 return_type: type_name,
-                description: Some(format!("Delete a single {} by primary key", base_name)),
+                description: Some(format!(
+                    "delete single row from the table: \"{}\"",
+                    table.name
+                )),
             });
         }
 

@@ -785,12 +785,32 @@ fn child_of<'a>(ctx: &ResolverContext<'_>, key: &str) -> Option<FieldValue<'a>> 
     }
 }
 
+/// An error the client could have avoided, coded the way Hasura codes one.
+///
+/// The default coding reads the message, and a refusal written here has no
+/// word in it that a message from PostgreSQL would not also have -- so it said
+/// so itself rather than being guessed at.
+fn validation_error(message: impl Into<String>) -> async_graphql::Error {
+    let mut error = async_graphql::Error::new(message);
+    let mut extensions = async_graphql::ErrorExtensionValues::default();
+    extensions.set("code", "validation-failed");
+    error.extensions = Some(extensions);
+    error
+}
+
 fn create_object_type(obj: &TableObjectType, relationships: &[RelationshipField]) -> Object {
     let mut object = Object::new(&obj.name);
 
-    if let Some(desc) = obj.description() {
-        object = object.description(desc);
-    }
+    // A table with no comment still gets a description, because Hasura gives
+    // one and a client generating documentation from the schema would
+    // otherwise show a blank where it used to show this.
+    object = match obj.description() {
+        Some(desc) => object.description(desc),
+        None => object.description(format!(
+            "columns and relationships of \"{}\"",
+            obj.table_name()
+        )),
+    };
 
     // A GraphQL object may not have two fields of one name, and a schema that
     // tries to build one aborts the process rather than returning an error.
@@ -860,13 +880,20 @@ fn create_object_type(obj: &TableObjectType, relationships: &[RelationshipField]
             TypeRef::named(&rel.target_type)
         };
 
+        let is_list = rel.is_list;
         let mut gql_field = Field::new(&rel.name, field_type, move |ctx| {
             let field_name = field_name.clone();
             FieldFuture::new(async move {
                 if let Some(Value::Object(map)) = ctx.parent_value.as_value() {
                     let key = async_graphql::Name::new(&field_name);
-                    if let Some(val) = map.get(&key) {
-                        return Ok(Some(FieldValue::value(val.clone())));
+                    match map.get(&key) {
+                        // A row that points at nothing has no related row, and
+                        // the answer to that is null -- not an object whose
+                        // every field is null, which is what handing a null
+                        // parent value to the field resolvers produced.
+                        Some(Value::Null) if !is_list => return Ok(None),
+                        Some(val) => return Ok(Some(FieldValue::value(val.clone()))),
+                        None => {}
                     }
                 }
                 Ok(None)
@@ -1072,7 +1099,10 @@ fn create_query_type(
                 ))
                 .argument(InputValue::new("limit", TypeRef::named("Int")))
                 .argument(InputValue::new("offset", TypeRef::named("Int")))
-                .description(format!("Aggregates over {}.", field.table_name));
+                .description(format!(
+                    "fetch aggregated fields from the table: \"{}\"",
+                    field.table_name
+                ));
             query = query.field(agg_field);
         }
     }
@@ -1893,13 +1923,9 @@ async fn resolve_query<'a>(
             && (leading.len() != distinct_on.len()
                 || distinct_on.iter().any(|column| !leading.contains(column)))
         {
-            let mut refusal = async_graphql::Error::new(
+            return Err(validation_error(
                 "\"distinct_on\" columns must match initial \"order_by\" columns",
-            );
-            let mut extensions = async_graphql::ErrorExtensionValues::default();
-            extensions.set("code", "validation-failed");
-            refusal.extensions = Some(extensions);
-            return Err(refusal);
+            ));
         }
         let order_sql = if written.is_empty() {
             format!(" ORDER BY {}", distinct_on.join(", "))
@@ -2376,6 +2402,28 @@ fn write_cast(column_types: &HashMap<String, String>, column: &str) -> String {
     }
 }
 
+/// The value one column is written with, as it goes over the wire.
+///
+/// A `json` column holds a JSON value, and `"[]"` is one -- a string whose
+/// characters happen to be brackets. Binding the bare text and casting stored
+/// an empty array instead, so a client that wrote a string read back a list.
+/// The document a column is given is the document it keeps.
+fn write_operand(
+    column_types: &HashMap<String, String>,
+    column: &str,
+    value: &serde_json::Value,
+) -> serde_json::Value {
+    match column_types.get(column).map(String::as_str) {
+        Some("json") | Some("jsonb") => match value {
+            serde_json::Value::String(_)
+            | serde_json::Value::Number(_)
+            | serde_json::Value::Bool(_) => serde_json::Value::String(value.to_string()),
+            other => other.clone(),
+        },
+        _ => value.clone(),
+    }
+}
+
 /// The expression that writes one bound value into one column.
 ///
 /// A cast is enough for almost everything. A shape is the exception: a client
@@ -2483,6 +2531,12 @@ fn insert_row<'life>(
                 None => {
                     columns.insert(key, value);
                 }
+                Some(_) if value.is_null() => {
+                    // `author: null` is a row with no author, not a row whose
+                    // author is a null object. A client writing one insert for
+                    // both cases sends the relationship either way.
+                    continue;
+                }
                 Some(relationship) => {
                     // `{data: {...}}` for one row, `{data: [{...}]}` for many,
                     // and an `on_conflict` beside either -- a nested row is
@@ -2515,6 +2569,18 @@ fn insert_row<'life>(
                     relationship.name
                 )));
             };
+            // Writing the related row is what fills this row's key column in,
+            // so a value already written there is a second answer to the same
+            // question and one of them would be silently discarded.
+            for (local, _) in &plan.columns {
+                if columns.get(local).is_some_and(|v| !v.is_null()) {
+                    return Err(validation_error(format!(
+                        "cannot insert object relationship \"{}\" as \"{}\" column \
+                         values are already determined",
+                        relationship.name, local
+                    )));
+                }
+            }
             let nested = InsertContext {
                 on_conflict: conflict,
                 cache: context.cache,
@@ -2637,7 +2703,7 @@ fn insert_row<'life>(
             let mut query = sqlx::query(&sql);
             for column in &names {
                 if let Some(value) = columns.get(*column) {
-                    query = bind_json_value(query, value);
+                    query = bind_json_value(query, &write_operand(&column_types, column, value));
                 }
             }
             query.fetch_optional(&mut *conn).await?
@@ -2672,6 +2738,16 @@ fn insert_row<'life>(
                     continue;
                 };
                 for (local, foreign) in &plan.columns {
+                    // The parent's key is what makes the child a child, so a
+                    // child that writes it too is asking for a different
+                    // parent than the one it is nested inside.
+                    if child.get(foreign).is_some_and(|v| !v.is_null()) {
+                        return Err(validation_error(format!(
+                            "cannot insert \"{}\" columns as their values are already \
+                             being determined by parent insert",
+                            foreign
+                        )));
+                    }
                     if let Some(value) = row.get(local) {
                         child.insert(foreign.clone(), value.clone());
                     }
@@ -3003,7 +3079,10 @@ async fn execute_update(
                 }
             };
             set_parts.push(assignment);
-            set_values.push(value.clone());
+            set_values.push(match *operator {
+                "_set" => write_operand(&column_types, column, value),
+                _ => value.clone(),
+            });
             param_idx += 1;
         }
     }

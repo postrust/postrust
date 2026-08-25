@@ -75,7 +75,15 @@ impl TableObjectType {
     fn computed_field(name: &str, computed: &postrust_core::schema_cache::ComputedColumn) -> GraphQLField {
         GraphQLField {
             name: name.to_string(),
-            description: computed.description.clone(),
+            // The function it calls, where it has no comment of its own --
+            // which is what Hasura says, and is the one thing a reader of the
+            // schema cannot otherwise find out.
+            description: computed.description.clone().or_else(|| {
+                Some(format!(
+                    "A computed field, executes function \"{}\"",
+                    computed.function.name
+                ))
+            }),
             graphql_type: pg_type_to_graphql(&computed.data_type),
             nullable: true,
             is_pk: false,
@@ -132,6 +140,12 @@ impl TableObjectType {
     /// Get the description from table comment.
     pub fn description(&self) -> Option<&str> {
         self.table.description.as_deref()
+    }
+
+    /// The name of the table itself, which is not always the type's: a
+    /// configured base name renames the type and leaves the table alone.
+    pub fn table_name(&self) -> &str {
+        &self.table.name
     }
 
     /// Get all fields.
