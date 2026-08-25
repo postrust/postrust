@@ -8,11 +8,11 @@ harness itself, divergences kept on purpose, and the gaps still open.
 
 | | status | same outcome | same data | full body |
 |---|---|---|---|---|
-| all (464) | 97.8% | 70.5% | **67.2%** | 43.5% |
-| **excluding the 142 permission cases (322)** | | | **89.8%** | |
+| all (464) | 97.8% | 72.0% | **68.8%** | 46.1% |
+| **excluding the 142 permission cases (322)** | | | **93.8%** | |
 
-Of the 312 cases the third column counts, **201 agree about data and 111 agree
-only because both servers answered with errors.** A further 111 are cases where
+Of the 319 cases the third column counts, **213 agree about data and 106 agree
+only because both servers answered with errors.** A further 116 are cases where
 Hasura refused and this server answered -- which is where a mutual-refusal case
 goes the moment this server gains the field it was missing.
 
@@ -23,17 +23,19 @@ else did -- with one exception, which was a real regression and is described
 below because that is what the comparison is for. The report prints the split,
 because a headline that mixes the two is not readable as progress.
 
-**201 is the figure that tracks the work.** It counts the cases where the same
+**213 is the figure that tracks the work.** It counts the cases where the same
 query came back with the same rows, which is the only thing a client can feel.
-Against it, **31 cases where Hasura answered with data and this server did not
-match it** -- down from 95.
+Against it, **19 cases where Hasura answered with data and this server did not
+match it** -- down from 95, and only **four** of those are cases where this
+server refuses a query Hasura answers. Ten of the other fifteen are
+introspection, where both servers answer and the schemas differ in shape.
 
 **The candidate is configured.** Each group's fixtures are converted into a
 `PGRST_GRAPHQL_NAMES` document by `scripts/hasura-names.py` and given to the
 server, because the names Hasura writes into metadata are not recoverable from
 a schema and a migration converts them. 25 of the 61 groups name something.
 
-Thirty-one groups agree completely, among them every boolean-expression group
+Thirty-four groups agree completely, among them every boolean-expression group
 except `basic`, both ordering groups, all three update groups, deletes,
 upserts, enums, GeoJSON writes, aggregates, transactions, both `custom_schema`
 groups and `graphql_introspection/descriptions`.
@@ -58,18 +60,22 @@ one transaction per mutation) → 63.6 (per-root names and column renaming) →
 enums, no relationship to an enum table, `on_conflict.where`) → 65.5 (the
 session argument; see the split for why this reads as a loss) → 67.2 (array
 columns, filtering on a computed field, and variables checked against the
-places they are used).
+places they are used) → 66.8 (computed relationships taking arguments; see the
+split) → 68.5 (computed columns taking arguments, `path` into a document
+column, composite foreign keys named, the scalar coercions Hasura performs) →
+68.8 (a null written into a comparison).
 
 Read as real agreement rather than as the headline, that is 137 → 167 → 176 →
-184 → 190 → 196 → 198 → 201 over the last eight runs. The figure excluding the
+184 → 190 → 196 → 198 → 201 → 205 → 213 → 213 over the last eleven runs. The
+figure excluding the
 permission cases went 51.2 → 55.3 → 55.9 → 58.4 → 60.6 → 62.4 → 64.0 → 64.6 →
-64.0 → 66.8 → 67.4 → 67.4 → 78.0 → 80.4 → 82.9 → 84.8 → 86.6 → 87.3 →
-**89.8**.
+64.0 → 66.8 → 67.4 → 67.4 → 78.0 → 80.4 → 82.9 → 84.8 → 86.6 → 87.3 → 89.8 →
+91.0 → 93.5 → **93.8**.
 
 **142 of the 464 cases cannot pass and are counted anyway.** They are the cases
 Hasura answers `access-denied` to, from a rule that lives in metadata, and
-there is no metadata here. Excluding them the figure is **289/322 = 89.8%**,
-and every one of the 201 real agreements is inside that 322.
+there is no metadata here. Excluding them the figure is **302/322 = 93.8%**,
+and every one of the 213 real agreements is inside that 322.
 
 That gap is worth understanding, because the headline moves less than the work
 behind it. Many of those permission cases "agree" only in the sense that both
@@ -175,80 +181,119 @@ wrong one.
 
 ## Open, ordered by consequence
 
-1. **A computed *column* can take arguments of its own.** The relationship half
-   of this is done -- `fetch_articles(search text, author_row author)` returns
-   rows and takes `args` where it is embedded. A column-shaped one,
-   `locations_distance("from" json, locations_row locations)`, still cannot:
-   its call is written by `computed_projections`, which assembles a select list
-   with no parameter list to bind an argument into. Threading one through is
-   the whole of the work. Two cases.
+1. **Subscriptions are notifications, not live queries.** Hasura's
+   `subscription_root` mirrors the query root: `article` yields `[article!]!`
+   with `where`, `order_by`, `distinct_on`, `limit` and `offset`, beside
+   `article_aggregate`, `article_by_pk` and `article_stream` with its cursor
+   types. Here a subscription is one row per `LISTEN`/`NOTIFY` payload, with no
+   arguments. The corpus group never loaded, so the difference shows only in
+   introspection -- but it is the largest shape divergence left, and a client
+   written against Hasura's subscriptions does not work here.
 
-2. **What is left of the enum tables.** They work: a marked table's rows are a
+2. **A predicate over an aggregate of a relationship.** `where: {articles_
+   aggregate: {count: {predicate: {_gt: 2}}}}` -- authors with more than two
+   articles. Hasura generates `article_aggregate_bool_exp` with `count`,
+   `bool_and` and `bool_or`, each taking `arguments`, `distinct`, `filter` and
+   `predicate`. Nothing in the corpus writes one, so it costs no measured case;
+   it is a real feature a migrating client can be using, and the machinery it
+   needs -- a correlated subselect against the child, which the relationship
+   predicates already build -- is there.
+
+3. **What is left of the enum tables.** They work: a marked table's rows are a
    generated enum, referencing columns are typed as it, and no relationship
    points at one. What remains is the metadata API around them —
    `v1/set_table_is_enum` is four cases of turning the flag on and off through
    `/v1/query`, which is the contract this server does not offer.
 
-3. **`on_conflict` inside a nested insert.** The top-level upsert works, `where`
+4. **`on_conflict` inside a nested insert.** The top-level upsert works, `where`
    and all; `{author: {data: {...}, on_conflict: {...}}}` does not, because the
    nested object has no `on_conflict` argument declared.
 
-4. **A manual relationship** -- one Hasura maps column by column rather than by
+5. **A manual relationship** -- one Hasura maps column by column rather than by
    a foreign key -- has no constraint to key a name by, so
    `PGRST_GRAPHQL_NAMES` cannot carry its name and the converter says so rather
    than guessing. In the corpus it is also a *second* name for a foreign key
-   that already has one, which reflection can only produce once.
+   that already has one, which reflection can only produce once. Two cases, one
+   of them the only remaining insert this server refuses and Hasura performs.
 
-5. **A function taking a table's row, tracked as a root field.** Hasura lets a
+6. **Which relationships exist is metadata's to say.** Hasura exposes the
+   relationships its metadata declares; this server exposes one per foreign
+   key. Where a fixture tracks a table without naming all of its keys, the
+   extra fields are here and not there. No query breaks on a field it does not
+   ask for, so this shows up only where a schema is compared field by field --
+   `graphql_introspection/nullable_object_relationship` is the case. Closing it
+   would mean letting the names document say which relationships exist, not
+   just what they are called, which is a different kind of directive.
+
+7. **A function's placement can be overridden in metadata.** `track_function`
+   with `configuration: {exposed_as: query}` puts a VOLATILE function on the
+   query root. Here placement follows volatility, which is the only thing the
+   catalogue records. Two cases, and like the names it is convertible -- the
+   document would have to carry functions as well as tables.
+
+8. **A function taking a table's row, tracked as a root field.** Hasura lets a
    client write `fetch_articles(args: {search: "Art", author_row: "(1, 'Roger',
    'Chris')"})` -- the row as a literal. Here such a function is a computed
    field and nothing else, on the grounds that a row type is not something a
    client can reasonably send. One case, and the position is deliberate.
 
-6. **Variable-free session.** Two cases now run correctly and still differ
-   because their fixtures send `X-Hasura-Search` and `X-Hasura-Offset-Int` as
-   *headers*. This server reads session variables from the verified token and
-   nowhere else, which is the deliberate divergence recorded below; the
-   machinery around them -- a computed field that takes the session, ordering
-   by an aggregate of one -- is right, and the input is not there on purpose.
+9. **A function returning one row, as a mutation.** `add_to_score_by_user_id`
+   returns `"user"` rather than `SETOF "user"`; Hasura exposes it as a root
+   field yielding one row. Here only a set-returning function becomes a root
+   field. Two cases, both of which Hasura answers `access-denied` to anyway.
 
-7. **A batched request.** A body that is a JSON *array* of operations is
-   answered by Hasura with an array of responses. Three cases in
-   `graphql_query/basic` use it, and the harness does not extract them, so this
-   is unmeasured rather than failing -- recorded because it is a contract a
-   client can depend on and this server does not offer it.
+10. **Variable-free session.** Two cases now run correctly and still differ
+    because their fixtures send `X-Hasura-Search` and `X-Hasura-Offset-Int` as
+    *headers*. This server reads session variables from the verified token and
+    nowhere else, which is the deliberate divergence recorded above; the
+    machinery around them -- a computed field that takes the session, ordering
+    by an aggregate of one -- is right, and the input is not there on purpose.
 
-8. **`count(columns: [...], distinct: true)`.** The argument is declared and
-   ignored: every `count` is `count(*)`. The corpus case that uses it passes
-   because the two answers happen to agree on its data, which is worth writing
-   down before someone reads it as coverage.
+11. **`hasura_session` says which database role is asking.** A function reading
+    `hasura_session->>'x-hasura-role'` gets `admin` from Hasura and the
+    connecting role's name here, because that is what a role is here. Two
+    cases, and they are the permission model showing through a value rather
+    than through a refusal.
 
-9. **An explicit null in a comparison.** `where: {id: {_eq: null}}` is refused
-   by Hasura -- "unexpected null value for type 'Int'" -- and answered here,
-   where `_eq` is a nullable `Int` and a null operand compares against null.
-   One case. Matching would mean refusing a spelling that is legal in the
-   schema this server publishes, which is a bigger change than the case is
-   worth and is worth deciding deliberately rather than by conformance.
+12. **A batched request.** A body that is a JSON *array* of operations is
+    answered by Hasura with an array of responses. Three cases in
+    `graphql_query/basic` use it, and the harness does not extract them, so this
+    is unmeasured rather than failing -- recorded because it is a contract a
+    client can depend on and this server does not offer it.
 
-10. **Scalar coercion is stricter than Hasura's.** `offset: "2"` and
-    `c1_smallint: "32767"` -- a string where an `Int` is declared -- are
-    accepted there and refused here. Two cases. Loosening it would mean not
-    using the scalar types async-graphql validates against, which is a worse
-    trade than the two cases are worth.
+13. **`count(columns: [...], distinct: true)`.** The argument is declared and
+    ignored: every `count` is `count(*)`. The corpus case that uses it passes
+    because the two answers happen to agree on its data, which is worth writing
+    down before someone reads it as coverage.
 
-11. **Introspection shape.** Three differences, all inside async-graphql rather
-    than in anything this server writes: it publishes five directives where
-    Hasura publishes three, `__TypeKind`'s members come back in specification
-    order rather than alphabetically, and the two schemas do not generate the
-    same *number* of types. Four cases, and none of them is reachable without
-    forking the library.
+14. **Every generated description is this server's wording, not Hasura's.**
+    `article_bool_exp` is described here as "Filter rows of article. Fields are
+    combined with AND unless _or says otherwise." and there as "Boolean
+    expression to filter rows from the table \"article\"...". Nothing breaks
+    on it -- a description is documentation -- but it is why no large
+    introspection case reaches full-body agreement, and adopting Hasura's
+    strings verbatim is the only way it would. The same goes for the order
+    arguments come back in: Hasura sorts them, this server lists them as
+    declared.
 
-12. **Actions and Apollo federation** are subsystems rather than gaps:
+15. **Introspection shape, inside async-graphql.** It publishes five directives
+    where Hasura publishes three, registers `ID` and `__DirectiveLocation`
+    where Hasura has neither, and answers `__TypeKind`'s members in
+    specification order rather than alphabetically. Six cases, and none of them
+    is reachable without forking the library.
+
+16. **An enum value beginning with `null`, `true` or `false`.** The parser
+    mis-lexes `nullPrefixTestTable_pkey` as the literal `null` followed by
+    something it cannot read, so an upsert naming that constraint is answered
+    with a parse error. This is async-graphql's lexer, not this server. One
+    case.
+
+17. **Actions and Apollo federation** are subsystems rather than gaps:
     `actions/*` describes handlers Hasura calls out to over HTTP, and
     `apollo_federation` describes the `_service`/`_entities` surface a
     federated gateway composes. Five cases between them.
 
-13. **The two cases typing the mutation inputs cost.** `objects` and `_set`
+18. **The two cases typing the mutation inputs cost.** `objects` and `_set`
     were `JSON`, which accepted a relationship under whatever name the request
     used; they are generated types now, so a relationship this server named
     differently is refused by validation rather than reaching a resolver that
@@ -510,6 +555,45 @@ wrong one.
   `"public"."author"` is not one: PostgreSQL reads it as a column of a table
   called `public`. An alias no column can share is a name that works in both
   positions.
+- **A computed column that takes arguments.** The symmetric half of the
+  relationship above. `locations_distance("from" json, locations_row
+  locations)` is a field of `locations` taking `args`, and the projection that
+  writes its call now carries the query's parameter list, which is what it was
+  missing.
+- **`path` into a document column.** `c32_json(path: "objs[0]['你好']")` reads
+  one part of a `json` or `jsonb` column, in the spelling Hasura accepts --
+  optional `$`, keys bare or after a dot, indices and quoted keys in brackets,
+  and a dot before a bracket meaning nothing. Answered where the value is
+  rather than in SQL, because the same column may be asked for under several
+  aliases and one projection cannot carry both.
+- **A key over more than one column can be named.** Hasura names a
+  relationship by its columns, not by its constraint, and the converter could
+  key only a single-column one -- so `article_multi.author` and
+  `author_multi.articles` kept their derived names and every query naming them
+  failed. Both sides now write the columns, sorted, as one key.
+- **The coercions Hasura performs on a written value.** `offset: "1"` and
+  `{c1_smallint: "32767", c20_boolean: "true"}` are a string where a number or
+  a boolean is declared, and Hasura reads them: a column's value goes through
+  PostgreSQL's own reading of a literal, which takes either spelling. The walk
+  is type-directed -- a `String` column keeps its digits -- and `limit` is left
+  strict, because the corpus refuses `limit: "3"` in the same breath that it
+  answers the offset.
+- **A null written into a comparison** is refused: `where: {id: {_eq: null}}`
+  reads as `id = NULL`, which is never true, so a client that wrote it meant
+  something the query cannot mean. A variable standing for a null counts; a
+  variable that was not given does not, because an absent variable makes the
+  comparison itself absent.
+- **`distinct_on` inside an embed**, under the same rule the root field
+  applies: the ordering has to begin with the distinct columns, or the row that
+  survives depends on the plan.
+- **The document operators are typed, and only where there is a document.**
+  `_append`, `_prepend`, `_delete_key`, `_delete_elem` and `_delete_at_path`
+  took an untyped `JSON`; each is an input object over the table's `jsonb`
+  columns now, and a table with none is not offered them at all. `_in` and
+  `_nin` take a list of non-null items, since a null is not a value a column
+  could equal. A bulk delete's `where` is non-null, which is what the resolver
+  was refusing at execution. A boolean column is out of `min` and `max`, which
+  PostgreSQL has no aggregate for.
 
 ## Not measured
 

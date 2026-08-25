@@ -151,6 +151,29 @@ fn relationship_keys(rel: &postrust_core::schema_cache::Relationship) -> Vec<Str
             keys.push(column.to_string());
         }
     }
+    // A key over more than one column, spelled as the columns in order. A
+    // composite foreign key has no single column to be named by, and Hasura
+    // names one by its columns rather than by its constraint -- so a
+    // relationship over `(author_id1, author_id2)` is unreachable under any
+    // of the spellings above. Sorted, because the order two sides list the
+    // same columns in is not something either of them promises.
+    let joined = |mut columns: Vec<String>| {
+        columns.sort();
+        columns.join(",")
+    };
+    let columns = rel.join_columns();
+    if columns.len() > 1 {
+        keys.push(format!(
+            "{}.{}",
+            rel.foreign_table().name,
+            joined(columns.iter().map(|(_, foreign)| foreign.clone()).collect())
+        ));
+        if !rel.is_one_to_many() {
+            keys.push(joined(
+                columns.iter().map(|(local, _)| local.clone()).collect(),
+            ));
+        }
+    }
     keys
 }
 
@@ -275,6 +298,37 @@ fn caller_arguments(
         .into_iter()
         .flatten()
         .find(|routine| routine.name == function.name)
+        .map(|routine| {
+            routine
+                .params
+                .iter()
+                .filter(|param| &param.name != row_argument)
+                .filter(|param| !is_session_argument(param))
+                .filter(|param| !param.name.is_empty())
+                .map(|param| (param.name.clone(), param.param_type.clone(), param.required))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// What a computed *column*'s function takes from the caller.
+///
+/// The same rule as [`caller_arguments`], one field kind along: everything but
+/// the row, which is what makes it a field of this table, and the session,
+/// which is the server's to supply.
+pub(crate) fn computed_caller_arguments(
+    computed: &postrust_core::schema_cache::ComputedColumn,
+    schema_cache: &SchemaCache,
+) -> Vec<(String, String, bool)> {
+    let Some(row_argument) = &computed.row_argument else {
+        return Vec::new();
+    };
+    schema_cache
+        .routines
+        .get(&computed.function)
+        .into_iter()
+        .flatten()
+        .find(|routine| routine.name == computed.function.name)
         .map(|routine| {
             routine
                 .params
@@ -695,7 +749,22 @@ pub fn build_schema(schema_cache: &SchemaCache, config: &SchemaConfig) -> Genera
             .clone();
 
         // Create object type
-        let obj_type = TableObjectType::from_table_named(table, &base_name, &config.names);
+        let mut obj_type = TableObjectType::from_table_named(table, &base_name, &config.names);
+        // What each computed field takes from the caller. Read from the
+        // routine, for the reason `caller_arguments` gives.
+        for field in &mut obj_type.fields {
+            let Some(function) = config
+                .names
+                .computed_source(&table.schema, &table.name, &field.name)
+                .or(Some(field.name.as_str()))
+            else {
+                continue;
+            };
+            let Some(computed) = table.get_computed_column(function) else {
+                continue;
+            };
+            field.arguments = computed_caller_arguments(computed, schema_cache);
+        }
         let type_name = obj_type.name.clone();
 
         // Add query fields. Each root may be named separately -- Hasura names

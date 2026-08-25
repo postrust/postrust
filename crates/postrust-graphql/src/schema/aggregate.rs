@@ -83,6 +83,10 @@ pub fn is_numeric(graphql_type: &GraphQLType) -> bool {
 pub fn is_ordered(graphql_type: &GraphQLType) -> bool {
     match graphql_type {
         GraphQLType::Json | GraphQLType::List(_) => false,
+        // PostgreSQL has no `max(boolean)`: the question "the largest of these
+        // flags" is asked as `bool_and`/`bool_or` instead, and Hasura leaves
+        // a boolean column out of `min` and `max` for the same reason.
+        GraphQLType::Boolean => false,
         // A named type orders unless PostgreSQL has no operator class for it.
         // `json` has none -- `max(details)` is an error, not an empty result.
         GraphQLType::Custom(name) => !matches!(name.as_str(), "json" | "raster"),

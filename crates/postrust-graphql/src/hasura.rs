@@ -233,7 +233,7 @@ pub fn prepare(
     schema: Option<&async_graphql::dynamic::Schema>,
     request: async_graphql::Request,
 ) -> Result<async_graphql::Request, (async_graphql::Request, Vec<ServerError>)> {
-    let mut request = drop_unused_variables(request);
+    let mut request = rewrite_document(schema, request);
     if let Some(schema) = schema {
         // Parsed again rather than threaded through: `set_parsed_query` takes
         // the document by value and gives nothing back, and re-parsing a
@@ -249,7 +249,18 @@ pub fn prepare(
     Ok(request)
 }
 
-fn drop_unused_variables(mut request: async_graphql::Request) -> async_graphql::Request {
+/// The edits made to a document before it is validated.
+///
+/// A declaration nothing uses is dropped, and a value written as a string
+/// where a number or a boolean is expected becomes one. Both are things
+/// Hasura accepts and the specification does not, and both are edits to the
+/// same parsed document -- which is why they are one pass: `set_parsed_query`
+/// takes the document by value, so a second pass would have to re-parse the
+/// source text and would undo the first.
+fn rewrite_document(
+    schema: Option<&async_graphql::dynamic::Schema>,
+    mut request: async_graphql::Request,
+) -> async_graphql::Request {
     use async_graphql::parser::types::{
         DocumentOperations, ExecutableDocument, Selection, SelectionSet,
     };
@@ -321,26 +332,208 @@ fn drop_unused_variables(mut request: async_graphql::Request) -> async_graphql::
         from_selection_set(&fragment.node.selection_set.node, &mut used);
     }
 
-    let mut dropped = false;
-    let mut prune = |operation: &mut async_graphql::Positioned<
-        async_graphql::parser::types::OperationDefinition,
-    >| {
-        let before = operation.node.variable_definitions.len();
-        operation
-            .node
-            .variable_definitions
-            .retain(|definition| used.contains(&definition.node.name.node));
-        dropped |= operation.node.variable_definitions.len() != before;
-    };
-    match &mut doc.operations {
-        DocumentOperations::Single(operation) => prune(operation),
-        DocumentOperations::Multiple(operations) => operations.values_mut().for_each(prune),
+    let mut edited = false;
+    {
+        let mut prune = |operation: &mut async_graphql::Positioned<
+            async_graphql::parser::types::OperationDefinition,
+        >| {
+            let before = operation.node.variable_definitions.len();
+            operation
+                .node
+                .variable_definitions
+                .retain(|definition| used.contains(&definition.node.name.node));
+            edited |= operation.node.variable_definitions.len() != before;
+        };
+        match &mut doc.operations {
+            DocumentOperations::Single(operation) => prune(operation),
+            DocumentOperations::Multiple(operations) => operations.values_mut().for_each(prune),
+        }
     }
 
-    if dropped {
+    // A value written as a string where a number or a boolean is expected.
+    // `insert_test_types(objects: [{c1_smallint: "32767", c20_boolean:
+    // "true"}])` is a mutation Hasura performs: a column's value is read the
+    // way PostgreSQL reads a literal, which takes either spelling, while the
+    // schema still introspects as `Int`. So does `article(offset: "1")`.
+    //
+    // `limit` is the exception, and the corpus is explicit about it: `limit:
+    // "3"` is refused in the same breath that `offset: "1"` is answered. It is
+    // the one Int in the schema that is the engine's own rather than a
+    // column's, and it is the only place a string is not a number.
+    if let Some(schema) = schema {
+        let registry = schema.registry();
+        {
+            let mut coerce = |operation: &mut async_graphql::Positioned<
+                async_graphql::parser::types::OperationDefinition,
+            >| {
+                use async_graphql::parser::types::OperationType;
+                let root = match operation.node.ty {
+                    OperationType::Query => Some(registry.query_type.as_str()),
+                    OperationType::Mutation => registry.mutation_type.as_deref(),
+                    OperationType::Subscription => registry.subscription_type.as_deref(),
+                };
+                if let Some(root) = root {
+                    edited |= coerce_selection_set(
+                        registry,
+                        &mut operation.node.selection_set.node,
+                        root,
+                    );
+                }
+            };
+            match &mut doc.operations {
+                DocumentOperations::Single(operation) => coerce(operation),
+                DocumentOperations::Multiple(operations) => {
+                    operations.values_mut().for_each(coerce)
+                }
+            }
+        }
+        // A fragment names the type it is on, so it is walked on its own
+        // rather than from wherever it is spread -- which also means a cyclic
+        // spread cannot walk forever.
+        for fragment in doc.fragments.values_mut() {
+            let on = fragment.node.type_condition.node.on.node.to_string();
+            edited |= coerce_selection_set(registry, &mut fragment.node.selection_set.node, &on);
+        }
+    }
+
+    if edited {
         request.set_parsed_query(doc);
     }
     request
+}
+
+/// Coerce the written values of one selection set, and of everything under it.
+///
+/// Type-directed, the same walk [`Usage`] makes: a field names its arguments,
+/// an argument names an input object, an input object names its fields, and at
+/// the leaves sits the type a written value has to be. Returns whether
+/// anything changed.
+fn coerce_selection_set(
+    registry: &async_graphql::registry::Registry,
+    set: &mut async_graphql::parser::types::SelectionSet,
+    type_name: &str,
+) -> bool {
+    use async_graphql::parser::types::Selection;
+    use async_graphql::registry::MetaTypeName;
+
+    let mut edited = false;
+    for selection in &mut set.items {
+        match &mut selection.node {
+            Selection::Field(field) => {
+                let meta = registry
+                    .types
+                    .get(type_name)
+                    .and_then(|ty| ty.field_by_name(field.node.name.node.as_str()));
+                for (name, value) in &mut field.node.arguments {
+                    // The engine's own Int, which is strict where a column's
+                    // is not.
+                    if name.node.as_str() == "limit" {
+                        continue;
+                    }
+                    let Some(argument) = meta.and_then(|meta| meta.args.get(name.node.as_str()))
+                    else {
+                        continue;
+                    };
+                    let ty = argument.ty.clone();
+                    edited |= coerce_value(registry, &mut value.node, &ty);
+                }
+                if let Some(meta) = meta {
+                    let inner = MetaTypeName::concrete_typename(&meta.ty).to_string();
+                    edited |=
+                        coerce_selection_set(registry, &mut field.node.selection_set.node, &inner);
+                }
+            }
+            Selection::InlineFragment(fragment) => {
+                let inner = fragment
+                    .node
+                    .type_condition
+                    .as_ref()
+                    .map(|condition| condition.node.on.node.to_string())
+                    .unwrap_or_else(|| type_name.to_string());
+                edited |=
+                    coerce_selection_set(registry, &mut fragment.node.selection_set.node, &inner);
+            }
+            Selection::FragmentSpread(_) => {}
+        }
+    }
+    edited
+}
+
+/// One written value, against the type of the place it was written in.
+fn coerce_value(
+    registry: &async_graphql::registry::Registry,
+    value: &mut async_graphql_value::Value,
+    expected: &str,
+) -> bool {
+    use async_graphql::registry::{MetaType, MetaTypeName};
+    use async_graphql_value::Value;
+
+    match value {
+        Value::List(items) => {
+            // A single value may be written where a list is expected, so the
+            // item type stands in for either.
+            let inner = match MetaTypeName::create(expected).unwrap_non_null() {
+                MetaTypeName::List(inner) => inner.to_string(),
+                _ => expected.to_string(),
+            };
+            let mut edited = false;
+            for item in items {
+                edited |= coerce_value(registry, item, &inner);
+            }
+            edited
+        }
+        Value::Object(fields) => {
+            let name = MetaTypeName::concrete_typename(expected);
+            let Some(MetaType::InputObject { input_fields, .. }) = registry.types.get(name) else {
+                return false;
+            };
+            let types: Vec<(async_graphql::Name, String)> = fields
+                .keys()
+                .filter_map(|key| {
+                    input_fields
+                        .get(key.as_str())
+                        .map(|field| (key.clone(), field.ty.clone()))
+                })
+                .collect();
+            let mut edited = false;
+            for (key, ty) in types {
+                if let Some(item) = fields.get_mut(&key) {
+                    edited |= coerce_value(registry, item, &ty);
+                }
+            }
+            edited
+        }
+        Value::String(text) => {
+            let Some(coerced) = as_written(text, MetaTypeName::concrete_typename(expected)) else {
+                return false;
+            };
+            *value = coerced;
+            true
+        }
+        _ => false,
+    }
+}
+
+/// A string read as the type it was written where, if it can be.
+///
+/// Only the three GraphQL scalars that are strict about it: everything else in
+/// this schema is a scalar of its own, which takes a string already.
+fn as_written(text: &str, expected: &str) -> Option<async_graphql_value::Value> {
+    use async_graphql_value::{Number, Value};
+    match expected {
+        "Int" => text.parse::<i64>().ok().map(|n| Value::Number(n.into())),
+        "Float" => text
+            .parse::<f64>()
+            .ok()
+            .and_then(Number::from_f64)
+            .map(Value::Number),
+        "Boolean" => match text {
+            "true" => Some(Value::Boolean(true)),
+            "false" => Some(Value::Boolean(false)),
+            _ => None,
+        },
+        _ => None,
+    }
 }
 
 #[cfg(test)]
@@ -473,14 +666,14 @@ fn variable_errors(
                 ));
             }
         }
-        if declared.is_empty() {
-            continue;
-        }
-
+        // Walked even with nothing declared: the second thing this looks for
+        // is a null written straight into a comparison, which needs no
+        // variable to be written.
         let mut scope = Usage {
             registry,
             fragments: &doc.fragments,
             declared: &declared,
+            variables,
             errors: &mut errors,
             seen: HashSet::new(),
         };
@@ -498,6 +691,9 @@ struct Usage<'a> {
         async_graphql::Positioned<async_graphql::parser::types::FragmentDefinition>,
     >,
     declared: &'a HashMap<&'a str, String>,
+    /// What the request gave for each variable, which is the only way to tell
+    /// a variable standing for a null from one standing for a value.
+    variables: &'a async_graphql::Variables,
     errors: &'a mut Vec<ServerError>,
     /// Fragments already walked, so a cycle terminates. async-graphql refuses
     /// cyclic fragments too, but this runs first.
@@ -580,6 +776,24 @@ impl Usage<'_> {
         }
     }
 
+    /// Whether a written value is a null, however it was written.
+    ///
+    /// A literal one, or a variable the request gave a null for. A variable
+    /// the request left out is not: an absent variable makes the field itself
+    /// absent, which is a query with no such comparison rather than one
+    /// comparing against nothing.
+    fn stands_for_null(&self, value: &async_graphql_value::Value) -> bool {
+        use async_graphql_value::Value;
+        match value {
+            Value::Null => true,
+            Value::Variable(name) => matches!(
+                self.variables.get(&async_graphql::Name::new(name)),
+                Some(async_graphql::Value::Null)
+            ),
+            _ => false,
+        }
+    }
+
     /// One written value, against the type of the place it was written in.
     fn value(
         &mut self,
@@ -625,10 +839,28 @@ impl Usage<'_> {
                 else {
                     return;
                 };
+                // A comparison against null. `where: {id: {_eq: null}}` reads
+                // as `id = NULL`, which is never true -- so a client that
+                // wrote it meant something the query cannot mean, and gets
+                // every row or no rows depending on which. Hasura refuses it,
+                // and the operand is a nullable `Int` in the schema either
+                // server publishes, so this is the only place it can be
+                // refused.
+                let comparison = name.ends_with("_comparison_exp");
                 for (key, item) in fields {
                     let Some(field) = input_fields.get(key.as_str()) else {
                         continue;
                     };
+                    if comparison && self.stands_for_null(item) {
+                        self.errors.push(coded(
+                            format!(
+                                "unexpected null value for type '{}'",
+                                MetaTypeName::concrete_typename(&field.ty)
+                            ),
+                            pos,
+                        ));
+                        continue;
+                    }
                     let ty = relax(&field.ty, field.default_value.is_some());
                     self.value(item, &ty, pos);
                 }
@@ -668,8 +900,15 @@ mod variable_position_tests {
     /// argument, a nested input object, a list, a non-null location, and a
     /// non-null location that has a default.
     fn schema() -> async_graphql::dynamic::Schema {
-        let filter =
-            InputObject::new("author_bool_exp").field(InputValue::new("id", TypeRef::named("Int")));
+        let filter = InputObject::new("author_bool_exp")
+            .field(InputValue::new("id", TypeRef::named("Int")))
+            .field(InputValue::new(
+                "name",
+                TypeRef::named("String_comparison_exp"),
+            ));
+        let comparison = InputObject::new("String_comparison_exp")
+            .field(InputValue::new("_eq", TypeRef::named("String")))
+            .field(InputValue::new("_in", TypeRef::named_nn_list("String")));
         let insert = InputObject::new("author_insert_input")
             .field(InputValue::new("name", TypeRef::named("String")));
         let query = Object::new("query_root").field(
@@ -707,6 +946,7 @@ mod variable_position_tests {
         }));
         Schema::build("query_root", Some("mutation_root"), None)
             .register(filter)
+            .register(comparison)
             .register(insert)
             .register(author)
             .register(query)
@@ -724,6 +964,48 @@ mod variable_position_tests {
             Ok(_) => Vec::new(),
             Err((_, errors)) => errors.into_iter().map(|e| e.message).collect(),
         }
+    }
+
+    /// `where: {name: {_eq: null}}` reads as `name = NULL`, which is never
+    /// true. Hasura refuses it, and so does this.
+    #[test]
+    fn a_null_written_into_a_comparison_is_refused() {
+        assert_eq!(
+            refusals("{ author(where: {name: {_eq: null}}) { id } }", "{}"),
+            vec!["unexpected null value for type 'String'"]
+        );
+    }
+
+    #[test]
+    fn a_variable_standing_for_a_null_is_refused_there_too() {
+        assert_eq!(
+            refusals(
+                "query ($n: String) { author(where: {name: {_eq: $n}}) { id } }",
+                r#"{"n": null}"#
+            ),
+            vec!["unexpected null value for type 'String'"]
+        );
+    }
+
+    /// An absent variable makes the comparison itself absent, which is a
+    /// query with no such filter rather than one filtering on nothing.
+    #[test]
+    fn a_variable_that_was_not_given_is_not_a_null() {
+        assert!(refusals(
+            "query ($n: String) { author(where: {name: {_eq: $n}}) { id } }",
+            "{}"
+        )
+        .is_empty());
+    }
+
+    /// Only comparisons. A column set to null is a column set to null.
+    #[test]
+    fn a_null_written_anywhere_else_is_left_alone() {
+        assert!(refusals(
+            "mutation { insert_author_one(object: {name: null}) { id } }",
+            "{}"
+        )
+        .is_empty());
     }
 
     #[test]
@@ -855,5 +1137,95 @@ mod variable_position_tests {
             ),
             vec!["variable 's' is declared as 'String', but used where 'Int' is expected"]
         );
+    }
+}
+
+#[cfg(test)]
+mod coercion_tests {
+    use super::*;
+    use async_graphql::dynamic::*;
+
+    /// The three places a value is written: a field argument the engine owns,
+    /// a field argument a column owns, and a column inside an input object.
+    fn schema() -> async_graphql::dynamic::Schema {
+        let insert = InputObject::new("test_types_insert_input")
+            .field(InputValue::new("c1_smallint", TypeRef::named("Int")))
+            .field(InputValue::new("c6_real", TypeRef::named("Float")))
+            .field(InputValue::new("c20_boolean", TypeRef::named("Boolean")))
+            .field(InputValue::new("c13_text", TypeRef::named("String")));
+        let row = Object::new("test_types").field(Field::new(
+            "c1_smallint",
+            TypeRef::named("Int"),
+            |_| FieldFuture::new(async move { Ok(None::<async_graphql::Value>) }),
+        ));
+        let query = Object::new("query_root").field(
+            Field::new(
+                "test_types",
+                TypeRef::named_nn_list_nn("test_types"),
+                |_| FieldFuture::new(async move { Ok(Some(async_graphql::Value::List(vec![]))) }),
+            )
+            .argument(InputValue::new("limit", TypeRef::named("Int")))
+            .argument(InputValue::new("offset", TypeRef::named("Int"))),
+        );
+        let mutation = Object::new("mutation_root").field(
+            Field::new("insert_test_types", TypeRef::named("test_types"), |_| {
+                FieldFuture::new(async move { Ok(None::<async_graphql::Value>) })
+            })
+            .argument(InputValue::new(
+                "objects",
+                TypeRef::named_nn_list_nn("test_types_insert_input"),
+            )),
+        );
+        Schema::build("query_root", Some("mutation_root"), None)
+            .register(insert)
+            .register(row)
+            .register(query)
+            .register(mutation)
+            .finish()
+            .expect("the schema builds")
+    }
+
+    fn rewritten(query: &str) -> String {
+        let schema = schema();
+        let request = prepare(Some(&schema), async_graphql::Request::new(query))
+            .unwrap_or_else(|(request, _)| request);
+        let mut request = request;
+        format!("{:?}", request.parsed_query().expect("the query parses"))
+    }
+
+    #[test]
+    fn an_offset_written_as_a_string_becomes_a_number() {
+        let printed = rewritten("{ test_types(offset: \"1\") { c1_smallint } }");
+        assert!(printed.contains("Number(1)"), "{}", printed);
+    }
+
+    /// The corpus refuses this one in the same breath as it answers the
+    /// offset above, so it is left exactly as written.
+    #[test]
+    fn a_limit_written_as_a_string_is_left_alone() {
+        let printed = rewritten("{ test_types(limit: \"3\") { c1_smallint } }");
+        assert!(printed.contains("String(\"3\")"), "{}", printed);
+    }
+
+    #[test]
+    fn a_column_written_as_a_string_becomes_what_the_column_is() {
+        let printed = rewritten(
+            "mutation { insert_test_types(objects: [{ \
+             c1_smallint: \"32767\", c6_real: \"0.5\", c20_boolean: \"true\" }]) \
+             { c1_smallint } }",
+        );
+        assert!(printed.contains("Number(32767)"), "{}", printed);
+        assert!(printed.contains("Number(0.5)"), "{}", printed);
+        assert!(printed.contains("Boolean(true)"), "{}", printed);
+    }
+
+    /// A text column keeps its digits. This is the whole reason the walk is
+    /// type-directed rather than a sweep over every string in the document.
+    #[test]
+    fn a_string_written_where_a_string_belongs_stays_one() {
+        let printed = rewritten(
+            "mutation { insert_test_types(objects: [{ c13_text: \"32767\" }]) { c1_smallint } }",
+        );
+        assert!(printed.contains("String(\"32767\")"), "{}", printed);
     }
 }

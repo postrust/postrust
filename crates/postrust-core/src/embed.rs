@@ -552,13 +552,17 @@ impl EmbedPlan {
         child_where: Option<&str>,
         order_by: Option<&str>,
         function_arguments: Option<&str>,
+        // A `DISTINCT ON (...) ` prefix, or empty. It belongs to the rows
+        // being summarised rather than to the summary: counting the distinct
+        // titles means counting the rows that survive it.
+        distinct_on: &str,
     ) -> Result<String> {
         let child = postrust_sql::escape_ident(child_alias);
         let rows = self.correlated_rows(
             parent_alias,
             parent_row,
             child_alias,
-            &format!("{}.*", child),
+            &format!("{}{}.*", distinct_on, child),
             limit,
             offset,
             child_where,

@@ -179,6 +179,21 @@ def qualified(table):
     return "public", ""
 
 
+def join_columns(columns):
+    """The key a key over more than one column is written under.
+
+    A composite foreign key has no single column to be named by, and Hasura
+    names one by its columns rather than by its constraint. Sorted, because
+    the order the two sides list the same columns in is not something either
+    of them promises -- the server sorts them the same way.
+    """
+    if not columns:
+        return None
+    if len(columns) == 1:
+        return columns[0]
+    return ",".join(sorted(columns))
+
+
 def relationship_key(entry, kind):
     """The key this server will look the relationship up under.
 
@@ -195,12 +210,12 @@ def relationship_key(entry, kind):
     if isinstance(on, str):
         return on
     if isinstance(on, list):
-        return on[0] if len(on) == 1 else None
+        return join_columns(on)
     if isinstance(on, dict):
         _, table = qualified(on.get("table"))
         columns = on.get("columns") or on.get("column")
         if isinstance(columns, list):
-            columns = columns[0] if len(columns) == 1 else None
+            columns = join_columns(columns)
         if table and columns:
             return f"{table}.{columns}"
         if columns:

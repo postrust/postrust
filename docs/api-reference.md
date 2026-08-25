@@ -456,9 +456,28 @@ query {
 }
 ```
 
-An embedded list takes the same four arguments the root field does, applied
-inside the child's own subselect -- so the limit bounds rows per parent and the
-ordering happens before it.
+An embedded list takes the same five arguments the root field does --
+`where`, `order_by`, `distinct_on`, `limit` and `offset` -- applied inside the
+child's own subselect, so the limit bounds rows per parent and the ordering
+happens before it.
+
+A `json` or `jsonb` column takes a `path`, which reads one part of the
+document the way `#>` does:
+
+```graphql
+{
+  events {
+    payload
+    actor: payload(path: "actor.login")
+    first_file: payload(path: "commits[0].files[0]")
+    odd_key: payload(path: "['a key with spaces']")
+  }
+}
+```
+
+A leading `$` is the document itself and may be left out; keys are written
+bare or after a dot; an index or a quoted key goes in brackets. A step the
+document does not have reads null.
 
 #### Filtering
 
@@ -546,6 +565,27 @@ query {
 `nodes` is a rows selection like any other: it takes relationships and computed
 fields, not only columns.
 
+### Computed fields
+
+A function of a table's row is a field of that table. Where it takes more than
+the row, the rest goes under `args`, so a parameter called `limit` cannot
+shadow the one that pages the result:
+
+```graphql
+{
+  locations {
+    location
+    distance(args: { from: { type: "Point", coordinates: [0, 0] } })
+  }
+}
+```
+
+The same applies to a function returning rows of another table, which is a
+relationship rather than a column: `get_articles(args: {search: "rust"}) { id }`,
+and `get_articles_aggregate(args: {search: "rust"})` beside it. A `hasura_session
+json` parameter is filled by the server from the caller's verified claims and is
+not an argument the client can write.
+
 ### Mutations
 
 #### Insert
@@ -600,6 +640,10 @@ mutation {
 | `_delete_elem` | remove an array element by index |
 | `_delete_at_path` | remove at a path, given as a list of keys |
 
+Each takes an input object over the table's `jsonb` columns --
+`_append: { config: {...} }`, `_delete_key: { config: "stale" }` -- and a
+table with no `jsonb` column is not offered them at all.
+
 `update_article_by_pk(pk_columns: {id: 1}, _set: {...})` addresses one row. An
 update that changes nothing changes no rows and says so.
 
@@ -639,6 +683,10 @@ mutation {
 `returning` can carry relationships: the delete runs in a CTE and the
 projection reads from it, while the rows it points at are still there.
 
+`where` is required. A bulk delete with no predicate is a delete of the whole
+table, so the schema says it is not a query that can be written -- a client's
+own tooling catches it before the request is sent.
+
 #### One mutation is one transaction
 
 A mutation may name several root fields, and they are resolved one after
@@ -667,10 +715,23 @@ an explicit null. A nullable variable may stand where a non-null is expected
 when either it or the place has a default, since the default is then what fills
 it.
 
-One deliberate exception: a variable that is *declared and never used* is
-accepted. The specification says a document like that is invalid; Hasura
-executes it, and a client whose filter was edited years ago has been getting
-answers ever since.
+A null written into a comparison is refused too: `where: {id: {_eq: null}}`
+reads as `id = NULL`, which is never true, so a client that wrote it meant
+something the query cannot mean. A variable standing for a null counts; a
+variable that was simply not given does not, since an absent variable makes
+the comparison itself absent.
+
+Two deliberate exceptions, both of them things Hasura accepts:
+
+- A variable that is *declared and never used*. The specification says a
+  document like that is invalid; Hasura executes it, and a client whose filter
+  was edited years ago has been getting answers ever since.
+- A value written as a string where a number or a boolean is expected --
+  `insert_test_types(objects: [{c1_smallint: "32767", c20_boolean: "true"}])`,
+  or `article(offset: "1")`. A column's value is read the way PostgreSQL reads
+  a literal, which takes either spelling. `limit` is the exception to the
+  exception and stays strict, because that is where Hasura draws the line
+  too.
 
 ### Errors
 

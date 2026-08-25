@@ -120,6 +120,13 @@ pub struct ComputedColumn {
     /// session document to give it, and is skipped there.
     #[serde(default)]
     pub session_argument: Option<String>,
+    /// Whether the function takes anything besides the row.
+    ///
+    /// The REST surface has nowhere to write an argument and no session to
+    /// supply, so it reads only the fields that take neither: a field it could
+    /// only ever call wrongly is worse than a field that is not there.
+    #[serde(default)]
+    pub takes_arguments: bool,
 }
 
 /// A table column.

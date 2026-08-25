@@ -95,6 +95,7 @@ impl SchemaCache {
                         description: computed.description,
                         row_argument: computed.row_argument,
                         session_argument: computed.session_argument,
+                        takes_arguments: computed.takes_arguments,
                     },
                 );
             }

@@ -16,6 +16,10 @@ pub struct GraphQLField {
     pub nullable: bool,
     /// Whether this is a primary key field.
     pub is_pk: bool,
+    /// The arguments a computed field takes from the caller, as `(name,
+    /// PostgreSQL type, required)`. Empty for a column, and for a computed
+    /// field that takes only the row and the session.
+    pub arguments: Vec<(String, String, bool)>,
 }
 
 impl GraphQLField {
@@ -30,6 +34,7 @@ impl GraphQLField {
             graphql_type,
             nullable,
             is_pk: column.is_pk,
+            arguments: Vec::new(),
         }
     }
 
@@ -94,6 +99,7 @@ impl TableObjectType {
             graphql_type: pg_type_to_graphql(&computed.data_type),
             nullable: true,
             is_pk: false,
+            arguments: Vec::new(),
         }
     }
 

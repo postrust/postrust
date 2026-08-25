@@ -35,6 +35,10 @@ use std::collections::{HashMap, HashSet};
 const UNIVERSAL: &[&str] = &["_eq", "_neq", "_gt", "_gte", "_lt", "_lte"];
 
 /// Comparisons taking a list of the column's own type.
+///
+/// The items are non-null: a null in `_in` is not a value the column could
+/// equal -- `= NULL` is never true -- so Hasura types the list `[Int!]` and
+/// refuses one rather than answering nothing.
 const LIST_VALUED: &[&str] = &["_in", "_nin"];
 
 /// Pattern matching, for text-shaped columns only.
@@ -150,7 +154,7 @@ fn comparison_input(scalar: &str) -> InputObject {
         input = input.field(InputValue::new(*op, TypeRef::named(scalar)));
     }
     for op in LIST_VALUED {
-        input = input.field(InputValue::new(*op, TypeRef::named_list(scalar)));
+        input = input.field(InputValue::new(*op, TypeRef::named_nn_list(scalar)));
     }
     input = input.field(InputValue::new("_is_null", TypeRef::named("Boolean")));
 

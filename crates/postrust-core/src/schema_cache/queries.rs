@@ -948,11 +948,13 @@ pub async fn load_computed_columns(
     schemas: &[String],
     function_schemas: &[String],
 ) -> Result<Vec<ComputedColumnRow>> {
-    // One argument is the table's row. A second is allowed only where it is
-    // the session document Hasura fills in -- `hasura_session json` -- which a
-    // client never sends and which is what lets a computed field know who is
-    // asking. Anything else with two arguments is a function that needs one,
-    // and a field with no way to supply it would be a field that always fails.
+    // One argument is the table's row. The rest are the caller's, and are
+    // exposed as the field's own arguments -- except the session document
+    // Hasura fills in, `hasura_session json`, which a client never sends and
+    // which is what lets a computed field know who is asking.
+    //
+    // Every argument has to be named: one that is not cannot be given by name,
+    // and a call with more than the row has to be.
     let rows = sqlx::query(
         r#"
         SELECT tn.nspname AS table_schema,
@@ -968,17 +970,15 @@ pub async fn load_computed_columns(
                (SELECT p.proargnames[i]
                   FROM generate_series(1, p.pronargs) AS i
                  WHERE p.proargnames[i] = 'hasura_session'
-                 LIMIT 1) AS session_argument
+                 LIMIT 1) AS session_argument,
+               p.pronargs > 1 AS takes_arguments
           FROM pg_proc p
           JOIN pg_namespace fn ON fn.oid = p.pronamespace
           JOIN pg_class t ON t.reltype = ANY (p.proargtypes::oid[])
           JOIN pg_namespace tn ON tn.oid = t.relnamespace
-         WHERE p.pronargs BETWEEN 1 AND 2
-           AND (p.pronargs = 1 OR EXISTS (
-                 SELECT 1 FROM generate_series(1, p.pronargs) AS i
-                  WHERE p.proargnames[i] = 'hasura_session'
-                    AND p.proargtypes[i - 1] IN (
-                          'pg_catalog.json'::regtype, 'pg_catalog.jsonb'::regtype)))
+         WHERE (p.pronargs = 1 OR (SELECT count(*)
+                                     FROM generate_series(1, p.pronargs) AS i
+                                    WHERE COALESCE(p.proargnames[i], '') = '') = 0)
            AND NOT p.proretset
            AND p.prokind = 'f'
            AND p.prorettype <> 'pg_catalog.trigger'::pg_catalog.regtype
@@ -1009,6 +1009,7 @@ pub async fn load_computed_columns(
             description: row.get::<Option<String>, _>("description"),
             row_argument: row.get::<Option<String>, _>("row_argument"),
             session_argument: row.get::<Option<String>, _>("session_argument"),
+            takes_arguments: row.get::<bool, _>("takes_arguments"),
         })
         .collect())
 }
@@ -1030,6 +1031,8 @@ pub struct ComputedColumnRow {
     pub row_argument: Option<String>,
     /// The parameter filled from the session, if any.
     pub session_argument: Option<String>,
+    /// Whether it takes anything besides the row.
+    pub takes_arguments: bool,
 }
 
 /// One view column, and the base-table column it was selected from.

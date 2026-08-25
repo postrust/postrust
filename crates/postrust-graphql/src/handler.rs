@@ -459,6 +459,22 @@ fn build_dynamic_schema(
             scalar_names.insert(leaf_scalar_name(&crate::types::pg_type_to_graphql(pg_type)));
         }
     }
+    // The same for the functions behind computed fields, whose arguments are
+    // written where the field is asked for rather than at a root.
+    for object in generated.object_types.values() {
+        for field in &object.fields {
+            for (_, pg_type, _) in &field.arguments {
+                scalar_names.insert(leaf_scalar_name(&crate::types::pg_type_to_graphql(pg_type)));
+            }
+        }
+    }
+    for relationships in generated.relationship_fields.values() {
+        for relationship in relationships {
+            for (_, pg_type, _) in &relationship.arguments {
+                scalar_names.insert(leaf_scalar_name(&crate::types::pg_type_to_graphql(pg_type)));
+            }
+        }
+    }
 
     // Every scalar the boolean expressions name, which is more than the
     // scalars the columns are: a cast from a geometry names `geography`, and a
@@ -604,7 +620,11 @@ fn build_dynamic_schema(
             let mut numeric = InputObject::new(format!("{}_inc_input", type_name))
                 .description(format!("Columns of {} to add to.", type_name));
             let mut any_numeric = false;
+            let mut any_jsonb = false;
             for field in &writable {
+                if matches!(&field.graphql_type, crate::types::GraphQLType::Json) {
+                    any_jsonb = true;
+                }
                 set = set.field(InputValue::new(
                     &field.name,
                     write_type_ref(&field.graphql_type),
@@ -648,16 +668,37 @@ fn build_dynamic_schema(
                     TypeRef::named(format!("{}_inc_input", type_name)),
                 ));
             }
-            for operator in [
-                "_append",
-                "_prepend",
-                "_delete_key",
-                "_delete_elem",
-                "_delete_at_path",
-            ] {
-                updates = updates.field(InputValue::new(operator, TypeRef::named("JSON")));
+            // What a document column may be told to do, one input per
+            // operator: each takes a value of a different shape -- a
+            // document, a key, an index, a path -- and only the columns that
+            // hold documents may be told any of it. A table with none is not
+            // given the operators at all, which is what says in the schema
+            // that `_append` is not a thing to write there.
+            for (operator, _) in JSONB_OPERATORS {
+                if !any_jsonb {
+                    break;
+                }
+                updates = updates.field(InputValue::new(
+                    *operator,
+                    TypeRef::named(jsonb_operator_input(type_name, operator)),
+                ));
             }
             builder = builder.register(updates);
+            if any_jsonb {
+                for (operator, item) in JSONB_OPERATORS {
+                    let mut input =
+                        InputObject::new(jsonb_operator_input(type_name, operator)).description(
+                            format!("Columns of {} to apply `{}` to.", type_name, operator),
+                        );
+                    for field in &writable {
+                        if !matches!(&field.graphql_type, crate::types::GraphQLType::Json) {
+                            continue;
+                        }
+                        input = input.field(InputValue::new(&field.name, item()));
+                    }
+                    builder = builder.register(input);
+                }
+            }
         }
     }
 
@@ -669,15 +710,16 @@ fn build_dynamic_schema(
         }
         let mut args = InputObject::new(format!("{}_args", function.name))
             .description(format!("Arguments to {}.", function.name));
-        for (name, pg_type, required) in &function.arguments {
+        for (name, pg_type, _) in &function.arguments {
             let scalar = crate::types::pg_type_to_graphql(pg_type).to_string();
-            args = args.field(InputValue::new(
-                name,
-                match required {
-                    true => TypeRef::named_nn(scalar),
-                    false => TypeRef::named(scalar),
-                },
-            ));
+            // Nullable, whether or not the parameter has a default. Every
+            // PostgreSQL argument accepts a null, and a client passing one
+            // through a variable declares it as the nullable type -- `query
+            // ($point: json)` used where `json!` was expected is a query the
+            // spec's variable rule refuses. Whether a defaulted argument may
+            // be left out entirely is enforced where the call is written,
+            // which is the only place that can tell.
+            args = args.field(InputValue::new(name, TypeRef::named(scalar)));
         }
         builder = builder.register(args);
     }
@@ -696,15 +738,33 @@ fn build_dynamic_schema(
                     "Arguments to {}, beside the row it is asked of.",
                     relationship.name
                 ));
-            for (name, pg_type, required) in &relationship.arguments {
+            for (name, pg_type, _) in &relationship.arguments {
                 let scalar = crate::types::pg_type_to_graphql(pg_type).to_string();
-                args = args.field(InputValue::new(
-                    name,
-                    match required {
-                        true => TypeRef::named_nn(scalar),
-                        false => TypeRef::named(scalar),
-                    },
+                // Nullable, for the reason the function arguments above are.
+                args = args.field(InputValue::new(name, TypeRef::named(scalar)));
+            }
+            builder = builder.register(args);
+        }
+    }
+
+    // And for a computed *column*'s function, which likewise takes its
+    // arguments where the field is asked for. `locations { distance(args: {
+    // from: ... }) }` -- the field is a function of the row and of what the
+    // caller wants measured against it.
+    for (type_name, object) in &generated.object_types {
+        for field in &object.fields {
+            if field.arguments.is_empty() {
+                continue;
+            }
+            let mut args = InputObject::new(computed_args_type_name(type_name, &field.name))
+                .description(format!(
+                    "Arguments to {}, beside the row it is asked of.",
+                    field.name
                 ));
+            for (name, pg_type, _) in &field.arguments {
+                let scalar = crate::types::pg_type_to_graphql(pg_type).to_string();
+                // Nullable, for the reason the function arguments above are.
+                args = args.field(InputValue::new(name, TypeRef::named(scalar)));
             }
             builder = builder.register(args);
         }
@@ -1025,6 +1085,16 @@ fn create_object_type(obj: &TableObjectType, relationships: &[RelationshipField]
     for field in &obj.fields {
         let field_name = field.name.clone();
         let field_type = graphql_type_ref(&field.type_string());
+        // A document-valued column can be asked for one part of itself, the
+        // same way `#>` reads one. It is answered here rather than in SQL
+        // because the same column may be asked for under several aliases --
+        // `c32_json(path: "a")` beside `c32_json(path: "arr[0]")` -- and
+        // one projection cannot carry both.
+        let takes_path = matches!(&field.graphql_type, crate::types::GraphQLType::Json)
+            || matches!(
+                &field.graphql_type,
+                crate::types::GraphQLType::Custom(name) if name == "json"
+            );
 
         // Create field with resolver that extracts from parent async_graphql::Value
         // The query resolver stores rows as FieldValue::value(Value::Object)
@@ -1036,13 +1106,26 @@ fn create_object_type(obj: &TableObjectType, relationships: &[RelationshipField]
                 if let Some(Value::Object(map)) = ctx.parent_value.as_value() {
                     // Convert field name to async_graphql::Name for lookup
                     let key = async_graphql::Name::new(&field_name);
+                    let path = match takes_path {
+                        true => ctx.args.get("path").and_then(|v| v.string().ok()),
+                        false => None,
+                    };
                     match map.get(&key) {
                         // A null is the answer, not a value to resolve. An
                         // enum-typed column said so with `internal: invalid
                         // item for enum` rather than answering null, because a
                         // null is not one of its members.
                         Some(Value::Null) => return Ok(None),
-                        Some(val) => return Ok(Some(FieldValue::value(val.clone()))),
+                        Some(val) => {
+                            let val = match path {
+                                Some(path) => walk_json_path(val, path)?,
+                                None => val.clone(),
+                            };
+                            return match val {
+                                Value::Null => Ok(None),
+                                val => Ok(Some(FieldValue::value(val))),
+                            };
+                        }
                         None => {}
                     }
                 }
@@ -1051,6 +1134,24 @@ fn create_object_type(obj: &TableObjectType, relationships: &[RelationshipField]
                 Ok(None)
             })
         });
+
+        let gql_field = match takes_path {
+            true => gql_field.argument(
+                InputValue::new("path", TypeRef::named("String")).description("JSON select path"),
+            ),
+            false => gql_field,
+        };
+
+        // A computed field whose function takes more than the row: the
+        // caller writes those under `args`, for the reason a computed
+        // relationship's are written there.
+        let gql_field = match field.arguments.is_empty() {
+            true => gql_field,
+            false => gql_field.argument(InputValue::new(
+                "args",
+                TypeRef::named_nn(computed_args_type_name(&obj.name, &field.name)),
+            )),
+        };
 
         let gql_field = if let Some(desc) = &field.description {
             gql_field.description(desc)
@@ -1123,6 +1224,12 @@ fn create_object_type(obj: &TableObjectType, relationships: &[RelationshipField]
         if rel.is_list {
             gql_field = gql_field
                 .argument(InputValue::new(
+                    "distinct_on",
+                    TypeRef::named_nn_list(crate::input::order_by::select_column_type_name(
+                        &rel.target_type,
+                    )),
+                ))
+                .argument(InputValue::new(
                     "where",
                     TypeRef::named(crate::input::bool_exp::bool_exp_type_name(&rel.target_type)),
                 ))
@@ -1175,6 +1282,12 @@ fn create_object_type(obj: &TableObjectType, relationships: &[RelationshipField]
                     // this author's articles were published this year" is the
                     // question a count is usually asked as, and without a
                     // `where` there is no way to write it.
+                    .argument(InputValue::new(
+                        "distinct_on",
+                        TypeRef::named_nn_list(crate::input::order_by::select_column_type_name(
+                            &rel.target_type,
+                        )),
+                    ))
                     .argument(InputValue::new(
                         "where",
                         TypeRef::named(crate::input::bool_exp::bool_exp_type_name(
@@ -1373,32 +1486,61 @@ fn create_query_type(
     query
 }
 
+/// One document operator: its name, and the type its columns are given.
+type JsonbOperator = (&'static str, fn() -> TypeRef);
+
+/// What a document column may be told to do, and what each is told with.
+///
+/// `_append` and `_prepend` take another document; `_delete_key` takes a key;
+/// `_delete_elem` takes an index into an array; `_delete_at_path` takes the
+/// path to what is being removed. The shapes are per operator rather than per
+/// column, which is why one input type per operator says all of it.
+const JSONB_OPERATORS: &[JsonbOperator] = &[
+    ("_append", || TypeRef::named("jsonb")),
+    ("_delete_at_path", || TypeRef::named_nn_list("String")),
+    ("_delete_elem", || TypeRef::named("Int")),
+    ("_delete_key", || TypeRef::named("String")),
+    ("_prepend", || TypeRef::named("jsonb")),
+];
+
+/// The name of the input holding one document operator's columns.
+fn jsonb_operator_input(type_name: &str, operator: &str) -> String {
+    format!("{}{}_input", type_name, operator)
+}
+
 /// Add the operators an update may be written with.
 ///
 /// All optional, and at least one required -- which GraphQL cannot express, so
 /// the resolver says so instead of the schema. Making `_set` non-null would
 /// have been expressible and wrong: an update that only increments a counter
 /// never sends one.
-fn with_update_operators(field: Field, base_name: &str, has_numeric: bool) -> Field {
-    let mut field = field.argument(InputValue::new(
-        "_set",
-        TypeRef::named(format!("{}_set_input", base_name)),
-    ));
+fn with_update_operators(
+    field: Field,
+    base_name: &str,
+    has_numeric: bool,
+    has_jsonb: bool,
+) -> Field {
+    let mut field = field;
+    // A table with no document column is not offered the document operators:
+    // there is nothing there to append to.
+    if has_jsonb {
+        for (operator, _) in JSONB_OPERATORS {
+            field = field.argument(InputValue::new(
+                *operator,
+                TypeRef::named(jsonb_operator_input(base_name, operator)),
+            ));
+        }
+    }
     if has_numeric {
         field = field.argument(InputValue::new(
             "_inc",
             TypeRef::named(format!("{}_inc_input", base_name)),
         ));
     }
-    field
-        // The jsonb operators keep an untyped argument: each takes a value of
-        // a different shape per column -- a key, an index, a path -- and the
-        // type that would say so is one per operator per table.
-        .argument(InputValue::new("_append", TypeRef::named("JSON")))
-        .argument(InputValue::new("_prepend", TypeRef::named("JSON")))
-        .argument(InputValue::new("_delete_key", TypeRef::named("JSON")))
-        .argument(InputValue::new("_delete_elem", TypeRef::named("JSON")))
-        .argument(InputValue::new("_delete_at_path", TypeRef::named("JSON")))
+    field.argument(InputValue::new(
+        "_set",
+        TypeRef::named(format!("{}_set_input", base_name)),
+    ))
 }
 
 /// Create the Mutation type with all mutation fields.
@@ -1424,6 +1566,18 @@ fn create_mutation_type(
             object.fields.iter().any(|field| {
                 object.table.get_column(&field.name).is_some()
                     && crate::schema::aggregate::is_numeric(&field.graphql_type)
+            })
+        })
+        .map(|(type_name, _)| type_name.clone())
+        .collect();
+
+    let has_jsonb_column: HashSet<String> = generated
+        .object_types
+        .iter()
+        .filter(|(_, object)| {
+            object.fields.iter().any(|field| {
+                object.table.get_column(&field.name).is_some()
+                    && matches!(&field.graphql_type, crate::types::GraphQLType::Json)
             })
         })
         .map(|(type_name, _)| type_name.clone())
@@ -1513,6 +1667,7 @@ fn create_mutation_type(
                     gql_field,
                     &where_type,
                     has_numeric_column.contains(&where_type),
+                    has_jsonb_column.contains(&where_type),
                 );
             }
             MutationType::Update => {
@@ -1524,6 +1679,7 @@ fn create_mutation_type(
                     gql_field,
                     &where_type,
                     has_numeric_column.contains(&where_type),
+                    has_jsonb_column.contains(&where_type),
                 );
             }
             MutationType::UpdateMany => {
@@ -1543,9 +1699,15 @@ fn create_mutation_type(
                 }
             }
             MutationType::Delete => {
+                // Required, as it is on an update: a delete with no predicate
+                // is a delete of the whole table, and this refused one at
+                // execution while the schema said it was a query worth
+                // writing. Saying so in the type is what Hasura does, and it
+                // is what a client's own tooling can catch before the request
+                // is sent.
                 gql_field = gql_field.argument(InputValue::new(
                     "where",
-                    TypeRef::named(crate::input::bool_exp::bool_exp_type_name(&where_type)),
+                    TypeRef::named_nn(crate::input::bool_exp::bool_exp_type_name(&where_type)),
                 ));
             }
         }
@@ -1921,10 +2083,19 @@ async fn resolve_aggregate<'a>(
                 &spec.table_name,
             );
             let table = cache.get_table(&qi);
-            let computed = table
-                .map(|table| computed_projections(table, nodes, "src", spec.names.as_ref()))
-                .unwrap_or_default();
             let mut param_idx = node_values.len() + 1;
+            let computed = match table {
+                Some(table) => computed_projections(
+                    table,
+                    nodes,
+                    "src",
+                    spec.names.as_ref(),
+                    cache,
+                    &mut param_idx,
+                    &mut node_values,
+                )?,
+                None => Vec::new(),
+            };
             let embeds = build_embed_expressions(
                 cache,
                 spec.relationships.as_ref(),
@@ -2216,44 +2387,15 @@ async fn resolve_query<'a>(
     // prepending the distinct columns instead produced an answer, and a wrong
     // one, since `ORDER BY "department", "department" DESC` is decided by its
     // first term and sorts ascending.
-    let (distinct_sql, order_sql) = if distinct_on.is_empty() {
-        (String::new(), order_sql)
-    } else {
-        let written: Vec<&str> = order_sql
-            .strip_prefix(" ORDER BY ")
-            .map(|rest| rest.split(", ").collect())
-            .unwrap_or_default();
-        // Terms are qualified and the distinct columns are not, so they are
-        // compared by the name itself.
-        let column_of = |term: &str| {
-            let expression = term.split_whitespace().next().unwrap_or(term);
-            expression
-                .rsplit_once('.')
-                .map(|(_, name)| name)
-                .unwrap_or(expression)
-                .to_string()
-        };
-        let leading: Vec<String> = written
-            .iter()
-            .take(distinct_on.len())
-            .map(|term| column_of(term))
-            .collect();
-        if !written.is_empty()
-            && (leading.len() != distinct_on.len()
-                || distinct_on.iter().any(|column| !leading.contains(column)))
-        {
-            return Err(validation_error(
-                "\"distinct_on\" columns must match initial \"order_by\" columns",
-            ));
-        }
-        let order_sql = if written.is_empty() {
-            format!(" ORDER BY {}", distinct_on.join(", "))
-        } else {
-            order_sql
-        };
+    let (distinct_sql, order_sql) = {
+        let written = order_sql.strip_prefix(" ORDER BY ");
+        let (prefix, order) = distinct_on_clause(&distinct_on, written)?;
         (
-            format!("DISTINCT ON ({}) ", distinct_on.join(", ")),
-            order_sql,
+            prefix,
+            match order {
+                Some(order) => format!(" ORDER BY {}", order),
+                None => String::new(),
+            },
         )
     };
 
@@ -2270,10 +2412,21 @@ async fn resolve_query<'a>(
                 let qi =
                     postrust_core::api_request::QualifiedIdentifier::new(schema_name, table_name);
                 match cache.get_table(&qi) {
-                    Some(table) => (
-                        computed_projections(table, ctx.field(), "src", spec.names.as_ref()),
-                        exposed_column_types(table, spec.names.as_ref()),
-                    ),
+                    Some(table) => {
+                        let mut param_idx = bound_values.len() + 1;
+                        (
+                            computed_projections(
+                                table,
+                                ctx.field(),
+                                "src",
+                                spec.names.as_ref(),
+                                cache,
+                                &mut param_idx,
+                                &mut bound_values,
+                            )?,
+                            exposed_column_types(table, spec.names.as_ref()),
+                        )
+                    }
                     None => (Vec::new(), HashMap::new()),
                 }
             }
@@ -3540,7 +3693,15 @@ async fn reread_returning(
         &mut values,
         names,
     )?;
-    let computed = computed_projections(table, returning, "src", names);
+    let computed = computed_projections(
+        table,
+        returning,
+        "src",
+        names,
+        cache,
+        &mut param_idx,
+        &mut values,
+    )?;
     // A rename is reason enough to read the rows again: `RETURNING` answers in
     // the table's own column names, which are not the names the client asked
     // under.
@@ -3958,10 +4119,18 @@ async fn execute_delete(
             &mut values,
             names,
         )?;
-        let computed = cache
-            .get_table(&qi)
-            .map(|table| computed_projections(table, returning, "src", names))
-            .unwrap_or_default();
+        let computed = match cache.get_table(&qi) {
+            Some(table) => computed_projections(
+                table,
+                returning,
+                "src",
+                names,
+                cache,
+                &mut param_idx,
+                &mut values,
+            )?,
+            None => Vec::new(),
+        };
         for expression in &computed {
             projection.push_str(", ");
             projection.push_str(expression);
@@ -5222,6 +5391,61 @@ fn aggregate_order_terms(
     Ok(())
 }
 
+/// The `DISTINCT ON (...)` prefix, and the ordering that has to go with it.
+///
+/// PostgreSQL keeps the first row of each DISTINCT ON group in the query's own
+/// order, and picks arbitrarily where the ordering does not begin with the
+/// distinct columns -- so which row survives would depend on the plan. Hasura
+/// refuses that query rather than answering it, and so does this: prepending
+/// the distinct columns instead produced an answer, and a wrong one, since
+/// `ORDER BY "department", "department" DESC` is decided by its first term and
+/// sorts ascending. Where nothing was ordered at all there is nothing to
+/// disagree with, so the distinct columns become the ordering.
+///
+/// `written` is the ordering as its comma-separated terms, without the
+/// keyword; the answer is in the same spelling.
+fn distinct_on_clause(
+    distinct_on: &[String],
+    written: Option<&str>,
+) -> Result<(String, Option<String>), async_graphql::Error> {
+    if distinct_on.is_empty() {
+        return Ok((String::new(), written.map(str::to_string)));
+    }
+    let terms: Vec<&str> = written
+        .map(|written| written.split(", ").collect())
+        .unwrap_or_default();
+    // Terms are qualified and the distinct columns may not be, so they are
+    // compared by the name itself.
+    let column_of = |term: &str| {
+        let expression = term.split_whitespace().next().unwrap_or(term);
+        expression
+            .rsplit_once('.')
+            .map(|(_, name)| name)
+            .unwrap_or(expression)
+            .to_string()
+    };
+    let leading: Vec<String> = terms
+        .iter()
+        .take(distinct_on.len())
+        .map(|term| column_of(term))
+        .collect();
+    if !terms.is_empty()
+        && (leading.len() != distinct_on.len()
+            || distinct_on
+                .iter()
+                .any(|column| !leading.contains(&column_of(column))))
+    {
+        return Err(validation_error(
+            "\"distinct_on\" columns must match initial \"order_by\" columns",
+        ));
+    }
+    let order = match terms.is_empty() {
+        true => Some(distinct_on.join(", ")),
+        false => written.map(str::to_string),
+    };
+    Ok((format!("DISTINCT ON ({}) ", distinct_on.join(", ")), order))
+}
+
 /// Build the `DISTINCT ON (...)` prefix from the `distinct_on` argument.
 ///
 /// PostgreSQL requires the leftmost `ORDER BY` terms to match the distinct
@@ -5290,12 +5514,16 @@ async fn build_distinct_on(
 /// notation reads `upper_name(author.*)` and `author.upper_name` as the same
 /// call; the explicit form is written here because it says which function is
 /// being called.
+#[allow(clippy::too_many_arguments)] // the selection, its source, and the binding state
 fn computed_projections(
     table: &postrust_core::schema_cache::Table,
     selection: async_graphql::SelectionField<'_>,
     row_reference: &str,
     names: &crate::names::NameOverrides,
-) -> Vec<String> {
+    schema_cache: &SchemaCache,
+    param_idx: &mut usize,
+    values: &mut Vec<serde_json::Value>,
+) -> Result<Vec<String>, async_graphql::Error> {
     let mut projections = Vec::new();
     for field in selection.selection_set() {
         let name = field.name();
@@ -5315,13 +5543,91 @@ fn computed_projections(
         let Some(computed) = table.get_computed_column(function) else {
             continue;
         };
+        let arguments = crate::schema::computed_caller_arguments(computed, schema_cache);
+        let given = match arguments.is_empty() {
+            true => None,
+            false => embed_arguments(field).remove("args"),
+        };
         projections.push(format!(
             "{} AS {}",
-            computed_call(computed, row_reference, row_reference),
+            computed_column_call(
+                computed,
+                row_reference,
+                name,
+                &arguments,
+                given.as_ref(),
+                param_idx,
+                values,
+            )?,
             postrust_sql::escape_ident(name)
         ));
     }
-    projections
+    Ok(projections)
+}
+
+/// The call behind a computed field, including whatever the caller passed.
+///
+/// The ordinary case is a function of the row alone, which is written
+/// positionally: that is the call REST writes, and the one a client that never
+/// heard of `args` is asking for. Anything else has to be written by name --
+/// the row is then not the only parameter and may not be the first -- so the
+/// row, the session where the function asks for one, and each argument the
+/// caller gave are all named.
+fn computed_column_call(
+    computed: &postrust_core::schema_cache::ComputedColumn,
+    row: &str,
+    field_name: &str,
+    arguments: &[(String, String, bool)],
+    given: Option<&serde_json::Value>,
+    param_idx: &mut usize,
+    values: &mut Vec<serde_json::Value>,
+) -> Result<String, async_graphql::Error> {
+    if arguments.is_empty() {
+        return Ok(computed_call(computed, row, row));
+    }
+    let Some(row_argument) = &computed.row_argument else {
+        return Ok(computed_call(computed, row, row));
+    };
+    let function = format!(
+        "{}.{}",
+        postrust_sql::escape_ident(&computed.function.schema),
+        postrust_sql::escape_ident(&computed.function.name)
+    );
+    let mut passed = vec![format!(
+        "{} => {}",
+        postrust_sql::escape_ident(row_argument),
+        row
+    )];
+    if let Some(session) = &computed.session_argument {
+        passed.push(format!(
+            "{} => {}",
+            postrust_sql::escape_ident(session),
+            SESSION_ARGUMENT
+        ));
+    }
+    for (name, pg_type, required) in arguments {
+        match given.and_then(|given| given.get(name)) {
+            None if *required => {
+                return Err(async_graphql::Error::new(format!(
+                    "{} needs the argument \"{}\"",
+                    field_name, name
+                )))
+            }
+            // Left out is left out, so the function's own default applies.
+            None => continue,
+            Some(value) => {
+                passed.push(format!(
+                    "{} => ${}::{}",
+                    postrust_sql::escape_ident(name),
+                    param_idx,
+                    pg_type
+                ));
+                *param_idx += 1;
+                values.push(value.clone());
+            }
+        }
+    }
+    Ok(format!("{}({})", function, passed.join(", ")))
 }
 
 /// The SELECT list for a nested aggregate.
@@ -5716,9 +6022,10 @@ fn embed_arguments(field: async_graphql::SelectionField<'_>) -> HashMap<String, 
         .unwrap_or_default()
 }
 
-/// What an embed's arguments narrow its child rows to: a predicate, an
-/// ordering, a limit and an offset, in the order the SQL takes them.
-type Narrowing = (Option<String>, Option<String>, Option<i64>, i64);
+/// What an embed's arguments narrow its child rows to: a `DISTINCT ON`
+/// prefix, a predicate, an ordering, a limit and an offset, in the order the
+/// SQL takes them.
+type Narrowing = (String, Option<String>, Option<String>, Option<i64>, i64);
 
 /// What an embed's arguments narrow its child rows to.
 ///
@@ -5788,7 +6095,50 @@ fn embed_narrowing(
         .and_then(|v| v.as_i64())
         .unwrap_or(0);
 
-    Ok((child_where, child_order, child_limit, child_offset))
+    // `author { articles(distinct_on: [title], order_by: {title: asc}) }` --
+    // one article per title, the same question the root field answers and
+    // under the same rule about what may be ordered by.
+    let requested = match arguments.get("distinct_on") {
+        Some(serde_json::Value::Array(items)) => items
+            .iter()
+            .filter_map(|item| item.as_str())
+            .collect::<Vec<_>>(),
+        Some(serde_json::Value::String(one)) => vec![one.as_str()],
+        _ => Vec::new(),
+    };
+    let mut distinct_on = Vec::with_capacity(requested.len());
+    if !requested.is_empty() {
+        let qi = postrust_core::api_request::QualifiedIdentifier::new(
+            &plan.foreign_schema,
+            &plan.foreign_table,
+        );
+        let table = schema_cache.get_table(&qi).ok_or_else(|| {
+            async_graphql::Error::new(format!("unknown table \"{}\"", plan.foreign_table))
+        })?;
+        for field in requested {
+            let column = table_column_for(names, table, field).to_string();
+            if table.get_column(&column).is_none() {
+                return Err(async_graphql::Error::new(format!(
+                    "cannot take distinct on unknown column \"{}\" of \"{}\"",
+                    field, plan.foreign_table
+                )));
+            }
+            distinct_on.push(format!(
+                "{}.{}",
+                postrust_sql::escape_ident(child_alias),
+                postrust_sql::escape_ident(&column)
+            ));
+        }
+    }
+    let (distinct, child_order) = distinct_on_clause(&distinct_on, child_order.as_deref())?;
+
+    Ok((
+        distinct,
+        child_where,
+        child_order,
+        child_limit,
+        child_offset,
+    ))
 }
 
 #[allow(clippy::too_many_arguments)] // one parameter per SQL clause, plus the binding state
@@ -5829,18 +6179,19 @@ fn build_embed_expressions(
             // which rows are counted, not which are returned, so it goes on the
             // set the aggregate reads rather than on the answer.
             let arguments = embed_arguments(field);
-            let (child_where, child_order, child_limit, child_offset) = embed_narrowing(
-                &arguments,
-                &plan,
-                schema_cache,
-                relationships,
-                &rel.target_type,
-                &child_alias,
-                max_rows,
-                param_idx,
-                values,
-                names,
-            )?;
+            let (child_distinct, child_where, child_order, child_limit, child_offset) =
+                embed_narrowing(
+                    &arguments,
+                    &plan,
+                    schema_cache,
+                    relationships,
+                    &rel.target_type,
+                    &child_alias,
+                    max_rows,
+                    param_idx,
+                    values,
+                    names,
+                )?;
 
             let child_table =
                 schema_cache.get_table(&postrust_core::api_request::QualifiedIdentifier::new(
@@ -5881,6 +6232,7 @@ fn build_embed_expressions(
                     child_where.as_deref(),
                     child_order.as_deref(),
                     call.as_deref(),
+                    &child_distinct,
                 )
                 .map_err(|e| async_graphql::Error::new(e.to_string()))?;
             expressions.push((field.name().to_string(), expression));
@@ -5912,18 +6264,19 @@ fn build_embed_expressions(
 
         // The arguments written on the embed itself.
         let arguments = embed_arguments(field);
-        let (child_where, child_order, child_limit, child_offset) = embed_narrowing(
-            &arguments,
-            &plan,
-            schema_cache,
-            relationships,
-            &rel.target_type,
-            &child_alias,
-            max_rows,
-            param_idx,
-            values,
-            names,
-        )?;
+        let (child_distinct, child_where, child_order, child_limit, child_offset) =
+            embed_narrowing(
+                &arguments,
+                &plan,
+                schema_cache,
+                relationships,
+                &rel.target_type,
+                &child_alias,
+                max_rows,
+                param_idx,
+                values,
+                names,
+            )?;
 
         // Leaf fields are columns; anything that resolved to a relationship is
         // an expression instead.
@@ -6011,7 +6364,7 @@ fn build_embed_expressions(
                 // alias names that row.
                 &postrust_sql::escape_ident(parent_alias),
                 &child_alias,
-                &parts.join(", "),
+                &format!("{}{}", child_distinct, parts.join(", ")),
                 child_limit,
                 child_offset,
                 child_where.as_deref(),
@@ -6793,5 +7146,185 @@ mod tests {
 
         let _subscription = create_subscription_type(&fields);
         // Just test that it doesn't panic
+    }
+}
+
+/// One step of a JSON path: a key of an object or an index of an array.
+#[derive(Debug, PartialEq, Eq)]
+enum PathStep {
+    Key(String),
+    Index(usize),
+}
+
+/// Read one part of a document, by the path spelling Hasura accepts.
+///
+/// `column(path: "objs[0]['你好']")` -- an optional leading `$`, then keys
+/// written bare or after a dot, and indices or quoted keys written in
+/// brackets. A step that names something the document does not have is null,
+/// which is what `#>` answers to the same path.
+fn walk_json_path(value: &Value, path: &str) -> Result<Value, async_graphql::Error> {
+    let mut at = value;
+    for step in parse_json_path(path)? {
+        let next = match (&step, at) {
+            (PathStep::Key(key), Value::Object(map)) => map.get(key.as_str()),
+            (PathStep::Index(index), Value::List(items)) => items.get(*index),
+            // An index of an object or a key of an array reads nothing, and so
+            // does anything asked of a scalar.
+            _ => None,
+        };
+        match next {
+            Some(next) => at = next,
+            None => return Ok(Value::Null),
+        }
+    }
+    Ok(at.clone())
+}
+
+/// A path whose bracket never closes: written wrong rather than written oddly.
+fn unclosed_bracket(path: &str) -> async_graphql::Error {
+    let message = format!("\"{}\" is not a JSON path: a bracket is never closed", path);
+    validation_error(&message)
+}
+
+/// Parse the path spelling Hasura accepts into its steps.
+///
+/// Deliberately tolerant about separators, because the corpus writes the same
+/// path four ways: `objs[0]["x"]`, `objs[0].["x"]`, `objs.[0].["x"]` and
+/// `.objs[0]['x']` all name one thing. What is not tolerated is a bracket that
+/// never closes, which is a path the client got wrong rather than a spelling.
+fn parse_json_path(path: &str) -> Result<Vec<PathStep>, async_graphql::Error> {
+    let mut steps = Vec::new();
+    let mut chars = path.chars().peekable();
+    // `$` is the document itself, and naming it is optional.
+    if chars.peek() == Some(&'$') {
+        chars.next();
+    }
+    while let Some(&c) = chars.peek() {
+        match c {
+            // A separator carries no step of its own.
+            '.' => {
+                chars.next();
+            }
+            '[' => {
+                chars.next();
+                let quote = match chars.peek() {
+                    Some(&q @ ('\'' | '"')) => {
+                        chars.next();
+                        Some(q)
+                    }
+                    _ => None,
+                };
+                let mut inner = String::new();
+                loop {
+                    let Some(c) = chars.next() else {
+                        return Err(unclosed_bracket(path));
+                    };
+                    match (quote, c) {
+                        (Some(quote), c) if c == quote => break,
+                        (None, ']') => break,
+                        _ => inner.push(c),
+                    }
+                }
+                // A quoted key's closing bracket, which the quote ended before.
+                if quote.is_some() {
+                    match chars.next() {
+                        Some(']') => {}
+                        _ => return Err(unclosed_bracket(path)),
+                    }
+                }
+                // An unquoted number is an index; anything else is a key,
+                // since an object may be keyed by a word as well as a digit.
+                match (quote, inner.parse::<usize>()) {
+                    (None, Ok(index)) => steps.push(PathStep::Index(index)),
+                    _ => steps.push(PathStep::Key(inner)),
+                }
+            }
+            _ => {
+                let mut key = String::new();
+                while let Some(&c) = chars.peek() {
+                    if matches!(c, '.' | '[') {
+                        break;
+                    }
+                    key.push(c);
+                    chars.next();
+                }
+                steps.push(PathStep::Key(key));
+            }
+        }
+    }
+    Ok(steps)
+}
+
+#[cfg(test)]
+mod json_path_tests {
+    use super::*;
+
+    fn steps(path: &str) -> Vec<PathStep> {
+        parse_json_path(path).expect("the path parses")
+    }
+
+    fn key(name: &str) -> PathStep {
+        PathStep::Key(name.to_string())
+    }
+
+    #[test]
+    fn the_document_itself_has_no_steps() {
+        assert_eq!(steps("$"), vec![]);
+        assert_eq!(steps(""), vec![]);
+    }
+
+    #[test]
+    fn a_key_is_written_bare_or_after_a_dot() {
+        assert_eq!(steps("a"), vec![key("a")]);
+        assert_eq!(steps(".obj.c1"), vec![key("obj"), key("c1")]);
+        assert_eq!(steps("._underscore"), vec![key("_underscore")]);
+    }
+
+    #[test]
+    fn a_bracket_holds_an_index_or_a_quoted_key() {
+        assert_eq!(steps("arr[0]"), vec![key("arr"), PathStep::Index(0)]);
+        assert_eq!(steps("['!@#$%^']"), vec![key("!@#$%^")]);
+        assert_eq!(
+            steps("translations['hello world!']"),
+            vec![key("translations"), key("hello world!")]
+        );
+    }
+
+    /// The corpus writes one path four ways, and Hasura reads them all alike.
+    #[test]
+    fn a_dot_before_a_bracket_changes_nothing() {
+        let expected = vec![key("objs"), PathStep::Index(0), key("\u{4f60}\u{597d}")];
+        for spelling in [
+            "objs[0]['\u{4f60}\u{597d}']",
+            "objs[0][\"\u{4f60}\u{597d}\"]",
+            "objs[0].[\"\u{4f60}\u{597d}\"]",
+            "objs.[0].[\"\u{4f60}\u{597d}\"]",
+        ] {
+            assert_eq!(steps(spelling), expected, "{}", spelling);
+        }
+    }
+
+    #[test]
+    fn a_bracket_that_never_closes_is_refused() {
+        assert!(parse_json_path("arr[0").is_err());
+        assert!(parse_json_path("['key'").is_err());
+    }
+
+    #[test]
+    fn a_step_the_document_does_not_have_reads_null() {
+        let document = Value::from_json(serde_json::json!({
+            "obj": {"c1": "c2"},
+            "arr": [1, 2, 3],
+        }))
+        .expect("a document");
+        let at = |path| walk_json_path(&document, path).expect("the path parses");
+        assert_eq!(at(".obj.c1"), Value::String("c2".to_string()));
+        assert_eq!(at("arr[1]"), Value::Number(2.into()));
+        assert_eq!(at("arr[9]"), Value::Null);
+        assert_eq!(at(".obj.nothing"), Value::Null);
+        // An index of an object, and a key of an array: neither reads
+        // anything, which is what `#>` answers.
+        assert_eq!(at("obj[0]"), Value::Null);
+        assert_eq!(at("arr.first"), Value::Null);
     }
 }

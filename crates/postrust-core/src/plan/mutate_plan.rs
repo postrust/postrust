@@ -379,7 +379,7 @@ fn get_returning_columns(request: &ApiRequest, table: &Table, creates: bool) -> 
                     if field.name == "*"
                         || table
                             .get_computed_column(&field.name)
-                            .is_some_and(|c| c.session_argument.is_none())
+                            .is_some_and(|c| !c.takes_arguments)
                     {
                         return everything();
                     }
