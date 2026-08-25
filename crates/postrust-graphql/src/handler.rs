@@ -2306,11 +2306,10 @@ fn insert_row<'life>(
             _ => String::new(),
         };
 
-        let qualified_table = format!(
-            "{}.{}",
-            postrust_sql::escape_ident(schema_name),
-            postrust_sql::escape_ident(table_name)
-        );
+        // The row this statement writes, as `RETURNING` names it: the table
+        // alone. Qualifying it reads as a column of a table called `public`,
+        // which is what `missing FROM-clause entry for table "public"` means.
+        let qualified_table = postrust_sql::escape_ident(table_name);
         let names: Vec<&str> = columns.keys().map(|k| k.as_str()).collect();
         let written = if names.is_empty() {
             // Every column defaulted. `DEFAULT VALUES` is how SQL says that;
@@ -2754,14 +2753,7 @@ async fn execute_update(
         postrust_sql::escape_ident(table_name),
         set_parts.join(", "),
         where_sql,
-        row_json(
-            &format!(
-                "{}.{}",
-                postrust_sql::escape_ident(schema_name),
-                postrust_sql::escape_ident(table_name)
-            ),
-            &column_types
-        )
+        row_json(&postrust_sql::escape_ident(table_name), &column_types)
     );
 
     trace!("Executing UPDATE SQL: {}", sql);
@@ -2825,14 +2817,7 @@ async fn execute_delete(
         postrust_sql::escape_ident(schema_name),
         postrust_sql::escape_ident(table_name),
         where_sql,
-        row_json(
-            &format!(
-                "{}.{}",
-                postrust_sql::escape_ident(schema_name),
-                postrust_sql::escape_ident(table_name)
-            ),
-            &Default::default()
-        )
+        row_json(&postrust_sql::escape_ident(table_name), &Default::default())
     );
 
     trace!("Executing DELETE SQL: {}", sql);
