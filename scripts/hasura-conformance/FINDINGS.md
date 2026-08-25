@@ -8,8 +8,8 @@ harness itself, divergences kept on purpose, and the gaps still open.
 
 | | status | same outcome | same data | full body |
 |---|---|---|---|---|
-| all (464) | 97.8% | 62.5% | **54.5%** | 28.7% |
-| **excluding the 142 permission cases (322)** | | | **66.8%** | |
+| all (464) | 97.8% | 63.6% | **55.0%** | 29.3% |
+| **excluding the 142 permission cases (322)** | | | **67.4%** | |
 
 **The candidate is configured.** Each group's fixtures are converted into a
 `PGRST_GRAPHQL_NAMES` document by `scripts/hasura-names.py` and given to the
@@ -28,9 +28,10 @@ that ask for it need permissions or a further feature besides) → 49.4
 (upserts) → 50.6 (enum tables) → 51.5 (ordering by a related row or an
 aggregate) → 52.6 (PostGIS comparisons) → 53.0 (`_cast`) → 52.6 (typed mutation
 inputs, which cost two cases; see below) → 54.5 (ltree comparisons, and a list
-bound as an array). The figure excluding the permission cases, which is the one
-worth reading, went 51.2 → 55.3 → 55.9 → 58.4 → 60.6 → 62.4 → 64.0 → 64.6 →
-64.0 → 66.8 over the same span.
+bound as an array) → 55.0 (shapes read and written as GeoJSON). The figure
+excluding the permission cases, which is the one worth reading, went 51.2 →
+55.3 → 55.9 → 58.4 → 60.6 → 62.4 → 64.0 → 64.6 → 64.0 → 66.8 → 67.4 over the
+same span.
 
 The third column is the one that matters to a client: the same query came back
 with the same rows.
@@ -38,7 +39,7 @@ with the same rows.
 **142 of the 464 cases cannot pass and are counted anyway.** They are the
 permission cases — Hasura answers `access-denied` from a rule that lives in
 metadata, and there is no metadata here. Excluding them the figure is
-**215/322 = 66.8%**, up from 165/322 = 51.2% before the names were given.
+**217/322 = 67.4%**, up from 165/322 = 51.2% before the names were given.
 
 That gap is worth understanding, because the headline did not move while the
 figure behind it moved four points. 49 of those 142 permission cases "agree"
@@ -188,7 +189,13 @@ wrong one.
    nested-insert cases that is about upserting rather than about another
    feature.
 
-5. **The two cases typing the mutation inputs cost.** `objects` and `_set`
+5. **What is left of `insert/geojson` (4/13).** Writing and reading a shape
+   works -- verified against a running server, a polygon round-trips to full
+   precision -- and the group is still low. One case answers a MultiPolygon
+   whose coordinates are all zero, which does not reproduce by hand, so
+   something narrower about the fixture is responsible and has not been found.
+
+6. **The two cases typing the mutation inputs cost.** `objects` and `_set`
    were `JSON`, which accepted a relationship under whatever name the request
    used; they are generated types now, so a relationship this server named
    differently is refused by validation rather than reaching a resolver that
@@ -197,15 +204,15 @@ wrong one.
    in item 1 wearing a different error. Recorded because the number went down
    and a reader is owed the reason.
 
-6. **The comment on a computed field's function** is not carried by the schema
+7. **The comment on a computed field's function** is not carried by the schema
    cache, so a computed field's description is always null.
 
-8. **Relationship predicates through a junction** are refused rather than
+9. **Relationship predicates through a junction** are refused rather than
    resolved: reaching the child means going through a third table, which is
    more than a pair of columns to correlate on. The computed-relationship half
    of this is now resolved, by argument rather than by columns.
 
-9. **What is left of nested inserts** (6/16). The write itself works in both
+10. **What is left of nested inserts** (8/16). The write itself works in both
    directions and counts every row it touches. What the remaining cases need is
    other features reached through a nested object: `on_conflict` inside nested
    data, a computed field taking arguments, a nested aggregate, and a
@@ -213,12 +220,12 @@ wrong one.
    written first and the key pushed down, the opposite of the ordinary to-one
    rule.
 
-10. **Tracked functions as root fields.** Hasura exposes a tracked function as
+11. **Tracked functions as root fields.** Hasura exposes a tracked function as
     `multi` and `multi_aggregate` beside the tables. Several introspection
     cases compare the whole root field list, so they fail on the absence rather
     than on anything they query.
 
-11. **A relationship in a `delete`'s `returning`** keeps the plain columns.
+12. **A relationship in a `delete`'s `returning`** keeps the plain columns.
     The rows are gone by the time they could be read again, so there is nothing
     to embed. Reporting the columns that were deleted is the honest answer, but
     it is not Hasura's.
@@ -246,6 +253,11 @@ wrong one.
   ordering happens before it. `EmbedPlan::embed_expression` already took all
   four for the REST surface; the GraphQL side had no way to say any of them.
 - **Computed columns are fields**, at the root and inside an embed.
+- **Shapes are GeoJSON in both directions.** A geometry column was written by
+  casting -- and `'{"type":"Point",…}'::geometry` is not a cast PostgreSQL has
+  -- and read back as WKB hex, which no client parses. Both ends speak GeoJSON
+  now, with the CRS member Hasura includes, applied everywhere a row becomes
+  JSON rather than only where the tests looked.
 - **Tree comparisons.** `_ancestor`, `_descendant`, `_matches` and their `_any`
   forms on an `ltree` column, each naming what its operand casts to -- `?` is
   "any of these labels" for a path and "has this key" for a jsonb, and
