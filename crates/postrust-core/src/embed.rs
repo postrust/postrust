@@ -350,7 +350,8 @@ impl EmbedPlan {
         ))
     }
 
-    /// A correlated subselect that yields this relationship as one JSON column.
+    /// The child rows belonging to one parent row, as a SELECT correlated
+    /// against the parent's alias.
     ///
     /// This is the single-query form of embedding: instead of fetching parents,
     /// collecting their keys and issuing a second query, the relationship is
@@ -362,13 +363,10 @@ impl EmbedPlan {
     /// this again. Only the caller knows the shape of its own selection tree, so
     /// the recursion lives there and the SQL assembly lives here.
     ///
-    /// Parent columns are deliberately left alone: they stay ordinary typed
-    /// columns and are converted to JSON by the same code as an unembedded
-    /// request, so embedding does not change how a NUMERIC or a timestamp is
-    /// rendered. Only the relationship column arrives as JSON, which is what
-    /// the separate child query already returned.
+    /// What is done with those rows is the caller's: [`embed_expression`]
+    /// renders them as JSON, [`aggregate_expression`] summarises them.
     #[allow(clippy::too_many_arguments)] // one parameter per SQL clause
-    pub fn embed_expression(
+    pub fn correlated_rows(
         &self,
         parent_alias: &str,
         parent_row: &str,
@@ -457,6 +455,37 @@ impl EmbedPlan {
             inner.push_str(&format!(" OFFSET {}", offset));
         }
 
+        Ok(inner)
+    }
+
+    /// A correlated subselect that yields this relationship as one JSON column.
+    ///
+    /// The rows come from [`correlated_rows`]; this decides how they are
+    /// rendered -- an array for a to-many relationship, one object or null for
+    /// a to-one.
+    #[allow(clippy::too_many_arguments)] // one parameter per SQL clause
+    pub fn embed_expression(
+        &self,
+        parent_alias: &str,
+        parent_row: &str,
+        child_alias: &str,
+        inner_select: &str,
+        limit: Option<i64>,
+        offset: i64,
+        child_where: Option<&str>,
+        order_by: Option<&str>,
+    ) -> Result<String> {
+        let inner = self.correlated_rows(
+            parent_alias,
+            parent_row,
+            child_alias,
+            inner_select,
+            limit,
+            offset,
+            child_where,
+            order_by,
+        )?;
+
         let alias = postrust_sql::escape_ident(&format!("{}_j", child_alias));
 
         // Cast to `jsonb`, as PostgREST does -- `COALESCE(json_agg(..),'[]')::jsonb`.
@@ -479,6 +508,54 @@ impl EmbedPlan {
                 inner = inner
             )
         })
+    }
+
+    /// A correlated subselect that summarises this relationship as one JSON
+    /// column.
+    ///
+    /// `author { articles_aggregate { aggregate { count } } }`. The rows are
+    /// the same correlated set an embed would render, but a `limit` here bounds
+    /// what is *counted* rather than what is returned -- so the aggregate reads
+    /// from the rows as a subquery instead of selecting over them directly.
+    /// The subquery carries the child's own alias, so a predicate or an
+    /// ordering written against it goes on reading the same name.
+    ///
+    /// Parent columns are deliberately left alone: they stay ordinary typed
+    /// columns and are converted to JSON by the same code as an unembedded
+    /// request, so embedding does not change how a NUMERIC or a timestamp is
+    /// rendered.
+    #[allow(clippy::too_many_arguments)] // one parameter per SQL clause
+    pub fn aggregate_expression(
+        &self,
+        parent_alias: &str,
+        parent_row: &str,
+        child_alias: &str,
+        aggregate_select: &str,
+        limit: Option<i64>,
+        offset: i64,
+        child_where: Option<&str>,
+        order_by: Option<&str>,
+    ) -> Result<String> {
+        let child = postrust_sql::escape_ident(child_alias);
+        let rows = self.correlated_rows(
+            parent_alias,
+            parent_row,
+            child_alias,
+            &format!("{}.*", child),
+            limit,
+            offset,
+            child_where,
+            order_by,
+        )?;
+        let alias = postrust_sql::escape_ident(&format!("{}_a", child_alias));
+        Ok(format!(
+            "(SELECT row_to_json({alias}) FROM \
+             (SELECT {select} FROM ({rows}) AS {child}) {alias})::jsonb",
+            alias = alias,
+            select = aggregate_select,
+            rows = rows,
+            child = child
+        ))
     }
 
     /// A scalar subselect yielding one column of the related row.

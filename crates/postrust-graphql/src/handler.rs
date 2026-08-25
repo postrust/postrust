@@ -929,6 +929,24 @@ fn create_object_type(obj: &TableObjectType, relationships: &[RelationshipField]
                             })
                         },
                     )
+                    // The same arguments the list itself takes. "How many of
+                    // this author's articles were published this year" is the
+                    // question a count is usually asked as, and without a
+                    // `where` there is no way to write it.
+                    .argument(InputValue::new(
+                        "where",
+                        TypeRef::named(crate::input::bool_exp::bool_exp_type_name(
+                            &rel.target_type,
+                        )),
+                    ))
+                    .argument(InputValue::new(
+                        "order_by",
+                        TypeRef::named_nn_list(crate::input::order_by::order_by_type_name(
+                            &rel.target_type,
+                        )),
+                    ))
+                    .argument(InputValue::new("limit", TypeRef::named("Int")))
+                    .argument(InputValue::new("offset", TypeRef::named("Int")))
                     .description(format!("Aggregates over {}.", rel.name)),
                 );
             }
@@ -1474,53 +1492,8 @@ async fn resolve_aggregate<'a>(
         (None, ceiling) => ceiling,
     };
 
-    // A computed field asked for under `nodes` is a function of the row and so
-    // is not in `*`, exactly as at the root.
-    let computed_sql = {
-        let guard = gql_ctx
-            .schema_cache
-            .get()
-            .await
-            .map_err(|e| async_graphql::Error::new(e.to_string()))?;
-        let nodes = ctx
-            .field()
-            .selection_set()
-            .find(|selection| selection.name() == "nodes");
-        match (guard.as_ref(), nodes) {
-            (Some(cache), Some(nodes)) => {
-                let qi = postrust_core::api_request::QualifiedIdentifier::new(
-                    &spec.schema_name,
-                    &spec.table_name,
-                );
-                match cache.get_table(&qi) {
-                    Some(table) => {
-                        let qualified = format!(
-                            "{}.{}",
-                            postrust_sql::escape_ident(&spec.schema_name),
-                            postrust_sql::escape_ident(&spec.table_name)
-                        );
-                        let projections = computed_projections(
-                            table,
-                            nodes,
-                            &format!("{}.*", qualified),
-                            spec.names.as_ref(),
-                        );
-                        if projections.is_empty() {
-                            String::new()
-                        } else {
-                            format!(", {}", projections.join(", "))
-                        }
-                    }
-                    None => String::new(),
-                }
-            }
-            _ => String::new(),
-        }
-    };
-
     let mut inner = format!(
-        "SELECT *{} FROM {}.{}{}{}",
-        computed_sql,
+        "SELECT * FROM {}.{}{}{}",
         postrust_sql::escape_ident(&spec.schema_name),
         postrust_sql::escape_ident(&spec.table_name),
         where_sql,
@@ -1612,16 +1585,76 @@ async fn resolve_aggregate<'a>(
     }
 
     if wants_nodes {
+        // `nodes` is the same rows selection the plain root field answers, so
+        // it gets the same projection: computed fields, which are functions of
+        // the row rather than part of it, and relationships, which are
+        // correlated subselects. Reading it as columns alone was why a
+        // relationship asked for beside a count came back null.
+        let nodes = ctx
+            .field()
+            .selection_set()
+            .find(|selection| selection.name() == "nodes")
+            .ok_or_else(|| async_graphql::Error::new("nodes was asked for and then was not"))?;
+
+        // The aggregate query has already been sent, so its parameters are
+        // fixed; anything an embed binds continues that numbering in a vector
+        // of its own.
+        let mut node_values = bound_values.clone();
+        let (projection, row_column_types) = {
+            let guard = gql_ctx
+                .schema_cache
+                .get()
+                .await
+                .map_err(|e| async_graphql::Error::new(e.to_string()))?;
+            let cache = guard
+                .as_ref()
+                .ok_or_else(|| async_graphql::Error::new("schema cache is not loaded"))?;
+            let qi = postrust_core::api_request::QualifiedIdentifier::new(
+                &spec.schema_name,
+                &spec.table_name,
+            );
+            let table = cache.get_table(&qi);
+            let computed = table
+                .map(|table| computed_projections(table, nodes, "src", spec.names.as_ref()))
+                .unwrap_or_default();
+            let mut param_idx = node_values.len() + 1;
+            let embeds = build_embed_expressions(
+                cache,
+                spec.relationships.as_ref(),
+                &spec.type_name,
+                "src",
+                nodes,
+                spec.max_rows,
+                &mut 0,
+                &mut param_idx,
+                &mut node_values,
+                spec.names.as_ref(),
+            )?;
+            let mut projection = String::from("src.*");
+            for expression in &computed {
+                projection.push_str(", ");
+                projection.push_str(expression);
+            }
+            for (field_name, expression) in &embeds {
+                projection.push_str(", ");
+                projection.push_str(expression);
+                projection.push_str(" AS ");
+                projection.push_str(&postrust_sql::escape_ident(field_name));
+            }
+            (
+                projection,
+                table.map(column_types_of_table).unwrap_or_default(),
+            )
+        };
+
         let sql = format!(
-            "SELECT {} FROM ({}) AS pgrst_nodes",
-            row_json(
-                "pgrst_nodes",
-                &column_types_of(&gql_ctx.schema_cache, &spec.schema_name, &spec.table_name).await
-            ),
+            "SELECT {} FROM (SELECT {} FROM ({}) AS src) AS pgrst_nodes",
+            row_json("pgrst_nodes", &row_column_types),
+            projection,
             inner
         );
         let mut conn = begin_with_session(pool, gql_ctx.role(), &gql_ctx.session_settings()).await?;
-        let rows = execute_query_on(&mut conn, &sql, &bound_values).await?;
+        let rows = execute_query_on(&mut conn, &sql, &node_values).await?;
         conn.commit().await?;
         result.insert(
             async_graphql::Name::new("nodes"),
@@ -4131,10 +4164,20 @@ fn computed_projections(
 /// row per parent, correlated the way any embed is. Both halves are aggregates
 /// over the same correlated set, so they go in one select list rather than two
 /// queries -- `count(*)` and `json_agg(...)` read the same rows.
+#[allow(clippy::too_many_arguments)] // the recursion carries its whole context
 fn nested_aggregate_select(
     selection: async_graphql::SelectionField<'_>,
     child_alias: &str,
-) -> String {
+    schema_cache: &SchemaCache,
+    relationships: &HashMap<String, Vec<RelationshipField>>,
+    target_type: &str,
+    child_table: Option<&postrust_core::schema_cache::Table>,
+    max_rows: Option<i64>,
+    alias_counter: &mut usize,
+    param_idx: &mut usize,
+    values: &mut Vec<serde_json::Value>,
+    names: &crate::names::NameOverrides,
+) -> Result<String, async_graphql::Error> {
     use crate::schema::aggregate as agg;
 
     let mut parts: Vec<String> = Vec::new();
@@ -4181,18 +4224,38 @@ fn nested_aggregate_select(
                     postrust_sql::escape_ident("aggregate")
                 ));
             }
+            // `nodes` under an aggregate is a rows selection like any other:
+            // what it names may be a column, a computed field, or a
+            // relationship of its own, and the last of those is a further
+            // correlated subselect rather than a column of this one.
             "nodes" => {
-                let columns: Vec<String> = child
-                    .selection_set()
-                    .map(|column| {
-                        format!(
-                            "'{}', {}.{}",
-                            column.name().replace('\'', "''"),
-                            postrust_sql::escape_ident(child_alias),
-                            postrust_sql::escape_ident(column.name())
-                        )
-                    })
-                    .collect();
+                let embeds = build_embed_expressions(
+                    schema_cache,
+                    relationships,
+                    target_type,
+                    child_alias,
+                    child,
+                    max_rows,
+                    alias_counter,
+                    param_idx,
+                    values,
+                    names,
+                )?;
+                let mut columns: Vec<String> = Vec::new();
+                for column in child.selection_set() {
+                    let name = column.name();
+                    if name == "__typename" || embeds.iter().any(|(field, _)| field == name) {
+                        continue;
+                    }
+                    columns.push(format!(
+                        "'{}', {}",
+                        name.replace('\'', "''"),
+                        column_expression(child_table, child_alias, name, names)
+                    ));
+                }
+                for (field, expression) in &embeds {
+                    columns.push(format!("'{}', {}", field.replace('\'', "''"), expression));
+                }
                 let row = if columns.is_empty() {
                     format!("row_to_json({})", postrust_sql::escape_ident(child_alias))
                 } else {
@@ -4213,7 +4276,41 @@ fn nested_aggregate_select(
         // valid SQL; a count nobody reads is.
         parts.push("count(*) AS pgrst_empty".to_string());
     }
-    parts.join(", ")
+    Ok(parts.join(", "))
+}
+
+/// How one named field of a row is read, given the alias the row goes by.
+///
+/// A column is itself; a computed field is the call that produces it. Which of
+/// the two a name is depends on the table, so this is the one place that asks.
+fn column_expression(
+    table: Option<&postrust_core::schema_cache::Table>,
+    alias: &str,
+    name: &str,
+    names: &crate::names::NameOverrides,
+) -> String {
+    let plain = format!(
+        "{}.{}",
+        postrust_sql::escape_ident(alias),
+        postrust_sql::escape_ident(name)
+    );
+    let computed = table
+        .filter(|t| t.get_column(name).is_none())
+        .and_then(|t| {
+            let function = names
+                .computed_source(&t.schema, &t.name, name)
+                .unwrap_or(name);
+            t.get_computed_column(function)
+        });
+    match computed {
+        Some(definition) => format!(
+            "{}.{}({}.*)",
+            postrust_sql::escape_ident(&definition.function.schema),
+            postrust_sql::escape_ident(&definition.function.name),
+            postrust_sql::escape_ident(alias)
+        ),
+        None => plain,
+    }
 }
 
 /// Render `order_by` terms against a table, qualified with an alias.
@@ -4273,6 +4370,78 @@ fn order_terms(
     })
 }
 
+/// The arguments written on an embedded field, as JSON.
+fn embed_arguments(
+    field: async_graphql::SelectionField<'_>,
+) -> HashMap<String, serde_json::Value> {
+    field
+        .arguments()
+        .map(|args| {
+            args.into_iter()
+                .map(|(name, value)| {
+                    (
+                        name.to_string(),
+                        value.into_json().unwrap_or(serde_json::Value::Null),
+                    )
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// What an embed's arguments narrow its child rows to.
+///
+/// A list and an aggregate of that same list take the same four arguments and
+/// mean the same thing by them; only what is done with the surviving rows
+/// differs, so the reading of the arguments is shared.
+#[allow(clippy::too_many_arguments)] // one parameter per SQL clause, plus the binding state
+fn embed_narrowing(
+    arguments: &HashMap<String, serde_json::Value>,
+    plan: &postrust_core::embed::EmbedPlan,
+    schema_cache: &SchemaCache,
+    relationships: &HashMap<String, Vec<RelationshipField>>,
+    target_type: &str,
+    child_alias: &str,
+    max_rows: Option<i64>,
+    param_idx: &mut usize,
+    values: &mut Vec<serde_json::Value>,
+) -> Result<(Option<String>, Option<String>, Option<i64>, i64), async_graphql::Error> {
+    let child_where = match arguments.get("where") {
+        Some(expression) if !expression.is_null() => {
+            let child_scope =
+                WhereScope::for_alias(child_alias, target_type, schema_cache, relationships);
+            let mut nested_alias = 0usize;
+            build_condition(expression, &child_scope, param_idx, values, &mut nested_alias)?
+        }
+        _ => None,
+    };
+
+    let child_order = match arguments.get("order_by") {
+        Some(order) if !order.is_null() => order_terms(
+            order,
+            schema_cache,
+            &plan.foreign_schema,
+            &plan.foreign_table,
+            child_alias,
+        )?,
+        _ => None,
+    };
+
+    // A limit written on the embed is what the client asked for; the
+    // configured ceiling still applies as an upper bound, the same way it
+    // does at the top level.
+    let child_limit = match arguments.get("limit").and_then(|v| v.as_i64()) {
+        Some(requested) => match max_rows {
+            Some(ceiling) => Some(requested.min(ceiling)),
+            None => Some(requested),
+        },
+        None => max_rows,
+    };
+    let child_offset = arguments.get("offset").and_then(|v| v.as_i64()).unwrap_or(0);
+
+    Ok((child_where, child_order, child_limit, child_offset))
+}
+
 fn build_embed_expressions(
     schema_cache: &SchemaCache,
     relationships: &HashMap<String, Vec<RelationshipField>>,
@@ -4306,21 +4475,52 @@ fn build_embed_expressions(
             *alias_counter += 1;
             let child_alias = format!("a{}", alias_counter);
 
-            // One row per parent rather than a list of them: the aggregate is
-            // the answer, not the rows it read.
-            let mut one_row = plan.clone();
-            one_row.is_list = false;
+            // The same narrowing an embedded list takes. `where` here decides
+            // which rows are counted, not which are returned, so it goes on the
+            // set the aggregate reads rather than on the answer.
+            let arguments = embed_arguments(field);
+            let (child_where, child_order, child_limit, child_offset) = embed_narrowing(
+                &arguments,
+                &plan,
+                schema_cache,
+                relationships,
+                &rel.target_type,
+                &child_alias,
+                max_rows,
+                param_idx,
+                values,
+            )?;
 
-            let expression = one_row
-                .embed_expression(
+            let child_table = schema_cache.get_table(
+                &postrust_core::api_request::QualifiedIdentifier::new(
+                    &plan.foreign_schema,
+                    &plan.foreign_table,
+                ),
+            );
+            let select = nested_aggregate_select(
+                field,
+                &child_alias,
+                schema_cache,
+                relationships,
+                &rel.target_type,
+                child_table,
+                max_rows,
+                alias_counter,
+                param_idx,
+                values,
+                names,
+            )?;
+
+            let expression = plan
+                .aggregate_expression(
                     parent_alias,
                     &postrust_sql::escape_ident(parent_alias),
                     &child_alias,
-                    &nested_aggregate_select(field, &child_alias),
-                    None,
-                    0,
-                    None,
-                    None,
+                    &select,
+                    child_limit,
+                    child_offset,
+                    child_where.as_deref(),
+                    child_order.as_deref(),
                 )
                 .map_err(|e| async_graphql::Error::new(e.to_string()))?;
             expressions.push((field.name().to_string(), expression));
@@ -4351,56 +4551,18 @@ fn build_embed_expressions(
         )?;
 
         // The arguments written on the embed itself.
-        let arguments: HashMap<String, serde_json::Value> = field
-            .arguments()
-            .map(|args| {
-                args.into_iter()
-                    .map(|(name, value)| {
-                        (
-                            name.to_string(),
-                            value.into_json().unwrap_or(serde_json::Value::Null),
-                        )
-                    })
-                    .collect()
-            })
-            .unwrap_or_default();
-
-        let child_where = match arguments.get("where") {
-            Some(expression) if !expression.is_null() => {
-                let child_scope = WhereScope::for_alias(
-                    &child_alias,
-                    &rel.target_type,
-                    schema_cache,
-                    relationships,
-                );
-                let mut nested_alias = 0usize;
-                build_condition(expression, &child_scope, param_idx, values, &mut nested_alias)?
-            }
-            _ => None,
-        };
-
-        let child_order = match arguments.get("order_by") {
-            Some(order) if !order.is_null() => order_terms(
-                order,
-                schema_cache,
-                &plan.foreign_schema,
-                &plan.foreign_table,
-                &child_alias,
-            )?,
-            _ => None,
-        };
-
-        // A limit written on the embed is what the client asked for; the
-        // configured ceiling still applies as an upper bound, the same way it
-        // does at the top level.
-        let child_limit = match arguments.get("limit").and_then(|v| v.as_i64()) {
-            Some(requested) => match max_rows {
-                Some(ceiling) => Some(requested.min(ceiling)),
-                None => Some(requested),
-            },
-            None => max_rows,
-        };
-        let child_offset = arguments.get("offset").and_then(|v| v.as_i64()).unwrap_or(0);
+        let arguments = embed_arguments(field);
+        let (child_where, child_order, child_limit, child_offset) = embed_narrowing(
+            &arguments,
+            &plan,
+            schema_cache,
+            relationships,
+            &rel.target_type,
+            &child_alias,
+            max_rows,
+            param_idx,
+            values,
+        )?;
 
         // Leaf fields are columns; anything that resolved to a relationship is
         // an expression instead.
