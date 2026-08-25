@@ -935,7 +935,12 @@ pub async fn load_computed_columns(
     pool: &PgPool,
     schemas: &[String],
     function_schemas: &[String],
-) -> Result<Vec<(QualifiedIdentifier, String, QualifiedIdentifier, String, Option<String>)>> {
+) -> Result<Vec<ComputedColumnRow>> {
+    // One argument is the table's row. A second is allowed only where it is
+    // the session document Hasura fills in -- `hasura_session json` -- which a
+    // client never sends and which is what lets a computed field know who is
+    // asking. Anything else with two arguments is a function that needs one,
+    // and a field with no way to supply it would be a field that always fails.
     let rows = sqlx::query(
         r#"
         SELECT tn.nspname AS table_schema,
@@ -943,12 +948,25 @@ pub async fn load_computed_columns(
                fn.nspname AS function_schema,
                p.proname  AS function_name,
                pg_catalog.format_type(p.prorettype, null) AS return_type,
-               pg_catalog.obj_description(p.oid, 'pg_proc') AS description
+               pg_catalog.obj_description(p.oid, 'pg_proc') AS description,
+               (SELECT p.proargnames[i]
+                  FROM generate_series(1, p.pronargs) AS i
+                 WHERE p.proargtypes[i - 1] = t.reltype
+                 LIMIT 1) AS row_argument,
+               (SELECT p.proargnames[i]
+                  FROM generate_series(1, p.pronargs) AS i
+                 WHERE p.proargnames[i] = 'hasura_session'
+                 LIMIT 1) AS session_argument
           FROM pg_proc p
           JOIN pg_namespace fn ON fn.oid = p.pronamespace
-          JOIN pg_class t ON t.reltype = p.proargtypes[0]
+          JOIN pg_class t ON t.reltype = ANY (p.proargtypes::oid[])
           JOIN pg_namespace tn ON tn.oid = t.relnamespace
-         WHERE p.pronargs = 1
+         WHERE p.pronargs BETWEEN 1 AND 2
+           AND (p.pronargs = 1 OR EXISTS (
+                 SELECT 1 FROM generate_series(1, p.pronargs) AS i
+                  WHERE p.proargnames[i] = 'hasura_session'
+                    AND p.proargtypes[i - 1] IN (
+                          'pg_catalog.json'::regtype, 'pg_catalog.jsonb'::regtype)))
            AND NOT p.proretset
            AND p.prokind = 'f'
            AND p.prorettype <> 'pg_catalog.trigger'::pg_catalog.regtype
@@ -965,22 +983,41 @@ pub async fn load_computed_columns(
 
     Ok(rows
         .into_iter()
-        .map(|row| {
-            (
-                QualifiedIdentifier::new(
-                    row.get::<String, _>("table_schema"),
-                    row.get::<String, _>("table_name"),
-                ),
+        .map(|row| ComputedColumnRow {
+            table: QualifiedIdentifier::new(
+                row.get::<String, _>("table_schema"),
+                row.get::<String, _>("table_name"),
+            ),
+            name: row.get::<String, _>("function_name"),
+            function: QualifiedIdentifier::new(
+                row.get::<String, _>("function_schema"),
                 row.get::<String, _>("function_name"),
-                QualifiedIdentifier::new(
-                    row.get::<String, _>("function_schema"),
-                    row.get::<String, _>("function_name"),
-                ),
-                row.get::<String, _>("return_type"),
-                row.get::<Option<String>, _>("description"),
-            )
+            ),
+            return_type: row.get::<String, _>("return_type"),
+            description: row.get::<Option<String>, _>("description"),
+            row_argument: row.get::<Option<String>, _>("row_argument"),
+            session_argument: row.get::<Option<String>, _>("session_argument"),
         })
         .collect())
+}
+
+/// One function that reads as a column of a table.
+#[derive(Clone, Debug)]
+pub struct ComputedColumnRow {
+    /// The table it belongs to.
+    pub table: QualifiedIdentifier,
+    /// The name it is read under, which is the function's.
+    pub name: String,
+    /// The function itself.
+    pub function: QualifiedIdentifier,
+    /// What it returns.
+    pub return_type: String,
+    /// The function's comment.
+    pub description: Option<String>,
+    /// The parameter that takes the row.
+    pub row_argument: Option<String>,
+    /// The parameter filled from the session, if any.
+    pub session_argument: Option<String>,
 }
 
 /// One view column, and the base-table column it was selected from.

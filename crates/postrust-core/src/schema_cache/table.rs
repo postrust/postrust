@@ -106,6 +106,20 @@ pub struct ComputedColumn {
     /// it from.
     #[serde(default)]
     pub description: Option<String>,
+    /// The name of the parameter that takes the table's row.
+    ///
+    /// Usually the first and usually the only one, but not always: Hasura
+    /// records a `table_argument` because a function may take the row second,
+    /// after the session. Where it is not first the call has to be written in
+    /// named notation, which is why the name is kept rather than the position.
+    #[serde(default)]
+    pub row_argument: Option<String>,
+    /// The name of the parameter filled from the caller's session, if any.
+    ///
+    /// A function with one is not callable from the REST surface, which has no
+    /// session document to give it, and is skipped there.
+    #[serde(default)]
+    pub session_argument: Option<String>,
 }
 
 /// A table column.

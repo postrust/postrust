@@ -85,16 +85,16 @@ impl SchemaCache {
 
         // Functions that read as columns. Attached to the tables they belong
         // to, so resolving a field name has one place to look.
-        for (table, name, function, data_type, description) in
-            queries::load_computed_columns(pool, schemas, &function_schemas).await?
-        {
-            if let Some(table) = tables.get_mut(&table) {
+        for computed in queries::load_computed_columns(pool, schemas, &function_schemas).await? {
+            if let Some(table) = tables.get_mut(&computed.table) {
                 table.computed_columns.insert(
-                    name,
+                    computed.name,
                     ComputedColumn {
-                        function,
-                        data_type,
-                        description,
+                        function: computed.function,
+                        data_type: computed.return_type,
+                        description: computed.description,
+                        row_argument: computed.row_argument,
+                        session_argument: computed.session_argument,
                     },
                 );
             }

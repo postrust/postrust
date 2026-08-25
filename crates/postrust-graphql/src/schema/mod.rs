@@ -230,12 +230,29 @@ pub struct FunctionField {
     pub returns: String,
     /// The table those rows belong to, as `(schema, table)`.
     pub returns_table: (String, String),
-    /// Its arguments, as `(name, PostgreSQL type, required)`.
+    /// Its arguments, as `(name, PostgreSQL type, required)`. The session
+    /// argument is not among them: the client does not supply it.
     pub arguments: Vec<(String, String, bool)>,
+    /// The name of its session argument, if it has one.
+    ///
+    /// Hasura's convention: a `hasura_session json` parameter is filled from
+    /// the caller's session variables rather than taken from the request, so a
+    /// function can read who is asking. Exposing it as an argument would let
+    /// the caller name its own identity, which is the opposite of the point.
+    pub session_argument: Option<String>,
     /// Whether it may write, and so belongs on the mutation root.
     pub volatile: bool,
     /// Description from the function's comment.
     pub description: Option<String>,
+}
+
+/// Whether a parameter is the one Hasura fills from the session.
+///
+/// Recognised by name and type, which is the only thing the database records:
+/// Hasura writes `session_argument: hasura_session` into metadata, and every
+/// function that has one calls it that.
+fn is_session_argument(param: &postrust_core::schema_cache::RoutineParam) -> bool {
+    param.name == "hasura_session" && matches!(param.param_type.as_str(), "json" | "jsonb")
 }
 
 impl GeneratedSchema {
@@ -877,10 +894,16 @@ pub fn build_schema(schema_cache: &SchemaCache, config: &SchemaConfig) -> Genera
                     .params
                     .iter()
                     .filter(|param| !param.name.is_empty())
+                    .filter(|param| !is_session_argument(param))
                     .map(|param| {
                         (param.name.clone(), param.param_type.clone(), param.required)
                     })
                     .collect(),
+                session_argument: routine
+                    .params
+                    .iter()
+                    .find(|param| is_session_argument(param))
+                    .map(|param| param.name.clone()),
                 volatile: matches!(
                     routine.volatility,
                     postrust_core::schema_cache::FuncVolatility::Volatile

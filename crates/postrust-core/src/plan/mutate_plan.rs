@@ -376,7 +376,11 @@ fn get_returning_columns(request: &ApiRequest, table: &Table, creates: bool) -> 
         for item in &request.query_params.select {
             match item {
                 SelectItem::Field { field, .. } => {
-                    if field.name == "*" || table.computed_columns.contains_key(&field.name) {
+                    if field.name == "*"
+                        || table
+                            .get_computed_column(&field.name)
+                            .is_some_and(|c| c.session_argument.is_none())
+                    {
                         return everything();
                     }
                     wanted.push(field.name.clone());

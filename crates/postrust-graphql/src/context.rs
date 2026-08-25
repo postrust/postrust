@@ -78,7 +78,8 @@ impl GraphQLContext {
     /// `set_config` takes both as arguments, where `SET LOCAL` would need the
     /// value written into the statement.
     pub fn session_settings(&self) -> Vec<(String, String)> {
-        self.session
+        let mut settings: Vec<(String, String)> = self
+            .session
             .iter()
             .filter(|(name, _)| {
                 !name.is_empty()
@@ -87,7 +88,42 @@ impl GraphQLContext {
                         .all(|c| c.is_ascii_alphanumeric() || c == '_')
             })
             .map(|(name, value)| (format!("hasura.{}", name), value.clone()))
-            .collect()
+            .collect();
+        // The whole session as one document, for a function that takes it.
+        // A setting rather than a bound parameter because the places that call
+        // such a function are projections and correlated subselects, which
+        // assemble SQL without a parameter list to add to -- and because it is
+        // then set exactly where the role is, once per transaction.
+        settings.push((
+            "hasura.session".to_string(),
+            self.hasura_session().to_string(),
+        ));
+        settings
+    }
+
+    /// The session as a function reading `hasura_session` expects it.
+    ///
+    /// Hasura hands a function a JSON object of the caller's session
+    /// variables, under the names they arrive as -- `x-hasura-role`,
+    /// `x-hasura-user-id` -- which is what a function body indexes into.
+    /// [`Self::session`] holds them stripped and lowercased for the settings a
+    /// row-level policy reads, so the prefix goes back on here.
+    ///
+    /// The role is included and is not the caller's to choose: it is what the
+    /// token authenticated as.
+    pub fn hasura_session(&self) -> serde_json::Value {
+        let mut object = serde_json::Map::new();
+        for (name, value) in &self.session {
+            object.insert(
+                format!("x-hasura-{}", name.replace('_', "-")),
+                serde_json::Value::String(value.clone()),
+            );
+        }
+        object.insert(
+            "x-hasura-role".to_string(),
+            serde_json::Value::String(self.auth.role.clone()),
+        );
+        serde_json::Value::Object(object)
     }
 
     /// Get the current role.

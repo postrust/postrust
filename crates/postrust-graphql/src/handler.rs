@@ -1587,6 +1587,7 @@ fn add_function_fields(
                 schema: function.schema_name.clone(),
                 name: function.function_name.clone(),
                 arguments: function.arguments.clone(),
+                session_argument: function.session_argument.clone(),
             })),
         });
 
@@ -1636,6 +1637,9 @@ struct FunctionCall {
     schema: String,
     name: String,
     arguments: Vec<(String, String, bool)>,
+    /// The parameter filled from the caller's session rather than from the
+    /// request. See [`crate::schema::FunctionField::session_argument`].
+    session_argument: Option<String>,
 }
 
 /// Everything an aggregate field's resolver needs.
@@ -1997,6 +2001,17 @@ async fn resolve_query<'a>(
                     }
                 }
             }
+            // The session argument is not the client's to send: it says who
+            // is asking, and a caller that could write it could name any
+            // identity it liked. It is filled here, from the verified token.
+            if let Some(session) = &call.session_argument {
+                passed.push(format!(
+                    "{} => {}",
+                    postrust_sql::escape_ident(session),
+                    SESSION_ARGUMENT
+                ));
+            }
+
             // Aliased as the table, so a filter or an ordering written
             // against that table's columns finds them. Without it the FROM
             // clause names the function and `article.score` is a table nobody
@@ -2801,6 +2816,40 @@ fn check_geojson(value: &serde_json::Value) -> Result<(), async_graphql::Error> 
     }
     Ok(())
 }
+
+/// The call that produces a computed field's value.
+///
+/// `row` is a whole-row reference -- an alias, or a qualified table name --
+/// rather than `alias.*`: a function taking the session is called in named
+/// notation, and `a => t.*` is not something named notation accepts.
+fn computed_call(
+    definition: &postrust_core::schema_cache::ComputedColumn,
+    row: &str,
+) -> String {
+    let function = format!(
+        "{}.{}",
+        postrust_sql::escape_ident(&definition.function.schema),
+        postrust_sql::escape_ident(&definition.function.name)
+    );
+    match (&definition.session_argument, &definition.row_argument) {
+        (Some(session), Some(row_argument)) => format!(
+            "{}({} => {}, {} => {})",
+            function,
+            postrust_sql::escape_ident(row_argument),
+            row,
+            postrust_sql::escape_ident(session),
+            SESSION_ARGUMENT
+        ),
+        _ => format!("{}({})", function, row),
+    }
+}
+
+/// What a `hasura_session` argument is given.
+///
+/// The session document, read from the setting `begin_with_session` writes.
+/// `current_setting`'s second argument makes a missing setting null rather than
+/// an error, which is the case of a request with no session at all.
+const SESSION_ARGUMENT: &str = "coalesce(current_setting('hasura.session', true), '{}')::json";
 
 /// Everything an update may be told to do, in the order the schema declares
 /// them. Read by both spellings: one update, and one of many.
@@ -4749,13 +4798,7 @@ fn order_terms_into(
                 .computed_source(&table.schema, &table.name, key)
                 .unwrap_or(key);
             if let Some(definition) = table.get_computed_column(function) {
-                terms.push(format!(
-                    "{}.{}({}.*) {}",
-                    postrust_sql::escape_ident(&definition.function.schema),
-                    postrust_sql::escape_ident(&definition.function.name),
-                    reference,
-                    sql
-                ));
+                terms.push(format!("{} {}", computed_call(definition, reference), sql));
                 continue;
             }
             return Err(async_graphql::Error::new(format!(
@@ -5043,10 +5086,8 @@ fn computed_projections(
             continue;
         };
         projections.push(format!(
-            "{}.{}({}) AS {}",
-            postrust_sql::escape_ident(&computed.function.schema),
-            postrust_sql::escape_ident(&computed.function.name),
-            row_reference,
+            "{} AS {}",
+            computed_call(computed, row_reference),
             postrust_sql::escape_ident(name)
         ));
     }
@@ -5204,12 +5245,7 @@ fn column_expression(
             t.get_computed_column(function)
         });
     match computed {
-        Some(definition) => format!(
-            "{}.{}({}.*)",
-            postrust_sql::escape_ident(&definition.function.schema),
-            postrust_sql::escape_ident(&definition.function.name),
-            postrust_sql::escape_ident(alias)
-        ),
+        Some(definition) => computed_call(definition, &postrust_sql::escape_ident(alias)),
         None => plain,
     }
 }
@@ -5519,10 +5555,8 @@ fn build_embed_expressions(
                 });
             match computed {
                 Some(definition) => parts.push(format!(
-                    "{}.{}({}.*) AS {}",
-                    postrust_sql::escape_ident(&definition.function.schema),
-                    postrust_sql::escape_ident(&definition.function.name),
-                    postrust_sql::escape_ident(&child_alias),
+                    "{} AS {}",
+                    computed_call(definition, &postrust_sql::escape_ident(&child_alias)),
                     postrust_sql::escape_ident(name)
                 )),
                 // A column the child exposes under another name is selected as
