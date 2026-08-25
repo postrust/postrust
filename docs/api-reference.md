@@ -652,6 +652,26 @@ mutation {
 }
 ```
 
+### Validation
+
+A request is validated against the schema before it runs, and a document that
+cannot mean what it says is refused rather than answered:
+
+```graphql
+query ($limit: String) { author(limit: $limit) { id } }
+```
+
+`limit` is an `Int`, so this is refused — `variable 'limit' is declared as
+'String', but used where 'Int' is expected` — as is a non-null variable given
+an explicit null. A nullable variable may stand where a non-null is expected
+when either it or the place has a default, since the default is then what fills
+it.
+
+One deliberate exception: a variable that is *declared and never used* is
+accepted. The specification says a document like that is invalid; Hasura
+executes it, and a client whose filter was edited years ago has been getting
+answers ever since.
+
 ### Errors
 
 Errors come back in Hasura's envelope, which client code branches on: there is

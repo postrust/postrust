@@ -8,10 +8,10 @@ harness itself, divergences kept on purpose, and the gaps still open.
 
 | | status | same outcome | same data | full body |
 |---|---|---|---|---|
-| all (464) | 97.8% | 69.2% | **65.5%** | 42.7% |
-| **excluding the 142 permission cases (322)** | | | **87.3%** | |
+| all (464) | 97.8% | 70.5% | **67.2%** | 43.5% |
+| **excluding the 142 permission cases (322)** | | | **89.8%** | |
 
-Of the 304 cases the third column counts, **198 agree about data and 106 agree
+Of the 312 cases the third column counts, **201 agree about data and 111 agree
 only because both servers answered with errors.** A further 111 are cases where
 Hasura refused and this server answered -- which is where a mutual-refusal case
 goes the moment this server gains the field it was missing.
@@ -23,9 +23,9 @@ else did -- with one exception, which was a real regression and is described
 below because that is what the comparison is for. The report prints the split,
 because a headline that mixes the two is not readable as progress.
 
-**198 is the figure that tracks the work.** It counts the cases where the same
+**201 is the figure that tracks the work.** It counts the cases where the same
 query came back with the same rows, which is the only thing a client can feel.
-Against it, **34 cases where Hasura answered with data and this server did not
+Against it, **31 cases where Hasura answered with data and this server did not
 match it** -- down from 95.
 
 **The candidate is configured.** Each group's fixtures are converted into a
@@ -56,17 +56,20 @@ in a delete's `returning`, relationship predicates in a write, `_delete_at_path`
 one transaction per mutation) → 63.6 (per-root names and column renaming) →
 64.9 (metadata descriptions, `update_x_many`, sorted roots) → 66.2 (nullable
 enums, no relationship to an enum table, `on_conflict.where`) → 65.5 (the
-session argument; see the split for why this reads as a loss).
+session argument; see the split for why this reads as a loss) → 67.2 (array
+columns, filtering on a computed field, and variables checked against the
+places they are used).
 
 Read as real agreement rather than as the headline, that is 137 → 167 → 176 →
-184 → 190 → 196 → 198 over the last seven runs. The figure excluding the
+184 → 190 → 196 → 198 → 201 over the last eight runs. The figure excluding the
 permission cases went 51.2 → 55.3 → 55.9 → 58.4 → 60.6 → 62.4 → 64.0 → 64.6 →
-64.0 → 66.8 → 67.4 → 67.4 → 78.0 → 80.4 → 82.9 → 84.8 → 86.6 → **87.3**.
+64.0 → 66.8 → 67.4 → 67.4 → 78.0 → 80.4 → 82.9 → 84.8 → 86.6 → 87.3 →
+**89.8**.
 
 **142 of the 464 cases cannot pass and are counted anyway.** They are the cases
 Hasura answers `access-denied` to, from a rule that lives in metadata, and
-there is no metadata here. Excluding them the figure is **281/322 = 87.3%**,
-and every one of the 198 real agreements is inside that 322.
+there is no metadata here. Excluding them the figure is **289/322 = 89.8%**,
+and every one of the 201 real agreements is inside that 322.
 
 That gap is worth understanding, because the headline moves less than the work
 behind it. Many of those permission cases "agree" only in the sense that both
@@ -210,24 +213,23 @@ wrong one.
    `PGRST_GRAPHQL_NAMES` cannot carry its name and the converter says so rather
    than guessing.
 
-7. **Variable validation.** Hasura refuses a variable declared as one type and
-   used where another is expected, and a null passed for a non-nullable one.
-   async-graphql has exactly that rule and it does not fire here; whether the
-   dynamic schema's argument types reach the visitor has not been established.
-   Three cases, and it is the one open item that is a *missing refusal* rather
-   than a missing feature: a client with a mistyped variable is answered rather
-   than corrected.
-
-8. **A batched request.** A body that is a JSON *array* of operations is
+7. **A batched request.** A body that is a JSON *array* of operations is
    answered by Hasura with an array of responses. Three cases in
    `graphql_query/basic` use it, and the harness does not extract them, so this
    is unmeasured rather than failing -- recorded because it is a contract a
    client can depend on and this server does not offer it.
 
-9. **`count(columns: [...], distinct: true)`.** The argument is declared and
+8. **`count(columns: [...], distinct: true)`.** The argument is declared and
    ignored: every `count` is `count(*)`. The corpus case that uses it passes
    because the two answers happen to agree on its data, which is worth writing
    down before someone reads it as coverage.
+
+9. **An explicit null in a comparison.** `where: {id: {_eq: null}}` is refused
+   by Hasura -- "unexpected null value for type 'Int'" -- and answered here,
+   where `_eq` is a nullable `Int` and a null operand compares against null.
+   One case. Matching would mean refusing a spelling that is legal in the
+   schema this server publishes, which is a bigger change than the case is
+   worth and is worth deciding deliberately rather than by conformance.
 
 10. **Scalar coercion is stricter than Hasura's.** `offset: "2"` and
     `c1_smallint: "32767"` -- a string where an `Int` is declared -- are
@@ -477,6 +479,19 @@ wrong one.
   inputs were typed by the leaf scalar, so a `text[]` column said `String` and
   a client offering `[String]` was told it had the wrong type; and once past
   that, `["a","b"]` is JSON where PostgreSQL wanted `{a,b}`.
+
+- **A variable used where its type does not fit is refused.** The
+  specification's "All Variable Usages Are Allowed" rule, made here because
+  async-graphql carries exactly that rule and it does not fire -- verified
+  against 7.0.17 with a static schema, with a dynamic one, and on a built-in
+  directive, none of which report. It was the only gap that was a missing
+  *refusal*: a client whose variable was mistyped got rows instead of an
+  error, and found out from the rows. Written with the two exemptions that
+  make the rule usable -- a nullable variable fits a non-null place when
+  either it or the place has a default -- and with a default *of null* not
+  counting, which is the difference between the two cases the corpus has.
+  Alongside it, a non-null variable given an explicit null. Every message is
+  Hasura's, word for word.
 
 ## Not measured
 
