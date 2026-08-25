@@ -1477,7 +1477,11 @@ async fn resolve_aggregate<'a>(
 
     if wants_nodes {
         let sql = format!(
-            "SELECT row_to_json(pgrst_nodes) FROM ({}) AS pgrst_nodes",
+            "SELECT {} FROM ({}) AS pgrst_nodes",
+            row_json(
+                "pgrst_nodes",
+                &column_types_of(&gql_ctx.schema_cache, &spec.schema_name, &spec.table_name).await
+            ),
             inner
         );
         let mut conn = begin_with_session(pool, gql_ctx.role(), &gql_ctx.session_settings()).await?;
@@ -1627,30 +1631,25 @@ async fn resolve_query<'a>(
 
     // A computed column is a function of the row rather than part of it, so
     // it is not in `*` and is named only when it was asked for.
-    let computed = {
+    let (computed, row_column_types) = {
         let guard = gql_ctx
             .schema_cache
             .get()
             .await
             .map_err(|e| async_graphql::Error::new(e.to_string()))?;
-        let qualified = format!(
-            "{}.{}",
-            postrust_sql::escape_ident(schema_name),
-            postrust_sql::escape_ident(table_name)
-        );
         match guard.as_ref() {
             Some(cache) => {
                 let qi =
                     postrust_core::api_request::QualifiedIdentifier::new(schema_name, table_name);
                 match cache.get_table(&qi) {
-                    Some(table) => {
-                        let _ = &qualified;
-                        computed_projections(table, ctx.field(), "src", spec.names.as_ref())
-                    }
-                    None => Vec::new(),
+                    Some(table) => (
+                        computed_projections(table, ctx.field(), "src", spec.names.as_ref()),
+                        column_types_of_table(table),
+                    ),
+                    None => (Vec::new(), HashMap::new()),
                 }
             }
-            None => Vec::new(),
+            None => (Vec::new(), HashMap::new()),
         }
     };
     // ORDER BY, LIMIT and OFFSET belong inside the subquery: applying them to
@@ -1729,7 +1728,11 @@ async fn resolve_query<'a>(
         format!("SELECT {} FROM ({}) AS src", projection, inner)
     };
 
-    let sql = format!("SELECT row_to_json(t) FROM ({}) t", inner);
+    let sql = format!(
+        "SELECT {} FROM ({}) t",
+        row_json("t", &row_column_types),
+        inner
+    );
 
     // One transaction for the query and any embeds hanging off it, so the role
     // applies to all of them and the parent and child rows come from a single
@@ -2000,6 +2003,53 @@ async fn begin_with_session(
     Ok(tx)
 }
 
+/// Render a row as JSON, with any shape column rendered as GeoJSON.
+///
+/// PostgreSQL's text form for a geometry is WKB hex --
+/// `0103000020E6100000…` -- which is what `row_to_json` puts in the response
+/// and is not what any client can read. Hasura answers GeoJSON, and a client
+/// migrating from it parses GeoJSON.
+///
+/// The shape columns are merged over the row rather than replacing the
+/// projection, so a table with no shape column produces exactly the SQL it did
+/// before and one with three needs no list of the others.
+fn row_json(expr: &str, column_types: &HashMap<String, String>) -> String {
+    let mut shapes: Vec<(&String, &String)> = column_types
+        .iter()
+        .filter(|(_, pg_type)| matches!(pg_type.as_str(), "geometry" | "geography"))
+        .collect();
+    if shapes.is_empty() {
+        return format!("row_to_json({})", expr);
+    }
+    shapes.sort();
+
+    let overrides: Vec<String> = shapes
+        .iter()
+        .map(|(name, _)| {
+            format!(
+                "'{}', ST_AsGeoJSON({}.{})::jsonb",
+                name.replace('\'', "''"),
+                expr,
+                postrust_sql::escape_ident(name)
+            )
+        })
+        .collect();
+    format!(
+        "(to_jsonb({}) || jsonb_build_object({}))",
+        expr,
+        overrides.join(", ")
+    )
+}
+
+/// The column types of a table, for the helpers that take a map.
+fn column_types_of_table(table: &postrust_core::schema_cache::Table) -> HashMap<String, String> {
+    table
+        .columns
+        .values()
+        .map(|c| (c.name.clone(), c.nominal_type.clone()))
+        .collect()
+}
+
 /// Execute a SQL query and return results as serde_json::Value.
 /// We keep data as serde_json::Value so field resolvers can use try_downcast_ref.
 async fn execute_query_on(
@@ -2256,17 +2306,21 @@ fn insert_row<'life>(
             _ => String::new(),
         };
 
+        let qualified_table = format!(
+            "{}.{}",
+            postrust_sql::escape_ident(schema_name),
+            postrust_sql::escape_ident(table_name)
+        );
         let names: Vec<&str> = columns.keys().map(|k| k.as_str()).collect();
         let written = if names.is_empty() {
             // Every column defaulted. `DEFAULT VALUES` is how SQL says that;
             // an empty column list is a syntax error.
             let sql = format!(
-                "INSERT INTO {}.{} DEFAULT VALUES{} RETURNING row_to_json({}.{}.*)",
+                "INSERT INTO {}.{} DEFAULT VALUES{} RETURNING {}",
                 postrust_sql::escape_ident(schema_name),
                 postrust_sql::escape_ident(table_name),
                 conflict_sql,
-                postrust_sql::escape_ident(schema_name),
-                postrust_sql::escape_ident(table_name)
+                row_json(&qualified_table, &column_types)
             );
             sqlx::query(&sql).fetch_optional(&mut *conn).await?
         } else {
@@ -2284,7 +2338,7 @@ fn insert_row<'life>(
                 })
                 .collect();
             let sql = format!(
-                "INSERT INTO {}.{} ({}) VALUES ({}){} RETURNING row_to_json({}.{}.*)",
+                "INSERT INTO {}.{} ({}) VALUES ({}){} RETURNING {}",
                 postrust_sql::escape_ident(schema_name),
                 postrust_sql::escape_ident(table_name),
                 names
@@ -2294,8 +2348,7 @@ fn insert_row<'life>(
                     .join(", "),
                 placeholders.join(", "),
                 conflict_sql,
-                postrust_sql::escape_ident(schema_name),
-                postrust_sql::escape_ident(table_name)
+                row_json(&qualified_table, &column_types)
             );
             trace!("Executing INSERT SQL: {}", sql);
             let mut query = sqlx::query(&sql);
@@ -2475,7 +2528,8 @@ async fn reread_returning(
     }
 
     let sql = format!(
-        "SELECT row_to_json(pgrst_r) FROM (SELECT {} FROM (SELECT * FROM {}.{} WHERE {}) AS src) AS pgrst_r",
+        "SELECT {} FROM (SELECT {} FROM (SELECT * FROM {}.{} WHERE {}) AS src) AS pgrst_r",
+        row_json("pgrst_r", &column_types_of_table(table)),
         projection,
         postrust_sql::escape_ident(schema_name),
         postrust_sql::escape_ident(table_name),
@@ -2695,13 +2749,19 @@ async fn execute_update(
     }
 
     let sql = format!(
-        "UPDATE {}.{} SET {} {} RETURNING row_to_json({}.{}.*)",
+        "UPDATE {}.{} SET {} {} RETURNING {}",
         postrust_sql::escape_ident(schema_name),
         postrust_sql::escape_ident(table_name),
         set_parts.join(", "),
         where_sql,
-        postrust_sql::escape_ident(schema_name),
-        postrust_sql::escape_ident(table_name)
+        row_json(
+            &format!(
+                "{}.{}",
+                postrust_sql::escape_ident(schema_name),
+                postrust_sql::escape_ident(table_name)
+            ),
+            &column_types
+        )
     );
 
     trace!("Executing UPDATE SQL: {}", sql);
@@ -2761,12 +2821,18 @@ async fn execute_delete(
     }
 
     let sql = format!(
-        "DELETE FROM {}.{} {} RETURNING row_to_json({}.{}.*)",
+        "DELETE FROM {}.{} {} RETURNING {}",
         postrust_sql::escape_ident(schema_name),
         postrust_sql::escape_ident(table_name),
         where_sql,
-        postrust_sql::escape_ident(schema_name),
-        postrust_sql::escape_ident(table_name)
+        row_json(
+            &format!(
+                "{}.{}",
+                postrust_sql::escape_ident(schema_name),
+                postrust_sql::escape_ident(table_name)
+            ),
+            &Default::default()
+        )
     );
 
     trace!("Executing DELETE SQL: {}", sql);
