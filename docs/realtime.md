@@ -1,90 +1,157 @@
 # Realtime Subscriptions
 
-Postrust provides realtime data synchronization through GraphQL subscriptions, powered by PostgreSQL's native `LISTEN/NOTIFY` mechanism. Subscribe to changes on any table or view and receive updates instantly.
+Postrust streams table changes to clients over GraphQL subscriptions, carried
+by PostgreSQL's own `LISTEN`/`NOTIFY`. A trigger publishes the changed row; the
+server is listening; the client sees it.
 
 ## Overview
 
-Realtime subscriptions allow your application to:
+Subscriptions let an application:
 
-- Receive live updates when data changes
-- Build reactive dashboards and UIs
-- Implement collaborative features
-- Stream data to clients without polling
+- receive live updates when data changes
+- build reactive dashboards and UIs
+- implement collaborative features
+- stream data to clients without polling
 
 ## Architecture
 
 ```
 ┌──────────────┐     WebSocket      ┌──────────────┐   LISTEN/NOTIFY   ┌──────────────┐
-│   Client     │◀──────────────────▶│   Postrust   │◀────────────────▶│  PostgreSQL  │
+│   Client     │◀──────────────────▶│   Postrust   │◀─────────────────▶│  PostgreSQL  │
 │  (Browser)   │                    │   Server     │                   │   Database   │
 └──────────────┘                    └──────────────┘                   └──────────────┘
-                                          │
-                                    GraphQL Subscriptions
-                                    over WebSocket
 ```
 
-## Enabling Subscriptions
+One connection to PostgreSQL is shared by every subscriber: the server listens
+on a channel per table and fans each notification out to whoever asked for it.
 
-Subscriptions are enabled by default when using the GraphQL endpoint. Connect via WebSocket to start subscribing:
+## What a subscription is here
+
+**A subscription streams the rows that changed, one notification at a time.**
+It is not a live query: there is no initial result, no `where`, no `order_by`,
+no `limit`, and no aggregate. The field takes no arguments at all, and each
+message is the row a trigger published.
+
+That is worth being plain about, because the two models look alike and behave
+differently. A live query re-runs when anything it depends on changes and
+answers with the whole current result; this answers with one row, when that row
+changes. If you need the current state at connect time, query for it and then
+subscribe.
+
+Views are not subscribable — a view has no rows of its own for a trigger to
+fire on.
+
+## Enabling subscriptions
+
+Subscriptions are served over WebSocket wherever GraphQL is:
 
 ```
-ws://localhost:3000/api/graphql/ws
+ws://localhost:3000/v1/graphql/ws
 ```
 
-## GraphQL Subscriptions
+`ws://localhost:3000/api/graphql/ws` serves the same thing.
 
-### Basic Subscription
+The server listens on a channel per table at startup, so a table needs its
+trigger before anything is streamed from it. See [PostgreSQL
+setup](#postgresql-setup).
 
-Subscribe to all changes on a table:
+## GraphQL subscriptions
+
+The field is named after the table, and its type is the table's type — the same
+type a query returns, so the same fields select from it:
 
 ```graphql
 subscription {
-  users {
-    id
-    name
-    email
-    updatedAt
-  }
-}
-```
-
-### Filtered Subscriptions
-
-Subscribe to specific records:
-
-```graphql
-subscription {
-  orders(filter: { status: { eq: "pending" } }) {
+  orders {
     id
     total
     status
-    customer {
-      name
-      email
-    }
   }
 }
 ```
 
-### Subscribe to Views
+Each message carries one row: the new row for an insert or an update, the old
+row for a delete.
 
-Subscribe to PostgreSQL views for computed/aggregated data:
+### Narrowing what arrives
 
-```graphql
-subscription {
-  salesDashboard {
-    totalRevenue
-    orderCount
-    averageOrderValue
-    topProducts {
-      name
-      salesCount
-    }
-  }
-}
+Since the field takes no arguments, narrowing happens where the notification is
+published — in the trigger's `WHEN` clause. This is stricter than a client-side
+filter and cheaper than either: a row that does not qualify never becomes a
+notification, never crosses the socket, and never wakes the client.
+
+```sql
+CREATE TRIGGER postrust_notify_public_orders
+    AFTER INSERT OR UPDATE OR DELETE ON public.orders
+    FOR EACH ROW
+    WHEN (COALESCE(NEW.total, OLD.total) > 1000)
+    EXECUTE FUNCTION public.postrust_notify_public_orders_fn();
 ```
 
-## Client Integration
+## PostgreSQL setup
+
+The server listens on `postrust_<schema>_<table>` and expects a JSON payload
+with `operation`, `table`, `schema` and the row under `old` or `new`. This is
+the trigger that produces it:
+
+```sql
+CREATE OR REPLACE FUNCTION public.postrust_notify_public_orders_fn()
+RETURNS TRIGGER AS $$
+DECLARE
+    payload jsonb;
+BEGIN
+    IF TG_OP = 'DELETE' THEN
+        payload := jsonb_build_object(
+            'operation', 'DELETE',
+            'table', TG_TABLE_NAME,
+            'schema', TG_TABLE_SCHEMA,
+            'old', row_to_json(OLD)
+        );
+    ELSIF TG_OP = 'UPDATE' THEN
+        payload := jsonb_build_object(
+            'operation', 'UPDATE',
+            'table', TG_TABLE_NAME,
+            'schema', TG_TABLE_SCHEMA,
+            'old', row_to_json(OLD),
+            'new', row_to_json(NEW)
+        );
+    ELSIF TG_OP = 'INSERT' THEN
+        payload := jsonb_build_object(
+            'operation', 'INSERT',
+            'table', TG_TABLE_NAME,
+            'schema', TG_TABLE_SCHEMA,
+            'new', row_to_json(NEW)
+        );
+    END IF;
+
+    PERFORM pg_notify('postrust_public_orders', payload::text);
+
+    RETURN COALESCE(NEW, OLD);
+END;
+$$ LANGUAGE plpgsql;
+
+DROP TRIGGER IF EXISTS postrust_notify_public_orders ON public.orders;
+CREATE TRIGGER postrust_notify_public_orders
+    AFTER INSERT OR UPDATE OR DELETE ON public.orders
+    FOR EACH ROW
+    EXECUTE FUNCTION public.postrust_notify_public_orders_fn();
+```
+
+`postrust_graphql::subscription::create_notify_trigger_sql(schema, table)`
+generates exactly this, if you would rather not write it per table.
+
+### Two limits worth knowing
+
+`pg_notify` refuses a payload over 8000 bytes — it raises `payload string too
+long`, which fails the transaction that wrote the row. A wide row, or one with
+a large `jsonb` column, will not fit: publish the key and let the client fetch
+the rest.
+
+A notification is delivered when the transaction commits, and is not delivered
+at all if it rolls back. That is the behaviour you want, and it means a
+subscriber sees nothing from a mutation that failed.
+
+## Client integration
 
 ### JavaScript/TypeScript
 
@@ -94,18 +161,17 @@ Using `graphql-ws`:
 import { createClient } from 'graphql-ws';
 
 const client = createClient({
-  url: 'ws://localhost:3000/api/graphql/ws',
+  url: 'ws://localhost:3000/v1/graphql/ws',
   connectionParams: {
     authorization: `Bearer ${token}`,
   },
 });
 
-// Subscribe to orders
 const unsubscribe = client.subscribe(
   {
     query: `
       subscription {
-        orders(filter: { status: { eq: "pending" } }) {
+        orders {
           id
           total
           status
@@ -114,15 +180,9 @@ const unsubscribe = client.subscribe(
     `,
   },
   {
-    next: (data) => {
-      console.log('Order update:', data);
-    },
-    error: (err) => {
-      console.error('Subscription error:', err);
-    },
-    complete: () => {
-      console.log('Subscription complete');
-    },
+    next: (data) => console.log('Order changed:', data),
+    error: (err) => console.error('Subscription error:', err),
+    complete: () => console.log('Subscription complete'),
   }
 );
 
@@ -134,278 +194,120 @@ const unsubscribe = client.subscribe(
 ```tsx
 import { useSubscription, gql } from '@apollo/client';
 
-const ORDERS_SUBSCRIPTION = gql`
-  subscription OnOrderUpdate {
-    orders(filter: { status: { eq: "pending" } }) {
+const ORDER_CHANGES = gql`
+  subscription OnOrderChange {
+    orders {
       id
       total
       status
-      customer { name }
     }
   }
 `;
 
-function PendingOrders() {
-  const { data, loading, error } = useSubscription(ORDERS_SUBSCRIPTION);
+function OrderFeed() {
+  const [seen, setSeen] = useState<Order[]>([]);
+  const { error } = useSubscription(ORDER_CHANGES, {
+    onData: ({ data }) => setSeen((rows) => [data.data.orders, ...rows]),
+  });
 
-  if (loading) return <p>Connecting...</p>;
   if (error) return <p>Error: {error.message}</p>;
 
   return (
     <ul>
-      {data.orders.map(order => (
-        <li key={order.id}>
-          Order #{order.id} - ${order.total} ({order.customer.name})
-        </li>
+      {seen.map((order) => (
+        <li key={order.id}>Order #{order.id} — {order.status}</li>
       ))}
     </ul>
   );
 }
 ```
+
+Each message is one row, so the client accumulates them. Apollo's cache will
+not assemble a list for you here the way it does for a live query.
 
 ### React with urql
 
 ```tsx
 import { useSubscription } from 'urql';
 
-const OrdersSubscription = `
+const OrderChanges = `
   subscription {
-    orders(filter: { status: { eq: "pending" } }) {
-      id
-      total
-      status
-    }
+    orders { id total status }
   }
 `;
 
-function OrdersList() {
-  const [result] = useSubscription({ query: OrdersSubscription });
+function OrderList() {
+  const [result] = useSubscription(
+    { query: OrderChanges },
+    (rows: Order[] = [], data) => [data.orders, ...rows]
+  );
 
-  if (result.fetching) return <p>Loading...</p>;
   if (result.error) return <p>Error!</p>;
-
-  return (
-    <ul>
-      {result.data.orders.map(order => (
-        <li key={order.id}>Order #{order.id}</li>
-      ))}
-    </ul>
-  );
-}
-```
-
-## PostgreSQL Setup
-
-### Trigger-Based Notifications
-
-For fine-grained control, create triggers that publish changes:
-
-```sql
--- Create notification function
-CREATE OR REPLACE FUNCTION notify_table_change()
-RETURNS TRIGGER AS $$
-BEGIN
-  PERFORM pg_notify(
-    'table_change',
-    json_build_object(
-      'table', TG_TABLE_NAME,
-      'operation', TG_OP,
-      'data', CASE
-        WHEN TG_OP = 'DELETE' THEN row_to_json(OLD)
-        ELSE row_to_json(NEW)
-      END
-    )::text
-  );
-  RETURN COALESCE(NEW, OLD);
-END;
-$$ LANGUAGE plpgsql;
-
--- Apply to tables
-CREATE TRIGGER orders_notify
-  AFTER INSERT OR UPDATE OR DELETE ON orders
-  FOR EACH ROW EXECUTE FUNCTION notify_table_change();
-```
-
-### Filtered Notifications
-
-Only notify for specific conditions:
-
-```sql
-CREATE OR REPLACE FUNCTION notify_high_value_order()
-RETURNS TRIGGER AS $$
-BEGIN
-  IF NEW.total > 1000 THEN
-    PERFORM pg_notify(
-      'high_value_order',
-      row_to_json(NEW)::text
-    );
-  END IF;
-  RETURN NEW;
-END;
-$$ LANGUAGE plpgsql;
-
-CREATE TRIGGER high_value_orders_notify
-  AFTER INSERT ON orders
-  FOR EACH ROW EXECUTE FUNCTION notify_high_value_order();
-```
-
-## Real-World Examples
-
-### Live Dashboard
-
-```graphql
-subscription LiveMetrics {
-  dashboardMetrics {
-    activeUsers
-    ordersPerMinute
-    revenue {
-      today
-      thisWeek
-      thisMonth
-    }
-    recentOrders(limit: 5) {
-      id
-      total
-      customer { name }
-    }
-  }
-}
-```
-
-### Chat Application
-
-```graphql
-subscription ChatMessages($roomId: Int!) {
-  messages(filter: { roomId: { eq: $roomId } }, orderBy: { createdAt: DESC }) {
-    id
-    content
-    createdAt
-    author {
-      id
-      name
-      avatarUrl
-    }
-  }
-}
-```
-
-### Collaborative Editing
-
-```graphql
-subscription DocumentChanges($documentId: Int!) {
-  documentEdits(filter: { documentId: { eq: $documentId } }) {
-    id
-    content
-    cursorPosition
-    lastEditedBy {
-      id
-      name
-    }
-    updatedAt
-  }
-}
-```
-
-### Notifications Feed
-
-```graphql
-subscription UserNotifications($userId: Int!) {
-  notifications(
-    filter: { userId: { eq: $userId }, read: { eq: false } }
-    orderBy: { createdAt: DESC }
-  ) {
-    id
-    type
-    message
-    createdAt
-    relatedEntity {
-      ... on Order { id total }
-      ... on Comment { id content }
-    }
-  }
+  return <ul>{(result.data ?? []).map((o) => <li key={o.id}>#{o.id}</li>)}</ul>;
 }
 ```
 
 ## Authentication
 
-Subscriptions respect the same JWT authentication as queries:
+Subscriptions use the same JWT as queries, sent in the connection parameters:
 
 ```typescript
 const client = createClient({
-  url: 'ws://localhost:3000/api/graphql/ws',
+  url: 'ws://localhost:3000/v1/graphql/ws',
   connectionParams: () => ({
     authorization: `Bearer ${getToken()}`,
   }),
 });
 ```
 
-Row-Level Security policies apply to subscriptions:
+**Row-level security does not filter a notification.** A policy is evaluated
+against a query, and a notification is not a query — it comes from a trigger
+that ran as whoever wrote the row. A subscriber on a table therefore sees every
+change published on it. Where that matters, publish only what everyone may see:
+narrow the trigger, or notify a key and let the client read the row back
+through a query, where the policy does apply.
+
+## Performance
+
+- **One PostgreSQL connection** serves every subscriber. Adding subscribers
+  costs a channel entry and a broadcast, not a connection.
+- **Publish narrowly.** A trigger `WHEN` clause is the cheapest filter
+  available: it stops the notification from existing.
+- **Select only the fields you need** — the payload is what the trigger built,
+  but what crosses the socket is what the selection asked for.
+- **Debounce at the database** for high-frequency tables, by making the trigger
+  statement-level or by rate-limiting inside it.
 
 ```sql
--- Users only receive updates for their own orders
-CREATE POLICY orders_subscription ON orders
-  FOR SELECT
-  USING (user_id = current_setting('request.jwt.claims')::json->>'sub');
+-- One notification per statement rather than per row
+CREATE TRIGGER postrust_notify_public_ticks
+    AFTER INSERT OR UPDATE OR DELETE ON public.ticks
+    FOR EACH STATEMENT
+    EXECUTE FUNCTION public.postrust_notify_public_ticks_fn();
 ```
-
-## Performance Considerations
-
-### Connection Limits
-
-Configure maximum WebSocket connections:
-
-```env
-POSTRUST_MAX_SUBSCRIPTIONS=1000
-POSTRUST_SUBSCRIPTION_TIMEOUT=300  # seconds
-```
-
-### Debouncing Updates
-
-For high-frequency changes, consider debouncing at the database level:
-
-```sql
--- Aggregate changes over a time window
-CREATE OR REPLACE FUNCTION debounced_notify()
-RETURNS TRIGGER AS $$
-DECLARE
-  last_notify timestamptz;
-BEGIN
-  -- Check last notification time
-  SELECT last_notified INTO last_notify
-  FROM notification_state
-  WHERE table_name = TG_TABLE_NAME;
-
-  -- Only notify if more than 100ms since last
-  IF last_notify IS NULL OR
-     NOW() - last_notify > interval '100 milliseconds' THEN
-    PERFORM pg_notify(TG_TABLE_NAME || '_change', '');
-    INSERT INTO notification_state (table_name, last_notified)
-    VALUES (TG_TABLE_NAME, NOW())
-    ON CONFLICT (table_name) DO UPDATE SET last_notified = NOW();
-  END IF;
-
-  RETURN NEW;
-END;
-$$ LANGUAGE plpgsql;
-```
-
-### Subscription Best Practices
-
-1. **Use filters**: Subscribe to specific records, not entire tables
-2. **Select only needed fields**: Minimize payload size
-3. **Implement reconnection logic**: Handle network interruptions gracefully
-4. **Unsubscribe when done**: Clean up subscriptions to free resources
 
 ## Troubleshooting
 
-### Connection Issues
+**Nothing arrives.** Check the trigger exists and that its channel name matches
+`postrust_<schema>_<table>` exactly, then watch it by hand:
+
+```sql
+LISTEN postrust_public_orders;
+-- then, from another session, change a row
+```
+
+**The server is not listening on the channel.** Channels are collected at
+startup from the tables in the exposed schemas. A table created since the
+server started has no channel; restart it, or reload the schema cache.
+
+**Connection drops.** Reconnect with backoff — `graphql-ws` does this for you:
 
 ```typescript
 const client = createClient({
-  url: 'ws://localhost:3000/api/graphql/ws',
+  url: 'ws://localhost:3000/v1/graphql/ws',
   retryAttempts: 5,
   retryWait: async (retries) => {
-    await new Promise(r => setTimeout(r, retries * 1000));
+    await new Promise((r) => setTimeout(r, retries * 1000));
   },
   on: {
     connected: () => console.log('Connected'),
@@ -415,16 +317,14 @@ const client = createClient({
 });
 ```
 
-### Debugging Subscriptions
-
-Enable debug logging:
+**Debug logging:**
 
 ```env
-RUST_LOG=postrust=debug
+RUST_LOG=postrust=debug,postrust_graphql=debug
 ```
 
 ## Next Steps
 
-- See [GraphQL](./graphql.md) for query and mutation documentation
-- See [Authentication](./authentication.md) for JWT configuration
-- See [Custom Routes](./custom-routes.md) for extending functionality
+- [GraphQL API](./api-reference.md#graphql-api) — queries and mutations
+- [Authentication](./authentication.md) — JWT configuration
+- [Custom Routes](./custom-routes.md) — extending functionality
