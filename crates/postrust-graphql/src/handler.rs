@@ -359,6 +359,14 @@ fn build_dynamic_schema(
     // Used as an argument type in its own right, whether or not any column is
     // one: `objects`, `_set` and the mutation inputs are still JSON.
     scalar_names.insert("JSON".to_string());
+    // A function's arguments name scalars of their own: a table may have no
+    // geometry column while a function takes one.
+    for function in &generated.function_fields {
+        for (_, pg_type, _) in &function.arguments {
+            scalar_names.insert(leaf_scalar_name(&crate::types::pg_type_to_graphql(pg_type)));
+        }
+    }
+
     // Every scalar the boolean expressions name, which is more than the
     // scalars the columns are: a cast from a geometry names `geography`, and a
     // raster comparison names `geometry`. Taken from what was generated rather

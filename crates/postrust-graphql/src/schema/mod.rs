@@ -708,6 +708,17 @@ pub fn build_schema(schema_cache: &SchemaCache, config: &SchemaConfig) -> Genera
             let postrust_core::schema_cache::RetType::SetOf(returned) = &routine.return_type else {
                 continue;
             };
+            // A function taking a table's row is that table's computed field,
+            // not a root field: `fetch_articles(author_row author)` is asked
+            // of an author, and a row type is not something a client can send
+            // as an argument. It is already exposed where it belongs.
+            if routine.params.iter().any(|param| {
+                base_names
+                    .keys()
+                    .any(|(_, table)| table == &param.param_type)
+            }) {
+                continue;
+            }
             // `SETOF <table>`, where the table is one this schema exposes. The
             // catalogue names the returned type without a schema, so the
             // function's own schema is tried first -- a function and the table
