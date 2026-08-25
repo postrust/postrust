@@ -8,7 +8,7 @@ harness itself, divergences kept on purpose, and the gaps still open.
 
 | | status | same outcome | same data | full body |
 |---|---|---|---|---|
-| all (464) | 97.8% | 63.6% | **55.0%** | 29.3% |
+| all (464) | 97.8% | 62.7% | **54.1%** | 29.3% |
 | **excluding the 142 permission cases (322)** | | | **67.4%** | |
 
 **The candidate is configured.** Each group's fixtures are converted into a
@@ -28,10 +28,12 @@ that ask for it need permissions or a further feature besides) → 49.4
 (upserts) → 50.6 (enum tables) → 51.5 (ordering by a related row or an
 aggregate) → 52.6 (PostGIS comparisons) → 53.0 (`_cast`) → 52.6 (typed mutation
 inputs, which cost two cases; see below) → 54.5 (ltree comparisons, and a list
-bound as an array) → 55.0 (shapes read and written as GeoJSON). The figure
-excluding the permission cases, which is the one worth reading, went 51.2 →
-55.3 → 55.9 → 58.4 → 60.6 → 62.4 → 64.0 → 64.6 → 64.0 → 66.8 → 67.4 over the
-same span.
+bound as an array) → 55.0 (shapes read and written as GeoJSON) → 54.1
+(functions as root fields, which moved no case either way and cost four
+permission cases their accidental agreement). The figure excluding the
+permission cases, which is the one worth reading, went 51.2 → 55.3 → 55.9 →
+58.4 → 60.6 → 62.4 → 64.0 → 64.6 → 64.0 → 66.8 → 67.4 → 67.4 over the same
+span.
 
 The third column is the one that matters to a client: the same query came back
 with the same rows.
@@ -227,10 +229,19 @@ wrong one.
    written first and the key pushed down, the opposite of the ordinary to-one
    rule.
 
-12. **Tracked functions as root fields.** Hasura exposes a tracked function as
-    `multi` and `multi_aggregate` beside the tables. Several introspection
-    cases compare the whole root field list, so they fail on the absence rather
-    than on anything they query.
+12. **Why the corpus's functions are still not root fields.** A function
+    returning `SETOF <table>` is a root field now, verified against a running
+    server in both directions -- a stable one on the query root, a volatile one
+    on the mutation root, filtered and ordered and paged like the table. The
+    corpus still answers `Unknown field "add_to_score"`, and the same function
+    written out by hand *is* exposed. Something about the fixture is
+    responsible and has not been found.
+
+    Two things Hasura does here that this does not, either of which may be it:
+    a session argument (`hasura_session json`) is filled from session variables
+    and not exposed as an argument at all, and a volatile function can be
+    tracked `exposed_as: query`, which is a decision in metadata rather than a
+    fact about the function.
 
 13. **A relationship in a `delete`'s `returning`** keeps the plain columns.
     The rows are gone by the time they could be read again, so there is nothing
@@ -260,6 +271,13 @@ wrong one.
   ordering happens before it. `EmbedPlan::embed_expression` already took all
   four for the REST surface; the GraphQL side had no way to say any of them.
 - **Computed columns are fields**, at the root and inside an embed.
+- **Functions that answer with rows of a table.** `search_articles(args: {term:
+  "rust"}, where: …, order_by: …, limit: 5)` -- the rows are that table's rows,
+  so everything built for reading them applies unchanged, and the function's
+  own arguments go under `args` where a parameter called `limit` cannot shadow
+  the one that pages the result. VOLATILE puts it on the mutation root and
+  STABLE on the query root, which is what PostgreSQL says about it rather than
+  what its name suggests.
 - **A comparison against a null.** `where: {id: {_eq: $id}}` with a null
   answered `operator does not exist: integer = text`: a bound parameter is
   untyped and PostgreSQL infers what it is from the operator, and a null gives
