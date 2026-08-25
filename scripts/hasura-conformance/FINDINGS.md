@@ -8,8 +8,8 @@ harness itself, divergences kept on purpose, and the gaps still open.
 
 | | status | same outcome | same data | full body |
 |---|---|---|---|---|
-| all (464) | 97.8% | 60.6% | **52.6%** | 26.7% |
-| **excluding the 142 permission cases (322)** | | | **64.0%** | |
+| all (464) | 97.8% | 62.5% | **54.5%** | 28.7% |
+| **excluding the 142 permission cases (322)** | | | **66.8%** | |
 
 **The candidate is configured.** Each group's fixtures are converted into a
 `PGRST_GRAPHQL_NAMES` document by `scripts/hasura-names.py` and given to the
@@ -27,9 +27,10 @@ casts, root type names) → 49.1 (embed arguments, computed columns) → 48.9
 that ask for it need permissions or a further feature besides) → 49.4
 (upserts) → 50.6 (enum tables) → 51.5 (ordering by a related row or an
 aggregate) → 52.6 (PostGIS comparisons) → 53.0 (`_cast`) → 52.6 (typed mutation
-inputs, which cost two cases; see below). The figure excluding the permission
-cases, which is the one worth reading, went 51.2 → 55.3 → 55.9 → 58.4 → 60.6 →
-62.4 → 64.0 → 64.6 → 64.0 over the same span.
+inputs, which cost two cases; see below) → 54.5 (ltree comparisons, and a list
+bound as an array). The figure excluding the permission cases, which is the one
+worth reading, went 51.2 → 55.3 → 55.9 → 58.4 → 60.6 → 62.4 → 64.0 → 64.6 →
+64.0 → 66.8 over the same span.
 
 The third column is the one that matters to a client: the same query came back
 with the same rows.
@@ -37,7 +38,7 @@ with the same rows.
 **142 of the 464 cases cannot pass and are counted anyway.** They are the
 permission cases — Hasura answers `access-denied` from a rule that lives in
 metadata, and there is no metadata here. Excluding them the figure is
-**206/322 = 64.0%**, up from 165/322 = 51.2% before the names were given.
+**215/322 = 66.8%**, up from 165/322 = 51.2% before the names were given.
 
 That gap is worth understanding, because the headline did not move while the
 figure behind it moved four points. 49 of those 142 permission cases "agree"
@@ -245,6 +246,14 @@ wrong one.
   ordering happens before it. `EmbedPlan::embed_expression` already took all
   four for the REST surface; the GraphQL side had no way to say any of them.
 - **Computed columns are fields**, at the root and inside an embed.
+- **Tree comparisons.** `_ancestor`, `_descendant`, `_matches` and their `_any`
+  forms on an `ltree` column, each naming what its operand casts to -- `?` is
+  "any of these labels" for a path and "has this key" for a jsonb, and
+  PostgreSQL tells them apart by the operand's type alone. `boolexp/ltree` went
+  5/12 to 12/12.
+- **A list is bound as an array.** `_has_keys_any` never worked: one parameter
+  carrying `["a","b"]` is a JSON array, not an array literal, and PostgreSQL
+  said so. Elements are bound one at a time into an `ARRAY[...]`.
 - **Typed mutation inputs.** `<table>_insert_input`, `_set_input` and
   `_inc_input`, with `obj_rel`/`arr_rel` inputs carrying nested writes and
   their own `on_conflict` -- so a nested row is upserted exactly as a top-level
