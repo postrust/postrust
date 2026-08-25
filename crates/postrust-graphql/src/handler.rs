@@ -269,21 +269,37 @@ fn build_dynamic_schema(
             })
             .collect(),
     );
-    let query = create_query_type(
+    let query = add_function_fields(
+        create_query_type(
+            generated,
+            max_rows,
+            Arc::clone(&relationships),
+            Arc::clone(&names),
+        ),
         generated,
+        false,
         max_rows,
         Arc::clone(&relationships),
         Arc::clone(&names),
     );
 
     // Create mutation type
-    let mutation = if !generated.mutation_fields.is_empty() {
-        Some(create_mutation_type(
+    let mutation = if !generated.mutation_fields.is_empty()
+        || generated.function_fields.iter().any(|f| f.volatile)
+    {
+        Some(add_function_fields(
+            create_mutation_type(
+                generated,
+                Arc::clone(&relationships),
+                Arc::clone(&type_names),
+                Arc::clone(&names),
+                max_rows,
+            ),
             generated,
-            Arc::clone(&relationships),
-            Arc::clone(&type_names),
-            Arc::clone(&names),
+            true,
             max_rows,
+            Arc::clone(&relationships),
+            Arc::clone(&names),
         ))
     } else {
         None
@@ -496,6 +512,27 @@ fn build_dynamic_schema(
                 builder = builder.register(numeric);
             }
         }
+    }
+
+    // A function's own arguments, under a name of their own so they cannot
+    // collide with `where` or `limit`.
+    for function in &generated.function_fields {
+        if function.arguments.is_empty() {
+            continue;
+        }
+        let mut args = InputObject::new(format!("{}_args", function.name))
+            .description(format!("Arguments to {}.", function.name));
+        for (name, pg_type, required) in &function.arguments {
+            let scalar = crate::types::pg_type_to_graphql(pg_type).to_string();
+            args = args.field(InputValue::new(
+                name,
+                match required {
+                    true => TypeRef::named_nn(scalar),
+                    false => TypeRef::named(scalar),
+                },
+            ));
+        }
+        builder = builder.register(args);
     }
 
     // Upserts. A table with no unique constraint has no conflict to resolve,
@@ -920,6 +957,7 @@ fn create_query_type(
             max_rows,
             relationships: Arc::clone(&relationships),
             names: Arc::clone(&names),
+            call: None,
         });
 
         let mut gql_field = Field::new(&field.name, return_type, move |ctx| {
@@ -1272,6 +1310,91 @@ struct QueryFieldSpec {
     max_rows: Option<i64>,
     relationships: Arc<HashMap<String, Vec<RelationshipField>>>,
     names: Arc<crate::names::NameOverrides>,
+    /// Set where the rows come from a function rather than from the table
+    /// itself. Everything else about reading them is the same.
+    call: Option<Arc<FunctionCall>>,
+}
+
+/// Add the root fields for functions that answer with rows of a table.
+///
+/// The same arguments a table's own root field takes, because the rows are the
+/// same rows: what the function adds is `args`, which is where its own
+/// arguments go so that a parameter called `limit` cannot shadow the one that
+/// pages the result.
+fn add_function_fields(
+    mut root: Object,
+    generated: &GeneratedSchema,
+    volatile: bool,
+    max_rows: Option<i64>,
+    relationships: Arc<HashMap<String, Vec<RelationshipField>>>,
+    names: Arc<crate::names::NameOverrides>,
+) -> Object {
+    for function in &generated.function_fields {
+        if function.volatile != volatile {
+            continue;
+        }
+        let spec = Arc::new(QueryFieldSpec {
+            schema_name: function.returns_table.0.clone(),
+            table_name: function.returns_table.1.clone(),
+            type_name: function.returns.clone(),
+            is_by_pk: false,
+            pk_columns: Vec::new(),
+            max_rows,
+            relationships: Arc::clone(&relationships),
+            names: Arc::clone(&names),
+            call: Some(Arc::new(FunctionCall {
+                schema: function.schema_name.clone(),
+                name: function.function_name.clone(),
+                arguments: function.arguments.clone(),
+            })),
+        });
+
+        let mut field = Field::new(
+            &function.name,
+            TypeRef::named_nn_list_nn(&function.returns),
+            move |ctx| {
+                let spec = Arc::clone(&spec);
+                FieldFuture::new(async move { resolve_query(&ctx, &spec).await })
+            },
+        );
+        if !function.arguments.is_empty() {
+            field = field.argument(InputValue::new(
+                "args",
+                TypeRef::named_nn(format!("{}_args", function.name)),
+            ));
+        }
+        field = field
+            .argument(InputValue::new(
+                "where",
+                TypeRef::named(crate::input::bool_exp::bool_exp_type_name(&function.returns)),
+            ))
+            .argument(InputValue::new(
+                "order_by",
+                TypeRef::named_nn_list(crate::input::order_by::order_by_type_name(
+                    &function.returns,
+                )),
+            ))
+            .argument(InputValue::new(
+                "distinct_on",
+                TypeRef::named_nn_list(crate::input::order_by::select_column_type_name(
+                    &function.returns,
+                )),
+            ))
+            .argument(InputValue::new("limit", TypeRef::named("Int")))
+            .argument(InputValue::new("offset", TypeRef::named("Int")));
+        if let Some(description) = &function.description {
+            field = field.description(description);
+        }
+        root = root.field(field);
+    }
+    root
+}
+
+/// A function a root field calls instead of reading a table.
+struct FunctionCall {
+    schema: String,
+    name: String,
+    arguments: Vec<(String, String, bool)>,
 }
 
 /// Everything an aggregate field's resolver needs.
@@ -1327,6 +1450,11 @@ async fn resolve_aggregate<'a>(
         &spec.table_name,
         &spec.type_name,
         spec.relationships.as_ref(),
+        &format!(
+            "{}.{}",
+            postrust_sql::escape_ident(&spec.schema_name),
+            postrust_sql::escape_ident(&spec.table_name)
+        ),
     )
     .await?;
 
@@ -1544,6 +1672,83 @@ async fn resolve_query<'a>(
     let mut where_sql = String::new();
     let mut bound_values: Vec<serde_json::Value> = Vec::new();
 
+    // Where the rows come from. A function's own arguments are bound before
+    // anything else, because they sit in the FROM clause and every other
+    // parameter is numbered after them.
+    let source = match &spec.call {
+        None => format!(
+            "{}.{}",
+            postrust_sql::escape_ident(schema_name),
+            postrust_sql::escape_ident(table_name)
+        ),
+        Some(call) => {
+            let given = ctx
+                .args
+                .try_get("args")
+                .ok()
+                .map(|v| accessor_to_json(&v))
+                .unwrap_or_else(|| serde_json::json!({}));
+            let mut passed = Vec::new();
+            for (name, _, required) in &call.arguments {
+                let value = given.get(name);
+                match value {
+                    None if *required => {
+                        return Err(async_graphql::Error::new(format!(
+                            "{} needs the argument \"{}\"",
+                            call.name, name
+                        )))
+                    }
+                    // An argument left out is left out, so the function's own
+                    // default applies. Passing null instead would override it.
+                    None => continue,
+                    Some(value) => {
+                        // Named notation, so the arguments a client did give
+                        // land on the parameters it meant regardless of order.
+                        // A GraphQL Int binds as a bigint, and
+                        // `f(article_id => bigint)` is not `f(integer)` -- the
+                        // function is looked up by the types of what it was
+                        // handed, so what it was handed has to be the types it
+                        // declares.
+                        let (_, pg_type, _) = call
+                            .arguments
+                            .iter()
+                            .find(|(argument, _, _)| argument == name)
+                            .expect("iterating the arguments");
+                        passed.push(format!(
+                            "{} => ${}::{}",
+                            postrust_sql::escape_ident(name),
+                            bound_values.len() + 1,
+                            pg_type
+                        ));
+                        bound_values.push(value.clone());
+                    }
+                }
+            }
+            // Aliased as the table, so a filter or an ordering written
+            // against that table's columns finds them. Without it the FROM
+            // clause names the function and `article.score` is a table nobody
+            // mentioned.
+            format!(
+                "{}.{}({}) AS {}",
+                postrust_sql::escape_ident(&call.schema),
+                postrust_sql::escape_ident(&call.name),
+                passed.join(", "),
+                postrust_sql::escape_ident(table_name)
+            )
+        }
+    };
+
+    // How a column of the source is referred to: a table by its qualified
+    // name, a function's rows by the alias above.
+    let source_ref = match &spec.call {
+        None => format!(
+            "{}.{}",
+            postrust_sql::escape_ident(schema_name),
+            postrust_sql::escape_ident(table_name)
+        ),
+        Some(_) => postrust_sql::escape_ident(table_name),
+    };
+
     if is_by_pk {
         if pk_columns.is_empty() {
             return Err(async_graphql::Error::new(format!(
@@ -1579,12 +1784,16 @@ async fn resolve_query<'a>(
         let cache = guard
             .as_ref()
             .ok_or_else(|| async_graphql::Error::new("schema cache is not loaded"))?;
-        let scope = WhereScope::table(schema_name, table_name, type_name)
-            .with_resolution(cache, relationships);
-        let (filter_sql, filter_values) = build_where_clause(Some(&filter), 1, &scope)?;
+        let scope = match &spec.call {
+            None => WhereScope::table(schema_name, table_name, type_name)
+                .with_resolution(cache, relationships),
+            Some(_) => WhereScope::for_alias(table_name, type_name, cache, relationships),
+        };
+        let (filter_sql, filter_values) =
+            build_where_clause(Some(&filter), bound_values.len() + 1, &scope)?;
         if !filter_sql.is_empty() {
             where_sql = format!(" {}", filter_sql);
-            bound_values = filter_values;
+            bound_values.extend(filter_values);
         }
     }
 
@@ -1601,6 +1810,7 @@ async fn resolve_query<'a>(
                 table_name,
                 type_name,
                 relationships,
+                &source_ref,
             )
             .await?,
             build_distinct_on(ctx, &gql_ctx.schema_cache, schema_name, table_name).await?,
@@ -1656,12 +1866,8 @@ async fn resolve_query<'a>(
     // the outer `row_to_json` projection would leave the ordering of the rows
     // that survive the limit unspecified.
     let mut inner = format!(
-        "SELECT {}* FROM {}.{}{}{}",
-        distinct_sql,
-        postrust_sql::escape_ident(schema_name),
-        postrust_sql::escape_ident(table_name),
-        where_sql,
-        order_sql
+        "SELECT {}* FROM {}{}{}",
+        distinct_sql, source, where_sql, order_sql
     );
 
     if let Some(limit) = limit {
@@ -3530,6 +3736,7 @@ async fn build_order_by_clause(
     table_name: &str,
     type_name: &str,
     relationships: &HashMap<String, Vec<RelationshipField>>,
+    reference: &str,
 ) -> Result<String, async_graphql::Error> {
     let Ok(order_arg) = ctx.args.try_get("order_by") else {
         return Ok(String::new());
@@ -3566,11 +3773,6 @@ async fn build_order_by_clause(
 
     let mut terms = Vec::new();
     let mut alias_counter = 0usize;
-    let reference = format!(
-        "{}.{}",
-        postrust_sql::escape_ident(schema_name),
-        postrust_sql::escape_ident(table_name)
-    );
     for entry in entries {
         order_terms_into(
             entry,
@@ -3578,7 +3780,7 @@ async fn build_order_by_clause(
             relationships,
             type_name,
             table,
-            &reference,
+            reference,
             &mut alias_counter,
             &mut terms,
         )?;

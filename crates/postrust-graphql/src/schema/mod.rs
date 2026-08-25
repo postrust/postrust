@@ -188,6 +188,39 @@ pub struct GeneratedSchema {
     /// GraphQL enums generated from enum tables: type name to
     /// `(member, description)`.
     pub enum_types: HashMap<String, Vec<(String, Option<String>)>>,
+    /// Database functions exposed as root fields.
+    pub function_fields: Vec<FunctionField>,
+}
+
+/// A database function returning rows of a table, exposed as a root field.
+///
+/// A function that returns `SETOF <table>` answers the same question a table
+/// does, from a query somebody wrote in SQL rather than from the table
+/// directly. It filters, orders and pages like the table it returns, and its
+/// own arguments arrive under `args` so they cannot collide with those.
+///
+/// Where it appears follows from what PostgreSQL says it does: a function
+/// declared VOLATILE may write, so it is a mutation; one declared STABLE or
+/// IMMUTABLE may not, so it is a query. Nothing else is a safe place to draw
+/// that line -- the alternative is trusting a name.
+#[derive(Debug, Clone)]
+pub struct FunctionField {
+    /// The field's name, which is the function's.
+    pub name: String,
+    /// Schema the function lives in.
+    pub schema_name: String,
+    /// The function's own name, which the field is named after.
+    pub function_name: String,
+    /// The GraphQL type of the rows it returns.
+    pub returns: String,
+    /// The table those rows belong to, as `(schema, table)`.
+    pub returns_table: (String, String),
+    /// Its arguments, as `(name, PostgreSQL type, required)`.
+    pub arguments: Vec<(String, String, bool)>,
+    /// Whether it may write, and so belongs on the mutation root.
+    pub volatile: bool,
+    /// Description from the function's comment.
+    pub description: Option<String>,
 }
 
 impl GeneratedSchema {
@@ -662,12 +695,68 @@ pub fn build_schema(schema_cache: &SchemaCache, config: &SchemaConfig) -> Genera
         }
     }
 
+    // Functions that answer with rows of a table it already exposes. One
+    // returning anything else has no type here to return: a scalar-returning
+    // function is not a root field, it is an RPC, which the REST surface
+    // already offers.
+    let mut function_fields = Vec::new();
+    for routines in schema_cache.routines.values() {
+        for routine in routines {
+            if !config.is_schema_exposed(&routine.schema) || routine.is_procedure {
+                continue;
+            }
+            let postrust_core::schema_cache::RetType::SetOf(returned) = &routine.return_type else {
+                continue;
+            };
+            // `SETOF <table>`, where the table is one this schema exposes. The
+            // catalogue names the returned type without a schema, so the
+            // function's own schema is tried first -- a function and the table
+            // it returns usually live together, and two schemas may both have
+            // a table of that name.
+            let found = base_names
+                .iter()
+                .find(|((schema, table), _)| table == returned && schema == &routine.schema)
+                .or_else(|| {
+                    base_names
+                        .iter()
+                        .find(|((_, table), _)| table == returned)
+                });
+            let Some(((target_schema, target_table), base)) = found else {
+                continue;
+            };
+            let target = (target_schema.clone(), target_table.clone());
+
+            function_fields.push(FunctionField {
+                name: routine.name.clone(),
+                schema_name: routine.schema.clone(),
+                function_name: routine.name.clone(),
+                returns: base.clone(),
+                returns_table: target,
+                arguments: routine
+                    .params
+                    .iter()
+                    .filter(|param| !param.name.is_empty())
+                    .map(|param| {
+                        (param.name.clone(), param.param_type.clone(), param.required)
+                    })
+                    .collect(),
+                volatile: matches!(
+                    routine.volatility,
+                    postrust_core::schema_cache::FuncVolatility::Volatile
+                ),
+                description: routine.description.clone(),
+            });
+        }
+    }
+    function_fields.sort_by(|a, b| a.name.cmp(&b.name));
+
     GeneratedSchema {
         object_types,
         query_fields,
         mutation_fields,
         relationship_fields,
         enum_types,
+        function_fields,
     }
 }
 
