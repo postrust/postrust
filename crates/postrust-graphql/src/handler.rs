@@ -2042,6 +2042,32 @@ fn write_cast(column_types: &HashMap<String, String>, column: &str) -> String {
     }
 }
 
+/// The expression that writes one bound value into one column.
+///
+/// A cast is enough for almost everything. A shape is the exception: a client
+/// sends GeoJSON, which is what Hasura accepts, and `'{"type":"Point",…}'` is
+/// not something PostgreSQL will cast to a geometry -- it has a function for
+/// reading that, and the function is the only way in.
+///
+/// Only when the value actually is an object. A string in a geometry column is
+/// WKT or WKB hex, which the cast does read, and passing that to
+/// `ST_GeomFromGeoJSON` would refuse a perfectly good value.
+fn write_expression(
+    column_types: &HashMap<String, String>,
+    column: &str,
+    value: &serde_json::Value,
+    placeholder: &str,
+) -> String {
+    let pg_type = column_types.get(column).map(String::as_str);
+    if value.is_object() && matches!(pg_type, Some("geometry") | Some("geography")) {
+        return match pg_type {
+            Some("geography") => format!("ST_GeomFromGeoJSON({})::geography", placeholder),
+            _ => format!("ST_GeomFromGeoJSON({})", placeholder),
+        };
+    }
+    format!("{}{}", placeholder, write_cast(column_types, column))
+}
+
 /// Every column of a table with the type it is declared as.
 async fn column_types_of(
     schema_cache: &postrust_core::schema_cache::SchemaCacheRef,
@@ -2247,7 +2273,15 @@ fn insert_row<'life>(
             let placeholders: Vec<String> = names
                 .iter()
                 .enumerate()
-                .map(|(i, column)| format!("${}{}", i + 1, write_cast(&column_types, column)))
+                .map(|(i, column)| {
+                    let placeholder = format!("${}", i + 1);
+                    match columns.get(*column) {
+                        Some(value) => {
+                            write_expression(&column_types, column, value, &placeholder)
+                        }
+                        None => placeholder,
+                    }
+                })
                 .collect();
             let sql = format!(
                 "INSERT INTO {}.{} ({}) VALUES ({}){} RETURNING row_to_json({}.{}.*)",
@@ -2603,10 +2637,14 @@ async fn execute_update(
             // concatenation, `::text[]` for a path -- and casting twice would
             // be wrong for `_delete_elem`, whose operand is an integer rather
             // than a value of the column.
-            let placeholder = if *operator == "_set" {
-                format!("${}{}", param_idx, write_cast(&column_types, column))
-            } else {
-                format!("${}", param_idx)
+            let placeholder = match *operator {
+                "_set" => write_expression(
+                    &column_types,
+                    column,
+                    value,
+                    &format!("${}", param_idx),
+                ),
+                _ => format!("${}", param_idx),
             };
             // The assignment PostgreSQL needs, which for everything but `_set`
             // reads the column's current value.
