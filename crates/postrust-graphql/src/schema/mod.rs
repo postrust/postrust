@@ -750,11 +750,8 @@ pub fn build_schema(schema_cache: &SchemaCache, config: &SchemaConfig) -> Genera
                 if let Some(given) = config.names.root(&table.schema, &table.name, kind) {
                     field.name = given.to_string();
                 }
-                if let Some(comment) =
-                    config.names.root_comment(&table.schema, &table.name, kind)
-                {
-                    field.description =
-                        Some(comment.to_string()).filter(|c| !c.is_empty());
+                if let Some(comment) = config.names.root_comment(&table.schema, &table.name, kind) {
+                    field.description = Some(comment.to_string()).filter(|c| !c.is_empty());
                 }
             }
             mutation_fields.extend(fields);
@@ -855,8 +852,8 @@ pub fn build_schema(schema_cache: &SchemaCache, config: &SchemaConfig) -> Genera
                     // always its own.
                     let exposed = config
                         .names
-                        .column(&object.table.schema, &object.table.name, &column)
-                        .unwrap_or(&column)
+                        .column(&object.table.schema, &object.table.name, column)
+                        .unwrap_or(column)
                         .to_string();
                     for field in &mut object.fields {
                         if field.name == exposed {
@@ -939,9 +936,7 @@ pub fn build_schema(schema_cache: &SchemaCache, config: &SchemaConfig) -> Genera
                     .iter()
                     .filter(|param| !param.name.is_empty())
                     .filter(|param| !is_session_argument(param))
-                    .map(|param| {
-                        (param.name.clone(), param.param_type.clone(), param.required)
-                    })
+                    .map(|param| (param.name.clone(), param.param_type.clone(), param.required))
                     .collect(),
                 session_argument: routine
                     .params

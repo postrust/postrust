@@ -194,7 +194,9 @@ impl NameOverrides {
 
     /// Whether a table was marked as a set of allowed values.
     pub fn is_enum(&self, schema: &str, table: &str) -> bool {
-        self.table(schema, table).map(|t| t.is_enum).unwrap_or(false)
+        self.table(schema, table)
+            .map(|t| t.is_enum)
+            .unwrap_or(false)
     }
 
     /// Every table marked as one, as `(schema, table)`.
@@ -235,12 +237,18 @@ impl NameOverrides {
     ///
     /// `kind` is Hasura's own key -- `select`, `insert_one`, `delete_by_pk`.
     pub fn root(&self, schema: &str, table: &str, kind: &str) -> Option<&str> {
-        self.table(schema, table)?.roots.get(kind).map(String::as_str)
+        self.table(schema, table)?
+            .roots
+            .get(kind)
+            .map(String::as_str)
     }
 
     /// The field a column is exposed as, if it was renamed.
     pub fn column(&self, schema: &str, table: &str, column: &str) -> Option<&str> {
-        self.table(schema, table)?.columns.get(column).map(String::as_str)
+        self.table(schema, table)?
+            .columns
+            .get(column)
+            .map(String::as_str)
     }
 
     /// The column behind a field name, if that name is a rename.
@@ -444,6 +452,10 @@ mod tests {
     #[test]
     fn a_path_that_is_not_there_names_itself() {
         let error = NameOverrides::parse("/no/such/names.json").unwrap_err();
-        assert!(error.contains("/no/such/names.json"), "unhelpful: {}", error);
+        assert!(
+            error.contains("/no/such/names.json"),
+            "unhelpful: {}",
+            error
+        );
     }
 }

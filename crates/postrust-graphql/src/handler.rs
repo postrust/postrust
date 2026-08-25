@@ -282,9 +282,7 @@ fn exposed_column_types(
 /// input said `String`. Every write is optional, so nothing here is non-null.
 fn write_type_ref(graphql_type: &crate::types::GraphQLType) -> TypeRef {
     match graphql_type {
-        crate::types::GraphQLType::List(inner) => {
-            TypeRef::named_list(leaf_scalar_name(inner))
-        }
+        crate::types::GraphQLType::List(inner) => TypeRef::named_list(leaf_scalar_name(inner)),
         other => TypeRef::named(leaf_scalar_name(other)),
     }
 }
@@ -479,9 +477,8 @@ fn build_dynamic_schema(
         if generated.enum_types.contains_key(&name) {
             continue;
         }
-        builder = builder.register(
-            Scalar::new(&name).description(format!("The PostgreSQL `{}` type.", name)),
-        );
+        builder = builder
+            .register(Scalar::new(&name).description(format!("The PostgreSQL `{}` type.", name)));
     }
 
     // Register the boolean expression inputs -- one per table, plus one
@@ -651,8 +648,13 @@ fn build_dynamic_schema(
                     TypeRef::named(format!("{}_inc_input", type_name)),
                 ));
             }
-            for operator in ["_append", "_prepend", "_delete_key", "_delete_elem",
-                             "_delete_at_path"] {
+            for operator in [
+                "_append",
+                "_prepend",
+                "_delete_key",
+                "_delete_elem",
+                "_delete_at_path",
+            ] {
                 updates = updates.field(InputValue::new(operator, TypeRef::named("JSON")));
             }
             builder = builder.register(updates);
@@ -689,12 +691,11 @@ fn build_dynamic_schema(
             if relationship.arguments.is_empty() {
                 continue;
             }
-            let mut args =
-                InputObject::new(computed_args_type_name(type_name, &relationship.name))
-                    .description(format!(
-                        "Arguments to {}, beside the row it is asked of.",
-                        relationship.name
-                    ));
+            let mut args = InputObject::new(computed_args_type_name(type_name, &relationship.name))
+                .description(format!(
+                    "Arguments to {}, beside the row it is asked of.",
+                    relationship.name
+                ));
             for (name, pg_type, required) in &relationship.arguments {
                 let scalar = crate::types::pg_type_to_graphql(pg_type).to_string();
                 args = args.field(InputValue::new(
@@ -722,9 +723,8 @@ fn build_dynamic_schema(
             type_name
         ));
         for (name, columns) in &object.table.unique_constraints {
-            constraints = constraints.item(
-                EnumItem::new(name).description(format!("unique ({})", columns.join(", "))),
-            );
+            constraints = constraints
+                .item(EnumItem::new(name).description(format!("unique ({})", columns.join(", "))));
         }
 
         let mut updatable = Enum::new(format!("{}_update_column", type_name))
@@ -734,7 +734,10 @@ fn build_dynamic_schema(
         }
 
         let on_conflict = InputObject::new(format!("{}_on_conflict", type_name))
-            .description(format!("What to do when an insert into {} conflicts.", type_name))
+            .description(format!(
+                "What to do when an insert into {} conflicts.",
+                type_name
+            ))
             .field(InputValue::new(
                 "constraint",
                 TypeRef::named_nn(format!("{}_constraint", type_name)),
@@ -763,8 +766,8 @@ fn build_dynamic_schema(
 
     // The enums generated from enum tables.
     for (type_name, members) in &generated.enum_types {
-        let mut generated_enum = Enum::new(type_name)
-            .description(format!("The values {} allows.", type_name));
+        let mut generated_enum =
+            Enum::new(type_name).description(format!("The values {} allows.", type_name));
         for (value, comment) in members {
             let item = EnumItem::new(value);
             generated_enum = generated_enum.item(match comment {
@@ -777,8 +780,10 @@ fn build_dynamic_schema(
 
     // Ordering: one input per table, one column enum per table, and the single
     // direction enum they all share.
-    let (order_inputs, order_enums) =
-        crate::input::order_by::build_inputs(&generated.object_types, &generated.relationship_fields);
+    let (order_inputs, order_enums) = crate::input::order_by::build_inputs(
+        &generated.object_types,
+        &generated.relationship_fields,
+    );
     for input in order_inputs {
         builder = builder.register(input);
     }
@@ -829,12 +834,12 @@ fn create_mutation_response_type(base_name: &str) -> Object {
             |ctx| {
                 FieldFuture::new(async move {
                     let rows = match ctx.parent_value.as_value() {
-                        Some(Value::Object(map)) => match map
-                            .get(&async_graphql::Name::new("returning"))
-                        {
-                            Some(Value::List(items)) => items.clone(),
-                            _ => Vec::new(),
-                        },
+                        Some(Value::Object(map)) => {
+                            match map.get(&async_graphql::Name::new("returning")) {
+                                Some(Value::List(items)) => items.clone(),
+                                _ => Vec::new(),
+                            }
+                        }
                         _ => Vec::new(),
                     };
                     Ok(Some(FieldValue::list(
@@ -859,7 +864,10 @@ fn create_aggregate_types(base_name: &str, object: &TableObjectType) -> Vec<Obje
     let fields_type = agg::aggregate_fields_type_name(base_name);
     types.push(
         Object::new(agg::aggregate_type_name(base_name))
-            .description(format!("Aggregates over {}, with the rows themselves.", base_name))
+            .description(format!(
+                "Aggregates over {}, with the rows themselves.",
+                base_name
+            ))
             .field(Field::new(
                 "aggregate",
                 TypeRef::named(&fields_type),
@@ -874,7 +882,9 @@ fn create_aggregate_types(base_name: &str, object: &TableObjectType) -> Vec<Obje
                             Some(Value::List(items)) => items,
                             _ => Vec::new(),
                         };
-                        Ok(Some(FieldValue::list(rows.into_iter().map(FieldValue::value))))
+                        Ok(Some(FieldValue::list(
+                            rows.into_iter().map(FieldValue::value),
+                        )))
                     })
                 },
             )),
@@ -886,10 +896,9 @@ fn create_aggregate_types(base_name: &str, object: &TableObjectType) -> Vec<Obje
         .field(
             Field::new("count", TypeRef::named_nn(TypeRef::INT), |ctx| {
                 FieldFuture::new(async move {
-                    Ok(Some(
+                    Ok(Some(FieldValue::value(
                         child_value(&ctx, "count").unwrap_or(Value::from(0)),
-                    )
-                    .map(FieldValue::value))
+                    )))
                 })
             })
             // `count(columns:)` counts the rows where those columns are not
@@ -903,17 +912,20 @@ fn create_aggregate_types(base_name: &str, object: &TableObjectType) -> Vec<Obje
 
     for (function, returns, columns) in agg::functions_for(object) {
         let function_type = agg::function_fields_type_name(base_name, function);
-        let mut per_column = Object::new(&function_type)
-            .description(format!("`{}` of each {} column it applies to.", function, base_name));
+        let mut per_column = Object::new(&function_type).description(format!(
+            "`{}` of each {} column it applies to.",
+            function, base_name
+        ));
         for column in &columns {
             let column_name = column.clone();
             let type_name = agg::field_type_for(object, column, returns);
-            per_column = per_column.field(Field::new(column, TypeRef::named(type_name), move |ctx| {
-                let column_name = column_name.clone();
-                FieldFuture::new(async move {
-                    Ok(child_value(&ctx, &column_name).map(FieldValue::value))
-                })
-            }));
+            per_column =
+                per_column.field(Field::new(column, TypeRef::named(type_name), move |ctx| {
+                    let column_name = column_name.clone();
+                    FieldFuture::new(async move {
+                        Ok(child_value(&ctx, &column_name).map(FieldValue::value))
+                    })
+                }));
         }
         types.push(per_column);
 
@@ -1246,9 +1258,7 @@ fn create_query_type(
             gql_field = gql_field
                 .argument(InputValue::new(
                     "where",
-                    TypeRef::named(crate::input::bool_exp::bool_exp_type_name(
-                        &spec_type_name,
-                    )),
+                    TypeRef::named(crate::input::bool_exp::bool_exp_type_name(&spec_type_name)),
                 ))
                 .argument(InputValue::new(
                     "order_by",
@@ -1298,9 +1308,7 @@ fn create_query_type(
             let aggregate_field_name = field
                 .aggregate_name
                 .clone()
-                .unwrap_or_else(|| {
-                    crate::schema::aggregate::aggregate_type_name(&field.type_name)
-                });
+                .unwrap_or_else(|| crate::schema::aggregate::aggregate_type_name(&field.type_name));
             let aggregate_field_name_for_sorting = aggregate_field_name.clone();
             let mut agg_field = Field::new(
                 aggregate_field_name,
@@ -1485,8 +1493,7 @@ fn create_mutation_type(
                 } else {
                     // A single insert takes `object`, not a one-element
                     // `objects`.
-                    gql_field
-                        .argument(InputValue::new("object", TypeRef::named_nn(&insert_input)))
+                    gql_field.argument(InputValue::new("object", TypeRef::named_nn(&insert_input)))
                 };
                 if has_conflict_target.contains(&where_type) {
                     gql_field = gql_field.argument(InputValue::new(
@@ -1507,13 +1514,10 @@ fn create_mutation_type(
                 );
             }
             MutationType::Update => {
-                gql_field = gql_field
-                    .argument(InputValue::new(
-                        "where",
-                        TypeRef::named_nn(crate::input::bool_exp::bool_exp_type_name(
-                            &where_type,
-                        )),
-                    ));
+                gql_field = gql_field.argument(InputValue::new(
+                    "where",
+                    TypeRef::named_nn(crate::input::bool_exp::bool_exp_type_name(&where_type)),
+                ));
                 gql_field = with_update_operators(
                     gql_field,
                     &where_type,
@@ -1681,7 +1685,9 @@ fn add_function_fields(
         field = field
             .argument(InputValue::new(
                 "where",
-                TypeRef::named(crate::input::bool_exp::bool_exp_type_name(&function.returns)),
+                TypeRef::named(crate::input::bool_exp::bool_exp_type_name(
+                    &function.returns,
+                )),
             ))
             .argument(InputValue::new(
                 "order_by",
@@ -1751,14 +1757,13 @@ async fn resolve_aggregate<'a>(
         let cache = guard
             .as_ref()
             .ok_or_else(|| async_graphql::Error::new("schema cache is not loaded"))?;
-        let scope =
-            WhereScope::table(
-                &spec.schema_name,
-                &spec.table_name,
-                &spec.type_name,
-                spec.names.as_ref(),
-            )
-                .with_resolution(cache, spec.relationships.as_ref());
+        let scope = WhereScope::table(
+            &spec.schema_name,
+            &spec.table_name,
+            &spec.type_name,
+            spec.names.as_ref(),
+        )
+        .with_resolution(cache, spec.relationships.as_ref());
         let (sql, values) = build_where_clause(Some(&filter), 1, &scope)?;
         if !sql.is_empty() {
             where_sql = format!(" {}", sql);
@@ -1873,15 +1878,13 @@ async fn resolve_aggregate<'a>(
             parts.join(", "),
             inner
         );
-        let mut conn = begin_with_session(pool, gql_ctx.role(), &gql_ctx.session_settings()).await?;
+        let mut conn =
+            begin_with_session(pool, gql_ctx.role(), &gql_ctx.session_settings()).await?;
         let rows = execute_query_on(&mut conn, &sql, &bound_values).await?;
         conn.commit().await?;
         if let Some(first) = rows.into_iter().next() {
             if let Value::Object(map) = json_to_value(first) {
-                result.insert(
-                    async_graphql::Name::new("aggregate"),
-                    Value::Object(map),
-                );
+                result.insert(async_graphql::Name::new("aggregate"), Value::Object(map));
             }
         }
     }
@@ -1962,7 +1965,8 @@ async fn resolve_aggregate<'a>(
             projection,
             inner
         );
-        let mut conn = begin_with_session(pool, gql_ctx.role(), &gql_ctx.session_settings()).await?;
+        let mut conn =
+            begin_with_session(pool, gql_ctx.role(), &gql_ctx.session_settings()).await?;
         let rows = execute_query_on(&mut conn, &sql, &node_values).await?;
         conn.commit().await?;
         result.insert(
@@ -2686,8 +2690,7 @@ async fn write_tx<'a>(
 > {
     let mut guard = gql_ctx.write.lock().await;
     if guard.is_none() {
-        *guard =
-            Some(begin_with_session(pool, gql_ctx.role(), &gql_ctx.session_settings()).await?);
+        *guard = Some(begin_with_session(pool, gql_ctx.role(), &gql_ctx.session_settings()).await?);
     }
     Ok(guard)
 }
@@ -2764,7 +2767,6 @@ fn row_json(expr: &str, column_types: &HashMap<String, String>) -> String {
     )
 }
 
-
 /// Execute a SQL query and return results as serde_json::Value.
 /// We keep data as serde_json::Value so field resolvers can use try_downcast_ref.
 async fn execute_query_on(
@@ -2810,7 +2812,9 @@ fn check_geojson(value: &serde_json::Value) -> Result<(), async_graphql::Error> 
         Err(coded_error("parse-failed", message))
     }
 
-    fn position(value: &serde_json::Value) -> Result<&Vec<serde_json::Value>, async_graphql::Error> {
+    fn position(
+        value: &serde_json::Value,
+    ) -> Result<&Vec<serde_json::Value>, async_graphql::Error> {
         match value.as_array() {
             Some(items) if items.len() >= 2 && items.iter().all(|i| i.is_number()) => Ok(items),
             _ => refuse("A Position needs at least 2 elements"),
@@ -2876,7 +2880,12 @@ fn check_geojson(value: &serde_json::Value) -> Result<(), async_graphql::Error> 
             }
         }
         "GeometryCollection" => {
-            for geometry in map.get("geometries").and_then(|v| v.as_array()).into_iter().flatten() {
+            for geometry in map
+                .get("geometries")
+                .and_then(|v| v.as_array())
+                .into_iter()
+                .flatten()
+            {
                 check_geojson(geometry)?;
             }
         }
@@ -3099,16 +3108,19 @@ fn insert_row<'life>(
     context: &'life InsertContext<'life>,
     written_count: &'life mut usize,
 ) -> std::pin::Pin<
-    Box<dyn std::future::Future<Output = Result<serde_json::Value, async_graphql::Error>> + Send + 'life>,
+    Box<
+        dyn std::future::Future<Output = Result<serde_json::Value, async_graphql::Error>>
+            + Send
+            + 'life,
+    >,
 > {
     Box::pin(async move {
         use sqlx::Row;
 
         let qi = postrust_core::api_request::QualifiedIdentifier::new(schema_name, table_name);
-        let table = context
-            .cache
-            .get_table(&qi)
-            .ok_or_else(|| async_graphql::Error::new(format!("unknown table \"{}\"", table_name)))?;
+        let table = context.cache.get_table(&qi).ok_or_else(|| {
+            async_graphql::Error::new(format!("unknown table \"{}\"", table_name))
+        })?;
         let column_types: HashMap<String, String> = table
             .columns
             .values()
@@ -3116,14 +3128,20 @@ fn insert_row<'life>(
             .collect();
 
         // A key that is a relationship rather than a column is a nested write.
-        let type_name = context.type_names.get(&(schema_name.to_string(), table_name.to_string()));
+        let type_name = context
+            .type_names
+            .get(&(schema_name.to_string(), table_name.to_string()));
         let relationships: &[RelationshipField] = type_name
             .and_then(|name| context.relationships.get(name))
             .map(|r| r.as_slice())
             .unwrap_or(&[]);
 
         let mut columns = serde_json::Map::new();
-        type Nested<'r> = (&'r RelationshipField, serde_json::Value, Option<serde_json::Value>);
+        type Nested<'r> = (
+            &'r RelationshipField,
+            serde_json::Value,
+            Option<serde_json::Value>,
+        );
         let mut to_one: Vec<Nested> = Vec::new();
         let mut to_many: Vec<Nested> = Vec::new();
 
@@ -3286,10 +3304,14 @@ fn insert_row<'life>(
                                 .get(&(schema_name.to_string(), table_name.to_string()))
                                 .map(String::as_str)
                                 .unwrap_or(table_name);
-                            let scope =
-                                WhereScope::table(schema_name, table_name, type_name, context.names)
-                                    .under_alias(WRITTEN_ROW)
-                                    .with_resolution(context.cache, context.relationships);
+                            let scope = WhereScope::table(
+                                schema_name,
+                                table_name,
+                                type_name,
+                                context.names,
+                            )
+                            .under_alias(WRITTEN_ROW)
+                            .with_resolution(context.cache, context.relationships);
                             let mut param_idx = column_names.len() + 1;
                             let mut alias_counter = 0usize;
                             build_condition(
@@ -3345,9 +3367,7 @@ fn insert_row<'life>(
                 .map(|(i, column)| {
                     let placeholder = format!("${}", i + 1);
                     match columns.get(*column) {
-                        Some(value) => {
-                            write_expression(&column_types, column, value, &placeholder)
-                        }
+                        Some(value) => write_expression(&column_types, column, value, &placeholder),
                         None => placeholder,
                     }
                 })
@@ -3552,8 +3572,8 @@ async fn reread_returning(
         return Ok(rows);
     }
 
-    let mut projection = rename_projection(table, "src", names)
-        .unwrap_or_else(|| "src.*".to_string());
+    let mut projection =
+        rename_projection(table, "src", names).unwrap_or_else(|| "src.*".to_string());
     for expression in &computed {
         projection.push_str(", ");
         projection.push_str(expression);
@@ -3621,7 +3641,9 @@ async fn execute_insert(
 
     for object in objects_array {
         let serde_json::Value::Object(map) = object else {
-            return Err(async_graphql::Error::new("each object to insert is an object"));
+            return Err(async_graphql::Error::new(
+                "each object to insert is an object",
+            ));
         };
         let row = insert_row(conn, schema_name, table_name, map, context, &mut written).await?;
         // A row `DO NOTHING` left alone is not in `returning` and is not in
@@ -3734,12 +3756,9 @@ async fn execute_update(
             // be wrong for `_delete_elem`, whose operand is an integer rather
             // than a value of the column.
             let placeholder = match *operator {
-                "_set" => write_expression(
-                    &column_types,
-                    column,
-                    value,
-                    &format!("${}", param_idx),
-                ),
+                "_set" => {
+                    write_expression(&column_types, column, value, &format!("${}", param_idx))
+                }
                 _ => format!("${}", param_idx),
             };
             // The assignment PostgreSQL needs, which for everything but `_set`
@@ -3813,8 +3832,7 @@ async fn execute_update(
     let scope = WhereScope::table(schema_name, table_name, type_name, names)
         .under_alias(WRITTEN_ROW)
         .with_resolution(cache, relationships);
-    let (where_sql, where_values) =
-        build_where_clause(where_clause.as_ref(), param_idx, &scope)?;
+    let (where_sql, where_values) = build_where_clause(where_clause.as_ref(), param_idx, &scope)?;
 
     // An absent or unrecognised `where` argument yields an empty clause, which
     // would update every row in the table. Refuse instead.
@@ -4018,7 +4036,13 @@ fn build_where_clause(
     let mut alias_counter = 0usize;
 
     let condition = match where_value {
-        Some(value) => build_condition(value, scope, &mut param_idx, &mut values, &mut alias_counter)?,
+        Some(value) => build_condition(
+            value,
+            scope,
+            &mut param_idx,
+            &mut values,
+            &mut alias_counter,
+        )?,
         None => None,
     };
 
@@ -4184,11 +4208,9 @@ impl<'a> WhereScope<'a> {
             .computed_source(&table.schema, &table.name, name)
             .unwrap_or(name);
         match table.get_computed_column(function) {
-            Some(definition) => computed_call(
-                definition,
-                &format!("{}.*", self.row_ref),
-                &self.row_ref,
-            ),
+            Some(definition) => {
+                computed_call(definition, &format!("{}.*", self.row_ref), &self.row_ref)
+            }
             None => plain,
         }
     }
@@ -4335,16 +4357,12 @@ fn exists_sql(
     values: &mut Vec<serde_json::Value>,
     alias_counter: &mut usize,
 ) -> Result<String, async_graphql::Error> {
-    let cache = scope
-        .resolution
-        .as_ref()
-        .map(|r| r.cache)
-        .ok_or_else(|| {
-            async_graphql::Error::new(format!(
-                "filtering on the relationship \"{}\" is not available here",
-                relationship.name
-            ))
-        })?;
+    let cache = scope.resolution.as_ref().map(|r| r.cache).ok_or_else(|| {
+        async_graphql::Error::new(format!(
+            "filtering on the relationship \"{}\" is not available here",
+            relationship.name
+        ))
+    })?;
 
     let plan = postrust_core::embed::EmbedPlan::resolve(&relationship.relationship, cache)
         .map_err(|e| async_graphql::Error::new(e.to_string()))?;
@@ -4399,8 +4417,13 @@ fn exists_sql(
         }
     };
 
-    let child_condition =
-        build_condition(child_expression, &child_scope, param_idx, values, alias_counter)?;
+    let child_condition = build_condition(
+        child_expression,
+        &child_scope,
+        param_idx,
+        values,
+        alias_counter,
+    )?;
     if let Some(sql) = child_condition {
         correlation.push(format!("({})", sql));
     }
@@ -4613,7 +4636,6 @@ fn comparison_sql(
                 )?);
             }
         }
-        let mut conditions = conditions;
         return Ok(match conditions.len() {
             0 => "true".to_string(),
             1 => conditions.pop().expect("just counted"),
@@ -4624,7 +4646,15 @@ fn comparison_sql(
     // A spatial relation is a function of two shapes rather than an operator
     // between them, so it is written before the operator table is consulted.
     if let Some(function) = crate::input::bool_exp::postgis_function(op) {
-        return postgis_sql(quoted, column_type, function, op, operand, param_idx, values);
+        return postgis_sql(
+            quoted,
+            column_type,
+            function,
+            op,
+            operand,
+            param_idx,
+            values,
+        );
     }
 
     // A tree comparison is an operator, but one whose operand has to be cast:
@@ -4702,7 +4732,8 @@ fn comparison_sql(
         // goes over the wire is the value as it is written in JSON.
         values.push(match op {
             "_contains" | "_contained_in" => match operand {
-                serde_json::Value::String(_) | serde_json::Value::Number(_)
+                serde_json::Value::String(_)
+                | serde_json::Value::Number(_)
                 | serde_json::Value::Bool(_) => serde_json::Value::String(operand.to_string()),
                 other => other.clone(),
             },
@@ -4819,6 +4850,7 @@ fn comparison_sql(
 /// schema cache before being quoted, so a name that is unknown, or crafted to
 /// inject SQL, is rejected rather than interpolated. Returns an empty string
 /// when no ordering was requested.
+#[allow(clippy::too_many_arguments)] // one parameter per SQL clause
 async fn build_order_by_clause(
     ctx: &ResolverContext<'_>,
     schema_cache: &postrust_core::schema_cache::SchemaCacheRef,
@@ -5267,7 +5299,10 @@ fn computed_projections(
         let name = field.name();
         // A real column wins, and the projection already carries it -- under
         // this name, whether or not that is the column's own.
-        if table.get_column(table_column_for(names, table, name)).is_some() {
+        if table
+            .get_column(table_column_for(names, table, name))
+            .is_some()
+        {
             continue;
         }
         // The field may be exposed under a name that was given rather than
@@ -5545,8 +5580,7 @@ fn computed_session_argument(
         .params
         .iter()
         .find(|param| {
-            param.name == "hasura_session"
-                && matches!(param.param_type.as_str(), "json" | "jsonb")
+            param.name == "hasura_session" && matches!(param.param_type.as_str(), "json" | "jsonb")
         })
         .map(|param| param.name.clone())
 }
@@ -5632,9 +5666,7 @@ fn computed_arguments(
 }
 
 /// The arguments written on an embedded field, as JSON.
-fn embed_arguments(
-    field: async_graphql::SelectionField<'_>,
-) -> HashMap<String, serde_json::Value> {
+fn embed_arguments(field: async_graphql::SelectionField<'_>) -> HashMap<String, serde_json::Value> {
     field
         .arguments()
         .map(|args| {
@@ -5649,6 +5681,10 @@ fn embed_arguments(
         })
         .unwrap_or_default()
 }
+
+/// What an embed's arguments narrow its child rows to: a predicate, an
+/// ordering, a limit and an offset, in the order the SQL takes them.
+type Narrowing = (Option<String>, Option<String>, Option<i64>, i64);
 
 /// What an embed's arguments narrow its child rows to.
 ///
@@ -5667,21 +5703,26 @@ fn embed_narrowing(
     param_idx: &mut usize,
     values: &mut Vec<serde_json::Value>,
     names: &crate::names::NameOverrides,
-) -> Result<(Option<String>, Option<String>, Option<i64>, i64), async_graphql::Error> {
+) -> Result<Narrowing, async_graphql::Error> {
     let child_where = match arguments.get("where") {
         Some(expression) if !expression.is_null() => {
-            let child_scope =
-                WhereScope::for_alias(
-                    &plan.foreign_schema,
-                    &plan.foreign_table,
-                    child_alias,
-                    target_type,
-                    schema_cache,
-                    relationships,
-                    names,
-                );
+            let child_scope = WhereScope::for_alias(
+                &plan.foreign_schema,
+                &plan.foreign_table,
+                child_alias,
+                target_type,
+                schema_cache,
+                relationships,
+                names,
+            );
             let mut nested_alias = 0usize;
-            build_condition(expression, &child_scope, param_idx, values, &mut nested_alias)?
+            build_condition(
+                expression,
+                &child_scope,
+                param_idx,
+                values,
+                &mut nested_alias,
+            )?
         }
         _ => None,
     };
@@ -5708,11 +5749,15 @@ fn embed_narrowing(
         },
         None => max_rows,
     };
-    let child_offset = arguments.get("offset").and_then(|v| v.as_i64()).unwrap_or(0);
+    let child_offset = arguments
+        .get("offset")
+        .and_then(|v| v.as_i64())
+        .unwrap_or(0);
 
     Ok((child_where, child_order, child_limit, child_offset))
 }
 
+#[allow(clippy::too_many_arguments)] // one parameter per SQL clause, plus the binding state
 fn build_embed_expressions(
     schema_cache: &SchemaCache,
     relationships: &HashMap<String, Vec<RelationshipField>>,
@@ -5763,12 +5808,11 @@ fn build_embed_expressions(
                 names,
             )?;
 
-            let child_table = schema_cache.get_table(
-                &postrust_core::api_request::QualifiedIdentifier::new(
+            let child_table =
+                schema_cache.get_table(&postrust_core::api_request::QualifiedIdentifier::new(
                     &plan.foreign_schema,
                     &plan.foreign_table,
-                ),
-            );
+                ));
             let select = nested_aggregate_select(
                 field,
                 &child_alias,
@@ -5905,9 +5949,7 @@ fn build_embed_expressions(
             parts.push(
                 child_table
                     .and_then(|table| rename_projection(table, &child_alias, names))
-                    .unwrap_or_else(|| {
-                        format!("{}.*", postrust_sql::escape_ident(&child_alias))
-                    }),
+                    .unwrap_or_else(|| format!("{}.*", postrust_sql::escape_ident(&child_alias))),
             );
         }
         for (field_name, expression) in nested {
@@ -6232,7 +6274,9 @@ fn plain_numbers(value: serde_json::Value) -> serde_json::Value {
         serde_json::Value::Object(map) => match number_kept_as_text(&map) {
             Some(number) => number,
             None => serde_json::Value::Object(
-                map.into_iter().map(|(k, v)| (k, plain_numbers(v))).collect(),
+                map.into_iter()
+                    .map(|(k, v)| (k, plain_numbers(v)))
+                    .collect(),
             ),
         },
         serde_json::Value::Array(items) => {
@@ -6533,7 +6577,8 @@ mod tests {
         let config = SchemaConfig::default();
         let generated = build_schema(&cache, &config);
 
-        let result = build_dynamic_schema(&generated, &cache, None, None, Arc::new(Default::default()));
+        let result =
+            build_dynamic_schema(&generated, &cache, None, None, Arc::new(Default::default()));
         if let Err(ref e) = result {
             eprintln!("Schema build error: {:?}", e);
         }
@@ -6553,7 +6598,12 @@ mod tests {
         let config = SchemaConfig::default();
         let generated = build_schema(&cache, &config);
 
-        let _query = create_query_type(&generated, None, Arc::new(HashMap::new()), Arc::new(Default::default()));
+        let _query = create_query_type(
+            &generated,
+            None,
+            Arc::new(HashMap::new()),
+            Arc::new(Default::default()),
+        );
     }
 
     #[test]
@@ -6562,7 +6612,13 @@ mod tests {
         let config = SchemaConfig::default();
         let generated = build_schema(&cache, &config);
 
-        let _mutation = create_mutation_type(&generated, Arc::new(HashMap::new()), Arc::new(HashMap::new()), Arc::new(Default::default()), None);
+        let _mutation = create_mutation_type(
+            &generated,
+            Arc::new(HashMap::new()),
+            Arc::new(HashMap::new()),
+            Arc::new(Default::default()),
+            None,
+        );
     }
 
     // ============================================================================
@@ -6636,11 +6692,16 @@ mod tests {
         let config = SchemaConfig::default();
         let generated = build_schema(&cache, &config);
 
-        let schema = build_dynamic_schema(&generated, &cache, None, None, Arc::new(Default::default()));
+        let schema =
+            build_dynamic_schema(&generated, &cache, None, None, Arc::new(Default::default()));
         assert!(schema.is_ok(), "{:?}", schema.err());
 
         let sdl = schema.unwrap().sdl();
-        assert!(sdl.contains("_bool_exp"), "no boolean expressions in:\n{}", sdl);
+        assert!(
+            sdl.contains("_bool_exp"),
+            "no boolean expressions in:\n{}",
+            sdl
+        );
         assert!(sdl.contains("_and"), "no _and in the generated expressions");
     }
 
@@ -6662,7 +6723,13 @@ mod tests {
         assert!(!sub_fields.is_empty(), "Should have subscription fields");
 
         // Build schema with subscriptions
-        let result = build_dynamic_schema(&generated, &cache, Some(&sub_fields), None, Arc::new(Default::default()));
+        let result = build_dynamic_schema(
+            &generated,
+            &cache,
+            Some(&sub_fields),
+            None,
+            Arc::new(Default::default()),
+        );
         assert!(result.is_ok(), "Schema with subscriptions should build");
     }
 

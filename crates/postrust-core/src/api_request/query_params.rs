@@ -1689,5 +1689,4 @@ mod tests {
             "\"failed to parse logic tree ((,))\" (line 1, column 4)"
         );
     }
-
 }

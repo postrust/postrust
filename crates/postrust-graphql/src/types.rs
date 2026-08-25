@@ -108,9 +108,7 @@ pub fn pg_type_to_graphql(pg_type: &str) -> GraphQLType {
 
         // Date/Time types
         "timestamptz" | "timestamp with time zone" => GraphQLType::DateTime,
-        "timestamp" | "timestamp without time zone" => {
-            GraphQLType::Custom("timestamp".to_string())
-        }
+        "timestamp" | "timestamp without time zone" => GraphQLType::Custom("timestamp".to_string()),
         "date" => GraphQLType::Date,
         "time" | "time without time zone" => GraphQLType::Time,
         "timetz" | "time with time zone" => GraphQLType::Custom("timetz".to_string()),

@@ -890,6 +890,7 @@ mod tests {
 
     fn plan(is_list: bool) -> EmbedPlan {
         EmbedPlan {
+            row_argument: None,
             local_column: "id".into(),
             foreign_column: "user_id".into(),
             foreign_column_type: "int4".into(),
@@ -924,6 +925,7 @@ mod tests {
                 0,
                 None,
                 None,
+                None,
             )
             .unwrap();
 
@@ -944,7 +946,7 @@ mod tests {
     #[test]
     fn embed_expression_takes_one_row_for_a_to_one_relation() {
         let sql = plan(false)
-            .embed_expression("p", "\"p\"", "author", r#""id""#, None, 0, None, None)
+            .embed_expression("p", "\"p\"", "author", r#""id""#, None, 0, None, None, None)
             .unwrap();
 
         assert!(sql.contains("row_to_json"), "{}", sql);
@@ -959,7 +961,17 @@ mod tests {
     #[test]
     fn embed_expression_limits_rows_per_parent() {
         let sql = plan(true)
-            .embed_expression("p", "\"p\"", "posts", r#""id""#, Some(25), 0, None, None)
+            .embed_expression(
+                "p",
+                "\"p\"",
+                "posts",
+                r#""id""#,
+                Some(25),
+                0,
+                None,
+                None,
+                None,
+            )
             .unwrap();
         assert!(sql.contains("LIMIT 25"), "{}", sql);
     }

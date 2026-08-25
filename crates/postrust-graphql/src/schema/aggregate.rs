@@ -161,7 +161,10 @@ mod tests {
             aggregate_fields_type_name("author"),
             "author_aggregate_fields"
         );
-        assert_eq!(function_fields_type_name("author", "sum"), "author_sum_fields");
+        assert_eq!(
+            function_fields_type_name("author", "sum"),
+            "author_sum_fields"
+        );
     }
 
     #[test]

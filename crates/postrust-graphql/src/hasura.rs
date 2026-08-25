@@ -225,6 +225,10 @@ pub fn allow_unused_variables(request: async_graphql::Request) -> async_graphql:
 ///
 /// `Err` carries the request back beside the errors, so the caller can answer
 /// with them rather than executing.
+// The error carries the request back, which is the whole point of it: the
+// caller answers with the errors instead of executing, and needs the request
+// to do anything else with. Boxing it would hide that.
+#[allow(clippy::result_large_err)]
 pub fn prepare(
     schema: Option<&async_graphql::dynamic::Schema>,
     request: async_graphql::Request,
@@ -266,9 +270,7 @@ fn drop_unused_variables(mut request: async_graphql::Request) -> async_graphql::
                 used.insert(name.clone());
             }
             Value::List(items) => items.iter().for_each(|item| from_value(item, used)),
-            Value::Object(fields) => {
-                fields.values().for_each(|field| from_value(field, used))
-            }
+            Value::Object(fields) => fields.values().for_each(|field| from_value(field, used)),
             _ => {}
         }
     }
@@ -332,9 +334,7 @@ fn drop_unused_variables(mut request: async_graphql::Request) -> async_graphql::
     };
     match &mut doc.operations {
         DocumentOperations::Single(operation) => prune(operation),
-        DocumentOperations::Multiple(operations) => {
-            operations.values_mut().for_each(prune)
-        }
+        DocumentOperations::Multiple(operations) => operations.values_mut().for_each(prune),
     }
 
     if dropped {
@@ -424,9 +424,9 @@ fn variable_errors(
 
     let mut errors: Vec<ServerError> = Vec::new();
 
-    let operations: Vec<&async_graphql::Positioned<
-        async_graphql::parser::types::OperationDefinition,
-    >> = match &doc.operations {
+    let operations: Vec<
+        &async_graphql::Positioned<async_graphql::parser::types::OperationDefinition>,
+    > = match &doc.operations {
         DocumentOperations::Single(operation) => vec![operation],
         DocumentOperations::Multiple(operations) => operations.values().collect(),
     };
@@ -505,11 +505,7 @@ struct Usage<'a> {
 }
 
 impl Usage<'_> {
-    fn selection_set(
-        &mut self,
-        set: &async_graphql::parser::types::SelectionSet,
-        type_name: &str,
-    ) {
+    fn selection_set(&mut self, set: &async_graphql::parser::types::SelectionSet, type_name: &str) {
         use async_graphql::parser::types::Selection;
         use async_graphql::registry::MetaTypeName;
 
@@ -556,9 +552,7 @@ impl Usage<'_> {
                     if !self.seen.insert(name.clone()) {
                         continue;
                     }
-                    if let Some(fragment) =
-                        self.fragments.get(&async_graphql::Name::new(&name))
-                    {
+                    if let Some(fragment) = self.fragments.get(&async_graphql::Name::new(&name)) {
                         let on = fragment.node.type_condition.node.on.node.to_string();
                         self.selection_set(&fragment.node.selection_set.node, &on);
                     }
@@ -577,8 +571,7 @@ impl Usage<'_> {
                 .directives
                 .get(directive.node.name.node.as_str());
             for (name, value) in &directive.node.arguments {
-                let Some(argument) = meta.and_then(|meta| meta.args.get(name.node.as_str()))
-                else {
+                let Some(argument) = meta.and_then(|meta| meta.args.get(name.node.as_str())) else {
                     continue;
                 };
                 let expected = relax(&argument.ty, argument.default_value.is_some());
@@ -603,9 +596,7 @@ impl Usage<'_> {
                     // Undefined, which async-graphql reports itself.
                     return;
                 };
-                if !MetaTypeName::create(expected)
-                    .is_subtype(&MetaTypeName::create(declared))
-                {
+                if !MetaTypeName::create(expected).is_subtype(&MetaTypeName::create(declared)) {
                     self.errors.push(coded(
                         format!(
                             "variable '{}' is declared as '{}', but used where '{}' is expected",
@@ -677,8 +668,8 @@ mod variable_position_tests {
     /// argument, a nested input object, a list, a non-null location, and a
     /// non-null location that has a default.
     fn schema() -> async_graphql::dynamic::Schema {
-        let filter = InputObject::new("author_bool_exp")
-            .field(InputValue::new("id", TypeRef::named("Int")));
+        let filter =
+            InputObject::new("author_bool_exp").field(InputValue::new("id", TypeRef::named("Int")));
         let insert = InputObject::new("author_insert_input")
             .field(InputValue::new("name", TypeRef::named("String")));
         let query = Object::new("query_root").field(
@@ -711,11 +702,9 @@ mod variable_position_tests {
                         .default_value(async_graphql::Value::List(Vec::new())),
                 ),
             );
-        let author = Object::new("author").field(Field::new(
-            "id",
-            TypeRef::named("Int"),
-            |_| FieldFuture::new(async move { Ok(None::<async_graphql::Value>) }),
-        ));
+        let author = Object::new("author").field(Field::new("id", TypeRef::named("Int"), |_| {
+            FieldFuture::new(async move { Ok(None::<async_graphql::Value>) })
+        }));
         Schema::build("query_root", Some("mutation_root"), None)
             .register(filter)
             .register(insert)
@@ -727,8 +716,8 @@ mod variable_position_tests {
     }
 
     fn refusals(query: &str, variables: &str) -> Vec<String> {
-        let request = async_graphql::Request::new(query)
-            .variables(async_graphql::Variables::from_json(
+        let request =
+            async_graphql::Request::new(query).variables(async_graphql::Variables::from_json(
                 serde_json::from_str(variables).expect("the variables are JSON"),
             ));
         match prepare(Some(&schema()), request) {
@@ -821,7 +810,11 @@ mod variable_position_tests {
 
     #[test]
     fn a_non_null_variable_fits_a_nullable_place() {
-        assert!(refusals("query ($n: Int!) { author(limit: $n) { id } }", "{\"n\": 1}").is_empty());
+        assert!(refusals(
+            "query ($n: Int!) { author(limit: $n) { id } }",
+            "{\"n\": 1}"
+        )
+        .is_empty());
     }
 
     #[test]

@@ -105,10 +105,7 @@ pub fn build_inputs(
             if !taken.insert(field.name.clone()) {
                 continue;
             }
-            input = input.field(InputValue::new(
-                &field.name,
-                TypeRef::named(DIRECTION_ENUM),
-            ));
+            input = input.field(InputValue::new(&field.name, TypeRef::named(DIRECTION_ENUM)));
             columns = columns.item(EnumItem::new(&field.name));
         }
 
@@ -149,12 +146,11 @@ pub fn build_inputs(
                 function, type_name
             ));
             for column in &columns {
-                per_column = per_column
-                    .field(InputValue::new(column, TypeRef::named(DIRECTION_ENUM)));
+                per_column =
+                    per_column.field(InputValue::new(column, TypeRef::named(DIRECTION_ENUM)));
             }
             inputs.push(per_column);
-            aggregate = aggregate
-                .field(InputValue::new(function, TypeRef::named(&function_type)));
+            aggregate = aggregate.field(InputValue::new(function, TypeRef::named(&function_type)));
         }
         inputs.push(aggregate);
     }

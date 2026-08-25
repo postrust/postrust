@@ -155,7 +155,11 @@ async fn main() -> Result<()> {
             for (schema, table) in graphql_names.enum_tables() {
                 let qi = postrust_core::api_request::QualifiedIdentifier::new(&schema, &table);
                 let Some(definition) = cache.get_table(&qi) else {
-                    tracing::warn!("{}.{} is marked as an enumeration but was not found", schema, table);
+                    tracing::warn!(
+                        "{}.{} is marked as an enumeration but was not found",
+                        schema,
+                        table
+                    );
                     continue;
                 };
                 // One column identifies a member. A composite key names no
@@ -194,12 +198,9 @@ async fn main() -> Result<()> {
                                 .collect(),
                         );
                     }
-                    Err(e) => tracing::warn!(
-                        "cannot read the values of {}.{}: {}",
-                        schema,
-                        table,
-                        e
-                    ),
+                    Err(e) => {
+                        tracing::warn!("cannot read the values of {}.{}: {}", schema, table, e)
+                    }
                 }
             }
         }

@@ -25,8 +25,8 @@
 //! * A column's expression is named for the column's scalar type, so every
 //!   `text` column in the schema shares one `String_comparison_exp`.
 
-use crate::schema::relationship::RelationshipField;
 use crate::schema::object::TableObjectType;
+use crate::schema::relationship::RelationshipField;
 use crate::types::GraphQLType;
 use async_graphql::dynamic::{InputObject, InputValue, TypeRef};
 use std::collections::{HashMap, HashSet};
@@ -39,9 +39,16 @@ const LIST_VALUED: &[&str] = &["_in", "_nin"];
 
 /// Pattern matching, for text-shaped columns only.
 const TEXT: &[&str] = &[
-    "_like", "_nlike", "_ilike", "_nilike",
-    "_similar", "_nsimilar",
-    "_regex", "_iregex", "_nregex", "_niregex",
+    "_like",
+    "_nlike",
+    "_ilike",
+    "_nilike",
+    "_similar",
+    "_nsimilar",
+    "_regex",
+    "_iregex",
+    "_nregex",
+    "_niregex",
 ];
 
 /// Containment and key tests, for `json` and `jsonb` columns only.
@@ -164,7 +171,10 @@ fn comparison_input(scalar: &str) -> InputObject {
                 input = input.field(InputValue::new(*op, TypeRef::named("geometry")));
             }
         } else {
-            input = input.field(InputValue::new("_st_intersects", TypeRef::named("geography")));
+            input = input.field(InputValue::new(
+                "_st_intersects",
+                TypeRef::named("geography"),
+            ));
         }
         input = input.field(InputValue::new(
             "_st_d_within",
@@ -186,7 +196,10 @@ fn comparison_input(scalar: &str) -> InputObject {
     }
     if scalar == "raster" {
         input = input
-            .field(InputValue::new("_st_intersects_rast", TypeRef::named("raster")))
+            .field(InputValue::new(
+                "_st_intersects_rast",
+                TypeRef::named("raster"),
+            ))
             .field(InputValue::new(
                 "_st_intersects_geom_nband",
                 TypeRef::named("st_intersects_geom_nband_input"),
@@ -213,8 +226,14 @@ fn comparison_input(scalar: &str) -> InputObject {
             input = input.field(InputValue::new(*op, TypeRef::named(scalar)));
         }
         input = input.field(InputValue::new("_has_key", TypeRef::named("String")));
-        input = input.field(InputValue::new("_has_keys_any", TypeRef::named_list("String")));
-        input = input.field(InputValue::new("_has_keys_all", TypeRef::named_list("String")));
+        input = input.field(InputValue::new(
+            "_has_keys_any",
+            TypeRef::named_list("String"),
+        ));
+        input = input.field(InputValue::new(
+            "_has_keys_all",
+            TypeRef::named_list("String"),
+        ));
         // A document has no `LIKE`, and the text it renders as does. Casting
         // is how a client asks the pattern question of a column whose type
         // cannot answer it.
@@ -228,8 +247,14 @@ fn comparison_input(scalar: &str) -> InputObject {
         // comparison against one: `_exists` asks whether the path selects
         // anything, `_match` whether the predicate it ends in holds.
         input = input
-            .field(InputValue::new("_jsonb_path_exists", TypeRef::named("String")))
-            .field(InputValue::new("_jsonb_path_match", TypeRef::named("String")));
+            .field(InputValue::new(
+                "_jsonb_path_exists",
+                TypeRef::named("String"),
+            ))
+            .field(InputValue::new(
+                "_jsonb_path_match",
+                TypeRef::named("String"),
+            ));
     }
 
     input
@@ -349,8 +374,7 @@ pub fn build_inputs(
         scalars.insert("String".to_string());
     }
 
-    let mut comparisons: Vec<InputObject> =
-        scalars.iter().map(|s| comparison_input(s)).collect();
+    let mut comparisons: Vec<InputObject> = scalars.iter().map(|s| comparison_input(s)).collect();
 
     // The comparisons that take more than one value need an input of their
     // own. Registered only where a column of that shape exists, so a schema

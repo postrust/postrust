@@ -252,6 +252,13 @@ curl -X POST http://localhost:3000/v1/graphql \
 open http://localhost:3000/v1/graphql
 ```
 
+Everything checkable without Hasura runs from one script:
+
+```bash
+scripts/check.sh                    # formatting, lints, unit tests
+DATABASE_URL=... scripts/check.sh   # and the 82 that need a database
+```
+
 Measured against Hasura's own test corpus: see
 [the harness](scripts/hasura-conformance/) and
 [what it found](scripts/hasura-conformance/FINDINGS.md).

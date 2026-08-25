@@ -238,7 +238,7 @@ async fn list_query_returns_rows_with_typed_columns() {
         &state,
         &pool,
         &schema,
-        "{ widgets(orderBy: [\"id.asc\"]) { id name stock is_active } }",
+        "{ widgets(order_by: [{id: asc}]) { id name stock is_active } }",
     )
     .await;
 
@@ -271,9 +271,15 @@ async fn by_pk_query_returns_the_requested_row() {
     create_widgets_schema(&pool, &schema).await;
 
     let state = build_state(&pool, &schema, None, false).await;
-    let data = execute_ok(&state, &pool, &schema, "{ widgetByPk(id: 3) { id name } }").await;
+    let data = execute_ok(
+        &state,
+        &pool,
+        &schema,
+        "{ widgets_by_pk(id: 3) { id name } }",
+    )
+    .await;
 
-    let row = data.get("widgetByPk").expect("missing by-pk field");
+    let row = data.get("widgets_by_pk").expect("missing by-pk field");
     assert_eq!(row.get("id").and_then(|v| v.as_i64()), Some(3));
     assert_eq!(row.get("name").and_then(|v| v.as_str()), Some("charlie"));
 
@@ -292,12 +298,12 @@ async fn by_pk_query_returns_null_for_a_missing_key() {
         &state,
         &pool,
         &schema,
-        "{ widgetByPk(id: 9999) { id name } }",
+        "{ widgets_by_pk(id: 9999) { id name } }",
     )
     .await;
 
     assert_eq!(
-        data.get("widgetByPk"),
+        data.get("widgets_by_pk"),
         Some(&serde_json::Value::Null),
         "a key that matches nothing must resolve to null"
     );
@@ -319,7 +325,7 @@ async fn filter_argument_narrows_results() {
         &state,
         &pool,
         &schema,
-        "{ widgets(filter: {category: {eq: \"books\"}}, orderBy: [\"id.asc\"]) { id } }",
+        "{ widgets(where: {category: {_eq: \"books\"}}, order_by: [{id: asc}]) { id } }",
     )
     .await;
 
@@ -340,7 +346,7 @@ async fn filter_supports_comparison_operators() {
         &state,
         &pool,
         &schema,
-        "{ widgets(filter: {stock: {gt: 5}}, orderBy: [\"id.asc\"]) { id } }",
+        "{ widgets(where: {stock: {_gt: 5}}, order_by: [{id: asc}]) { id } }",
     )
     .await;
 
@@ -363,14 +369,14 @@ async fn order_by_sorts_ascending_and_descending() {
         &state,
         &pool,
         &schema,
-        "{ widgets(orderBy: [\"id.asc\"]) { id } }",
+        "{ widgets(order_by: [{id: asc}]) { id } }",
     )
     .await;
     let descending = execute_ok(
         &state,
         &pool,
         &schema,
-        "{ widgets(orderBy: [\"id.desc\"]) { id } }",
+        "{ widgets(order_by: [{id: desc}]) { id } }",
     )
     .await;
 
@@ -392,7 +398,7 @@ async fn order_by_sorts_on_a_non_key_column() {
         &state,
         &pool,
         &schema,
-        "{ widgets(orderBy: [\"stock.asc\"]) { id stock } }",
+        "{ widgets(order_by: [{stock: asc}]) { id stock } }",
     )
     .await;
 
@@ -405,7 +411,11 @@ async fn order_by_sorts_on_a_non_key_column() {
 #[tokio::test]
 #[ignore = "requires PostgreSQL"]
 async fn order_by_rejects_an_unknown_column() {
-    // The column name is interpolated into SQL, so it must be validated.
+    // A column name reaches SQL, so it has to be one the table has. It is
+    // refused by validation now rather than by the builder -- `<table>_order_by`
+    // is a generated input, so a name that is not a column is not a field --
+    // which is a better place to refuse it: the client is told before the
+    // request runs, and nothing crafted can be written there at all.
     let pool = connect().await;
     let schema = unique_schema_name("orderbad");
     create_widgets_schema(&pool, &schema).await;
@@ -415,12 +425,12 @@ async fn order_by_rejects_an_unknown_column() {
         &state,
         &pool,
         &schema,
-        "{ widgets(orderBy: [\"id; DROP TABLE widgets\"]) { id } }",
+        "{ widgets(order_by: [{no_such_column: asc}]) { id } }",
     )
     .await;
     assert!(
-        errors.contains("unknown column"),
-        "expected an unknown-column error, got: {}",
+        errors.contains("no_such_column"),
+        "expected the unknown column to be named, got: {}",
         errors
     );
 
@@ -446,12 +456,12 @@ async fn order_by_rejects_an_invalid_direction() {
         &state,
         &pool,
         &schema,
-        "{ widgets(orderBy: [\"id.sideways\"]) { id } }",
+        "{ widgets(order_by: [{id: sideways}]) { id } }",
     )
     .await;
     assert!(
-        errors.contains("invalid order direction"),
-        "expected a direction error, got: {}",
+        errors.contains("sideways"),
+        "expected the direction to be named, got: {}",
         errors
     );
 
@@ -470,7 +480,7 @@ async fn limit_and_offset_paginate() {
         &state,
         &pool,
         &schema,
-        "{ widgets(orderBy: [\"id.asc\"], limit: 2, offset: 1) { id } }",
+        "{ widgets(order_by: [{id: asc}], limit: 2, offset: 1) { id } }",
     )
     .await;
 
@@ -492,7 +502,7 @@ async fn max_rows_caps_a_query_with_no_limit() {
         &state,
         &pool,
         &schema,
-        "{ widgets(orderBy: [\"id.asc\"]) { id } }",
+        "{ widgets(order_by: [{id: asc}]) { id } }",
     )
     .await;
 
@@ -513,7 +523,7 @@ async fn max_rows_bounds_a_larger_requested_limit() {
         &state,
         &pool,
         &schema,
-        "{ widgets(orderBy: [\"id.asc\"], limit: 100) { id } }",
+        "{ widgets(order_by: [{id: asc}], limit: 100) { id } }",
     )
     .await;
 
@@ -538,14 +548,20 @@ async fn insert_mutation_creates_a_row() {
         &state,
         &pool,
         &schema,
-        "mutation { insertWidgets(objects: [{name: \"echo\", category: \"tools\", price: 5.5, stock: 3}]) { id name } }",
+        "mutation { insert_widgets(objects: [{name: \"echo\", category: \"tools\", price: 5.5, stock: 3}]) \
+          { affected_rows returning { id name } } }",
     )
     .await;
 
-    let rows = data
-        .get("insertWidgets")
+    let response = data.get("insert_widgets").expect("insert returned nothing");
+    assert_eq!(
+        response.get("affected_rows").and_then(|v| v.as_i64()),
+        Some(1)
+    );
+    let rows = response
+        .get("returning")
         .and_then(|v| v.as_array())
-        .expect("insert returned no list");
+        .expect("insert returned no rows");
     assert_eq!(rows.len(), 1);
     assert_eq!(rows[0].get("name").and_then(|v| v.as_str()), Some("echo"));
 
@@ -570,7 +586,8 @@ async fn update_mutation_with_where_changes_only_matching_rows() {
         &state,
         &pool,
         &schema,
-        "mutation { updateWidgets(where: {id: {eq: 2}}, set: {name: \"renamed\"}) { id name } }",
+        "mutation { update_widgets(where: {id: {_eq: 2}}, _set: {name: \"renamed\"}) \
+          { affected_rows returning { id name } } }",
     )
     .await;
 
@@ -600,12 +617,14 @@ async fn update_mutation_without_where_is_refused() {
         &state,
         &pool,
         &schema,
-        "mutation { updateWidgets(set: {name: \"clobbered\"}) { id } }",
+        "mutation { update_widgets(_set: {name: \"clobbered\"}) { returning { id } } }",
     )
     .await;
+    // Refused by validation now rather than by the resolver: `where` is
+    // non-null on a bulk write, so a request without one never runs.
     assert!(
-        errors.contains("requires a `where`"),
-        "expected a refusal, got: {}",
+        errors.contains("where"),
+        "expected a refusal naming `where`, got: {}",
         errors
     );
 
@@ -633,7 +652,8 @@ async fn delete_mutation_with_where_removes_only_matching_rows() {
         &state,
         &pool,
         &schema,
-        "mutation { deleteWidgets(where: {category: {eq: \"books\"}}) { id } }",
+        "mutation { delete_widgets(where: {category: {_eq: \"books\"}}) \
+          { affected_rows returning { id } } }",
     )
     .await;
 
@@ -656,10 +676,18 @@ async fn delete_mutation_without_where_is_refused() {
     create_widgets_schema(&pool, &schema).await;
 
     let state = build_state(&pool, &schema, None, false).await;
-    let errors = execute_err(&state, &pool, &schema, "mutation { deleteWidgets { id } }").await;
+    let errors = execute_err(
+        &state,
+        &pool,
+        &schema,
+        "mutation { delete_widgets { returning { id } } }",
+    )
+    .await;
+    // Refused by validation now rather than by the resolver: `where` is
+    // non-null on a bulk write, so a request without one never runs.
     assert!(
-        errors.contains("requires a `where`"),
-        "expected a refusal, got: {}",
+        errors.contains("where"),
+        "expected a refusal naming `where`, got: {}",
         errors
     );
 
@@ -684,7 +712,8 @@ async fn mutation_value_is_not_interpreted_as_sql() {
         &state,
         &pool,
         &schema,
-        "mutation { updateWidgets(where: {name: {eq: \"alpha\"}}, set: {name: \"x'); DROP TABLE widgets;--\"}) { id } }",
+        "mutation { update_widgets(where: {name: {_eq: \"alpha\"}}, _set: {name: \"x'); DROP TABLE widgets;--\"}) \
+          { returning { id } } }",
     )
     .await;
 
@@ -711,7 +740,7 @@ async fn subscription_type_is_present_when_enabled() {
     let state = build_state(&pool, &schema, None, true).await;
     let sdl = state.schema.sdl();
     assert!(
-        sdl.contains("type Subscription"),
+        sdl.contains("type subscription_root"),
         "subscriptions enabled but no Subscription type in the schema"
     );
     assert!(
@@ -750,10 +779,10 @@ async fn schema_exposes_read_and_write_fields_for_each_table() {
 
     for field in [
         "widgets",
-        "widgetByPk",
-        "insertWidgets",
-        "updateWidgets",
-        "deleteWidgets",
+        "widgets_by_pk",
+        "insert_widgets",
+        "update_widgets",
+        "delete_widgets",
     ] {
         assert!(sdl.contains(field), "schema is missing field {}", field);
     }
@@ -884,7 +913,7 @@ async fn filter_in_operator_matches_a_set() {
         &state,
         &pool,
         &schema,
-        "{ widgets(filter: {id: {in: [1, 3]}}, orderBy: [\"id.asc\"]) { id } }",
+        "{ widgets(where: {id: {_in: [1, 3]}}, order_by: [{id: asc}]) { id } }",
     )
     .await;
 
@@ -905,7 +934,7 @@ async fn filter_in_operator_with_an_empty_list_matches_nothing() {
         &state,
         &pool,
         &schema,
-        "{ widgets(filter: {id: {in: []}}) { id } }",
+        "{ widgets(where: {id: {_in: []}}) { id } }",
     )
     .await;
 
@@ -939,7 +968,7 @@ async fn filter_is_null_operator_accepts_camel_case() {
         &state,
         &pool,
         &schema,
-        "{ widgets(filter: {note: {isNull: true}}, orderBy: [\"id.asc\"]) { id } }",
+        "{ widgets(where: {note: {_is_null: true}}, order_by: [{id: asc}]) { id } }",
     )
     .await;
     assert_eq!(ids_of(&null_rows, "widgets"), vec![2, 3, 4]);
@@ -948,7 +977,7 @@ async fn filter_is_null_operator_accepts_camel_case() {
         &state,
         &pool,
         &schema,
-        "{ widgets(filter: {note: {isNull: false}}) { id } }",
+        "{ widgets(where: {note: {_is_null: false}}) { id } }",
     )
     .await;
     assert_eq!(ids_of(&non_null_rows, "widgets"), vec![1]);
@@ -969,12 +998,12 @@ async fn filter_rejects_an_unsupported_operator() {
         &state,
         &pool,
         &schema,
-        "{ widgets(filter: {stock: {between: 5}}) { id } }",
+        "{ widgets(where: {stock: {_between: 5}}) { id } }",
     )
     .await;
 
     assert!(
-        errors.contains("unsupported filter operator"),
+        errors.contains("_between"),
         "expected a rejection, got: {}",
         errors
     );
@@ -996,11 +1025,11 @@ async fn mutation_with_unsupported_where_operator_is_refused() {
         &state,
         &pool,
         &schema,
-        "mutation { deleteWidgets(where: {stock: {between: 5}}) { id } }",
+        "mutation { delete_widgets(where: {stock: {_between: 5}}) { returning { id } } }",
     )
     .await;
     assert!(
-        errors.contains("unsupported filter operator"),
+        errors.contains("_between"),
         "expected a rejection, got: {}",
         errors
     );
@@ -1034,11 +1063,11 @@ async fn update_by_pk_targets_exactly_one_row() {
         &state,
         &pool,
         &schema,
-        "mutation { updateWidgetByPk(id: 2, set: {name: \"renamed\"}) { id name } }",
+        "mutation { update_widgets_by_pk(pk_columns: {id: 2}, _set: {name: \"renamed\"}) { id name } }",
     )
     .await;
 
-    let row = data.get("updateWidgetByPk").expect("missing result");
+    let row = data.get("update_widgets_by_pk").expect("missing result");
     assert_eq!(row.get("id").and_then(|v| v.as_i64()), Some(2));
     assert_eq!(row.get("name").and_then(|v| v.as_str()), Some("renamed"));
 
@@ -1066,11 +1095,11 @@ async fn delete_by_pk_removes_exactly_one_row() {
         &state,
         &pool,
         &schema,
-        "mutation { deleteWidgetByPk(id: 3) { id name } }",
+        "mutation { delete_widgets_by_pk(id: 3) { id name } }",
     )
     .await;
 
-    let row = data.get("deleteWidgetByPk").expect("missing result");
+    let row = data.get("delete_widgets_by_pk").expect("missing result");
     assert_eq!(row.get("id").and_then(|v| v.as_i64()), Some(3));
 
     let remaining: i64 = sqlx::query_scalar(&format!("SELECT count(*) FROM {}.widgets", schema))
@@ -1096,7 +1125,7 @@ async fn by_pk_mutations_require_the_key_and_reject_where() {
         &state,
         &pool,
         &schema,
-        "mutation { deleteWidgetByPk { id } }",
+        "mutation { delete_widgets_by_pk { id } }",
     )
     .await;
     assert!(
@@ -1109,7 +1138,7 @@ async fn by_pk_mutations_require_the_key_and_reject_where() {
         &state,
         &pool,
         &schema,
-        "mutation { deleteWidgetByPk(where: {id: {eq: 1}}) { id } }",
+        "mutation { delete_widgets_by_pk(where: {id: {_eq: 1}}) { id } }",
     )
     .await;
     assert!(
@@ -1139,12 +1168,12 @@ async fn by_pk_mutation_with_an_unknown_key_affects_nothing() {
         &state,
         &pool,
         &schema,
-        "mutation { deleteWidgetByPk(id: 9999) { id } }",
+        "mutation { delete_widgets_by_pk(id: 9999) { id } }",
     )
     .await;
 
     assert_eq!(
-        data.get("deleteWidgetByPk"),
+        data.get("delete_widgets_by_pk"),
         Some(&serde_json::Value::Null),
         "a key that matches nothing must resolve to null"
     );
@@ -1220,7 +1249,7 @@ async fn to_many_relationship_is_embedded() {
         &state,
         &pool,
         &schema,
-        "{ authors(orderBy: [\"id.asc\"]) { id name books { id title } } }",
+        "{ authors(order_by: [{id: asc}]) { id name books { id title } } }",
     )
     .await;
 
@@ -1254,7 +1283,7 @@ async fn to_one_relationship_is_embedded() {
         &state,
         &pool,
         &schema,
-        "{ books(orderBy: [\"id.asc\"]) { id title author { id name } } }",
+        "{ books(order_by: [{id: asc}]) { id title author { id name } } }",
     )
     .await;
 
@@ -1282,7 +1311,7 @@ async fn nested_relationships_recurse_two_levels() {
         &state,
         &pool,
         &schema,
-        "{ authors(orderBy: [\"id.asc\"]) { id books { id chapters { id heading } } } }",
+        "{ authors(order_by: [{id: asc}]) { id books { id chapters { id heading } } } }",
     )
     .await;
 
@@ -1313,11 +1342,13 @@ async fn embedding_works_from_a_by_pk_query() {
         &state,
         &pool,
         &schema,
-        "{ authorByPk(id: 1) { id name books { title } } }",
+        "{ authors_by_pk(id: 1) { id name books { title } } }",
     )
     .await;
 
-    let books = data["authorByPk"]["books"].as_array().expect("books list");
+    let books = data["authors_by_pk"]["books"]
+        .as_array()
+        .expect("books list");
     assert_eq!(books.len(), 2);
 
     drop_schema(&pool, &schema).await;
@@ -1334,8 +1365,11 @@ async fn relationship_fields_appear_in_the_schema() {
     let sdl = state.schema.sdl();
 
     assert!(
-        sdl.contains("books: [Books!]!"),
-        "expected a to-many relationship field on Authors, got:\n{}",
+        // The field carries the four arguments an embedded list takes, so it
+        // is matched by what it answers with rather than by its whole
+        // signature.
+        sdl.contains("): [books!]!"),
+        "expected a to-many relationship field on authors, got:\n{}",
         sdl.lines()
             .filter(|l| l.contains("book") || l.contains("author"))
             .collect::<Vec<_>>()

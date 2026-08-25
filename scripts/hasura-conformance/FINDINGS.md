@@ -175,43 +175,42 @@ wrong one.
 
 ## Open, ordered by consequence
 
-1. **A computed field can take arguments of its own.**
-   `locations_distance("from" json, locations_row locations)` is a computed
-   field whose row is one argument and whose *caller* supplies the other. The
-   session argument beside the row is handled now; a caller-supplied one is
-   not, and a field with an argument nobody can pass would always fail, so the
-   function is not exposed at all. Two cases, and the same gap keeps
-   `graphql_query/computed_fields/locations.yaml` from resolving.
+1. **A computed *column* can take arguments of its own.** The relationship half
+   of this is done -- `fetch_articles(search text, author_row author)` returns
+   rows and takes `args` where it is embedded. A column-shaped one,
+   `locations_distance("from" json, locations_row locations)`, still cannot:
+   its call is written by `computed_projections`, which assembles a select list
+   with no parameter list to bind an argument into. Threading one through is
+   the whole of the work. Two cases.
 
-2. **A computed *relationship* may take the session too.**
-   `get_articles(hasura_session json, author_row author)` returns `setof
-   author`, which makes it an embed rather than a field, and the embed loader
-   still requires exactly one argument. Widening it is the same change made for
-   computed columns -- with one difference that stopped it: an embed is
-   resolved by the REST surface through the same plan, and REST sets no session,
-   so such a function would silently receive an empty one there. Doing it
-   properly means either giving REST a session document or refusing these
-   relationships on that surface, and neither is a line of code. Three cases.
-
-3. **What is left of the enum tables.** They work: a marked table's rows are a
+2. **What is left of the enum tables.** They work: a marked table's rows are a
    generated enum, referencing columns are typed as it, and no relationship
    points at one. What remains is the metadata API around them —
    `v1/set_table_is_enum` is four cases of turning the flag on and off through
    `/v1/query`, which is the contract this server does not offer.
 
-4. **`on_conflict` inside a nested insert.** The top-level upsert works, `where`
+3. **`on_conflict` inside a nested insert.** The top-level upsert works, `where`
    and all; `{author: {data: {...}, on_conflict: {...}}}` does not, because the
    nested object has no `on_conflict` argument declared.
 
-5. **A one-to-one whose child key *is* the parent's.** `insert_author_one(object:
-   {name: …, detail_fk: {data: {phone: …}}})` where `detail.id` references
-   `author.id`: the parent has to be written first and its key pushed down,
-   which is the opposite of the ordinary to-one rule.
-
-6. **A manual relationship** -- one Hasura maps column by column rather than by
+4. **A manual relationship** -- one Hasura maps column by column rather than by
    a foreign key -- has no constraint to key a name by, so
    `PGRST_GRAPHQL_NAMES` cannot carry its name and the converter says so rather
-   than guessing.
+   than guessing. In the corpus it is also a *second* name for a foreign key
+   that already has one, which reflection can only produce once.
+
+5. **A function taking a table's row, tracked as a root field.** Hasura lets a
+   client write `fetch_articles(args: {search: "Art", author_row: "(1, 'Roger',
+   'Chris')"})` -- the row as a literal. Here such a function is a computed
+   field and nothing else, on the grounds that a row type is not something a
+   client can reasonably send. One case, and the position is deliberate.
+
+6. **Variable-free session.** Two cases now run correctly and still differ
+   because their fixtures send `X-Hasura-Search` and `X-Hasura-Offset-Int` as
+   *headers*. This server reads session variables from the verified token and
+   nowhere else, which is the deliberate divergence recorded below; the
+   machinery around them -- a computed field that takes the session, ordering
+   by an aggregate of one -- is right, and the input is not there on purpose.
 
 7. **A batched request.** A body that is a JSON *array* of operations is
    answered by Hasura with an array of responses. Three cases in
@@ -492,6 +491,25 @@ wrong one.
   counting, which is the difference between the two cases the corpus has.
   Alongside it, a non-null variable given an explicit null. Every message is
   Hasura's, word for word.
+
+- **A computed relationship that takes arguments.** `fetch_articles(search
+  text, author_row author)` returns rows of another table, so it is an embed
+  rather than a field -- and it takes something from the caller, which an embed
+  had nowhere to put. It takes `args` now, the way a function root field does;
+  the row is passed by name, since it is no longer the only argument; and the
+  session is filled by the server. The aggregate over one takes the same
+  arguments, because counting the rows a function answers with means calling
+  it.
+- **Which row a nested insert writes first** follows from which side holds the
+  key, not from how many rows there are. `author_detail.id` referencing
+  `author.id` is one row in either direction, and the detail was written first
+  and failed on a null key. `Cardinality::O2O` already recorded which side is
+  the parent; the code was reading cardinality where it needed direction.
+- **A table read at the root is aliased.** A whole-row reference -- what a
+  computed field is passed -- can only be written as a bare name, and
+  `"public"."author"` is not one: PostgreSQL reads it as a column of a table
+  called `public`. An alias no column can share is a name that works in both
+  positions.
 
 ## Not measured
 

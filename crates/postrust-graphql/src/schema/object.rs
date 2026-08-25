@@ -76,7 +76,10 @@ impl TableObjectType {
     /// PostgreSQL lets a query read as though it were a column. Always
     /// nullable: the function decides, and nothing in the catalogue says it
     /// cannot return null.
-    fn computed_field(name: &str, computed: &postrust_core::schema_cache::ComputedColumn) -> GraphQLField {
+    fn computed_field(
+        name: &str,
+        computed: &postrust_core::schema_cache::ComputedColumn,
+    ) -> GraphQLField {
         GraphQLField {
             name: name.to_string(),
             // The function it calls, where it has no comment of its own --

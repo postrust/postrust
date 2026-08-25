@@ -18,8 +18,7 @@ use std::sync::Arc;
 /// Opened lazily by the first write and settled once the operation is answered:
 /// committed when the response carries no errors, rolled back otherwise. A
 /// query never touches it.
-pub type SharedWrite =
-    Arc<tokio::sync::Mutex<Option<sqlx::Transaction<'static, sqlx::Postgres>>>>;
+pub type SharedWrite = Arc<tokio::sync::Mutex<Option<sqlx::Transaction<'static, sqlx::Postgres>>>>;
 
 /// Context available to all GraphQL resolvers.
 pub struct GraphQLContext {
@@ -82,10 +81,7 @@ impl GraphQLContext {
             .session
             .iter()
             .filter(|(name, _)| {
-                !name.is_empty()
-                    && name
-                        .chars()
-                        .all(|c| c.is_ascii_alphanumeric() || c == '_')
+                !name.is_empty() && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
             })
             .map(|(name, value)| (format!("hasura.{}", name), value.clone()))
             .collect();
