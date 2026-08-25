@@ -275,6 +275,20 @@ fn exposed_column_types(
         .collect()
 }
 
+/// The type a value is written as, which keeps the list an array column is.
+///
+/// Not the leaf scalar: `c34_text_array` is a `text[]`, and a client sending
+/// `$textArray: [String]` into it was refused for offering a list where the
+/// input said `String`. Every write is optional, so nothing here is non-null.
+fn write_type_ref(graphql_type: &crate::types::GraphQLType) -> TypeRef {
+    match graphql_type {
+        crate::types::GraphQLType::List(inner) => {
+            TypeRef::named_list(leaf_scalar_name(inner))
+        }
+        other => TypeRef::named(leaf_scalar_name(other)),
+    }
+}
+
 /// The scalar at the bottom of a type, past any list wrapping.
 fn leaf_scalar_name(graphql_type: &crate::types::GraphQLType) -> String {
     match graphql_type {
@@ -546,7 +560,7 @@ fn build_dynamic_schema(
                 taken.insert(field.name.as_str());
                 insert = insert.field(InputValue::new(
                     &field.name,
-                    TypeRef::named(leaf_scalar_name(&field.graphql_type)),
+                    write_type_ref(&field.graphql_type),
                 ));
             }
             // A nested write: the rows to insert beside this one.
@@ -594,11 +608,18 @@ fn build_dynamic_schema(
                 .description(format!("Columns of {} to add to.", type_name));
             let mut any_numeric = false;
             for field in &writable {
-                let scalar = leaf_scalar_name(&field.graphql_type);
-                set = set.field(InputValue::new(&field.name, TypeRef::named(&scalar)));
+                set = set.field(InputValue::new(
+                    &field.name,
+                    write_type_ref(&field.graphql_type),
+                ));
+                // Only a number can be added to, and a list of them is not a
+                // number: `_inc` takes the scalar or nothing.
                 if crate::schema::aggregate::is_numeric(&field.graphql_type) {
                     any_numeric = true;
-                    numeric = numeric.field(InputValue::new(&field.name, TypeRef::named(&scalar)));
+                    numeric = numeric.field(InputValue::new(
+                        &field.name,
+                        TypeRef::named(leaf_scalar_name(&field.graphql_type)),
+                    ));
                 }
             }
             builder = builder.register(set);
@@ -2819,12 +2840,15 @@ fn check_geojson(value: &serde_json::Value) -> Result<(), async_graphql::Error> 
 
 /// The call that produces a computed field's value.
 ///
-/// `row` is a whole-row reference -- an alias, or a qualified table name --
-/// rather than `alias.*`: a function taking the session is called in named
-/// notation, and `a => t.*` is not something named notation accepts.
+/// Two spellings of the same row, because the two calls need different ones.
+/// A positional call takes `alias.*`, which is what a qualified table can be
+/// written as; a named call takes the row as one value, which only a bare
+/// alias is. Named notation is needed exactly where a session argument is,
+/// since the row is then not the only parameter and may not be the first.
 fn computed_call(
     definition: &postrust_core::schema_cache::ComputedColumn,
     row: &str,
+    row_by_name: &str,
 ) -> String {
     let function = format!(
         "{}.{}",
@@ -2836,7 +2860,7 @@ fn computed_call(
             "{}({} => {}, {} => {})",
             function,
             postrust_sql::escape_ident(row_argument),
-            row,
+            row_by_name,
             postrust_sql::escape_ident(session),
             SESSION_ARGUMENT
         ),
@@ -2901,8 +2925,50 @@ fn write_operand(
             | serde_json::Value::Bool(_) => serde_json::Value::String(value.to_string()),
             other => other.clone(),
         },
+        // An array column takes an array literal. `["a","b"]` is JSON, and
+        // PostgreSQL reads a text parameter destined for a `text[]` as
+        // `{a,b}` -- `malformed array literal` is what it says about the
+        // other spelling.
+        Some(pg_type) if is_array_type(pg_type) => match value {
+            serde_json::Value::Array(_) => serde_json::Value::String(array_literal(value)),
+            other => other.clone(),
+        },
         _ => value.clone(),
     }
+}
+
+/// Whether a PostgreSQL type name is an array.
+///
+/// Both spellings appear in the catalogue depending on how it was asked:
+/// `text[]` from `format_type`, `_text` from `typname`.
+fn is_array_type(pg_type: &str) -> bool {
+    pg_type.ends_with("[]") || pg_type.starts_with('_')
+}
+
+/// A JSON array as PostgreSQL writes one.
+///
+/// `["a","b"]` becomes `{"a","b"}`. Every element is quoted, so a value
+/// containing a comma, a brace or a backslash survives; a null is the unquoted
+/// `NULL`, which is the only way to write one.
+fn array_literal(value: &serde_json::Value) -> String {
+    fn element(value: &serde_json::Value) -> String {
+        match value {
+            serde_json::Value::Null => "NULL".to_string(),
+            serde_json::Value::Array(_) => array_literal(value),
+            serde_json::Value::String(text) => {
+                format!("\"{}\"", text.replace('\\', "\\\\").replace('"', "\\\""))
+            }
+            other => format!("\"{}\"", other.to_string().replace('"', "\\\"")),
+        }
+    }
+    let items = match value {
+        serde_json::Value::Array(items) => items,
+        other => return element(other),
+    };
+    format!(
+        "{{{}}}",
+        items.iter().map(element).collect::<Vec<_>>().join(",")
+    )
 }
 
 /// The expression that writes one bound value into one column.
@@ -4034,13 +4100,37 @@ impl<'a> WhereScope<'a> {
         }
     }
 
-    /// The column a field name names, quoted and qualified.
+    /// What a field name refers to, as SQL: a column of this table, or the
+    /// call that produces a computed field.
+    ///
+    /// A computed field is in the boolean expression because it is on the type
+    /// -- `where: {sum_float_offset: {_gt: 5}}` is a question a client can
+    /// write -- and reading it as a column answered `column
+    /// float_test.sum_float_offset does not exist`.
     fn column(&self, name: &str) -> String {
-        format!(
-            "{}.{}",
-            self.sql_ref,
-            postrust_sql::escape_ident(self.column_name(name))
-        )
+        let column = self.column_name(name);
+        let plain = format!("{}.{}", self.sql_ref, postrust_sql::escape_ident(column));
+        let Some(cache) = self.resolution.as_ref().map(|r| r.cache) else {
+            return plain;
+        };
+        let Some(table) = cache.get_table(&self.qualified) else {
+            return plain;
+        };
+        if table.get_column(column).is_some() {
+            return plain;
+        }
+        let function = self
+            .names
+            .computed_source(&table.schema, &table.name, name)
+            .unwrap_or(name);
+        match table.get_computed_column(function) {
+            Some(definition) => computed_call(
+                definition,
+                &format!("{}.*", self.row_ref),
+                &self.row_ref,
+            ),
+            None => plain,
+        }
     }
 
     /// The column behind a field name.
@@ -4798,7 +4888,11 @@ fn order_terms_into(
                 .computed_source(&table.schema, &table.name, key)
                 .unwrap_or(key);
             if let Some(definition) = table.get_computed_column(function) {
-                terms.push(format!("{} {}", computed_call(definition, reference), sql));
+                terms.push(format!(
+                    "{} {}",
+                    computed_call(definition, &format!("{}.*", reference), reference),
+                    sql
+                ));
                 continue;
             }
             return Err(async_graphql::Error::new(format!(
@@ -5087,7 +5181,7 @@ fn computed_projections(
         };
         projections.push(format!(
             "{} AS {}",
-            computed_call(computed, row_reference),
+            computed_call(computed, row_reference, row_reference),
             postrust_sql::escape_ident(name)
         ));
     }
@@ -5245,7 +5339,11 @@ fn column_expression(
             t.get_computed_column(function)
         });
     match computed {
-        Some(definition) => computed_call(definition, &postrust_sql::escape_ident(alias)),
+        Some(definition) => computed_call(
+            definition,
+            &format!("{}.*", postrust_sql::escape_ident(alias)),
+            &postrust_sql::escape_ident(alias),
+        ),
         None => plain,
     }
 }
@@ -5556,7 +5654,11 @@ fn build_embed_expressions(
             match computed {
                 Some(definition) => parts.push(format!(
                     "{} AS {}",
-                    computed_call(definition, &postrust_sql::escape_ident(&child_alias)),
+                    computed_call(
+                        definition,
+                        &format!("{}.*", postrust_sql::escape_ident(&child_alias)),
+                        &postrust_sql::escape_ident(&child_alias),
+                    ),
                     postrust_sql::escape_ident(name)
                 )),
                 // A column the child exposes under another name is selected as
