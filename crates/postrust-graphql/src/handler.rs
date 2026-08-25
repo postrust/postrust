@@ -606,6 +606,35 @@ fn build_dynamic_schema(
             if any_numeric {
                 builder = builder.register(numeric);
             }
+
+            // One entry of `update_x_many`: a filter and the values to write
+            // where it matches. The whole list runs in one transaction, in the
+            // order it was given, which is what makes it different from
+            // sending the updates one at a time.
+            let mut updates = InputObject::new(format!("{}_updates", type_name))
+                .description(format!(
+                    "One update to {}: which rows, and what to write.",
+                    type_name
+                ))
+                .field(InputValue::new(
+                    "where",
+                    TypeRef::named_nn(crate::input::bool_exp::bool_exp_type_name(type_name)),
+                ))
+                .field(InputValue::new(
+                    "_set",
+                    TypeRef::named(format!("{}_set_input", type_name)),
+                ));
+            if any_numeric {
+                updates = updates.field(InputValue::new(
+                    "_inc",
+                    TypeRef::named(format!("{}_inc_input", type_name)),
+                ));
+            }
+            for operator in ["_append", "_prepend", "_delete_key", "_delete_elem",
+                             "_delete_at_path"] {
+                updates = updates.field(InputValue::new(operator, TypeRef::named("JSON")));
+            }
+            builder = builder.register(updates);
         }
     }
 
@@ -1085,7 +1114,11 @@ fn create_query_type(
     relationships: Arc<HashMap<String, Vec<RelationshipField>>>,
     names: Arc<crate::names::NameOverrides>,
 ) -> Object {
-    let mut query = Object::new("query_root");
+    // Collected rather than added as they are built, so they can go on in name
+    // order: that is the order Hasura answers introspection in, and it is the
+    // order a client diffing two schemas, or a generator writing its types
+    // out, gets a stable answer from.
+    let mut roots: Vec<(String, Field)> = Vec::new();
 
     for field in &generated.query_fields {
         let table_name = field.table_name.clone();
@@ -1153,7 +1186,7 @@ fn create_query_type(
             gql_field = gql_field.description(desc);
         }
 
-        query = query.field(gql_field);
+        roots.push((field.name.clone(), gql_field));
 
         // The same rows, with numbers about them. Same arguments as the list
         // field, because `author_aggregate(where: ...)` counts the set the
@@ -1173,6 +1206,7 @@ fn create_query_type(
                 .unwrap_or_else(|| {
                     crate::schema::aggregate::aggregate_type_name(&field.type_name)
                 });
+            let aggregate_field_name_for_sorting = aggregate_field_name.clone();
             let mut agg_field = Field::new(
                 aggregate_field_name,
                 TypeRef::named_nn(crate::schema::aggregate::aggregate_type_name(
@@ -1210,19 +1244,26 @@ fn create_query_type(
                     field.table_name
                 )),
             };
-            query = query.field(agg_field);
+            roots.push((aggregate_field_name_for_sorting, agg_field));
         }
     }
 
-    // Add introspection queries
-    query = query.field(
-        Field::new("_schema", TypeRef::named("String"), |_| {
-            FieldFuture::new(async move {
-                Ok(Some(Value::String("Postrust GraphQL Schema".to_string())))
+    roots.sort_by(|(a, _), (b, _)| a.cmp(b));
+    let mut query = Object::new("query_root");
+    // A GraphQL object may not have no fields, so a schema that exposes no
+    // table needs something on its query root. Hasura puts a placeholder there
+    // and calls it this; a client that reaches it has nothing to read.
+    if roots.is_empty() {
+        return query.field(
+            Field::new("no_queries_available", TypeRef::named("String"), |_| {
+                FieldFuture::new(async move { Ok(None::<Value>) })
             })
-        })
-        .description("Schema introspection"),
-    );
+            .description("There are no queries available to the current role."),
+        );
+    }
+    for (_, field) in roots {
+        query = query.field(field);
+    }
 
     query
 }
@@ -1264,6 +1305,8 @@ fn create_mutation_type(
     max_rows: Option<i64>,
 ) -> Object {
     let mut mutation = Object::new("mutation_root");
+    // In name order, for the reason the query root is: see there.
+    let mut roots: Vec<(String, Field)> = Vec::new();
 
     // Only a table with a unique constraint has a conflict to name, and only
     // those got the types for it.
@@ -1382,6 +1425,12 @@ fn create_mutation_type(
                     has_numeric_column.contains(&where_type),
                 );
             }
+            MutationType::UpdateMany => {
+                gql_field = gql_field.argument(InputValue::new(
+                    "updates",
+                    TypeRef::named_nn_list_nn(format!("{}_updates", where_type)),
+                ));
+            }
             MutationType::DeleteByPk => {
                 for (col_name, pg_type) in &pk_columns {
                     gql_field = gql_field.argument(InputValue::new(
@@ -1404,7 +1453,12 @@ fn create_mutation_type(
             gql_field = gql_field.description(desc);
         }
 
-        mutation = mutation.field(gql_field);
+        roots.push((field.name.clone(), gql_field));
+    }
+
+    roots.sort_by(|(a, _), (b, _)| a.cmp(b));
+    for (_, field) in roots {
+        mutation = mutation.field(field);
     }
 
     mutation
@@ -2291,6 +2345,72 @@ async fn resolve_mutation<'a>(
             .find(|selection| selection.name() == "returning")
     };
 
+    // Several updates, each with its own filter, applied in the order given.
+    // They share the operation's transaction like any other write, which is
+    // the whole difference from sending them one at a time: either all of them
+    // happened or none did.
+    if mutation_type == MutationType::UpdateMany {
+        let updates = ctx
+            .args
+            .try_get("updates")
+            .ok()
+            .map(|v| accessor_to_json(&v))
+            .unwrap_or(serde_json::Value::Null);
+        let serde_json::Value::Array(entries) = updates else {
+            return Err(async_graphql::Error::new(
+                "\"updates\" takes a list of {where, _set, …} objects",
+            ));
+        };
+        let column_types = column_types_of(&gql_ctx.schema_cache, schema_name, table_name).await;
+        let mut answers: Vec<FieldValue<'_>> = Vec::with_capacity(entries.len());
+        for entry in entries {
+            let serde_json::Value::Object(entry) = entry else {
+                return Err(async_graphql::Error::new(
+                    "each update is an object of {where, _set, …}",
+                ));
+            };
+            let operators: Vec<(&'static str, serde_json::Value)> = UPDATE_OPERATORS
+                .iter()
+                .filter_map(|name| entry.get(*name).map(|value| (*name, value.clone())))
+                .filter(|(_, value)| !value.is_null())
+                .collect();
+            let rows = execute_update(
+                pool,
+                gql_ctx,
+                schema_name,
+                table_name,
+                &type_name,
+                operators,
+                column_types.clone(),
+                entry.get("where").cloned(),
+                relationships.as_ref(),
+                names.as_ref(),
+            )
+            .await?;
+            let affected = rows.len();
+            let rows = match returning {
+                Some(returning) if !rows.is_empty() => {
+                    reread_returning(
+                        pool,
+                        gql_ctx,
+                        schema_name,
+                        table_name,
+                        &type_name,
+                        rows,
+                        returning,
+                        relationships.as_ref(),
+                        names.as_ref(),
+                        max_rows,
+                    )
+                    .await?
+                }
+                _ => rows,
+            };
+            answers.extend(mutation_result(rows, affected, false));
+        }
+        return Ok(Some(FieldValue::list(answers)));
+    }
+
     let (result, affected) = match mutation_type {
         MutationType::Insert | MutationType::InsertOne => {
             let objects = ctx
@@ -2331,20 +2451,13 @@ async fn resolve_mutation<'a>(
 
             execute_insert(pool, gql_ctx, schema_name, table_name, objects, &context).await?
         }
-        MutationType::Update | MutationType::UpdateByPk => {
+        // `UpdateMany` answered above: it is a list of responses rather than
+        // one, so it does not share this shape.
+        MutationType::UpdateMany | MutationType::Update | MutationType::UpdateByPk => {
             // `_set` replaces, the others read the column they write. A client
             // may send more than one, so all of them are collected rather than
             // the first that happens to be present.
-            const OPERATORS: [&str; 7] = [
-                "_set",
-                "_inc",
-                "_append",
-                "_prepend",
-                "_delete_key",
-                "_delete_elem",
-                "_delete_at_path",
-            ];
-            let operators: Vec<(&'static str, serde_json::Value)> = OPERATORS
+            let operators: Vec<(&'static str, serde_json::Value)> = UPDATE_OPERATORS
                 .iter()
                 .filter_map(|name| {
                     ctx.args
@@ -2666,6 +2779,18 @@ fn check_geojson(value: &serde_json::Value) -> Result<(), async_graphql::Error> 
     }
     Ok(())
 }
+
+/// Everything an update may be told to do, in the order the schema declares
+/// them. Read by both spellings: one update, and one of many.
+const UPDATE_OPERATORS: [&str; 7] = [
+    "_set",
+    "_inc",
+    "_append",
+    "_prepend",
+    "_delete_key",
+    "_delete_elem",
+    "_delete_at_path",
+];
 
 /// What a written table is called inside its own statement.
 ///

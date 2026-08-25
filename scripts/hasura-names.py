@@ -270,14 +270,6 @@ def derived_relationship_name(entry, kind, bases):
     return None
 
 
-def strip_suffix(value, suffix):
-    return value[: -len(suffix)] if value.endswith(suffix) else None
-
-
-def strip_prefix(value, prefix):
-    return value[len(prefix):] if value.startswith(prefix) else None
-
-
 # What each root field would be called, given a base name. The server derives
 # all of them from one word; Hasura names them one at a time.
 DERIVED_ROOTS = {
@@ -288,21 +280,9 @@ DERIVED_ROOTS = {
     "insert_one": lambda base: f"insert_{base}_one",
     "update": lambda base: f"update_{base}",
     "update_by_pk": lambda base: f"update_{base}_by_pk",
+    "update_many": lambda base: f"update_{base}_many",
     "delete": lambda base: f"delete_{base}",
     "delete_by_pk": lambda base: f"delete_{base}_by_pk",
-}
-
-# And the reverse: the base a given root name implies.
-IMPLIED_BASE = {
-    "select": lambda v: v,
-    "select_by_pk": lambda v: strip_suffix(v, "_by_pk"),
-    "select_aggregate": lambda v: strip_suffix(v, "_aggregate"),
-    "insert": lambda v: strip_prefix(v, "insert_"),
-    "insert_one": lambda v: strip_suffix(strip_prefix(v, "insert_") or "", "_one"),
-    "update": lambda v: strip_prefix(v, "update_"),
-    "update_by_pk": lambda v: strip_suffix(strip_prefix(v, "update_") or "", "_by_pk"),
-    "delete": lambda v: strip_prefix(v, "delete_"),
-    "delete_by_pk": lambda v: strip_suffix(strip_prefix(v, "delete_") or "", "_by_pk"),
 }
 
 
@@ -340,10 +320,12 @@ def custom_root_comments(entry):
 def exposed_base(entry, table):
     """The one word this server derives every name for this table from.
 
-    `custom_name` where it was given. Otherwise the base implied by the custom
-    root fields, where they all imply the same one -- `select: Articles` beside
-    `select_by_pk: Article` implies `Articles`, and the by-pk name is written
-    down separately. Otherwise the table's own name.
+    `custom_name`, or the table's own name. Deliberately *not* inferred from
+    the custom root fields, however neatly they share a stem: in Hasura those
+    rename the root fields and nothing else, while a base name here renames the
+    generated types too. A table whose roots are `AutomaticNoCommentInDb` and
+    whose type is still `automatic_no_comment_in_db` is the case that says so,
+    and it is in the corpus.
 
     Computed once and used twice: it decides this table's own names, and it
     decides what a relationship *to* this table derives to.
@@ -352,12 +334,6 @@ def exposed_base(entry, table):
     custom = configuration.get("custom_name")
     if isinstance(custom, str) and custom:
         return custom
-    implied = {IMPLIED_BASE[root](value) for root, value in custom_roots(entry).items()
-               if root in IMPLIED_BASE}
-    implied.discard(None)
-    implied.discard("")
-    if len(implied) == 1:
-        return implied.pop()
     return table
 
 

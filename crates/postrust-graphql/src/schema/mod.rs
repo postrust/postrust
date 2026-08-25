@@ -410,6 +410,8 @@ pub enum MutationType {
     Update,
     /// Update a single record by PK
     UpdateByPk,
+    /// Several updates, each with its own filter, in one transaction
+    UpdateMany,
     /// Delete records matching a filter
     Delete,
     /// Delete a single record by PK
@@ -489,6 +491,21 @@ impl MutationField {
             pk_columns: Vec::new(),
             return_type: format!("{}_mutation_response", type_name),
             description: Some(format!("update data of the table: \"{}\"", table.name)),
+        });
+
+        // update_users_many (several filters, each with its own values)
+        let name = format!("update_{}_many", base_name);
+        fields.push(Self {
+            name,
+            table_name: table.name.clone(),
+            schema_name: table.schema.clone(),
+            mutation_type: MutationType::UpdateMany,
+            pk_columns: Vec::new(),
+            return_type: format!("[{}_mutation_response]", type_name),
+            description: Some(format!(
+                "update multiples rows of table: \"{}\"",
+                table.name
+            )),
         });
 
         // update_user_by_pk (single update by PK)
@@ -667,6 +684,7 @@ pub fn build_schema(schema_cache: &SchemaCache, config: &SchemaConfig) -> Genera
                     MutationType::InsertOne => "insert_one",
                     MutationType::Update => "update",
                     MutationType::UpdateByPk => "update_by_pk",
+                    MutationType::UpdateMany => "update_many",
                     MutationType::Delete => "delete",
                     MutationType::DeleteByPk => "delete_by_pk",
                 };
@@ -1051,11 +1069,13 @@ mod tests {
         let table = create_test_table("users", true, true, true);
         let fields = MutationField::update_fields(&table);
 
-        assert_eq!(fields.len(), 2);
+        assert_eq!(fields.len(), 3);
         assert_eq!(fields[0].name, "update_users");
         assert_eq!(fields[0].mutation_type, MutationType::Update);
-        assert_eq!(fields[1].name, "update_users_by_pk");
-        assert_eq!(fields[1].mutation_type, MutationType::UpdateByPk);
+        assert_eq!(fields[1].name, "update_users_many");
+        assert_eq!(fields[1].mutation_type, MutationType::UpdateMany);
+        assert_eq!(fields[2].name, "update_users_by_pk");
+        assert_eq!(fields[2].mutation_type, MutationType::UpdateByPk);
     }
 
     #[test]
@@ -1127,14 +1147,14 @@ mod tests {
         let config = SchemaConfig::default();
         let schema = build_schema(&cache, &config);
 
-        // users: 2 insert + 2 update + 2 delete = 6
-        // posts: 2 insert + 2 update + 2 delete = 6
+        // users: 2 insert + 3 update + 2 delete = 7
+        // posts: 2 insert + 3 update + 2 delete = 7
         // comments: 2 insert + 0 update + 0 delete = 2
-        // Total: 14
-        assert_eq!(schema.mutation_fields.len(), 14);
+        // Total: 16
+        assert_eq!(schema.mutation_fields.len(), 16);
 
         let users_mutations = schema.get_mutation_fields("users");
-        assert_eq!(users_mutations.len(), 6);
+        assert_eq!(users_mutations.len(), 7);
     }
 
     #[test]
