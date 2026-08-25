@@ -195,7 +195,14 @@ wrong one.
    whose coordinates are all zero, which does not reproduce by hand, so
    something narrower about the fixture is responsible and has not been found.
 
-6. **The two cases typing the mutation inputs cost.** `objects` and `_set`
+6. **Variable validation.** `graphql_validation` is 7/17. Hasura refuses a
+   variable declared as one type and used where another is expected, and a null
+   passed for a non-nullable one; this server answers data for several of those.
+   Probed by hand, async-graphql does refuse the plain cases -- `$limit: String`
+   used as an `Int` is caught -- so what the corpus is exercising is narrower
+   than "no validation" and has not been pinned down.
+
+7. **The two cases typing the mutation inputs cost.** `objects` and `_set`
    were `JSON`, which accepted a relationship under whatever name the request
    used; they are generated types now, so a relationship this server named
    differently is refused by validation rather than reaching a resolver that
@@ -204,15 +211,15 @@ wrong one.
    in item 1 wearing a different error. Recorded because the number went down
    and a reader is owed the reason.
 
-7. **The comment on a computed field's function** is not carried by the schema
+8. **The comment on a computed field's function** is not carried by the schema
    cache, so a computed field's description is always null.
 
-9. **Relationship predicates through a junction** are refused rather than
+10. **Relationship predicates through a junction** are refused rather than
    resolved: reaching the child means going through a third table, which is
    more than a pair of columns to correlate on. The computed-relationship half
    of this is now resolved, by argument rather than by columns.
 
-10. **What is left of nested inserts** (8/16). The write itself works in both
+11. **What is left of nested inserts** (8/16). The write itself works in both
    directions and counts every row it touches. What the remaining cases need is
    other features reached through a nested object: `on_conflict` inside nested
    data, a computed field taking arguments, a nested aggregate, and a
@@ -220,12 +227,12 @@ wrong one.
    written first and the key pushed down, the opposite of the ordinary to-one
    rule.
 
-11. **Tracked functions as root fields.** Hasura exposes a tracked function as
+12. **Tracked functions as root fields.** Hasura exposes a tracked function as
     `multi` and `multi_aggregate` beside the tables. Several introspection
     cases compare the whole root field list, so they fail on the absence rather
     than on anything they query.
 
-12. **A relationship in a `delete`'s `returning`** keeps the plain columns.
+13. **A relationship in a `delete`'s `returning`** keeps the plain columns.
     The rows are gone by the time they could be read again, so there is nothing
     to embed. Reporting the columns that were deleted is the honest answer, but
     it is not Hasura's.
@@ -253,6 +260,12 @@ wrong one.
   ordering happens before it. `EmbedPlan::embed_expression` already took all
   four for the REST surface; the GraphQL side had no way to say any of them.
 - **Computed columns are fields**, at the root and inside an embed.
+- **A comparison against a null.** `where: {id: {_eq: $id}}` with a null
+  answered `operator does not exist: integer = text`: a bound parameter is
+  untyped and PostgreSQL infers what it is from the operator, and a null gives
+  it nothing to infer from. Only a null is cast -- casting every operand broke
+  every numeric comparison, because a cast makes PostgreSQL infer the parameter
+  feeding it as text.
 - **Shapes are GeoJSON in both directions.** A geometry column was written by
   casting -- and `'{"type":"Point",…}'::geometry` is not a cast PostgreSQL has
   -- and read back as WKB hex, which no client parses. Both ends speak GeoJSON
