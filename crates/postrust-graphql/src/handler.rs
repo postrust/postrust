@@ -3426,15 +3426,33 @@ fn comparison_sql(
         let placeholder = format!("${}", param_idx);
         *param_idx += 1;
         values.push(operand.clone());
-        // A bound parameter arrives as text, and PostgreSQL will infer a type
-        // for it from the operator only where one is unambiguous. `@>` is
-        // defined over several pairs of types, so `jsonb @> text` is not an
-        // operator at all and the comparison fails outright. The containment
-        // and key operators say what they were given.
+        // A bound parameter arrives as text and PostgreSQL infers a type for
+        // it from the operator, which works only while the inference is
+        // unambiguous. `jsonb @> text` is not an operator at all; and `id =
+        // $1` against an integer column answers `operator does not exist:
+        // integer = text` the moment the value is one PostgreSQL cannot read
+        // as a number -- a null, most obviously, which is how a client asks a
+        // question it expects an empty answer to.
+        //
+        // So the operand says what it is. The containment and key operators
+        // name the type the operator needs; everything else names the
+        // column's, which is the type it is being compared against.
         let cast = match op {
-            "_contains" | "_contained_in" => "::jsonb",
-            "_has_key" => "::text",
-            _ => "",
+            "_contains" | "_contained_in" => "::jsonb".to_string(),
+            "_has_key" => "::text".to_string(),
+            // Only where inference would otherwise pick text and be wrong. A
+            // cast tells PostgreSQL what the *result* is, and it infers the
+            // parameter feeding it as text -- so `$1::int4` bound with a
+            // number sends binary int8 bytes into a text parameter and
+            // answers `invalid byte sequence for encoding "UTF8"`. A value
+            // PostgreSQL can read as a number needs no help; a null is the one
+            // that does, because `id = $1` with nothing to infer from is
+            // `integer = text`.
+            _ if operand.is_null() => match column_type {
+                Some(pg_type) => format!("::{}", pg_type),
+                None => String::new(),
+            },
+            _ => String::new(),
         };
         return Ok(format!("{} {} {}{}", quoted, sql_op, placeholder, cast));
     }
@@ -3459,7 +3477,13 @@ fn comparison_sql(
             }
             let mut placeholders = Vec::with_capacity(items.len());
             for item in items {
-                placeholders.push(format!("${}", param_idx));
+                // Cast only a null, for the reason the binary comparisons
+                // give: a cast makes PostgreSQL infer the parameter as text.
+                let cast = match (item.is_null(), column_type) {
+                    (true, Some(pg_type)) => format!("::{}", pg_type),
+                    _ => String::new(),
+                };
+                placeholders.push(format!("${}{}", param_idx, cast));
                 values.push(item.clone());
                 *param_idx += 1;
             }
