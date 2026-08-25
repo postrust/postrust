@@ -3194,6 +3194,32 @@ fn postgis_sql(
     }
 }
 
+/// A list of values as an array PostgreSQL will read.
+///
+/// Bound one element at a time rather than as one parameter. A JSON array
+/// arrives as the text `["a","b"]`, which is not an array literal -- PostgreSQL
+/// answers `malformed array literal` and means it.
+fn sql_array(
+    items: &[serde_json::Value],
+    cast: &str,
+    param_idx: &mut usize,
+    values: &mut Vec<serde_json::Value>,
+) -> String {
+    if items.is_empty() {
+        return format!("ARRAY[]::{}", cast);
+    }
+    let placeholders: Vec<String> = items
+        .iter()
+        .map(|item| {
+            let placeholder = format!("${}", param_idx);
+            *param_idx += 1;
+            values.push(item.clone());
+            placeholder
+        })
+        .collect();
+    format!("ARRAY[{}]::{}", placeholders.join(", "), cast)
+}
+
 /// One comparison against one column.
 #[allow(clippy::too_many_arguments)]
 fn comparison_sql(
@@ -3252,6 +3278,30 @@ fn comparison_sql(
     // between them, so it is written before the operator table is consulted.
     if let Some(function) = crate::input::bool_exp::postgis_function(op) {
         return postgis_sql(quoted, column_type, function, op, operand, param_idx, values);
+    }
+
+    // A tree comparison is an operator, but one whose operand has to be cast:
+    // `?` is "any of these labels" for an ltree and "has this key" for a
+    // jsonb, and PostgreSQL tells them apart by the operand's type alone.
+    if let Some((operator, cast)) = crate::input::bool_exp::ltree_operator(op) {
+        if cast.ends_with("[]") {
+            let items = operand.as_array().ok_or_else(|| {
+                async_graphql::Error::new(format!(
+                    "the \"{}\" comparison on \"{}\" takes a list",
+                    op, column
+                ))
+            })?;
+            return Ok(format!(
+                "{} {} {}",
+                quoted,
+                operator,
+                sql_array(items, cast, param_idx, values)
+            ));
+        }
+        let placeholder = format!("${}", param_idx);
+        *param_idx += 1;
+        values.push(operand.clone());
+        return Ok(format!("{} {} {}::{}", quoted, operator, placeholder, cast));
     }
 
     // Comparisons binding exactly one parameter, by the SQL they become.
@@ -3333,20 +3383,11 @@ fn comparison_sql(
                     op, column
                 ))
             })?;
-            let keys: Vec<String> = items
-                .iter()
-                .map(|i| i.as_str().unwrap_or_default().to_string())
-                .collect();
-            let placeholder = format!("${}", param_idx);
-            *param_idx += 1;
-            values.push(serde_json::Value::Array(
-                keys.into_iter().map(serde_json::Value::String).collect(),
-            ));
             Ok(format!(
-                "{} {} {}::text[]",
+                "{} {} {}",
                 quoted,
                 if op == "_has_keys_any" { "?|" } else { "?&" },
-                placeholder
+                sql_array(items, "text[]", param_idx, values)
             ))
         }
         other => Err(async_graphql::Error::new(format!(

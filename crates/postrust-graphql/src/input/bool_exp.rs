@@ -47,6 +47,40 @@ const TEXT: &[&str] = &[
 /// Containment and key tests, for `json` and `jsonb` columns only.
 const JSON: &[&str] = &["_contains", "_contained_in"];
 
+/// Tree comparisons, for `ltree` columns.
+///
+/// A label path is compared by where it sits in the tree rather than by
+/// ordering: `_ancestor` asks whether this path is above another, `_matches`
+/// whether it satisfies a query pattern. The `_any` forms take a list and ask
+/// the same question of each.
+const LTREE: &[(&str, &str)] = &[
+    ("_ancestor", "ltree"),
+    ("_ancestor_any", "ltree"),
+    ("_descendant", "ltree"),
+    ("_descendant_any", "ltree"),
+    ("_matches", "lquery"),
+    ("_matches_any", "lquery"),
+    ("_matches_fulltext", "ltxtquery"),
+];
+
+/// The operator each tree comparison becomes, and what its operand is cast to.
+///
+/// `?` is PostgreSQL's "any of these" for label paths, and is the same symbol
+/// jsonb uses for key existence -- different types, one spelling, which is why
+/// the cast is not optional.
+pub fn ltree_operator(comparison: &str) -> Option<(&'static str, &'static str)> {
+    Some(match comparison {
+        "_ancestor" => ("@>", "ltree"),
+        "_ancestor_any" => ("@>", "ltree[]"),
+        "_descendant" => ("<@", "ltree"),
+        "_descendant_any" => ("<@", "ltree[]"),
+        "_matches" => ("~", "lquery"),
+        "_matches_any" => ("?", "lquery[]"),
+        "_matches_fulltext" => ("@", "ltxtquery"),
+        _ => return None,
+    })
+}
+
 /// Spatial relations taking one other shape, for `geometry` columns.
 ///
 /// PostGIS names them `ST_Contains` and so on; Hasura spells each in the same
@@ -159,6 +193,18 @@ fn comparison_input(scalar: &str) -> InputObject {
                 TypeRef::named("st_intersects_nband_geom_input"),
             ));
     }
+    if scalar == "ltree" {
+        for (comparison, operand) in LTREE {
+            // The `_any` forms take a list of the same thing.
+            input = input.field(InputValue::new(
+                *comparison,
+                match comparison.ends_with("_any") {
+                    true => TypeRef::named_list(*operand),
+                    false => TypeRef::named(*operand),
+                },
+            ));
+        }
+    }
     if scalar == "jsonb" || scalar == "json" {
         for op in JSON {
             input = input.field(InputValue::new(*op, TypeRef::named(scalar)));
@@ -270,6 +316,11 @@ pub fn build_inputs(
     let mut named: HashSet<String> = scalars.clone();
     if scalars.contains("raster") {
         named.insert("geometry".to_string());
+    }
+    // The tree comparisons name the query types beside the path type.
+    if scalars.contains("ltree") {
+        named.insert("lquery".to_string());
+        named.insert("ltxtquery".to_string());
     }
 
     let mut comparisons: Vec<InputObject> =
