@@ -24,6 +24,7 @@
 
 use async_graphql::{Response, ServerError};
 use serde_json::{json, Map, Value};
+use std::collections::{HashMap, HashSet};
 
 /// Hasura's `extensions.code` for a server error.
 ///
@@ -205,7 +206,46 @@ mod tests {
 /// runs: this makes one specific refusal go away, not validation in general.
 /// A document that does not parse is handed on untouched, so the parse error is
 /// reported by the executor with its own position rather than by this.
-pub fn allow_unused_variables(mut request: async_graphql::Request) -> async_graphql::Request {
+pub fn allow_unused_variables(request: async_graphql::Request) -> async_graphql::Request {
+    prepare(None, request).unwrap_or_else(|(request, _)| request)
+}
+
+/// Ready a request for execution, and refuse it where async-graphql would not.
+///
+/// Two passes over the same parsed document, because parsing it twice to do
+/// them separately would be the only reason to separate them:
+///
+/// - variable declarations nothing uses are dropped, since Hasura executes
+///   such a document and the specification does not;
+/// - variables used where their declared type does not fit are refused, since
+///   the specification says so and async-graphql does not.
+///
+/// `schema` is what the second pass needs -- the types a variable is being
+/// used against. Without one only the first pass runs.
+///
+/// `Err` carries the request back beside the errors, so the caller can answer
+/// with them rather than executing.
+pub fn prepare(
+    schema: Option<&async_graphql::dynamic::Schema>,
+    request: async_graphql::Request,
+) -> Result<async_graphql::Request, (async_graphql::Request, Vec<ServerError>)> {
+    let mut request = drop_unused_variables(request);
+    if let Some(schema) = schema {
+        // Parsed again rather than threaded through: `set_parsed_query` takes
+        // the document by value and gives nothing back, and re-parsing a
+        // document that has already parsed once is not where the time goes.
+        if let Ok(doc) = async_graphql::parser::parse_query(&request.query) {
+            let errors = variable_errors(&doc, schema.registry(), &request.variables);
+            if !errors.is_empty() {
+                return Err((request, errors));
+            }
+        }
+    }
+    let _ = &mut request;
+    Ok(request)
+}
+
+fn drop_unused_variables(mut request: async_graphql::Request) -> async_graphql::Request {
     use async_graphql::parser::types::{
         DocumentOperations, ExecutableDocument, Selection, SelectionSet,
     };
@@ -359,5 +399,468 @@ mod unused_variable_tests {
     fn a_document_that_does_not_parse_is_left_alone() {
         let request = allow_unused_variables(async_graphql::Request::new("query ("));
         assert_eq!(request.query, "query (");
+    }
+}
+
+/// Refuse a variable used where its declared type does not fit.
+///
+/// The specification's "All Variable Usages Are Allowed" rule: `query
+/// ($limit: String) { author(limit: $limit) }` is invalid, because `limit` is
+/// an `Int` and a `String` is not one. async-graphql carries exactly this rule
+/// and it does not fire -- verified against 7.0.17 with a static schema, a
+/// dynamic one, and a built-in directive, none of which report -- so the check
+/// is made here instead. It is the one place where being lax is worse than
+/// being wrong: the client is answered with data when what it wrote cannot
+/// mean what it thinks, and it finds out from the rows.
+///
+/// The messages are Hasura's, since a client that shows them to a developer is
+/// showing text it already ships.
+fn variable_errors(
+    doc: &async_graphql::parser::types::ExecutableDocument,
+    registry: &async_graphql::registry::Registry,
+    variables: &async_graphql::Variables,
+) -> Vec<ServerError> {
+    use async_graphql::parser::types::{DocumentOperations, OperationType};
+
+    let mut errors: Vec<ServerError> = Vec::new();
+
+    let operations: Vec<&async_graphql::Positioned<
+        async_graphql::parser::types::OperationDefinition,
+    >> = match &doc.operations {
+        DocumentOperations::Single(operation) => vec![operation],
+        DocumentOperations::Multiple(operations) => operations.values().collect(),
+    };
+
+    for operation in operations {
+        let root = match operation.node.ty {
+            OperationType::Query => Some(registry.query_type.as_str()),
+            OperationType::Mutation => registry.mutation_type.as_deref(),
+            OperationType::Subscription => registry.subscription_type.as_deref(),
+        };
+        let Some(root) = root else { continue };
+
+        // What each variable was declared as, and what a null in it means.
+        let mut declared: HashMap<&str, String> = HashMap::new();
+        for definition in &operation.node.variable_definitions {
+            let name = definition.node.name.node.as_str();
+            let written = definition.node.var_type.node.to_string();
+            // A nullable declaration with a default behaves as a non-null
+            // one: the default stands in wherever the variable is left out.
+            // A default *of* null does not -- `$author: author_insert_input =
+            // null` still cannot be used where a non-null is expected, because
+            // what it stands in with is a null.
+            let defaulted = definition
+                .node
+                .default_value
+                .as_ref()
+                .is_some_and(|value| !matches!(value.node, async_graphql::Value::Null));
+            let effective = match (definition.node.var_type.node.nullable, defaulted) {
+                (true, true) => format!("{}!", written),
+                _ => written.clone(),
+            };
+            declared.insert(name, effective);
+
+            // An explicit null for a non-null variable. The default does not
+            // save it: a default stands in for a variable that was not given,
+            // not for one that was given as null.
+            let given = variables.get(&async_graphql::Name::new(name));
+            if !definition.node.var_type.node.nullable
+                && matches!(given, Some(async_graphql::Value::Null))
+            {
+                errors.push(coded(
+                    format!("null value found for non-nullable type: \"{}\"", written),
+                    definition.pos,
+                ));
+            }
+        }
+        if declared.is_empty() {
+            continue;
+        }
+
+        let mut scope = Usage {
+            registry,
+            fragments: &doc.fragments,
+            declared: &declared,
+            errors: &mut errors,
+            seen: HashSet::new(),
+        };
+        scope.selection_set(&operation.node.selection_set.node, root);
+    }
+
+    errors
+}
+
+/// One walk of a document, checking every variable against where it is used.
+struct Usage<'a> {
+    registry: &'a async_graphql::registry::Registry,
+    fragments: &'a std::collections::HashMap<
+        async_graphql::Name,
+        async_graphql::Positioned<async_graphql::parser::types::FragmentDefinition>,
+    >,
+    declared: &'a HashMap<&'a str, String>,
+    errors: &'a mut Vec<ServerError>,
+    /// Fragments already walked, so a cycle terminates. async-graphql refuses
+    /// cyclic fragments too, but this runs first.
+    seen: HashSet<String>,
+}
+
+impl Usage<'_> {
+    fn selection_set(
+        &mut self,
+        set: &async_graphql::parser::types::SelectionSet,
+        type_name: &str,
+    ) {
+        use async_graphql::parser::types::Selection;
+        use async_graphql::registry::MetaTypeName;
+
+        for selection in &set.items {
+            match &selection.node {
+                Selection::Field(field) => {
+                    let meta = self
+                        .registry
+                        .types
+                        .get(type_name)
+                        .and_then(|ty| ty.field_by_name(field.node.name.node.as_str()));
+                    for (name, value) in &field.node.arguments {
+                        let Some(argument) =
+                            meta.and_then(|meta| meta.args.get(name.node.as_str()))
+                        else {
+                            continue;
+                        };
+                        // A location with a default of its own accepts a
+                        // nullable variable where it says non-null, since
+                        // leaving the variable out is then the same as not
+                        // writing the argument.
+                        let expected = relax(&argument.ty, argument.default_value.is_some());
+                        self.value(&value.node, &expected, value.pos);
+                    }
+                    self.directives(&field.node.directives);
+                    if let Some(meta) = meta {
+                        let inner = MetaTypeName::concrete_typename(&meta.ty).to_string();
+                        self.selection_set(&field.node.selection_set.node, &inner);
+                    }
+                }
+                Selection::InlineFragment(fragment) => {
+                    let inner = fragment
+                        .node
+                        .type_condition
+                        .as_ref()
+                        .map(|condition| condition.node.on.node.to_string())
+                        .unwrap_or_else(|| type_name.to_string());
+                    self.directives(&fragment.node.directives);
+                    self.selection_set(&fragment.node.selection_set.node, &inner);
+                }
+                Selection::FragmentSpread(spread) => {
+                    let name = spread.node.fragment_name.node.to_string();
+                    self.directives(&spread.node.directives);
+                    if !self.seen.insert(name.clone()) {
+                        continue;
+                    }
+                    if let Some(fragment) =
+                        self.fragments.get(&async_graphql::Name::new(&name))
+                    {
+                        let on = fragment.node.type_condition.node.on.node.to_string();
+                        self.selection_set(&fragment.node.selection_set.node, &on);
+                    }
+                }
+            }
+        }
+    }
+
+    fn directives(
+        &mut self,
+        directives: &[async_graphql::Positioned<async_graphql::parser::types::Directive>],
+    ) {
+        for directive in directives {
+            let meta = self
+                .registry
+                .directives
+                .get(directive.node.name.node.as_str());
+            for (name, value) in &directive.node.arguments {
+                let Some(argument) = meta.and_then(|meta| meta.args.get(name.node.as_str()))
+                else {
+                    continue;
+                };
+                let expected = relax(&argument.ty, argument.default_value.is_some());
+                self.value(&value.node, &expected, value.pos);
+            }
+        }
+    }
+
+    /// One written value, against the type of the place it was written in.
+    fn value(
+        &mut self,
+        value: &async_graphql_value::Value,
+        expected: &str,
+        pos: async_graphql::Pos,
+    ) {
+        use async_graphql::registry::{MetaType, MetaTypeName};
+        use async_graphql_value::Value;
+
+        match value {
+            Value::Variable(name) => {
+                let Some(declared) = self.declared.get(name.as_str()) else {
+                    // Undefined, which async-graphql reports itself.
+                    return;
+                };
+                if !MetaTypeName::create(expected)
+                    .is_subtype(&MetaTypeName::create(declared))
+                {
+                    self.errors.push(coded(
+                        format!(
+                            "variable '{}' is declared as '{}', but used where '{}' is expected",
+                            name, declared, expected
+                        ),
+                        pos,
+                    ));
+                }
+            }
+            Value::List(items) => {
+                // A list may be written where one value is expected, in which
+                // case each item is checked against that same type -- which is
+                // what list input coercion means.
+                let inner = match MetaTypeName::create(expected).unwrap_non_null() {
+                    MetaTypeName::List(inner) => inner.to_string(),
+                    _ => expected.to_string(),
+                };
+                for item in items {
+                    self.value(item, &inner, pos);
+                }
+            }
+            Value::Object(fields) => {
+                let name = MetaTypeName::concrete_typename(expected);
+                let Some(MetaType::InputObject { input_fields, .. }) =
+                    self.registry.types.get(name)
+                else {
+                    return;
+                };
+                for (key, item) in fields {
+                    let Some(field) = input_fields.get(key.as_str()) else {
+                        continue;
+                    };
+                    let ty = relax(&field.ty, field.default_value.is_some());
+                    self.value(item, &ty, pos);
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+/// A location type as it accepts a variable, given whether it has a default.
+///
+/// A non-null location with a default takes a nullable variable: leaving that
+/// variable out is the same as not writing the argument, and the default then
+/// stands in. Without a default it does not.
+fn relax(ty: &str, has_default: bool) -> String {
+    match has_default {
+        true => ty.strip_suffix('!').unwrap_or(ty).to_string(),
+        false => ty.to_string(),
+    }
+}
+
+/// A validation failure, coded as one.
+fn coded(message: String, pos: async_graphql::Pos) -> ServerError {
+    let mut error = ServerError::new(message, Some(pos));
+    let mut extensions = async_graphql::ErrorExtensionValues::default();
+    extensions.set("code", "validation-failed");
+    error.extensions = Some(extensions);
+    error
+}
+
+#[cfg(test)]
+mod variable_position_tests {
+    use super::*;
+    use async_graphql::dynamic::*;
+
+    /// A schema with the shapes the rule has to reason about: a scalar
+    /// argument, a nested input object, a list, a non-null location, and a
+    /// non-null location that has a default.
+    fn schema() -> async_graphql::dynamic::Schema {
+        let filter = InputObject::new("author_bool_exp")
+            .field(InputValue::new("id", TypeRef::named("Int")));
+        let insert = InputObject::new("author_insert_input")
+            .field(InputValue::new("name", TypeRef::named("String")));
+        let query = Object::new("query_root").field(
+            Field::new("author", TypeRef::named_nn_list_nn("author"), |_| {
+                FieldFuture::new(async move { Ok(Some(async_graphql::Value::List(vec![]))) })
+            })
+            .argument(InputValue::new("limit", TypeRef::named("Int")))
+            .argument(InputValue::new("where", TypeRef::named("author_bool_exp"))),
+        );
+        let mutation = Object::new("mutation_root")
+            .field(
+                Field::new("insert_author_one", TypeRef::named("author"), |_| {
+                    FieldFuture::new(async move { Ok(None::<async_graphql::Value>) })
+                })
+                .argument(InputValue::new(
+                    "object",
+                    TypeRef::named_nn("author_insert_input"),
+                )),
+            )
+            .field(
+                Field::new("insert_author", TypeRef::named("author"), |_| {
+                    FieldFuture::new(async move { Ok(None::<async_graphql::Value>) })
+                })
+                .argument(InputValue::new(
+                    "objects",
+                    TypeRef::named_nn_list_nn("author_insert_input"),
+                ))
+                .argument(
+                    InputValue::new("update_columns", TypeRef::named_nn_list_nn("String"))
+                        .default_value(async_graphql::Value::List(Vec::new())),
+                ),
+            );
+        let author = Object::new("author").field(Field::new(
+            "id",
+            TypeRef::named("Int"),
+            |_| FieldFuture::new(async move { Ok(None::<async_graphql::Value>) }),
+        ));
+        Schema::build("query_root", Some("mutation_root"), None)
+            .register(filter)
+            .register(insert)
+            .register(author)
+            .register(query)
+            .register(mutation)
+            .finish()
+            .expect("the test schema builds")
+    }
+
+    fn refusals(query: &str, variables: &str) -> Vec<String> {
+        let request = async_graphql::Request::new(query)
+            .variables(async_graphql::Variables::from_json(
+                serde_json::from_str(variables).expect("the variables are JSON"),
+            ));
+        match prepare(Some(&schema()), request) {
+            Ok(_) => Vec::new(),
+            Err((_, errors)) => errors.into_iter().map(|e| e.message).collect(),
+        }
+    }
+
+    #[test]
+    fn a_variable_of_the_wrong_type_is_refused() {
+        assert_eq!(
+            refusals("query ($s: String) { author(limit: $s) { id } }", "{}"),
+            vec!["variable 's' is declared as 'String', but used where 'Int' is expected"]
+        );
+    }
+
+    #[test]
+    fn the_check_reaches_inside_an_input_object() {
+        assert_eq!(
+            refusals(
+                "query ($s: String) { author(where: {id: $s}) { id } }",
+                "{}"
+            ),
+            vec!["variable 's' is declared as 'String', but used where 'Int' is expected"]
+        );
+    }
+
+    #[test]
+    fn the_check_reaches_inside_a_list() {
+        assert_eq!(
+            refusals(
+                "mutation ($n: Int) { insert_author(objects: [{name: $n}]) { id } }",
+                "{}"
+            ),
+            vec!["variable 'n' is declared as 'Int', but used where 'String' is expected"]
+        );
+    }
+
+    #[test]
+    fn a_nullable_variable_cannot_fill_a_non_null_place() {
+        assert_eq!(
+            refusals(
+                "mutation ($a: author_insert_input) { insert_author_one(object: $a) { id } }",
+                "{}"
+            ),
+            vec![
+                "variable 'a' is declared as 'author_insert_input', but used where \
+                 'author_insert_input!' is expected"
+            ]
+        );
+    }
+
+    #[test]
+    fn a_default_lets_it() {
+        // The default stands in wherever the variable is left out, so the
+        // place can never actually see a null.
+        assert!(refusals(
+            "mutation ($a: author_insert_input = {name: \"x\"}) \
+             { insert_author_one(object: $a) { id } }",
+            "{}"
+        )
+        .is_empty());
+    }
+
+    #[test]
+    fn a_default_of_null_does_not() {
+        assert_eq!(
+            refusals(
+                "mutation ($a: author_insert_input = null) \
+                 { insert_author_one(object: $a) { id } }",
+                "{}"
+            ),
+            vec![
+                "variable 'a' is declared as 'author_insert_input', but used where \
+                 'author_insert_input!' is expected"
+            ]
+        );
+    }
+
+    #[test]
+    fn a_default_on_the_place_lets_it_too() {
+        // `update_columns` is non-null with a default: not writing the
+        // argument is allowed, so a variable that might be absent is too.
+        assert!(refusals(
+            "mutation ($c: [String!]) { insert_author(objects: [], update_columns: $c) { id } }",
+            "{}"
+        )
+        .is_empty());
+    }
+
+    #[test]
+    fn a_non_null_variable_fits_a_nullable_place() {
+        assert!(refusals("query ($n: Int!) { author(limit: $n) { id } }", "{\"n\": 1}").is_empty());
+    }
+
+    #[test]
+    fn a_non_null_variable_given_null_is_refused() {
+        assert_eq!(
+            refusals(
+                "query ($n: Int! = 1) { author(limit: $n) { id } }",
+                "{\"n\": null}"
+            ),
+            vec!["null value found for non-nullable type: \"Int!\""]
+        );
+    }
+
+    #[test]
+    fn a_nullable_variable_given_null_is_not() {
+        assert!(refusals(
+            "query ($n: Int) { author(limit: $n) { id } }",
+            "{\"n\": null}"
+        )
+        .is_empty());
+    }
+
+    #[test]
+    fn a_variable_used_through_a_fragment_is_checked() {
+        assert_eq!(
+            refusals(
+                "query ($s: String) { author { ...rows } } \
+                 fragment rows on author { id }",
+                "{}"
+            ),
+            Vec::<String>::new()
+        );
+        assert_eq!(
+            refusals(
+                "query ($s: String) { ...roots } \
+                 fragment roots on query_root { author(limit: $s) { id } }",
+                "{}"
+            ),
+            vec!["variable 's' is declared as 'String', but used where 'Int' is expected"]
+        );
     }
 }

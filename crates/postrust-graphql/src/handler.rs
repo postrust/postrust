@@ -2709,14 +2709,6 @@ fn row_json(expr: &str, column_types: &HashMap<String, String>) -> String {
     )
 }
 
-/// The column types of a table, for the helpers that take a map.
-fn column_types_of_table(table: &postrust_core::schema_cache::Table) -> HashMap<String, String> {
-    table
-        .columns
-        .values()
-        .map(|c| (c.name.clone(), c.nominal_type.clone()))
-        .collect()
-}
 
 /// Execute a SQL query and return results as serde_json::Value.
 /// We keep data as serde_json::Value so field resolvers can use try_downcast_ref.

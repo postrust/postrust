@@ -312,12 +312,24 @@ async fn main() -> Result<()> {
                 .with_session(session)
                 .with_write(Arc::clone(&write));
 
-                let request = postrust_graphql::hasura::allow_unused_variables(
+                let prepared = postrust_graphql::hasura::prepare(
+                    Some(&app_state.gql_state.schema),
                     req.into_inner(),
-                )
-                .data(gql_ctx)
-                .data(app_state.gql_state.pool.clone())
-                .data(Arc::clone(&app_state.gql_state.broker));
+                );
+                let request = match prepared {
+                    Ok(request) => request,
+                    // Refused before it ran: nothing was written, so there is
+                    // nothing to settle.
+                    Err((_, errors)) => {
+                        let mut response = async_graphql::Response::new(async_graphql::Value::Null);
+                        response.errors = errors;
+                        return Json(postrust_graphql::hasura::envelope(response));
+                    }
+                };
+                let request = request
+                    .data(gql_ctx)
+                    .data(app_state.gql_state.pool.clone())
+                    .data(Arc::clone(&app_state.gql_state.broker));
                 let mut response = app_state.gql_state.schema.execute(request).await;
 
                 if let Some(tx) = write.lock().await.take() {
