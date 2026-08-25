@@ -309,6 +309,9 @@ pub struct QueryField {
     /// `QueryField` of its own, so the name it was given rides along with the
     /// list field that spawns it.
     pub aggregate_name: Option<String>,
+    /// The description given to that aggregate root, if one was. `Some("")`
+    /// means metadata said it has none.
+    pub aggregate_description: Option<String>,
 }
 
 impl QueryField {
@@ -333,6 +336,7 @@ impl QueryField {
             pk_columns: Vec::new(),
             description: Some(format!("fetch data from the table: \"{}\"", table.name)),
             aggregate_name: None,
+            aggregate_description: None,
         }
     }
 
@@ -368,6 +372,7 @@ impl QueryField {
                 table.name
             )),
             aggregate_name: None,
+            aggregate_description: None,
         })
     }
 }
@@ -620,9 +625,15 @@ pub fn build_schema(schema_cache: &SchemaCache, config: &SchemaConfig) -> Genera
         // Add query fields. Each root may be named separately -- Hasura names
         // them one at a time, and a set that does not agree on a base name has
         // nowhere else to be written down.
+        // A root may be given a name, a description, or both. An empty
+        // description is one that was given and is empty: metadata said the
+        // field has none.
         let rename = |field: &mut QueryField, kind: &str| {
             if let Some(given) = config.names.root(&table.schema, &table.name, kind) {
                 field.name = given.to_string();
+            }
+            if let Some(comment) = config.names.root_comment(&table.schema, &table.name, kind) {
+                field.description = Some(comment.to_string()).filter(|c| !c.is_empty());
             }
         };
         let mut list = QueryField::list_named(table, &base_name);
@@ -633,6 +644,10 @@ pub fn build_schema(schema_cache: &SchemaCache, config: &SchemaConfig) -> Genera
         list.aggregate_name = config
             .names
             .root(&table.schema, &table.name, "select_aggregate")
+            .map(str::to_string);
+        list.aggregate_description = config
+            .names
+            .root_comment(&table.schema, &table.name, "select_aggregate")
             .map(str::to_string);
         query_fields.push(list);
         if let Some(mut by_pk) = QueryField::by_pk_named(table, &base_name) {
@@ -657,6 +672,12 @@ pub fn build_schema(schema_cache: &SchemaCache, config: &SchemaConfig) -> Genera
                 };
                 if let Some(given) = config.names.root(&table.schema, &table.name, kind) {
                     field.name = given.to_string();
+                }
+                if let Some(comment) =
+                    config.names.root_comment(&table.schema, &table.name, kind)
+                {
+                    field.description =
+                        Some(comment.to_string()).filter(|c| !c.is_empty());
                 }
             }
             mutation_fields.extend(fields);

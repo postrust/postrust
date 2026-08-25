@@ -200,7 +200,7 @@ RUST_LOG="postrust=debug,sqlx=info"
 
 | Variable | Description | Default |
 |----------|-------------|---------|
-| `PGRST_GRAPHQL_NAMES` | Names for tables, relationships and computed fields that the schema cannot supply. A JSON document, or a path to a file holding one. | unset (every name derived) |
+| `PGRST_GRAPHQL_NAMES` | Names for tables, columns, root fields, relationships and computed fields that the schema cannot supply. A JSON document, or a path to a file holding one. | unset (every name derived) |
 
 Almost everything in the generated GraphQL API is derived: a table's name gives
 its root fields, a foreign key gives a relationship, a function gives a
@@ -211,7 +211,9 @@ down. This is where those names go when a schema is migrated from one.
 ```json
 {
   "public.author": {
-    "name": "Author",
+    "name": "Authors",
+    "roots": { "select_by_pk": "Author", "select_aggregate": "AuthorAgg" },
+    "columns": { "id": "AuthorId" },
     "relationships": {
       "article_author_id_fkey": "posts",
       "fetch_articles_plain": "get_articles"
@@ -222,13 +224,44 @@ down. This is where those names go when a schema is migrated from one.
 ```
 
 - **`name`** replaces the base name every root field and type is built from, so
-  `Author`, `Author_by_pk`, `insert_Author`, `Author_bool_exp` and the rest all
-  follow from this one entry.
+  `Authors`, `Authors_by_pk`, `insert_Authors`, `Authors_bool_exp` and the rest
+  all follow from this one entry.
+- **`roots`** names a single root field, for the cases a base name cannot
+  reach: Hasura names each root independently, and `select_by_pk: Author`
+  beside `select: Authors` is not a pair one word derives. The keys are
+  Hasura's own — `select`, `select_by_pk`, `select_aggregate`, `insert`,
+  `insert_one`, `update`, `update_by_pk`, `delete`, `delete_by_pk`. Only the
+  field is renamed; the types keep the base name, which is what a generated
+  client reads them as.
+- **`columns`** exposes a column under another name, keyed by the column. This
+  is the one entry that reaches everywhere: the field is renamed in the rows
+  that come back, in `where`, in `order_by`, in `distinct_on`, in the key
+  arguments, in `_set` and `objects`, in `on_conflict.update_columns` and
+  inside every embed and aggregate. The database keeps its own name throughout.
 - **`relationships`** is keyed by *constraint* name, or by *function* name for a
   computed relationship, because a constraint names exactly one relationship
   even where two of them point at the same table. The name being replaced would
   not: that is what this is for.
 - **`computed_fields`** is keyed by the function behind the field.
+- **`comments`** carries the descriptions Hasura keeps in metadata rather than
+  in the database, under `table`, `columns`, `roots` and `computed_fields`. A
+  description given here replaces the database's own comment; an **empty
+  string** removes it, which is how `set_table_customization` says a field has
+  no description at all. Nothing said leaves the comment — or the generated
+  default — alone.
+
+```json
+{
+  "public.author": {
+    "comments": {
+      "table": "Everyone who has written something",
+      "columns": { "name": "As it should be printed" },
+      "roots": { "select": "Every author" },
+      "computed_fields": { "author_upper_name": "Shouted" }
+    }
+  }
+}
+```
 
 Keys are `schema.table`, so a table in the default schema is still
 `public.author`. A table absent from the document is exposed exactly as before.
@@ -252,9 +285,14 @@ scripts/hasura-names.py --file metadata.json > graphql-names.json
 
 It emits only the names that differ from what this server derives on its own,
 so the document is the exceptions rather than the whole schema — usually a
-short file. It converts names and nothing else: permissions, tracked-table
-lists, actions, remote schemas and event triggers are the metadata model rather
-than names, and this server does not have one.
+short file. Where a table's custom root fields all follow from one word, that
+word is carried as `name`, because it names the generated *types* as well and a
+client reads those too; whatever the word cannot account for is written down
+root by root.
+
+It converts names and descriptions and nothing else: permissions,
+tracked-table lists, actions, remote schemas and event triggers are the
+metadata model rather than names, and this server does not have one.
 
 Relationships can be keyed by constraint name, by the foreign key column, or by
 `table.column` on the far side. That is what lets the converter work from the
@@ -262,7 +300,7 @@ metadata alone: Hasura names a relationship by its column, and turning a column
 into the constraint that carries it would otherwise need a database connection.
 
 This is a lookup table, not a metadata model. It grants no permissions and
-tracks no tables; a name is all it can change. A document that cannot be read
+tracks no tables; what a client sees something called is all it can change. A document that cannot be read
 or parsed stops the server rather than being ignored — serving derived names
 instead would answer every request under a name the client does not send.
 

@@ -53,6 +53,10 @@ pub struct TableObjectType {
     pub name: String,
     /// Fields derived from columns.
     pub fields: Vec<GraphQLField>,
+    /// The type's description: the table's comment, or the one metadata gave
+    /// instead. `Some("")` is a description that was given and is empty, which
+    /// is how metadata says the type has none.
+    pub description: Option<String>,
 }
 
 impl TableObjectType {
@@ -116,6 +120,13 @@ impl TableObjectType {
                 if let Some(given) = names.column(&table.schema, &table.name, &column.name) {
                     field.name = given.to_string();
                 }
+                // A description given in metadata replaces the column's own
+                // comment, and an empty one removes it.
+                if let Some(comment) =
+                    names.column_comment(&table.schema, &table.name, &column.name)
+                {
+                    field.description = Some(comment.to_string()).filter(|c| !c.is_empty());
+                }
                 field
             })
             .collect();
@@ -131,13 +142,23 @@ impl TableObjectType {
             if fields.iter().any(|f| f.name == exposed) {
                 continue;
             }
-            fields.push(Self::computed_field(exposed, definition));
+            let mut field = Self::computed_field(exposed, definition);
+            if let Some(comment) = names.computed_comment(&table.schema, &table.name, function) {
+                field.description = Some(comment.to_string()).filter(|c| !c.is_empty());
+            }
+            fields.push(field);
         }
+
+        let description = names
+            .table_comment(&table.schema, &table.name)
+            .map(str::to_string)
+            .or_else(|| table.description.clone());
 
         Self {
             table: table.clone(),
             name,
             fields,
+            description,
         }
     }
 
@@ -148,7 +169,7 @@ impl TableObjectType {
 
     /// Get the description from table comment.
     pub fn description(&self) -> Option<&str> {
-        self.table.description.as_deref()
+        self.description.as_deref()
     }
 
     /// The name of the table itself, which is not always the type's: a

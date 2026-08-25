@@ -152,7 +152,9 @@ def tables_from_commands(paths):
                 )
             elif kind == "add_computed_field":
                 entry.setdefault("computed_fields", []).append(
-                    {"name": args.get("name"), "definition": args.get("definition")}
+                    {"name": args.get("name"),
+                     "definition": args.get("definition"),
+                     "comment": args.get("comment")}
                 )
             elif kind == "set_table_is_enum":
                 entry["is_enum"] = bool(args.get("is_enum", True))
@@ -305,11 +307,34 @@ IMPLIED_BASE = {
 
 
 def custom_roots(entry):
-    """The root names Hasura was told, keeping only the ones that are names."""
+    """The root names Hasura was told.
+
+    A root may be written as a bare name or as `{name, comment}`, and in the
+    second shape the name may be null -- which says "keep the derived name and
+    only change the comment". Both spellings appear in the same corpus.
+    """
     configuration = entry.get("configuration") or {}
-    return {root: value
-            for root, value in (configuration.get("custom_root_fields") or {}).items()
-            if isinstance(value, str) and value}
+    named = {}
+    for root, value in (configuration.get("custom_root_fields") or {}).items():
+        if isinstance(value, str):
+            name = value
+        elif isinstance(value, dict):
+            name = value.get("name")
+        else:
+            continue
+        if isinstance(name, str) and name:
+            named[root] = name
+    return named
+
+
+def custom_root_comments(entry):
+    """The comments Hasura was told to put on the root fields."""
+    configuration = entry.get("configuration") or {}
+    comments = {}
+    for root, value in (configuration.get("custom_root_fields") or {}).items():
+        if isinstance(value, dict) and isinstance(value.get("comment"), str):
+            comments[root] = value["comment"]
+    return comments
 
 
 def exposed_base(entry, table):
@@ -390,6 +415,34 @@ def convert(tables):
                    if isinstance(name, str) and name and name != column}
         if columns:
             given["columns"] = columns
+
+        # Comments. Hasura keeps a description in metadata as readily as a
+        # name, and where it does the database's own comment is not what a
+        # client sees -- an empty string is "no description", not "no opinion".
+        comments = {}
+        if isinstance(configuration.get("comment"), str):
+            comments["table"] = configuration["comment"]
+        column_comments = {
+            column: config["comment"]
+            for column, config in (configuration.get("column_config") or {}).items()
+            if isinstance(config, dict) and isinstance(config.get("comment"), str)
+        }
+        if column_comments:
+            comments["columns"] = column_comments
+        root_comments = {root: text for root, text in custom_root_comments(entry).items()
+                         if root in DERIVED_ROOTS}
+        if root_comments:
+            comments["roots"] = root_comments
+        computed_comments = {}
+        for field in entry.get("computed_fields") or []:
+            function = (field.get("definition") or {}).get("function")
+            _, function_name = qualified(function)
+            if function_name and isinstance(field.get("comment"), str):
+                computed_comments[function_name] = field["comment"]
+        if computed_comments:
+            comments["computed_fields"] = computed_comments
+        if comments:
+            given["comments"] = comments
 
         relationships = {}
         for kind, field in (("object", "object_relationships"),

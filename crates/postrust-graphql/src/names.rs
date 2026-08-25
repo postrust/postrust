@@ -20,7 +20,9 @@
 //! ```json
 //! {
 //!   "public.author": {
-//!     "name": "Author",
+//!     "name": "Authors",
+//!     "roots": { "select_by_pk": "Author" },
+//!     "columns": { "id": "AuthorId" },
 //!     "relationships": { "article_author_id_fkey": "posts" },
 //!     "computed_fields": { "automatic_comment_in_db_upper_name": "upper_name" }
 //!   }
@@ -33,6 +35,11 @@
 //! keying by it would mean writing down the answer to ask the question; and
 //! where two foreign keys point at one table the derived names collide, which
 //! is one of the cases this is for.
+//!
+//! Columns are keyed by the column, which is the same rule: the column is what
+//! the database has. It is also the entry that reaches furthest -- a renamed
+//! column is a name in the schema and in nothing else, so every path from a
+//! request to SQL translates it back.
 
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -69,6 +76,15 @@ pub struct TableNames {
     #[serde(default)]
     pub roots: HashMap<String, String>,
 
+    /// Descriptions Hasura keeps in metadata rather than in the database.
+    ///
+    /// A comment is not a name, and is here for the same reason the names are:
+    /// where metadata carries one, the database's own comment is not what a
+    /// client sees. An empty string is "no description", which is how
+    /// `set_table_customization` suppresses a comment the database has.
+    #[serde(default)]
+    pub comments: Comments,
+
     /// Field names for columns, keyed by the column.
     ///
     /// The one rename that is not a name for something derived: a column has a
@@ -93,6 +109,26 @@ pub struct TableNames {
     /// text.
     #[serde(default, rename = "enum")]
     pub is_enum: bool,
+}
+
+/// Descriptions given to one table and the things on it.
+///
+/// Every value is a description as written: an empty string means the field
+/// has none, which is a different answer from having said nothing.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct Comments {
+    /// The description of the table's own type.
+    #[serde(default)]
+    pub table: Option<String>,
+    /// Column descriptions, keyed by the column.
+    #[serde(default)]
+    pub columns: HashMap<String, String>,
+    /// Computed field descriptions, keyed by the function behind them.
+    #[serde(default)]
+    pub computed_fields: HashMap<String, String>,
+    /// Root field descriptions, keyed by the root: `select`, `insert_one`.
+    #[serde(default)]
+    pub roots: HashMap<String, String>,
 }
 
 /// Every name given, keyed by `schema.table`.
@@ -230,6 +266,42 @@ impl NameOverrides {
         self.table(schema, table)
             .map(|names| !names.columns.is_empty())
             .unwrap_or(false)
+    }
+
+    /// The description given to a table's type, if one was.
+    ///
+    /// `Some("")` is a description that was given and is empty, which means
+    /// the type has none. `None` means nothing was said and the database's own
+    /// comment stands.
+    pub fn table_comment(&self, schema: &str, table: &str) -> Option<&str> {
+        self.table(schema, table)?.comments.table.as_deref()
+    }
+
+    /// The description given to a column, by the column.
+    pub fn column_comment(&self, schema: &str, table: &str, column: &str) -> Option<&str> {
+        self.table(schema, table)?
+            .comments
+            .columns
+            .get(column)
+            .map(String::as_str)
+    }
+
+    /// The description given to a computed field, by its function.
+    pub fn computed_comment(&self, schema: &str, table: &str, function: &str) -> Option<&str> {
+        self.table(schema, table)?
+            .comments
+            .computed_fields
+            .get(function)
+            .map(String::as_str)
+    }
+
+    /// The description given to one root field, by its kind.
+    pub fn root_comment(&self, schema: &str, table: &str, kind: &str) -> Option<&str> {
+        self.table(schema, table)?
+            .comments
+            .roots
+            .get(kind)
+            .map(String::as_str)
     }
 
     /// The name given to a computed field, by its function.

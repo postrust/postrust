@@ -897,6 +897,9 @@ fn create_object_type(obj: &TableObjectType, relationships: &[RelationshipField]
     // one and a client generating documentation from the schema would
     // otherwise show a blank where it used to show this.
     object = match obj.description() {
+        // An empty description is one that was given and is empty: metadata
+        // said the type has none, which is not the same as saying nothing.
+        Some("") => object,
         Some(desc) => object.description(desc),
         None => object.description(format!(
             "columns and relationships of \"{}\"",
@@ -1198,11 +1201,15 @@ fn create_query_type(
                     )),
                 ))
                 .argument(InputValue::new("limit", TypeRef::named("Int")))
-                .argument(InputValue::new("offset", TypeRef::named("Int")))
-                .description(format!(
+                .argument(InputValue::new("offset", TypeRef::named("Int")));
+            agg_field = match field.aggregate_description.as_deref() {
+                Some("") => agg_field,
+                Some(given) => agg_field.description(given),
+                None => agg_field.description(format!(
                     "fetch aggregated fields from the table: \"{}\"",
                     field.table_name
-                ));
+                )),
+            };
             query = query.field(agg_field);
         }
     }
