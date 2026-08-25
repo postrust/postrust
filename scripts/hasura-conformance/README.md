@@ -111,9 +111,18 @@ into phantom failures in everything after it.
 ## Roles
 
 Header selection mirrors `validate.py`'s `check_query`, because the corpus
-relies on it: a case that names headers is speaking as that role, and a case
-that names none is speaking as admin and is sent the admin secret. Both
-servers receive identical headers.
+relies on it: the admin secret is attached to every case, and a case that also
+names `X-Hasura-Role` is asking to be treated as that role. Both servers
+receive identical headers.
+
+The two halves of that are one mechanism, not two. Naming a role is not an
+alternative to authenticating — it is something an authenticated caller asks
+for, and a role header arriving on its own is an unauthenticated request.
+Reading it as an alternative is what this harness did until run 38, and it
+cost every permission case in the corpus: the reference answered all 142 with
+`"x-hasura-admin-secret" required, but not found` and never reached its
+permission layer, while the report called them a difference between two
+permission models. `run.py`'s docstring carries the detail.
 
 Postrust has no metadata-defined permissions — it has database roles and row
 level security — so the permission cases are expected to diverge. They are

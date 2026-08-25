@@ -429,7 +429,11 @@ For a table `author`, with a to-many relationship `articles`:
 | `delete_author(where:)` | `affected_rows` and `returning { … }` |
 | `delete_author_by_pk(id: 1)` | the row removed |
 
-The root types are named `query_root` and `mutation_root`.
+The root types are named `query_root`, `mutation_root` and `subscription_root`.
+The subscription root mirrors the query root — `author`, `author_by_pk` and
+`author_aggregate`, with the same arguments — and each of its fields is a live
+query: the answer now, and the answer again whenever it changes. See
+[Realtime](./realtime.md).
 
 ### Queries
 
@@ -767,6 +771,24 @@ Two deliberate exceptions, both of them things Hasura accepts:
   a literal, which takes either spelling. `limit` is the exception to the
   exception and stays strict, because that is where Hasura draws the line
   too.
+
+### Batching
+
+A body that is a JSON *array* is several operations in one request, answered
+with an array of responses in the order they were sent — the shape Apollo's
+batching client sends and Hasura answers:
+
+```json
+[
+  { "query": "{ author { id } }" },
+  { "query": "mutation { insert_author(objects: {name: \"Ada\"}) { affected_rows } }" }
+]
+```
+
+Each entry is its own operation with its own transaction, and each answers for
+itself: one of them failing does not affect the others, and the array comes
+back whole. Batching saves round trips; naming several root fields inside one
+mutation is what makes several writes atomic.
 
 ### Errors
 

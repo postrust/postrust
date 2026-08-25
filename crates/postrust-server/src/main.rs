@@ -109,7 +109,7 @@ async fn main() -> Result<()> {
     // Add admin routes and GraphQL endpoint if feature is enabled
     #[cfg(feature = "admin-ui")]
     {
-        use async_graphql_axum::GraphQLRequest as GqlRequest;
+        use async_graphql_axum::GraphQLBatchRequest as GqlRequest;
         use axum::extract::State as AxumState;
         use axum::http::HeaderMap;
         use postrust_graphql::handler::GraphQLState;
@@ -211,8 +211,18 @@ async fn main() -> Result<()> {
             }
         }
 
+        // How often a live query re-reads itself with nothing having
+        // notified it. The notifications do the work; this is the floor
+        // under what a trigger cannot see -- a view, an embedded row on a
+        // table with no trigger, a predicate written against the clock.
+        let subscription_refresh_seconds = std::env::var("PGRST_SUBSCRIPTION_REFRESH")
+            .ok()
+            .and_then(|value| value.trim().parse::<u64>().ok())
+            .unwrap_or(30);
+
         let graphql_config = SchemaConfig {
             enable_subscriptions: true,
+            subscription_refresh_seconds,
             max_rows: config.db_max_rows,
             // The GraphQL schema was built for `public` whatever the server
             // was told to expose, so a table in any other schema of
@@ -259,11 +269,38 @@ async fn main() -> Result<()> {
             };
 
             // Wrapper handler that creates context from request with proper auth
+            /// A body that is a JSON *array* is a batch: several operations
+            /// in one request, answered with an array of responses in the
+            /// order they were sent. Each is its own operation with its own
+            /// transaction -- batching is a way to save round trips, not a
+            /// way to make several mutations atomic, which is what naming
+            /// several root fields in one mutation is for.
             async fn handle_graphql(
                 AxumState(app_state): AxumState<GraphQLAppState>,
                 headers: HeaderMap,
                 req: GqlRequest,
             ) -> Json<serde_json::Value> {
+                match req.0 {
+                    async_graphql::BatchRequest::Single(request) => {
+                        Json(one_graphql(app_state, headers, request).await)
+                    }
+                    async_graphql::BatchRequest::Batch(requests) => {
+                        let mut answers = Vec::with_capacity(requests.len());
+                        for request in requests {
+                            answers.push(
+                                one_graphql(app_state.clone(), headers.clone(), request).await,
+                            );
+                        }
+                        Json(serde_json::Value::Array(answers))
+                    }
+                }
+            }
+
+            async fn one_graphql(
+                app_state: GraphQLAppState,
+                headers: HeaderMap,
+                req: async_graphql::Request,
+            ) -> serde_json::Value {
                 // Extract auth header and authenticate
                 let auth_header = headers.get("authorization").and_then(|v| v.to_str().ok());
 
@@ -319,10 +356,8 @@ async fn main() -> Result<()> {
                 .with_session(session)
                 .with_write(Arc::clone(&write));
 
-                let prepared = postrust_graphql::hasura::prepare(
-                    Some(&app_state.gql_state.schema),
-                    req.into_inner(),
-                );
+                let prepared =
+                    postrust_graphql::hasura::prepare(Some(&app_state.gql_state.schema), req);
                 let request = match prepared {
                     Ok(request) => request,
                     // Refused before it ran: nothing was written, so there is
@@ -330,7 +365,7 @@ async fn main() -> Result<()> {
                     Err((_, errors)) => {
                         let mut response = async_graphql::Response::new(async_graphql::Value::Null);
                         response.errors = errors;
-                        return Json(postrust_graphql::hasura::envelope(response));
+                        return postrust_graphql::hasura::envelope(response);
                     }
                 };
                 let request = request
@@ -357,7 +392,7 @@ async fn main() -> Result<()> {
                     }
                 }
 
-                Json(postrust_graphql::hasura::envelope(response))
+                postrust_graphql::hasura::envelope(response)
             }
 
             /// Collect `x-hasura-*` claims from a verified token.
@@ -419,9 +454,13 @@ async fn main() -> Result<()> {
             // `/v1/graphql` is where a Hasura client sends its queries, and it is
             // the only address most of them can be told about: the endpoint is
             // baked into generated clients and codegen configs. `/api/graphql`
-            // keeps working for anything already pointed at it.
+            // keeps working for anything already pointed at it, and
+            // `/v1alpha1/graphql` is the address Hasura served before `/v1`
+            // and still answers on -- a client old enough to have been
+            // pointed there is exactly the one that cannot be repointed.
             app = app
                 .nest("/v1/graphql", graphql_app.clone())
+                .nest("/v1alpha1/graphql", graphql_app.clone())
                 .nest("/api/graphql", graphql_app);
         }
     }

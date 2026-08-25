@@ -114,8 +114,10 @@ def is_mutating(payload):
 
     Read off the operation keyword rather than the field names: a query named
     `insert_author` is still a query, and a mutation that only reads back is
-    still run inside one.
+    still run inside one. A batch is mutating if any operation in it is.
     """
+    if isinstance(payload, list):
+        return any(is_mutating(one) for one in payload if isinstance(one, dict))
     text = payload.get("query") or ""
     return re.search(r"(^|[\s{])mutation[\s({]", text) is not None
 
@@ -166,7 +168,14 @@ def main():
 
             for index, entry in enumerate(entries):
                 payload = entry.get("query") or {}
-                if not isinstance(payload, dict):
+                # A batch: the body is a JSON array of operations and the
+                # answer is an array of responses. One case, replayed as it
+                # was written -- splitting it would measure something else.
+                if isinstance(payload, list):
+                    payload = [one for one in payload if isinstance(one, dict)]
+                    if not payload:
+                        continue
+                elif not isinstance(payload, dict):
                     continue
                 cases.append({
                     "id": rel_file if len(entries) == 1 else f"{rel_file}#{index}",

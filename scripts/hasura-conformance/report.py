@@ -28,10 +28,8 @@ def parse(body):
         return False, body
 
 
-def outcome(body):
-    """What a client would branch on: data, errors, or something unreadable."""
-    ok, value = parse(body)
-    if not ok or not isinstance(value, dict):
+def one_outcome(value):
+    if not isinstance(value, dict):
         return "unparseable"
     if value.get("errors"):
         return "errors"
@@ -40,20 +38,50 @@ def outcome(body):
     return "neither"
 
 
+def outcome(body):
+    """What a client would branch on: data, errors, or something unreadable.
+
+    A batched request is answered with an *array* of responses, and it is one
+    case: any operation in it that errored is an error the client branches on,
+    which is the same rule a single response follows.
+    """
+    ok, value = parse(body)
+    if not ok:
+        return "unparseable"
+    if isinstance(value, list):
+        parts = [one_outcome(v) for v in value]
+        if not parts or any(p in ("unparseable", "neither") for p in parts):
+            return "unparseable"
+        return "errors" if "errors" in parts else "data"
+    return one_outcome(value)
+
+
 def data_of(body):
     ok, value = parse(body)
-    return value.get("data") if ok and isinstance(value, dict) else None
+    if not ok:
+        return None
+    if isinstance(value, list):
+        return [v.get("data") if isinstance(v, dict) else None for v in value]
+    return value.get("data") if isinstance(value, dict) else None
+
+
+def one_codes(value):
+    if not isinstance(value, dict):
+        return []
+    return [
+        e.get("extensions", {}).get("code")
+        for e in (value.get("errors") or [])
+        if isinstance(e, dict) and isinstance(e.get("extensions"), dict)
+    ]
 
 
 def codes_of(body):
     ok, value = parse(body)
-    if not ok or not isinstance(value, dict):
+    if not ok:
         return []
-    return sorted(
-        e.get("extensions", {}).get("code")
-        for e in (value.get("errors") or [])
-        if isinstance(e, dict) and isinstance(e.get("extensions"), dict)
-    )
+    if isinstance(value, list):
+        return sorted({code for v in value for code in one_codes(v)})
+    return sorted(one_codes(value))
 
 
 rows = []

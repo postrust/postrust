@@ -748,6 +748,29 @@ async fn subscription_type_is_present_when_enabled() {
         "no subscription fields were generated"
     );
 
+    // The subscription root mirrors the query root: a live query answers with
+    // the same rows the query does, under the same arguments.
+    let root = sdl
+        .split("type subscription_root")
+        .nth(1)
+        .expect("the subscription root is in the SDL");
+    let root = root.split("\n}").next().expect("the root type closes");
+    for expected in [
+        "widgets(",
+        "widgets_by_pk(",
+        "widgets_aggregate(",
+        "where: widgets_bool_exp",
+        "distinct_on: [widgets_select_column!]",
+        "): [widgets!]!",
+    ] {
+        assert!(
+            root.contains(expected),
+            "expected `{}` on the subscription root, got:{}",
+            expected,
+            root
+        );
+    }
+
     drop_schema(&pool, &schema).await;
 }
 
@@ -1487,5 +1510,116 @@ async fn count_answers_each_alias_with_what_that_alias_asked_for() {
     assert_eq!(aggregate["named"], serde_json::json!(4));
     assert_eq!(aggregate["categories"], serde_json::json!(2));
 
+    drop_schema(&pool, &schema).await;
+}
+
+/// A live query answers now, and answers again when what it answered stops
+/// being true. This drives the refresh rather than the notifications, because
+/// the test schema carries no trigger -- which is exactly the case the refresh
+/// is there for.
+#[tokio::test]
+#[ignore = "requires PostgreSQL"]
+async fn a_subscription_is_a_live_query() {
+    use futures::StreamExt;
+
+    let pool = connect().await;
+    let schema = unique_schema_name("livequery");
+    create_widgets_schema(&pool, &schema).await;
+
+    let schemas = vec![schema.clone()];
+    let cache = SchemaCache::load(&pool, &schemas)
+        .await
+        .expect("failed to load schema cache");
+    let state = Arc::new(
+        GraphQLState::new(
+            pool.clone(),
+            Arc::new(cache),
+            SchemaConfig {
+                exposed_schemas: schemas.clone(),
+                enable_mutations: true,
+                enable_subscriptions: true,
+                subscription_refresh_seconds: 1,
+                ..SchemaConfig::default()
+            },
+        )
+        .expect("failed to build GraphQL schema"),
+    );
+
+    let cache = SchemaCache::load(&pool, &schemas)
+        .await
+        .expect("failed to load schema cache");
+    let ctx = GraphQLContext::new(
+        pool.clone(),
+        SchemaCacheRef::from_static(cache),
+        AuthResult {
+            role: TEST_ROLE.to_string(),
+            claims: HashMap::new(),
+        },
+    );
+    let request = Request::new(
+        "subscription { widgets(where: {category: {_eq: \"books\"}}, order_by: [{id: asc}]) \
+         { id name } }",
+    )
+    .data(ctx)
+    .data(pool.clone());
+
+    let mut stream = state.schema.execute_stream(request);
+
+    // The answer now, before anything has changed: a live query has no window
+    // in which the client knows nothing.
+    let first = tokio::time::timeout(std::time::Duration::from_secs(10), stream.next())
+        .await
+        .expect("the first answer did not arrive")
+        .expect("the stream ended");
+    assert!(first.errors.is_empty(), "{:?}", first.errors);
+    let names = |response: &async_graphql::Response| -> Vec<String> {
+        serde_json::to_value(&response.data).expect("serialisable")["widgets"]
+            .as_array()
+            .expect("a list of widgets")
+            .iter()
+            .map(|row| row["name"].as_str().unwrap_or_default().to_string())
+            .collect()
+    };
+    assert_eq!(names(&first), vec!["alpha", "charlie"]);
+
+    // A row the subscription does not select is a wake and not a message: the
+    // refresh reads the query again, sees the same answer, and sends nothing.
+    pool.execute(
+        format!(
+            "INSERT INTO {}.widgets (name, category, price, stock) \
+             VALUES ('echo', 'tools', 1, 1)",
+            schema
+        )
+        .as_str(),
+    )
+    .await
+    .expect("insert failed");
+    let quiet = tokio::time::timeout(std::time::Duration::from_secs(3), stream.next()).await;
+    assert!(
+        quiet.is_err(),
+        "a change outside the subscription was sent to it: {:?}",
+        quiet.ok().flatten().map(|r| serde_json::to_value(&r.data))
+    );
+
+    // One it does select is answered again.
+    pool.execute(
+        format!(
+            "INSERT INTO {}.widgets (name, category, price, stock) \
+             VALUES ('foxtrot', 'books', 2, 2)",
+            schema
+        )
+        .as_str(),
+    )
+    .await
+    .expect("insert failed");
+
+    let next = tokio::time::timeout(std::time::Duration::from_secs(10), stream.next())
+        .await
+        .expect("the changed answer did not arrive")
+        .expect("the stream ended");
+    assert!(next.errors.is_empty(), "{:?}", next.errors);
+    assert_eq!(names(&next), vec!["alpha", "charlie", "foxtrot"]);
+
+    drop(stream);
     drop_schema(&pool, &schema).await;
 }

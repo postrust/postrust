@@ -22,6 +22,16 @@ pub struct SchemaConfig {
     pub enable_mutations: bool,
     /// Whether to generate subscription types
     pub enable_subscriptions: bool,
+
+    /// How often a live query re-reads itself when nothing has notified it.
+    ///
+    /// A subscription is woken by the trigger on the table it reads, which
+    /// costs nothing while nothing is written. A trigger cannot see
+    /// everything: a view has none, an embedded row may live in a table that
+    /// carries none, and a predicate written against the clock changes with
+    /// no write at all. This is how often those are noticed anyway. Seconds;
+    /// zero turns the refresh off and leaves only the notifications.
+    pub subscription_refresh_seconds: u64,
     /// The members of each enum table, keyed by `schema.table`, as
     /// `(value, comment)`.
     ///
@@ -51,6 +61,7 @@ impl Default for SchemaConfig {
             names: crate::names::NameOverrides::default(),
             enable_mutations: true,
             enable_subscriptions: false,
+            subscription_refresh_seconds: 30,
             max_rows: None,
         }
     }
@@ -78,6 +89,16 @@ impl SchemaConfig {
     pub fn with_subscriptions(mut self, enable: bool) -> Self {
         self.enable_subscriptions = enable;
         self
+    }
+
+    /// How often a live query re-reads itself when nothing has notified it.
+    pub fn subscription_refresh(&self) -> std::time::Duration {
+        match self.subscription_refresh_seconds {
+            // A zero interval is not a tick every instant; it is no tick at
+            // all, which leaves the notifications alone to wake it.
+            0 => std::time::Duration::from_secs(60 * 60 * 24 * 365),
+            seconds => std::time::Duration::from_secs(seconds),
+        }
     }
 
     /// Check if a schema is exposed.

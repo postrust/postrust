@@ -216,10 +216,23 @@ PY
 
 # --- reference -------------------------------------------------------------
 #
-# The expensive half, and its answers only change when Hasura's version or the
-# corpus does, so a previous run can be reused while iterating on the
-# candidate. Set HASURA_CONFORMANCE_REUSE_REF=1 to do that -- it reuses the
-# per-group dumps too, which is what the candidate phase reads.
+# The expensive half, and its answers only change when Hasura's version, the
+# corpus, or the harness itself does -- so a previous run can be reused while
+# iterating on the candidate. Set HASURA_CONFORMANCE_REUSE_REF=1 to do that --
+# it reuses the per-group dumps too, which is what the candidate phase reads.
+#
+# "or the harness itself" is not a caveat, it is the thing that went wrong.
+# `run.py` was changed to attach the admin secret to every case; every run
+# after that reused a reference recorded before it, in which 142 cases had
+# answered `access-denied` because the request was never authenticated. The
+# harness went on reporting a permission-model difference that had been fixed.
+# So the reference is stamped with what produced it, and a stamp that does not
+# match is replayed rather than reused.
+STAMP="$WORK/ref.stamp"
+harness_stamp() {
+    cat "$HERE/run.py" "$HERE/extract.py" "$WORK/cases.json" 2>/dev/null |
+        shasum -a 256 | cut -d' ' -f1
+}
 
 SNAPSHOT_CMD="docker exec -e PGPASSWORD=postgres $DB pg_dump -U postgres -d $DATA_DB \
     --no-owner --no-acl -N hdb_catalog -N hdb_views -N topology -N tiger -N tiger_data -N extensions \
@@ -233,9 +246,14 @@ DATA_SNAPSHOT_CMD="docker exec -e PGPASSWORD=postgres $DB pg_dump -U postgres -d
     -N hdb_catalog -N hdb_views -N topology -N tiger -N tiger_data -N extensions \
     -f /data-{group}.sql && docker cp $DB:/data-{group}.sql $WORK/dumps/{group}.data.sql"
 
-if [ "${HASURA_CONFORMANCE_REUSE_REF:-}" = "1" ] && [ -s "$WORK/ref.json" ]; then
+WANTED_STAMP="$(harness_stamp)"
+if [ "${HASURA_CONFORMANCE_REUSE_REF:-}" = "1" ] && [ -s "$WORK/ref.json" ] &&
+   [ "$(cat "$STAMP" 2>/dev/null)" = "$WANTED_STAMP" ]; then
     say "Reusing the recorded Hasura $HGE_VERSION responses"
 else
+    if [ "${HASURA_CONFORMANCE_REUSE_REF:-}" = "1" ] && [ -s "$WORK/ref.json" ]; then
+        say "The recorded responses were produced by a different harness -- replaying"
+    fi
     say "Replaying against Hasura $HGE_VERSION (reference)"
     create_databases
     docker rm -f "$REF" >/dev/null 2>&1 || true
@@ -256,6 +274,10 @@ else
         --snapshot-cmd "$SNAPSHOT_CMD && $DATA_SNAPSHOT_CMD" \
         --data-reset-cmd "docker exec -e PGPASSWORD=postgres $DB psql -q -U postgres -d $DATA_DB -v ON_ERROR_STOP=1 -f /truncate.sql -f /data-{group}.sql" \
         --teardown-cmd "docker exec -e PGPASSWORD=postgres $DB psql -q -U postgres -d $DATA_DB -f /sweep.sql"
+
+    # Written only after a replay that finished, so an interrupted one is not
+    # mistaken for a reusable reference.
+    printf '%s' "$WANTED_STAMP" > "$STAMP"
 fi
 
 # --- candidate -------------------------------------------------------------

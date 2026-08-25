@@ -67,6 +67,17 @@ pub fn function_fields_type_name(base_name: &str, function: &str) -> String {
     format!("{}_{}_fields", base_name, function)
 }
 
+/// Whether a column can be added to.
+///
+/// Everything that can be summed, and `money` beside them: PostgreSQL adds to
+/// an amount the way it adds to a number, and Hasura offers `_inc` on one.
+/// It is not in [`is_numeric`] because the aggregates that set answers --
+/// `stddev`, `variance` and their kin -- have no `money` form, and a schema
+/// that offered them would be advertising a call the database refuses.
+pub fn is_incrementable(graphql_type: &GraphQLType) -> bool {
+    is_numeric(graphql_type) || matches!(graphql_type, GraphQLType::Custom(name) if name == "money")
+}
+
 /// Whether a column can be summed and averaged.
 pub fn is_numeric(graphql_type: &GraphQLType) -> bool {
     matches!(

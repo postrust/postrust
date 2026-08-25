@@ -1,17 +1,22 @@
 # Realtime Subscriptions
 
-Postrust streams table changes to clients over GraphQL subscriptions, carried
-by PostgreSQL's own `LISTEN`/`NOTIFY`. A trigger publishes the changed row; the
-server is listening; the client sees it.
+A subscription in Postrust is a **live query**: the client asks the question
+once and is answered whenever the answer changes. It carries the same fields
+the query root does, takes the same arguments, and comes back with the same
+rows — the only difference is that it keeps coming back.
+
+What wakes it is PostgreSQL's own `LISTEN`/`NOTIFY`. A trigger publishes on the
+changed table, the server reads the query again, and it sends the new answer
+only if it differs from the one it sent last.
 
 ## Overview
 
 Subscriptions let an application:
 
-- receive live updates when data changes
+- keep a view of the data current without polling for it
 - build reactive dashboards and UIs
 - implement collaborative features
-- stream data to clients without polling
+- know that what is on screen is what is in the database
 
 ## Architecture
 
@@ -27,19 +32,40 @@ on a channel per table and fans each notification out to whoever asked for it.
 
 ## What a subscription is here
 
-**A subscription streams the rows that changed, one notification at a time.**
-It is not a live query: there is no initial result, no `where`, no `order_by`,
-no `limit`, and no aggregate. The field takes no arguments at all, and each
-message is the row a trigger published.
+**A subscription is a live query.** `subscription { orders(where: {status:
+{_eq: "open"}}, order_by: [{id: desc}], limit: 20) { id total } }` answers
+immediately with those twenty rows, and answers again with the whole current
+set whenever it stops being right. It is the same contract Hasura's
+subscriptions have, and a client generated against one works against this.
 
-That is worth being plain about, because the two models look alike and behave
-differently. A live query re-runs when anything it depends on changes and
-answers with the whole current result; this answers with one row, when that row
-changes. If you need the current state at connect time, query for it and then
-subscribe.
+The subscription root mirrors the query root, field for field:
 
-Views are not subscribable — a view has no rows of its own for a trigger to
-fire on.
+| Field | What it answers |
+|---|---|
+| `orders(where:, order_by:, distinct_on:, limit:, offset:)` | the rows, again on every change |
+| `orders_by_pk(id: 1)` | one row, again whenever it changes |
+| `orders_aggregate(where: …)` | `aggregate { count sum { … } }`, again on every change |
+
+**Two things wake it.** A trigger on the table publishes when a row is written,
+which is instant and costs nothing while nothing is being written. Beside it, a
+slow refresh re-reads the query every `PGRST_SUBSCRIPTION_REFRESH` seconds — 30
+by default — because a trigger cannot see everything a query can:
+
+- a **view** has no rows of its own for a trigger to fire on;
+- an **embedded row** may live in a table that carries no trigger, so
+  `orders { customer { name } }` would not notice the customer being renamed;
+- a predicate written against the **clock** — `where: {expires_at: {_lt:
+  "now()"}}` — changes with no write at all.
+
+Set the refresh to `0` to turn it off and leave only the notifications, which
+is the right setting when every subscribable table carries a trigger and no
+subscription depends on time. Set it lower to close the gap faster, at the cost
+of one query per subscriber per interval.
+
+**A wake is not a message.** Every wake re-reads the query and compares the
+answer with the one last sent; a write that changes a row the subscription does
+not select sends nothing. Clients see a message only when what they are looking
+at actually changed.
 
 ## Enabling subscriptions
 
@@ -51,34 +77,40 @@ ws://localhost:3000/v1/graphql/ws
 
 `ws://localhost:3000/api/graphql/ws` serves the same thing.
 
-The server listens on a channel per table at startup, so a table needs its
-trigger before anything is streamed from it. See [PostgreSQL
+Every table the query root exposes has a subscription, whether or not it
+carries a trigger: without one it is answered by the refresh alone, which is
+slower and works. Adding the trigger is what makes it instant. See [PostgreSQL
 setup](#postgresql-setup).
 
 ## GraphQL subscriptions
 
-The field is named after the table, and its type is the table's type — the same
-type a query returns, so the same fields select from it:
+The field is named after the table and takes what the query field takes:
 
 ```graphql
 subscription {
-  orders {
+  orders(
+    where: { status: { _eq: "open" } }
+    order_by: [{ created_at: desc }]
+    limit: 20
+  ) {
     id
     total
     status
+    customer { name }
   }
 }
 ```
 
-Each message carries one row: the new row for an insert or an update, the old
-row for a delete.
+Every message carries the whole current answer — the twenty rows as they are
+now — not a delta. That is what makes a live query simple to hold on the client
+side: replace what you had with what arrived.
 
 ### Narrowing what arrives
 
-Since the field takes no arguments, narrowing happens where the notification is
-published — in the trigger's `WHEN` clause. This is stricter than a client-side
-filter and cheaper than either: a row that does not qualify never becomes a
-notification, never crosses the socket, and never wakes the client.
+`where` narrows the answer, exactly as it does on a query. Narrowing what
+*wakes* the server is a second thing, and it happens in the trigger's `WHEN`
+clause: a row that does not qualify never becomes a notification, so the query
+is not re-read for it at all.
 
 ```sql
 CREATE TRIGGER postrust_notify_public_orders
@@ -87,6 +119,10 @@ CREATE TRIGGER postrust_notify_public_orders
     WHEN (COALESCE(NEW.total, OLD.total) > 1000)
     EXECUTE FUNCTION public.postrust_notify_public_orders_fn();
 ```
+
+The two are independent: a `WHEN` clause that is too narrow makes a
+subscription miss changes until the refresh catches them, and one that is too
+wide only costs a re-read that sends nothing.
 
 ## PostgreSQL setup
 
@@ -144,12 +180,25 @@ generates exactly this, if you would rather not write it per table.
 
 `pg_notify` refuses a payload over 8000 bytes — it raises `payload string too
 long`, which fails the transaction that wrote the row. A wide row, or one with
-a large `jsonb` column, will not fit: publish the key and let the client fetch
-the rest.
+a large `jsonb` column, will not fit. Nothing here reads the payload — it is
+the *signal* that matters, and the answer is read from the table afterwards —
+so a trigger that publishes only the key is enough, and safer:
+
+```sql
+PERFORM pg_notify('postrust_public_orders', jsonb_build_object(
+    'operation', TG_OP,
+    'table', TG_TABLE_NAME,
+    'schema', TG_TABLE_SCHEMA
+)::text);
+```
 
 A notification is delivered when the transaction commits, and is not delivered
 at all if it rolls back. That is the behaviour you want, and it means a
 subscriber sees nothing from a mutation that failed.
+
+`NOTIFY` is not replicated to a physical standby. Every server instance serving
+subscriptions has to be connected to the primary; one pointed at a read replica
+would be answered by the refresh alone.
 
 ## Client integration
 
@@ -171,7 +220,7 @@ const unsubscribe = client.subscribe(
   {
     query: `
       subscription {
-        orders {
+        orders(where: { status: { _eq: "open" } }, limit: 20) {
           id
           total
           status
@@ -180,7 +229,7 @@ const unsubscribe = client.subscribe(
     `,
   },
   {
-    next: (data) => console.log('Order changed:', data),
+    next: (data) => console.log('Open orders now:', data.data.orders),
     error: (err) => console.error('Subscription error:', err),
     complete: () => console.log('Subscription complete'),
   }
@@ -191,12 +240,15 @@ const unsubscribe = client.subscribe(
 
 ### React with Apollo Client
 
+Every message is the whole current answer, so the component renders what
+arrived rather than accumulating it:
+
 ```tsx
 import { useSubscription, gql } from '@apollo/client';
 
-const ORDER_CHANGES = gql`
-  subscription OnOrderChange {
-    orders {
+const OPEN_ORDERS = gql`
+  subscription OpenOrders {
+    orders(where: { status: { _eq: "open" } }, order_by: [{ id: desc }]) {
       id
       total
       status
@@ -204,17 +256,13 @@ const ORDER_CHANGES = gql`
   }
 `;
 
-function OrderFeed() {
-  const [seen, setSeen] = useState<Order[]>([]);
-  const { error } = useSubscription(ORDER_CHANGES, {
-    onData: ({ data }) => setSeen((rows) => [data.data.orders, ...rows]),
-  });
+function OrderList() {
+  const { data, error } = useSubscription(OPEN_ORDERS);
 
   if (error) return <p>Error: {error.message}</p>;
-
   return (
     <ul>
-      {seen.map((order) => (
+      {(data?.orders ?? []).map((order) => (
         <li key={order.id}>Order #{order.id} — {order.status}</li>
       ))}
     </ul>
@@ -222,28 +270,22 @@ function OrderFeed() {
 }
 ```
 
-Each message is one row, so the client accumulates them. Apollo's cache will
-not assemble a list for you here the way it does for a live query.
-
 ### React with urql
 
 ```tsx
 import { useSubscription } from 'urql';
 
-const OrderChanges = `
+const OpenOrders = `
   subscription {
-    orders { id total status }
+    orders(where: { status: { _eq: "open" } }) { id total status }
   }
 `;
 
 function OrderList() {
-  const [result] = useSubscription(
-    { query: OrderChanges },
-    (rows: Order[] = [], data) => [data.orders, ...rows]
-  );
+  const [result] = useSubscription({ query: OpenOrders });
 
   if (result.error) return <p>Error!</p>;
-  return <ul>{(result.data ?? []).map((o) => <li key={o.id}>#{o.id}</li>)}</ul>;
+  return <ul>{(result.data?.orders ?? []).map((o) => <li key={o.id}>#{o.id}</li>)}</ul>;
 }
 ```
 
@@ -260,21 +302,30 @@ const client = createClient({
 });
 ```
 
-**Row-level security does not filter a notification.** A policy is evaluated
-against a query, and a notification is not a query — it comes from a trigger
-that ran as whoever wrote the row. A subscriber on a table therefore sees every
-change published on it. Where that matters, publish only what everyone may see:
-narrow the trigger, or notify a key and let the client read the row back
-through a query, where the policy does apply.
+**Row-level security applies, because the answer is a query.** Each re-read
+runs as the subscriber's own role in its own transaction, so a policy filters a
+live query exactly as it filters the query it was written from. A notification
+only says "look again"; it never carries a row to a client that could not have
+read it.
 
 ## Performance
 
-- **One PostgreSQL connection** serves every subscriber. Adding subscribers
-  costs a channel entry and a broadcast, not a connection.
+- **One PostgreSQL connection carries every notification**, whatever the
+  number of subscribers or of server instances: `NOTIFY` is a broadcast, and
+  each instance holds one `LISTEN` connection. Adding an instance costs one
+  connection and a copy of the signal.
+- **What a wake costs is one re-read of that subscriber's query.** Idle costs
+  nothing: with no writes and the refresh off, a thousand subscribers generate
+  no database work at all.
 - **Publish narrowly.** A trigger `WHEN` clause is the cheapest filter
-  available: it stops the notification from existing.
-- **Select only the fields you need** — the payload is what the trigger built,
-  but what crosses the socket is what the selection asked for.
+  available: it stops the wake from existing, so the query is never re-read.
+- **Raise `PGRST_SUBSCRIPTION_REFRESH`** where every subscribable table has a
+  trigger and nothing depends on the clock — or set it to `0`. It is a floor
+  under correctness, not the main mechanism, and every tick is a query per
+  subscriber.
+- **Narrow the subscription itself.** A `limit` bounds what is re-read and what
+  crosses the socket, and an answer that is smaller is also less likely to have
+  changed.
 - **Debounce at the database** for high-frequency tables, by making the trigger
   statement-level or by rate-limiting inside it.
 
@@ -288,8 +339,11 @@ CREATE TRIGGER postrust_notify_public_ticks
 
 ## Troubleshooting
 
-**Nothing arrives.** Check the trigger exists and that its channel name matches
-`postrust_<schema>_<table>` exactly, then watch it by hand:
+**The first answer arrives and nothing else does.** That is the trigger, not
+the subscription: without one, changes are noticed by the refresh, so the delay
+is up to `PGRST_SUBSCRIPTION_REFRESH` seconds. Check the trigger exists and
+that its channel name matches `postrust_<schema>_<table>` exactly, then watch it
+by hand:
 
 ```sql
 LISTEN postrust_public_orders;

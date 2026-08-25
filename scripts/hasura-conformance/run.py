@@ -100,11 +100,28 @@ def apply_fixtures(paths, corpus, hasura_url, secret, tolerate_errors=False):
 
 
 def send(base, case, secret):
-    """Send one case. Header selection mirrors validate.py's check_query: a
-    case that names headers is speaking as that role, and one that names none
-    is speaking as admin."""
+    """Send one case, with the admin secret attached whenever there is one.
+
+    This is what `validate.py`'s `check_query` does, and getting it wrong is
+    the most expensive fault this harness has had. The secret used to be
+    attached only to a case that named no headers, on the reading that a case
+    naming `X-Hasura-Role: user` is speaking as that role and should not also
+    be speaking as admin. That is not how Hasura works: the role header is how
+    an *admin-authenticated* caller asks to be treated as another role, and
+    without the secret beside it the engine never reaches its permission layer
+    at all. All 142 cases that name a role came back with the same answer --
+    `"x-hasura-admin-secret" required, but not found` -- and were recorded as
+    permission denials, which is what they look like from the outside: status
+    200, code `access-denied`. Their own YAML expects rows.
+
+    So the reference never evaluated a single permission rule, and the 142
+    were counted as a difference between the two permission models rather than
+    as an unauthenticated request. `check_query` attaches the secret whenever
+    one is configured and no webhook is in play, headers or not, which is the
+    condition below.
+    """
     headers = dict(case["headers"])
-    if not headers and secret:
+    if secret:
         headers["X-Hasura-Admin-Secret"] = secret
 
     record = {k: case[k] for k in ("id", "group", "file", "seq", "url", "mutating")}

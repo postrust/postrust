@@ -9,14 +9,13 @@ use crate::schema::object::TableObjectType;
 use crate::schema::relationship::RelationshipField;
 use crate::schema::{build_schema, GeneratedSchema, MutationType, SchemaConfig};
 use crate::subscription::{
-    generate_subscription_fields, NotifyBroker, SubscriptionField as SubField, TableChangePayload,
+    generate_subscription_fields, NotifyBroker, SubscriptionField as SubField,
 };
 use async_graphql::dynamic::*;
 use async_graphql::Value;
 use async_graphql_axum::{GraphQLRequest, GraphQLResponse};
 use axum::extract::State;
 use axum::response::IntoResponse;
-use futures::stream::StreamExt;
 use postrust_core::schema_cache::SchemaCache;
 use sqlx::PgPool;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
@@ -65,6 +64,7 @@ impl GraphQLState {
             },
             config.max_rows,
             Arc::new(config.names.clone()),
+            config.subscription_refresh(),
         )?;
 
         Ok(Self {
@@ -96,6 +96,7 @@ impl GraphQLState {
             },
             self.config.max_rows,
             Arc::new(self.config.names.clone()),
+            self.config.subscription_refresh(),
         )?;
         Ok(())
     }
@@ -302,6 +303,7 @@ fn build_dynamic_schema(
     subscription_fields: Option<&[SubField]>,
     max_rows: Option<i64>,
     names: Arc<crate::names::NameOverrides>,
+    subscription_refresh: std::time::Duration,
 ) -> Result<Schema, GraphQLError> {
     // Create object types for each table
     let mut object_types: HashMap<String, Object> = HashMap::new();
@@ -399,7 +401,15 @@ fn build_dynamic_schema(
     };
 
     // Create subscription type if enabled
-    let subscription = subscription_fields.map(create_subscription_type);
+    let subscription = subscription_fields.map(|_| {
+        create_subscription_type(
+            generated,
+            max_rows,
+            Arc::clone(&relationships),
+            Arc::clone(&names),
+            subscription_refresh,
+        )
+    });
 
     // Build schema
     // `query_root`, not `Query`. The root type's name is not private to the
@@ -631,7 +641,7 @@ fn build_dynamic_schema(
                 ));
                 // Only a number can be added to, and a list of them is not a
                 // number: `_inc` takes the scalar or nothing.
-                if crate::schema::aggregate::is_numeric(&field.graphql_type) {
+                if crate::schema::aggregate::is_incrementable(&field.graphql_type) {
                     any_numeric = true;
                     numeric = numeric.field(InputValue::new(
                         &field.name,
@@ -1423,6 +1433,69 @@ fn create_object_type(obj: &TableObjectType, relationships: &[RelationshipField]
     object
 }
 
+/// A root field, whichever root it is on.
+///
+/// A query field and a subscription field take the same arguments and mean the
+/// same by them -- the difference is only whether the answer is sent once or
+/// whenever it changes -- and the two builders share no trait of their own, so
+/// this is what lets the argument list be written once.
+trait RootField: Sized {
+    fn with_argument(self, value: InputValue) -> Self;
+}
+
+impl RootField for Field {
+    fn with_argument(self, value: InputValue) -> Self {
+        self.argument(value)
+    }
+}
+
+impl RootField for SubscriptionField {
+    fn with_argument(self, value: InputValue) -> Self {
+        self.argument(value)
+    }
+}
+
+/// The five arguments that narrow a set of rows, in the order Hasura lists
+/// them.
+fn with_row_arguments<F: RootField>(field: F, type_name: &str) -> F {
+    field
+        .with_argument(InputValue::new(
+            "distinct_on",
+            TypeRef::named_nn_list(crate::input::order_by::select_column_type_name(type_name)),
+        ))
+        .with_argument(InputValue::new("limit", TypeRef::named("Int")))
+        .with_argument(InputValue::new("offset", TypeRef::named("Int")))
+        .with_argument(InputValue::new(
+            "order_by",
+            TypeRef::named_nn_list(crate::input::order_by::order_by_type_name(type_name)),
+        ))
+        .with_argument(InputValue::new(
+            "where",
+            TypeRef::named(crate::input::bool_exp::bool_exp_type_name(type_name)),
+        ))
+}
+
+/// One argument per primary key column, named and typed after the column
+/// itself rather than assuming an integer `id`.
+fn with_key_arguments<F: RootField>(
+    field: F,
+    schema_name: &str,
+    table_name: &str,
+    pk_columns: &[(String, String)],
+    names: &crate::names::NameOverrides,
+) -> F {
+    let mut field = field;
+    for (column, pg_type) in pk_columns {
+        field = field.with_argument(InputValue::new(
+            names
+                .column(schema_name, table_name, column)
+                .unwrap_or(column),
+            TypeRef::named_nn(pk_argument_type(pg_type)),
+        ));
+    }
+    field
+}
+
 /// Create the Query type with all table query fields.
 fn create_query_type(
     generated: &GeneratedSchema,
@@ -1463,38 +1536,16 @@ fn create_query_type(
         });
 
         // Add standard query arguments
-        if !is_by_pk {
-            gql_field = gql_field
-                .argument(InputValue::new(
-                    "where",
-                    TypeRef::named(crate::input::bool_exp::bool_exp_type_name(&spec_type_name)),
-                ))
-                .argument(InputValue::new(
-                    "order_by",
-                    TypeRef::named_nn_list(crate::input::order_by::order_by_type_name(
-                        &spec_type_name,
-                    )),
-                ))
-                .argument(InputValue::new(
-                    "distinct_on",
-                    TypeRef::named_nn_list(crate::input::order_by::select_column_type_name(
-                        &spec_type_name,
-                    )),
-                ))
-                .argument(InputValue::new("limit", TypeRef::named("Int")))
-                .argument(InputValue::new("offset", TypeRef::named("Int")));
-        } else {
-            // One required argument per primary key column, named and typed
-            // after the column itself rather than assuming an integer `id`.
-            for (col_name, pg_type) in &pk_columns {
-                gql_field = gql_field.argument(InputValue::new(
-                    names
-                        .column(&field.schema_name, &field.table_name, col_name)
-                        .unwrap_or(col_name),
-                    TypeRef::named_nn(pk_argument_type(pg_type)),
-                ));
-            }
-        }
+        gql_field = match is_by_pk {
+            false => with_row_arguments(gql_field, &spec_type_name),
+            true => with_key_arguments(
+                gql_field,
+                &field.schema_name,
+                &field.table_name,
+                &pk_columns,
+                names.as_ref(),
+            ),
+        };
 
         if let Some(desc) = &field.description {
             gql_field = gql_field.description(desc);
@@ -1513,6 +1564,7 @@ fn create_query_type(
                 max_rows,
                 relationships: Arc::clone(&relationships),
                 names: Arc::clone(&names),
+                call: None,
             });
             let aggregate_field_name = field
                 .aggregate_name
@@ -1529,25 +1581,7 @@ fn create_query_type(
                     FieldFuture::new(async move { resolve_aggregate(&ctx, &agg_spec).await })
                 },
             );
-            agg_field = agg_field
-                .argument(InputValue::new(
-                    "where",
-                    TypeRef::named(crate::input::bool_exp::bool_exp_type_name(&spec_type_name)),
-                ))
-                .argument(InputValue::new(
-                    "order_by",
-                    TypeRef::named_nn_list(crate::input::order_by::order_by_type_name(
-                        &spec_type_name,
-                    )),
-                ))
-                .argument(InputValue::new(
-                    "distinct_on",
-                    TypeRef::named_nn_list(crate::input::order_by::select_column_type_name(
-                        &spec_type_name,
-                    )),
-                ))
-                .argument(InputValue::new("limit", TypeRef::named("Int")))
-                .argument(InputValue::new("offset", TypeRef::named("Int")));
+            agg_field = with_row_arguments(agg_field, &spec_type_name);
             agg_field = match field.aggregate_description.as_deref() {
                 Some("") => agg_field,
                 Some(given) => agg_field.description(given),
@@ -1659,7 +1693,7 @@ fn create_mutation_type(
         .filter(|(_, object)| {
             object.fields.iter().any(|field| {
                 object.table.get_column(&field.name).is_some()
-                    && crate::schema::aggregate::is_numeric(&field.graphql_type)
+                    && crate::schema::aggregate::is_incrementable(&field.graphql_type)
             })
         })
         .map(|(type_name, _)| type_name.clone())
@@ -1821,59 +1855,282 @@ fn create_mutation_type(
     mutation
 }
 
-/// Create the Subscription type with all subscription fields.
-fn create_subscription_type(fields: &[SubField]) -> Subscription {
-    let mut subscription = Subscription::new("subscription_root");
+/// Create the Subscription type: the query root, answered again on change.
+///
+/// A subscription here is a **live query**. It carries the same fields the
+/// query root does, takes the same arguments, and answers with the same rows
+/// -- the difference is that the answer is sent again whenever it stops being
+/// true. That is the contract a client generated against Hasura expects, and
+/// the reason its `subscription_root` is a mirror of its `query_root`.
+///
+/// What wakes it is this server's own: a trigger publishes on the changed
+/// table and the query is read again, which costs nothing while nothing is
+/// written and answers in milliseconds when something is. A trigger cannot
+/// see everything a query can -- a view has none, an embedded row may live in
+/// a table that carries none, and `where: {expires_at: {_lt: "now()"}}`
+/// changes with no write at all -- so a slow refresh runs beside it and
+/// closes exactly those gaps. Polling alone is what Hasura does, and it pays
+/// for every subscriber every tick whether or not anything happened.
+fn create_subscription_type(
+    generated: &GeneratedSchema,
+    max_rows: Option<i64>,
+    relationships: Arc<HashMap<String, Vec<RelationshipField>>>,
+    names: Arc<crate::names::NameOverrides>,
+    refresh: std::time::Duration,
+) -> Subscription {
+    let mut roots: Vec<(String, SubscriptionField)> = Vec::new();
 
-    for field in fields {
-        let channel_name = field.channel_name();
-        let return_type = TypeRef::named(&field.return_type);
-        let field_name = field.name.clone();
-        let description = field.description.clone();
+    for field in &generated.query_fields {
+        let spec_type_name = field.type_name.clone();
+        let pk_columns = field.pk_columns.clone();
+        let is_by_pk = field.is_by_pk;
+        let return_type = graphql_type_ref(&field.return_type);
+        let watched = vec![crate::subscription::table_channel_name(
+            &field.schema_name,
+            &field.table_name,
+        )];
 
-        let gql_field = SubscriptionField::new(&field_name, return_type, move |ctx| {
-            let channel_name = channel_name.clone();
+        let spec = Arc::new(QueryFieldSpec {
+            schema_name: field.schema_name.clone(),
+            table_name: field.table_name.clone(),
+            type_name: field.type_name.clone(),
+            is_by_pk,
+            pk_columns: pk_columns.clone(),
+            max_rows,
+            relationships: Arc::clone(&relationships),
+            names: Arc::clone(&names),
+            call: None,
+        });
+
+        let mut gql_field = SubscriptionField::new(&field.name, return_type, move |ctx| {
+            let spec = Arc::clone(&spec);
+            let watched = watched.clone();
             SubscriptionFieldFuture::new(async move {
-                let broker_arc = ctx.data::<Arc<RwLock<Option<NotifyBroker>>>>()?;
-                let broker_guard = broker_arc.read().await;
-
-                let broker = broker_guard.as_ref().ok_or_else(|| {
-                    async_graphql::Error::new("Subscription broker not initialized")
-                })?;
-
-                let stream = broker
-                    .subscribe(&channel_name)
-                    .await
-                    .map_err(|e| async_graphql::Error::new(format!("Subscription error: {}", e)))?;
-
-                // Transform notification stream to GraphQL values
-                // Use FieldValue::value() so field resolvers can use as_value()
-                let value_stream = stream.filter_map(|notification| async move {
-                    match TableChangePayload::from_payload(&notification.payload) {
-                        Ok(payload) => payload
-                            .data()
-                            .map(|data| Ok(FieldValue::value(json_to_value(data.clone())))),
-                        Err(e) => {
-                            debug!("Failed to parse notification payload: {}", e);
-                            None
-                        }
-                    }
-                });
-
-                Ok(value_stream)
+                let wake = wake_on(&ctx, &watched, refresh).await;
+                Ok(live(ctx, LiveSource::Rows(spec), wake))
             })
         });
 
-        let gql_field = if let Some(desc) = description {
-            gql_field.description(desc)
-        } else {
-            gql_field
+        gql_field = match is_by_pk {
+            false => with_row_arguments(gql_field, &spec_type_name),
+            true => with_key_arguments(
+                gql_field,
+                &field.schema_name,
+                &field.table_name,
+                &pk_columns,
+                names.as_ref(),
+            ),
         };
+        if let Some(desc) = &field.description {
+            gql_field = gql_field.description(desc);
+        }
+        roots.push((field.name.clone(), gql_field));
 
-        subscription = subscription.field(gql_field);
+        if is_by_pk {
+            continue;
+        }
+
+        // The same rows, with numbers about them, watched the same way.
+        let agg_spec = Arc::new(AggregateSpec {
+            schema_name: field.schema_name.clone(),
+            table_name: field.table_name.clone(),
+            type_name: field.type_name.clone(),
+            max_rows,
+            relationships: Arc::clone(&relationships),
+            names: Arc::clone(&names),
+            call: None,
+        });
+        let agg_watched = vec![crate::subscription::table_channel_name(
+            &field.schema_name,
+            &field.table_name,
+        )];
+        let agg_name = field
+            .aggregate_name
+            .clone()
+            .unwrap_or_else(|| crate::schema::aggregate::aggregate_type_name(&field.type_name));
+        let mut agg_field = SubscriptionField::new(
+            agg_name.clone(),
+            TypeRef::named_nn(crate::schema::aggregate::aggregate_type_name(
+                &field.type_name,
+            )),
+            move |ctx| {
+                let agg_spec = Arc::clone(&agg_spec);
+                let watched = agg_watched.clone();
+                SubscriptionFieldFuture::new(async move {
+                    let wake = wake_on(&ctx, &watched, refresh).await;
+                    Ok(live(ctx, LiveSource::Aggregate(agg_spec), wake))
+                })
+            },
+        );
+        agg_field = with_row_arguments(agg_field, &spec_type_name);
+        agg_field = match field.aggregate_description.as_deref() {
+            Some("") => agg_field,
+            Some(given) => agg_field.description(given),
+            None => agg_field.description(format!(
+                "fetch aggregated fields from the table: \"{}\"",
+                field.table_name
+            )),
+        };
+        roots.push((agg_name, agg_field));
     }
 
+    roots.sort_by(|(a, _), (b, _)| a.cmp(b));
+    let mut subscription = Subscription::new("subscription_root");
+    // A GraphQL object may not have no fields, and a schema that exposes no
+    // table still has a subscription root if subscriptions are on.
+    if roots.is_empty() {
+        return subscription.field(SubscriptionField::new(
+            "no_subscriptions_available",
+            TypeRef::named("String"),
+            |_| {
+                SubscriptionFieldFuture::new(async move {
+                    Ok(futures::stream::empty::<
+                        Result<FieldValue, async_graphql::Error>,
+                    >())
+                })
+            },
+        ));
+    }
+    for (_, field) in roots {
+        subscription = subscription.field(field);
+    }
     subscription
+}
+
+/// What tells a live query its answer may have changed.
+///
+/// Every notification on the tables it reads, and a slow tick beside them.
+/// Yields once per wake and never ends -- a subscription lasts as long as the
+/// client holds it open.
+async fn wake_on(
+    ctx: &ResolverContext<'_>,
+    channels: &[String],
+    refresh: std::time::Duration,
+) -> futures::stream::BoxStream<'static, ()> {
+    use futures::StreamExt;
+
+    let mut streams: Vec<futures::stream::BoxStream<'static, ()>> =
+        Vec::with_capacity(channels.len() + 1);
+    // A tick even where nothing is listening: a table with no trigger, a view,
+    // and a predicate that changes with the clock all depend on it.
+    streams.push(
+        tokio_stream::wrappers::IntervalStream::new({
+            let mut interval = tokio::time::interval(refresh);
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            interval
+        })
+        .map(|_| ())
+        .boxed(),
+    );
+
+    if let Ok(broker_arc) = ctx.data::<Arc<RwLock<Option<NotifyBroker>>>>() {
+        let guard = broker_arc.read().await;
+        if let Some(broker) = guard.as_ref() {
+            for channel in channels {
+                // `subscribe_or_create` rather than `subscribe`: a table whose
+                // trigger was never installed has no channel, and a live query
+                // on it is answered by the refresh rather than refused.
+                streams.push(
+                    broker
+                        .subscribe_or_create(channel)
+                        .await
+                        .map(|_| ())
+                        .boxed(),
+                );
+            }
+        }
+    }
+
+    futures::stream::select_all(streams).boxed()
+}
+
+/// What a live query reads each time it is woken.
+///
+/// An enum rather than a closure because the answer borrows the context it is
+/// read from, and a closure returning a future that borrows its argument is
+/// not something a bound can say.
+enum LiveSource {
+    Rows(Arc<QueryFieldSpec>),
+    Aggregate(Arc<AggregateSpec>),
+}
+
+/// Read one answer, and the value to compare it against the last one by.
+async fn read_live<'a>(
+    ctx: &ResolverContext<'a>,
+    source: &LiveSource,
+) -> Result<(serde_json::Value, Option<FieldValue<'a>>), async_graphql::Error> {
+    match source {
+        LiveSource::Rows(spec) => {
+            let rows = query_rows(ctx, spec).await?;
+            Ok((
+                serde_json::Value::Array(rows.clone()),
+                rows_as_field_value(rows, spec.is_by_pk),
+            ))
+        }
+        LiveSource::Aggregate(spec) => {
+            let value = aggregate_value(ctx, spec).await?;
+            let seen = serde_json::to_value(&value).unwrap_or_default();
+            Ok((seen, Some(FieldValue::value(value))))
+        }
+    }
+}
+
+/// A live query: the answer now, and the answer again each time it changes.
+///
+/// The first item is sent as soon as the client subscribes, which is what
+/// makes this a query rather than a feed -- there is no window in which the
+/// client knows nothing. After that, `answer` is read again on every wake and
+/// sent only when what came back is not what was sent last: a write that
+/// changes a row the subscription does not select is a wake and not a message.
+fn live<'a>(
+    ctx: ResolverContext<'a>,
+    source: LiveSource,
+    wake: futures::stream::BoxStream<'static, ()>,
+) -> impl futures::Stream<Item = Result<FieldValue<'a>, async_graphql::Error>> + Send + 'a {
+    use futures::StreamExt;
+
+    struct Live<'a> {
+        ctx: ResolverContext<'a>,
+        source: LiveSource,
+        wake: futures::stream::BoxStream<'static, ()>,
+        sent: Option<serde_json::Value>,
+        started: bool,
+    }
+
+    futures::stream::unfold(
+        Live {
+            ctx,
+            source,
+            wake,
+            sent: None,
+            started: false,
+        },
+        |mut live: Live<'a>| async move {
+            loop {
+                if live.started {
+                    live.wake.next().await?;
+                } else {
+                    live.started = true;
+                }
+                let read = read_live(&live.ctx, &live.source).await;
+                match read {
+                    // An error ends the subscription: the client asked
+                    // something that cannot be answered, and answering it
+                    // again on the next tick would only repeat that.
+                    Err(e) => return Some((Err(e), live)),
+                    Ok((seen, value)) => {
+                        if live.sent.as_ref() == Some(&seen) {
+                            continue;
+                        }
+                        live.sent = Some(seen);
+                        let value = value.unwrap_or_else(|| FieldValue::value(Value::Null));
+                        return Some((Ok(value), live));
+                    }
+                }
+            }
+        },
+    )
+    .take_while(|item| futures::future::ready(item.is_ok()))
 }
 
 /// Everything a query field's resolver needs about the field it serves.
@@ -1965,8 +2222,120 @@ fn add_function_fields(
             field = field.description(description);
         }
         root = root.field(field);
+
+        // The same rows, with numbers about them. Every table root has one and
+        // so does every function root: `search_tracks_aggregate(args: {…})`
+        // counts what `search_tracks(args: {…})` would have answered with,
+        // which means calling the function and taking the same arguments.
+        let agg_spec = Arc::new(AggregateSpec {
+            schema_name: function.returns_table.0.clone(),
+            table_name: function.returns_table.1.clone(),
+            type_name: function.returns.clone(),
+            max_rows,
+            relationships: Arc::clone(&relationships),
+            names: Arc::clone(&names),
+            call: Some(Arc::new(FunctionCall {
+                schema: function.schema_name.clone(),
+                name: function.function_name.clone(),
+                arguments: function.arguments.clone(),
+                session_argument: function.session_argument.clone(),
+            })),
+        });
+        let mut aggregate = Field::new(
+            format!("{}_aggregate", function.name),
+            TypeRef::named_nn(crate::schema::aggregate::aggregate_type_name(
+                &function.returns,
+            )),
+            move |ctx| {
+                let agg_spec = Arc::clone(&agg_spec);
+                FieldFuture::new(async move { resolve_aggregate(&ctx, &agg_spec).await })
+            },
+        );
+        if !function.arguments.is_empty() {
+            aggregate = aggregate.argument(InputValue::new(
+                "args",
+                TypeRef::named_nn(format!("{}_args", function.name)),
+            ));
+        }
+        aggregate = with_row_arguments(aggregate, &function.returns).description(format!(
+            "fetch aggregated fields from the table: \"{}\"",
+            function.returns_table.1
+        ));
+        root = root.field(aggregate);
     }
     root
+}
+
+/// The FROM entry for a root field that calls a function.
+///
+/// Aliased as the table the function answers with rows of, so a filter or an
+/// ordering written against that table's columns finds them: without it the
+/// FROM clause names the function and `article.score` is a table nobody
+/// mentioned. Whatever the caller put under `args` is bound here, which is why
+/// it takes the parameter list.
+fn function_source(
+    ctx: &ResolverContext<'_>,
+    call: &FunctionCall,
+    alias: &str,
+    bound_values: &mut Vec<serde_json::Value>,
+) -> Result<String, async_graphql::Error> {
+    let given = ctx
+        .args
+        .try_get("args")
+        .ok()
+        .map(|v| accessor_to_json(&v))
+        .unwrap_or_else(|| serde_json::json!({}));
+    let mut passed = Vec::new();
+    for (name, _, required) in &call.arguments {
+        match given.get(name) {
+            None if *required => {
+                return Err(async_graphql::Error::new(format!(
+                    "{} needs the argument \"{}\"",
+                    call.name, name
+                )))
+            }
+            // An argument left out is left out, so the function's own default
+            // applies. Passing null instead would override it.
+            None => continue,
+            Some(value) => {
+                // Named notation, so the arguments a client did give land on
+                // the parameters it meant regardless of order. A GraphQL Int
+                // binds as a bigint, and `f(article_id => bigint)` is not
+                // `f(integer)` -- the function is looked up by the types of
+                // what it was handed, so what it was handed has to be the
+                // types it declares.
+                let (_, pg_type, _) = call
+                    .arguments
+                    .iter()
+                    .find(|(argument, _, _)| argument == name)
+                    .expect("iterating the arguments");
+                passed.push(format!(
+                    "{} => ${}::{}",
+                    postrust_sql::escape_ident(name),
+                    bound_values.len() + 1,
+                    pg_type
+                ));
+                bound_values.push(value.clone());
+            }
+        }
+    }
+    // The session argument is not the client's to send: it says who is
+    // asking, and a caller that could write it could name any identity it
+    // liked. It is filled here, from the verified token.
+    if let Some(session) = &call.session_argument {
+        passed.push(format!(
+            "{} => {}",
+            postrust_sql::escape_ident(session),
+            SESSION_ARGUMENT
+        ));
+    }
+    Ok(format!(
+        "{}.{}({}) AS {}",
+        postrust_sql::escape_ident(&call.schema),
+        postrust_sql::escape_ident(&call.name),
+        passed.join(", "),
+        postrust_sql::escape_ident(alias)
+    ))
 }
 
 /// A function a root field calls instead of reading a table.
@@ -1987,6 +2356,10 @@ struct AggregateSpec {
     max_rows: Option<i64>,
     relationships: Arc<HashMap<String, Vec<RelationshipField>>>,
     names: Arc<crate::names::NameOverrides>,
+    /// Set where the rows come from a function rather than from the table
+    /// itself, exactly as it is on [`QueryFieldSpec`]. Counting the rows a
+    /// function answers with means calling it.
+    call: Option<Arc<FunctionCall>>,
 }
 
 /// Resolve an aggregate field.
@@ -1999,12 +2372,35 @@ async fn resolve_aggregate<'a>(
     ctx: &ResolverContext<'a>,
     spec: &AggregateSpec,
 ) -> Result<Option<FieldValue<'a>>, async_graphql::Error> {
+    Ok(Some(FieldValue::value(aggregate_value(ctx, spec).await?)))
+}
+
+/// The numbers an aggregate field answers with.
+///
+/// Split from the resolver for the reason [`query_rows`] is: a subscription
+/// reads them over and over and has to tell one answer from the last.
+async fn aggregate_value(
+    ctx: &ResolverContext<'_>,
+    spec: &AggregateSpec,
+) -> Result<Value, async_graphql::Error> {
     use crate::schema::aggregate as agg;
 
     let pool = ctx.data::<PgPool>()?;
     let gql_ctx = ctx.data::<GraphQLContext>()?;
 
     let mut bound_values: Vec<serde_json::Value> = Vec::new();
+    // A function's own arguments are bound before anything else, so a
+    // predicate written beside them continues the numbering rather than
+    // colliding with it.
+    let source = match &spec.call {
+        None => format!(
+            "{}.{}",
+            postrust_sql::escape_ident(&spec.schema_name),
+            postrust_sql::escape_ident(&spec.table_name)
+        ),
+        Some(call) => function_source(ctx, call, &spec.table_name, &mut bound_values)?,
+    };
+
     let mut where_sql = String::new();
     if let Some(filter) = ctx.args.try_get("where").ok().map(|v| accessor_to_json(&v)) {
         let guard = gql_ctx
@@ -2022,10 +2418,10 @@ async fn resolve_aggregate<'a>(
             spec.names.as_ref(),
         )
         .with_resolution(cache, spec.relationships.as_ref());
-        let (sql, values) = build_where_clause(Some(&filter), 1, &scope)?;
+        let (sql, values) = build_where_clause(Some(&filter), bound_values.len() + 1, &scope)?;
         if !sql.is_empty() {
             where_sql = format!(" {}", sql);
-            bound_values = values;
+            bound_values.extend(values);
         }
     }
 
@@ -2053,13 +2449,7 @@ async fn resolve_aggregate<'a>(
         (None, ceiling) => ceiling,
     };
 
-    let mut inner = format!(
-        "SELECT * FROM {}.{}{}{}",
-        postrust_sql::escape_ident(&spec.schema_name),
-        postrust_sql::escape_ident(&spec.table_name),
-        where_sql,
-        order_sql
-    );
+    let mut inner = format!("SELECT * FROM {}{}{}", source, where_sql, order_sql);
     if let Some(limit) = limit {
         inner.push_str(&format!(" LIMIT {}", limit));
     }
@@ -2266,7 +2656,7 @@ async fn resolve_aggregate<'a>(
     }
 
     let _ = &spec.type_name;
-    Ok(Some(FieldValue::value(Value::Object(result))))
+    Ok(Value::Object(result))
 }
 
 /// Resolve a query field.
@@ -2274,6 +2664,21 @@ async fn resolve_query<'a>(
     ctx: &ResolverContext<'a>,
     spec: &QueryFieldSpec,
 ) -> Result<Option<FieldValue<'a>>, async_graphql::Error> {
+    Ok(rows_as_field_value(
+        query_rows(ctx, spec).await?,
+        spec.is_by_pk,
+    ))
+}
+
+/// The rows a query field answers with, as JSON.
+///
+/// Split from the field's own resolver because a subscription reads the same
+/// rows over and over and has to tell one answer from the last: a
+/// `FieldValue` is neither comparable nor readable, and this is.
+async fn query_rows(
+    ctx: &ResolverContext<'_>,
+    spec: &QueryFieldSpec,
+) -> Result<Vec<serde_json::Value>, async_graphql::Error> {
     let schema_name = spec.schema_name.as_str();
     let table_name = spec.table_name.as_str();
     let type_name = spec.type_name.as_str();
@@ -2331,72 +2736,7 @@ async fn resolve_query<'a>(
             postrust_sql::escape_ident(table_name),
             postrust_sql::escape_ident(READ_ROW)
         ),
-        Some(call) => {
-            let given = ctx
-                .args
-                .try_get("args")
-                .ok()
-                .map(|v| accessor_to_json(&v))
-                .unwrap_or_else(|| serde_json::json!({}));
-            let mut passed = Vec::new();
-            for (name, _, required) in &call.arguments {
-                let value = given.get(name);
-                match value {
-                    None if *required => {
-                        return Err(async_graphql::Error::new(format!(
-                            "{} needs the argument \"{}\"",
-                            call.name, name
-                        )))
-                    }
-                    // An argument left out is left out, so the function's own
-                    // default applies. Passing null instead would override it.
-                    None => continue,
-                    Some(value) => {
-                        // Named notation, so the arguments a client did give
-                        // land on the parameters it meant regardless of order.
-                        // A GraphQL Int binds as a bigint, and
-                        // `f(article_id => bigint)` is not `f(integer)` -- the
-                        // function is looked up by the types of what it was
-                        // handed, so what it was handed has to be the types it
-                        // declares.
-                        let (_, pg_type, _) = call
-                            .arguments
-                            .iter()
-                            .find(|(argument, _, _)| argument == name)
-                            .expect("iterating the arguments");
-                        passed.push(format!(
-                            "{} => ${}::{}",
-                            postrust_sql::escape_ident(name),
-                            bound_values.len() + 1,
-                            pg_type
-                        ));
-                        bound_values.push(value.clone());
-                    }
-                }
-            }
-            // The session argument is not the client's to send: it says who
-            // is asking, and a caller that could write it could name any
-            // identity it liked. It is filled here, from the verified token.
-            if let Some(session) = &call.session_argument {
-                passed.push(format!(
-                    "{} => {}",
-                    postrust_sql::escape_ident(session),
-                    SESSION_ARGUMENT
-                ));
-            }
-
-            // Aliased as the table, so a filter or an ordering written
-            // against that table's columns finds them. Without it the FROM
-            // clause names the function and `article.score` is a table nobody
-            // mentioned.
-            format!(
-                "{}.{}({}) AS {}",
-                postrust_sql::escape_ident(&call.schema),
-                postrust_sql::escape_ident(&call.name),
-                passed.join(", "),
-                postrust_sql::escape_ident(table_name)
-            )
-        }
+        Some(call) => function_source(ctx, call, table_name, &mut bound_values)?,
     };
 
     // How a column of the source is referred to: a table by its qualified
@@ -2674,20 +3014,23 @@ async fn resolve_query<'a>(
 
     tx.commit().await?;
 
-    if is_by_pk {
-        // Return single item as Value::Object
-        // json_to_value converts serde_json to async_graphql Value
-        Ok(result
+    Ok(result)
+}
+
+/// The rows a field answers with, in the shape its type says.
+///
+/// A by-key field is one row or none; every other is a list, empty where
+/// nothing matched rather than null.
+fn rows_as_field_value<'a>(rows: Vec<serde_json::Value>, is_by_pk: bool) -> Option<FieldValue<'a>> {
+    match is_by_pk {
+        true => rows
             .into_iter()
             .next()
-            .map(|v| FieldValue::value(json_to_value(v))))
-    } else {
-        // Return list with each item as Value::Object
-        let items: Vec<FieldValue> = result
-            .into_iter()
-            .map(|v| FieldValue::value(json_to_value(v)))
-            .collect();
-        Ok(Some(FieldValue::list(items)))
+            .map(|v| FieldValue::value(json_to_value(v))),
+        false => Some(FieldValue::list(
+            rows.into_iter()
+                .map(|v| FieldValue::value(json_to_value(v))),
+        )),
     }
 }
 
@@ -3328,6 +3671,14 @@ fn write_expression(
             Some("geography") => format!("ST_GeomFromGeoJSON({})::geography", placeholder),
             _ => format!("ST_GeomFromGeoJSON({})", placeholder),
         };
+    }
+    // An amount written as a number is reached through one: PostgreSQL has no
+    // cast from `double precision` to `money`, which is what a bound JSON
+    // number arrives as, and `numeric` is the type it does take one from. One
+    // written as text -- `"$12,344.57"` -- is read by `money` directly, and
+    // going through `numeric` would refuse the currency symbol.
+    if pg_type == Some("money") && value.is_number() {
+        return format!("{}::numeric::money", placeholder);
     }
     format!("{}{}", placeholder, write_cast(column_types, column))
 }
@@ -4030,13 +4381,16 @@ async fn execute_update(
                 )));
             }
             let quoted = postrust_sql::escape_ident(column);
-            // `_set` writes the column, so its value is cast to the column's
-            // type. The others already say what they need -- `::jsonb` for a
+            // `_set` writes the column and `_inc` adds to it, so both take a
+            // value of the column's type and are cast to it -- `money + $1`
+            // is not an operator PostgreSQL has, and neither is `money +
+            // double precision`, which is what a bound number arrives as. The
+            // others already say what they need -- `::jsonb` for a
             // concatenation, `::text[]` for a path -- and casting twice would
             // be wrong for `_delete_elem`, whose operand is an integer rather
             // than a value of the column.
             let placeholder = match *operator {
-                "_set" => {
+                "_set" | "_inc" => {
                     write_expression(&column_types, column, value, &format!("${}", param_idx))
                 }
                 _ => format!("${}", param_idx),
@@ -7381,8 +7735,14 @@ mod tests {
         let config = SchemaConfig::default();
         let generated = build_schema(&cache, &config);
 
-        let result =
-            build_dynamic_schema(&generated, &cache, None, None, Arc::new(Default::default()));
+        let result = build_dynamic_schema(
+            &generated,
+            &cache,
+            None,
+            None,
+            Arc::new(Default::default()),
+            std::time::Duration::from_secs(30),
+        );
         if let Err(ref e) = result {
             eprintln!("Schema build error: {:?}", e);
         }
@@ -7496,8 +7856,14 @@ mod tests {
         let config = SchemaConfig::default();
         let generated = build_schema(&cache, &config);
 
-        let schema =
-            build_dynamic_schema(&generated, &cache, None, None, Arc::new(Default::default()));
+        let schema = build_dynamic_schema(
+            &generated,
+            &cache,
+            None,
+            None,
+            Arc::new(Default::default()),
+            std::time::Duration::from_secs(30),
+        );
         assert!(schema.is_ok(), "{:?}", schema.err());
 
         let sdl = schema.unwrap().sdl();
@@ -7533,6 +7899,7 @@ mod tests {
             Some(&sub_fields),
             None,
             Arc::new(Default::default()),
+            std::time::Duration::from_secs(30),
         );
         assert!(result.is_ok(), "Schema with subscriptions should build");
     }
@@ -7554,15 +7921,18 @@ mod tests {
 
     #[test]
     fn test_create_subscription_type() {
-        use crate::subscription::SubscriptionField as SubField;
-
-        let fields = vec![
-            SubField::for_table("public", "users", "Users"),
-            SubField::for_table("public", "orders", "Orders"),
-        ];
-
-        let _subscription = create_subscription_type(&fields);
-        // Just test that it doesn't panic
+        let cache = create_test_schema_cache();
+        let config = SchemaConfig::default();
+        let generated = build_schema(&cache, &config);
+        // A live query per queryable root: the subscription root mirrors the
+        // query root, which is the whole contract.
+        let _subscription = create_subscription_type(
+            &generated,
+            None,
+            Arc::new(Default::default()),
+            Arc::new(Default::default()),
+            std::time::Duration::from_secs(30),
+        );
     }
 }
 

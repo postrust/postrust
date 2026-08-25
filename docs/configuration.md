@@ -196,6 +196,20 @@ RUST_LOG="postrust=debug,sqlx=info"
 | `PGRST_MAX_ROWS` | Maximum rows returned by a single request. Caps requests that specify no `limit`, and bounds larger ones. Alias: `PGRST_DB_MAX_ROWS` | unset (unlimited) |
 | `PGRST_MAX_BODY_SIZE` | Maximum request body (bytes) | `10485760` |
 
+## GraphQL Subscriptions
+
+| Variable | Description | Default |
+|----------|-------------|---------|
+| `PGRST_SUBSCRIPTION_REFRESH` | How often a live query re-reads itself with nothing having notified it, in seconds. `0` turns the refresh off and leaves only the notifications. | `30` |
+
+A subscription is a live query: it is woken by the trigger on the table it
+reads, which is instant and costs nothing while nothing is written. The refresh
+is a floor under what a trigger cannot see — a view has none, an embedded row
+may live in a table that carries none, and a predicate written against the
+clock changes with no write at all. Every tick costs one query per subscriber,
+so raise it, or set it to `0`, where every subscribable table has a trigger and
+nothing depends on time. See [Realtime](./realtime.md).
+
 ## GraphQL Names
 
 | Variable | Description | Default |

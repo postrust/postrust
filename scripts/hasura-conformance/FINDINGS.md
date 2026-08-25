@@ -1,6 +1,6 @@
 # What the Hasura harness found
 
-Measured against `hasura/graphql-engine:v2.50.1`, 464 replayable cases in 61
+Measured against `hasura/graphql-engine:v2.50.1`, 468 replayable cases in 61
 groups. Three things the commit history does not keep: faults found in the
 harness itself, divergences kept on purpose, and the gaps still open.
 
@@ -8,93 +8,70 @@ harness itself, divergences kept on purpose, and the gaps still open.
 
 | | status | same outcome | same data | full body |
 |---|---|---|---|---|
-| all (464) | 97.8% | 72.4% | **69.2%** | 46.3% |
-| **excluding the 142 permission cases (322)** | | | **94.4%** | |
+| all (468) | 99.4% | 93.4% | **78.0%** | 55.8% |
 
-Of the 321 cases the third column counts, **214 agree about data and 107 agree
-only because both servers answered with errors.** A further 115 are cases where
-Hasura refused and this server answered -- which is where a mutual-refusal case
-goes the moment this server gains the field it was missing.
+Of the 365 cases the third column counts, **260 agree about data and 105 agree
+only because both servers answered with errors.** A further 26 are cases where
+Hasura refused and this server answered.
 
-That is the whole explanation for a number that falls while the server
-improves, and it is measured rather than asserted: comparing consecutive runs,
-every case lost went from `errors -> errors` to `errors -> data`, and nothing
-else did -- with one exception, which was a real regression and is described
-below because that is what the comparison is for. The report prints the split,
-because a headline that mixes the two is not readable as progress.
-
-**214 is the figure that tracks the work.** It counts the cases where the same
+**260 is the figure that tracks the work.** It counts the cases where the same
 query came back with the same rows, which is the only thing a client can feel.
-Against it, **18 cases where Hasura answered with data and this server did not
-match it** -- down from 95, and only **three** of those are cases where this
-server refuses a query Hasura answers. Ten of the other fifteen are
-introspection, where both servers answer and the schemas differ in shape.
+
+**These numbers are not comparable with the ones this file carried before, and
+the reason is in the instrument.** Every run since the admin-secret fix in
+`run.py` had been reusing a reference recorded *before* it, in which 142 cases
+answered `access-denied` because the request was never authenticated at all.
+That reference was replayed, and those 142 cases became real comparisons of two
+permission models rather than a comparison of this server against an
+unauthenticated Hasura. The old headline said 69.2% of 464 with a permission
+exclusion of 94.4%; the honest one is 78.0% of 468 with nothing excluded, and
+the "142 permission cases" that framed every previous number are gone. The
+guard against it happening again is below.
+
+The corpus is 468 cases rather than 464 because a batched request -- a body
+that is a JSON array of operations -- is a case the extractor now reads.
+
+Where the remaining 103 divergences are:
+
+| | count |
+|---|---|
+| both answered with data, and the data differs | 72 |
+| Hasura refused, this server answered | 26 |
+| Hasura answered, this server refused | 5 |
+
+**Seventy-two of those are one thing.** Hasura's permission rules live in its
+metadata database, which the harness does not restore -- it restores the *data*
+database, where a Hasura permission leaves no trace. So the candidate serves
+those tables with no row-level policy at all and answers with every row, while
+the reference answers with the rows the rule allows. It is a real difference
+between the two models and it is also the shape of the remaining work: a
+converter from `create_select_permission` to `CREATE POLICY`, the way
+`hasura-names.py` converts names.
+
+Thirty-four of the 59 groups that load agree completely.
+
+**What the figure did before this run is not on the same scale.** Every one of
+those measurements was taken against the stale reference, so they record the
+work rather than the standing: same-data went 34.1 → 41.8 (duplicate-field
+panic) → 43.8 (enum arguments read) → 44.6 (scalar naming) → 48.3 (update
+operators, written-value casts, root type names) → 49.4 (nested inserts, embeds
+in `returning`) → 50.6 (enum tables) → 51.5 (ordering by a related row or an
+aggregate) → 53.0 (`_cast`) → 54.5 (ltree comparisons) → 55.0 (GeoJSON) → 61.0
+(aggregate `nodes` as rows, the jsonb comparisons, unused variables, four
+orderings, null relationships) → 63.6 (per-root names and column renaming) →
+64.9 (metadata descriptions, `update_x_many`, sorted roots) → 66.2 (nullable
+enums, `on_conflict.where`) → 67.2 (array columns, filtering on a computed
+field, variables checked against where they are used) → 68.5 (computed columns
+taking arguments, `path` into a document, composite keys named, the scalar
+coercions) → 68.8 (a null in a comparison) → 69.2 (a predicate over an
+aggregate, the counts a client asked for, function placement). Then the
+reference was replayed and the scale changed underneath: 76.5 → 78.0 (live
+queries, `/v1alpha1`, `money` arithmetic, an aggregate over a function).
 
 **The candidate is configured.** Each group's fixtures are converted into a
 `PGRST_GRAPHQL_NAMES` document by `scripts/hasura-names.py` and given to the
 server, because the names Hasura writes into metadata are not recoverable from
 a schema and a migration converts them. 25 of the 61 groups name something.
-
-Thirty-four groups agree completely, among them every boolean-expression group
-except `basic`, both ordering groups, all three update groups, deletes,
-upserts, enums, GeoJSON writes, aggregates, transactions, both `custom_schema`
-groups and `graphql_introspection/descriptions`.
-
-The same-data figure over successive fixes: 34.1 → 41.8 (duplicate-field
-panic) → 43.8 (enum arguments read) → 44.2 (relationship predicates, aggregate
-result decoding) → 44.6 (scalar naming) → 48.3 (update operators, written-value
-casts, root type names) → 49.1 (embed arguments, computed columns) → 48.9
-(names given, and see immediately below) → 49.4 (nested inserts, embeds in
-`returning`) → 49.4 (nested aggregates: the field exists now, and the cases
-that ask for it need permissions or a further feature besides) → 49.4
-(upserts) → 50.6 (enum tables) → 51.5 (ordering by a related row or an
-aggregate) → 52.6 (PostGIS comparisons) → 53.0 (`_cast`) → 52.6 (typed mutation
-inputs, which cost two cases; see below) → 54.5 (ltree comparisons, and a list
-bound as an array) → 55.0 (shapes read and written as GeoJSON) → 53.9 (functions
-as root fields; see the split above for why this reads as a loss) → 61.0
-(aggregate `nodes` as rows, the jsonb comparisons, unused variables, four
-orderings, null relationships, GeoJSON through variables) → 61.9 (relationships
-in a delete's `returning`, relationship predicates in a write, `_delete_at_path`,
-one transaction per mutation) → 63.6 (per-root names and column renaming) →
-64.9 (metadata descriptions, `update_x_many`, sorted roots) → 66.2 (nullable
-enums, no relationship to an enum table, `on_conflict.where`) → 65.5 (the
-session argument; see the split for why this reads as a loss) → 67.2 (array
-columns, filtering on a computed field, and variables checked against the
-places they are used) → 66.8 (computed relationships taking arguments; see the
-split) → 68.5 (computed columns taking arguments, `path` into a document
-column, composite foreign keys named, the scalar coercions Hasura performs) →
-68.8 (a null written into a comparison) → 69.2 (a predicate over an
-aggregate, the counts a client asked for, and where metadata says a function
-goes).
-
-Read as real agreement rather than as the headline, that is 137 → 167 → 176 →
-184 → 190 → 196 → 198 → 201 → 205 → 213 → 213 → 214 over the last twelve runs.
-The figure excluding the
-permission cases went 51.2 → 55.3 → 55.9 → 58.4 → 60.6 → 62.4 → 64.0 → 64.6 →
-64.0 → 66.8 → 67.4 → 67.4 → 78.0 → 80.4 → 82.9 → 84.8 → 86.6 → 87.3 → 89.8 →
-91.0 → 93.5 → 93.8 → **94.4**.
-
-**142 of the 464 cases cannot pass and are counted anyway.** They are the cases
-Hasura answers `access-denied` to, from a rule that lives in metadata, and
-there is no metadata here. Excluding them the figure is **304/322 = 94.4%**,
-and every one of the 214 real agreements is inside that 322.
-
-That gap is worth understanding, because the headline moves less than the work
-behind it. Many of those permission cases "agree" only in the sense that both
-servers answer with errors — Hasura because permission is denied, this server
-because the query names a field it does not have. Giving it the field makes the
-query valid here, so it answers with data where Hasura still denies, and the
-case flips from agreeing to differing. Real fidelity went up; a category that
-was passing for the wrong reason stopped.
-
-Which is the argument for reading the second number rather than the first. The
-headline counts cases whose only route to agreement is failing in the same
-breath as the reference, and improving the server can only make that worse.
-
-Reported as measured, at four levels, because a single systemic gap otherwise
-sinks everything behind it. Two of those gaps were found exactly that way, and
-a third -- a computed field ordered on a table addressed by its qualified name
--- was found by the run-to-run comparison rather than by any test.
 
 ## Faults in the harness, found by their symptoms
 
@@ -114,6 +91,22 @@ server. Every fault in the instrument either invents work or hides it.
   `/v1/metadata`, and posting one to the other's endpoint is rejected outright.
   Commands are now sent individually rather than as the `bulk` they arrive in,
   because a file mixing the two has no single endpoint that would accept it.
+
+- **A reference recorded by a different harness was reused for eleven runs.**
+  `run.py` attaches the admin secret to every case, because a case that names
+  `X-Hasura-Role: user` and nothing else is an *admin-authenticated* caller
+  asking to be treated as another role -- without the secret the engine never
+  reaches its permission layer. That was fixed; what was not fixed is that
+  `HASURA_CONFORMANCE_REUSE_REF=1` went on reusing a `ref.json` recorded before
+  it, in which all 142 role-naming cases had answered `access-denied`. The
+  harness reported a permission-model difference that no longer existed, and
+  the number it printed was built on it for eleven runs.
+
+  The instrument now stamps the reference with a hash of what produced it --
+  `run.py`, `extract.py`, and the extracted cases -- and replays rather than
+  reuses when the stamp does not match. This is the same class as the two
+  faults below and the worst of the three: those produced no answer, which is
+  visible, and this produced a confident wrong one.
 
 - **Reading only mapping-shaped case files loses a third of the corpus.** A
   file beginning with `-` is an ordered sequence of cases — an insert followed
@@ -162,11 +155,14 @@ wrong one.
 ## Kept on purpose
 
 - **Permissions.** Hasura's rules live in metadata and are compiled into every
-  query. Here they live in the database as roles and row level security. The
-  142 `access-denied` cases are that difference, and they are counted rather
-  than excluded — the size of the gap is one of the things worth knowing. What
-  transfers is the caller's identity: the `x-hasura-*` claims of a verified
-  token become `SET LOCAL` settings, so a policy reading
+  query. Here they live in the database as roles and row level security. Now
+  that the reference actually evaluates its rules, the difference is visible as
+  what it is: the two models agree far more often than the old reference
+  suggested, and where they part it is because a rule was written in metadata
+  that no database object carries -- a column preset filling `name` from a
+  session variable, a role that may read a table but not aggregate over it.
+  What transfers is the caller's identity: the `x-hasura-*` claims of a
+  verified token become `SET LOCAL` settings, so a policy reading
   `current_setting('hasura.user_id')` sees what the Hasura permission would
   have seen.
 
@@ -183,24 +179,30 @@ wrong one.
 
 ## Open, ordered by consequence
 
-1. **Subscriptions are notifications, not live queries.** Hasura's
-   `subscription_root` mirrors the query root: `article` yields `[article!]!`
-   with `where`, `order_by`, `distinct_on`, `limit` and `offset`, beside
-   `article_aggregate`, `article_by_pk` and `article_stream` with its cursor
-   types. Here a subscription is one row per `LISTEN`/`NOTIFY` payload, with no
-   arguments. The corpus group never loaded, so the difference shows only in
-   introspection -- but it is the largest shape divergence left, and a client
-   written against Hasura's subscriptions does not work here.
+1. **Permissions have no converter.** Seventy-two cases, and the largest thing
+   left by an order of magnitude. Hasura compiles a rule written in metadata
+   into every query; here the equivalent is a row-level security policy, and
+   nothing writes one. The names document showed the shape this takes: read the
+   metadata, emit the thing the database can carry. `create_select_permission`
+   with a `filter` is a `CREATE POLICY … USING (…)`, an insert `check` is a
+   `WITH CHECK`, `columns` is a column grant, and `X-Hasura-User-Id` inside a
+   filter is `current_setting('hasura.user_id')` -- which this server already
+   sets from the verified token. Column **presets** are the part with no
+   database equivalent: `set: {name: "X-Hasura-User-Name"}` fills a column the
+   client never sent, and a policy cannot write a value.
 
-2. **What is left of the enum tables.** They work: a marked table's rows are a
+2. **`_stream` subscriptions.** The cursor-based half of Hasura's subscription
+   surface: `article_stream(cursor: {initial_value: {id: 0}}, batch_size: 10)`
+   sends rows *after* a cursor rather than the whole answer, which is what a
+   client tailing an append-only table wants. The live queries beside it are
+   done; this is a second shape with its own cursor types, and nothing in the
+   corpus exercises it -- it shows up in introspection only.
+
+3. **What is left of the enum tables.** They work: a marked table's rows are a
    generated enum, referencing columns are typed as it, and no relationship
    points at one. What remains is the metadata API around them —
    `v1/set_table_is_enum` is four cases of turning the flag on and off through
    `/v1/query`, which is the contract this server does not offer.
-
-3. **`on_conflict` inside a nested insert.** The top-level upsert works, `where`
-   and all; `{author: {data: {...}, on_conflict: {...}}}` does not, because the
-   nested object has no `on_conflict` argument declared.
 
 4. **A manual relationship** -- one Hasura maps column by column rather than by
    a foreign key -- has no constraint to key a name by, so
@@ -229,12 +231,10 @@ wrong one.
 7. **A function returning one row, as a mutation.** `add_to_score_by_user_id`
    returns `"user"` rather than `SETOF "user"`; Hasura exposes it as a root
    field yielding one row. Here only a set-returning function becomes a root
-   field. Two cases, both of which Hasura answers `access-denied` to -- so
-   adding the field would *cost* them, which is the same trade recorded at the
-   end of this list.
+   field.
 
-8. **Variable-free session.** Two cases now run correctly and still differ
-   because their fixtures send `X-Hasura-Search` and `X-Hasura-Offset-Int` as
+8. **Variable-free session.** Two cases run correctly and still differ because
+   their fixtures send `X-Hasura-Search` and `X-Hasura-Offset-Int` as
    *headers*. This server reads session variables from the verified token and
    nowhere else, which is the deliberate divergence recorded above; the
    machinery around them -- a computed field that takes the session, ordering
@@ -246,13 +246,7 @@ wrong one.
    cases, and they are the permission model showing through a value rather
    than through a refusal.
 
-10. **A batched request.** A body that is a JSON *array* of operations is
-    answered by Hasura with an array of responses. Three cases in
-    `graphql_query/basic` use it, and the harness does not extract them, so this
-    is unmeasured rather than failing -- recorded because it is a contract a
-    client can depend on and this server does not offer it.
-
-11. **Every generated description is this server's wording, not Hasura's.**
+10. **Every generated description is this server's wording, not Hasura's.**
     `article_bool_exp` is described here as "Filter rows of article. Fields are
     combined with AND unless _or says otherwise." and there as "Boolean
     expression to filter rows from the table \"article\"...". Nothing breaks
@@ -262,30 +256,22 @@ wrong one.
     arguments come back in: Hasura sorts them, this server lists them as
     declared.
 
-12. **Introspection shape, inside async-graphql.** It publishes five directives
+11. **Introspection shape, inside async-graphql.** It publishes five directives
     where Hasura publishes three, registers `ID` and `__DirectiveLocation`
     where Hasura has neither, and answers `__TypeKind`'s members in
     specification order rather than alphabetically. Six cases, and none of them
     is reachable without forking the library.
 
-13. **An enum value beginning with `null`, `true` or `false`.** The parser
+12. **An enum value beginning with `null`, `true` or `false`.** The parser
     mis-lexes `nullPrefixTestTable_pkey` as the literal `null` followed by
     something it cannot read, so an upsert naming that constraint is answered
     with a parse error. This is async-graphql's lexer, not this server. One
     case.
 
-14. **Actions and Apollo federation** are subsystems rather than gaps:
+13. **Actions and Apollo federation** are subsystems rather than gaps:
     `actions/*` describes handlers Hasura calls out to over HTTP, and
     `apollo_federation` describes the `_service`/`_entities` surface a
     federated gateway composes. Five cases between them.
-
-15. **The two cases typing the mutation inputs cost.** `objects` and `_set`
-    were `JSON`, which accepted a relationship under whatever name the request
-    used; they are generated types now, so a relationship this server named
-    differently is refused by validation rather than reaching a resolver that
-    would also have failed. The change is kept: a client can generate types
-    from the mutation surface for the first time. Recorded because the number
-    went down and a reader is owed the reason.
 
 ## Fixed since the first run
 
@@ -602,6 +588,51 @@ wrong one.
   catalogue records. The names document grew a `functions` section for it, and
   the converter reads it out of the same metadata. The document's flat shape is
   still read, so nothing written against the old one has to change.
+- **A batched request.** A body that is a JSON array of operations is answered
+  with an array of responses, in the order they were sent -- the shape Apollo's
+  batching client posts. Each entry is its own operation with its own
+  transaction: one failing answers for itself and the array still comes back
+  whole. Three cases in `graphql_query/basic` use it, and the harness could not
+  see them: `extract.py` skipped any case whose payload was not a mapping, and
+  `report.py` read every body as one response. Both read an array now, so the
+  corpus is 467 cases rather than 464.
+- **A subscription is a live query.** It was a change stream: one row per
+  `LISTEN`/`NOTIFY` payload, no arguments, no initial answer. It is now what a
+  Hasura client expects -- `subscription_root` mirrors the query root field for
+  field, `orders(where:, order_by:, distinct_on:, limit:, offset:)` yields
+  `[orders!]!`, and `orders_by_pk` and `orders_aggregate` sit beside it -- and
+  every message is the whole current answer.
+
+  The mechanism is this server's own rather than Hasura's. Hasura polls every
+  subscriber on an interval and pays for it whether or not anything happened;
+  here the trigger on the table wakes the query, which is instant and costs
+  nothing while nothing is written, and one `LISTEN` connection per instance
+  serves any number of subscribers. A slow refresh runs beside it --
+  `PGRST_SUBSCRIPTION_REFRESH`, 30 seconds -- because a trigger cannot see
+  everything a query can: a view has none, an embedded row may live in a table
+  that carries none, and `where: {expires_at: {_lt: "now()"}}` changes with no
+  write at all. A wake is not a message: the answer is compared with the one
+  last sent, so a write outside the subscription sends nothing.
+
+  Row-level security now applies to a subscription, which it could not before:
+  each re-read runs as the subscriber's own role, where a notification carried
+  whatever the trigger published.
+
+- **`/v1alpha1/graphql`** is served. Ten cases in the corpus post there -- it is
+  the address Hasura answered on before `/v1`, and a client old enough to have
+  been pointed at it is exactly the one that cannot be repointed.
+
+- **`money` arithmetic.** `_inc: {price: -1.1}` failed with `operator does not
+  exist: money + double precision`: the operand was bound uncast, and a JSON
+  number arrives as a double. `_inc` now casts to the column's type the way
+  `_set` does, and `money` is reached through `numeric`, which is the only cast
+  PostgreSQL has to it -- while an amount written as text keeps going straight
+  to `money`, so `"$12,344.57"` is still read as one.
+
+- **An aggregate over a function.** Every table root has an `_aggregate` and now
+  every function root does too: `search_tracks_aggregate(args: {…})` counts what
+  `search_tracks(args: {…})` would have answered with, which means calling the
+  function and taking the same arguments.
 
 ## Not measured
 
