@@ -37,6 +37,7 @@ fn code_for(error: &ServerError) -> &'static str {
         if let Some(Value::String(code)) = extensions.get("code").map(value_of) {
             return match code.as_str() {
                 "validation-failed" => "validation-failed",
+                "bad-request" => "bad-request",
                 "permission-error" => "permission-error",
                 "constraint-violation" => "constraint-violation",
                 "data-exception" => "data-exception",

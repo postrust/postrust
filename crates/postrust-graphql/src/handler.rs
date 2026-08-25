@@ -785,17 +785,22 @@ fn child_of<'a>(ctx: &ResolverContext<'_>, key: &str) -> Option<FieldValue<'a>> 
     }
 }
 
-/// An error the client could have avoided, coded the way Hasura codes one.
+/// An error carrying the code Hasura would give it.
 ///
 /// The default coding reads the message, and a refusal written here has no
-/// word in it that a message from PostgreSQL would not also have -- so it said
+/// word in it that a message from PostgreSQL would not also have -- so it says
 /// so itself rather than being guessed at.
-fn validation_error(message: impl Into<String>) -> async_graphql::Error {
+fn coded_error(code: &'static str, message: impl Into<String>) -> async_graphql::Error {
     let mut error = async_graphql::Error::new(message);
     let mut extensions = async_graphql::ErrorExtensionValues::default();
-    extensions.set("code", "validation-failed");
+    extensions.set("code", code);
     error.extensions = Some(extensions);
     error
+}
+
+/// A refusal the client could have avoided by writing the request differently.
+fn validation_error(message: impl Into<String>) -> async_graphql::Error {
+    coded_error("validation-failed", message)
 }
 
 fn create_object_type(obj: &TableObjectType, relationships: &[RelationshipField]) -> Object {
@@ -2388,6 +2393,104 @@ async fn execute_query_on(
     Ok(results)
 }
 
+/// Refuse a GeoJSON document PostGIS would accept and should not.
+///
+/// `ST_GeomFromGeoJSON` will build a "Polygon" from three points that do not
+/// meet, and a "LineString" from one point -- neither of which is a shape, and
+/// both of which are then stored and read back as though they were. Hasura
+/// checks the document before it reaches the database, refuses with
+/// `parse-failed`, and says which rule was broken; the messages here are its
+/// messages, because a client that reports them to a user is reporting text it
+/// already ships.
+///
+/// A value that is not an object is left alone: a string in a geometry column
+/// is WKT or WKB hex, which is a different thing entirely.
+fn check_geojson(value: &serde_json::Value) -> Result<(), async_graphql::Error> {
+    fn refuse<T>(message: &str) -> Result<T, async_graphql::Error> {
+        Err(coded_error("parse-failed", message))
+    }
+
+    fn position(value: &serde_json::Value) -> Result<&Vec<serde_json::Value>, async_graphql::Error> {
+        match value.as_array() {
+            Some(items) if items.len() >= 2 && items.iter().all(|i| i.is_number()) => Ok(items),
+            _ => refuse("A Position needs at least 2 elements"),
+        }
+    }
+
+    fn positions(
+        value: Option<&serde_json::Value>,
+        least: usize,
+        what: &str,
+    ) -> Result<Vec<Vec<serde_json::Value>>, async_graphql::Error> {
+        let items = match value.and_then(|v| v.as_array()) {
+            Some(items) => items,
+            None => return refuse(&format!("A {} needs at least {} Positions", what, least)),
+        };
+        if items.len() < least {
+            return refuse(&format!("A {} needs at least {} Positions", what, least));
+        }
+        items.iter().map(|item| position(item).cloned()).collect()
+    }
+
+    fn ring(value: &serde_json::Value) -> Result<(), async_graphql::Error> {
+        let points = positions(Some(value), 4, "LinearRing")?;
+        match (points.first(), points.last()) {
+            (Some(first), Some(last)) if first == last => Ok(()),
+            _ => refuse("the first and last locations have to be equal for a LinearRing"),
+        }
+    }
+
+    fn polygon(value: &serde_json::Value) -> Result<(), async_graphql::Error> {
+        let Some(rings) = value.as_array() else {
+            return refuse("A LinearRing needs at least 4 Positions");
+        };
+        rings.iter().try_for_each(ring)
+    }
+
+    let serde_json::Value::Object(map) = value else {
+        return Ok(());
+    };
+    let Some(kind) = map.get("type").and_then(|v| v.as_str()) else {
+        return Ok(());
+    };
+    let coordinates = map.get("coordinates");
+    match kind {
+        "Point" => {
+            position(coordinates.unwrap_or(&serde_json::Value::Null))?;
+        }
+        "MultiPoint" => {
+            positions(coordinates, 0, "MultiPoint")?;
+        }
+        "LineString" => {
+            positions(coordinates, 2, "LineString")?;
+        }
+        "MultiLineString" => {
+            for line in coordinates.and_then(|v| v.as_array()).into_iter().flatten() {
+                positions(Some(line), 2, "LineString")?;
+            }
+        }
+        "Polygon" => polygon(coordinates.unwrap_or(&serde_json::Value::Null))?,
+        "MultiPolygon" => {
+            for one in coordinates.and_then(|v| v.as_array()).into_iter().flatten() {
+                polygon(one)?;
+            }
+        }
+        "GeometryCollection" => {
+            for geometry in map.get("geometries").and_then(|v| v.as_array()).into_iter().flatten() {
+                check_geojson(geometry)?;
+            }
+        }
+        other => return refuse(&format!("unexpected geometry type: {}", other)),
+    }
+    Ok(())
+}
+
+/// What a written table is called inside its own statement.
+///
+/// See [`WhereScope::under_alias`]: the row a statement returns has to be
+/// named, and a table's own name is read as a column first.
+const WRITTEN_ROW: &str = "pgrst_row";
+
 /// The cast a written value needs to reach a column of this type.
 ///
 /// A bound parameter arrives as text. PostgreSQL will coerce it to a numeric
@@ -2557,6 +2660,17 @@ fn insert_row<'life>(
             }
         }
 
+        // A shape is checked before it is written, since PostGIS would build
+        // one from a document that is not a shape.
+        for (column, value) in &columns {
+            if matches!(
+                column_types.get(column).map(String::as_str),
+                Some("geometry") | Some("geography")
+            ) {
+                check_geojson(value)?;
+            }
+        }
+
         // The rows this one points at, first: this row's own column carries
         // their key.
         for (relationship, data, conflict) in to_one {
@@ -2656,18 +2770,21 @@ fn insert_row<'life>(
             _ => String::new(),
         };
 
-        // The row this statement writes, as `RETURNING` names it: the table
-        // alone. Qualifying it reads as a column of a table called `public`,
-        // which is what `missing FROM-clause entry for table "public"` means.
-        let qualified_table = postrust_sql::escape_ident(table_name);
+        // The row this statement writes, as `RETURNING` names it. Not the
+        // table's own name: qualifying it reads as a column of a table called
+        // `public`, which is what `missing FROM-clause entry for table
+        // "public"` means, and leaving it bare reads as a column of the table
+        // where one shares the name.
+        let qualified_table = postrust_sql::escape_ident(WRITTEN_ROW);
         let names: Vec<&str> = columns.keys().map(|k| k.as_str()).collect();
         let written = if names.is_empty() {
             // Every column defaulted. `DEFAULT VALUES` is how SQL says that;
             // an empty column list is a syntax error.
             let sql = format!(
-                "INSERT INTO {}.{} DEFAULT VALUES{} RETURNING {}",
+                "INSERT INTO {}.{} AS {} DEFAULT VALUES{} RETURNING {}",
                 postrust_sql::escape_ident(schema_name),
                 postrust_sql::escape_ident(table_name),
+                qualified_table,
                 conflict_sql,
                 row_json(&qualified_table, &column_types)
             );
@@ -2687,9 +2804,10 @@ fn insert_row<'life>(
                 })
                 .collect();
             let sql = format!(
-                "INSERT INTO {}.{} ({}) VALUES ({}){} RETURNING {}",
+                "INSERT INTO {}.{} AS {} ({}) VALUES ({}){} RETURNING {}",
                 postrust_sql::escape_ident(schema_name),
                 postrust_sql::escape_ident(table_name),
+                qualified_table,
                 names
                     .iter()
                     .map(|c| postrust_sql::escape_ident(c))
@@ -3078,6 +3196,14 @@ async fn execute_update(
                     )))
                 }
             };
+            if *operator == "_set"
+                && matches!(
+                    column_types.get(column).map(String::as_str),
+                    Some("geometry") | Some("geography")
+                )
+            {
+                check_geojson(value)?;
+            }
             set_parts.push(assignment);
             set_values.push(match *operator {
                 "_set" => write_operand(&column_types, column, value),
@@ -3096,7 +3222,7 @@ async fn execute_update(
     }
 
     // Build WHERE clause
-    let scope = WhereScope::table(schema_name, table_name, table_name);
+    let scope = WhereScope::table(schema_name, table_name, table_name).under_alias(WRITTEN_ROW);
     let (where_sql, where_values) =
         build_where_clause(where_clause.as_ref(), param_idx, &scope)?;
 
@@ -3111,12 +3237,13 @@ async fn execute_update(
     }
 
     let sql = format!(
-        "UPDATE {}.{} SET {} {} RETURNING {}",
+        "UPDATE {}.{} AS {} SET {} {} RETURNING {}",
         postrust_sql::escape_ident(schema_name),
         postrust_sql::escape_ident(table_name),
+        postrust_sql::escape_ident(WRITTEN_ROW),
         set_parts.join(", "),
         where_sql,
-        row_json(&postrust_sql::escape_ident(table_name), &column_types)
+        row_json(&postrust_sql::escape_ident(WRITTEN_ROW), &column_types)
     );
 
     trace!("Executing UPDATE SQL: {}", sql);
@@ -3162,7 +3289,7 @@ async fn execute_delete(
     let mut conn = begin_with_role(pool, role).await?;
 
     // Build WHERE clause
-    let scope = WhereScope::table(schema_name, table_name, table_name);
+    let scope = WhereScope::table(schema_name, table_name, table_name).under_alias(WRITTEN_ROW);
     let (where_sql, where_values) = build_where_clause(where_clause.as_ref(), 1, &scope)?;
 
     // An absent or unrecognised `where` argument yields an empty clause, which
@@ -3176,11 +3303,12 @@ async fn execute_delete(
     }
 
     let sql = format!(
-        "DELETE FROM {}.{} {} RETURNING {}",
+        "DELETE FROM {}.{} AS {} {} RETURNING {}",
         postrust_sql::escape_ident(schema_name),
         postrust_sql::escape_ident(table_name),
+        postrust_sql::escape_ident(WRITTEN_ROW),
         where_sql,
-        row_json(&postrust_sql::escape_ident(table_name), &Default::default())
+        row_json(&postrust_sql::escape_ident(WRITTEN_ROW), &Default::default())
     );
 
     trace!("Executing DELETE SQL: {}", sql);
@@ -3281,6 +3409,19 @@ impl<'a> WhereScope<'a> {
             type_name: type_name.to_string(),
             resolution: None,
         }
+    }
+
+    /// The same, referred to by an alias rather than by its name.
+    ///
+    /// A statement that writes a table has to name that table's row in
+    /// `RETURNING`, and a bare table name there is read as a *column* first --
+    /// so `area.area`, a geography column in a table of the same name, made
+    /// `to_jsonb("area")` the shape rather than the row. The alias is a name
+    /// no column has.
+    fn under_alias(mut self, alias: &str) -> Self {
+        self.sql_ref = postrust_sql::escape_ident(alias);
+        self.row_ref = postrust_sql::escape_ident(alias);
+        self
     }
 
     /// The same, able to follow relationships.
@@ -4580,7 +4721,7 @@ fn embed_arguments(
                 .map(|(name, value)| {
                     (
                         name.to_string(),
-                        value.into_json().unwrap_or(serde_json::Value::Null),
+                        plain_numbers(value.into_json().unwrap_or(serde_json::Value::Null)),
                     )
                 })
                 .collect()
@@ -5081,6 +5222,47 @@ fn graphql_type_ref(type_str: &str) -> TypeRef {
     }
 }
 
+/// The key serde_json wraps a number in when it is keeping its digits.
+///
+/// This crate reads `serde_json` with `arbitrary_precision`, so a PostgreSQL
+/// `numeric` survives a round trip through JSON with every digit it had. The
+/// cost is on the way in: a fractional number in a *variable* is deserialized
+/// into async-graphql's own value type as a one-key object holding the text,
+/// because the generic path cannot know it is looking at a number. Integers
+/// are unaffected, which is why this went unnoticed until a shape arrived by
+/// variable and every coordinate in it read as zero.
+const NUMBER_AS_TEXT: &str = "$serde_json::private::Number";
+
+/// The number an arbitrary-precision wrapper is holding, if that is what this
+/// object is.
+fn number_kept_as_text(
+    map: &serde_json::Map<String, serde_json::Value>,
+) -> Option<serde_json::Value> {
+    if map.len() != 1 {
+        return None;
+    }
+    let text = map.get(NUMBER_AS_TEXT)?.as_str()?;
+    serde_json::from_str::<serde_json::Value>(text)
+        .ok()
+        .filter(|value| value.is_number())
+}
+
+/// The same, applied to a whole document that came in as one.
+fn plain_numbers(value: serde_json::Value) -> serde_json::Value {
+    match value {
+        serde_json::Value::Object(map) => match number_kept_as_text(&map) {
+            Some(number) => number,
+            None => serde_json::Value::Object(
+                map.into_iter().map(|(k, v)| (k, plain_numbers(v))).collect(),
+            ),
+        },
+        serde_json::Value::Array(items) => {
+            serde_json::Value::Array(items.into_iter().map(plain_numbers).collect())
+        }
+        other => other,
+    }
+}
+
 /// Convert ValueAccessor to JSON.
 fn accessor_to_json(accessor: &ValueAccessor<'_>) -> serde_json::Value {
     // Use the deserialize method if available, or convert manually
@@ -5107,7 +5289,10 @@ fn accessor_to_json(accessor: &ValueAccessor<'_>) -> serde_json::Value {
             .iter()
             .map(|(k, v)| (k.to_string(), accessor_to_json(&v)))
             .collect();
-        serde_json::Value::Object(map)
+        match number_kept_as_text(&map) {
+            Some(number) => number,
+            None => serde_json::Value::Object(map),
+        }
     } else {
         serde_json::Value::Null
     }
