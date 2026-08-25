@@ -154,6 +154,21 @@ fn relationship_keys(rel: &postrust_core::schema_cache::Relationship) -> Vec<Str
     keys
 }
 
+/// A type name as the catalogue writes it, reduced to the table it names.
+///
+/// `pg_catalog.format_type` quotes anything that needs quoting and qualifies
+/// anything outside the search path, so a function returning rows of a table
+/// called `user` -- a reserved word -- reports `"user"`, and one returning rows
+/// of `other.thing` reports `other.thing`. Neither is the table's name, and
+/// comparing them against one finds nothing.
+fn type_name_of(rendered: &str) -> (Option<String>, String) {
+    let (schema, name) = match rendered.rsplit_once('.') {
+        Some((schema, name)) => (Some(schema.trim_matches('"').to_string()), name),
+        None => (None, rendered),
+    };
+    (schema, name.trim_matches('"').to_string())
+}
+
 /// Base name used to derive a table's GraphQL type and field names.
 ///
 /// Tables in the default schema keep their bare name, so a single-schema
@@ -713,9 +728,8 @@ pub fn build_schema(schema_cache: &SchemaCache, config: &SchemaConfig) -> Genera
             // of an author, and a row type is not something a client can send
             // as an argument. It is already exposed where it belongs.
             if routine.params.iter().any(|param| {
-                base_names
-                    .keys()
-                    .any(|(_, table)| table == &param.param_type)
+                let (_, named) = type_name_of(&param.param_type);
+                base_names.keys().any(|(_, table)| table == &named)
             }) {
                 continue;
             }
@@ -724,13 +738,17 @@ pub fn build_schema(schema_cache: &SchemaCache, config: &SchemaConfig) -> Genera
             // function's own schema is tried first -- a function and the table
             // it returns usually live together, and two schemas may both have
             // a table of that name.
+            let (returned_schema, returned_table) = type_name_of(returned);
             let found = base_names
                 .iter()
-                .find(|((schema, table), _)| table == returned && schema == &routine.schema)
+                .find(|((schema, table), _)| {
+                    table == &returned_table
+                        && schema == returned_schema.as_ref().unwrap_or(&routine.schema)
+                })
                 .or_else(|| {
                     base_names
                         .iter()
-                        .find(|((_, table), _)| table == returned)
+                        .find(|((_, table), _)| table == &returned_table)
                 });
             let Some(((target_schema, target_table), base)) = found else {
                 continue;
