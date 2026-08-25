@@ -237,32 +237,115 @@ def singularize(word):
     return word
 
 
-def derived_relationship_name(entry, kind):
+def derived_relationship_name(entry, kind, bases):
     """What this server would call it without being told.
 
-    A relationship to many rows takes the target table's name pluralised, one
-    to a single row its singular -- the same two rules the server applies. An
-    entry that matches is left out: writing down a name reflection already
+    A relationship to many rows takes the target's exposed base name
+    pluralised, one to a single row its singular -- the same two rules the
+    server applies. `bases` maps `schema.table` to that exposed name, because a
+    table given a custom name changes what every relationship *to* it derives
+    to: a `Articles`-named table is reached as `Articles`, not as `articles`.
+
+    An entry that matches is left out: writing down a name reflection already
     produces makes the document longer to read and gives it something to go
     stale against.
     """
     using = entry.get("using") or {}
     on = using.get("foreign_key_constraint_on")
     if kind == "array" and isinstance(on, dict):
-        _, table = qualified(on.get("table"))
-        return pluralize(table) if table else None
+        schema, table = qualified(on.get("table"))
+        if not table:
+            return None
+        return pluralize(bases.get(f"{schema}.{table}", table))
     if kind == "object":
         # The object side names the table it points at, which the metadata
         # does not carry -- only the column carrying the key. `author_id`
         # pointing at `author` is the ordinary spelling and the only one that
         # can be checked without a database.
         if isinstance(on, str) and on.endswith("_id"):
-            return singularize(on[: -len("_id")])
+            target = on[: -len("_id")]
+            return singularize(bases.get(f"public.{target}", target))
     return None
+
+
+def strip_suffix(value, suffix):
+    return value[: -len(suffix)] if value.endswith(suffix) else None
+
+
+def strip_prefix(value, prefix):
+    return value[len(prefix):] if value.startswith(prefix) else None
+
+
+# What each root field would be called, given a base name. The server derives
+# all of them from one word; Hasura names them one at a time.
+DERIVED_ROOTS = {
+    "select": lambda base: base,
+    "select_by_pk": lambda base: f"{base}_by_pk",
+    "select_aggregate": lambda base: f"{base}_aggregate",
+    "insert": lambda base: f"insert_{base}",
+    "insert_one": lambda base: f"insert_{base}_one",
+    "update": lambda base: f"update_{base}",
+    "update_by_pk": lambda base: f"update_{base}_by_pk",
+    "delete": lambda base: f"delete_{base}",
+    "delete_by_pk": lambda base: f"delete_{base}_by_pk",
+}
+
+# And the reverse: the base a given root name implies.
+IMPLIED_BASE = {
+    "select": lambda v: v,
+    "select_by_pk": lambda v: strip_suffix(v, "_by_pk"),
+    "select_aggregate": lambda v: strip_suffix(v, "_aggregate"),
+    "insert": lambda v: strip_prefix(v, "insert_"),
+    "insert_one": lambda v: strip_suffix(strip_prefix(v, "insert_") or "", "_one"),
+    "update": lambda v: strip_prefix(v, "update_"),
+    "update_by_pk": lambda v: strip_suffix(strip_prefix(v, "update_") or "", "_by_pk"),
+    "delete": lambda v: strip_prefix(v, "delete_"),
+    "delete_by_pk": lambda v: strip_suffix(strip_prefix(v, "delete_") or "", "_by_pk"),
+}
+
+
+def custom_roots(entry):
+    """The root names Hasura was told, keeping only the ones that are names."""
+    configuration = entry.get("configuration") or {}
+    return {root: value
+            for root, value in (configuration.get("custom_root_fields") or {}).items()
+            if isinstance(value, str) and value}
+
+
+def exposed_base(entry, table):
+    """The one word this server derives every name for this table from.
+
+    `custom_name` where it was given. Otherwise the base implied by the custom
+    root fields, where they all imply the same one -- `select: Articles` beside
+    `select_by_pk: Article` implies `Articles`, and the by-pk name is written
+    down separately. Otherwise the table's own name.
+
+    Computed once and used twice: it decides this table's own names, and it
+    decides what a relationship *to* this table derives to.
+    """
+    configuration = entry.get("configuration") or {}
+    custom = configuration.get("custom_name")
+    if isinstance(custom, str) and custom:
+        return custom
+    implied = {IMPLIED_BASE[root](value) for root, value in custom_roots(entry).items()
+               if root in IMPLIED_BASE}
+    implied.discard(None)
+    implied.discard("")
+    if len(implied) == 1:
+        return implied.pop()
+    return table
 
 
 def convert(tables):
     names = {}
+
+    # What each table is exposed as, which a relationship to it derives from.
+    bases = {}
+    for entry in tables:
+        schema, table = qualified(entry.get("table"))
+        if not table:
+            continue
+        bases[f"{schema}.{table}"] = exposed_base(entry, table)
 
     for entry in tables:
         schema, table = qualified(entry.get("table"))
@@ -281,50 +364,32 @@ def convert(tables):
             given["enum"] = True
 
         configuration = entry.get("configuration") or {}
-        custom_name = configuration.get("custom_name")
-        if custom_name and custom_name != table:
-            given["name"] = custom_name
+        base = bases[key]
+        if base != table:
+            given["name"] = base
 
-        # Hasura names each root separately -- `select: Authors`,
-        # `select_by_pk: Author`, `select_aggregate: AuthorAgg`. This server
-        # derives all of them from one base name, so a set that agrees on one
-        # converts and a set that does not is reported rather than guessed at.
-        roots = configuration.get("custom_root_fields") or {}
-        if roots and "name" not in given:
-            def strip_suffix(value, suffix):
-                return value[: -len(suffix)] if value.endswith(suffix) else None
+        # Whatever the base name does not reproduce is written down root by
+        # root: `select_by_pk: Article` beside `select: Articles` needs an
+        # entry, because one base name derives `Articles_by_pk`.
+        # `select_stream` and `update_many` name surfaces this server does not
+        # generate, so they are dropped rather than named.
+        roots = {root: value for root, value in custom_roots(entry).items()
+                 if root in DERIVED_ROOTS and DERIVED_ROOTS[root](base) != value}
+        if roots:
+            given["roots"] = roots
 
-            def strip_prefix(value, prefix):
-                return value[len(prefix):] if value.startswith(prefix) else None
-
-            implied = {
-                "select": lambda v: v,
-                "select_by_pk": lambda v: strip_suffix(v, "_by_pk"),
-                "select_aggregate": lambda v: strip_suffix(v, "_aggregate"),
-                "insert": lambda v: strip_prefix(v, "insert_"),
-                "update": lambda v: strip_prefix(v, "update_"),
-                "delete": lambda v: strip_prefix(v, "delete_"),
-            }
-            bases = {implied[root](value) for root, value in roots.items()
-                     if root in implied and isinstance(value, str)}
-            bases.discard(None)
-            if len(bases) == 1:
-                base = bases.pop()
-                if base != table:
-                    given["name"] = base
-            elif bases:
-                print(
-                    f"note: {key} names its roots separately ({', '.join(sorted(roots))}); "
-                    f"this server derives them from one base name, so they are left alone",
-                    file=sys.stderr,
-                )
-
-        if configuration.get("custom_column_names"):
-            print(
-                f"note: {key} renames columns, which this server does not; "
-                f"those fields keep their database names",
-                file=sys.stderr,
-            )
+        # Hasura keeps a column's exposed name in two places depending on its
+        # version: `custom_column_names` maps column to name directly, and
+        # `column_config` wraps it in an object beside other per-column
+        # settings.
+        columns = dict(configuration.get("custom_column_names") or {})
+        for column, config in (configuration.get("column_config") or {}).items():
+            if isinstance(config, dict) and isinstance(config.get("custom_name"), str):
+                columns[column] = config["custom_name"]
+        columns = {column: name for column, name in columns.items()
+                   if isinstance(name, str) and name and name != column}
+        if columns:
+            given["columns"] = columns
 
         relationships = {}
         for kind, field in (("object", "object_relationships"),
@@ -341,7 +406,7 @@ def convert(tables):
                         file=sys.stderr,
                     )
                     continue
-                if derived_relationship_name(relationship, kind) == name:
+                if derived_relationship_name(relationship, kind, bases) == name:
                     continue          # reflection already produces this name
                 if lookup in relationships and relationships[lookup] != name:
                     print(

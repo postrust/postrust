@@ -57,6 +57,28 @@ pub struct TableNames {
     #[serde(default)]
     pub computed_fields: HashMap<String, String>,
 
+    /// Root field names, keyed by the root they replace: `select`,
+    /// `select_by_pk`, `select_aggregate`, `insert`, `insert_one`, `update`,
+    /// `update_by_pk`, `delete`, `delete_by_pk`.
+    ///
+    /// Separate from `name` because Hasura names each root independently --
+    /// `select: Authors`, `select_by_pk: Author`, `select_aggregate:
+    /// AuthorAgg` -- where a base name derives all of them from one word. A
+    /// set that agrees on a base could be written as `name`; one that does not
+    /// can only be written here.
+    #[serde(default)]
+    pub roots: HashMap<String, String>,
+
+    /// Field names for columns, keyed by the column.
+    ///
+    /// The one rename that is not a name for something derived: a column has a
+    /// name, and this is a different one to expose it under. It reaches
+    /// further than the others because a column appears in the projection, in
+    /// `where`, in `order_by`, in `distinct_on`, in both mutation inputs and
+    /// in every embed -- everywhere a field name has to become SQL.
+    #[serde(default)]
+    pub columns: HashMap<String, String>,
+
     /// Whether this table is a set of allowed values rather than a set of
     /// rows.
     ///
@@ -171,6 +193,43 @@ impl NameOverrides {
             .get(source)
             .or_else(|| names.computed_fields.get(source))
             .map(String::as_str)
+    }
+
+    /// The name given to one root field, if one was.
+    ///
+    /// `kind` is Hasura's own key -- `select`, `insert_one`, `delete_by_pk`.
+    pub fn root(&self, schema: &str, table: &str, kind: &str) -> Option<&str> {
+        self.table(schema, table)?.roots.get(kind).map(String::as_str)
+    }
+
+    /// The field a column is exposed as, if it was renamed.
+    pub fn column(&self, schema: &str, table: &str, column: &str) -> Option<&str> {
+        self.table(schema, table)?.columns.get(column).map(String::as_str)
+    }
+
+    /// The column behind a field name, if that name is a rename.
+    ///
+    /// The other direction, which is the one every resolver needs: it is
+    /// handed a field name from the request and has to write a column. `None`
+    /// means the name is already the column's, which is the ordinary case.
+    pub fn column_source(&self, schema: &str, table: &str, field: &str) -> Option<&str> {
+        let names = self.table(schema, table)?;
+        names
+            .columns
+            .iter()
+            .find(|(_, exposed)| exposed.as_str() == field)
+            .map(|(column, _)| column.as_str())
+    }
+
+    /// Whether any column of this table is exposed under another name.
+    ///
+    /// Worth asking before building a projection: a table with no renames
+    /// keeps the `SELECT *` it had, and only one that has them pays for a
+    /// column list.
+    pub fn renames_columns(&self, schema: &str, table: &str) -> bool {
+        self.table(schema, table)
+            .map(|names| !names.columns.is_empty())
+            .unwrap_or(false)
     }
 
     /// The name given to a computed field, by its function.

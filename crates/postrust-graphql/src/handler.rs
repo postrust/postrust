@@ -194,6 +194,87 @@ pub async fn graphql_playground() -> impl axum::response::IntoResponse {
     ))
 }
 
+/// The column a field name refers to.
+///
+/// The name itself, unless the table exposes that column under another one.
+/// Every path from a request to SQL goes through here: a renamed column is a
+/// name in the schema and in nothing else, so the translation has to happen at
+/// each boundary rather than once.
+fn column_for<'a>(
+    names: &'a crate::names::NameOverrides,
+    schema: &str,
+    table: &str,
+    field: &'a str,
+) -> &'a str {
+    names.column_source(schema, table, field).unwrap_or(field)
+}
+
+/// The same, given the table itself.
+fn table_column_for<'a>(
+    names: &'a crate::names::NameOverrides,
+    table: &postrust_core::schema_cache::Table,
+    field: &'a str,
+) -> &'a str {
+    column_for(names, &table.schema, &table.name, field)
+}
+
+/// The select list that renames a table's columns to the fields they are
+/// exposed as, or `None` where nothing is renamed.
+///
+/// Applied to a projection over the table rather than to the table itself, so
+/// the row a computed field or a computed relationship is passed stays the
+/// table's own composite -- `cannot cast type record to author` is what
+/// happens when it does not.
+fn rename_projection(
+    table: &postrust_core::schema_cache::Table,
+    alias: &str,
+    names: &crate::names::NameOverrides,
+) -> Option<String> {
+    if !names.renames_columns(&table.schema, &table.name) {
+        return None;
+    }
+    let parts: Vec<String> = table
+        .columns
+        .values()
+        .map(|column| {
+            let exposed = names
+                .column(&table.schema, &table.name, &column.name)
+                .unwrap_or(&column.name);
+            format!(
+                "{}.{} AS {}",
+                postrust_sql::escape_ident(alias),
+                postrust_sql::escape_ident(&column.name),
+                postrust_sql::escape_ident(exposed)
+            )
+        })
+        .collect();
+    match parts.is_empty() {
+        true => None,
+        false => Some(parts.join(", ")),
+    }
+}
+
+/// A table's column types, keyed by the names those columns are exposed under.
+///
+/// [`row_json`] names the shape columns it has to rewrite as GeoJSON, and it
+/// names them in whatever the projection called them. Over a renamed
+/// projection that is the field name, not the column's.
+fn exposed_column_types(
+    table: &postrust_core::schema_cache::Table,
+    names: &crate::names::NameOverrides,
+) -> HashMap<String, String> {
+    table
+        .columns
+        .values()
+        .map(|column| {
+            let exposed = names
+                .column(&table.schema, &table.name, &column.name)
+                .unwrap_or(&column.name);
+            (exposed.to_string(), column.nominal_type.clone())
+        })
+        .collect()
+}
+
 /// The scalar at the bottom of a type, past any list wrapping.
 fn leaf_scalar_name(graphql_type: &crate::types::GraphQLType) -> String {
     match graphql_type {
@@ -410,7 +491,9 @@ fn build_dynamic_schema(
             .description(format!("The primary key of one {} row.", base_name));
         for (column, pg_type) in &field.pk_columns {
             input = input.field(InputValue::new(
-                column,
+                names
+                    .column(&field.schema_name, &field.table_name, column)
+                    .unwrap_or(column),
                 TypeRef::named_nn(pk_argument_type(pg_type)),
             ));
         }
@@ -432,7 +515,11 @@ fn build_dynamic_schema(
         let writable: Vec<&crate::schema::object::GraphQLField> = object
             .fields
             .iter()
-            .filter(|field| table.get_column(&field.name).is_some())
+            .filter(|field| {
+                table
+                    .get_column(table_column_for(&names, table, &field.name))
+                    .is_some()
+            })
             .collect();
         if writable.is_empty() {
             continue;
@@ -1051,7 +1138,9 @@ fn create_query_type(
             // after the column itself rather than assuming an integer `id`.
             for (col_name, pg_type) in &pk_columns {
                 gql_field = gql_field.argument(InputValue::new(
-                    col_name,
+                    names
+                        .column(&field.schema_name, &field.table_name, col_name)
+                        .unwrap_or(col_name),
                     TypeRef::named_nn(pk_argument_type(pg_type)),
                 ));
             }
@@ -1075,8 +1164,14 @@ fn create_query_type(
                 relationships: Arc::clone(&relationships),
                 names: Arc::clone(&names),
             });
+            let aggregate_field_name = field
+                .aggregate_name
+                .clone()
+                .unwrap_or_else(|| {
+                    crate::schema::aggregate::aggregate_type_name(&field.type_name)
+                });
             let mut agg_field = Field::new(
-                crate::schema::aggregate::aggregate_type_name(&field.type_name),
+                aggregate_field_name,
                 TypeRef::named_nn(crate::schema::aggregate::aggregate_type_name(
                     &field.type_name,
                 )),
@@ -1283,7 +1378,9 @@ fn create_mutation_type(
             MutationType::DeleteByPk => {
                 for (col_name, pg_type) in &pk_columns {
                     gql_field = gql_field.argument(InputValue::new(
-                        col_name,
+                        names
+                            .column(&field.schema_name, &field.table_name, col_name)
+                            .unwrap_or(col_name),
                         TypeRef::named_nn(pk_argument_type(pg_type)),
                     ));
                 }
@@ -1495,7 +1592,12 @@ async fn resolve_aggregate<'a>(
             .as_ref()
             .ok_or_else(|| async_graphql::Error::new("schema cache is not loaded"))?;
         let scope =
-            WhereScope::table(&spec.schema_name, &spec.table_name, &spec.type_name)
+            WhereScope::table(
+                &spec.schema_name,
+                &spec.table_name,
+                &spec.type_name,
+                spec.names.as_ref(),
+            )
                 .with_resolution(cache, spec.relationships.as_ref());
         let (sql, values) = build_where_clause(Some(&filter), 1, &scope)?;
         if !sql.is_empty() {
@@ -1586,12 +1688,16 @@ async fn resolve_aggregate<'a>(
                 })?;
             let per_column: Vec<String> = columns
                 .iter()
-                .map(|column| {
+                .map(|field| {
+                    let source = spec
+                        .names
+                        .column_source(&spec.schema_name, &spec.table_name, field)
+                        .unwrap_or(field);
                     format!(
                         "'{}', {}({})",
-                        column.replace('\'', "''"),
+                        field.replace('\'', "''"),
                         sql_function,
-                        postrust_sql::escape_ident(column)
+                        postrust_sql::escape_ident(source)
                     )
                 })
                 .collect();
@@ -1666,7 +1772,12 @@ async fn resolve_aggregate<'a>(
                 &mut node_values,
                 spec.names.as_ref(),
             )?;
-            let mut projection = String::from("src.*");
+            // A renamed column is renamed here, in the projection over the
+            // subquery -- not inside it, where `src` has to stay the table's
+            // own composite for a computed field to be passed the row.
+            let mut projection = table
+                .and_then(|table| rename_projection(table, "src", spec.names.as_ref()))
+                .unwrap_or_else(|| "src.*".to_string());
             for expression in &computed {
                 projection.push_str(", ");
                 projection.push_str(expression);
@@ -1679,7 +1790,9 @@ async fn resolve_aggregate<'a>(
             }
             (
                 projection,
-                table.map(column_types_of_table).unwrap_or_default(),
+                table
+                    .map(|table| exposed_column_types(table, spec.names.as_ref()))
+                    .unwrap_or_default(),
             )
         };
 
@@ -1836,10 +1949,14 @@ async fn resolve_query<'a>(
 
         let mut conditions = Vec::with_capacity(pk_columns.len());
         for (idx, (col_name, pg_type)) in pk_columns.iter().enumerate() {
-            let value = ctx.args.try_get(col_name).map_err(|_| {
+            let field = spec
+                .names
+                .column(schema_name, table_name, col_name)
+                .unwrap_or(col_name);
+            let value = ctx.args.try_get(field).map_err(|_| {
                 async_graphql::Error::new(format!(
                     "missing required primary key argument \"{}\"",
-                    col_name
+                    field
                 ))
             })?;
 
@@ -1862,9 +1979,19 @@ async fn resolve_query<'a>(
             .as_ref()
             .ok_or_else(|| async_graphql::Error::new("schema cache is not loaded"))?;
         let scope = match &spec.call {
-            None => WhereScope::table(schema_name, table_name, type_name)
+            None => WhereScope::table(schema_name, table_name, type_name, spec.names.as_ref())
                 .with_resolution(cache, relationships),
-            Some(_) => WhereScope::for_alias(table_name, type_name, cache, relationships),
+            // A function's rows are the table's rows, so they are renamed the
+            // same way; only how they are reached differs.
+            Some(_) => WhereScope::for_alias(
+                schema_name,
+                table_name,
+                table_name,
+                type_name,
+                cache,
+                relationships,
+                spec.names.as_ref(),
+            ),
         };
         let (filter_sql, filter_values) =
             build_where_clause(Some(&filter), bound_values.len() + 1, &scope)?;
@@ -1891,7 +2018,14 @@ async fn resolve_query<'a>(
                 spec.names.as_ref(),
             )
             .await?,
-            build_distinct_on(ctx, &gql_ctx.schema_cache, schema_name, table_name).await?,
+            build_distinct_on(
+                ctx,
+                &gql_ctx.schema_cache,
+                schema_name,
+                table_name,
+                spec.names.as_ref(),
+            )
+            .await?,
         )
     };
 
@@ -1958,7 +2092,7 @@ async fn resolve_query<'a>(
                 match cache.get_table(&qi) {
                     Some(table) => (
                         computed_projections(table, ctx.field(), "src", spec.names.as_ref()),
-                        column_types_of_table(table),
+                        exposed_column_types(table, spec.names.as_ref()),
                     ),
                     None => (Vec::new(), HashMap::new()),
                 }
@@ -2021,10 +2155,26 @@ async fn resolve_query<'a>(
     // subquery alias is only passable as a composite value while its columns
     // are exactly the table's. So both live out here, where `src` still is
     // one.
-    let inner = if embed_expressions.is_empty() && computed.is_empty() {
+    let renamed = {
+        let guard = gql_ctx
+            .schema_cache
+            .get()
+            .await
+            .map_err(|e| async_graphql::Error::new(e.to_string()))?;
+        guard
+            .as_ref()
+            .and_then(|cache| {
+                cache.get_table(&postrust_core::api_request::QualifiedIdentifier::new(
+                    schema_name,
+                    table_name,
+                ))
+            })
+            .and_then(|table| rename_projection(table, "src", spec.names.as_ref()))
+    };
+    let inner = if embed_expressions.is_empty() && computed.is_empty() && renamed.is_none() {
         inner
     } else {
-        let mut projection = String::from("src.*");
+        let mut projection = renamed.unwrap_or_else(|| "src.*".to_string());
         for expression in &computed {
             projection.push_str(", ");
             projection.push_str(expression);
@@ -2169,6 +2319,7 @@ async fn resolve_mutation<'a>(
                 cache,
                 relationships: relationships.as_ref(),
                 type_names: type_names.as_ref(),
+                names: names.as_ref(),
             };
 
             execute_insert(pool, gql_ctx, schema_name, table_name, objects, &context).await?
@@ -2198,7 +2349,13 @@ async fn resolve_mutation<'a>(
                 .collect();
 
             let where_clause = if mutation_type == MutationType::UpdateByPk {
-                Some(pk_where_from_args(ctx, table_name, pk_columns)?)
+                Some(pk_where_from_args(
+                    ctx,
+                    schema_name,
+                    table_name,
+                    pk_columns,
+                    names.as_ref(),
+                )?)
             } else {
                 ctx.args.try_get("where").ok().map(|v| accessor_to_json(&v))
             };
@@ -2213,6 +2370,7 @@ async fn resolve_mutation<'a>(
                 column_types_of(&gql_ctx.schema_cache, schema_name, table_name).await,
                 where_clause,
                 relationships.as_ref(),
+                names.as_ref(),
             )
             .await
             .map(|rows| {
@@ -2222,7 +2380,13 @@ async fn resolve_mutation<'a>(
         }
         MutationType::Delete | MutationType::DeleteByPk => {
             let where_clause = if mutation_type == MutationType::DeleteByPk {
-                Some(pk_where_from_args(ctx, table_name, pk_columns)?)
+                Some(pk_where_from_args(
+                    ctx,
+                    schema_name,
+                    table_name,
+                    pk_columns,
+                    names.as_ref(),
+                )?)
             } else {
                 ctx.args.try_get("where").ok().map(|v| accessor_to_json(&v))
             };
@@ -2643,7 +2807,12 @@ fn insert_row<'life>(
         for (key, value) in object {
             match relationships.iter().find(|r| r.name == key) {
                 None => {
-                    columns.insert(key, value);
+                    // A written value is keyed by the field it was sent under;
+                    // the statement is written in the table's own columns.
+                    columns.insert(
+                        table_column_for(context.names, table, &key).to_string(),
+                        value,
+                    );
                 }
                 Some(_) if value.is_null() => {
                     // `author: null` is a row with no author, not a row whose
@@ -2711,6 +2880,7 @@ fn insert_row<'life>(
                 cache: context.cache,
                 relationships: context.relationships,
                 type_names: context.type_names,
+                names: context.names,
             };
             let written = insert_row(
                 conn,
@@ -2763,7 +2933,8 @@ fn insert_row<'life>(
                 } else {
                     let assignments: Vec<String> = updates
                         .iter()
-                        .map(|column| {
+                        .map(|field| {
+                            let column = table_column_for(context.names, table, field);
                             format!(
                                 "{} = EXCLUDED.{}",
                                 postrust_sql::escape_ident(column),
@@ -2886,6 +3057,7 @@ fn insert_row<'life>(
                     cache: context.cache,
                     relationships: context.relationships,
                     type_names: context.type_names,
+                    names: context.names,
                 };
                 insert_row(
                     conn,
@@ -2914,6 +3086,9 @@ struct InsertContext<'a> {
     /// map. A table's type is not always its name: a second schema prefixes
     /// it, and a name may have been given.
     type_names: &'a HashMap<(String, String), String>,
+    /// The names columns are exposed under, so a written value keyed by a
+    /// field reaches the column it names.
+    names: &'a crate::names::NameOverrides,
 }
 
 /// Re-read written rows so that a mutation's `returning` can carry
@@ -2974,7 +3149,11 @@ async fn reread_returning(
         names,
     )?;
     let computed = computed_projections(table, returning, "src", names);
-    if embeds.is_empty() && computed.is_empty() {
+    // A rename is reason enough to read the rows again: `RETURNING` answers in
+    // the table's own column names, which are not the names the client asked
+    // under.
+    let renames = names.renames_columns(&table.schema, &table.name);
+    if embeds.is_empty() && computed.is_empty() && !renames {
         return Ok(rows);
     }
 
@@ -3003,7 +3182,8 @@ async fn reread_returning(
         return Ok(rows);
     }
 
-    let mut projection = String::from("src.*");
+    let mut projection = rename_projection(table, "src", names)
+        .unwrap_or_else(|| "src.*".to_string());
     for expression in &computed {
         projection.push_str(", ");
         projection.push_str(expression);
@@ -3017,7 +3197,7 @@ async fn reread_returning(
 
     let sql = format!(
         "SELECT {} FROM (SELECT {} FROM (SELECT * FROM {}.{} WHERE {}) AS src) AS pgrst_r",
-        row_json("pgrst_r", &column_types_of_table(table)),
+        row_json("pgrst_r", &exposed_column_types(table, names)),
         projection,
         postrust_sql::escape_ident(schema_name),
         postrust_sql::escape_ident(table_name),
@@ -3143,6 +3323,7 @@ async fn execute_update(
     column_types: HashMap<String, String>,
     where_clause: Option<serde_json::Value>,
     relationships: &HashMap<String, Vec<RelationshipField>>,
+    names: &crate::names::NameOverrides,
 ) -> Result<Vec<Value>, async_graphql::Error> {
     use sqlx::Row;
 
@@ -3164,7 +3345,11 @@ async fn execute_update(
                 operator
             )));
         };
-        for (column, value) in map {
+        for (field, value) in map {
+            let column = &names
+                .column_source(schema_name, table_name, field)
+                .unwrap_or(field)
+                .to_string();
             if !written.insert(column.clone()) {
                 return Err(async_graphql::Error::new(format!(
                     "\"{}\" is written twice in one update; a column may be \
@@ -3255,7 +3440,7 @@ async fn execute_update(
     let cache = guard
         .as_ref()
         .ok_or_else(|| async_graphql::Error::new("schema cache is not loaded"))?;
-    let scope = WhereScope::table(schema_name, table_name, type_name)
+    let scope = WhereScope::table(schema_name, table_name, type_name, names)
         .under_alias(WRITTEN_ROW)
         .with_resolution(cache, relationships);
     let (where_sql, where_values) =
@@ -3338,13 +3523,13 @@ async fn execute_delete(
     let qi = postrust_core::api_request::QualifiedIdentifier::new(schema_name, table_name);
     let column_types = cache
         .get_table(&qi)
-        .map(column_types_of_table)
+        .map(|table| exposed_column_types(table, names))
         .unwrap_or_default();
 
     // Build WHERE clause. It can follow a relationship -- `delete_article(where:
     // {author: {id: {_eq: 2}}})` is the article-by-author delete anyone writes
     // -- so the scope is given the schema to resolve one with.
-    let scope = WhereScope::table(schema_name, table_name, type_name)
+    let scope = WhereScope::table(schema_name, table_name, type_name, names)
         .under_alias(WRITTEN_ROW)
         .with_resolution(cache, relationships);
     let (where_sql, mut values) = build_where_clause(where_clause.as_ref(), 1, &scope)?;
@@ -3365,6 +3550,9 @@ async fn execute_delete(
     // the deleted rows are still a table: the delete goes in a CTE and the
     // projection reads from it, while the rows it points at are still there.
     let mut projection = String::new();
+    let renamed = cache
+        .get_table(&qi)
+        .and_then(|table| rename_projection(table, "src", names));
     if let Some(returning) = returning {
         let mut param_idx = values.len() + 1;
         let mut alias_counter = 0usize;
@@ -3397,7 +3585,7 @@ async fn execute_delete(
     }
 
     let written = postrust_sql::escape_ident(WRITTEN_ROW);
-    let sql = if projection.is_empty() {
+    let sql = if projection.is_empty() && renamed.is_none() {
         format!(
             "DELETE FROM {}.{} AS {} {} RETURNING {}",
             postrust_sql::escape_ident(schema_name),
@@ -3409,13 +3597,14 @@ async fn execute_delete(
     } else {
         format!(
             "WITH pgrst_deleted AS (DELETE FROM {}.{} AS {} {} RETURNING {}.*) \
-             SELECT {} FROM (SELECT src.*{} FROM pgrst_deleted AS src) AS pgrst_r",
+             SELECT {} FROM (SELECT {}{} FROM pgrst_deleted AS src) AS pgrst_r",
             postrust_sql::escape_ident(schema_name),
             postrust_sql::escape_ident(table_name),
             written,
             where_sql,
             written,
             row_json("pgrst_r", &column_types),
+            renamed.unwrap_or_else(|| "src.*".to_string()),
             projection
         )
     };
@@ -3491,6 +3680,9 @@ pub struct WhereScope<'a> {
     row_ref: String,
     /// The GraphQL type name, which is the key into the relationship map.
     type_name: String,
+    /// The names this table's columns are exposed under, so a predicate
+    /// written against a field can be written as SQL against a column.
+    names: &'a crate::names::NameOverrides,
     resolution: Option<WhereResolution<'a>>,
 }
 
@@ -3502,7 +3694,12 @@ struct WhereResolution<'a> {
 
 impl<'a> WhereScope<'a> {
     /// A scope over a table addressed by its qualified name.
-    pub fn table(schema: &str, table: &str, type_name: &str) -> Self {
+    pub fn table(
+        schema: &str,
+        table: &str,
+        type_name: &str,
+        names: &'a crate::names::NameOverrides,
+    ) -> Self {
         Self {
             qualified: postrust_core::api_request::QualifiedIdentifier::new(schema, table),
             sql_ref: format!(
@@ -3512,6 +3709,7 @@ impl<'a> WhereScope<'a> {
             ),
             row_ref: postrust_sql::escape_ident(table),
             type_name: type_name.to_string(),
+            names,
             resolution: None,
         }
     }
@@ -3543,17 +3741,22 @@ impl<'a> WhereScope<'a> {
     }
 
     /// A scope over an aliased table, able to follow relationships.
+    #[allow(clippy::too_many_arguments)]
     fn for_alias(
+        schema: &str,
+        table: &str,
         alias: &str,
         type_name: &str,
         cache: &'a SchemaCache,
         relationships: &'a HashMap<String, Vec<RelationshipField>>,
+        names: &'a crate::names::NameOverrides,
     ) -> Self {
         Self {
-            qualified: postrust_core::api_request::QualifiedIdentifier::new("", ""),
+            qualified: postrust_core::api_request::QualifiedIdentifier::new(schema, table),
             sql_ref: postrust_sql::escape_ident(alias),
             row_ref: postrust_sql::escape_ident(alias),
             type_name: type_name.to_string(),
+            names,
             resolution: Some(WhereResolution {
                 cache,
                 relationships,
@@ -3562,12 +3765,24 @@ impl<'a> WhereScope<'a> {
     }
 
     /// A scope over an aliased table, for the inside of an `EXISTS`.
-    fn aliased(alias: &str, type_name: &str, from: &WhereScope<'a>) -> Self {
+    /// A scope over the *other* table of a relationship, under an alias.
+    ///
+    /// The child's own qualified name, not the parent's: a comparison inside
+    /// an `EXISTS` is against the child's columns, so it is the child's types
+    /// and the child's renames that decide how to write it.
+    fn aliased(
+        schema: &str,
+        table: &str,
+        alias: &str,
+        type_name: &str,
+        from: &WhereScope<'a>,
+    ) -> Self {
         Self {
-            qualified: from.qualified.clone(),
+            qualified: postrust_core::api_request::QualifiedIdentifier::new(schema, table),
             sql_ref: postrust_sql::escape_ident(alias),
             row_ref: postrust_sql::escape_ident(alias),
             type_name: type_name.to_string(),
+            names: from.names,
             resolution: from.resolution.as_ref().map(|r| WhereResolution {
                 cache: r.cache,
                 relationships: r.relationships,
@@ -3575,8 +3790,20 @@ impl<'a> WhereScope<'a> {
         }
     }
 
+    /// The column a field name names, quoted and qualified.
     fn column(&self, name: &str) -> String {
-        format!("{}.{}", self.sql_ref, postrust_sql::escape_ident(name))
+        format!(
+            "{}.{}",
+            self.sql_ref,
+            postrust_sql::escape_ident(self.column_name(name))
+        )
+    }
+
+    /// The column behind a field name.
+    fn column_name<'n>(&'n self, name: &'n str) -> &'n str {
+        self.names
+            .column_source(&self.qualified.schema, &self.qualified.name, name)
+            .unwrap_or(name)
     }
 
     /// The PostgreSQL type of one of this table's columns, where it can be
@@ -3585,7 +3812,9 @@ impl<'a> WhereScope<'a> {
     fn column_type(&self, name: &str) -> Option<String> {
         let cache = self.resolution.as_ref()?.cache;
         let table = cache.get_table(&self.qualified)?;
-        table.get_column(name).map(|c| c.nominal_type.clone())
+        table
+            .get_column(self.column_name(name))
+            .map(|c| c.nominal_type.clone())
     }
 
     fn relationship(&self, name: &str) -> Option<&'a RelationshipField> {
@@ -3736,7 +3965,13 @@ fn exists_sql(
 
     *alias_counter += 1;
     let alias = format!("pgrst_rel_{}", alias_counter);
-    let child_scope = WhereScope::aliased(&alias, &relationship.target_type, scope);
+    let child_scope = WhereScope::aliased(
+        &plan.foreign_schema,
+        &plan.foreign_table,
+        &alias,
+        &relationship.target_type,
+        scope,
+    );
 
     // A computed relationship is correlated by argument -- the function takes
     // the parent row -- where a key relationship is correlated by columns.
@@ -4303,11 +4538,12 @@ fn order_terms_into(
                     name
                 ))
             })?;
-            if table.get_column(key).is_some() {
+            let column = table_column_for(names, table, key);
+            if table.get_column(column).is_some() {
                 terms.push(format!(
                     "{}.{} {}",
                     reference,
-                    postrust_sql::escape_ident(key),
+                    postrust_sql::escape_ident(column),
                     sql
                 ));
                 continue;
@@ -4533,12 +4769,13 @@ async fn build_distinct_on(
     schema_cache: &postrust_core::schema_cache::SchemaCacheRef,
     schema_name: &str,
     table_name: &str,
+    names: &crate::names::NameOverrides,
 ) -> Result<Vec<String>, async_graphql::Error> {
     let Ok(arg) = ctx.args.try_get("distinct_on") else {
         return Ok(Vec::new());
     };
     let value = accessor_to_json(&arg);
-    let names: Vec<String> = match &value {
+    let requested: Vec<String> = match &value {
         serde_json::Value::Array(items) => items
             .iter()
             .filter_map(|i| i.as_str().map(|s| s.to_string()))
@@ -4546,7 +4783,7 @@ async fn build_distinct_on(
         serde_json::Value::String(one) => vec![one.clone()],
         _ => Vec::new(),
     };
-    if names.is_empty() {
+    if requested.is_empty() {
         return Ok(Vec::new());
     }
 
@@ -4562,12 +4799,13 @@ async fn build_distinct_on(
         .get_table(&qi)
         .ok_or_else(|| async_graphql::Error::new(format!("unknown table \"{}\"", table_name)))?;
 
-    let mut quoted = Vec::with_capacity(names.len());
-    for name in names {
+    let mut quoted = Vec::with_capacity(requested.len());
+    for field in requested {
+        let name = table_column_for(names, table, &field).to_string();
         if table.get_column(&name).is_none() {
             return Err(async_graphql::Error::new(format!(
                 "cannot take distinct on unknown column \"{}\" of \"{}\"",
-                name, table_name
+                field, table_name
             )));
         }
         quoted.push(postrust_sql::escape_ident(&name));
@@ -4596,8 +4834,9 @@ fn computed_projections(
     let mut projections = Vec::new();
     for field in selection.selection_set() {
         let name = field.name();
-        // A real column wins, and is already in `*`.
-        if table.get_column(name).is_some() {
+        // A real column wins, and the projection already carries it -- under
+        // this name, whether or not that is the column's own.
+        if table.get_column(table_column_for(names, table, name)).is_some() {
             continue;
         }
         // The field may be exposed under a name that was given rather than
@@ -4662,12 +4901,15 @@ fn nested_aggregate_select(
                     let columns: Vec<String> = function
                         .selection_set()
                         .map(|column| {
+                            let source = child_table
+                                .map(|table| table_column_for(names, table, column.name()))
+                                .unwrap_or_else(|| column.name());
                             format!(
                                 "'{}', {}({}.{})",
                                 column.name().replace('\'', "''"),
                                 sql_function,
                                 postrust_sql::escape_ident(child_alias),
-                                postrust_sql::escape_ident(column.name())
+                                postrust_sql::escape_ident(source)
                             )
                         })
                         .collect();
@@ -4750,13 +4992,16 @@ fn column_expression(
     name: &str,
     names: &crate::names::NameOverrides,
 ) -> String {
+    let column = table
+        .map(|t| table_column_for(names, t, name))
+        .unwrap_or(name);
     let plain = format!(
         "{}.{}",
         postrust_sql::escape_ident(alias),
-        postrust_sql::escape_ident(name)
+        postrust_sql::escape_ident(column)
     );
     let computed = table
-        .filter(|t| t.get_column(name).is_none())
+        .filter(|t| t.get_column(column).is_none())
         .and_then(|t| {
             let function = names
                 .computed_source(&t.schema, &t.name, name)
@@ -4787,6 +5032,7 @@ fn order_terms(
     schema_name: &str,
     table_name: &str,
     alias: &str,
+    names: &crate::names::NameOverrides,
 ) -> Result<Option<String>, async_graphql::Error> {
     let entries: Vec<&serde_json::Value> = match order {
         serde_json::Value::Array(items) => items.iter().collect(),
@@ -4804,15 +5050,16 @@ fn order_terms(
         let serde_json::Value::Object(map) = entry else {
             continue;
         };
-        for (column, direction) in map {
+        for (field, direction) in map {
             // A direction given as null is no direction, as at the root.
             if direction.is_null() {
                 continue;
             }
+            let column = table_column_for(names, table, field);
             if table.get_column(column).is_none() {
                 return Err(async_graphql::Error::new(format!(
                     "cannot order by unknown column \"{}\" on \"{}\"",
-                    column, table_name
+                    field, table_name
                 )));
             }
             let name = direction.as_str().unwrap_or_default();
@@ -4870,11 +5117,20 @@ fn embed_narrowing(
     max_rows: Option<i64>,
     param_idx: &mut usize,
     values: &mut Vec<serde_json::Value>,
+    names: &crate::names::NameOverrides,
 ) -> Result<(Option<String>, Option<String>, Option<i64>, i64), async_graphql::Error> {
     let child_where = match arguments.get("where") {
         Some(expression) if !expression.is_null() => {
             let child_scope =
-                WhereScope::for_alias(child_alias, target_type, schema_cache, relationships);
+                WhereScope::for_alias(
+                    &plan.foreign_schema,
+                    &plan.foreign_table,
+                    child_alias,
+                    target_type,
+                    schema_cache,
+                    relationships,
+                    names,
+                );
             let mut nested_alias = 0usize;
             build_condition(expression, &child_scope, param_idx, values, &mut nested_alias)?
         }
@@ -4888,6 +5144,7 @@ fn embed_narrowing(
             &plan.foreign_schema,
             &plan.foreign_table,
             child_alias,
+            names,
         )?,
         _ => None,
     };
@@ -4954,6 +5211,7 @@ fn build_embed_expressions(
                 max_rows,
                 param_idx,
                 values,
+                names,
             )?;
 
             let child_table = schema_cache.get_table(
@@ -5027,6 +5285,7 @@ fn build_embed_expressions(
             max_rows,
             param_idx,
             values,
+            names,
         )?;
 
         // Leaf fields are columns; anything that resolved to a relationship is
@@ -5052,8 +5311,11 @@ fn build_embed_expressions(
             }
             // A computed column inside an embed is the same call, against the
             // child's alias rather than the table.
+            let column = child_table
+                .map(|t| table_column_for(names, t, name))
+                .unwrap_or(name);
             let computed = child_table
-                .filter(|t| t.get_column(name).is_none())
+                .filter(|t| t.get_column(column).is_none())
                 .and_then(|t| {
                     let function = names
                         .computed_source(&t.schema, &t.name, name)
@@ -5068,11 +5330,24 @@ fn build_embed_expressions(
                     postrust_sql::escape_ident(&child_alias),
                     postrust_sql::escape_ident(name)
                 )),
+                // A column the child exposes under another name is selected as
+                // that name, since the row it lands in is the client's.
+                None if column != name => parts.push(format!(
+                    "{} AS {}",
+                    postrust_sql::escape_ident(column),
+                    postrust_sql::escape_ident(name)
+                )),
                 None => parts.push(postrust_sql::escape_ident(name)),
             }
         }
         if parts.is_empty() && nested.is_empty() {
-            parts.push(format!("{}.*", postrust_sql::escape_ident(&child_alias)));
+            parts.push(
+                child_table
+                    .and_then(|table| rename_projection(table, &child_alias, names))
+                    .unwrap_or_else(|| {
+                        format!("{}.*", postrust_sql::escape_ident(&child_alias))
+                    }),
+            );
         }
         for (field_name, expression) in nested {
             parts.push(format!(
@@ -5249,8 +5524,10 @@ fn embed_relationships<'f>(
 /// of a free-form `where`.
 fn pk_where_from_args(
     ctx: &ResolverContext<'_>,
+    schema_name: &str,
     table_name: &str,
     pk_columns: &[(String, String)],
+    names: &crate::names::NameOverrides,
 ) -> Result<serde_json::Value, async_graphql::Error> {
     if pk_columns.is_empty() {
         return Err(async_graphql::Error::new(format!(
@@ -5270,24 +5547,30 @@ fn pk_where_from_args(
 
     let mut conditions = serde_json::Map::new();
     for (col_name, _) in pk_columns {
+        // Under the name the key column is exposed as, on both sides: the
+        // argument the client wrote, and the predicate handed on to the same
+        // builder every other `where` goes through.
+        let field = names
+            .column(schema_name, table_name, col_name)
+            .unwrap_or(col_name);
         let value = match &from_object {
-            Some(serde_json::Value::Object(map)) => map.get(col_name).cloned().ok_or_else(|| {
+            Some(serde_json::Value::Object(map)) => map.get(field).cloned().ok_or_else(|| {
                 async_graphql::Error::new(format!(
                     "pk_columns is missing the key column \"{}\"",
-                    col_name
+                    field
                 ))
             })?,
             _ => {
-                let arg = ctx.args.try_get(col_name).map_err(|_| {
+                let arg = ctx.args.try_get(field).map_err(|_| {
                     async_graphql::Error::new(format!(
                         "missing required primary key argument \"{}\"",
-                        col_name
+                        field
                     ))
                 })?;
                 accessor_to_json(&arg)
             }
         };
-        conditions.insert(col_name.clone(), serde_json::json!({ "_eq": value }));
+        conditions.insert(field.to_string(), serde_json::json!({ "_eq": value }));
     }
 
     Ok(serde_json::Value::Object(conditions))

@@ -303,6 +303,12 @@ pub struct QueryField {
     pub pk_columns: Vec<(String, String)>,
     /// Field description
     pub description: Option<String>,
+    /// The name given to this table's aggregate root, if one was.
+    ///
+    /// The aggregate field is built beside the list field rather than being a
+    /// `QueryField` of its own, so the name it was given rides along with the
+    /// list field that spawns it.
+    pub aggregate_name: Option<String>,
 }
 
 impl QueryField {
@@ -326,6 +332,7 @@ impl QueryField {
             is_by_pk: false,
             pk_columns: Vec::new(),
             description: Some(format!("fetch data from the table: \"{}\"", table.name)),
+            aggregate_name: None,
         }
     }
 
@@ -360,6 +367,7 @@ impl QueryField {
                 "fetch data from the table: \"{}\" using primary key columns",
                 table.name
             )),
+            aggregate_name: None,
         })
     }
 }
@@ -609,17 +617,49 @@ pub fn build_schema(schema_cache: &SchemaCache, config: &SchemaConfig) -> Genera
         let obj_type = TableObjectType::from_table_named(table, &base_name, &config.names);
         let type_name = obj_type.name.clone();
 
-        // Add query fields
-        query_fields.push(QueryField::list_named(table, &base_name));
-        if let Some(by_pk) = QueryField::by_pk_named(table, &base_name) {
+        // Add query fields. Each root may be named separately -- Hasura names
+        // them one at a time, and a set that does not agree on a base name has
+        // nowhere else to be written down.
+        let rename = |field: &mut QueryField, kind: &str| {
+            if let Some(given) = config.names.root(&table.schema, &table.name, kind) {
+                field.name = given.to_string();
+            }
+        };
+        let mut list = QueryField::list_named(table, &base_name);
+        rename(&mut list, "select");
+        // The aggregate root is generated from the type name rather than being
+        // a `QueryField` of its own, so its name travels with the list field
+        // that spawns it.
+        list.aggregate_name = config
+            .names
+            .root(&table.schema, &table.name, "select_aggregate")
+            .map(str::to_string);
+        query_fields.push(list);
+        if let Some(mut by_pk) = QueryField::by_pk_named(table, &base_name) {
+            rename(&mut by_pk, "select_by_pk");
             query_fields.push(by_pk);
         }
 
         // Add mutation fields if enabled
         if config.enable_mutations {
-            mutation_fields.extend(MutationField::insert_fields_named(table, &base_name));
-            mutation_fields.extend(MutationField::update_fields_named(table, &base_name));
-            mutation_fields.extend(MutationField::delete_fields_named(table, &base_name));
+            let mut fields: Vec<MutationField> = Vec::new();
+            fields.extend(MutationField::insert_fields_named(table, &base_name));
+            fields.extend(MutationField::update_fields_named(table, &base_name));
+            fields.extend(MutationField::delete_fields_named(table, &base_name));
+            for field in &mut fields {
+                let kind = match field.mutation_type {
+                    MutationType::Insert => "insert",
+                    MutationType::InsertOne => "insert_one",
+                    MutationType::Update => "update",
+                    MutationType::UpdateByPk => "update_by_pk",
+                    MutationType::Delete => "delete",
+                    MutationType::DeleteByPk => "delete_by_pk",
+                };
+                if let Some(given) = config.names.root(&table.schema, &table.name, kind) {
+                    field.name = given.to_string();
+                }
+            }
+            mutation_fields.extend(fields);
         }
 
         // Add relationship fields

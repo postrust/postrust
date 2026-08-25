@@ -108,7 +108,16 @@ impl TableObjectType {
         let mut fields: Vec<GraphQLField> = table
             .columns
             .values()
-            .map(GraphQLField::from_column)
+            .map(|column| {
+                let mut field = GraphQLField::from_column(column);
+                // A column may be exposed under another name. This is the one
+                // place the schema decides that; every resolver reads it back
+                // the other way, from the field to the column.
+                if let Some(given) = names.column(&table.schema, &table.name, &column.name) {
+                    field.name = given.to_string();
+                }
+                field
+            })
             .collect();
         let mut computed: Vec<(&String, &postrust_core::schema_cache::ComputedColumn)> =
             table.computed_columns.iter().collect();
