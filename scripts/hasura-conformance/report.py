@@ -109,6 +109,24 @@ table(rows, "ALL")
 table([r for r in rows if not r["mutating"]], "READS (query)")
 table([r for r in rows if r["mutating"]], "WRITES (mutation)")
 
+# What the third level is made of. Half of it is not agreement about data at
+# all: a case where both servers answer with errors counts as agreement --
+# correctly, a client branches the same way -- but it is agreement by mutual
+# refusal, and it evaporates the moment this server can answer a query it
+# previously could not. Every feature added moves cases from the left column to
+# the right one, so a headline that mixes them falls while the server improves.
+passing = [r for r in rows if r["status_ok"] and r["outcome_ok"]
+           and (r["data_ok"] or r["ref_outcome"] == "errors")]
+mutual = [r for r in passing if r["ref_outcome"] == "errors"]
+same_data = [r for r in passing if r["ref_outcome"] == "data"]
+diverged = [r for r in rows if r["ref_outcome"] == "errors" and r["cand_outcome"] == "data"]
+
+print("\nwhat the third level is made of")
+print(f"  {len(same_data):>4}  the same data came back")
+print(f"  {len(mutual):>4}  both answered with errors -- agreement by mutual refusal")
+print(f"  {len(diverged):>4}  Hasura refused and this answered, which is where the")
+print("        mutual-refusal cases go as this server gains fields")
+
 print("\nwhere the divergences are")
 print(f"  status differs        {sum(1 for r in rows if not r['status_ok']):>4}")
 print(f"  outcome differs       {sum(1 for r in rows if not r['outcome_ok']):>4}")

@@ -8,8 +8,19 @@ harness itself, divergences kept on purpose, and the gaps still open.
 
 | | status | same outcome | same data | full body |
 |---|---|---|---|---|
-| all (464) | 97.8% | 62.7% | **54.1%** | 29.3% |
+| all (464) | 97.6% | 62.5% | **53.9%** | 29.5% |
 | **excluding the 142 permission cases (322)** | | | **67.4%** | |
+
+Of the 250 cases the third column counts, **137 agree about data and 113 agree
+only because both servers answered with errors.** A further 108 are cases where
+Hasura refused and this server answered -- which is where a mutual-refusal case
+goes the moment this server gains the field it was missing.
+
+That is the whole explanation for a number that falls while the server
+improves, and it is measured rather than asserted: comparing two consecutive
+runs, every case lost went from `errors -> errors` to `errors -> data`. The
+report prints the split now, because a headline that mixes the two is not
+readable as progress.
 
 **The candidate is configured.** Each group's fixtures are converted into a
 `PGRST_GRAPHQL_NAMES` document by `scripts/hasura-names.py` and given to the
@@ -28,9 +39,8 @@ that ask for it need permissions or a further feature besides) → 49.4
 (upserts) → 50.6 (enum tables) → 51.5 (ordering by a related row or an
 aggregate) → 52.6 (PostGIS comparisons) → 53.0 (`_cast`) → 52.6 (typed mutation
 inputs, which cost two cases; see below) → 54.5 (ltree comparisons, and a list
-bound as an array) → 55.0 (shapes read and written as GeoJSON) → 54.1
-(functions as root fields, which moved no case either way and cost four
-permission cases their accidental agreement). The figure excluding the
+bound as an array) → 55.0 (shapes read and written as GeoJSON) → 53.9 (functions
+as root fields; see the split above for why this reads as a loss). The figure excluding the
 permission cases, which is the one worth reading, went 51.2 → 55.3 → 55.9 →
 58.4 → 60.6 → 62.4 → 64.0 → 64.6 → 64.0 → 66.8 → 67.4 → 67.4 over the same
 span.
@@ -229,19 +239,13 @@ wrong one.
    written first and the key pushed down, the opposite of the ordinary to-one
    rule.
 
-12. **Why the corpus's functions are still not root fields.** A function
-    returning `SETOF <table>` is a root field now, verified against a running
-    server in both directions -- a stable one on the query root, a volatile one
-    on the mutation root, filtered and ordered and paged like the table. The
-    corpus still answers `Unknown field "add_to_score"`, and the same function
-    written out by hand *is* exposed. Something about the fixture is
-    responsible and has not been found.
-
-    Two things Hasura does here that this does not, either of which may be it:
-    a session argument (`hasura_session json`) is filled from session variables
-    and not exposed as an argument at all, and a volatile function can be
-    tracked `exposed_as: query`, which is a decision in metadata rather than a
-    fact about the function.
+12. **Function permissions and the session argument.** All six of the corpus's
+    functions are exposed now. What is left in that group is Hasura's own two
+    decisions about them: a function is unavailable to a role until
+    `create_function_permission` grants it -- which is the permission model, not
+    the function -- and a session argument (`hasura_session json`) is filled
+    from session variables rather than taken from the client, where here it is
+    an ordinary argument the client must pass.
 
 13. **A relationship in a `delete`'s `returning`** keeps the plain columns.
     The rows are gone by the time they could be read again, so there is nothing
@@ -271,6 +275,11 @@ wrong one.
   ordering happens before it. `EmbedPlan::embed_expression` already took all
   four for the REST surface; the GraphQL side had no way to say any of them.
 - **Computed columns are fields**, at the root and inside an embed.
+- **A reserved word in a returned type.** `pg_catalog.format_type` quotes what
+  needs quoting, so a function returning rows of `user` reports `SETOF "user"`
+  -- which matches no table called `user`. Not one of the corpus's six
+  functions was exposed and a hand-written stand-in was, which is what let it
+  hide for a round.
 - **Functions that answer with rows of a table.** `search_articles(args: {term:
   "rust"}, where: …, order_by: …, limit: 5)` -- the rows are that table's rows,
   so everything built for reading them applies unchanged, and the function's
