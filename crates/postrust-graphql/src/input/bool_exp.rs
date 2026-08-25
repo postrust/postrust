@@ -147,9 +147,12 @@ fn comparison_input(scalar: &str) -> InputObject {
     }
     input = input.field(InputValue::new("_is_null", TypeRef::named("Boolean")));
 
-    if scalar == "String" {
+    // `citext` is text that compares without regard to case. It is its own
+    // GraphQL scalar because a client declaring `$name: citext!` is naming the
+    // column's type, but every pattern question text answers, it answers.
+    if scalar == "String" || scalar == "citext" {
         for op in TEXT {
-            input = input.field(InputValue::new(*op, TypeRef::named("String")));
+            input = input.field(InputValue::new(*op, TypeRef::named(scalar)));
         }
     }
     // A shape is compared by how it lies against another shape, not by

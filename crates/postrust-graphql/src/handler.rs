@@ -1481,6 +1481,7 @@ async fn resolve_aggregate<'a>(
             postrust_sql::escape_ident(&spec.schema_name),
             postrust_sql::escape_ident(&spec.table_name)
         ),
+        spec.names.as_ref(),
     )
     .await?;
 
@@ -1852,6 +1853,7 @@ async fn resolve_query<'a>(
                 type_name,
                 relationships,
                 &source_ref,
+                spec.names.as_ref(),
             )
             .await?,
             build_distinct_on(ctx, &gql_ctx.schema_cache, schema_name, table_name).await?,
@@ -1859,24 +1861,54 @@ async fn resolve_query<'a>(
     };
 
     // PostgreSQL keeps the first row of each DISTINCT ON group in the query's
-    // own order, and picks arbitrarily where the order does not begin with the
-    // distinct columns. Prepending them keeps whatever the client asked for as
-    // the tiebreak instead of discarding it.
+    // own order, and picks arbitrarily where the ordering does not begin with
+    // the distinct columns -- so which row survives would depend on the plan.
+    // Hasura refuses that query rather than answering it, and so does this:
+    // prepending the distinct columns instead produced an answer, and a wrong
+    // one, since `ORDER BY "department", "department" DESC` is decided by its
+    // first term and sorts ascending.
     let (distinct_sql, order_sql) = if distinct_on.is_empty() {
         (String::new(), order_sql)
     } else {
-        let mut terms: Vec<String> = distinct_on.clone();
-        if let Some(rest) = order_sql.strip_prefix(" ORDER BY ") {
-            for term in rest.split(", ") {
-                let column = term.split_whitespace().next().unwrap_or(term);
-                if !distinct_on.iter().any(|d| d == column) {
-                    terms.push(term.to_string());
-                }
-            }
+        let written: Vec<&str> = order_sql
+            .strip_prefix(" ORDER BY ")
+            .map(|rest| rest.split(", ").collect())
+            .unwrap_or_default();
+        // Terms are qualified and the distinct columns are not, so they are
+        // compared by the name itself.
+        let column_of = |term: &str| {
+            let expression = term.split_whitespace().next().unwrap_or(term);
+            expression
+                .rsplit_once('.')
+                .map(|(_, name)| name)
+                .unwrap_or(expression)
+                .to_string()
+        };
+        let leading: Vec<String> = written
+            .iter()
+            .take(distinct_on.len())
+            .map(|term| column_of(term))
+            .collect();
+        if !written.is_empty()
+            && (leading.len() != distinct_on.len()
+                || distinct_on.iter().any(|column| !leading.contains(column)))
+        {
+            let mut refusal = async_graphql::Error::new(
+                "\"distinct_on\" columns must match initial \"order_by\" columns",
+            );
+            let mut extensions = async_graphql::ErrorExtensionValues::default();
+            extensions.set("code", "validation-failed");
+            refusal.extensions = Some(extensions);
+            return Err(refusal);
         }
+        let order_sql = if written.is_empty() {
+            format!(" ORDER BY {}", distinct_on.join(", "))
+        } else {
+            order_sql
+        };
         (
             format!("DISTINCT ON ({}) ", distinct_on.join(", ")),
-            format!(" ORDER BY {}", terms.join(", ")),
+            order_sql,
         )
     };
 
@@ -3735,6 +3767,12 @@ fn comparison_sql(
                 Some(pg_type) => format!("::{}", pg_type),
                 None => String::new(),
             },
+            // A parameter arrives as `text`, and `citext = text` is decided by
+            // resolving the citext down to text -- so `_eq: "clarke"` against a
+            // case-insensitive column answered case-sensitively. The operand
+            // has to say it is a citext for the citext operator to be the one
+            // chosen.
+            _ if column_type == Some("citext") => "::citext".to_string(),
             _ => String::new(),
         };
         return Ok(format!("{} {} {}{}", quoted, sql_op, placeholder, cast));
@@ -3764,6 +3802,7 @@ fn comparison_sql(
                 // give: a cast makes PostgreSQL infer the parameter as text.
                 let cast = match (item.is_null(), column_type) {
                     (true, Some(pg_type)) => format!("::{}", pg_type),
+                    (_, Some("citext")) => "::citext".to_string(),
                     _ => String::new(),
                 };
                 placeholders.push(format!("${}{}", param_idx, cast));
@@ -3814,6 +3853,7 @@ async fn build_order_by_clause(
     type_name: &str,
     relationships: &HashMap<String, Vec<RelationshipField>>,
     reference: &str,
+    names: &crate::names::NameOverrides,
 ) -> Result<String, async_graphql::Error> {
     let Ok(order_arg) = ctx.args.try_get("order_by") else {
         return Ok(String::new());
@@ -3858,6 +3898,7 @@ async fn build_order_by_clause(
             type_name,
             table,
             reference,
+            names,
             &mut alias_counter,
             &mut terms,
         )?;
@@ -3884,6 +3925,7 @@ fn order_terms_into(
     type_name: &str,
     table: &postrust_core::schema_cache::Table,
     reference: &str,
+    names: &crate::names::NameOverrides,
     alias_counter: &mut usize,
     terms: &mut Vec<String>,
 ) -> Result<(), async_graphql::Error> {
@@ -3898,14 +3940,17 @@ fn order_terms_into(
         .unwrap_or(&[]);
 
     for (key, value) in map {
-        // A direction: this table's own column.
+        // A direction given as null is no direction. `order_by: {id:
+        // $direction}` with nothing bound for `$direction` is how a client
+        // makes an ordering optional without writing the query twice, and the
+        // same goes for `{author: $author_order_by}`, which is a whole
+        // ordering left out.
+        if value.is_null() {
+            continue;
+        }
+
+        // A direction: this table's own column, or a function of its row.
         if let Some(name) = value.as_str() {
-            if table.get_column(key).is_none() {
-                return Err(async_graphql::Error::new(format!(
-                    "cannot order by unknown column \"{}\" on \"{}\"",
-                    key, table.name
-                )));
-            }
             let sql = crate::input::order_by::direction_sql(name).ok_or_else(|| {
                 async_graphql::Error::new(format!(
                     "\"{}\" is not a sort direction; expected one of asc, desc, \
@@ -3913,8 +3958,34 @@ fn order_terms_into(
                     name
                 ))
             })?;
-            terms.push(format!("{}.{} {}", reference, postrust_sql::escape_ident(key), sql));
-            continue;
+            if table.get_column(key).is_some() {
+                terms.push(format!(
+                    "{}.{} {}",
+                    reference,
+                    postrust_sql::escape_ident(key),
+                    sql
+                ));
+                continue;
+            }
+            // A computed field is a column as far as ordering is concerned:
+            // the row is the argument, and the call is what is sorted on.
+            let function = names
+                .computed_source(&table.schema, &table.name, key)
+                .unwrap_or(key);
+            if let Some(definition) = table.get_computed_column(function) {
+                terms.push(format!(
+                    "{}.{}({}.*) {}",
+                    postrust_sql::escape_ident(&definition.function.schema),
+                    postrust_sql::escape_ident(&definition.function.name),
+                    reference,
+                    sql
+                ));
+                continue;
+            }
+            return Err(async_graphql::Error::new(format!(
+                "cannot order by unknown column \"{}\" on \"{}\"",
+                key, table.name
+            )));
         }
 
         // An aggregate of the rows that point here.
@@ -3974,6 +4045,7 @@ fn order_terms_into(
                 &rel.target_type,
                 target,
                 &quoted_alias,
+                names,
                 alias_counter,
                 &mut nested,
             )?;
@@ -4046,6 +4118,11 @@ fn aggregate_order_terms(
     // `{count: desc}` is one term; `{max: {id: desc}}` is one per column.
     let mut wanted: Vec<(String, String)> = Vec::new();
     for (function, argument) in spec {
+        // A direction given as null is no direction, as everywhere else an
+        // ordering is read.
+        if argument.is_null() {
+            continue;
+        }
         if function == "count" {
             let name = argument.as_str().unwrap_or_default();
             let Some(direction) = crate::input::order_by::direction_sql(name) else {
@@ -4061,6 +4138,9 @@ fn aggregate_order_terms(
             continue;
         };
         for (column, direction) in columns {
+            if direction.is_null() {
+                continue;
+            }
             let name = direction.as_str().unwrap_or_default();
             let Some(direction) = crate::input::order_by::direction_sql(name) else {
                 return Err(async_graphql::Error::new(format!(
@@ -4380,6 +4460,10 @@ fn order_terms(
             continue;
         };
         for (column, direction) in map {
+            // A direction given as null is no direction, as at the root.
+            if direction.is_null() {
+                continue;
+            }
             if table.get_column(column).is_none() {
                 return Err(async_graphql::Error::new(format!(
                     "cannot order by unknown column \"{}\" on \"{}\"",
