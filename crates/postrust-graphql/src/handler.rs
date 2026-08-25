@@ -2027,7 +2027,12 @@ fn row_json(expr: &str, column_types: &HashMap<String, String>) -> String {
         .iter()
         .map(|(name, _)| {
             format!(
-                "'{}', ST_AsGeoJSON({}.{})::jsonb",
+                // Option 4 asks PostGIS for the long-form CRS member --
+                // `urn:ogc:def:crs:EPSG::4326` -- which Hasura includes and
+                // which a client round-tripping a shape needs in order to
+                // write it back where it came from. PostGIS emits it only
+                // where the geometry has an SRID to report.
+                "'{}', ST_AsGeoJSON({}.{}, 9, 4)::jsonb",
                 name.replace('\'', "''"),
                 expr,
                 postrust_sql::escape_ident(name)
