@@ -2171,15 +2171,7 @@ async fn resolve_mutation<'a>(
                 type_names: type_names.as_ref(),
             };
 
-            execute_insert(
-                pool,
-                schema_name,
-                table_name,
-                gql_ctx.role(),
-                objects,
-                &context,
-            )
-            .await?
+            execute_insert(pool, gql_ctx, schema_name, table_name, objects, &context).await?
         }
         MutationType::Update | MutationType::UpdateByPk => {
             // `_set` replaces, the others read the column they write. A client
@@ -2281,19 +2273,26 @@ async fn resolve_mutation<'a>(
     Ok(mutation_result(result, affected, by_key))
 }
 
-/// Begin a transaction with the request's role applied.
+/// The transaction this operation's writes share, opening it if this is the
+/// first one.
 ///
-/// The role has to be set inside a transaction. `SET LOCAL` sent on a bare
-/// pooled connection applies to its own implicit single-statement transaction
-/// and is discarded before the next statement runs, so the query would execute
-/// as the pool's login role -- row-level security and role grants bypassed.
-/// PostgreSQL logs "SET LOCAL can only be used in transaction blocks" every
-/// time it happens.
-async fn begin_with_role(
+/// Held for the length of the write, and settled by whoever answers the
+/// request -- see [`crate::context::SharedWrite`]. Mutation root fields are
+/// resolved one after another, so the lock is never contended; it is what
+/// makes the transaction reachable from a resolver that owns nothing.
+async fn write_tx<'a>(
+    gql_ctx: &'a GraphQLContext,
     pool: &PgPool,
-    role: &str,
-) -> Result<sqlx::Transaction<'static, sqlx::Postgres>, async_graphql::Error> {
-    begin_with_session(pool, role, &[]).await
+) -> Result<
+    tokio::sync::MutexGuard<'a, Option<sqlx::Transaction<'static, sqlx::Postgres>>>,
+    async_graphql::Error,
+> {
+    let mut guard = gql_ctx.write.lock().await;
+    if guard.is_none() {
+        *guard =
+            Some(begin_with_session(pool, gql_ctx.role(), &gql_ctx.session_settings()).await?);
+    }
+    Ok(guard)
 }
 
 /// Begin a transaction with the request's role and session variables applied.
@@ -3025,9 +3024,12 @@ async fn reread_returning(
         conditions.join(" OR ")
     );
 
-    let mut conn = begin_with_session(pool, gql_ctx.role(), &gql_ctx.session_settings()).await?;
-    let reread = execute_query_on(&mut conn, &sql, &values).await?;
-    conn.commit().await?;
+    // The same transaction the write went into: the rows it is reading are the
+    // rows that write produced, and nothing has committed yet.
+    let mut guard = write_tx(gql_ctx, pool).await?;
+    let conn = guard.as_mut().expect("write_tx opens one");
+    let reread = execute_query_on(conn, &sql, &values).await?;
+    drop(guard);
 
     if reread.is_empty() {
         return Ok(rows);
@@ -3038,9 +3040,9 @@ async fn reread_returning(
 /// Execute an insert mutation.
 async fn execute_insert(
     pool: &PgPool,
+    gql_ctx: &GraphQLContext,
     schema_name: &str,
     table_name: &str,
-    role: &str,
     objects: serde_json::Value,
     context: &InsertContext<'_>,
 ) -> Result<(Vec<Value>, usize), async_graphql::Error> {
@@ -3061,7 +3063,8 @@ async fn execute_insert(
         return Err(async_graphql::Error::new("objects cannot be empty"));
     }
 
-    let mut conn = begin_with_role(pool, role).await?;
+    let mut guard = write_tx(gql_ctx, pool).await?;
+    let conn = guard.as_mut().expect("write_tx opens one");
 
     let mut inserted: Vec<Value> = Vec::new();
     let mut written = 0usize;
@@ -3070,7 +3073,7 @@ async fn execute_insert(
         let serde_json::Value::Object(map) = object else {
             return Err(async_graphql::Error::new("each object to insert is an object"));
         };
-        let row = insert_row(&mut conn, schema_name, table_name, map, context, &mut written).await?;
+        let row = insert_row(conn, schema_name, table_name, map, context, &mut written).await?;
         // A row `DO NOTHING` left alone is not in `returning` and is not in
         // `affected_rows` either: nothing was written, and the row that was
         // already there is not this mutation's to report.
@@ -3078,12 +3081,6 @@ async fn execute_insert(
             inserted.push(json_to_value(row));
         }
     }
-
-    // Commit once every object has been written, nested rows included:
-    // committing inside the loop would end the transaction, and the role set
-    // on it, after the first row -- and would leave a half-written parent
-    // behind when a child fails.
-    conn.commit().await?;
 
     Ok((inserted, written))
 }
@@ -3150,9 +3147,6 @@ async fn execute_update(
     use sqlx::Row;
 
     trace!("Update mutation for {}: {:?}", table_name, operators);
-
-    let mut conn =
-        begin_with_session(pool, gql_ctx.role(), &gql_ctx.session_settings()).await?;
 
     // Build the SET clause. Each operator writes a column in terms of itself
     // except `_set`, which replaces it -- `_inc` adds, the jsonb operators
@@ -3302,15 +3296,15 @@ async fn execute_update(
         query = bind_json_value(query, val);
     }
 
-    let rows = query.fetch_all(&mut *conn).await?;
+    let mut guard = write_tx(gql_ctx, pool).await?;
+    let conn = guard.as_mut().expect("write_tx opens one");
+    let rows = query.fetch_all(&mut **conn).await?;
 
     let updated: Vec<Value> = rows
         .iter()
         .filter_map(|row| row.try_get::<serde_json::Value, _>(0).ok())
         .map(json_to_value)
         .collect();
-
-    conn.commit().await?;
 
     Ok(updated)
 }
@@ -3428,22 +3422,20 @@ async fn execute_delete(
 
     trace!("Executing DELETE SQL: {}", sql);
 
-    let mut conn =
-        begin_with_session(pool, gql_ctx.role(), &gql_ctx.session_settings()).await?;
     let mut query = sqlx::query(&sql);
     for val in &values {
         query = bind_json_value(query, val);
     }
 
-    let rows = query.fetch_all(&mut *conn).await?;
+    let mut guard = write_tx(gql_ctx, pool).await?;
+    let conn = guard.as_mut().expect("write_tx opens one");
+    let rows = query.fetch_all(&mut **conn).await?;
 
     let deleted: Vec<Value> = rows
         .iter()
         .filter_map(|row| row.try_get::<serde_json::Value, _>(0).ok())
         .map(json_to_value)
         .collect();
-
-    conn.commit().await?;
 
     Ok(deleted)
 }

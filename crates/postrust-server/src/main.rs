@@ -297,12 +297,20 @@ async fn main() -> Result<()> {
                 // `current_setting('hasura.user_id')`.
                 let session = hasura_session_from_claims(&auth_result.claims);
 
+                // Every write in this operation goes into one transaction, and
+                // this is the half that decides its fate: a mutation naming
+                // several root fields is all-or-nothing, so the second one
+                // failing has to take the first one's rows with it. Nothing to
+                // settle for a query, which never opens it.
+                let write: postrust_graphql::context::SharedWrite = Arc::default();
+
                 let gql_ctx = postrust_graphql::context::GraphQLContext::new(
                     app_state.gql_state.pool.clone(),
                     schema_cache_ref,
                     auth_result,
                 )
-                .with_session(session);
+                .with_session(session)
+                .with_write(Arc::clone(&write));
 
                 let request = postrust_graphql::hasura::allow_unused_variables(
                     req.into_inner(),
@@ -310,7 +318,26 @@ async fn main() -> Result<()> {
                 .data(gql_ctx)
                 .data(app_state.gql_state.pool.clone())
                 .data(Arc::clone(&app_state.gql_state.broker));
-                let response = app_state.gql_state.schema.execute(request).await;
+                let mut response = app_state.gql_state.schema.execute(request).await;
+
+                if let Some(tx) = write.lock().await.take() {
+                    let settled = if response.errors.is_empty() {
+                        tx.commit().await
+                    } else {
+                        tx.rollback().await
+                    };
+                    // A commit that fails is a mutation that did not happen,
+                    // however well every statement in it went. Saying so is
+                    // the whole point of running them together.
+                    if let Err(e) = settled {
+                        tracing::error!("GraphQL mutation could not be settled: {}", e);
+                        response
+                            .errors
+                            .push(async_graphql::ServerError::new(e.to_string(), None));
+                        response.data = async_graphql::Value::Null;
+                    }
+                }
+
                 Json(postrust_graphql::hasura::envelope(response))
             }
 

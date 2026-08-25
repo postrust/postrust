@@ -144,6 +144,10 @@ async fn execute(
         .await
         .expect("failed to load schema cache");
 
+    // Every write in one operation shares a transaction, and the caller is what
+    // settles it -- so a test that only executes and never settles would leave
+    // its rows uncommitted, exactly as the server would.
+    let write: postrust_graphql::context::SharedWrite = Default::default();
     let ctx = GraphQLContext::new(
         pool.clone(),
         SchemaCacheRef::from_static(cache),
@@ -151,10 +155,19 @@ async fn execute(
             role: TEST_ROLE.to_string(),
             claims: HashMap::new(),
         },
-    );
+    )
+    .with_write(std::sync::Arc::clone(&write));
 
     let request = Request::new(query).data(ctx).data(pool.clone());
-    state.schema.execute(request).await
+    let response = state.schema.execute(request).await;
+    if let Some(tx) = write.lock().await.take() {
+        if response.errors.is_empty() {
+            tx.commit().await.expect("the write could not be committed");
+        } else {
+            tx.rollback().await.expect("the write could not be undone");
+        }
+    }
+    response
 }
 
 /// Execute and require success, returning the `data` payload as JSON.

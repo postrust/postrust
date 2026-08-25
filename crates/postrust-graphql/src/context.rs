@@ -4,6 +4,22 @@ use postrust_auth::AuthResult;
 use postrust_core::schema_cache::SchemaCacheRef;
 use sqlx::PgPool;
 use std::collections::HashMap;
+use std::sync::Arc;
+
+/// The transaction every write in one operation shares.
+///
+/// A GraphQL mutation may name several root fields, and the specification
+/// resolves them one after another. Hasura runs the whole set in one
+/// transaction, so a mutation whose second root field violates a constraint
+/// leaves nothing behind from its first -- which is what a client sending
+/// "create the order and its lines" is relying on. Opening a transaction per
+/// resolver, as this used to, half-applies that mutation and reports failure.
+///
+/// Opened lazily by the first write and settled once the operation is answered:
+/// committed when the response carries no errors, rolled back otherwise. A
+/// query never touches it.
+pub type SharedWrite =
+    Arc<tokio::sync::Mutex<Option<sqlx::Transaction<'static, sqlx::Postgres>>>>;
 
 /// Context available to all GraphQL resolvers.
 pub struct GraphQLContext {
@@ -23,6 +39,8 @@ pub struct GraphQLContext {
     /// `current_setting('hasura.user_id')` sees what the Hasura permission
     /// would have seen.
     pub session: HashMap<String, String>,
+    /// The transaction every write in this operation shares. See [`SharedWrite`].
+    pub write: SharedWrite,
 }
 
 impl GraphQLContext {
@@ -33,7 +51,18 @@ impl GraphQLContext {
             schema_cache,
             auth,
             session: HashMap::new(),
+            write: Arc::new(tokio::sync::Mutex::new(None)),
         }
+    }
+
+    /// Share one transaction with whoever is going to settle it.
+    ///
+    /// The caller keeps the other handle: it is the only thing that knows
+    /// whether the operation ended in errors, and so the only thing that can
+    /// decide between commit and rollback.
+    pub fn with_write(mut self, write: SharedWrite) -> Self {
+        self.write = write;
+        self
     }
 
     /// Carry session variables into every transaction this request opens.
