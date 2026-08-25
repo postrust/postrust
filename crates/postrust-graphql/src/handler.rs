@@ -690,11 +690,16 @@ fn build_dynamic_schema(
                 TypeRef::named_nn(format!("{}_constraint", type_name)),
             ))
             // An empty list is `DO NOTHING`, which is how Hasura spells "leave
-            // the row that is already there alone".
-            .field(InputValue::new(
-                "update_columns",
-                TypeRef::named_nn_list_nn(format!("{}_update_column", type_name)),
-            ))
+            // the row that is already there alone" -- and is the default, so
+            // `on_conflict: {constraint: article_pkey}` means exactly that
+            // rather than being refused for saying nothing about columns.
+            .field(
+                InputValue::new(
+                    "update_columns",
+                    TypeRef::named_nn_list_nn(format!("{}_update_column", type_name)),
+                )
+                .default_value(Value::List(Vec::new())),
+            )
             .field(InputValue::new(
                 "where",
                 TypeRef::named(crate::input::bool_exp::bool_exp_type_name(type_name)),
@@ -950,6 +955,11 @@ fn create_object_type(obj: &TableObjectType, relationships: &[RelationshipField]
     // metadata is marked inconsistent and the field is simply not there.
     let mut taken: HashSet<String> = obj.fields.iter().map(|f| f.name.clone()).collect();
 
+    // Collected rather than added as they are built, so they can go on in name
+    // order -- which is the order Hasura answers introspection in, and does not
+    // depend on which column the catalogue happened to list first.
+    let mut fields: Vec<(String, Field)> = Vec::new();
+
     for field in &obj.fields {
         let field_name = field.name.clone();
         let field_type = graphql_type_ref(&field.type_string());
@@ -964,8 +974,14 @@ fn create_object_type(obj: &TableObjectType, relationships: &[RelationshipField]
                 if let Some(Value::Object(map)) = ctx.parent_value.as_value() {
                     // Convert field name to async_graphql::Name for lookup
                     let key = async_graphql::Name::new(&field_name);
-                    if let Some(val) = map.get(&key) {
-                        return Ok(Some(FieldValue::value(val.clone())));
+                    match map.get(&key) {
+                        // A null is the answer, not a value to resolve. An
+                        // enum-typed column said so with `internal: invalid
+                        // item for enum` rather than answering null, because a
+                        // null is not one of its members.
+                        Some(Value::Null) => return Ok(None),
+                        Some(val) => return Ok(Some(FieldValue::value(val.clone()))),
+                        None => {}
                     }
                 }
 
@@ -980,7 +996,7 @@ fn create_object_type(obj: &TableObjectType, relationships: &[RelationshipField]
             gql_field
         };
 
-        object = object.field(gql_field);
+        fields.push((field.name.clone(), gql_field));
     }
 
     // Relationship fields. The query resolver embeds related rows into the
@@ -1052,7 +1068,7 @@ fn create_object_type(obj: &TableObjectType, relationships: &[RelationshipField]
             gql_field
         };
 
-        object = object.field(gql_field);
+        fields.push((rel.name.clone(), gql_field));
 
         // `author { articles_aggregate { aggregate { count } } }` -- the count
         // of a row's children without fetching them, which is the query behind
@@ -1062,7 +1078,8 @@ fn create_object_type(obj: &TableObjectType, relationships: &[RelationshipField]
             let aggregate_field = format!("{}_aggregate", rel.name);
             if taken.insert(aggregate_field.clone()) {
                 let key = aggregate_field.clone();
-                object = object.field(
+                fields.push((
+                    aggregate_field.clone(),
                     Field::new(
                         &aggregate_field,
                         TypeRef::named_nn(crate::schema::aggregate::aggregate_type_name(
@@ -1099,9 +1116,14 @@ fn create_object_type(obj: &TableObjectType, relationships: &[RelationshipField]
                     .argument(InputValue::new("limit", TypeRef::named("Int")))
                     .argument(InputValue::new("offset", TypeRef::named("Int")))
                     .description(format!("Aggregates over {}.", rel.name)),
-                );
+                ));
             }
         }
+    }
+
+    fields.sort_by(|(a, _), (b, _)| a.cmp(b));
+    for (_, field) in fields {
+        object = object.field(field);
     }
 
     object
@@ -3033,6 +3055,10 @@ fn insert_row<'life>(
         // `ON CONFLICT` says which uniqueness is being resolved against and
         // what to do about it. An empty `update_columns` is `DO NOTHING`,
         // which is how a client says "leave the row that is already there".
+        // The columns this statement writes, settled before the conflict
+        // clause so a predicate on it can number its parameters after theirs.
+        let column_names: Vec<&str> = columns.keys().map(|k| k.as_str()).collect();
+        let mut conflict_values: Vec<serde_json::Value> = Vec::new();
         let conflict_sql = match &context.on_conflict {
             Some(serde_json::Value::Object(spec)) => {
                 let constraint = spec.get("constraint").and_then(|v| v.as_str());
@@ -3074,10 +3100,40 @@ fn insert_row<'life>(
                             )
                         })
                         .collect();
+                    // `where` on an upsert decides whether the row that is
+                    // already there is overwritten -- "only if what I am
+                    // writing is newer". It reads the existing row, which is
+                    // what the statement's alias names.
+                    let condition = match spec.get("where") {
+                        Some(filter) if !filter.is_null() => {
+                            let type_name = context
+                                .type_names
+                                .get(&(schema_name.to_string(), table_name.to_string()))
+                                .map(String::as_str)
+                                .unwrap_or(table_name);
+                            let scope =
+                                WhereScope::table(schema_name, table_name, type_name, context.names)
+                                    .under_alias(WRITTEN_ROW)
+                                    .with_resolution(context.cache, context.relationships);
+                            let mut param_idx = column_names.len() + 1;
+                            let mut alias_counter = 0usize;
+                            build_condition(
+                                filter,
+                                &scope,
+                                &mut param_idx,
+                                &mut conflict_values,
+                                &mut alias_counter,
+                            )?
+                            .map(|sql| format!(" WHERE {}", sql))
+                            .unwrap_or_default()
+                        }
+                        _ => String::new(),
+                    };
                     format!(
-                        " ON CONFLICT ON CONSTRAINT {} DO UPDATE SET {}",
+                        " ON CONFLICT ON CONSTRAINT {} DO UPDATE SET {}{}",
                         postrust_sql::escape_ident(constraint),
-                        assignments.join(", ")
+                        assignments.join(", "),
+                        condition
                     )
                 }
             }
@@ -3090,7 +3146,7 @@ fn insert_row<'life>(
         // "public"` means, and leaving it bare reads as a column of the table
         // where one shares the name.
         let qualified_table = postrust_sql::escape_ident(WRITTEN_ROW);
-        let names: Vec<&str> = columns.keys().map(|k| k.as_str()).collect();
+        let names = column_names;
         let written = if names.is_empty() {
             // Every column defaulted. `DEFAULT VALUES` is how SQL says that;
             // an empty column list is a syntax error.
@@ -3102,7 +3158,11 @@ fn insert_row<'life>(
                 conflict_sql,
                 row_json(&qualified_table, &column_types)
             );
-            sqlx::query(&sql).fetch_optional(&mut *conn).await?
+            let mut query = sqlx::query(&sql);
+            for value in &conflict_values {
+                query = bind_json_value(query, value);
+            }
+            query.fetch_optional(&mut *conn).await?
         } else {
             let placeholders: Vec<String> = names
                 .iter()
@@ -3137,6 +3197,9 @@ fn insert_row<'life>(
                 if let Some(value) = columns.get(*column) {
                     query = bind_json_value(query, &write_operand(&column_types, column, value));
                 }
+            }
+            for value in &conflict_values {
+                query = bind_json_value(query, value);
             }
             query.fetch_optional(&mut *conn).await?
         };

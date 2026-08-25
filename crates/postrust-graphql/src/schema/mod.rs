@@ -790,14 +790,35 @@ pub fn build_schema(schema_cache: &SchemaCache, config: &SchemaConfig) -> Genera
                     continue;
                 };
                 if let Some(object) = object_types.get_mut(type_name) {
+                    // Under the name the column is exposed as, which is not
+                    // always its own.
+                    let exposed = config
+                        .names
+                        .column(&object.table.schema, &object.table.name, &column)
+                        .unwrap_or(&column)
+                        .to_string();
                     for field in &mut object.fields {
-                        if field.name == column {
+                        if field.name == exposed {
                             field.graphql_type =
                                 crate::types::GraphQLType::Custom(enum_type.clone());
                         }
                     }
                 }
             }
+        }
+    }
+
+    // A table marked as a set of allowed values is a set of *values*: the
+    // column typed as the enum is the whole of what a client needs, and there
+    // is nothing at the other end of a relationship to it worth traversing to.
+    // Hasura exposes none, and a stray `user { color { ... } }` beside
+    // `favorite_color` is a second spelling of the same fact.
+    if !enum_type_of.is_empty() {
+        for relationships in relationship_fields.values_mut() {
+            relationships.retain(|relationship| {
+                let foreign = relationship.relationship.foreign_table();
+                !enum_type_of.contains_key(&(foreign.schema.clone(), foreign.name.clone()))
+            });
         }
     }
 
