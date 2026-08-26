@@ -155,6 +155,22 @@ print(f"  {len(mutual):>4}  both answered with errors -- agreement by mutual ref
 print(f"  {len(diverged):>4}  Hasura refused and this answered, which is where the")
 print("        mutual-refusal cases go as this server gains fields")
 
+# A guard against the harness fault that cost every permission case in the
+# corpus. `access-denied` from the reference means the request never reached
+# its permission layer -- the admin secret was missing, so a case naming
+# `X-Hasura-Role` was read as an unauthenticated request rather than as an
+# authenticated caller asking to be treated as that role. It looks exactly
+# like a permission denial from the outside, which is why it survived for
+# thirty-seven runs. One case is expected: `unauthorized_role` tests the
+# refusal on purpose.
+unauthenticated = [r for r in rows if "access-denied" in r["ref_body"]]
+if len(unauthenticated) > 5:
+    print(f"\n!! {len(unauthenticated)} cases were refused by the reference before it "
+          "reached its\n   permission layer. The admin secret is not being sent. "
+          "These measure nothing --\n   see run.py's send().")
+    for r in unauthenticated[:5]:
+        print(f"     {r['id']}")
+
 print("\nwhere the divergences are")
 print(f"  status differs        {sum(1 for r in rows if not r['status_ok']):>4}")
 print(f"  outcome differs       {sum(1 for r in rows if not r['outcome_ok']):>4}")
