@@ -526,6 +526,7 @@ fn build_dynamic_schema(
                 Arc::clone(&type_names),
                 Arc::clone(&names),
                 max_rows,
+                role,
             ),
             generated,
             true,
@@ -690,6 +691,13 @@ fn build_dynamic_schema(
     // would name a type nobody registered. async-graphql refuses to build a
     // schema with a dangling reference, so the whole role would have no schema
     // over one field it was never allowed to use.
+    // Which types actually got each write input, recorded as they are built
+    // rather than predicted from the object type's fields. The two answers
+    // used to be the same and are not any more: an input is built from the
+    // write permission's columns, so a table whose readable columns include a
+    // number may still have no `_inc_input` -- and an argument naming a type
+    // nobody registered is a schema async-graphql refuses to build, which
+    // costs the role every field it has rather than the one it cannot use.
     let insertable_types: HashSet<&str> = generated
         .object_types
         .iter()
@@ -704,17 +712,6 @@ fn build_dynamic_schema(
         // ["age"]` on insert may not name `is_user` even where it can read it,
         // and the corpus tests exactly that: `field 'is_user' not found in
         // type: 'resident_insert_input'`.
-        let may_write = |verb: crate::role::Verb| {
-            let Some(role) = role else {
-                return None;
-            };
-            names
-                .permissions(&table.schema, &table.name, role)
-                .and_then(|granted| granted.write_columns(verb))
-        };
-        let insertable_columns = may_write(crate::role::Verb::Insert);
-        let updatable_columns = may_write(crate::role::Verb::Update);
-
         // Only real columns are written. A computed field is a function of the
         // row and a relationship is handled separately below.
         let writable_named = |allowed: Option<&crate::names::ColumnSet>| {
@@ -729,8 +726,8 @@ fn build_dynamic_schema(
                 .collect::<Vec<&crate::schema::object::GraphQLField>>()
         };
         let writable = writable_named(None);
-        let insert_fields = writable_named(insertable_columns);
-        let update_fields = writable_named(updatable_columns);
+        let insert_fields = write_fields(object, &names, role, crate::role::Verb::Insert);
+        let update_fields = write_fields(object, &names, role, crate::role::Verb::Update);
         if writable.is_empty() {
             continue;
         }
@@ -1854,12 +1851,60 @@ fn with_update_operators(
 }
 
 /// Create the Mutation type with all mutation fields.
+/// Which columns a write may name, and so which of its inputs exist.
+///
+/// One definition, called both where the inputs are registered and where the
+/// arguments naming them are declared. They used to agree by coincidence --
+/// both read the object type's fields -- and stopped the moment a write input
+/// began following its own permission. An argument naming a type nobody
+/// registered is a schema async-graphql refuses to build, which costs a role
+/// every field it has over the one it cannot use.
+fn write_fields<'a>(
+    object: &'a crate::schema::object::TableObjectType,
+    names: &crate::names::NameOverrides,
+    role: Option<&str>,
+    verb: crate::role::Verb,
+) -> Vec<&'a crate::schema::object::GraphQLField> {
+    let allowed = role.and_then(|role| {
+        names
+            .permissions(&object.table.schema, &object.table.name, role)
+            .and_then(|granted| granted.write_columns(verb))
+    });
+    object
+        .fields
+        .iter()
+        .filter(|field| {
+            let column = table_column_for(names, &object.table, &field.name);
+            object.table.get_column(column).is_some()
+                && allowed.is_none_or(|set| set.allows(column))
+        })
+        .collect()
+}
+
+/// Whether a type has an `_inc_input` and a set of document operator inputs.
+fn update_inputs(
+    object: &crate::schema::object::TableObjectType,
+    names: &crate::names::NameOverrides,
+    role: Option<&str>,
+) -> (bool, bool) {
+    let fields = write_fields(object, names, role, crate::role::Verb::Update);
+    (
+        fields
+            .iter()
+            .any(|f| crate::schema::aggregate::is_incrementable(&f.graphql_type)),
+        fields
+            .iter()
+            .any(|f| matches!(&f.graphql_type, crate::types::GraphQLType::Json)),
+    )
+}
+
 fn create_mutation_type(
     generated: &GeneratedSchema,
     relationships: Arc<HashMap<String, Vec<RelationshipField>>>,
     type_names: Arc<HashMap<(String, String), String>>,
     names: Arc<crate::names::NameOverrides>,
     max_rows: Option<i64>,
+    role: Option<&str>,
 ) -> Object {
     let mut mutation = Object::new("mutation_root");
     // In name order, for the reason the query root is: see there.
@@ -1867,31 +1912,21 @@ fn create_mutation_type(
 
     // Only a table with a unique constraint has a conflict to name, and only
     // those got the types for it.
-    // Which tables have something to add to, since `_inc` is only offered
-    // where there is.
-    let has_numeric_column: HashSet<String> = generated
-        .object_types
-        .iter()
-        .filter(|(_, object)| {
-            object.fields.iter().any(|field| {
-                object.table.get_column(&field.name).is_some()
-                    && crate::schema::aggregate::is_incrementable(&field.graphql_type)
-            })
-        })
-        .map(|(type_name, _)| type_name.clone())
-        .collect();
-
-    let has_jsonb_column: HashSet<String> = generated
-        .object_types
-        .iter()
-        .filter(|(_, object)| {
-            object.fields.iter().any(|field| {
-                object.table.get_column(&field.name).is_some()
-                    && matches!(&field.graphql_type, crate::types::GraphQLType::Json)
-            })
-        })
-        .map(|(type_name, _)| type_name.clone())
-        .collect();
+    // Which tables have something to add to, and which have a document to
+    // operate on. Read from what was registered above rather than worked out
+    // again from the object types: the second answer is the one that can
+    // drift, and drifting means an argument naming a type that is not there.
+    let mut has_numeric_column: HashSet<String> = HashSet::new();
+    let mut has_jsonb_column: HashSet<String> = HashSet::new();
+    for (type_name, object) in &generated.object_types {
+        let (numeric, jsonb) = update_inputs(object, &names, role);
+        if numeric {
+            has_numeric_column.insert(type_name.clone());
+        }
+        if jsonb {
+            has_jsonb_column.insert(type_name.clone());
+        }
+    }
 
     let has_conflict_target: HashSet<String> = generated
         .object_types
@@ -8369,6 +8404,7 @@ mod tests {
             Arc::new(HashMap::new()),
             Arc::new(HashMap::new()),
             Arc::new(Default::default()),
+            None,
             None,
         );
     }

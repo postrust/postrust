@@ -69,6 +69,15 @@ pub fn cache_for_role(
             return false;
         };
 
+        // A permission granting no columns is not a narrower view of the
+        // table; it is no view of it. A GraphQL type with no fields is not a
+        // legal type, and the enum of its columns is not a legal enum, so
+        // there is nothing to build and the role is told the table is not
+        // there -- which is the same answer, in the direction that withholds.
+        if select.columns.is_empty() {
+            return false;
+        }
+
         // The columns the role may see. Everything else is not merely
         // unreadable but absent, which is what makes this a schema question.
         //
