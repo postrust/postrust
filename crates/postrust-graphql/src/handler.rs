@@ -32,13 +32,100 @@ pub struct GraphQLState {
     /// Generated GraphQL schema
     pub generated_schema: GeneratedSchema,
     /// async-graphql Schema (built dynamically)
+    ///
+    /// The unrestricted one: what an administrator is answered from, and what
+    /// every caller is answered from on a server with no permission document.
     pub schema: Schema,
+    /// One schema per role the permission document names.
+    ///
+    /// Hasura builds a schema per role because a permission is a statement
+    /// about what exists, not about what is allowed: a role with no `select`
+    /// on a table has no field to name, and naming one is a validation failure
+    /// rather than a denial. Each is built from a schema cache already reduced
+    /// to what that role may see.
+    ///
+    /// Built at startup rather than on first use, so a permission document
+    /// that cannot be built fails while someone is watching rather than on the
+    /// first request from whichever role it broke.
+    pub role_schemas: HashMap<String, Schema>,
     /// Schema configuration
     pub config: SchemaConfig,
     /// Subscription fields
     pub subscription_fields: Vec<SubField>,
     /// Notification broker for subscriptions
     pub broker: Arc<RwLock<Option<NotifyBroker>>>,
+}
+
+/// Build one schema for each role the permission document names.
+///
+/// Each is built from a cache reduced to what that role may see, so nothing in
+/// the builders needs to know a permission exists -- a table this role cannot
+/// read is one the code generating root fields cannot see either. See
+/// [`crate::role`] for why the filtering is done there rather than threaded
+/// through.
+///
+/// Empty when the document carries no permissions, which is what leaves an
+/// unconfigured server building exactly the one schema it always did.
+fn build_role_schemas(
+    schema_cache: &Arc<SchemaCache>,
+    config: &SchemaConfig,
+) -> Result<HashMap<String, Schema>, GraphQLError> {
+    if !config.names.has_permissions() {
+        return Ok(HashMap::new());
+    }
+
+    let mut schemas = HashMap::new();
+    for role in config.names.roles() {
+        // An administrator is not a role with permissions; it is the caller
+        // the permissions do not apply to. Building it a restricted schema
+        // would take the bypass away.
+        if role == postrust_auth::hasura::ADMIN_ROLE {
+            continue;
+        }
+
+        let view = Arc::new(crate::role::cache_for_role(
+            schema_cache,
+            &config.names,
+            role,
+        ));
+        let mut role_config = config.clone();
+        role_config.role = Some(role.to_string());
+
+        let generated = build_schema(&view, &role_config);
+        // Subscriptions are left to the unrestricted schema for now: a live
+        // query is one this server answers from notifications rather than from
+        // the query root, so restricting it is a different piece of work from
+        // restricting a read.
+        let built = build_dynamic_schema(
+            &generated,
+            &view,
+            None,
+            role_config.max_rows,
+            Arc::new(role_config.names.clone()),
+            role_config.subscription_refresh(),
+        );
+
+        match built {
+            Ok(schema) => {
+                schemas.insert(role.to_string(), schema);
+            }
+            // One role's permissions being unbuildable is not a reason for
+            // every other role to lose its API, which is what returning here
+            // would mean -- the caller serves no GraphQL at all on an error.
+            // The role is left without a schema instead, which the request
+            // path already reads as a refusal: it fails closed, loudly, and
+            // alone.
+            Err(e) => tracing::error!(
+                "GraphQL schema for role \"{}\" could not be built, \
+                 so that role is refused: {}",
+                role,
+                e
+            ),
+        }
+    }
+
+    tracing::info!("GraphQL schemas built for {} roles", schemas.len());
+    Ok(schemas)
 }
 
 impl GraphQLState {
@@ -67,19 +154,41 @@ impl GraphQLState {
             config.subscription_refresh(),
         )?;
 
+        let role_schemas = build_role_schemas(&schema_cache, &config)?;
+
         Ok(Self {
             pool: pool.clone(),
             schema_cache,
             generated_schema,
             schema,
+            role_schemas,
             config,
             subscription_fields,
             broker: Arc::new(RwLock::new(None)),
         })
     }
 
+    /// Which schema answers for a caller speaking as this role.
+    ///
+    /// `None` for a role the document does not name, which the caller turns
+    /// into a refusal. Three things are deliberately not that: a server with no
+    /// permission document answers everyone from the unrestricted schema, an
+    /// administrator is answered from it too -- permissions are rules for
+    /// everyone else -- and so is a request on a server where the layer is off.
+    pub fn schema_for(&self, role: Option<&str>) -> Option<&Schema> {
+        if !self.config.names.has_permissions() {
+            return Some(&self.schema);
+        }
+        match role {
+            None | Some(postrust_auth::hasura::ADMIN_ROLE) => Some(&self.schema),
+            Some(role) => self.role_schemas.get(role),
+        }
+    }
+
     /// Rebuild the schema (e.g., after schema cache refresh).
+    #[allow(clippy::needless_update)]
     pub fn rebuild(&mut self) -> Result<(), GraphQLError> {
+        self.role_schemas = build_role_schemas(&self.schema_cache, &self.config)?;
         self.generated_schema = build_schema(&self.schema_cache, &self.config);
         self.subscription_fields = if self.config.enable_subscriptions {
             generate_subscription_fields(&self.schema_cache, &self.generated_schema)
@@ -545,6 +654,21 @@ fn build_dynamic_schema(
     // and a misspelled column reaching the database instead of being caught
     // before the request was sent. The same argument that made `where` a real
     // type applies unchanged.
+    // Which types have an `_insert_input` at all, which is what a nested write
+    // names. Collected first because a relationship may point at a table this
+    // loop has not reached yet -- and because the answer is now a permission
+    // question: a role granted `insert` on `article` and only `select` on
+    // `author` gets an `article_insert_input`, and writing `author` inside it
+    // would name a type nobody registered. async-graphql refuses to build a
+    // schema with a dangling reference, so the whole role would have no schema
+    // over one field it was never allowed to use.
+    let insertable_types: HashSet<&str> = generated
+        .object_types
+        .iter()
+        .filter(|(_, object)| crate::input::mutation::is_insertable(&object.table))
+        .map(|(type_name, _)| type_name.as_str())
+        .collect();
+
     for (type_name, object) in &generated.object_types {
         let table = &object.table;
         // Only real columns are written. A computed field is a function of the
@@ -586,8 +710,13 @@ fn build_dynamic_schema(
                     write_type_ref(&field.graphql_type),
                 ));
             }
-            // A nested write: the rows to insert beside this one.
+            // A nested write: the rows to insert beside this one. Only where
+            // the far side is something this schema can write -- see
+            // `insertable_types`.
             for relationship in relationships {
+                if !insertable_types.contains(relationship.target_type.as_str()) {
+                    continue;
+                }
                 if !taken.insert(relationship.name.as_str()) {
                     continue;
                 }
@@ -1556,7 +1685,11 @@ fn create_query_type(
         // The same rows, with numbers about them. Same arguments as the list
         // field, because `author_aggregate(where: ...)` counts the set the
         // filter describes, not the whole table.
-        if !is_by_pk {
+        //
+        // Not built at all for a role whose permission withholds it: counting
+        // rows is a way of learning about them, so it is granted separately
+        // from reading them and refused by absence rather than at execution.
+        if !is_by_pk && field.aggregates {
             let agg_spec = Arc::new(AggregateSpec {
                 schema_name: field.schema_name.clone(),
                 table_name: field.table_name.clone(),
@@ -1926,7 +2059,9 @@ fn create_subscription_type(
         }
         roots.push((field.name.clone(), gql_field));
 
-        if is_by_pk {
+        // A live query mirrors the query root, so an aggregate the role may not
+        // ask for once is not one it may ask for continuously either.
+        if is_by_pk || !field.aggregates {
             continue;
         }
 

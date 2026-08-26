@@ -411,7 +411,24 @@ async fn main() -> Result<()> {
                         ),
                     };
 
+                // Which schema answers. A permission is a statement about what
+                // exists, so the role decides the shape of the API before it
+                // decides anything about a row: a role the document does not
+                // name has no schema at all, and is refused here rather than
+                // being answered from someone else's.
+                let Some(schema) = app_state.gql_state.schema_for(hasura_role.as_deref()) else {
+                    return postrust_graphql::hasura::denied(&format!(
+                        "role \"{}\" is not defined in the permissions",
+                        hasura_role.as_deref().unwrap_or_default()
+                    ));
+                };
+
                 // Create SchemaCacheRef from the static Arc<SchemaCache>
+                //
+                // The unreduced cache, deliberately. The schema above decides
+                // what may be asked for; this is what a resolver looks a type
+                // up in once something has been asked, and a superset can only
+                // answer the same questions.
                 let schema_cache_ref = postrust_core::schema_cache::SchemaCacheRef::from_static(
                     (*app_state.gql_state.schema_cache).clone(),
                 );
@@ -432,8 +449,7 @@ async fn main() -> Result<()> {
                 .with_identity(hasura_role, elevated)
                 .with_write(Arc::clone(&write));
 
-                let prepared =
-                    postrust_graphql::hasura::prepare(Some(&app_state.gql_state.schema), req);
+                let prepared = postrust_graphql::hasura::prepare(Some(schema), req);
                 let request = match prepared {
                     Ok(request) => request,
                     // Refused before it ran: nothing was written, so there is
@@ -448,7 +464,7 @@ async fn main() -> Result<()> {
                     .data(gql_ctx)
                     .data(app_state.gql_state.pool.clone())
                     .data(Arc::clone(&app_state.gql_state.broker));
-                let mut response = app_state.gql_state.schema.execute(request).await;
+                let mut response = schema.execute(request).await;
 
                 if let Some(tx) = write.lock().await.take() {
                     let settled = if response.errors.is_empty() {

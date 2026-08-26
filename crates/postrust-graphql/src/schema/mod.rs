@@ -51,6 +51,14 @@ pub struct SchemaConfig {
     /// Applied when a query supplies no `limit` of its own, and as an upper
     /// bound when it supplies a larger one. `None` leaves queries unbounded.
     pub max_rows: Option<i64>,
+
+    /// Whose schema this is.
+    ///
+    /// `None` is the unrestricted one: what an administrator sees, and what
+    /// every caller sees on a server with no permission document. `Some(role)`
+    /// is built from a cache already reduced to what that role may see, so the
+    /// only thing left for the builders to ask about is the aggregate root.
+    pub role: Option<String>,
 }
 
 impl Default for SchemaConfig {
@@ -63,6 +71,7 @@ impl Default for SchemaConfig {
             enable_subscriptions: false,
             subscription_refresh_seconds: 30,
             max_rows: None,
+            role: None,
         }
     }
 }
@@ -446,6 +455,16 @@ pub struct QueryField {
     /// The description given to that aggregate root, if one was. `Some("")`
     /// means metadata said it has none.
     pub aggregate_description: Option<String>,
+    /// Whether the aggregate root is built at all.
+    ///
+    /// The one thing a role's view of the schema cache cannot say. Dropping a
+    /// table or a column is a fact about the database as this role sees it;
+    /// whether that role may *count* the rows it can already read is a fact
+    /// about the permission, and Hasura keeps the two apart because counting
+    /// rows you cannot see is a way of seeing them. True unless a select
+    /// permission says otherwise, which is what leaves an unconfigured server
+    /// exactly as it was.
+    pub aggregates: bool,
 }
 
 impl QueryField {
@@ -471,6 +490,7 @@ impl QueryField {
             description: Some(format!("fetch data from the table: \"{}\"", table.name)),
             aggregate_name: None,
             aggregate_description: None,
+            aggregates: true,
         }
     }
 
@@ -507,6 +527,7 @@ impl QueryField {
             )),
             aggregate_name: None,
             aggregate_description: None,
+            aggregates: true,
         })
     }
 }
@@ -815,6 +836,13 @@ pub fn build_schema(schema_cache: &SchemaCache, config: &SchemaConfig) -> Genera
             .names
             .root_comment(&table.schema, &table.name, "select_aggregate")
             .map(str::to_string);
+        // Whether this role may count what it can read. Only asked where a
+        // role is building its own schema; the unrestricted one aggregates
+        // whatever the database will.
+        if let Some(role) = &config.role {
+            list.aggregates =
+                crate::role::allows_aggregations(&config.names, &table.schema, &table.name, role);
+        }
         query_fields.push(list);
         if let Some(mut by_pk) = QueryField::by_pk_named(table, &base_name) {
             rename(&mut by_pk, "select_by_pk");

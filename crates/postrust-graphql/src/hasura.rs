@@ -60,6 +60,12 @@ fn code_for(error: &ServerError) -> &'static str {
     if message.contains("invalid value for argument")
         || message.contains("does not contain the value")
         || message.contains("is not defined by operation")
+        // A role granted only reads has no mutation root, so a document naming
+        // a mutation names an operation this schema does not have. That is the
+        // document being wrong about the schema, which is what validation is.
+        // async-graphql's wording, classified here rather than there.
+        || message.contains("not configured for mutations")
+        || message.contains("not configured for subscriptions")
     {
         "validation-failed"
     } else if message.contains("permission") || message.contains("not allowed") {
