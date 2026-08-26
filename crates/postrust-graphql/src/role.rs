@@ -482,13 +482,22 @@ fn rewrite(
                     continue;
                 }
 
+                // `$in`, `$gt`, `$is_null`: the whole operator family has an
+                // older spelling, not just the three connectives above, and
+                // the corpus writes both. Everything after the sigil is the
+                // operator this server already knows.
+                let key = match key.strip_prefix('$') {
+                    Some(rest) if !rest.is_empty() => std::borrow::Cow::Owned(format!("_{}", rest)),
+                    _ => std::borrow::Cow::Borrowed(key.as_str()),
+                };
+
                 if key.starts_with('_') {
                     // An operator. Its operand may be a session variable, and
                     // whether that is one value or several depends on which
                     // operator it is.
                     out.insert(
-                        key.clone(),
-                        rewrite(child, session, names, schema, table, Some(key))?,
+                        key.to_string(),
+                        rewrite(child, session, names, schema, table, Some(&key))?,
                     );
                     continue;
                 }
@@ -502,8 +511,8 @@ fn rewrite(
                 // inside a permission is the one spelling this does not
                 // follow.
                 let exposed = names
-                    .column(schema, table, key)
-                    .unwrap_or(key.as_str())
+                    .column(schema, table, &key)
+                    .unwrap_or(&key)
                     .to_string();
 
                 let rewritten = rewrite(child, session, names, schema, table, None)?;
@@ -830,6 +839,23 @@ mod tests {
                 {"author_id": {"_eq": "1"}},
                 {"is_published": {"_eq": true}}
             ]})
+        );
+    }
+
+    #[test]
+    fn the_older_operator_spellings_are_the_newer_ones_too() {
+        // Not only the three connectives: the whole family has a `$` spelling
+        // and the corpus writes both.
+        assert_eq!(
+            compiled(
+                serde_json::json!({"id": {"$in": "X-Hasura-Allowed-Ids"}}),
+                &session(&[("allowed_ids", "{1,2}")])
+            ),
+            serde_json::json!({"id": {"_in": ["1", "2"]}})
+        );
+        assert_eq!(
+            compiled(serde_json::json!({"age": {"$gt": 18}}), &session(&[])),
+            serde_json::json!({"age": {"_gt": 18}})
         );
     }
 

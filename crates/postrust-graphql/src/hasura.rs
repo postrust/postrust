@@ -17,10 +17,17 @@
 //! switches on to tell a permission failure from a constraint violation, and
 //! the message text is only for a human.
 //!
-//! The status code is 200 for all of this. Of the 468 cases in Hasura's own
-//! corpus that this server is measured against, 464 expect 200 -- including
-//! every permission failure and every constraint violation. A GraphQL error
-//! is a value in the response body, not a transport failure.
+//! The status code is 200 for almost all of this. Of the 468 cases in Hasura's
+//! own corpus that this server is measured against, 465 expect 200 --
+//! including every constraint violation, every refusal to authenticate, and
+//! all but one kind of permission failure. A GraphQL error is a value in the
+//! response body, not a transport failure.
+//!
+//! The exception is narrow enough to be worth stating exactly: a write refused
+//! by the `check` of an insert or update permission is answered 400. Not
+//! `permission-error` in general -- four cases carry that code with a 200 --
+//! but that one failure, which Hasura raises while executing a mutation rather
+//! than while resolving a schema. [`status_for`] is the whole rule.
 
 use async_graphql::{Response, ServerError};
 use serde_json::{json, Map, Value};
@@ -146,6 +153,26 @@ pub fn envelope(response: Response) -> Value {
     Value::Object(body)
 }
 
+/// The HTTP status a body is answered with.
+///
+/// 200 unless the body reports a write refused by a permission's `check`. See
+/// the note at the top of this module for why that one error is different, and
+/// why the code alone does not decide it.
+pub fn status_for(body: &Value) -> u16 {
+    let refused = body
+        .get("errors")
+        .and_then(Value::as_array)
+        .is_some_and(|errors| {
+            errors.iter().any(|error| {
+                error.get("message").and_then(Value::as_str) == Some(crate::role::CHECK_FAILED)
+            })
+        });
+    match refused {
+        true => 400,
+        false => 200,
+    }
+}
+
 /// A request refused before it was read.
 ///
 /// Nothing authenticated the caller, or the role it named is not one it may
@@ -173,6 +200,36 @@ mod tests {
         let mut error = ServerError::new(message, None);
         error.path = path;
         error
+    }
+
+    #[test]
+    fn only_a_refused_write_is_answered_with_a_failure_status() {
+        // Hasura's own inconsistency, reproduced because a client may branch
+        // on it: this one error is 400 and every other refusal is 200.
+        let refused = json!({"errors": [{"message": crate::role::CHECK_FAILED,
+                                         "extensions": {"code": "permission-error"}}]});
+        assert_eq!(status_for(&refused), 400);
+
+        // The same code, a different error: four cases in the corpus.
+        let denied = json!({"errors": [{"message": "not allowed",
+                                        "extensions": {"code": "permission-error"}}]});
+        assert_eq!(status_for(&denied), 200);
+        assert_eq!(status_for(&json!({"data": {"article": []}})), 200);
+    }
+
+    #[test]
+    fn a_role_may_be_refused_the_schema_without_being_refused_its_rows() {
+        let asked = |query: &str| {
+            let doc = async_graphql::parser::parse_query(query).unwrap();
+            introspection_refusal(&doc, "reader").map(|e| e.message)
+        };
+        let refusal = Some("introspection is disabled for role: \"reader\"".to_string());
+        assert_eq!(asked("{ __schema { types { name } } }"), refusal);
+        assert_eq!(asked("{ __type(name: \"article\") { name } }"), refusal);
+        // Not introspection in the sense that matters: every client library
+        // sends it, and Hasura answers it.
+        assert_eq!(asked("{ article { __typename id } }"), None);
+        assert_eq!(asked("{ article { id } }"), None);
     }
 
     #[test]
@@ -238,7 +295,7 @@ mod tests {
 /// A document that does not parse is handed on untouched, so the parse error is
 /// reported by the executor with its own position rather than by this.
 pub fn allow_unused_variables(request: async_graphql::Request) -> async_graphql::Request {
-    prepare(None, request).unwrap_or_else(|(request, _)| request)
+    prepare(None, request, None).unwrap_or_else(|(request, _)| request)
 }
 
 /// Ready a request for execution, and refuse it where async-graphql would not.
@@ -263,6 +320,11 @@ pub fn allow_unused_variables(request: async_graphql::Request) -> async_graphql:
 pub fn prepare(
     schema: Option<&async_graphql::dynamic::Schema>,
     request: async_graphql::Request,
+    // The role introspection is withheld from, where it is withheld from this
+    // one. Checked here because this is where the document is already parsed,
+    // and because refusing it is the whole answer: a schema a role may not
+    // read is not one it may read a little of.
+    introspection_disabled_for: Option<&str>,
 ) -> Result<async_graphql::Request, (async_graphql::Request, Vec<ServerError>)> {
     let mut request = rewrite_document(schema, request);
     if let Some(schema) = schema {
@@ -270,6 +332,11 @@ pub fn prepare(
         // the document by value and gives nothing back, and re-parsing a
         // document that has already parsed once is not where the time goes.
         if let Ok(doc) = async_graphql::parser::parse_query(&request.query) {
+            if let Some(role) = introspection_disabled_for {
+                if let Some(error) = introspection_refusal(&doc, role) {
+                    return Err((request, vec![error]));
+                }
+            }
             let errors = variable_errors(&doc, schema.registry(), &request.variables);
             if !errors.is_empty() {
                 return Err((request, errors));
@@ -278,6 +345,56 @@ pub fn prepare(
     }
     let _ = &mut request;
     Ok(request)
+}
+
+/// Whether a document asks the schema about itself, and the refusal if so.
+///
+/// `__typename` is not introspection in the sense that matters: it names the
+/// type of a row a client is already reading, every client library sends it,
+/// and Hasura answers it for a role introspection is disabled for. `__schema`
+/// and `__type` are the two that read the schema as data.
+///
+/// The message and the code are Hasura's.
+fn introspection_refusal(
+    doc: &async_graphql::parser::types::ExecutableDocument,
+    role: &str,
+) -> Option<ServerError> {
+    use async_graphql::parser::types::{OperationType, Selection};
+
+    let operations: Vec<_> = match &doc.operations {
+        async_graphql::parser::types::DocumentOperations::Single(one) => vec![one],
+        async_graphql::parser::types::DocumentOperations::Multiple(many) => many.values().collect(),
+    };
+
+    let asks = operations.iter().any(|operation| {
+        operation.node.ty == OperationType::Query
+            && operation
+                .node
+                .selection_set
+                .node
+                .items
+                .iter()
+                .any(|item| match &item.node {
+                    Selection::Field(field) => {
+                        matches!(field.node.name.node.as_str(), "__schema" | "__type")
+                    }
+                    _ => false,
+                })
+    });
+
+    match asks {
+        false => None,
+        true => {
+            let mut error = ServerError::new(
+                format!("introspection is disabled for role: \"{}\"", role),
+                None,
+            );
+            let mut extensions = async_graphql::ErrorExtensionValues::default();
+            extensions.set("code", "not-supported");
+            error.extensions = Some(extensions);
+            Some(error)
+        }
+    }
 }
 
 /// The edits made to a document before it is validated.
@@ -991,7 +1108,7 @@ mod variable_position_tests {
             async_graphql::Request::new(query).variables(async_graphql::Variables::from_json(
                 serde_json::from_str(variables).expect("the variables are JSON"),
             ));
-        match prepare(Some(&schema()), request) {
+        match prepare(Some(&schema()), request, None) {
             Ok(_) => Vec::new(),
             Err((_, errors)) => errors.into_iter().map(|e| e.message).collect(),
         }
@@ -1218,7 +1335,7 @@ mod coercion_tests {
 
     fn rewritten(query: &str) -> String {
         let schema = schema();
-        let request = prepare(Some(&schema), async_graphql::Request::new(query))
+        let request = prepare(Some(&schema), async_graphql::Request::new(query), None)
             .unwrap_or_else(|(request, _)| request);
         let mut request = request;
         format!("{:?}", request.parsed_query().expect("the query parses"))

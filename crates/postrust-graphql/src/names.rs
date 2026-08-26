@@ -141,6 +141,17 @@ pub struct TableNames {
     pub permissions: HashMap<String, RolePermissions>,
 }
 
+impl RolePermissions {
+    /// The columns one verb may name, where that verb names columns at all.
+    pub fn write_columns(&self, verb: crate::role::Verb) -> Option<&ColumnSet> {
+        match verb {
+            crate::role::Verb::Insert => self.insert.as_ref().map(|p| &p.columns),
+            crate::role::Verb::Update => self.update.as_ref().map(|p| &p.columns),
+            crate::role::Verb::Select | crate::role::Verb::Delete => None,
+        }
+    }
+}
+
 /// What one role may do with one table.
 ///
 /// Four independent grants, and the absence of one is meaningful: no `select`
@@ -336,6 +347,7 @@ pub struct Comments {
 pub struct NameOverrides {
     tables: HashMap<String, TableNames>,
     functions: HashMap<String, FunctionNames>,
+    introspection_disabled_for: Vec<String>,
 }
 
 /// The document in its sectioned shape.
@@ -345,6 +357,13 @@ struct Sections {
     tables: HashMap<String, TableNames>,
     #[serde(default)]
     functions: HashMap<String, FunctionNames>,
+    /// Roles that may not read the schema as data.
+    ///
+    /// Not per table, unlike everything else here, because the question is not
+    /// about a table: Hasura's `set_graphql_schema_introspection_options` names
+    /// roles and nothing else.
+    #[serde(default)]
+    introspection_disabled_for: Vec<String>,
 }
 
 /// What metadata says about one function, beyond what the catalogue knows.
@@ -383,23 +402,29 @@ impl NameOverrides {
         // sections they name. The flat shape came first and stays valid.
         let parsed: serde_json::Value = serde_json::from_str(&document)
             .map_err(|e| format!("GraphQL names are not valid JSON: {}", e))?;
-        let sectioned = parsed
-            .as_object()
-            .is_some_and(|map| map.contains_key("tables") || map.contains_key("functions"));
+        let sectioned = parsed.as_object().is_some_and(|map| {
+            map.contains_key("tables")
+                || map.contains_key("functions")
+                || map.contains_key("introspection_disabled_for")
+        });
 
-        let (tables, functions): (HashMap<String, TableNames>, HashMap<String, FunctionNames>) =
-            match sectioned {
-                true => {
-                    let document: Sections = serde_json::from_value(parsed)
-                        .map_err(|e| format!("GraphQL names are not valid JSON: {}", e))?;
-                    (document.tables, document.functions)
-                }
-                false => (
-                    serde_json::from_value(parsed)
-                        .map_err(|e| format!("GraphQL names are not valid JSON: {}", e))?,
-                    HashMap::new(),
-                ),
-            };
+        let (tables, functions, introspection_disabled_for) = match sectioned {
+            true => {
+                let document: Sections = serde_json::from_value(parsed)
+                    .map_err(|e| format!("GraphQL names are not valid JSON: {}", e))?;
+                (
+                    document.tables,
+                    document.functions,
+                    document.introspection_disabled_for,
+                )
+            }
+            false => (
+                serde_json::from_value(parsed)
+                    .map_err(|e| format!("GraphQL names are not valid JSON: {}", e))?,
+                HashMap::new(),
+                Vec::new(),
+            ),
+        };
 
         for key in functions.keys() {
             if !key.contains('.') {
@@ -424,7 +449,11 @@ impl NameOverrides {
             }
         }
 
-        Ok(Self { tables, functions })
+        Ok(Self {
+            tables,
+            functions,
+            introspection_disabled_for,
+        })
     }
 
     /// Whether any name was given at all.
@@ -478,6 +507,16 @@ impl NameOverrides {
         self.tables
             .values()
             .filter_map(move |table| table.permissions.get(role))
+    }
+
+    /// Whether this role may read the schema as data.
+    ///
+    /// `__typename` is not this question: it names the type of a row a client
+    /// is already reading, every client library sends it, and Hasura answers it
+    /// for a role introspection is disabled for. `__schema` and `__type` are
+    /// the two that read the schema itself.
+    pub fn introspection_disabled(&self, role: &str) -> bool {
+        self.introspection_disabled_for.iter().any(|it| it == role)
     }
 
     /// Whether the document says anything about permissions at all.
@@ -928,6 +967,7 @@ mod tests {
         let written = serde_json::to_string(&Sections {
             tables: names.tables.clone(),
             functions: HashMap::new(),
+            introspection_disabled_for: Vec::new(),
         })
         .unwrap();
         let again = NameOverrides::parse(&written).unwrap();

@@ -132,6 +132,7 @@ def tables_from_commands(paths):
     """
     entries = {}
     functions = []
+    introspection_disabled = []
 
     def entry_for(table):
         schema, name = qualified(table)
@@ -168,6 +169,10 @@ def tables_from_commands(paths):
                     "function": args.get("function") or args.get("name"),
                     "configuration": args.get("configuration"),
                 })
+                continue
+            # Nor is this: it names roles and nothing else.
+            if kind == "set_graphql_schema_introspection_options":
+                introspection_disabled.extend(args.get("disabled_for_roles") or [])
                 continue
             if "table" not in args:
                 continue
@@ -210,7 +215,7 @@ def tables_from_commands(paths):
                 if "is_enum" in args:
                     entry["is_enum"] = bool(args["is_enum"])
 
-    return list(entries.values()), functions
+    return list(entries.values()), functions, introspection_disabled
 
 
 def qualified(table):
@@ -627,12 +632,13 @@ def main():
     parser.add_argument("--admin-secret", default=os.environ.get("HASURA_GRAPHQL_ADMIN_SECRET"))
     args = parser.parse_args()
 
+    introspection_disabled = []
     if args.url:
         tables, functions = tables_from_document(
             export_from_engine(args.url, args.admin_secret)
         )
     elif args.commands:
-        tables, functions = tables_from_commands(args.commands)
+        tables, functions, introspection_disabled = tables_from_commands(args.commands)
     elif args.metadata_dir:
         tables, functions = tables_from_metadata_dir(args.metadata_dir)
     else:
@@ -644,7 +650,7 @@ def main():
             document = load_yaml(args.file)
         tables, functions = tables_from_document(document)
 
-    if not tables and not functions:
+    if not tables and not functions and not introspection_disabled:
         # An empty document is a legitimate answer for a schema that renames
         # nothing, and a caller generating one per group should not have to
         # special-case it.
@@ -656,7 +662,13 @@ def main():
     # The sectioned shape only where there is a second section to write. The
     # flat one came first, is still read, and is shorter for the schemas that
     # need nothing but names.
-    document = {"tables": names, "functions": placed} if placed else names
+    document = names
+    if placed or introspection_disabled:
+        document = {"tables": names}
+        if placed:
+            document["functions"] = placed
+        if introspection_disabled:
+            document["introspection_disabled_for"] = sorted(set(introspection_disabled))
     print(json.dumps(document, indent=2, sort_keys=True))
     print(
         f"note: {len(names)} of {len(tables)} tables need a name written down; "

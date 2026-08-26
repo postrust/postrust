@@ -302,10 +302,15 @@ async fn main() -> Result<()> {
                 AxumState(app_state): AxumState<GraphQLAppState>,
                 headers: HeaderMap,
                 req: GqlRequest,
-            ) -> Json<serde_json::Value> {
+            ) -> (axum::http::StatusCode, Json<serde_json::Value>) {
                 match req.0 {
                     async_graphql::BatchRequest::Single(request) => {
-                        Json(one_graphql(app_state, headers, request).await)
+                        let body = one_graphql(app_state, headers, request).await;
+                        let status = axum::http::StatusCode::from_u16(
+                            postrust_graphql::hasura::status_for(&body),
+                        )
+                        .unwrap_or(axum::http::StatusCode::OK);
+                        (status, Json(body))
                     }
                     async_graphql::BatchRequest::Batch(requests) => {
                         let mut answers = Vec::with_capacity(requests.len());
@@ -314,7 +319,13 @@ async fn main() -> Result<()> {
                                 one_graphql(app_state.clone(), headers.clone(), request).await,
                             );
                         }
-                        Json(serde_json::Value::Array(answers))
+                        // A batch is answered 200 whatever its parts say: the
+                        // transport carried every one of them, and which of
+                        // them failed is in the array.
+                        (
+                            axum::http::StatusCode::OK,
+                            Json(serde_json::Value::Array(answers)),
+                        )
                     }
                 }
             }
@@ -449,10 +460,24 @@ async fn main() -> Result<()> {
                     auth_result,
                 )
                 .with_session(session)
-                .with_identity(hasura_role, elevated)
+                .with_identity(hasura_role.clone(), elevated)
                 .with_write(Arc::clone(&write));
 
-                let prepared = postrust_graphql::hasura::prepare(Some(schema), req);
+                // A role may be told it cannot read the schema as data. Not a
+                // permission on a table, so it is not settled by which schema
+                // answers -- the schema is the thing being withheld.
+                let introspection_disabled_for = hasura_role.as_deref().filter(|role| {
+                    app_state
+                        .gql_state
+                        .config
+                        .names
+                        .introspection_disabled(role)
+                });
+                let prepared = postrust_graphql::hasura::prepare(
+                    Some(schema),
+                    req,
+                    introspection_disabled_for,
+                );
                 let request = match prepared {
                     Ok(request) => request,
                     // Refused before it ran: nothing was written, so there is

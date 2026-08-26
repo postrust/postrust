@@ -117,6 +117,7 @@ fn build_role_schemas(
                 role_config.max_rows,
                 Arc::new(role_config.names.clone()),
                 role_config.subscription_refresh(),
+                Some(role),
             );
 
             match built {
@@ -167,6 +168,7 @@ impl GraphQLState {
             config.max_rows,
             Arc::new(config.names.clone()),
             config.subscription_refresh(),
+            None,
         )?;
 
         let role_schemas = build_role_schemas(&schema_cache, &config)?;
@@ -226,6 +228,7 @@ impl GraphQLState {
             self.config.max_rows,
             Arc::new(self.config.names.clone()),
             self.config.subscription_refresh(),
+            None,
         )?;
         Ok(())
     }
@@ -433,6 +436,11 @@ fn build_dynamic_schema(
     max_rows: Option<i64>,
     names: Arc<crate::names::NameOverrides>,
     subscription_refresh: std::time::Duration,
+    // Whose schema this is, where it is one role's. What it decides here is
+    // which columns a write may name, which is not the same question as which
+    // columns may be read -- Hasura grants the two separately, and a role that
+    // may set a column it cannot read is ordinary rather than exotic.
+    role: Option<&str>,
 ) -> Result<Schema, GraphQLError> {
     // Create object types for each table
     let mut object_types: HashMap<String, Object> = HashMap::new();
@@ -691,17 +699,38 @@ fn build_dynamic_schema(
 
     for (type_name, object) in &generated.object_types {
         let table = &object.table;
+        // Which columns a write may name, which is the write permission's
+        // answer and not the read permission's. A role granted `columns:
+        // ["age"]` on insert may not name `is_user` even where it can read it,
+        // and the corpus tests exactly that: `field 'is_user' not found in
+        // type: 'resident_insert_input'`.
+        let may_write = |verb: crate::role::Verb| {
+            let Some(role) = role else {
+                return None;
+            };
+            names
+                .permissions(&table.schema, &table.name, role)
+                .and_then(|granted| granted.write_columns(verb))
+        };
+        let insertable_columns = may_write(crate::role::Verb::Insert);
+        let updatable_columns = may_write(crate::role::Verb::Update);
+
         // Only real columns are written. A computed field is a function of the
         // row and a relationship is handled separately below.
-        let writable: Vec<&crate::schema::object::GraphQLField> = object
-            .fields
-            .iter()
-            .filter(|field| {
-                table
-                    .get_column(table_column_for(&names, table, &field.name))
-                    .is_some()
-            })
-            .collect();
+        let writable_named = |allowed: Option<&crate::names::ColumnSet>| {
+            object
+                .fields
+                .iter()
+                .filter(|field| {
+                    let column = table_column_for(&names, table, &field.name);
+                    table.get_column(column).is_some()
+                        && allowed.is_none_or(|set| set.allows(column))
+                })
+                .collect::<Vec<&crate::schema::object::GraphQLField>>()
+        };
+        let writable = writable_named(None);
+        let insert_fields = writable_named(insertable_columns);
+        let update_fields = writable_named(updatable_columns);
         if writable.is_empty() {
             continue;
         }
@@ -720,7 +749,7 @@ fn build_dynamic_schema(
             let mut insert = InputObject::new(format!("{}_insert_input", type_name))
                 .description(format!("The columns of a new {} row.", type_name));
             let mut taken: HashSet<&str> = HashSet::new();
-            for field in &writable {
+            for field in &insert_fields {
                 // Every column optional: which ones the database insists on is
                 // the database's answer, and a column that is NOT NULL with a
                 // default does not have to be given.
@@ -780,7 +809,7 @@ fn build_dynamic_schema(
                 .description(format!("Columns of {} to add to.", type_name));
             let mut any_numeric = false;
             let mut any_jsonb = false;
-            for field in &writable {
+            for field in &update_fields {
                 if matches!(&field.graphql_type, crate::types::GraphQLType::Json) {
                     any_jsonb = true;
                 }
@@ -849,7 +878,7 @@ fn build_dynamic_schema(
                         InputObject::new(jsonb_operator_input(type_name, operator)).description(
                             format!("Columns of {} to apply `{}` to.", type_name, operator),
                         );
-                    for field in &writable {
+                    for field in &update_fields {
                         if !matches!(&field.graphql_type, crate::types::GraphQLType::Json) {
                             continue;
                         }
@@ -8300,6 +8329,7 @@ mod tests {
             None,
             Arc::new(Default::default()),
             std::time::Duration::from_secs(30),
+            None,
         );
         if let Err(ref e) = result {
             eprintln!("Schema build error: {:?}", e);
@@ -8421,6 +8451,7 @@ mod tests {
             None,
             Arc::new(Default::default()),
             std::time::Duration::from_secs(30),
+            None,
         );
         assert!(schema.is_ok(), "{:?}", schema.err());
 
@@ -8458,6 +8489,7 @@ mod tests {
             None,
             Arc::new(Default::default()),
             std::time::Duration::from_secs(30),
+            None,
         );
         assert!(result.is_ok(), "Schema with subscriptions should build");
     }
