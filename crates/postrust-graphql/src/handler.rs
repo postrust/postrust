@@ -47,7 +47,11 @@ pub struct GraphQLState {
     /// Built at startup rather than on first use, so a permission document
     /// that cannot be built fails while someone is watching rather than on the
     /// first request from whichever role it broke.
-    pub role_schemas: HashMap<String, Schema>,
+    ///
+    /// Keyed by the role and by whether the caller asked for what only a
+    /// backend may name -- which is a second schema rather than a check,
+    /// because `backend_only` decides whether a field exists.
+    pub role_schemas: HashMap<(String, bool), Schema>,
     /// Schema configuration
     pub config: SchemaConfig,
     /// Subscription fields
@@ -69,7 +73,7 @@ pub struct GraphQLState {
 fn build_role_schemas(
     schema_cache: &Arc<SchemaCache>,
     config: &SchemaConfig,
-) -> Result<HashMap<String, Schema>, GraphQLError> {
+) -> Result<HashMap<(String, bool), Schema>, GraphQLError> {
     if !config.names.has_permissions() {
         return Ok(HashMap::new());
     }
@@ -83,44 +87,55 @@ fn build_role_schemas(
             continue;
         }
 
-        let view = Arc::new(crate::role::cache_for_role(
-            schema_cache,
-            &config.names,
-            role,
-        ));
-        let mut role_config = config.clone();
-        role_config.role = Some(role.to_string());
+        // A second schema only where the role has something a backend alone
+        // may name. Otherwise the one schema answers both, since there is
+        // nothing for the flag to hide.
+        let variants: &[bool] = match crate::role::has_backend_only(&config.names, role) {
+            true => &[false, true],
+            false => &[false],
+        };
 
-        let generated = build_schema(&view, &role_config);
-        // Subscriptions are left to the unrestricted schema for now: a live
-        // query is one this server answers from notifications rather than from
-        // the query root, so restricting it is a different piece of work from
-        // restricting a read.
-        let built = build_dynamic_schema(
-            &generated,
-            &view,
-            None,
-            role_config.max_rows,
-            Arc::new(role_config.names.clone()),
-            role_config.subscription_refresh(),
-        );
-
-        match built {
-            Ok(schema) => {
-                schemas.insert(role.to_string(), schema);
-            }
-            // One role's permissions being unbuildable is not a reason for
-            // every other role to lose its API, which is what returning here
-            // would mean -- the caller serves no GraphQL at all on an error.
-            // The role is left without a schema instead, which the request
-            // path already reads as a refusal: it fails closed, loudly, and
-            // alone.
-            Err(e) => tracing::error!(
-                "GraphQL schema for role \"{}\" could not be built, \
-                 so that role is refused: {}",
+        for &backend in variants {
+            let view = Arc::new(crate::role::cache_for_role(
+                schema_cache,
+                &config.names,
                 role,
-                e
-            ),
+                backend,
+            ));
+            let mut role_config = config.clone();
+            role_config.role = Some(role.to_string());
+
+            let generated = build_schema(&view, &role_config);
+            // Subscriptions are left to the unrestricted schema for now: a live
+            // query is one this server answers from notifications rather than from
+            // the query root, so restricting it is a different piece of work from
+            // restricting a read.
+            let built = build_dynamic_schema(
+                &generated,
+                &view,
+                None,
+                role_config.max_rows,
+                Arc::new(role_config.names.clone()),
+                role_config.subscription_refresh(),
+            );
+
+            match built {
+                Ok(schema) => {
+                    schemas.insert((role.to_string(), backend), schema);
+                }
+                // One role's permissions being unbuildable is not a reason for
+                // every other role to lose its API, which is what returning here
+                // would mean -- the caller serves no GraphQL at all on an error.
+                // The role is left without a schema instead, which the request
+                // path already reads as a refusal: it fails closed, loudly, and
+                // alone.
+                Err(e) => tracing::error!(
+                    "GraphQL schema for role \"{}\" could not be built, \
+                 so that role is refused: {}",
+                    role,
+                    e
+                ),
+            }
         }
     }
 
@@ -175,13 +190,18 @@ impl GraphQLState {
     /// permission document answers everyone from the unrestricted schema, an
     /// administrator is answered from it too -- permissions are rules for
     /// everyone else -- and so is a request on a server where the layer is off.
-    pub fn schema_for(&self, role: Option<&str>) -> Option<&Schema> {
+    pub fn schema_for(&self, role: Option<&str>, backend: bool) -> Option<&Schema> {
         if !self.config.names.has_permissions() {
             return Some(&self.schema);
         }
         match role {
             None | Some(postrust_auth::hasura::ADMIN_ROLE) => Some(&self.schema),
-            Some(role) => self.role_schemas.get(role),
+            Some(role) => self
+                .role_schemas
+                .get(&(role.to_string(), backend))
+                // A role with nothing backend-only has one schema, under
+                // `false`, and it answers a backend caller too.
+                .or_else(|| self.role_schemas.get(&(role.to_string(), false))),
         }
     }
 
@@ -3387,6 +3407,7 @@ async fn resolve_mutation<'a>(
                 relationships: relationships.as_ref(),
                 type_names: type_names.as_ref(),
                 names: names.as_ref(),
+                caller: gql_ctx.caller(),
             };
 
             execute_insert(pool, gql_ctx, schema_name, table_name, objects, &context).await?
@@ -3419,6 +3440,19 @@ async fn resolve_mutation<'a>(
             } else {
                 ctx.args.try_get("where").ok().map(|v| accessor_to_json(&v))
             };
+            // Which rows this role may change, beside which rows the request
+            // asked to change. A by-key update is narrowed too: naming the key
+            // of a row the permission withholds must not be a way to reach it.
+            let where_clause = and_predicates(
+                where_clause,
+                permission_filter(
+                    &gql_ctx.caller(),
+                    names.as_ref(),
+                    schema_name,
+                    table_name,
+                    crate::role::Verb::Update,
+                )?,
+            );
 
             execute_update(
                 pool,
@@ -3450,6 +3484,16 @@ async fn resolve_mutation<'a>(
             } else {
                 ctx.args.try_get("where").ok().map(|v| accessor_to_json(&v))
             };
+            let where_clause = and_predicates(
+                where_clause,
+                permission_filter(
+                    &gql_ctx.caller(),
+                    names.as_ref(),
+                    schema_name,
+                    table_name,
+                    crate::role::Verb::Delete,
+                )?,
+            );
 
             execute_delete(
                 pool,
@@ -4059,6 +4103,7 @@ fn insert_row<'life>(
                 relationships: context.relationships,
                 type_names: context.type_names,
                 names: context.names,
+                caller: context.caller,
             };
             let written = insert_row(
                 conn,
@@ -4074,6 +4119,23 @@ fn insert_row<'life>(
                     columns.insert(local.clone(), value.clone());
                 }
             }
+        }
+
+        // What the server fills in regardless of what was sent. Applied after
+        // the nested rows have contributed their keys and before the columns
+        // are counted, because a preset is a column this statement writes --
+        // and applied *over* the request, since a preset the client could
+        // override is not a preset.
+        for (column, value) in crate::role::presets(
+            &context.caller,
+            context.names,
+            schema_name,
+            table_name,
+            crate::role::Verb::Insert,
+        )
+        .map_err(|fault| coded_error(fault.code(), fault.to_string()))?
+        {
+            columns.insert(column, value);
         }
 
         // `ON CONFLICT` says which uniqueness is being resolved against and
@@ -4174,20 +4236,78 @@ fn insert_row<'life>(
         // "public"` means, and leaving it bare reads as a column of the table
         // where one shares the name.
         let qualified_table = postrust_sql::escape_ident(WRITTEN_ROW);
+
+        // What the written row has to satisfy for the write to stand,
+        // evaluated in `RETURNING` against the row as written. Its parameters
+        // are numbered after the values and the conflict clause, since
+        // `RETURNING` is last.
+        let check_scope = WhereScope::for_alias(
+            schema_name,
+            table_name,
+            WRITTEN_ROW,
+            context
+                .type_names
+                .get(&(schema_name.to_string(), table_name.to_string()))
+                .map(String::as_str)
+                .unwrap_or(table_name),
+            context.cache,
+            context.relationships,
+            context.names,
+        );
+        let (check_sql, check_values) = {
+            let check = crate::role::write_check(
+                &context.caller,
+                context.names,
+                schema_name,
+                table_name,
+                crate::role::Verb::Insert,
+            )
+            .map_err(|fault| coded_error(fault.code(), fault.to_string()))?;
+            match check {
+                None => (String::new(), Vec::new()),
+                Some(check) => {
+                    let mut values = Vec::new();
+                    let mut param_idx = column_names.len() + conflict_values.len() + 1;
+                    let mut alias_counter = 0usize;
+                    match build_condition(
+                        &check,
+                        &check_scope,
+                        &mut param_idx,
+                        &mut values,
+                        &mut alias_counter,
+                    )? {
+                        None => (String::new(), Vec::new()),
+                        Some(sql) => (
+                            format!(
+                                ", ({}) AS {}",
+                                sql,
+                                postrust_sql::escape_ident(CHECK_COLUMN)
+                            ),
+                            values,
+                        ),
+                    }
+                }
+            }
+        };
+
         let names = column_names;
         let written = if names.is_empty() {
             // Every column defaulted. `DEFAULT VALUES` is how SQL says that;
             // an empty column list is a syntax error.
             let sql = format!(
-                "INSERT INTO {}.{} AS {} DEFAULT VALUES{} RETURNING {}",
+                "INSERT INTO {}.{} AS {} DEFAULT VALUES{} RETURNING {}{}",
                 postrust_sql::escape_ident(schema_name),
                 postrust_sql::escape_ident(table_name),
                 qualified_table,
                 conflict_sql,
-                row_json(&qualified_table, &column_types)
+                row_json(&qualified_table, &column_types),
+                check_sql
             );
             let mut query = sqlx::query(&sql);
             for value in &conflict_values {
+                query = bind_json_value(query, value);
+            }
+            for value in &check_values {
                 query = bind_json_value(query, value);
             }
             query.fetch_optional(&mut *conn).await?
@@ -4204,7 +4324,7 @@ fn insert_row<'life>(
                 })
                 .collect();
             let sql = format!(
-                "INSERT INTO {}.{} AS {} ({}) VALUES ({}){} RETURNING {}",
+                "INSERT INTO {}.{} AS {} ({}) VALUES ({}){} RETURNING {}{}",
                 postrust_sql::escape_ident(schema_name),
                 postrust_sql::escape_ident(table_name),
                 qualified_table,
@@ -4215,7 +4335,8 @@ fn insert_row<'life>(
                     .join(", "),
                 placeholders.join(", "),
                 conflict_sql,
-                row_json(&qualified_table, &column_types)
+                row_json(&qualified_table, &column_types),
+                check_sql
             );
             trace!("Executing INSERT SQL: {}", sql);
             let mut query = sqlx::query(&sql);
@@ -4227,6 +4348,9 @@ fn insert_row<'life>(
             for value in &conflict_values {
                 query = bind_json_value(query, value);
             }
+            for value in &check_values {
+                query = bind_json_value(query, value);
+            }
             query.fetch_optional(&mut *conn).await?
         };
 
@@ -4235,6 +4359,7 @@ fn insert_row<'life>(
         let Some(written) = written else {
             return Ok(serde_json::Value::Null);
         };
+        refuse_unchecked_rows(std::slice::from_ref(&written), !check_sql.is_empty())?;
         let row: serde_json::Value = written.try_get(0).unwrap_or(serde_json::Value::Null);
         *written_count += 1;
 
@@ -4279,6 +4404,7 @@ fn insert_row<'life>(
                     relationships: context.relationships,
                     type_names: context.type_names,
                     names: context.names,
+                    caller: context.caller,
                 };
                 insert_row(
                     conn,
@@ -4310,6 +4436,10 @@ struct InsertContext<'a> {
     /// The names columns are exposed under, so a written value keyed by a
     /// field reaches the column it names.
     names: &'a crate::names::NameOverrides,
+    /// Who is writing, so that a permission's presets and its check reach
+    /// every row this insert writes -- including the nested ones, which are
+    /// rows of other tables under other rules.
+    caller: crate::role::Caller<'a>,
 }
 
 /// Re-read written rows so that a mutation's `returning` can carry
@@ -4687,14 +4817,29 @@ async fn execute_update(
         )));
     }
 
+    // What the changed row has to satisfy for the change to stand. Evaluated
+    // in the `RETURNING` clause, against the row as written -- which is the
+    // only place it can honestly be evaluated, and costs neither a re-read nor
+    // a way to identify the rows afterwards.
+    let (check_sql, check_values) = permission_check_sql(
+        gql_ctx,
+        names,
+        schema_name,
+        table_name,
+        crate::role::Verb::Update,
+        &scope,
+        param_idx + where_values.len(),
+    )?;
+
     let sql = format!(
-        "UPDATE {}.{} AS {} SET {} {} RETURNING {}",
+        "UPDATE {}.{} AS {} SET {} {} RETURNING {}{}",
         postrust_sql::escape_ident(schema_name),
         postrust_sql::escape_ident(table_name),
         postrust_sql::escape_ident(WRITTEN_ROW),
         set_parts.join(", "),
         where_sql,
-        row_json(&postrust_sql::escape_ident(WRITTEN_ROW), &column_types)
+        row_json(&postrust_sql::escape_ident(WRITTEN_ROW), &column_types),
+        check_sql
     );
 
     trace!("Executing UPDATE SQL: {}", sql);
@@ -4712,9 +4857,16 @@ async fn execute_update(
         query = bind_json_value(query, val);
     }
 
+    // And the check's, last, because `RETURNING` is.
+    for val in &check_values {
+        query = bind_json_value(query, val);
+    }
+
     let mut guard = write_tx(gql_ctx, pool).await?;
     let conn = guard.as_mut().expect("write_tx opens one");
     let rows = query.fetch_all(&mut **conn).await?;
+
+    refuse_unchecked_rows(&rows, !check_sql.is_empty())?;
 
     let updated: Vec<Value> = rows
         .iter()
@@ -4723,6 +4875,78 @@ async fn execute_update(
         .collect();
 
     Ok(updated)
+}
+
+/// A permission's check, as a column of the write's `RETURNING`.
+///
+/// Empty where nothing has to be checked. Otherwise `, (<predicate>) AS ...`,
+/// evaluated per written row against the row itself -- so a row the permission
+/// refuses is known before the transaction is settled, and settling it is
+/// already a rollback once an error is reported.
+fn permission_check_sql(
+    gql_ctx: &GraphQLContext,
+    names: &crate::names::NameOverrides,
+    schema_name: &str,
+    table_name: &str,
+    verb: crate::role::Verb,
+    scope: &WhereScope<'_>,
+    start_param_idx: usize,
+) -> Result<(String, Vec<serde_json::Value>), async_graphql::Error> {
+    let check = crate::role::write_check(&gql_ctx.caller(), names, schema_name, table_name, verb)
+        .map_err(|fault| coded_error(fault.code(), fault.to_string()))?;
+    let Some(check) = check else {
+        return Ok((String::new(), Vec::new()));
+    };
+
+    let mut values = Vec::new();
+    let mut param_idx = start_param_idx;
+    let mut alias_counter = 0usize;
+    let condition = build_condition(
+        &check,
+        scope,
+        &mut param_idx,
+        &mut values,
+        &mut alias_counter,
+    )?;
+    Ok(match condition {
+        // A check that compiles to nothing restricts nothing, which is what an
+        // empty one says.
+        None => (String::new(), Vec::new()),
+        Some(sql) => (
+            format!(
+                ", ({}) AS {}",
+                sql,
+                postrust_sql::escape_ident(CHECK_COLUMN)
+            ),
+            values,
+        ),
+    })
+}
+
+/// The column a permission's check is returned in.
+const CHECK_COLUMN: &str = "pgrst_permission_check";
+
+/// Refuse the whole write if any row it produced fails the permission's check.
+///
+/// Every row, not the first: a mutation is one transaction and a single
+/// refused row takes the rest with it, which is what makes a check a rule
+/// about the write rather than about a row. A null counts as a failure -- an
+/// unknown is not a satisfied condition.
+fn refuse_unchecked_rows(
+    rows: &[sqlx::postgres::PgRow],
+    checked: bool,
+) -> Result<(), async_graphql::Error> {
+    if !checked {
+        return Ok(());
+    }
+    use sqlx::Row;
+    let all_passed = rows
+        .iter()
+        .all(|row| row.try_get::<bool, _>(CHECK_COLUMN).unwrap_or(false));
+    match all_passed {
+        true => Ok(()),
+        false => Err(coded_error("permission-error", crate::role::CHECK_FAILED)),
+    }
 }
 
 /// Execute a delete mutation.
@@ -4882,7 +5106,18 @@ fn permission_predicate(
     schema: &str,
     table: &str,
 ) -> Result<Option<serde_json::Value>, async_graphql::Error> {
-    crate::role::read_predicate(caller, names, schema, table)
+    permission_filter(caller, names, schema, table, crate::role::Verb::Select)
+}
+
+/// The same, for whichever grant the operation is asking under.
+fn permission_filter(
+    caller: &crate::role::Caller<'_>,
+    names: &crate::names::NameOverrides,
+    schema: &str,
+    table: &str,
+    verb: crate::role::Verb,
+) -> Result<Option<serde_json::Value>, async_graphql::Error> {
+    crate::role::row_filter(caller, names, schema, table, verb)
         .map_err(|fault| coded_error(fault.code(), fault.to_string()))
 }
 

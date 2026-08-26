@@ -470,6 +470,16 @@ impl NameOverrides {
         self.table(schema, table)?.permissions.get(role)
     }
 
+    /// What one role was granted, across every table that grants it anything.
+    pub fn tables_with_permissions<'a>(
+        &'a self,
+        role: &'a str,
+    ) -> impl Iterator<Item = &'a RolePermissions> + 'a {
+        self.tables
+            .values()
+            .filter_map(move |table| table.permissions.get(role))
+    }
+
     /// Whether the document says anything about permissions at all.
     ///
     /// The switch for the whole layer. A document carrying only names leaves

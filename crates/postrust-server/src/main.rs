@@ -416,7 +416,10 @@ async fn main() -> Result<()> {
                 // decides anything about a row: a role the document does not
                 // name has no schema at all, and is refused here rather than
                 // being answered from someone else's.
-                let Some(schema) = app_state.gql_state.schema_for(hasura_role.as_deref()) else {
+                let Some(schema) = app_state.gql_state.schema_for(
+                    hasura_role.as_deref(),
+                    postrust_auth::hasura::backend_only_requested(&pairs[..], elevated),
+                ) else {
                     return postrust_graphql::hasura::denied(&format!(
                         "role \"{}\" is not defined in the permissions",
                         hasura_role.as_deref().unwrap_or_default()

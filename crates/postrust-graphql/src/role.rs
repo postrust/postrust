@@ -39,7 +39,12 @@ use postrust_core::schema_cache::SchemaCache;
 /// Returns the cache unchanged when the document grants that role nothing to
 /// narrow -- which is the case for `admin`, and for every role when the
 /// document carries no permissions at all.
-pub fn cache_for_role(cache: &SchemaCache, names: &NameOverrides, role: &str) -> SchemaCache {
+pub fn cache_for_role(
+    cache: &SchemaCache,
+    names: &NameOverrides,
+    role: &str,
+    backend: bool,
+) -> SchemaCache {
     let mut view = cache.clone();
 
     view.tables.retain(|_, table| {
@@ -82,7 +87,17 @@ pub fn cache_for_role(cache: &SchemaCache, names: &NameOverrides, role: &str) ->
 
         // A write the role was not granted is a root field that does not
         // exist, and the builders already gate on these three.
-        table.insertable = table.insertable && granted.insert.is_some();
+        //
+        // `backend_only` narrows it once more: such an insert is reachable
+        // only by a caller that proved it holds the admin secret and asked for
+        // it by name, so for everyone else the field is not there at all --
+        // which is the point of the flag. A client must not be able to reach
+        // it by naming a role.
+        table.insertable = table.insertable
+            && granted
+                .insert
+                .as_ref()
+                .is_some_and(|insert| backend || !insert.backend_only);
         table.updatable = table.updatable && granted.update.is_some();
         table.deletable = table.deletable && granted.delete.is_some();
 
@@ -102,6 +117,19 @@ pub fn cache_for_role(cache: &SchemaCache, names: &NameOverrides, role: &str) ->
     });
 
     view
+}
+
+/// Whether any of this role's permissions is reachable only by a backend.
+///
+/// Which decides whether the role needs a second schema at all: without one,
+/// what a backend caller may name is what everyone may name.
+pub fn has_backend_only(names: &NameOverrides, role: &str) -> bool {
+    names.tables_with_permissions(role).any(|granted| {
+        granted
+            .insert
+            .as_ref()
+            .is_some_and(|insert| insert.backend_only)
+    })
 }
 
 /// Who is asking, for the places that have to narrow rows to them.
@@ -164,30 +192,193 @@ impl std::fmt::Display for Fault {
     }
 }
 
-/// The predicate a role's select permission adds to a read of one table.
+/// Hasura's wording for a written row that a permission refuses.
 ///
-/// `Ok(None)` where nothing restricts it.
+/// One message for both verbs, which is Hasura's choice and not a shortcut
+/// taken here: `check constraint of an insert/update permission has failed`.
+pub const CHECK_FAILED: &str = "check constraint of an insert/update permission has failed";
+
+/// Which of the four grants is being asked about.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Verb {
+    Select,
+    Insert,
+    Update,
+    Delete,
+}
+
+impl Verb {
+    fn of<'a>(&self, granted: &'a crate::names::RolePermissions) -> Option<Grant<'a>> {
+        match self {
+            Self::Select => granted.select.as_ref().map(Grant::Select),
+            Self::Insert => granted.insert.as_ref().map(Grant::Insert),
+            Self::Update => granted.update.as_ref().map(Grant::Update),
+            Self::Delete => granted.delete.as_ref().map(Grant::Delete),
+        }
+    }
+}
+
+/// One grant, whichever it is.
+enum Grant<'a> {
+    Select(&'a crate::names::SelectPermission),
+    Insert(&'a crate::names::InsertPermission),
+    Update(&'a crate::names::UpdatePermission),
+    Delete(&'a crate::names::DeletePermission),
+}
+
+impl Grant<'_> {
+    /// Which rows this grant applies to, read before the operation.
+    ///
+    /// An insert has none: there are no rows to choose from yet, which is
+    /// exactly why it has a `check` instead.
+    fn filter(&self) -> Option<&serde_json::Value> {
+        match self {
+            Self::Select(p) => Some(&p.filter),
+            Self::Update(p) => Some(&p.filter),
+            Self::Delete(p) => Some(&p.filter),
+            Self::Insert(_) => None,
+        }
+    }
+
+    /// What a written row has to satisfy afterwards.
+    ///
+    /// An update with no `check` of its own is held to its `filter`, which is
+    /// Hasura's rule: a row you may change is a row you may change into
+    /// something you may still change.
+    fn check(&self) -> Option<&serde_json::Value> {
+        match self {
+            Self::Insert(p) => Some(&p.check),
+            Self::Update(p) => match p.check.is_null() {
+                false => Some(&p.check),
+                true => Some(&p.filter),
+            },
+            Self::Select(_) | Self::Delete(_) => None,
+        }
+    }
+
+    /// Columns the server fills in, whatever the request said.
+    fn set(&self) -> Option<&std::collections::HashMap<String, serde_json::Value>> {
+        match self {
+            Self::Insert(p) => Some(&p.set),
+            Self::Update(p) => Some(&p.set),
+            Self::Select(_) | Self::Delete(_) => None,
+        }
+    }
+}
+
+fn grant_for<'a>(
+    caller: &Caller<'_>,
+    names: &'a NameOverrides,
+    schema: &str,
+    table: &str,
+    verb: Verb,
+) -> Result<Option<Grant<'a>>, Fault> {
+    if caller.unrestricted() {
+        return Ok(None);
+    }
+    let role = caller.role.unwrap_or_default();
+    match names
+        .permissions(schema, table, role)
+        .and_then(|granted| verb.of(granted))
+    {
+        Some(grant) => Ok(Some(grant)),
+        // Reaching here means a schema was built naming an operation this role
+        // has no permission for, which should not happen -- and the safe
+        // answer to "which rows" is none of them, not all of them.
+        None => Err(Fault::NoPermission {
+            role: role.to_string(),
+            table: table.to_string(),
+        }),
+    }
+}
+
+/// Which rows a role's permission lets one operation reach.
+///
+/// `Ok(None)` where nothing restricts it: an unrestricted caller, a filter of
+/// `{}`, or an insert, which has no rows to choose from.
+pub fn row_filter(
+    caller: &Caller<'_>,
+    names: &NameOverrides,
+    schema: &str,
+    table: &str,
+    verb: Verb,
+) -> Result<Option<serde_json::Value>, Fault> {
+    let Some(grant) = grant_for(caller, names, schema, table, verb)? else {
+        return Ok(None);
+    };
+    let Some(filter) = grant.filter() else {
+        return Ok(None);
+    };
+    permission_where(filter, caller.session, names, schema, table)
+        .map_err(Fault::MissingSessionVariable)
+}
+
+/// What a written row has to satisfy for the write to stand.
+pub fn write_check(
+    caller: &Caller<'_>,
+    names: &NameOverrides,
+    schema: &str,
+    table: &str,
+    verb: Verb,
+) -> Result<Option<serde_json::Value>, Fault> {
+    let Some(grant) = grant_for(caller, names, schema, table, verb)? else {
+        return Ok(None);
+    };
+    let Some(check) = grant.check() else {
+        return Ok(None);
+    };
+    permission_where(check, caller.session, names, schema, table)
+        .map_err(Fault::MissingSessionVariable)
+}
+
+/// The columns the server fills in itself, with their values.
+///
+/// This is how `author_id` comes from the caller's identity rather than from
+/// the caller: a preset overrides whatever the request said, so a client that
+/// names the column anyway does not get to choose it.
+pub fn presets(
+    caller: &Caller<'_>,
+    names: &NameOverrides,
+    schema: &str,
+    table: &str,
+    verb: Verb,
+) -> Result<Vec<(String, serde_json::Value)>, Fault> {
+    let Some(grant) = grant_for(caller, names, schema, table, verb)? else {
+        return Ok(Vec::new());
+    };
+    let Some(set) = grant.set() else {
+        return Ok(Vec::new());
+    };
+
+    let mut filled = Vec::with_capacity(set.len());
+    for (column, value) in set {
+        // A preset's value is a session variable as often as it is a literal,
+        // and it is resolved the same way a filter's operand is.
+        let resolved = match value {
+            serde_json::Value::String(text) => match session_variable(text) {
+                Some(name) => {
+                    resolve(name, caller.session, false).map_err(Fault::MissingSessionVariable)?
+                }
+                None => value.clone(),
+            },
+            other => other.clone(),
+        };
+        filled.push((column.clone(), resolved));
+    }
+    // Sorted, so the SQL a preset produces does not depend on how a hash map
+    // felt about its keys.
+    filled.sort_by(|a, b| a.0.cmp(&b.0));
+    Ok(filled)
+}
+
+/// The predicate a role's select permission adds to a read of one table.
 pub fn read_predicate(
     caller: &Caller<'_>,
     names: &NameOverrides,
     schema: &str,
     table: &str,
 ) -> Result<Option<serde_json::Value>, Fault> {
-    if caller.unrestricted() {
-        return Ok(None);
-    }
-    let role = caller.role.unwrap_or_default();
-    let Some(select) = names
-        .permissions(schema, table, role)
-        .and_then(|granted| granted.select.as_ref())
-    else {
-        return Err(Fault::NoPermission {
-            role: role.to_string(),
-            table: table.to_string(),
-        });
-    };
-    permission_where(&select.filter, caller.session, names, schema, table)
-        .map_err(Fault::MissingSessionVariable)
+    row_filter(caller, names, schema, table, Verb::Select)
 }
 
 /// How many rows a role's permission lets one read return.
@@ -499,6 +690,7 @@ mod tests {
             &cache(vec![table("article", &["id"]), table("secret", &["id"])]),
             &names(),
             "user",
+            false,
         );
         assert!(view
             .tables
@@ -516,6 +708,7 @@ mod tests {
             &cache(vec![table("article", &["id", "title", "content"])]),
             &names(),
             "user",
+            false,
         );
         let article = &view.tables[&QualifiedIdentifier::new("public", "article")];
         assert!(article.has_column("title"));
@@ -528,6 +721,7 @@ mod tests {
             &cache(vec![table("article", &["id", "title", "content"])]),
             &names(),
             "reader",
+            false,
         );
         let article = &view.tables[&QualifiedIdentifier::new("public", "article")];
         assert_eq!(article.columns.len(), 3);
@@ -535,7 +729,12 @@ mod tests {
 
     #[test]
     fn a_write_the_role_was_not_granted_is_not_a_root_field() {
-        let view = cache_for_role(&cache(vec![table("article", &["id"])]), &names(), "user");
+        let view = cache_for_role(
+            &cache(vec![table("article", &["id"])]),
+            &names(),
+            "user",
+            false,
+        );
         let article = &view.tables[&QualifiedIdentifier::new("public", "article")];
         // Granted insert; told nothing about update or delete.
         assert!(article.insertable);
@@ -547,7 +746,7 @@ mod tests {
     fn a_permission_cannot_grant_a_write_the_database_refuses() {
         let mut read_only = table("article", &["id"]);
         read_only.insertable = false;
-        let view = cache_for_role(&cache(vec![read_only]), &names(), "user");
+        let view = cache_for_role(&cache(vec![read_only]), &names(), "user", false);
         let article = &view.tables[&QualifiedIdentifier::new("public", "article")];
         // The document grants `insert` and the database does not. Metadata
         // above the database cannot widen what is beneath it.
@@ -568,7 +767,7 @@ mod tests {
                 takes_arguments: false,
             },
         );
-        let view = cache_for_role(&cache(vec![article]), &names(), "user");
+        let view = cache_for_role(&cache(vec![article]), &names(), "user", false);
         let article = &view.tables[&QualifiedIdentifier::new("public", "article")];
         // The permission names no computed fields, and none is the default.
         assert!(article.computed_columns.is_empty());
@@ -584,7 +783,12 @@ mod tests {
                  {"writer": {"insert": {"columns": "*", "check": {}}}}}}}"#,
         )
         .unwrap();
-        let view = cache_for_role(&cache(vec![table("article", &["id"])]), &names, "writer");
+        let view = cache_for_role(
+            &cache(vec![table("article", &["id"])]),
+            &names,
+            "writer",
+            false,
+        );
         assert!(view.tables.is_empty());
     }
 
@@ -732,6 +936,97 @@ mod tests {
         .unwrap();
         // The permission names the column; the compiler below reads the field.
         assert_eq!(compiled, serde_json::json!({"writtenBy": {"_eq": "1"}}));
+    }
+
+    const WRITES: &str = r#"{
+        "tables": {"public.article": {"permissions": {"user": {
+            "select": {"columns": "*", "filter": {}},
+            "insert": {"columns": "*", "check": {"is_published": false},
+                       "set": {"author_id": "X-Hasura-User-Id", "source": "web"},
+                       "backend_only": true},
+            "update": {"columns": "*", "filter": {"author_id": "X-Hasura-User-Id"}},
+            "delete": {"filter": {"author_id": "X-Hasura-User-Id"}}
+        }}}}
+    }"#;
+
+    fn writer() -> (NameOverrides, HashMap<String, String>) {
+        (
+            NameOverrides::parse(WRITES).unwrap(),
+            session(&[("user_id", "3")]),
+        )
+    }
+
+    #[test]
+    fn each_verb_is_asked_about_its_own_grant() {
+        let (names, sess) = writer();
+        let caller = Caller {
+            role: Some("user"),
+            session: &sess,
+        };
+        // An insert has no rows to choose from, which is why it has a check.
+        assert_eq!(
+            row_filter(&caller, &names, "public", "article", Verb::Insert).unwrap(),
+            None
+        );
+        for verb in [Verb::Update, Verb::Delete] {
+            assert_eq!(
+                row_filter(&caller, &names, "public", "article", verb).unwrap(),
+                Some(serde_json::json!({"author_id": {"_eq": "3"}}))
+            );
+        }
+    }
+
+    #[test]
+    fn an_update_with_no_check_of_its_own_is_held_to_its_filter() {
+        // Hasura's rule: a row you may change is a row you may change into
+        // something you may still change.
+        let (names, sess) = writer();
+        let caller = Caller {
+            role: Some("user"),
+            session: &sess,
+        };
+        assert_eq!(
+            write_check(&caller, &names, "public", "article", Verb::Update).unwrap(),
+            Some(serde_json::json!({"author_id": {"_eq": "3"}}))
+        );
+        assert_eq!(
+            write_check(&caller, &names, "public", "article", Verb::Insert).unwrap(),
+            Some(serde_json::json!({"is_published": {"_eq": false}}))
+        );
+    }
+
+    #[test]
+    fn a_preset_resolves_a_session_variable_and_keeps_a_literal() {
+        let (names, sess) = writer();
+        let caller = Caller {
+            role: Some("user"),
+            session: &sess,
+        };
+        assert_eq!(
+            presets(&caller, &names, "public", "article", Verb::Insert).unwrap(),
+            vec![
+                ("author_id".to_string(), serde_json::json!("3")),
+                ("source".to_string(), serde_json::json!("web")),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_backend_only_insert_is_absent_until_a_backend_asks() {
+        let (names, _) = writer();
+        assert!(has_backend_only(&names, "user"));
+        let of = |backend| {
+            cache_for_role(
+                &cache(vec![table("article", &["id"])]),
+                &names,
+                "user",
+                backend,
+            )
+            .tables[&QualifiedIdentifier::new("public", "article")]
+                .insertable
+        };
+        assert!(!of(false));
+        assert!(of(true));
     }
 
     #[test]
