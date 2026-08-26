@@ -188,7 +188,7 @@ say "Extracting cases from the corpus"
 # This makes the run measure a *configured* server rather than a bare one.
 # That is the fair comparison -- it is what migrating actually involves -- but
 # it is a different measurement, and the report says which one it is.
-say "Converting each group's names"
+say "Converting each group's names and permissions"
 mkdir -p "$WORK/names"
 "$PYTHON" - "$WORK/cases.json" "$CORPUS/queries" "$WORK/names" "$REPO_ROOT/scripts/hasura-names.py" <<'PY'
 import json, os, subprocess, sys

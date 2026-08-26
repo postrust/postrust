@@ -121,10 +121,19 @@ async fn main() -> Result<()> {
         // Create GraphQL state with subscriptions enabled
         let schema_cache_snapshot = state.schema_cache.read().await.clone();
         let schema_cache_arc = Arc::new(schema_cache_snapshot);
-        // Names Hasura keeps in metadata and a schema cannot carry. Absent,
-        // every name is derived exactly as before.
-        let graphql_names = match std::env::var("PGRST_GRAPHQL_NAMES") {
-            Ok(value) => match postrust_graphql::names::NameOverrides::parse(&value) {
+        // What Hasura keeps in metadata and a schema cannot carry: the names,
+        // and what each role may do. Absent, every name is derived exactly as
+        // before and there is no permission layer at all.
+        //
+        // Two spellings because the document outgrew the first one. `_NAMES`
+        // is what it was called when names were all it held, and a deployment
+        // already setting it should not have to change anything.
+        let names_var = ["PGRST_GRAPHQL_METADATA", "PGRST_GRAPHQL_NAMES"]
+            .into_iter()
+            .find_map(|name| std::env::var(name).ok().map(|value| (name, value)));
+
+        let graphql_names = match names_var {
+            Some((var, value)) => match postrust_graphql::names::NameOverrides::parse(&value) {
                 Ok(names) => {
                     if !names.is_empty() {
                         info!("GraphQL names given for {} tables", names.len());
@@ -135,17 +144,26 @@ async fn main() -> Result<()> {
                             names.placed_functions()
                         );
                     }
+                    if names.has_permissions() {
+                        info!(
+                            "GraphQL permissions given for {} roles, {} grants",
+                            names.roles().len(),
+                            names.granted()
+                        );
+                    }
                     names
                 }
                 Err(e) => {
                     // Serving the derived names instead would answer every
                     // request under a name the client does not send, which
-                    // reads as a broken server rather than a bad setting.
-                    tracing::error!("PGRST_GRAPHQL_NAMES: {}", e);
-                    return Err(anyhow::anyhow!("PGRST_GRAPHQL_NAMES: {}", e));
+                    // reads as a broken server rather than a bad setting. A
+                    // permission read wrong is worse still: it would serve
+                    // rows a rule was written to withhold.
+                    tracing::error!("{}: {}", var, e);
+                    return Err(anyhow::anyhow!("{}: {}", var, e));
                 }
             },
-            Err(_) => postrust_graphql::names::NameOverrides::default(),
+            None => postrust_graphql::names::NameOverrides::default(),
         };
 
         // An enum table's members are rows, not schema, so they are read here

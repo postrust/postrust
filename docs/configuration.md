@@ -282,7 +282,7 @@ nothing depends on time. See [Realtime](./realtime.md).
 
 | Variable | Description | Default |
 |----------|-------------|---------|
-| `PGRST_GRAPHQL_NAMES` | Names for tables, columns, root fields, relationships and computed fields that the schema cannot supply, and which root a function is exposed on. A JSON document, or a path to a file holding one. | unset (every name derived) |
+| `PGRST_GRAPHQL_METADATA` | Names for tables, columns, root fields, relationships and computed fields that the schema cannot supply; which root a function is exposed on; and what each role may do with each table. A JSON document, or a path to a file holding one. Also read as `PGRST_GRAPHQL_NAMES`, which is what it was called when names were all it carried. | unset (every name derived, no permission layer) |
 
 Almost everything in the generated GraphQL API is derived: a table's name gives
 its root fields, a foreign key gives a relationship, a function gives a
@@ -347,6 +347,81 @@ down. This is where those names go when a schema is migrated from one.
 
 Keys are `schema.table`, so a table in the default schema is still
 `public.author`. A table absent from the document is exposed exactly as before.
+
+### What each role may do
+
+The one entry that is not a name. A permission is not derived from anything, so
+unlike every other key here it is written whether or not it differs from a
+default — a role the document says nothing about has no access at all.
+
+```json
+{
+  "public.article": {
+    "permissions": {
+      "user": {
+        "select": {
+          "columns": ["id", "title", "content"],
+          "filter": { "$or": [{ "author_id": "X-Hasura-User-Id" },
+                              { "is_published": true }] },
+          "limit": 10,
+          "allow_aggregations": true,
+          "computed_fields": ["get_articles"]
+        },
+        "insert": {
+          "columns": "*",
+          "check": { "author_id": "X-Hasura-User-Id" },
+          "set": { "author_id": "X-Hasura-User-Id" },
+          "backend_only": false
+        },
+        "update": { "columns": ["title"], "filter": {}, "check": {} },
+        "delete": { "filter": { "is_published": false } }
+      },
+      "anonymous": {
+        "select": { "columns": "*", "filter": { "is_published": true } }
+      }
+    }
+  }
+}
+```
+
+- **`columns`** is a list, or `"*"` for every column the table has. The two
+  differ for a column added later: `"*"` covers it and a list does not. A
+  column outside the set is not merely unreadable — it is absent from the type,
+  which is what makes a permission a statement about the schema rather than
+  about a request.
+- **`filter`** and **`check`** are boolean expressions in the same shape a
+  `where` argument takes, with one addition: a string like `X-Hasura-User-Id`
+  stands for the caller's session variable of that name. `filter` chooses rows
+  before the operation; `check` is what a written row must satisfy after it.
+- **`set`** fills columns in from the server, overriding whatever the request
+  said — which is how `author_id` comes from the caller's identity rather than
+  from the caller.
+- **`limit`** is a ceiling, not a default: a request asking for more gets this,
+  and one asking for fewer gets what it asked for.
+- **`allow_aggregations`** is separate from reading rows because counting rows
+  you cannot see is a way of seeing them.
+- **`backend_only`** hides a mutation from anything but a caller that proved it
+  holds the admin secret (see [Hasura Authentication](#hasura-authentication)),
+  whatever role it then claims.
+
+Absent entries mean different things at different levels, and the difference
+matters:
+
+| | meaning |
+|---|---|
+| no `permissions` key anywhere in the document | no permission layer at all — database roles and RLS, as before |
+| a role absent from a table's `permissions` | that role cannot touch that table |
+| `select` absent for a role that has `insert` | it may write rows it cannot read |
+| `columns` absent from a write permission | every column, which is Hasura's own default |
+
+The third column of that table is why one permission anywhere turns the layer
+on for every table: a document granting `user` a filtered view of `article` and
+saying nothing about `author` is saying `user` cannot read `author` — not that
+`author` is open to everyone.
+
+`scripts/hasura-names.py` converts these from Hasura's own metadata alongside
+the names, from a running engine, a metadata directory, an export, or a list of
+migration commands.
 
 ### Where a function is exposed
 

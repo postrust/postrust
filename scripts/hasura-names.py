@@ -26,10 +26,15 @@ are emitted. A relationship Hasura called `articles` on a table called
 `article` is the name reflection already produces, so writing it down would
 only make the document harder to read and easier to leave stale.
 
-What is deliberately not converted: permissions, tracked-table lists, actions,
-remote schemas and event triggers. Those are the metadata model rather than
-names, and this server does not have one -- permissions live in the database as
-roles and row level security. The document this writes is a lookup table.
+Permissions are the exception to that rule, and are always written: nothing
+derives a permission, so one that is not in the document does not exist. That
+asymmetry is the point of them -- a role the document says nothing about has
+no access, where a table the document says nothing about keeps every name
+reflection gives it.
+
+What is still not converted: tracked-table lists, actions, remote schemas and
+event triggers. Those are the metadata model rather than a lookup table, and
+this server does not have one.
 """
 import argparse
 import json
@@ -180,6 +185,20 @@ def tables_from_commands(paths):
                      "definition": args.get("definition"),
                      "comment": args.get("comment")}
                 )
+            elif kind.startswith("create_") and kind.endswith("_permission"):
+                # `create_select_permission` -> `select_permissions`, which is
+                # the key an exported document uses, so both inputs reach
+                # `convert` in one shape.
+                verb = kind[len("create_"):-len("_permission")]
+                entry.setdefault(f"{verb}_permissions", []).append(
+                    {"role": args.get("role"), "permission": args.get("permission") or {}}
+                )
+            elif kind.startswith("drop_") and kind.endswith("_permission"):
+                verb = kind[len("drop_"):-len("_permission")]
+                granted = entry.get(f"{verb}_permissions") or []
+                entry[f"{verb}_permissions"] = [
+                    p for p in granted if p.get("role") != args.get("role")
+                ]
             elif kind == "set_table_is_enum":
                 entry["is_enum"] = bool(args.get("is_enum", True))
             elif kind in ("track_table", "set_table_customization", "add_existing_table_or_view"):
@@ -505,10 +524,67 @@ def convert(tables):
         if computed:
             given["computed_fields"] = computed
 
+        permissions = convert_permissions(entry)
+        if permissions:
+            given["permissions"] = permissions
+
         if given:
             names[key] = given
 
     return names
+
+
+# Which keys of a Hasura permission this server reads, per verb. Everything
+# else Hasura accepts there -- `allow_upsert`, `query_root_fields`,
+# `subscription_root_fields`, `validate_input` -- is reported rather than
+# dropped silently, because a permission that converts to something weaker
+# than it was is worse than one that fails to convert.
+PERMISSION_KEYS = {
+    "select": {"columns", "filter", "limit", "allow_aggregations", "computed_fields"},
+    "insert": {"columns", "check", "set", "backend_only"},
+    "update": {"columns", "filter", "check", "set"},
+    "delete": {"filter"},
+}
+
+
+def convert_permissions(entry):
+    """What each role may do with one table, keyed by role.
+
+    Unlike the names, a permission is converted whether or not it differs from
+    something derived, because nothing derives it: a permission that is not
+    written down does not exist, and the absence of one is itself the
+    statement that the role has no access.
+    """
+    _, table = qualified(entry.get("table"))
+    by_role = {}
+
+    for verb, wanted in PERMISSION_KEYS.items():
+        for granted in entry.get(f"{verb}_permissions") or []:
+            role = granted.get("role")
+            permission = granted.get("permission")
+            if not role or not isinstance(permission, dict):
+                continue
+
+            unread = sorted(set(permission) - wanted)
+            if unread:
+                print(
+                    f"note: {table}.{verb} for \"{role}\" says "
+                    f"{', '.join(unread)}, which this server does not read",
+                    file=sys.stderr,
+                )
+
+            kept = {k: v for k, v in permission.items() if k in wanted}
+            # A write permission that names no columns covers all of them.
+            # Worth stating rather than leaving to a default, because getting
+            # it the other way round refuses every insert the permission was
+            # written to allow: `author` for `user` in
+            # `graphql_mutation/insert/permissions` says only `check`, and the
+            # corpus expects an insert naming three columns to succeed.
+            if "columns" in wanted and "columns" not in kept:
+                kept["columns"] = "*"
+            by_role.setdefault(role, {})[verb] = kept
+
+    return by_role
 
 
 def convert_functions(functions):

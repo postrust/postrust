@@ -13,9 +13,11 @@
 //! fail on it across four groups, every one of them by answering correctly
 //! under a different name.
 //!
-//! So names can be given. Only names: this is a lookup table, not a metadata
-//! model. It grants no permissions, tracks no tables, and a table absent from
-//! it is exposed exactly as before.
+//! So names can be given -- and, since a permission is the same kind of thing,
+//! permissions too. Both are decisions a person wrote into metadata that no
+//! schema remembers. This is still a lookup table rather than a metadata model:
+//! it tracks no tables, offers no API to change it, and a table absent from it
+//! is exposed exactly as before.
 //!
 //! ```json
 //! {
@@ -24,10 +26,23 @@
 //!     "roots": { "select_by_pk": "Author" },
 //!     "columns": { "id": "AuthorId" },
 //!     "relationships": { "article_author_id_fkey": "posts" },
-//!     "computed_fields": { "automatic_comment_in_db_upper_name": "upper_name" }
+//!     "computed_fields": { "automatic_comment_in_db_upper_name": "upper_name" },
+//!     "permissions": {
+//!       "user": {
+//!         "select": {
+//!           "columns": ["id", "name"],
+//!           "filter": { "id": "X-Hasura-User-Id" },
+//!           "limit": 10
+//!         }
+//!       }
+//!     }
 //!   }
 //! }
 //! ```
+//!
+//! The module is called `names` because names came first, and the document's
+//! variable keeps both spellings for the same reason. What it holds is now
+//! wider than that.
 //!
 //! Relationships and computed fields are keyed by the thing the database
 //! actually has -- a constraint name, or a function name -- rather than by the
@@ -109,6 +124,191 @@ pub struct TableNames {
     /// text.
     #[serde(default, rename = "enum")]
     pub is_enum: bool,
+
+    /// What each role may do with this table, keyed by role.
+    ///
+    /// A role absent from this map has no permission on the table at all,
+    /// which in Hasura is not a refusal at execution but an absence in the
+    /// schema: the root fields are not there to be named. The same is true one
+    /// level down -- a role with `select` and no `insert` has no `insert_x`
+    /// field, and asking for one is a validation failure rather than a denial.
+    ///
+    /// Empty for every table until a document says otherwise, and a document
+    /// that says nothing about permissions leaves the server behaving as it did
+    /// before they existed: database roles and row level security, with no
+    /// second layer above them.
+    #[serde(default)]
+    pub permissions: HashMap<String, RolePermissions>,
+}
+
+/// What one role may do with one table.
+///
+/// Four independent grants, and the absence of one is meaningful: no `select`
+/// means the table cannot be read by this role, not that it can be read
+/// without restriction.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct RolePermissions {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub select: Option<SelectPermission>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub insert: Option<InsertPermission>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub update: Option<UpdatePermission>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delete: Option<DeletePermission>,
+}
+
+/// Which rows a role may read, and which of their columns.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct SelectPermission {
+    /// The columns this role can see. Every other column of the table is not
+    /// merely unreadable but absent from the type, which is what makes a
+    /// permission a statement about the schema rather than about a request.
+    #[serde(default)]
+    pub columns: ColumnSet,
+
+    /// Which rows. A boolean expression in the same shape a `where` argument
+    /// takes, with one addition: a string like `X-Hasura-User-Id` stands for
+    /// the caller's session variable of that name.
+    ///
+    /// Left uninterpreted here. Reading it is the query builder's job, and a
+    /// document that carries a predicate this server cannot compile should
+    /// fail where the compilation is, not where the parsing is.
+    #[serde(default, skip_serializing_if = "serde_json::Value::is_null")]
+    pub filter: serde_json::Value,
+
+    /// The most rows a single request may read. A ceiling, not a default: a
+    /// request asking for more gets this, and one asking for fewer gets what it
+    /// asked for.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub limit: Option<u64>,
+
+    /// Whether this role may ask for aggregates. Hasura keeps it separate from
+    /// reading rows because counting rows you cannot see is a way of seeing
+    /// them.
+    #[serde(default)]
+    pub allow_aggregations: bool,
+
+    /// Which computed fields this role may ask for. Empty is none, not all:
+    /// a computed field runs a function over a row, so it can answer questions
+    /// the column permissions were written to prevent.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub computed_fields: Vec<String>,
+}
+
+/// What a role may write, and what the result has to satisfy.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct InsertPermission {
+    /// The columns a request may supply.
+    #[serde(default)]
+    pub columns: ColumnSet,
+
+    /// What every written row must satisfy. Unlike a `filter`, this is checked
+    /// against the row *after* it is built, which is what stops a caller
+    /// inserting a row it would not then be allowed to read.
+    #[serde(default, skip_serializing_if = "serde_json::Value::is_null")]
+    pub check: serde_json::Value,
+
+    /// Columns the server fills in, overriding whatever the request said. The
+    /// value may be a session variable, which is how `author_id` comes from
+    /// the caller's identity rather than from the caller.
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub set: HashMap<String, serde_json::Value>,
+
+    /// Reachable only by a caller that proved it holds the admin secret,
+    /// whatever role it then claims. A mutation a client must not be able to
+    /// reach by naming a role.
+    #[serde(default)]
+    pub backend_only: bool,
+}
+
+/// Which rows a role may change, which columns of them, and what the result
+/// has to satisfy.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct UpdatePermission {
+    #[serde(default)]
+    pub columns: ColumnSet,
+
+    /// Which rows may be changed, read before the change.
+    #[serde(default, skip_serializing_if = "serde_json::Value::is_null")]
+    pub filter: serde_json::Value,
+
+    /// What they must satisfy afterwards. Absent means the `filter` stands in,
+    /// which is Hasura's rule: a row you may change is a row you may change
+    /// into something you may still change.
+    #[serde(default, skip_serializing_if = "serde_json::Value::is_null")]
+    pub check: serde_json::Value,
+
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub set: HashMap<String, serde_json::Value>,
+}
+
+/// Which rows a role may delete.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct DeletePermission {
+    #[serde(default, skip_serializing_if = "serde_json::Value::is_null")]
+    pub filter: serde_json::Value,
+}
+
+/// The columns a permission covers.
+///
+/// Hasura writes either a list or `"*"`, and the two are not the same thing
+/// even when they name the same columns today: `"*"` follows the table, so a
+/// column added tomorrow is covered, and a list does not.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub enum ColumnSet {
+    /// Every column the table has, now and later.
+    #[default]
+    All,
+    /// Exactly these.
+    Named(Vec<String>),
+}
+
+impl ColumnSet {
+    /// Whether a column is covered.
+    pub fn allows(&self, column: &str) -> bool {
+        match self {
+            Self::All => true,
+            Self::Named(columns) => columns.iter().any(|name| name == column),
+        }
+    }
+
+    /// Whether this covers nothing at all.
+    ///
+    /// A permission naming no columns is one Hasura accepts and which grants
+    /// only the ability to know the table exists.
+    pub fn is_empty(&self) -> bool {
+        matches!(self, Self::Named(columns) if columns.is_empty())
+    }
+}
+
+impl Serialize for ColumnSet {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        match self {
+            Self::All => serializer.serialize_str("*"),
+            Self::Named(columns) => columns.serialize(serializer),
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for ColumnSet {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum Either {
+            Wildcard(String),
+            Named(Vec<String>),
+        }
+
+        match Either::deserialize(deserializer)? {
+            Either::Named(columns) => Ok(Self::Named(columns)),
+            Either::Wildcard(text) if text == "*" => Ok(Self::All),
+            Either::Wildcard(text) => Err(serde::de::Error::custom(format!(
+                "\"{}\" is not a column set; write a list of columns, or \"*\" for all of them",
+                text
+            ))),
+        }
+    }
 }
 
 /// Descriptions given to one table and the things on it.
@@ -258,6 +458,57 @@ impl NameOverrides {
 
     fn table(&self, schema: &str, table: &str) -> Option<&TableNames> {
         self.tables.get(&format!("{}.{}", schema, table))
+    }
+
+    /// What one role may do with one table.
+    ///
+    /// `None` means the role was named nothing about this table, which is not
+    /// the same as being named an empty permission: the first has no access,
+    /// the second has access to nothing. Both refuse, and only the second is a
+    /// decision someone wrote down.
+    pub fn permissions(&self, schema: &str, table: &str, role: &str) -> Option<&RolePermissions> {
+        self.table(schema, table)?.permissions.get(role)
+    }
+
+    /// Whether the document says anything about permissions at all.
+    ///
+    /// The switch for the whole layer. A document carrying only names leaves
+    /// the server as it was: database roles and row level security, with
+    /// nothing above them. One permission anywhere turns the layer on for
+    /// every table, because a document that grants `user` a filtered view of
+    /// `article` and says nothing about `author` is saying `user` cannot read
+    /// `author` -- not that `author` is open to everyone.
+    pub fn has_permissions(&self) -> bool {
+        self.tables
+            .values()
+            .any(|table| !table.permissions.is_empty())
+    }
+
+    /// Every role the document names, sorted.
+    ///
+    /// Sorted because a schema is built per role and the order they are built
+    /// in should not depend on how a hash map felt. `admin` is not among them
+    /// unless a permission names it: an administrator is not a role with
+    /// permissions but a caller the permissions do not apply to.
+    pub fn roles(&self) -> Vec<&str> {
+        let mut roles: Vec<&str> = self
+            .tables
+            .values()
+            .flat_map(|table| table.permissions.keys())
+            .map(String::as_str)
+            .collect();
+        roles.sort_unstable();
+        roles.dedup();
+        roles
+    }
+
+    /// How many table-and-role pairs were granted something, for the line the
+    /// server logs at startup.
+    pub fn granted(&self) -> usize {
+        self.tables
+            .values()
+            .map(|table| table.permissions.len())
+            .sum()
     }
 
     /// Whether a table was marked as a set of allowed values.
@@ -553,5 +804,123 @@ mod tests {
             "unhelpful: {}",
             error
         );
+    }
+
+    const GRANTED: &str = r#"{
+        "tables": {
+            "public.article": {
+                "permissions": {
+                    "user": {
+                        "select": {
+                            "columns": ["id", "title", "content"],
+                            "filter": {"$or": [{"author_id": "X-HASURA-USER-ID"},
+                                               {"is_published": true}]},
+                            "limit": 10,
+                            "allow_aggregations": true,
+                            "computed_fields": ["get_articles"]
+                        },
+                        "insert": {
+                            "check": {"author_id": "X-Hasura-User-Id"},
+                            "columns": ["title", "content"],
+                            "set": {"author_id": "X-Hasura-User-Id"},
+                            "backend_only": true
+                        },
+                        "update": {"columns": ["title"], "filter": {}},
+                        "delete": {"filter": {"is_published": false}}
+                    },
+                    "anonymous": {
+                        "select": {"columns": "*", "filter": {"is_published": true}}
+                    }
+                }
+            }
+        }
+    }"#;
+
+    #[test]
+    fn what_a_role_may_do_is_read_from_the_document() {
+        let names = NameOverrides::parse(GRANTED).unwrap();
+        let user = names.permissions("public", "article", "user").unwrap();
+
+        let select = user.select.as_ref().unwrap();
+        assert!(select.columns.allows("title"));
+        assert!(!select.columns.allows("is_published"));
+        assert_eq!(select.limit, Some(10));
+        assert!(select.allow_aggregations);
+        assert_eq!(select.computed_fields, vec!["get_articles".to_string()]);
+        // The predicate is carried, not read: compiling it is the query
+        // builder's job and a failure there should say so there.
+        assert_eq!(
+            select.filter["$or"][1]["is_published"],
+            serde_json::json!(true)
+        );
+
+        let insert = user.insert.as_ref().unwrap();
+        assert!(insert.backend_only);
+        assert_eq!(
+            insert.set.get("author_id"),
+            Some(&serde_json::json!("X-Hasura-User-Id"))
+        );
+
+        assert!(user.update.is_some());
+        assert!(user.delete.is_some());
+    }
+
+    #[test]
+    fn a_wildcard_column_set_is_not_a_list_that_happens_to_be_long() {
+        let names = NameOverrides::parse(GRANTED).unwrap();
+        let anonymous = names.permissions("public", "article", "anonymous").unwrap();
+        let select = anonymous.select.as_ref().unwrap();
+        assert_eq!(select.columns, ColumnSet::All);
+        // Which means a column nobody has thought of yet is covered too.
+        assert!(select.columns.allows("a_column_added_next_year"));
+        // And this role was told nothing about writing.
+        assert!(anonymous.insert.is_none());
+    }
+
+    #[test]
+    fn a_role_named_nothing_has_nothing() {
+        let names = NameOverrides::parse(GRANTED).unwrap();
+        assert!(names.permissions("public", "article", "stranger").is_none());
+        assert!(names.permissions("public", "author", "user").is_none());
+    }
+
+    #[test]
+    fn the_roles_come_back_sorted_and_once_each() {
+        let names = NameOverrides::parse(GRANTED).unwrap();
+        assert_eq!(names.roles(), vec!["anonymous", "user"]);
+        assert_eq!(names.granted(), 2);
+    }
+
+    #[test]
+    fn a_document_of_names_alone_leaves_the_layer_off() {
+        assert!(!NameOverrides::parse(SAMPLE).unwrap().has_permissions());
+        assert!(NameOverrides::parse(GRANTED).unwrap().has_permissions());
+        assert!(NameOverrides::parse("").unwrap().roles().is_empty());
+    }
+
+    #[test]
+    fn a_column_set_that_is_neither_says_so() {
+        let error = NameOverrides::parse(
+            r#"{"tables": {"public.a": {"permissions":
+                 {"user": {"select": {"columns": "all"}}}}}}"#,
+        )
+        .unwrap_err();
+        assert!(error.contains("not a column set"), "unhelpful: {}", error);
+    }
+
+    #[test]
+    fn a_permission_survives_the_round_trip() {
+        // The converter writes this document and the server reads it, so the
+        // two spellings of a column set have to mean the same thing in both
+        // directions -- `"*"` must not come back as the one-element list
+        // `["*"]`, which would name a column no table has.
+        let names = NameOverrides::parse(GRANTED).unwrap();
+        let written = serde_json::to_string(&Sections {
+            tables: names.tables.clone(),
+            functions: HashMap::new(),
+        })
+        .unwrap();
+        let again = NameOverrides::parse(&written).unwrap();
+        assert_eq!(again, names);
     }
 }
