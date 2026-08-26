@@ -108,6 +108,25 @@ pub struct AppConfig {
     pub jwt_cache_max_lifetime: u64,
 
     // ========================================================================
+    // Hasura Authentication
+    // ========================================================================
+    /// The shared secret that authenticates an administrator, and the switch
+    /// that makes `x-hasura-*` headers mean anything at all.
+    ///
+    /// Unset, this server ignores those headers and reads session variables
+    /// only from a verified token -- because honouring a header nothing
+    /// authenticated would let any caller name its own identity, and a policy
+    /// reading a value the caller chose is not a policy. Hasura instead treats
+    /// an unsecured deployment as wholly administrative; the divergence is
+    /// deliberate and is recorded in `postrust_auth::hasura`.
+    pub hasura_admin_secret: Option<String>,
+
+    /// The role a request falls to when nothing authenticated it. Hasura's
+    /// `HASURA_GRAPHQL_UNAUTHORIZED_ROLE`; unset means such a request is
+    /// refused rather than answered as a stranger.
+    pub hasura_unauthorized_role: Option<String>,
+
+    // ========================================================================
     // OpenAPI Settings
     // ========================================================================
     /// OpenAPI server URL
@@ -175,6 +194,8 @@ impl Default for AppConfig {
             jwt_role_claim_key: default_jwt_role_claim(),
             jwt_cache_enabled: true,
             jwt_cache_max_lifetime: default_jwt_cache_max(),
+            hasura_admin_secret: None,
+            hasura_unauthorized_role: None,
             openapi_server_proxy_uri: None,
             openapi_mode: OpenApiMode::FollowPrivileges,
             log_level: LogLevel::Error,
@@ -240,6 +261,28 @@ impl AppConfig {
         }
         if let Ok(aud) = std::env::var("PGRST_JWT_AUD") {
             config.jwt_aud = Some(aud);
+        }
+        // Hasura's own spelling is accepted beside ours, because a deployment
+        // migrating from it has these in a compose file already and the point
+        // of the mode is that the client does not have to be rewritten. The
+        // `PGRST_` name wins where both are set, on the grounds that it is the
+        // more specific instruction to this server.
+        for var in ["HASURA_GRAPHQL_ADMIN_SECRET", "PGRST_HASURA_ADMIN_SECRET"] {
+            if let Ok(secret) = std::env::var(var) {
+                if !secret.is_empty() {
+                    config.hasura_admin_secret = Some(secret);
+                }
+            }
+        }
+        for var in [
+            "HASURA_GRAPHQL_UNAUTHORIZED_ROLE",
+            "PGRST_HASURA_UNAUTHORIZED_ROLE",
+        ] {
+            if let Ok(role) = std::env::var(var) {
+                if !role.is_empty() {
+                    config.hasura_unauthorized_role = Some(role);
+                }
+            }
         }
         if let Ok(host) = std::env::var("PGRST_SERVER_HOST") {
             config.server_host = host;

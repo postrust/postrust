@@ -296,6 +296,7 @@ NAMES="$WORK/names/\$1.json"
 PGRST_GRAPHQL_NAMES="\$NAMES" \
 DATABASE_URL="postgres://postgres:postgres@localhost:$DB_PORT/$DATA_DB" \
 PGRST_DB_SCHEMAS="$DB_SCHEMAS" PGRST_DB_ANON_ROLE=postgres \
+PGRST_HASURA_ADMIN_SECRET="$ADMIN_SECRET" \
 PGRST_DB_EXTRA_SEARCH_PATH="public,extensions" \
 PGRST_SERVER_PORT="$CAND_PORT" PGRST_SERVER_HOST=127.0.0.1 \
 PGRST_DB_AGGREGATES_ENABLED=true PGRST_LOG_LEVEL=warn \
@@ -312,6 +313,7 @@ start_postrust() {
     pkill -f 'target/release/postrust' 2>/dev/null || true
     DATABASE_URL="postgres://postgres:postgres@localhost:$DB_PORT/$DATA_DB" \
     PGRST_DB_SCHEMAS="$DB_SCHEMAS" PGRST_DB_ANON_ROLE=postgres \
+    PGRST_HASURA_ADMIN_SECRET="$ADMIN_SECRET" \
     PGRST_SERVER_PORT="$CAND_PORT" PGRST_SERVER_HOST=127.0.0.1 \
     PGRST_DB_AGGREGATES_ENABLED=true PGRST_LOG_LEVEL=warn \
         "$REPO_ROOT/target/release/postrust" >>"$WORK/postrust.log" 2>&1 &

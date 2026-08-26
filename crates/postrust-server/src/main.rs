@@ -261,11 +261,16 @@ async fn main() -> Result<()> {
             struct GraphQLAppState {
                 gql_state: Arc<GraphQLState>,
                 jwt_config: postrust_auth::JwtConfig,
+                hasura_auth: postrust_auth::HasuraAuthConfig,
             }
 
             let graphql_app_state = GraphQLAppState {
                 gql_state: graphql_state.clone(),
                 jwt_config: state.jwt_config.clone(),
+                hasura_auth: postrust_auth::HasuraAuthConfig {
+                    admin_secret: config.hasura_admin_secret.clone(),
+                    unauthorized_role: config.hasura_unauthorized_role.clone(),
+                },
             };
 
             // Wrapper handler that creates context from request with proper auth
@@ -304,42 +309,94 @@ async fn main() -> Result<()> {
                 // Extract auth header and authenticate
                 let auth_header = headers.get("authorization").and_then(|v| v.to_str().ok());
 
-                let auth_result =
-                    match postrust_auth::authenticate(auth_header, &app_state.jwt_config) {
-                        Ok(auth) => auth,
-                        Err(e) => {
-                            tracing::debug!("GraphQL auth failed: {}, using anon role", e);
-                            postrust_auth::AuthResult {
-                                role: app_state
-                                    .jwt_config
-                                    .anon_role
-                                    .clone()
-                                    .unwrap_or_else(|| "anon".to_string()),
-                                claims: std::collections::HashMap::new(),
-                            }
+                let token = postrust_auth::authenticate(auth_header, &app_state.jwt_config);
+                // A token that was offered and verified. Not the same as
+                // `token.is_ok()`, which is also true of the anonymous
+                // fallback -- and an anonymous request is precisely the one
+                // that has not been authenticated.
+                let token_verified = auth_header.is_some() && token.is_ok();
+
+                let auth_result = match token {
+                    Ok(auth) => auth,
+                    Err(e) => {
+                        tracing::debug!("GraphQL auth failed: {}, using anon role", e);
+                        postrust_auth::AuthResult {
+                            role: app_state
+                                .jwt_config
+                                .anon_role
+                                .clone()
+                                .unwrap_or_else(|| "anon".to_string()),
+                            claims: std::collections::HashMap::new(),
                         }
-                    };
+                    }
+                };
 
                 tracing::debug!(
                     "GraphQL request authenticated as role: {}",
                     auth_result.role
                 );
 
+                // Who the caller is in Hasura's sense, which is a different
+                // question from which database user the transaction runs as.
+                // The secret goes first: a caller that tried to be an
+                // administrator and got the secret wrong is refused rather
+                // than asked for a token.
+                let pairs: Vec<(&str, &str)> = headers
+                    .iter()
+                    .filter_map(|(name, value)| {
+                        value.to_str().ok().map(|value| (name.as_str(), value))
+                    })
+                    .collect();
+
+                let (hasura_role, session, elevated) =
+                    match postrust_auth::hasura::from_admin_secret(
+                        &app_state.hasura_auth,
+                        &pairs[..],
+                    ) {
+                        postrust_auth::SecretOutcome::Accepted(identity) => {
+                            (Some(identity.role), identity.session, identity.elevated)
+                        }
+                        postrust_auth::SecretOutcome::Rejected => {
+                            return postrust_graphql::hasura::denied(
+                                postrust_auth::hasura::SECRET_INVALID,
+                            );
+                        }
+                        // Nothing settled by the secret. A verified token speaks
+                        // next, and session variables come from its claims -- the
+                        // headers are not read here, because on a server with no
+                        // secret to gate them they would let any caller name its
+                        // own identity.
+                        _ if token_verified => (
+                            hasura_role_from_claims(&auth_result.claims),
+                            hasura_session_from_claims(&auth_result.claims),
+                            false,
+                        ),
+                        // A secret is configured and nothing authenticated this
+                        // request. Answering it as a stranger is a choice the
+                        // deployment makes; refusing is the default.
+                        _ if app_state.hasura_auth.is_configured() => {
+                            match postrust_auth::hasura::unauthenticated(&app_state.hasura_auth) {
+                                Some(identity) => (Some(identity.role), identity.session, false),
+                                None => {
+                                    return postrust_graphql::hasura::denied(
+                                        postrust_auth::hasura::SECRET_MISSING,
+                                    );
+                                }
+                            }
+                        }
+                        // No Hasura auth configured at all: unchanged from before
+                        // any of this existed.
+                        _ => (
+                            hasura_role_from_claims(&auth_result.claims),
+                            hasura_session_from_claims(&auth_result.claims),
+                            false,
+                        ),
+                    };
+
                 // Create SchemaCacheRef from the static Arc<SchemaCache>
                 let schema_cache_ref = postrust_core::schema_cache::SchemaCacheRef::from_static(
                     (*app_state.gql_state.schema_cache).clone(),
                 );
-
-                // Session variables come from the verified token, never from the
-                // request's own headers. Hasura reads `X-Hasura-User-Id` off the
-                // wire because it has an admin secret to gate that on; here a raw
-                // header would let any caller name its own identity, and a policy
-                // reading a value the caller chose is not a policy. A client
-                // migrating from Hasura keeps sending the same JWT, and its
-                // `x-hasura-*` claims -- top level or under Hasura's own namespace
-                // -- are what a row-level security policy reads as
-                // `current_setting('hasura.user_id')`.
-                let session = hasura_session_from_claims(&auth_result.claims);
 
                 // Every write in this operation goes into one transaction, and
                 // this is the half that decides its fate: a mutation naming
@@ -354,6 +411,7 @@ async fn main() -> Result<()> {
                     auth_result,
                 )
                 .with_session(session)
+                .with_identity(hasura_role, elevated)
                 .with_write(Arc::clone(&write));
 
                 let prepared =
@@ -393,6 +451,45 @@ async fn main() -> Result<()> {
                 }
 
                 postrust_graphql::hasura::envelope(response)
+            }
+
+            /// The Hasura role a verified token names, if it names one.
+            ///
+            /// `x-hasura-role` where the token fixes the role outright, and
+            /// `x-hasura-default-role` where it offers a default beside the
+            /// `x-hasura-allowed-roles` it may choose among -- which is the
+            /// shape Hasura's own documentation mints. Either spelling may sit
+            /// at the top level or under the namespace, and both are read.
+            ///
+            /// `None` leaves the database role standing in, which is what
+            /// happened before the two were told apart.
+            fn hasura_role_from_claims(
+                claims: &std::collections::HashMap<String, serde_json::Value>,
+            ) -> Option<String> {
+                const NAMESPACE: &str = "https://hasura.io/jwt/claims";
+
+                let read = |source: &std::collections::HashMap<String, serde_json::Value>| {
+                    for wanted in ["x-hasura-role", "x-hasura-default-role"] {
+                        let found = source.iter().find_map(|(key, value)| {
+                            (key.to_ascii_lowercase() == wanted)
+                                .then(|| value.as_str())
+                                .flatten()
+                        });
+                        if let Some(role) = found.filter(|role| !role.is_empty()) {
+                            return Some(role.to_string());
+                        }
+                    }
+                    None
+                };
+
+                if let Some(serde_json::Value::Object(namespaced)) = claims.get(NAMESPACE) {
+                    let namespaced: std::collections::HashMap<String, serde_json::Value> =
+                        namespaced.clone().into_iter().collect();
+                    if let Some(role) = read(&namespaced) {
+                        return Some(role);
+                    }
+                }
+                read(claims)
             }
 
             /// Collect `x-hasura-*` claims from a verified token.

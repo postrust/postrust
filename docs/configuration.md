@@ -83,6 +83,74 @@ PGRST_JWT_ROLE_CLAIM_KEY="user.role"
 # JWT payload: {"user": {"role": "admin"}}
 ```
 
+## Hasura Authentication
+
+For the GraphQL surface at `/v1/graphql`. These are what let a client written
+against Hasura keep sending the headers it already sends.
+
+| Variable | Description | Default |
+|----------|-------------|---------|
+| `PGRST_HASURA_ADMIN_SECRET` | Shared secret authenticating an administrator (alias: `HASURA_GRAPHQL_ADMIN_SECRET`) | (none) |
+| `PGRST_HASURA_UNAUTHORIZED_ROLE` | Role for a request nothing authenticated (alias: `HASURA_GRAPHQL_UNAUTHORIZED_ROLE`) | (none) |
+
+Both spellings are read, so a deployment migrating from Hasura can keep the
+names already in its compose file; the `PGRST_` name wins where both are set.
+
+### What the secret switches on
+
+Set it, and a caller that holds it is an administrator — and an administrator
+may ask to be treated as someone else:
+
+```bash
+curl localhost:3000/v1/graphql \
+  -H 'X-Hasura-Admin-Secret: shh' \
+  -H 'X-Hasura-Role: user' \
+  -H 'X-Hasura-User-Id: 1' \
+  -d '{"query":"{ article { id title } }"}'
+```
+
+That request is answered as `user`, and `x-hasura-user-id` becomes a session
+variable a row-level policy can read as `current_setting('hasura.user_id')` —
+or that a function taking `hasura_session json` receives whole, alongside
+`x-hasura-role`. The role is also available on its own as
+`current_setting('hasura.role')`.
+
+A Hasura role is not a database role. `Artist` and `anonymous` need not exist
+in any catalogue: what the role decides is what `x-hasura-role` reads as, and
+(once permissions land) which rules apply. Which database user the transaction
+runs as is still `PGRST_DB_ANON_ROLE` or the JWT's role claim.
+
+### One place this deliberately differs from Hasura
+
+Hasura with no admin secret configured treats every caller as an
+administrator — which also means an unsecured deployment lets any caller name
+its own role and its own identity. Postrust does not:
+
+```bash
+# No PGRST_HASURA_ADMIN_SECRET set. These headers are ignored entirely.
+curl localhost:3000/v1/graphql \
+  -H 'X-Hasura-Role: user' -H 'X-Hasura-User-Id: 1' ...
+```
+
+With no secret configured, `x-hasura-*` headers carry no weight and session
+variables come only from a verified token. A policy reading a value the caller
+chose is not a policy, and the failure is silent — the query succeeds, against
+the wrong rows.
+
+### What a request with no credentials gets
+
+With a secret configured and none offered, the request is refused:
+
+```json
+{"errors":[{"message":"\"x-hasura-admin-secret\" required, but not found",
+            "extensions":{"path":"$","code":"access-denied"}}]}
+```
+
+Set `PGRST_HASURA_UNAUTHORIZED_ROLE` to answer such a request as a named role
+instead — with no session variables, since nothing established any. A wrong
+secret is always refused rather than falling back to that role: a caller that
+tried to be an administrator and failed is not then treated as a stranger.
+
 ## Server Settings
 
 | Variable | Description | Default |

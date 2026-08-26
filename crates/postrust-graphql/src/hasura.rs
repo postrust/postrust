@@ -39,6 +39,10 @@ fn code_for(error: &ServerError) -> &'static str {
             return match code.as_str() {
                 "validation-failed" => "validation-failed",
                 "bad-request" => "bad-request",
+                // Nothing authenticated the request, or the role it claimed is
+                // not one it may claim. Distinct from `permission-error`,
+                // which is a rule refusing an authenticated caller.
+                "access-denied" => "access-denied",
                 "permission-error" => "permission-error",
                 "constraint-violation" => "constraint-violation",
                 "data-exception" => "data-exception",
@@ -130,6 +134,23 @@ pub fn envelope(response: Response) -> Value {
     let mut body = Map::new();
     body.insert("data".to_string(), value_of(&response.data));
     Value::Object(body)
+}
+
+/// A request refused before it was read.
+///
+/// Nothing authenticated the caller, or the role it named is not one it may
+/// name. The document is never parsed, so there is no path into it to report
+/// and no operation to blame -- which is why Hasura answers `$` here and this
+/// does too. Still a 200: a GraphQL error is a value in the body.
+pub fn denied(message: &str) -> Value {
+    let mut error = ServerError::new(message, None);
+    let mut extensions = async_graphql::ErrorExtensionValues::default();
+    extensions.set("code", "access-denied");
+    error.extensions = Some(extensions);
+
+    let mut response = Response::new(async_graphql::Value::Null);
+    response.errors = vec![error];
+    envelope(response)
 }
 
 #[cfg(test)]
