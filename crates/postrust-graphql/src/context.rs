@@ -149,6 +149,19 @@ impl GraphQLContext {
         self.hasura_role.as_deref().unwrap_or(&self.auth.role)
     }
 
+    /// Who is asking, for the SQL builders that have to narrow rows to them.
+    ///
+    /// The Hasura role rather than [`Self::acting_role`]: a permission is
+    /// keyed by a role someone wrote into a document, and the database role
+    /// standing in for a missing one would name no permission and read as
+    /// unrestricted -- which is right, and is worth being explicit about.
+    pub fn caller(&self) -> crate::role::Caller<'_> {
+        crate::role::Caller {
+            role: self.hasura_role.as_deref(),
+            session: &self.session,
+        }
+    }
+
     /// Share one transaction with whoever is going to settle it.
     ///
     /// The caller keeps the other handle: it is the only thing that knows

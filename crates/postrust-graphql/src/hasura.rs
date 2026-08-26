@@ -43,6 +43,10 @@ fn code_for(error: &ServerError) -> &'static str {
                 // not one it may claim. Distinct from `permission-error`,
                 // which is a rule refusing an authenticated caller.
                 "access-denied" => "access-denied",
+                // What Hasura answers when a permission needs a session
+                // variable the caller does not carry: the variable was looked
+                // for and is not there.
+                "not-found" => "not-found",
                 "permission-error" => "permission-error",
                 "constraint-violation" => "constraint-violation",
                 "data-exception" => "data-exception",

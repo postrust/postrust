@@ -104,6 +104,297 @@ pub fn cache_for_role(cache: &SchemaCache, names: &NameOverrides, role: &str) ->
     view
 }
 
+/// Who is asking, for the places that have to narrow rows to them.
+///
+/// The two request-scoped facts a permission needs, carried together because
+/// they are always needed together and because the SQL builders they reach are
+/// several calls below the context that holds them. `role: None` is the
+/// unrestricted read: no permission document, or an administrator.
+#[derive(Clone, Copy)]
+pub struct Caller<'a> {
+    pub role: Option<&'a str>,
+    pub session: &'a std::collections::HashMap<String, String>,
+}
+
+impl Caller<'_> {
+    /// Whether any permission applies to this caller at all.
+    pub fn unrestricted(&self) -> bool {
+        match self.role {
+            None => true,
+            Some(role) => role == postrust_auth::hasura::ADMIN_ROLE,
+        }
+    }
+}
+
+/// Why a read could not be narrowed to the caller.
+///
+/// Two different answers with two different codes in Hasura, so they are kept
+/// apart here rather than collapsed into one message.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Fault {
+    /// The role has no select permission on the table. Unreachable through a
+    /// role's own schema, which has no such field -- so reaching it means
+    /// something was built that should not have been, and the safe answer is
+    /// to refuse rather than to read every row.
+    NoPermission { role: String, table: String },
+    /// A permission names a session variable the caller does not carry.
+    MissingSessionVariable(String),
+}
+
+impl Fault {
+    /// Hasura's `extensions.code` for this.
+    pub fn code(&self) -> &'static str {
+        match self {
+            Self::NoPermission { .. } => "permission-error",
+            Self::MissingSessionVariable(_) => "not-found",
+        }
+    }
+}
+
+impl std::fmt::Display for Fault {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NoPermission { role, table } => write!(
+                f,
+                "role \"{}\" has no permission to read \"{}\"",
+                role, table
+            ),
+            Self::MissingSessionVariable(message) => f.write_str(message),
+        }
+    }
+}
+
+/// The predicate a role's select permission adds to a read of one table.
+///
+/// `Ok(None)` where nothing restricts it.
+pub fn read_predicate(
+    caller: &Caller<'_>,
+    names: &NameOverrides,
+    schema: &str,
+    table: &str,
+) -> Result<Option<serde_json::Value>, Fault> {
+    if caller.unrestricted() {
+        return Ok(None);
+    }
+    let role = caller.role.unwrap_or_default();
+    let Some(select) = names
+        .permissions(schema, table, role)
+        .and_then(|granted| granted.select.as_ref())
+    else {
+        return Err(Fault::NoPermission {
+            role: role.to_string(),
+            table: table.to_string(),
+        });
+    };
+    permission_where(&select.filter, caller.session, names, schema, table)
+        .map_err(Fault::MissingSessionVariable)
+}
+
+/// How many rows a role's permission lets one read return.
+///
+/// A ceiling rather than a default, and `None` where the permission names one
+/// no more than the configuration does.
+pub fn read_limit(
+    caller: &Caller<'_>,
+    names: &NameOverrides,
+    schema: &str,
+    table: &str,
+) -> Option<i64> {
+    if caller.unrestricted() {
+        return None;
+    }
+    names
+        .permissions(schema, table, caller.role?)
+        .and_then(|granted| granted.select.as_ref())
+        .and_then(|select| select.limit)
+        .map(|limit| limit as i64)
+}
+
+/// Turn a permission's row filter into the boolean expression a `where`
+/// argument would have been.
+///
+/// The two are the same language. Hasura's `filter` is written in the same
+/// shape a client writes `where` in, so there is no second predicate compiler
+/// here and no second set of operators to keep in step -- the filter is
+/// rewritten into a `<table>_bool_exp` and handed to the one that already
+/// exists. Everything it can express, a permission can express, including a
+/// predicate over a relationship.
+///
+/// Three things metadata spells differently, and they are all this does:
+///
+///   * `{"author_id": 1}` is `_eq` written without saying so. Metadata omits
+///     the operator where it is equality; a `where` argument never does.
+///   * `$and`, `$or` and `$not` are the older spellings of `_and`, `_or` and
+///     `_not`, and the corpus uses both -- sometimes in one file.
+///   * `"X-Hasura-User-Id"` is not a string to compare against but the name of
+///     a session variable to compare against the value of. This is the half
+///     that makes a permission about the caller rather than about the table.
+///
+/// `Ok(None)` means the filter restricts nothing, which is what `{}` says and
+/// is a real answer: a role may be granted every row. It is distinct from
+/// having no permission at all, which is settled before this is reached.
+///
+/// An `Err` names a session variable the caller does not carry. That is a
+/// refusal rather than an empty result, because a filter that silently
+/// compares against nothing is a filter that matches nothing for a reason the
+/// client cannot see -- and Hasura says so too, in these words.
+pub fn permission_where(
+    filter: &serde_json::Value,
+    session: &std::collections::HashMap<String, String>,
+    names: &NameOverrides,
+    schema: &str,
+    table: &str,
+) -> Result<Option<serde_json::Value>, String> {
+    let rewritten = rewrite(filter, session, names, schema, table, None)?;
+    Ok(match rewritten {
+        serde_json::Value::Object(map) if map.is_empty() => None,
+        serde_json::Value::Null => None,
+        value => Some(value),
+    })
+}
+
+/// The older spellings, and what they are now.
+fn connective(key: &str) -> Option<&'static str> {
+    match key {
+        "$and" | "_and" => Some("_and"),
+        "$or" | "_or" => Some("_or"),
+        "$not" | "_not" => Some("_not"),
+        _ => None,
+    }
+}
+
+/// Whether an operator takes a list, which decides how a session variable
+/// spells itself.
+fn takes_a_list(operator: &str) -> bool {
+    matches!(operator, "_in" | "_nin" | "_has_keys_any" | "_has_keys_all")
+}
+
+fn rewrite(
+    value: &serde_json::Value,
+    session: &std::collections::HashMap<String, String>,
+    names: &NameOverrides,
+    schema: &str,
+    table: &str,
+    // The operator this value is the operand of, where it is one. Only used to
+    // decide whether a session variable is one value or a list of them.
+    operator: Option<&str>,
+) -> Result<serde_json::Value, String> {
+    match value {
+        serde_json::Value::Object(map) => {
+            let mut out = serde_json::Map::with_capacity(map.len());
+            for (key, child) in map {
+                if let Some(spelling) = connective(key) {
+                    out.insert(
+                        spelling.to_string(),
+                        rewrite(child, session, names, schema, table, None)?,
+                    );
+                    continue;
+                }
+
+                if key.starts_with('_') {
+                    // An operator. Its operand may be a session variable, and
+                    // whether that is one value or several depends on which
+                    // operator it is.
+                    out.insert(
+                        key.clone(),
+                        rewrite(child, session, names, schema, table, Some(key))?,
+                    );
+                    continue;
+                }
+
+                // A column, or a relationship. A renamed column is exposed
+                // under the other name and the compiler below reads exposed
+                // names, so the rename is applied here. A relationship is not
+                // in the column map and so is left alone -- along with the
+                // columns inside it, which belong to a table this does not
+                // know the name of. A rename on the far side of a relationship
+                // inside a permission is the one spelling this does not
+                // follow.
+                let exposed = names
+                    .column(schema, table, key)
+                    .unwrap_or(key.as_str())
+                    .to_string();
+
+                let rewritten = rewrite(child, session, names, schema, table, None)?;
+                // Equality written without saying so: metadata omits the
+                // operator, a boolean expression never does.
+                let wrapped = match &rewritten {
+                    serde_json::Value::Object(_) => rewritten,
+                    scalar => serde_json::json!({ "_eq": scalar }),
+                };
+                out.insert(exposed, wrapped);
+            }
+            Ok(serde_json::Value::Object(out))
+        }
+
+        serde_json::Value::Array(items) => items
+            .iter()
+            .map(|item| rewrite(item, session, names, schema, table, operator))
+            .collect::<Result<Vec<_>, _>>()
+            .map(serde_json::Value::Array),
+
+        serde_json::Value::String(text) => match session_variable(text) {
+            Some(name) => resolve(name, session, operator.is_some_and(takes_a_list)),
+            None => Ok(value.clone()),
+        },
+
+        other => Ok(other.clone()),
+    }
+}
+
+/// The session variable a string names, if it names one.
+///
+/// Case does not matter: the corpus writes `X-HASURA-USER-ID` and
+/// `X-Hasura-User-Id` for the same variable, sometimes in adjacent lines of
+/// one file.
+fn session_variable(text: &str) -> Option<String> {
+    let lowered = text.to_ascii_lowercase();
+    let bare = lowered.strip_prefix("x-hasura-")?;
+    match bare.is_empty() {
+        true => None,
+        false => Some(bare.replace('-', "_")),
+    }
+}
+
+/// The value a session variable stands for.
+fn resolve(
+    name: String,
+    session: &std::collections::HashMap<String, String>,
+    as_a_list: bool,
+) -> Result<serde_json::Value, String> {
+    let Some(value) = session.get(&name) else {
+        // Hasura's wording, and Hasura's decision to refuse rather than to
+        // compare against nothing.
+        return Err(format!(
+            "missing session variable: \"x-hasura-{}\"",
+            name.replace('_', "-")
+        ));
+    };
+
+    if !as_a_list {
+        return Ok(serde_json::Value::String(value.clone()));
+    }
+
+    // A list arrives as a PostgreSQL array literal, because a header carries
+    // one string and that is the spelling both ends already agree on:
+    // `X-Hasura-Allowed-Ids: {1,2,3}`. Unbraced is read as a single-item list
+    // rather than refused, since a one-element list is the case a caller is
+    // most likely to write bare.
+    let inner = value
+        .strip_prefix('{')
+        .and_then(|rest| rest.strip_suffix('}'));
+    Ok(match inner {
+        None => serde_json::json!([value]),
+        Some("") => serde_json::json!([]),
+        Some(items) => serde_json::Value::Array(
+            items
+                .split(',')
+                .map(|item| serde_json::Value::String(item.trim().trim_matches('"').to_string()))
+                .collect(),
+        ),
+    })
+}
+
 /// Whether a role may ask for aggregates over a table.
 ///
 /// Separate from reading its rows because counting rows you cannot see is a
@@ -295,6 +586,152 @@ mod tests {
         .unwrap();
         let view = cache_for_role(&cache(vec![table("article", &["id"])]), &names, "writer");
         assert!(view.tables.is_empty());
+    }
+
+    fn session(pairs: &[(&str, &str)]) -> HashMap<String, String> {
+        pairs
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect()
+    }
+
+    fn compiled(filter: serde_json::Value, session: &HashMap<String, String>) -> serde_json::Value {
+        permission_where(
+            &filter,
+            session,
+            &NameOverrides::default(),
+            "public",
+            "article",
+        )
+        .unwrap()
+        .unwrap()
+    }
+
+    #[test]
+    fn equality_written_without_saying_so_becomes_an_operator() {
+        assert_eq!(
+            compiled(serde_json::json!({"is_published": true}), &session(&[])),
+            serde_json::json!({"is_published": {"_eq": true}})
+        );
+    }
+
+    #[test]
+    fn the_older_connectives_are_the_newer_ones() {
+        let filter = serde_json::json!({
+            "$or": [{"author_id": "X-HASURA-USER-ID"}, {"is_published": true}]
+        });
+        assert_eq!(
+            compiled(filter, &session(&[("user_id", "1")])),
+            serde_json::json!({"_or": [
+                {"author_id": {"_eq": "1"}},
+                {"is_published": {"_eq": true}}
+            ]})
+        );
+    }
+
+    #[test]
+    fn a_session_variable_is_read_however_it_is_spelled() {
+        // The corpus writes both, sometimes in one file.
+        let by_shouting = compiled(
+            serde_json::json!({"id": {"_eq": "X-HASURA-USER-ID"}}),
+            &session(&[("user_id", "7")]),
+        );
+        let by_title = compiled(
+            serde_json::json!({"id": {"_eq": "X-Hasura-User-Id"}}),
+            &session(&[("user_id", "7")]),
+        );
+        assert_eq!(by_shouting, by_title);
+        assert_eq!(by_shouting, serde_json::json!({"id": {"_eq": "7"}}));
+    }
+
+    #[test]
+    fn a_variable_the_caller_does_not_carry_is_refused() {
+        let error = permission_where(
+            &serde_json::json!({"id": "X-Hasura-User-Id"}),
+            &session(&[]),
+            &NameOverrides::default(),
+            "public",
+            "article",
+        )
+        .unwrap_err();
+        // Refused rather than compared against nothing: a filter that matches
+        // no rows for a reason the client cannot see is worse than a refusal.
+        assert!(error.contains("x-hasura-user-id"), "unhelpful: {}", error);
+    }
+
+    #[test]
+    fn a_list_operator_reads_its_variable_as_a_list() {
+        assert_eq!(
+            compiled(
+                serde_json::json!({"name": {"_in": "X-Hasura-Free-Artists"}}),
+                &session(&[("free_artists", "{Ann,Bob}")])
+            ),
+            serde_json::json!({"name": {"_in": ["Ann", "Bob"]}})
+        );
+        // An empty array literal is no items, not one empty item.
+        assert_eq!(
+            compiled(
+                serde_json::json!({"name": {"_in": "X-Hasura-Free-Artists"}}),
+                &session(&[("free_artists", "{}")])
+            ),
+            serde_json::json!({"name": {"_in": []}})
+        );
+        // And the same variable under an operator that takes one value stays
+        // one value.
+        assert_eq!(
+            compiled(
+                serde_json::json!({"name": {"_eq": "X-Hasura-Free-Artists"}}),
+                &session(&[("free_artists", "{Ann,Bob}")])
+            ),
+            serde_json::json!({"name": {"_eq": "{Ann,Bob}"}})
+        );
+    }
+
+    #[test]
+    fn a_predicate_over_a_relationship_survives_unchanged() {
+        // Nothing special to do: a relationship in a permission is the same
+        // shape a relationship in `where` is, and the compiler below already
+        // turns one into a correlated EXISTS.
+        assert_eq!(
+            compiled(
+                serde_json::json!({"articles": {"is_published": {"_eq": true}}}),
+                &session(&[])
+            ),
+            serde_json::json!({"articles": {"is_published": {"_eq": true}}})
+        );
+    }
+
+    #[test]
+    fn an_empty_filter_restricts_nothing() {
+        let none = permission_where(
+            &serde_json::json!({}),
+            &session(&[]),
+            &NameOverrides::default(),
+            "public",
+            "article",
+        )
+        .unwrap();
+        // A real answer, and not the same as having no permission at all --
+        // which is settled before this is reached.
+        assert!(none.is_none());
+    }
+
+    #[test]
+    fn a_renamed_column_is_named_the_way_the_schema_exposes_it() {
+        let names =
+            NameOverrides::parse(r#"{"public.article": {"columns": {"author_id": "writtenBy"}}}"#)
+                .unwrap();
+        let compiled = permission_where(
+            &serde_json::json!({"author_id": "X-Hasura-User-Id"}),
+            &session(&[("user_id", "1")]),
+            &names,
+            "public",
+            "article",
+        )
+        .unwrap()
+        .unwrap();
+        // The permission names the column; the compiler below reads the field.
+        assert_eq!(compiled, serde_json::json!({"writtenBy": {"_eq": "1"}}));
     }
 
     #[test]

@@ -2537,26 +2537,40 @@ async fn aggregate_value(
     };
 
     let mut where_sql = String::new();
-    if let Some(filter) = ctx.args.try_get("where").ok().map(|v| accessor_to_json(&v)) {
-        let guard = gql_ctx
-            .schema_cache
-            .get()
-            .await
-            .map_err(|e| async_graphql::Error::new(e.to_string()))?;
-        let cache = guard
-            .as_ref()
-            .ok_or_else(|| async_graphql::Error::new("schema cache is not loaded"))?;
-        let scope = WhereScope::table(
+    {
+        // Counting rows is reading them, so the permission applies here in the
+        // same breath as the request's own filter -- otherwise `count` would
+        // report a total the same role cannot list.
+        let requested = ctx.args.try_get("where").ok().map(|v| accessor_to_json(&v));
+        let permission = permission_predicate(
+            &gql_ctx.caller(),
+            spec.names.as_ref(),
             &spec.schema_name,
             &spec.table_name,
-            &spec.type_name,
-            spec.names.as_ref(),
-        )
-        .with_resolution(cache, spec.relationships.as_ref());
-        let (sql, values) = build_where_clause(Some(&filter), bound_values.len() + 1, &scope)?;
-        if !sql.is_empty() {
-            where_sql = format!(" {}", sql);
-            bound_values.extend(values);
+        )?;
+        if let Some(predicate) = and_predicates(requested, permission) {
+            let guard = gql_ctx
+                .schema_cache
+                .get()
+                .await
+                .map_err(|e| async_graphql::Error::new(e.to_string()))?;
+            let cache = guard
+                .as_ref()
+                .ok_or_else(|| async_graphql::Error::new("schema cache is not loaded"))?;
+            let scope = WhereScope::table(
+                &spec.schema_name,
+                &spec.table_name,
+                &spec.type_name,
+                spec.names.as_ref(),
+            )
+            .with_resolution(cache, spec.relationships.as_ref())
+            .for_caller(gql_ctx.caller());
+            let (sql, values) =
+                build_where_clause(Some(&predicate), bound_values.len() + 1, &scope)?;
+            if !sql.is_empty() {
+                where_sql = format!(" {}", sql);
+                bound_values.extend(values);
+            }
         }
     }
 
@@ -2578,7 +2592,19 @@ async fn aggregate_value(
 
     let requested_limit = ctx.args.try_get("limit").ok().and_then(|v| v.i64().ok());
     let offset = ctx.args.try_get("offset").ok().and_then(|v| v.i64().ok());
-    let limit = match (requested_limit, spec.max_rows) {
+    let ceiling = match (
+        spec.max_rows,
+        permission_limit(
+            &gql_ctx.caller(),
+            spec.names.as_ref(),
+            &spec.schema_name,
+            &spec.table_name,
+        ),
+    ) {
+        (Some(configured), Some(granted)) => Some(configured.min(granted)),
+        (only, None) | (None, only) => only,
+    };
+    let limit = match (requested_limit, ceiling) {
         (Some(requested), Some(ceiling)) => Some(requested.min(ceiling)),
         (Some(requested), None) => Some(requested),
         (None, ceiling) => ceiling,
@@ -2739,6 +2765,7 @@ async fn aggregate_value(
                 None => Vec::new(),
             };
             let embeds = build_embed_expressions(
+                &gql_ctx.caller(),
                 cache,
                 spec.relationships.as_ref(),
                 &spec.type_name,
@@ -2839,7 +2866,22 @@ async fn query_rows(
     let limit: Option<i64> = if is_by_pk {
         Some(1)
     } else {
-        match (requested_limit, max_rows) {
+        // The permission's ceiling is one more of the same kind, so it folds
+        // in the same way: whichever of the three is smallest wins, and a
+        // request naming none takes the lowest that was named.
+        let ceiling = match (
+            max_rows,
+            permission_limit(
+                &gql_ctx.caller(),
+                spec.names.as_ref(),
+                schema_name,
+                table_name,
+            ),
+        ) {
+            (Some(configured), Some(granted)) => Some(configured.min(granted)),
+            (only, None) | (None, only) => only,
+        };
+        match (requested_limit, ceiling) {
             (Some(requested), Some(ceiling)) => Some(requested.min(ceiling)),
             (Some(requested), None) => Some(requested),
             (None, ceiling) => ceiling,
@@ -2911,36 +2953,66 @@ async fn query_rows(
             bound_values.push(accessor_to_json(&value));
         }
         where_sql = format!(" WHERE {}", conditions.join(" AND "));
-    } else if let Some(filter) = ctx.args.try_get("where").ok().map(|v| accessor_to_json(&v)) {
-        let guard = gql_ctx
-            .schema_cache
-            .get()
-            .await
-            .map_err(|e| async_graphql::Error::new(e.to_string()))?;
-        let cache = guard
-            .as_ref()
-            .ok_or_else(|| async_graphql::Error::new("schema cache is not loaded"))?;
-        let scope = match &spec.call {
-            None => WhereScope::table(schema_name, table_name, type_name, spec.names.as_ref())
-                .under_alias(READ_ROW)
-                .with_resolution(cache, relationships),
-            // A function's rows are the table's rows, so they are renamed the
-            // same way; only how they are reached differs.
-            Some(_) => WhereScope::for_alias(
-                schema_name,
-                table_name,
-                table_name,
-                type_name,
-                cache,
-                relationships,
-                spec.names.as_ref(),
-            ),
+    }
+
+    // What this role may read, beside what the request asked for. Applied to
+    // both shapes and to neither: a query naming no `where` at all is still a
+    // read, and a by-key query that skipped the permission would be the one
+    // way to fetch a row the filter withholds.
+    {
+        let requested = match is_by_pk {
+            true => None,
+            false => ctx.args.try_get("where").ok().map(|v| accessor_to_json(&v)),
         };
-        let (filter_sql, filter_values) =
-            build_where_clause(Some(&filter), bound_values.len() + 1, &scope)?;
-        if !filter_sql.is_empty() {
-            where_sql = format!(" {}", filter_sql);
-            bound_values.extend(filter_values);
+        let permission = permission_predicate(
+            &gql_ctx.caller(),
+            spec.names.as_ref(),
+            schema_name,
+            table_name,
+        )?;
+
+        if let Some(predicate) = and_predicates(requested, permission) {
+            let guard = gql_ctx
+                .schema_cache
+                .get()
+                .await
+                .map_err(|e| async_graphql::Error::new(e.to_string()))?;
+            let cache = guard
+                .as_ref()
+                .ok_or_else(|| async_graphql::Error::new("schema cache is not loaded"))?;
+            let scope = match &spec.call {
+                None => WhereScope::table(schema_name, table_name, type_name, spec.names.as_ref())
+                    .under_alias(READ_ROW)
+                    .with_resolution(cache, relationships)
+                    .for_caller(gql_ctx.caller()),
+                // A function's rows are the table's rows, so they are renamed
+                // the same way; only how they are reached differs.
+                Some(_) => WhereScope::for_alias(
+                    schema_name,
+                    table_name,
+                    table_name,
+                    type_name,
+                    cache,
+                    relationships,
+                    spec.names.as_ref(),
+                )
+                .for_caller(gql_ctx.caller()),
+            };
+            let (filter_sql, filter_values) =
+                build_where_clause(Some(&predicate), bound_values.len() + 1, &scope)?;
+            if !filter_sql.is_empty() {
+                // A by-key query already has a `WHERE`, so this joins it
+                // rather than replacing it.
+                where_sql = match where_sql.is_empty() {
+                    true => format!(" {}", filter_sql),
+                    false => format!(
+                        "{} AND ({})",
+                        where_sql,
+                        filter_sql.trim_start_matches("WHERE ")
+                    ),
+                };
+                bound_values.extend(filter_values);
+            }
         }
     }
 
@@ -3057,6 +3129,7 @@ async fn query_rows(
                 // out.
                 let mut param_idx = bound_values.len() + 1;
                 build_embed_expressions(
+                    &gql_ctx.caller(),
                     cache,
                     relationships,
                     type_name,
@@ -4285,6 +4358,7 @@ async fn reread_returning(
     let mut values: Vec<serde_json::Value> = Vec::new();
     let mut alias_counter = 0usize;
     let embeds = build_embed_expressions(
+        &gql_ctx.caller(),
         cache,
         relationships,
         type_name,
@@ -4714,6 +4788,7 @@ async fn execute_delete(
         let mut param_idx = values.len() + 1;
         let mut alias_counter = 0usize;
         let embeds = build_embed_expressions(
+            &gql_ctx.caller(),
             cache,
             relationships,
             type_name,
@@ -4794,6 +4869,56 @@ async fn execute_delete(
     Ok(deleted)
 }
 
+/// The predicate a role's permission adds to every read of one table.
+///
+/// `None` where nothing restricts the read: no permission document, an
+/// administrator, or a permission whose filter is `{}`. The value is a
+/// `<table>_bool_exp` like any other, because [`crate::role::permission_where`]
+/// rewrites it into one -- which is what lets the same compiler serve both and
+/// keeps a permission able to say everything a `where` can.
+fn permission_predicate(
+    caller: &crate::role::Caller<'_>,
+    names: &crate::names::NameOverrides,
+    schema: &str,
+    table: &str,
+) -> Result<Option<serde_json::Value>, async_graphql::Error> {
+    crate::role::read_predicate(caller, names, schema, table)
+        .map_err(|fault| coded_error(fault.code(), fault.to_string()))
+}
+
+/// How many rows a permission lets one read return.
+///
+/// A ceiling rather than a default: a request asking for more gets this, one
+/// asking for fewer gets what it asked for, and one asking for nothing gets
+/// the ceiling. The same rule `PGRST_MAX_ROWS` follows, folded with it.
+fn permission_limit(
+    caller: &crate::role::Caller<'_>,
+    names: &crate::names::NameOverrides,
+    schema: &str,
+    table: &str,
+) -> Option<i64> {
+    crate::role::read_limit(caller, names, schema, table)
+}
+
+/// Both predicates, as one.
+///
+/// Written as an `_and` rather than as two clauses so that everything
+/// downstream -- parameter numbering, relationship resolution, the `EXISTS`
+/// that a relationship predicate becomes -- happens once, in one place, for
+/// both halves.
+fn and_predicates(
+    request: Option<serde_json::Value>,
+    permission: Option<serde_json::Value>,
+) -> Option<serde_json::Value> {
+    match (request, permission) {
+        (None, None) => None,
+        (Some(only), None) | (None, Some(only)) => Some(only),
+        (Some(request), Some(permission)) => {
+            Some(serde_json::json!({ "_and": [request, permission] }))
+        }
+    }
+}
+
 /// Build a WHERE clause from a boolean expression.
 ///
 /// The expression is the JSON form of a `<table>_bool_exp`: column names
@@ -4855,6 +4980,13 @@ pub struct WhereScope<'a> {
     /// written against a field can be written as SQL against a column.
     names: &'a crate::names::NameOverrides,
     resolution: Option<WhereResolution<'a>>,
+    /// Who is asking, so that a predicate following a relationship narrows the
+    /// far side to what that caller may read.
+    ///
+    /// Unrestricted unless a scope is told otherwise, which is what leaves
+    /// every path that has no caller to hand -- the mutation ones -- behaving
+    /// as it did.
+    caller: Option<crate::role::Caller<'a>>,
 }
 
 /// What a scope needs to follow a relationship.
@@ -4882,6 +5014,7 @@ impl<'a> WhereScope<'a> {
             type_name: type_name.to_string(),
             names,
             resolution: None,
+            caller: None,
         }
     }
 
@@ -4932,6 +5065,7 @@ impl<'a> WhereScope<'a> {
                 cache,
                 relationships,
             }),
+            caller: None,
         }
     }
 
@@ -4958,7 +5092,17 @@ impl<'a> WhereScope<'a> {
                 cache: r.cache,
                 relationships: r.relationships,
             }),
+            // Carried across the relationship: the caller does not change on
+            // the way into an EXISTS, and the far side has its own permission
+            // to be narrowed by.
+            caller: from.caller,
         }
+    }
+
+    /// Narrow what this scope's predicates may reach to one caller.
+    pub fn for_caller(mut self, caller: crate::role::Caller<'a>) -> Self {
+        self.caller = Some(caller);
+        self
     }
 
     /// What a field name refers to, as SQL: a column of this table, or the
@@ -5226,6 +5370,27 @@ fn exists_sql(
     )?;
     if let Some(sql) = child_condition {
         correlation.push(format!("({})", sql));
+    }
+
+    // The far side's own permission. `where: {author: {name: {_eq: "Ann"}}}`
+    // asks whether a related row exists, and a row this caller may not read is
+    // one it may not learn the existence of either -- so the child's filter
+    // narrows the EXISTS exactly as it narrows a read of the same table.
+    if let Some(caller) = &child_scope.caller {
+        let permission = crate::role::read_predicate(
+            caller,
+            child_scope.names,
+            &plan.foreign_schema,
+            &plan.foreign_table,
+        )
+        .map_err(|fault| coded_error(fault.code(), fault.to_string()))?;
+        if let Some(predicate) = permission {
+            if let Some(sql) =
+                build_condition(&predicate, &child_scope, param_idx, values, alias_counter)?
+            {
+                correlation.push(format!("({})", sql));
+            }
+        }
     }
     if correlation.is_empty() {
         correlation.push("true".to_string());
@@ -6514,6 +6679,7 @@ fn count_expression(
 /// queries -- `count(*)` and `json_agg(...)` read the same rows.
 #[allow(clippy::too_many_arguments)] // the recursion carries its whole context
 fn nested_aggregate_select(
+    caller: &crate::role::Caller<'_>,
     selection: async_graphql::SelectionField<'_>,
     child_alias: &str,
     schema_cache: &SchemaCache,
@@ -6611,6 +6777,7 @@ fn nested_aggregate_select(
             // correlated subselect rather than a column of this one.
             "nodes" => {
                 let embeds = build_embed_expressions(
+                    caller,
                     schema_cache,
                     relationships,
                     target_type,
@@ -6950,9 +7117,16 @@ fn embed_narrowing(
     param_idx: &mut usize,
     values: &mut Vec<serde_json::Value>,
     names: &crate::names::NameOverrides,
+    caller: &crate::role::Caller<'_>,
 ) -> Result<Narrowing, async_graphql::Error> {
-    let child_where = match arguments.get("where") {
-        Some(expression) if !expression.is_null() => {
+    // The child's own permission, which is the whole reason an embed is a
+    // place this has to be applied: `author { articles { ... } }` reads two
+    // tables, and the rule on the second is not the rule on the first.
+    let permission =
+        permission_predicate(caller, names, &plan.foreign_schema, &plan.foreign_table)?;
+    let requested = arguments.get("where").filter(|v| !v.is_null()).cloned();
+    let child_where = match and_predicates(requested, permission) {
+        Some(expression) => {
             let child_scope = WhereScope::for_alias(
                 &plan.foreign_schema,
                 &plan.foreign_table,
@@ -6961,17 +7135,18 @@ fn embed_narrowing(
                 schema_cache,
                 relationships,
                 names,
-            );
+            )
+            .for_caller(*caller);
             let mut nested_alias = 0usize;
             build_condition(
-                expression,
+                &expression,
                 &child_scope,
                 param_idx,
                 values,
                 &mut nested_alias,
             )?
         }
-        _ => None,
+        None => None,
     };
 
     let child_order = match arguments.get("order_by") {
@@ -6988,13 +7163,21 @@ fn embed_narrowing(
 
     // A limit written on the embed is what the client asked for; the
     // configured ceiling still applies as an upper bound, the same way it
-    // does at the top level.
+    // does at the top level -- and so does the child's own permission, which
+    // bounds rows per parent here rather than per query.
+    let ceiling = match (
+        max_rows,
+        crate::role::read_limit(caller, names, &plan.foreign_schema, &plan.foreign_table),
+    ) {
+        (Some(configured), Some(granted)) => Some(configured.min(granted)),
+        (only, None) | (None, only) => only,
+    };
     let child_limit = match arguments.get("limit").and_then(|v| v.as_i64()) {
-        Some(requested) => match max_rows {
+        Some(requested) => match ceiling {
             Some(ceiling) => Some(requested.min(ceiling)),
             None => Some(requested),
         },
-        None => max_rows,
+        None => ceiling,
     };
     let child_offset = arguments
         .get("offset")
@@ -7049,6 +7232,7 @@ fn embed_narrowing(
 
 #[allow(clippy::too_many_arguments)] // one parameter per SQL clause, plus the binding state
 fn build_embed_expressions(
+    caller: &crate::role::Caller<'_>,
     schema_cache: &SchemaCache,
     relationships: &HashMap<String, Vec<RelationshipField>>,
     type_name: &str,
@@ -7097,6 +7281,7 @@ fn build_embed_expressions(
                     param_idx,
                     values,
                     names,
+                    caller,
                 )?;
 
             let child_table =
@@ -7105,6 +7290,7 @@ fn build_embed_expressions(
                     &plan.foreign_table,
                 ));
             let select = nested_aggregate_select(
+                caller,
                 field,
                 &child_alias,
                 schema_cache,
@@ -7156,6 +7342,7 @@ fn build_embed_expressions(
         let child_alias = format!("e{}", alias_counter);
 
         let nested = build_embed_expressions(
+            caller,
             schema_cache,
             relationships,
             &rel.target_type,
@@ -7182,6 +7369,7 @@ fn build_embed_expressions(
                 param_idx,
                 values,
                 names,
+                caller,
             )?;
 
         // Leaf fields are columns; anything that resolved to a relationship is
