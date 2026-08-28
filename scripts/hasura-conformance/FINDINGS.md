@@ -8,23 +8,27 @@ harness itself, divergences kept on purpose, and the gaps still open.
 
 | | status | same outcome | same data | full body |
 |---|---|---|---|---|
-| all (468) | 99.6% | 93.4% | **88.5%** | 62.2% |
-| reads (271) | 100.0% | 93.4% | 86.0% | 66.4% |
-| writes (197) | 99.0% | 93.4% | **91.9%** | 56.3% |
+| all (468) | 100.0% | 94.4% | **89.5%** | 63.5% |
+| reads (271) | 100.0% | 93.7% | 86.3% | 66.8% |
+| writes (197) | 100.0% | 95.4% | **93.9%** | 58.9% |
 
-Of the 414 cases the third column counts, **286 agree about data and 128 agree
+Of the 419 cases the third column counts, **290 agree about data and 129 agree
 only because both servers answered with errors.** A further 2 are cases where
 Hasura refused and this server answered -- down from 115 before the permission
 layer existed.
 
-**286 is the figure that tracks the work.** It counts the cases where the same
+The status column reaching 100% is not a rounding: it was a rule read out of
+the corpus wrongly and is described below.
+
+**290 is the figure that tracks the work.** It counts the cases where the same
 query came back with the same rows, which is the only thing a client can feel.
 
 Over the permission work, measured at each step: 321/464 (69.2%, 214 real)
 before the harness was fixed -> 365/468 (78.0%, 260) once the reference was
 actually authenticated and this server could read a session variable ->
 402/468 (85.9%, 278) with the permission layer whole -> 403/468 (86.1%, 274)
--> 413/468 (88.2%, 285) -> 414/468 (**88.5%, 286**).
+-> 413/468 (88.2%, 285) -> 414/468 (88.5%, 286) -> 419/468 (**89.5%, 290**)
+once a role could write what it cannot read.
 
 The dip in the fourth of those is worth keeping. Three roles lost their entire
 API to one input type that was named and never registered, and the run-to-run
@@ -32,8 +36,8 @@ comparison is the only thing that showed it: the headline moved by one case
 while eleven real agreements turned into refusals underneath it. That fault is
 described below.
 
-Writes are the stronger half now, at 91.9% against 85.6% for reads. They were
-the weaker half three runs earlier.
+Writes are the stronger half now, at 93.9% against 86.3% for reads. They were
+the weaker half four runs earlier.
 
 **These numbers are not comparable with the ones this file carried before the
 admin-secret fix, and the reason is in the instrument.** Every run up to 37 had
@@ -48,23 +52,27 @@ measuring the instrument. The guard against it recurring is below.
 The corpus is 468 cases rather than 464 because a batched request -- a body
 that is a JSON array of operations -- is a case the extractor now reads.
 
-Where the remaining 54 divergences are:
+Where the remaining 49 divergences are:
 
 | | count |
 |---|---|
-| Hasura answered, this server refused | 30 |
+| Hasura answered, this server refused | 24 |
 | both answered with data, and the data differs | 23 |
-| status differs | 2 |
+| Hasura refused, this server answered | 2 |
+| status differs | 0 |
 
 Each is named in the open list rather than attributed to one missing
 subsystem.
 
-The last run moved exactly one group and moved nothing else in either
-direction, which is what a run should look like when a single fix lands: the
-introspection rule described below went from refusing what the reference
-answers to answering it. The case it left behind is not about introspection
-being disabled at all -- it is the async-graphql schema shape, further down the
-list.
+The last run moved five cases and moved nothing back, but it took three
+attempts to get there, and the two discarded ones are the record worth
+keeping. The first attempt read +3 on the headline and hid seven regressions
+underneath: four in a group with no permissions at all, which is the signature
+of a change that was supposed to touch only roles. The second fixed three of
+the four and left the fourth, because the fix was applied to the branch that
+runs for a role and the fault was in the branch that runs for everyone. Both
+were found by the per-case comparison against the previous run, not by the
+percentages, which moved the right way each time.
 
 ## Faults in the harness, found by their symptoms
 
@@ -151,6 +159,50 @@ wrong one.
   Found by the run-to-run comparison rather than by any single number: the
   headline moved by one case while eleven real agreements became refusals.
 
+- **A status rule read out of the corpus's own expectations, and read
+  wrongly.** Hasura answers 400 for a write refused by a permission's `check`
+  -- three cases in the corpus say so, and this server copied them. It answers
+  200 for the same refusal five other times, with an identical body and an
+  identical code, and the difference is not in the error at all: the three that
+  answer 400 were sent to `/v1alpha1/graphql` and the five that answer 200 to
+  `/v1/graphql`. Every non-200 in the whole corpus is on the legacy endpoint.
+
+  Reading a declared status as a fact about the error rather than about the
+  address cost three cases, all of them otherwise agreeing. The status column
+  is 100% with the endpoint passed in, and the lesson is the one the
+  admin-secret fault taught: a corpus expectation describes a request, and half
+  of a request is where it was sent.
+
+- **A type named twice over, registered for every table that could be
+  written.** The set of tables needing a `<t>_mutation_response` was collected
+  from the mutation fields' return types without trimming the suffix, so it
+  held both `article` and `article_mutation_response` -- and built a
+  `article_mutation_response_mutation_response` beside the real one. It was
+  harmless only because `insert_one` and `update_by_pk` return the bare type
+  and kept the right name in the set. The moment a table had bulk writes and
+  neither of those -- which is exactly what a role that cannot read it has --
+  the wrong name was registered and the right one was missing, and the schema
+  would not build. One junk type per mutable table had been in every
+  introspection answer until then.
+
+- **An upsert ignored the update permission.** `ON CONFLICT DO UPDATE`
+  overwrites a row that is already there, which is an update, and the update
+  permission's row filter was not part of it: a role could reach a row it may
+  not update by inserting over it. Two corpus cases show the shape from the
+  outside -- one expects `affected_rows: 0` because the filter excludes the
+  row, the other expects `missing session variable` because compiling the
+  filter is where a session variable the caller does not carry is noticed. Both
+  were passing by mutual refusal while the roles in question had no schema at
+  all, which is how a hole stays quiet.
+
+- **An enum with no members, reached through an argument.** A role whose update
+  permission grants no columns leaves `<t>_update_column` empty, which is not a
+  legal enum -- and dropping it drops `<t>_on_conflict` with it, which an
+  insert still names. Hasura's answer is a member that names no column,
+  `_PLACEHOLDER`, refused with `erroneous column name` where it is used. The
+  corpus tests both halves in one file, which is how the shape was found rather
+  than guessed.
+
 - **A column and a relationship sharing a name killed the process.**
   `create table pizza (crust text references crust)` is an ordinary way to
   write a foreign key. async-graphql panics on a duplicate field rather than
@@ -171,16 +223,6 @@ wrong one.
   carried a value through all three.
 
 ## Kept on purpose
-
-- **A permission is narrowed, never widened.** Hasura's rules and this
-  server's are the same rules now -- read from the same metadata, compiled into
-  the same queries -- with one asymmetry kept on purpose. Reading is what makes
-  a table exist here, so a role that Hasura lets insert into a table it cannot
-  read loses the insert rather than gaining a readable column, and the same for
-  a column. Six permissions in the corpus write a table they cannot read and 27
-  write a column they cannot read; every one of them fails closed. Reproducing
-  Hasura needs two column sets per table where a schema cache has one, and
-  until that exists the direction to be wrong in is the one that withholds.
 
 - **An unsecured server trusts no header.** Hasura with no admin secret
   configured treats every caller as an administrator, which also lets any
@@ -217,17 +259,7 @@ wrong one.
 
 ## Open, ordered by consequence
 
-1. **A role that may write a table it cannot read.** Six permissions in the
-   corpus, and the largest single item left. Hasura exposes `insert_x` to a
-   role with an insert permission and no select permission; here reading is
-   what makes a table exist, so such a role gets no schema for it and no
-   mutation. Closing it means two column sets per table -- one for the type,
-   one for the input -- where a schema cache has one, and a mutation response
-   that carries `affected_rows` without a `returning` to hang rows on. The
-   direction it is wrong in is the one that withholds, which is why it is an
-   open item rather than a fault.
-
-2. **`_exists`.** A predicate only a permission can write:
+1. **`_exists`.** A predicate only a permission can write:
    `{"_exists": {"_table": {...}, "_where": {...}}}` asks whether a row exists
    in *another* table, unrelated to this one by any foreign key. Two cases in
    `graphql_mutation/delete/permissions`. The machinery is there -- it is the
@@ -235,15 +267,31 @@ wrong one.
    correlation is written by hand in the `_where` rather than derived from a
    key, which is a different shape to read.
 
-3. **A preset that produces an invalid UTF-8 sequence.** `resident_user` in the
-   insert permissions group answers `invalid byte sequence for encoding
-   "UTF8"`, which is this server binding a preset value as something it is not.
-   One case, and a real fault rather than a gap.
+2. **A preset is the only thing a write assigns.** `update_resident` with no
+   `_set` at all, under a permission whose `set` names `city`, is an update
+   whose whole assignment comes from the permission; here it matches no rows.
+   The same gap on the other side of an upsert: `ON CONFLICT DO UPDATE` does
+   not apply the update permission's preset, so `blog_on_conflict_update_preset`
+   comes back with `updated_by` null where Hasura wrote 2. Presets are applied
+   on insert and nowhere else. Three cases.
 
-4. **An upsert that reports a check failure where Hasura reports it wrote
-   nothing.** `resident_5_modifies_resident_6_upsert` expects `affected_rows:
-   0` from an `ON CONFLICT` that changes nothing; here the check runs on a row
-   the statement did not write. One case, and the same shape of fault.
+3. **A permission's `limit` is not the aggregate's.** Hasura applies a select
+   permission's row ceiling to the rows it returns and not to the numbers it
+   reports: a role limited to one row of `article` still counts three of them,
+   and still gets `max(id)` over all three. Here the ceiling is applied once,
+   to the query, so both halves shrink together. Three cases, and the fix is a
+   distinction rather than a subsystem -- `nodes` takes the limit and
+   `aggregate` does not.
+
+4. **A table a role may count and not read.** A select permission naming no
+   columns at all, with `allow_aggregations`, is Hasura's way of granting
+   "how many" without granting "which": `article_aggregate { aggregate {
+   count } }` answers, `count(columns: ...)` is not offered, and the functions
+   that read column data are absent. Here such a table is dropped, because a
+   type with no fields is not a legal one and this one has no writes to keep it
+   alive either. Closing it means an aggregate type with no `nodes`, which is
+   the same "no row type" shape the write-only tables now have and the same
+   place to hang it. One case.
 
 5. **The path in an error is `$` where Hasura writes the selection.** Hasura
    answers `$.selectionSet.insert_computer.args.objects` for a refused write;
@@ -358,6 +406,36 @@ wrong one.
   `graphql_query/permissions` 0/34 -> 26/34, `graphql_mutation/insert/
   permissions` 0/39 -> 33/39, `graphql_mutation/delete/permissions` 0/9 -> 7/9,
   and the run-wide figure 260 -> 285 real agreements.
+
+- **Reading and writing are two column sets, not one.** The last piece of the
+  permission work, and the one the schema cache had no room for: Hasura grants
+  them separately, so a role may set a column it may not see -- ten permissions
+  in the corpus do -- and may write a table it cannot read at all, which eight
+  more do. Both used to fail closed, which is what this file recorded as the
+  largest item left.
+
+  The union goes in the cache and the split is made once, where the object
+  type's fields are built. `fields` is what may be read and `writable_fields`
+  is what may be written; everything a read is made of -- the type, its
+  boolean expression, its ordering, its column enum, its aggregates -- comes
+  from the first and narrows with it, and the write inputs come from the second
+  and are narrowed again by the permission naming them. That keeps the property
+  the whole permission layer rests on: one place to be right, rather than a
+  question asked at every place a name is emitted.
+
+  A table with no readable field is the limit of it, and has no GraphQL type at
+  all -- a type with no fields is not a legal one. The query roots, `insert_one`,
+  the `_by_pk` writes, `returning`, a relationship pointing at it and a function
+  returning it all go with the type; what is left is the bulk write, answering
+  with `affected_rows`. `insert_account`, `insert_leads` and `insert_author`
+  are that shape, and so is a select permission that grants only a computed
+  field.
+
+  Four faults came out with it, three older than the change, all described
+  above: a mutation response type named twice over, a status rule that belonged
+  to the endpoint, an upsert that ignored the update permission, and an enum
+  with no members reached through an argument. 286 -> 290 real agreements, and
+  the status column to 100%.
 
 
 - **Relationship predicates** now resolve as a correlated `EXISTS`, in both
