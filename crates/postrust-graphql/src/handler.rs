@@ -4309,17 +4309,51 @@ fn insert_row<'life>(
                         postrust_sql::escape_ident(constraint)
                     )
                 } else {
-                    let assignments: Vec<String> = updates
-                        .iter()
-                        .map(|field| {
-                            let column = table_column_for(context.names, table, field);
-                            format!(
-                                "{} = EXCLUDED.{}",
-                                postrust_sql::escape_ident(column),
-                                postrust_sql::escape_ident(column)
+                    // An `ON CONFLICT DO UPDATE` is an update, so the update
+                    // permission's presets are written here too -- and a
+                    // column a preset writes does not also take its value from
+                    // `EXCLUDED`, which is what "a preset overrides the
+                    // request" means on this side.
+                    let preset = crate::role::presets(
+                        &context.caller,
+                        context.names,
+                        schema_name,
+                        table_name,
+                        crate::role::Verb::Update,
+                    )
+                    .map_err(|fault| coded_error(fault.code(), fault.to_string()))?;
+
+                    // Numbered after the row's own values and before the
+                    // predicate below, because `SET` is written before `WHERE`
+                    // and the parameters are bound in the order they appear.
+                    let mut param_idx = column_names.len() + 1;
+                    let mut assignments: Vec<String> =
+                        Vec::with_capacity(preset.len() + updates.len());
+                    for (column, value) in &preset {
+                        assignments.push(format!(
+                            "{} = {}",
+                            postrust_sql::escape_ident(column),
+                            write_expression(
+                                &column_types,
+                                column,
+                                value,
+                                &format!("${}", param_idx)
                             )
-                        })
-                        .collect();
+                        ));
+                        conflict_values.push(write_operand(&column_types, column, value));
+                        param_idx += 1;
+                    }
+                    for field in &updates {
+                        let column = table_column_for(context.names, table, field);
+                        if preset.iter().any(|(written, _)| written == column) {
+                            continue;
+                        }
+                        assignments.push(format!(
+                            "{} = EXCLUDED.{}",
+                            postrust_sql::escape_ident(column),
+                            postrust_sql::escape_ident(column)
+                        ));
+                    }
                     // `where` on an upsert decides whether the row that is
                     // already there is overwritten -- "only if what I am
                     // writing is newer". It reads the existing row, which is
@@ -4356,7 +4390,6 @@ fn insert_row<'life>(
                             )
                             .under_alias(WRITTEN_ROW)
                             .with_resolution(context.cache, context.relationships);
-                            let mut param_idx = column_names.len() + 1;
                             let mut alias_counter = 0usize;
                             build_condition(
                                 filter,
@@ -4851,6 +4884,40 @@ async fn execute_update(
     let mut param_idx = 1;
     let mut written: HashSet<String> = HashSet::new();
 
+    // What the permission writes whatever the request said. A preset overrides
+    // rather than collides -- one a client could override is not a preset --
+    // so these go in first and the operators below step around the columns
+    // they name.
+    //
+    // This is also what makes an update with no `_set` at all a real update:
+    // `update_resident(where: {...})` under a permission whose `set` names
+    // `city` changes `city`, and answers with the rows it changed rather than
+    // with nothing.
+    let preset = crate::role::presets(
+        &gql_ctx.caller(),
+        names,
+        schema_name,
+        table_name,
+        crate::role::Verb::Update,
+    )
+    .map_err(|fault| coded_error(fault.code(), fault.to_string()))?;
+    let preset_columns: HashSet<&str> = preset.iter().map(|(name, _)| name.as_str()).collect();
+    for (column, value) in &preset {
+        let placeholder = write_expression(
+            &column_types,
+            column,
+            value,
+            &format!("${}", param_idx),
+        );
+        set_parts.push(format!(
+            "{} = {}",
+            postrust_sql::escape_ident(column),
+            placeholder
+        ));
+        set_values.push(write_operand(&column_types, column, value));
+        param_idx += 1;
+    }
+
     for (operator, payload) in &operators {
         let serde_json::Value::Object(map) = payload else {
             return Err(async_graphql::Error::new(format!(
@@ -4863,6 +4930,11 @@ async fn execute_update(
                 .column_source(schema_name, table_name, field)
                 .unwrap_or(field)
                 .to_string();
+            // A preset has this column. Not the duplicate-write error below:
+            // the request is allowed to name it, and the permission wins.
+            if preset_columns.contains(column.as_str()) {
+                continue;
+            }
             if !written.insert(column.clone()) {
                 return Err(async_graphql::Error::new(format!(
                     "\"{}\" is written twice in one update; a column may be \
