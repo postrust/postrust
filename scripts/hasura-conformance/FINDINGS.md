@@ -8,11 +8,11 @@ harness itself, divergences kept on purpose, and the gaps still open.
 
 | | status | same outcome | same data | full body |
 |---|---|---|---|---|
-| all (468) | 100.0% | 94.4% | **89.5%** | 63.5% |
-| reads (271) | 100.0% | 93.7% | 86.3% | 66.8% |
-| writes (197) | 100.0% | 95.4% | **93.9%** | 58.9% |
+| all (468) | 100.0% | 95.9% | **91.0%** | 65.0% |
+| reads (271) | 100.0% | 94.5% | 87.1% | 67.5% |
+| writes (197) | 100.0% | 98.0% | **96.4%** | 61.4% |
 
-Of the 419 cases the third column counts, **290 agree about data and 129 agree
+Of the 426 cases the third column counts, **297 agree about data and 129 agree
 only because both servers answered with errors.** A further 2 are cases where
 Hasura refused and this server answered -- down from 115 before the permission
 layer existed.
@@ -20,15 +20,16 @@ layer existed.
 The status column reaching 100% is not a rounding: it was a rule read out of
 the corpus wrongly and is described below.
 
-**290 is the figure that tracks the work.** It counts the cases where the same
+**297 is the figure that tracks the work.** It counts the cases where the same
 query came back with the same rows, which is the only thing a client can feel.
 
 Over the permission work, measured at each step: 321/464 (69.2%, 214 real)
 before the harness was fixed -> 365/468 (78.0%, 260) once the reference was
 actually authenticated and this server could read a session variable ->
 402/468 (85.9%, 278) with the permission layer whole -> 403/468 (86.1%, 274)
--> 413/468 (88.2%, 285) -> 414/468 (88.5%, 286) -> 419/468 (**89.5%, 290**)
-once a role could write what it cannot read.
+-> 413/468 (88.2%, 285) -> 414/468 (88.5%, 286) -> 419/468 (89.5%, 290)
+once a role could write what it cannot read -> 426/468 (**91.0%, 297**) with
+`_exists`.
 
 The dip in the fourth of those is worth keeping. Three roles lost their entire
 API to one input type that was named and never registered, and the run-to-run
@@ -36,8 +37,8 @@ comparison is the only thing that showed it: the headline moved by one case
 while eleven real agreements turned into refusals underneath it. That fault is
 described below.
 
-Writes are the stronger half now, at 93.9% against 86.3% for reads. They were
-the weaker half four runs earlier.
+Writes are the stronger half now, at 96.4% against 87.1% for reads. They were
+the weaker half five runs earlier. Four of the 197 write cases are left.
 
 **These numbers are not comparable with the ones this file carried before the
 admin-secret fix, and the reason is in the instrument.** Every run up to 37 had
@@ -52,11 +53,11 @@ measuring the instrument. The guard against it recurring is below.
 The corpus is 468 cases rather than 464 because a batched request -- a body
 that is a JSON array of operations -- is a case the extractor now reads.
 
-Where the remaining 49 divergences are:
+Where the remaining 42 divergences are:
 
 | | count |
 |---|---|
-| Hasura answered, this server refused | 24 |
+| Hasura answered, this server refused | 17 |
 | both answered with data, and the data differs | 23 |
 | Hasura refused, this server answered | 2 |
 | status differs | 0 |
@@ -64,15 +65,15 @@ Where the remaining 49 divergences are:
 Each is named in the open list rather than attributed to one missing
 subsystem.
 
-The last run moved five cases and moved nothing back, but it took three
-attempts to get there, and the two discarded ones are the record worth
-keeping. The first attempt read +3 on the headline and hid seven regressions
-underneath: four in a group with no permissions at all, which is the signature
-of a change that was supposed to touch only roles. The second fixed three of
-the four and left the fourth, because the fix was applied to the branch that
-runs for a role and the fault was in the branch that runs for everyone. Both
-were found by the per-case comparison against the previous run, not by the
-percentages, which moved the right way each time.
+The last two runs moved twelve cases between them and moved nothing back. The
+first of the two took three attempts to get there, and the two discarded ones
+are the record worth keeping: the first read +3 on the headline and hid seven
+regressions underneath, four of them in a group with no permissions at all --
+the signature of a change that was supposed to touch only roles. The second
+fixed three of the four and left the fourth, because the fix went to the
+branch that runs for a role and the fault was in the branch that runs for
+everyone. Both were found by the per-case comparison against the previous run,
+not by the percentages, which moved the right way each time.
 
 ## Faults in the harness, found by their symptoms
 
@@ -259,15 +260,7 @@ wrong one.
 
 ## Open, ordered by consequence
 
-1. **`_exists`.** A predicate only a permission can write:
-   `{"_exists": {"_table": {...}, "_where": {...}}}` asks whether a row exists
-   in *another* table, unrelated to this one by any foreign key. Two cases in
-   `graphql_mutation/delete/permissions`. The machinery is there -- it is the
-   correlated subselect a relationship predicate already builds -- but the
-   correlation is written by hand in the `_where` rather than derived from a
-   key, which is a different shape to read.
-
-2. **A preset is the only thing a write assigns.** `update_resident` with no
+1. **A preset is the only thing a write assigns.** `update_resident` with no
    `_set` at all, under a permission whose `set` names `city`, is an update
    whose whole assignment comes from the permission; here it matches no rows.
    The same gap on the other side of an upsert: `ON CONFLICT DO UPDATE` does
@@ -275,7 +268,7 @@ wrong one.
    comes back with `updated_by` null where Hasura wrote 2. Presets are applied
    on insert and nowhere else. Three cases.
 
-3. **A permission's `limit` is not the aggregate's.** Hasura applies a select
+2. **A permission's `limit` is not the aggregate's.** Hasura applies a select
    permission's row ceiling to the rows it returns and not to the numbers it
    reports: a role limited to one row of `article` still counts three of them,
    and still gets `max(id)` over all three. Here the ceiling is applied once,
@@ -283,7 +276,7 @@ wrong one.
    distinction rather than a subsystem -- `nodes` takes the limit and
    `aggregate` does not.
 
-4. **A table a role may count and not read.** A select permission naming no
+3. **A table a role may count and not read.** A select permission naming no
    columns at all, with `allow_aggregations`, is Hasura's way of granting
    "how many" without granting "which": `article_aggregate { aggregate {
    count } }` answers, `count(columns: ...)` is not offered, and the functions
@@ -293,33 +286,33 @@ wrong one.
    the same "no row type" shape the write-only tables now have and the same
    place to hang it. One case.
 
-5. **The path in an error is `$` where Hasura writes the selection.** Hasura
+4. **The path in an error is `$` where Hasura writes the selection.** Hasura
    answers `$.selectionSet.insert_computer.args.objects` for a refused write;
    this answers `$`, because the refusal is raised where the rows come back
    rather than where the argument was read. Costs nothing at the data level and
    is why those cases do not reach full-body agreement.
 
-6. **`_stream` subscriptions.** The cursor-based half of Hasura's subscription
+5. **`_stream` subscriptions.** The cursor-based half of Hasura's subscription
    surface: `article_stream(cursor: {initial_value: {id: 0}}, batch_size: 10)`
    sends rows *after* a cursor rather than the whole answer, which is what a
    client tailing an append-only table wants. The live queries beside it are
    done; this is a second shape with its own cursor types, and nothing in the
    corpus exercises it -- it shows up in introspection only.
 
-7. **What is left of the enum tables.** They work: a marked table's rows are a
+6. **What is left of the enum tables.** They work: a marked table's rows are a
    generated enum, referencing columns are typed as it, and no relationship
    points at one. What remains is the metadata API around them —
    `v1/set_table_is_enum` is four cases of turning the flag on and off through
    `/v1/query`, which is the contract this server does not offer.
 
-8. **A manual relationship** -- one Hasura maps column by column rather than by
+7. **A manual relationship** -- one Hasura maps column by column rather than by
    a foreign key -- has no constraint to key a name by, so
    `PGRST_GRAPHQL_NAMES` cannot carry its name and the converter says so rather
    than guessing. In the corpus it is also a *second* name for a foreign key
    that already has one, which reflection can only produce once. Two cases, one
    of them the only remaining insert this server refuses and Hasura performs.
 
-9. **Which relationships exist is metadata's to say.** Hasura exposes the
+8. **Which relationships exist is metadata's to say.** Hasura exposes the
    relationships its metadata declares; this server exposes one per foreign
    key. Where a fixture tracks a table without naming all of its keys, the
    extra fields are here and not there. No query breaks on a field it does not
@@ -328,7 +321,7 @@ wrong one.
    would mean letting the names document say which relationships exist, not
    just what they are called, which is a different kind of directive.
 
-10. **A function taking a table's row, tracked as a root field.** Hasura lets a
+9. **A function taking a table's row, tracked as a root field.** Hasura lets a
    client write `fetch_articles(args: {search: "Art", author_row: "(1, 'Roger',
    'Chris')"})` -- the row as a literal. Here such a function is a computed
    field and nothing else, on the grounds that a row type is not something a
@@ -336,12 +329,12 @@ wrong one.
    table's composite type as a scalar under the table's own name, which is a
    name the object type already has. One case, and the position is deliberate.
 
-11. **A function returning one row, as a mutation.** `add_to_score_by_user_id`
+10. **A function returning one row, as a mutation.** `add_to_score_by_user_id`
    returns `"user"` rather than `SETOF "user"`; Hasura exposes it as a root
    field yielding one row. Here only a set-returning function becomes a root
    field.
 
-12. **Every generated description is this server's wording, not Hasura's.**
+11. **Every generated description is this server's wording, not Hasura's.**
     `article_bool_exp` is described here as "Filter rows of article. Fields are
     combined with AND unless _or says otherwise." and there as "Boolean
     expression to filter rows from the table \"article\"...". Nothing breaks
@@ -351,19 +344,19 @@ wrong one.
     arguments come back in: Hasura sorts them, this server lists them as
     declared.
 
-13. **Introspection shape, inside async-graphql.** It publishes five directives
+12. **Introspection shape, inside async-graphql.** It publishes five directives
     where Hasura publishes three, registers `ID` and `__DirectiveLocation`
     where Hasura has neither, and answers `__TypeKind`'s members in
     specification order rather than alphabetically. Six cases, and none of them
     is reachable without forking the library.
 
-14. **An enum value beginning with `null`, `true` or `false`.** The parser
+13. **An enum value beginning with `null`, `true` or `false`.** The parser
     mis-lexes `nullPrefixTestTable_pkey` as the literal `null` followed by
     something it cannot read, so an upsert naming that constraint is answered
     with a parse error. This is async-graphql's lexer, not this server. One
     case.
 
-15. **Actions and Apollo federation** are subsystems rather than gaps:
+14. **Actions and Apollo federation** are subsystems rather than gaps:
     `actions/*` describes handlers Hasura calls out to over HTTP, and
     `apollo_federation` describes the `_service`/`_entities` surface a
     federated gateway composes. Five cases between them.
@@ -437,6 +430,30 @@ wrong one.
   with no members reached through an argument. 286 -> 290 real agreements, and
   the status column to 100%.
 
+
+- **`_exists`, the predicate only a permission can write.**
+  `{"_exists": {"_table": "user", "_where": {"id": "X-Hasura-User-Id",
+  "is_admin": true}}}` asks whether a row exists in *another* table -- one no
+  foreign key relates to this one. It is how Hasura writes "the caller is an
+  administrator" without asking the caller to say so: the row that decides it
+  lives in a table of its own, and whether an account is readable does not
+  depend on which account it is.
+
+  So the subselect is uncorrelated, which is the whole difference from the
+  `EXISTS` a relationship predicate builds -- if there were key columns to join
+  on, the permission would have been written as a relationship. Two things it
+  deliberately does not do. The caller's own permissions are not applied inside
+  it: the point is to consult a table the role has no access to, and in the
+  corpus the role reading `account` through this predicate may not read
+  `public.user` at all, so narrowing the subselect would make the predicate
+  refuse itself. And `_table` is copied through the permission rewrite
+  untouched, because it is a name and not a value -- rewriting it would read a
+  table called `x-hasura-anything` as a session variable and wrap it in an
+  `_eq` besides.
+
+  Seven cases across all four verbs and a read, and the last of the write-only
+  tables came good with it: `insert_account` had a schema after the previous
+  change and a predicate it could not compile until this one.
 
 - **Relationship predicates** now resolve as a correlated `EXISTS`, in both
   directions, with each nesting level aliased so a relationship followed twice
