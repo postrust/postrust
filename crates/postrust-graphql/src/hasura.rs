@@ -842,7 +842,15 @@ fn variable_errors(
             OperationType::Mutation => registry.mutation_type.as_deref(),
             OperationType::Subscription => registry.subscription_type.as_deref(),
         };
-        let Some(root) = root else { continue };
+        let Some(root) = root else {
+            // A mutation sent to a schema that has no mutation root. Hasura
+            // answers this rather than "the field you named is not there",
+            // because there is no type for it to have not been in.
+            if operation.node.ty == OperationType::Mutation {
+                errors.push(coded("no mutations exist".to_string(), operation.pos, "$"));
+            }
+            continue;
+        };
 
         // What each variable was declared as, and what a null in it means.
         let mut declared: HashMap<&str, String> = HashMap::new();
@@ -930,16 +938,44 @@ impl Usage<'_> {
         for selection in &set.items {
             match &selection.node {
                 Selection::Field(field) => {
-                    let meta = self
-                        .registry
-                        .types
-                        .get(type_name)
-                        .and_then(|ty| ty.field_by_name(field.node.name.node.as_str()));
+                    let named = field.node.name.node.as_str();
+                    let parent = self.registry.types.get(type_name);
+                    let meta = parent.and_then(|ty| ty.field_by_name(named));
                     let here = format!("{}.selectionSet.{}", path, field.node.name.node);
+                    // A field the type does not have. async-graphql reports
+                    // this too, and in its own words -- `Unknown field "x" on
+                    // type "y". Did you mean ...` -- so saying it here is what
+                    // makes the answer Hasura's: this walk runs first and a
+                    // document with an error in it never reaches validation.
+                    //
+                    // Only where the parent type is one this registry knows.
+                    // Not knowing it is not evidence that the field is absent.
+                    if meta.is_none() && parent.is_some() && !named.starts_with("__") {
+                        self.errors.push(coded(
+                            format!("field '{}' not found in type: '{}'", named, type_name),
+                            field.pos,
+                            &here,
+                        ));
+                        continue;
+                    }
                     for (name, value) in &field.node.arguments {
                         let Some(argument) =
                             meta.and_then(|meta| meta.args.get(name.node.as_str()))
                         else {
+                            // An argument the field does not take. Reported
+                            // against the field rather than against the
+                            // argument -- there is no such argument to point
+                            // at, which is the complaint.
+                            if meta.is_some() {
+                                self.errors.push(coded(
+                                    format!(
+                                        "'{}' has no argument named '{}'",
+                                        named, name.node
+                                    ),
+                                    name.pos,
+                                    &here,
+                                ));
+                            }
                             continue;
                         };
                         // A location with a default of its own accepts a
@@ -1046,8 +1082,18 @@ impl Usage<'_> {
                         pos,
                         path,
                     ));
+                    return;
+                }
+                // A variable of the right type may still carry a value the
+                // type does not have: `$color: colors_enum` given
+                // `"not_a_real_color"` is declared correctly and is still not
+                // one of the colours.
+                if let Some(given) = self.variables.get(&async_graphql::Name::new(name)) {
+                    let given: async_graphql_value::Value = given.clone().into();
+                    self.enumerated(&given, expected, pos, path);
                 }
             }
+            Value::Enum(_) | Value::String(_) => self.enumerated(value, expected, pos, path),
             Value::List(items) => {
                 // A list may be written where one value is expected, in which
                 // case each item is checked against that same type -- which is
@@ -1084,10 +1130,19 @@ impl Usage<'_> {
                     _ => path.to_string(),
                 };
                 for (key, item) in fields {
+                    let at = format!("{}.{}", base, key.as_str());
                     let Some(field) = input_fields.get(key.as_str()) else {
+                        // A key the input object does not have, in the same
+                        // words a missing selection field gets: Hasura writes
+                        // `field 'action' not found in type:
+                        // 'article_on_conflict'` for both.
+                        self.errors.push(coded(
+                            format!("field '{}' not found in type: '{}'", key.as_str(), name),
+                            pos,
+                            &at,
+                        ));
                         continue;
                     };
-                    let at = format!("{}.{}", base, key.as_str());
                     if comparison && self.stands_for_null(item) {
                         self.errors.push(coded(
                             format!(
@@ -1105,6 +1160,54 @@ impl Usage<'_> {
             }
             _ => {}
         }
+    }
+}
+
+impl Usage<'_> {
+    /// A value written where an enum is expected, against that enum's members.
+    ///
+    /// async-graphql reports this too, in its own words and against the
+    /// argument rather than against the place inside it. Hasura lists what it
+    /// would have accepted, which is the half a client can act on.
+    fn enumerated(
+        &mut self,
+        value: &async_graphql_value::Value,
+        expected: &str,
+        pos: async_graphql::Pos,
+        path: &str,
+    ) {
+        use async_graphql::registry::{MetaType, MetaTypeName};
+        use async_graphql_value::Value;
+
+        let name = MetaTypeName::concrete_typename(expected);
+        let Some(MetaType::Enum { enum_values, .. }) = self.registry.types.get(name) else {
+            return;
+        };
+        let written = match value {
+            Value::Enum(written) => written.as_str(),
+            Value::String(written) => written.as_str(),
+            _ => return,
+        };
+        if enum_values.contains_key(written) {
+            return;
+        }
+        // Alphabetical, which is the order Hasura lists them in and not
+        // necessarily the order they were declared.
+        let mut allowed: Vec<&str> = enum_values.keys().map(String::as_str).collect();
+        allowed.sort_unstable();
+        let listed = allowed
+            .iter()
+            .map(|value| format!("'{}'", value))
+            .collect::<Vec<_>>()
+            .join(", ");
+        self.errors.push(coded(
+            format!(
+                "expected one of the values [{}] for type '{}', but found '{}'",
+                listed, name, written
+            ),
+            pos,
+            path,
+        ));
     }
 }
 

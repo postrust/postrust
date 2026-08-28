@@ -1408,6 +1408,36 @@ fn validation_error(message: impl Into<String>) -> async_graphql::Error {
     coded_error("validation-failed", message)
 }
 
+/// A database error, classified the way Hasura classifies it.
+///
+/// PostgreSQL's own message is the whole of what either server says about
+/// what went wrong; what Hasura adds is a word for *which kind* of wrong,
+/// taken from the SQLSTATE rather than from the text: `Uniqueness violation.
+/// duplicate key value violates unique constraint "author_name_key"`. A client
+/// reporting that to a user is reporting text it already ships.
+///
+/// Read from the code, never from the message. The message is localised, the
+/// code is not, and every attempt to tell these apart by reading English is
+/// wrong the first time a server runs in another language.
+fn database_error(error: sqlx::Error) -> async_graphql::Error {
+    let sqlx::Error::Database(db) = &error else {
+        return async_graphql::Error::new(error.to_string());
+    };
+    let described = match db.code().as_deref() {
+        // Class 23, integrity constraint violation: the four PostgreSQL
+        // raises and Hasura names.
+        Some("23505") => "Uniqueness violation. ",
+        Some("23502") => "Not-NULL violation. ",
+        Some("23503") => "Foreign key violation. ",
+        Some("23514") => "Check constraint violation. ",
+        // Everything else is answered with PostgreSQL's own words and no
+        // heading. Inventing one for a class Hasura says nothing about would
+        // be a difference rather than a match.
+        _ => "",
+    };
+    async_graphql::Error::new(format!("{}{}", described, db.message()))
+}
+
 /// The same error, told where in the request it happened.
 ///
 /// Hasura names the place a write went wrong inside the *arguments* --
@@ -3898,7 +3928,7 @@ async fn execute_query_on(
     for param in params {
         query = bind_json_value(query, param);
     }
-    let rows = query.fetch_all(&mut *conn).await?;
+    let rows = query.fetch_all(&mut *conn).await.map_err(database_error)?;
 
     // Return raw JSON values - don't convert to async_graphql::Value
     // This allows field resolvers to use try_downcast_ref::<serde_json::Value>()
@@ -4634,7 +4664,12 @@ fn insert_row<'life>(
             for value in &check_values {
                 query = bind_json_value(query, value);
             }
-            query.fetch_optional(&mut *conn).await?
+            query
+                .fetch_optional(&mut *conn)
+                .await
+                // A constraint the write violated is reported against the rows
+                // the statement was given, which is where Hasura reports it.
+                .map_err(|error| at_path(database_error(error), &context.objects))?
         } else {
             let placeholders: Vec<String> = names
                 .iter()
@@ -4675,7 +4710,12 @@ fn insert_row<'life>(
             for value in &check_values {
                 query = bind_json_value(query, value);
             }
-            query.fetch_optional(&mut *conn).await?
+            query
+                .fetch_optional(&mut *conn)
+                .await
+                // A constraint the write violated is reported against the rows
+                // the statement was given, which is where Hasura reports it.
+                .map_err(|error| at_path(database_error(error), &context.objects))?
         };
 
         // `DO NOTHING` writes nothing and returns nothing, which is the answer
@@ -5269,7 +5309,7 @@ async fn execute_update(
 
     let mut guard = write_tx(gql_ctx, pool).await?;
     let conn = guard.as_mut().expect("write_tx opens one");
-    let rows = query.fetch_all(&mut **conn).await?;
+    let rows = query.fetch_all(&mut **conn).await.map_err(database_error)?;
 
     refuse_unchecked_rows(&rows, !check_sql.is_empty())?;
 
@@ -5487,7 +5527,7 @@ async fn execute_delete(
 
     let mut guard = write_tx(gql_ctx, pool).await?;
     let conn = guard.as_mut().expect("write_tx opens one");
-    let rows = query.fetch_all(&mut **conn).await?;
+    let rows = query.fetch_all(&mut **conn).await.map_err(database_error)?;
 
     let deleted: Vec<Value> = rows
         .iter()
@@ -8287,7 +8327,11 @@ fn embed_relationships<'f>(
                     .children_grouped_sql(ctx.max_rows, &child_columns)
                     .map_err(|e| async_graphql::Error::new(e.to_string()))?;
 
-                let fetched = sqlx::query(&sql).bind(&keys).fetch_all(&mut *conn).await?;
+                let fetched = sqlx::query(&sql)
+                    .bind(&keys)
+                    .fetch_all(&mut *conn)
+                    .await
+                    .map_err(database_error)?;
 
                 // The query returns the join key and a JSON array of that key's
                 // children, grouped by PostgreSQL rather than row by row here.
