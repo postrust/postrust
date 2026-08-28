@@ -36,7 +36,7 @@
 
 use async_graphql::{Response, ServerError};
 use serde_json::{json, Map, Value};
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 
 /// Hasura's `extensions.code` for a server error.
 ///
@@ -914,7 +914,8 @@ fn variable_errors(
             declared: &declared,
             variables,
             errors: &mut errors,
-            seen: HashSet::new(),
+            spreading: Vec::new(),
+            expansions: 0,
         };
         scope.selection_set(&operation.node.selection_set.node, root, "$");
     }
@@ -936,7 +937,17 @@ struct Usage<'a> {
     errors: &'a mut Vec<ServerError>,
     /// Fragments already walked, so a cycle terminates. async-graphql refuses
     /// cyclic fragments too, but this runs first.
-    seen: HashSet<String>,
+    /// The fragments currently being spread, outermost first.
+    ///
+    /// A stack rather than a set, because what a cycle is named after is the
+    /// run of fragments from the first occurrence to the repeat -- and because
+    /// a fragment spread twice in sibling positions is not a cycle and its
+    /// contents should be checked at both.
+    spreading: Vec<String>,
+    /// How many spreads have been expanded. A document whose fragments each
+    /// spread the next twice doubles the work per level without ever
+    /// repeating a name, so the stack alone does not bound this.
+    expansions: usize,
 }
 
 impl Usage<'_> {
@@ -1030,12 +1041,41 @@ impl Usage<'_> {
                 Selection::FragmentSpread(spread) => {
                     let name = spread.node.fragment_name.node.to_string();
                     self.directives(&spread.node.directives, path);
-                    if !self.seen.insert(name.clone()) {
+                    // A fragment that spreads its way back to itself. Nothing
+                    // can be checked inside it -- there is no inside, the
+                    // document does not describe a finite selection -- so this
+                    // is reported and the walk stops here. async-graphql finds
+                    // it too, as a recursion depth, which says that something
+                    // went too deep rather than what it was.
+                    if let Some(began) = self.spreading.iter().position(|held| held == &name) {
+                        let cycle: Vec<&str> =
+                            self.spreading[began..].iter().map(String::as_str).collect();
+                        self.errors.push(coded(
+                            format!(
+                                "the fragment definition(s) {} form a cycle",
+                                listed(&cycle)
+                            ),
+                            spread.pos,
+                            // The selection set the offending spread is in,
+                            // rather than the spread itself: by then the
+                            // spread has no selection set of its own to name.
+                            &format!("{}.selectionSet", path),
+                        ));
+                        continue;
+                    }
+                    self.expansions += 1;
+                    if self.expansions > SPREAD_BUDGET {
                         continue;
                     }
                     if let Some(fragment) = self.fragments.get(&async_graphql::Name::new(&name)) {
                         let on = fragment.node.type_condition.node.on.node.to_string();
-                        self.selection_set(&fragment.node.selection_set.node, &on, path);
+                        // A spread is a step in Hasura's path, named after the
+                        // fragment: `...selectionSet.author.selectionSet.
+                        // authorFragment.selectionSet.articles`.
+                        let here = format!("{}.selectionSet.{}", path, name);
+                        self.spreading.push(name);
+                        self.selection_set(&fragment.node.selection_set.node, &on, &here);
+                        self.spreading.pop();
                     }
                 }
             }
@@ -1407,6 +1447,25 @@ impl Usage<'_> {
     }
 }
 
+/// How many fragment spreads one document may expand before the walk gives up.
+///
+/// Not a limit anyone should reach: it is here because fragments that spread
+/// other fragments twice each double the work per level without any name
+/// repeating, so the cycle check alone does not bound the walk. Reaching it
+/// stops the checking rather than refusing the document -- async-graphql
+/// validates it afterwards either way.
+const SPREAD_BUDGET: usize = 1000;
+
+/// Names in a sentence, the way Hasura writes them: `a`, `a and b`,
+/// `a, b and c`.
+fn listed(names: &[&str]) -> String {
+    match names {
+        [] => String::new(),
+        [one] => one.to_string(),
+        [rest @ .., last] => format!("{} and {}", rest.join(", "), last),
+    }
+}
+
 /// A number as Haskell's `show` renders a `Double`, which is how the value in
 /// Hasura's message is spelled.
 ///
@@ -1655,6 +1714,41 @@ mod variable_position_tests {
             ),
             vec!["$.selectionSet.insert_author.args.objects[1].name"]
         );
+    }
+
+    /// A fragment that spreads its way back to itself describes no finite
+    /// selection. async-graphql notices that something went too deep; Hasura
+    /// says which fragments went round.
+    #[test]
+    fn fragments_that_spread_each_other_are_named_as_a_cycle() {
+        let cycle = "query { author { ...a } } \
+                     fragment a on author { id ...b } \
+                     fragment b on author { id ...a }";
+        assert_eq!(
+            refusals(cycle, "{}"),
+            vec!["the fragment definition(s) a and b form a cycle"]
+        );
+        // The selection set the offending spread is in, with each spread a
+        // step of its own.
+        assert_eq!(
+            refusals_with_paths(cycle, "{}"),
+            vec!["$.selectionSet.author.selectionSet.a.selectionSet.b.selectionSet"]
+        );
+        // A fragment that spreads itself is a cycle of one.
+        assert_eq!(
+            refusals(
+                "query { author { ...a } } fragment a on author { id ...a }",
+                "{}"
+            ),
+            vec!["the fragment definition(s) a form a cycle"]
+        );
+        // The same fragment twice in sibling positions is not a cycle.
+        assert!(refusals(
+            "query { author { ...a } articles: author { ...a } } \
+             fragment a on author { id }",
+            "{}"
+        )
+        .is_empty());
     }
 
     /// GraphQL's `Int` is a signed 32-bit integer, and a number that is not
