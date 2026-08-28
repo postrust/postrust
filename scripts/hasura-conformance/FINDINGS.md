@@ -8,11 +8,11 @@ harness itself, divergences kept on purpose, and the gaps still open.
 
 | | status | same outcome | same data | full body |
 |---|---|---|---|---|
-| all (468) | 100.0% | 95.9% | **92.3%** | 66.2% |
-| reads (271) | 100.0% | 94.5% | 88.2% | 68.6% |
+| all (468) | 100.0% | 96.2% | **92.5%** | 66.5% |
+| reads (271) | 100.0% | 94.8% | 88.6% | 69.0% |
 | writes (197) | 100.0% | 98.0% | **98.0%** | 62.9% |
 
-Of the 432 cases the third column counts, **303 agree about data and 129 agree
+Of the 433 cases the third column counts, **304 agree about data and 129 agree
 only because both servers answered with errors.** A further 2 are cases where
 Hasura refused and this server answered -- down from 115 before the permission
 layer existed.
@@ -20,7 +20,7 @@ layer existed.
 The status column reaching 100% is not a rounding: it was a rule read out of
 the corpus wrongly and is described below.
 
-**303 is the figure that tracks the work.** It counts the cases where the same
+**304 is the figure that tracks the work.** It counts the cases where the same
 query came back with the same rows, which is the only thing a client can feel.
 
 Over the permission work, measured at each step: 321/464 (69.2%, 214 real)
@@ -30,7 +30,8 @@ actually authenticated and this server could read a session variable ->
 -> 413/468 (88.2%, 285) -> 414/468 (88.5%, 286) -> 419/468 (89.5%, 290)
 once a role could write what it cannot read -> 426/468 (91.0%, 297) with
 `_exists` -> 429/468 (91.7%, 300) once a preset reached an update ->
-432/468 (**92.3%, 303**) once a ceiling stopped answering `count`.
+432/468 (92.3%, 303) once a ceiling stopped answering `count` -> 433/468
+(**92.5%, 304**) with the last of the permission model.
 
 The dip in the fourth of those is worth keeping. Three roles lost their entire
 API to one input type that was named and never registered, and the run-to-run
@@ -55,11 +56,11 @@ measuring the instrument. The guard against it recurring is below.
 The corpus is 468 cases rather than 464 because a batched request -- a body
 that is a JSON array of operations -- is a case the extractor now reads.
 
-Where the remaining 36 divergences are:
+Where the remaining 35 divergences are:
 
 | | count |
 |---|---|
-| Hasura answered, this server refused | 17 |
+| Hasura answered, this server refused | 16 |
 | both answered with data, and the data differs | 17 |
 | Hasura refused, this server answered | 2 |
 | status differs | 0 |
@@ -67,8 +68,8 @@ Where the remaining 36 divergences are:
 Each is named in the open list rather than attributed to one missing
 subsystem.
 
-The last four runs moved eighteen cases between them and moved nothing back.
-The first of the four took three attempts to get there, and the two discarded
+The last five runs moved nineteen cases between them and moved nothing back.
+The first of the five took three attempts to get there, and the two discarded
 ones are the record worth keeping: the first read +3 on the headline and hid
 seven regressions underneath, four of them in a group with no permissions at
 all -- the signature of a change that was supposed to touch only roles. The
@@ -77,10 +78,13 @@ the branch that runs for a role and the fault was in the branch that runs for
 everyone. Both were found by the per-case comparison against the previous run,
 not by the percentages, which moved the right way each time.
 
-The permission model is finished as far as the corpus can measure it. One case
-of it is left in the open list -- a table granted only a count -- and
-everything else there is schema shape, library internals, or a metadata API
-this server does not offer.
+**The permission model is finished as far as this corpus can measure it.**
+Nothing left in the open list is a permission question: what remains is schema
+shape, library internals, and metadata APIs this server does not offer. Two of
+the permission cases that agree do so by both servers refusing, and they refuse
+for the same reason now rather than by accident -- `Unknown argument "columns"
+on field "count"` against Hasura's `'count' has no argument named 'columns'`.
+The wording and the error path are their own open items, below.
 
 ## Faults in the harness, found by their symptoms
 
@@ -267,43 +271,33 @@ wrong one.
 
 ## Open, ordered by consequence
 
-1. **A table a role may count and not read.** A select permission naming no
-   columns at all, with `allow_aggregations`, is Hasura's way of granting
-   "how many" without granting "which": `article_aggregate { aggregate {
-   count } }` answers, `count(columns: ...)` is not offered, and the functions
-   that read column data are absent. Here such a table is dropped, because a
-   type with no fields is not a legal one and this one has no writes to keep it
-   alive either. Closing it means an aggregate type with no `nodes`, which is
-   the same "no row type" shape the write-only tables now have and the same
-   place to hang it. One case.
-
-2. **The path in an error is `$` where Hasura writes the selection.** Hasura
+1. **The path in an error is `$` where Hasura writes the selection.** Hasura
    answers `$.selectionSet.insert_computer.args.objects` for a refused write;
    this answers `$`, because the refusal is raised where the rows come back
    rather than where the argument was read. Costs nothing at the data level and
    is why those cases do not reach full-body agreement.
 
-3. **`_stream` subscriptions.** The cursor-based half of Hasura's subscription
+2. **`_stream` subscriptions.** The cursor-based half of Hasura's subscription
    surface: `article_stream(cursor: {initial_value: {id: 0}}, batch_size: 10)`
    sends rows *after* a cursor rather than the whole answer, which is what a
    client tailing an append-only table wants. The live queries beside it are
    done; this is a second shape with its own cursor types, and nothing in the
    corpus exercises it -- it shows up in introspection only.
 
-4. **What is left of the enum tables.** They work: a marked table's rows are a
+3. **What is left of the enum tables.** They work: a marked table's rows are a
    generated enum, referencing columns are typed as it, and no relationship
    points at one. What remains is the metadata API around them —
    `v1/set_table_is_enum` is four cases of turning the flag on and off through
    `/v1/query`, which is the contract this server does not offer.
 
-5. **A manual relationship** -- one Hasura maps column by column rather than by
+4. **A manual relationship** -- one Hasura maps column by column rather than by
    a foreign key -- has no constraint to key a name by, so
    `PGRST_GRAPHQL_NAMES` cannot carry its name and the converter says so rather
    than guessing. In the corpus it is also a *second* name for a foreign key
    that already has one, which reflection can only produce once. Two cases, one
    of them the only remaining insert this server refuses and Hasura performs.
 
-6. **Which relationships exist is metadata's to say.** Hasura exposes the
+5. **Which relationships exist is metadata's to say.** Hasura exposes the
    relationships its metadata declares; this server exposes one per foreign
    key. Where a fixture tracks a table without naming all of its keys, the
    extra fields are here and not there. No query breaks on a field it does not
@@ -312,7 +306,7 @@ wrong one.
    would mean letting the names document say which relationships exist, not
    just what they are called, which is a different kind of directive.
 
-7. **A function taking a table's row, tracked as a root field.** Hasura lets a
+6. **A function taking a table's row, tracked as a root field.** Hasura lets a
    client write `fetch_articles(args: {search: "Art", author_row: "(1, 'Roger',
    'Chris')"})` -- the row as a literal. Here such a function is a computed
    field and nothing else, on the grounds that a row type is not something a
@@ -320,12 +314,12 @@ wrong one.
    table's composite type as a scalar under the table's own name, which is a
    name the object type already has. One case, and the position is deliberate.
 
-8. **A function returning one row, as a mutation.** `add_to_score_by_user_id`
+7. **A function returning one row, as a mutation.** `add_to_score_by_user_id`
    returns `"user"` rather than `SETOF "user"`; Hasura exposes it as a root
    field yielding one row. Here only a set-returning function becomes a root
    field.
 
-9. **Every generated description is this server's wording, not Hasura's.**
+8. **Every generated description is this server's wording, not Hasura's.**
     `article_bool_exp` is described here as "Filter rows of article. Fields are
     combined with AND unless _or says otherwise." and there as "Boolean
     expression to filter rows from the table \"article\"...". Nothing breaks
@@ -335,19 +329,19 @@ wrong one.
     arguments come back in: Hasura sorts them, this server lists them as
     declared.
 
-10. **Introspection shape, inside async-graphql.** It publishes five directives
+9. **Introspection shape, inside async-graphql.** It publishes five directives
     where Hasura publishes three, registers `ID` and `__DirectiveLocation`
     where Hasura has neither, and answers `__TypeKind`'s members in
     specification order rather than alphabetically. Six cases, and none of them
     is reachable without forking the library.
 
-11. **An enum value beginning with `null`, `true` or `false`.** The parser
+10. **An enum value beginning with `null`, `true` or `false`.** The parser
     mis-lexes `nullPrefixTestTable_pkey` as the literal `null` followed by
     something it cannot read, so an upsert naming that constraint is answered
     with a parse error. This is async-graphql's lexer, not this server. One
     case.
 
-12. **Actions and Apollo federation** are subsystems rather than gaps:
+11. **Actions and Apollo federation** are subsystems rather than gaps:
     `actions/*` describes handlers Hasura calls out to over HTTP, and
     `apollo_federation` describes the `_service`/`_entities` surface a
     federated gateway composes. Five cases between them.
@@ -421,6 +415,24 @@ wrong one.
   with no members reached through an argument. 286 -> 290 real agreements, and
   the status column to 100%.
 
+
+- **A role may be granted "how many" without being granted "which".** A select
+  permission naming no columns, with `allow_aggregations`, is how Hasura says
+  that: the count is over rows the role may not see, one at a time or at all.
+  Such a table used to be dropped here, because a type with no fields is not a
+  legal type and there was nothing else keeping it alive.
+
+  It is the same shape a table a role may only write already had -- present in
+  the cache, absent from the object types -- so it hangs in the same place. The
+  aggregate root is built and the list root is not; `nodes` is not a field of
+  `<t>_aggregate`, because there is nothing for it to be a list of; `count`
+  takes no `columns`, because there are none to name; the functions that read
+  column data go with the columns; and the root's own `distinct_on` and
+  `order_by` go too, since they name a column enum that is not built and could
+  not be.
+
+  The group agrees entirely now, and the two cases beside this one refuse for
+  the reason Hasura refuses rather than because the root was missing.
 
 - **A ceiling bounds the page and not the count.** The aggregate read the same
   rows `nodes` did, so a permission's `limit` became the answer to `count`: a
