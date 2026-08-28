@@ -8,9 +8,9 @@ harness itself, divergences kept on purpose, and the gaps still open.
 
 | | status | same outcome | same data | full body |
 |---|---|---|---|---|
-| all (468) | 100.0% | 96.2% | **92.5%** | 70.9% |
-| reads (271) | 100.0% | 94.8% | 88.6% | 69.4% |
-| writes (197) | 100.0% | 98.0% | **98.0%** | 73.1% |
+| all (468) | 100.0% | 96.2% | **92.5%** | 84.6% |
+| reads (271) | 100.0% | 94.8% | 88.6% | 81.5% |
+| writes (197) | 100.0% | 98.0% | **98.0%** | 88.8% |
 
 Of the 433 cases the third column counts, **304 agree about data and 129 agree
 only because both servers answered with errors.** A further 2 are cases where
@@ -68,12 +68,13 @@ Where the remaining 35 divergences are:
 Each is named in the open list rather than attributed to one missing
 subsystem.
 
-The fourth column moved last, and on its own: error paths. 21 cases agreed
-about everything except where the error said it happened, and none does now --
-311 bodies matched entirely, and 332 do. Nothing else moved, which is what a
-change to error paths should look like.
+The fourth column has moved twice since, and on its own both times: what an
+error says, and where it says it happened. 311 bodies matched entirely before
+those two runs and 396 do now, with the other three columns unchanged --
+which is what a change to error text should look like. 37 cases are left in
+the gap between the third column and the fourth, down from 101.
 
-The five runs before that moved nineteen cases between them and moved nothing
+The five runs before those moved nineteen cases between them and moved nothing
 back.
 The first of the five took three attempts to get there, and the two discarded
 ones are the record worth keeping: the first read +3 on the headline and hid
@@ -277,15 +278,16 @@ wrong one.
 
 ## Open, ordered by consequence
 
-1. **Every error's wording is this server's, not Hasura's.** All 101 cases
-   that agree about the data and not about the whole body now differ by the
-   message text alone: `Unknown field "delete_resident" on type
-   "mutation_root"` against `field 'delete_resident' not found in type:
-   'mutation_root'`, and 100 more of that kind. Most are async-graphql's own
-   validation messages, which is what makes this a bigger job than it reads
-   as -- the codes already match, and a client switching on
-   `extensions.code` cannot tell the difference. It is the whole of the gap
-   between the third column and the fourth.
+1. **What is left of the error text: 37 cases, and no two alike.** The
+   families are gone; what remains is one-offs. Hasura parses an integer
+   literal itself and says `The value 2.147483648e9 lies outside the bounds`
+   where PostgreSQL says `integer out of range`; it reads an `ltree` pattern
+   before sending it and this server lets PostgreSQL refuse it; it answers
+   `not a valid graphql query` for a parse failure where async-graphql prints
+   the offending line with a caret under it; it detects a fragment cycle by
+   name where async-graphql reports a recursion depth. Six more differ in how
+   many errors they answer with rather than in what any of them says. Each is
+   its own small piece of Hasura reimplemented, and none is a family.
 
 2. **`_stream` subscriptions.** The cursor-based half of Hasura's subscription
    surface: `article_stream(cursor: {initial_value: {id: 0}}, batch_size: 10)`
@@ -425,6 +427,33 @@ wrong one.
   with no members reached through an argument. 286 -> 290 real agreements, and
   the status column to 100%.
 
+
+- **An error says what Hasura says it says.** 101 cases agreed about the data
+  and not about the whole body, and every one of them differed by the message
+  text. 64 do not any more.
+
+  Most were async-graphql's own validation wording -- `Unknown field "x" on
+  type "y". Did you mean ...` against `field 'x' not found in type: 'y'`.
+  Rewriting the text on the way out was the obvious approach and the wrong
+  one: it matches a string this server does not own, and it leaves the path
+  wrong besides, since a validation error carries no path at all.
+
+  So the walk that already checks variables now finds what async-graphql would
+  have found, and says it first -- it runs before validation, and a document
+  with an error in it never reaches validation. It knows the registry and it
+  knows where it is, so the message and the path come out right together: a
+  field the type does not have, in a selection or inside an input object,
+  which is one message in Hasura and two in async-graphql; an argument the
+  field does not take, reported against the field; a value the enum does not
+  have, listing the members; and a mutation sent to a schema with no mutation
+  root, which Hasura answers `no mutations exist` because there is no type for
+  the field to have not been in.
+
+  The other half is the database. Hasura names the *kind* of violation before
+  PostgreSQL's own words -- `Uniqueness violation. duplicate key value
+  violates unique constraint "author_name_key"` -- and the kind is read from
+  the SQLSTATE, never from the message: the message is localised and the code
+  is not.
 
 - **An error says where in the request it happened.** Hasura answers
   `$.selectionSet.insert_author.args.objects[0].bio` for a write it refused;
