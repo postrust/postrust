@@ -8,23 +8,23 @@ harness itself, divergences kept on purpose, and the gaps still open.
 
 | | status | same outcome | same data | full body |
 |---|---|---|---|---|
-| all (468) | 99.6% | 92.9% | **88.2%** | 62.0% |
-| reads (271) | 100.0% | 92.6% | 85.6% | 66.1% |
+| all (468) | 99.6% | 93.4% | **88.5%** | 62.2% |
+| reads (271) | 100.0% | 93.4% | 86.0% | 66.4% |
 | writes (197) | 99.0% | 93.4% | **91.9%** | 56.3% |
 
-Of the 413 cases the third column counts, **285 agree about data and 128 agree
+Of the 414 cases the third column counts, **286 agree about data and 128 agree
 only because both servers answered with errors.** A further 2 are cases where
 Hasura refused and this server answered -- down from 115 before the permission
 layer existed.
 
-**285 is the figure that tracks the work.** It counts the cases where the same
+**286 is the figure that tracks the work.** It counts the cases where the same
 query came back with the same rows, which is the only thing a client can feel.
 
 Over the permission work, measured at each step: 321/464 (69.2%, 214 real)
 before the harness was fixed -> 365/468 (78.0%, 260) once the reference was
 actually authenticated and this server could read a session variable ->
 402/468 (85.9%, 278) with the permission layer whole -> 403/468 (86.1%, 274)
--> 413/468 (**88.2%, 285**).
+-> 413/468 (88.2%, 285) -> 414/468 (**88.5%, 286**).
 
 The dip in the fourth of those is worth keeping. Three roles lost their entire
 API to one input type that was named and never registered, and the run-to-run
@@ -48,16 +48,23 @@ measuring the instrument. The guard against it recurring is below.
 The corpus is 468 cases rather than 464 because a batched request -- a body
 that is a JSON array of operations -- is a case the extractor now reads.
 
-Where the remaining 56 divergences are:
+Where the remaining 54 divergences are:
 
 | | count |
 |---|---|
-| Hasura answered, this server refused | 32 |
-| both answered with data, and the data differs | 22 |
+| Hasura answered, this server refused | 30 |
+| both answered with data, and the data differs | 23 |
 | status differs | 2 |
 
 Each is named in the open list rather than attributed to one missing
 subsystem.
+
+The last run moved exactly one group and moved nothing else in either
+direction, which is what a run should look like when a single fix lands: the
+introspection rule described below went from refusing what the reference
+answers to answering it. The case it left behind is not about introspection
+being disabled at all -- it is the async-graphql schema shape, further down the
+list.
 
 ## Faults in the harness, found by their symptoms
 
@@ -197,7 +204,10 @@ wrong one.
   This server was built to the corpus's text first and measured against the
   reference second, which cost two cases and is the right way round to find it.
   It now matches what the reference does: reading the schema is an
-  administrator's to do, whatever role it then names.
+  administrator's to do, whatever role it then names. The group went 1/3 to
+  2/3 on the fix, and the case still outstanding is not about introspection
+  being disabled -- it lists the schema's types, and the two schemas differ in
+  shape for the reason further down this list.
 
 - **Relationship names are Hasura's to choose.** Every relationship in the
   corpus is named by a metadata command a human wrote; here they are derived
