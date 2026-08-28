@@ -8,9 +8,9 @@ harness itself, divergences kept on purpose, and the gaps still open.
 
 | | status | same outcome | same data | full body |
 |---|---|---|---|---|
-| all (468) | 100.0% | 96.2% | **92.5%** | 85.0% |
-| reads (271) | 100.0% | 94.8% | 88.6% | 82.3% |
-| writes (197) | 100.0% | 98.0% | **98.0%** | 88.8% |
+| all (468) | 100.0% | 96.2% | **92.5%** | 86.8% |
+| reads (271) | 100.0% | 94.8% | 88.6% | 84.9% |
+| writes (197) | 100.0% | 98.0% | **98.0%** | 89.3% |
 
 Of the 433 cases the third column counts, **304 agree about data and 129 agree
 only because both servers answered with errors.** A further 2 are cases where
@@ -68,10 +68,10 @@ Where the remaining 35 divergences are:
 Each is named in the open list rather than attributed to one missing
 subsystem.
 
-The fourth column has moved twice since, and on its own both times: what an
-error says, and where it says it happened. 311 bodies matched entirely before
-those two runs and 398 do now, with the other three columns unchanged --
-which is what a change to error text should look like. 35 cases are left in
+The fourth column has moved on its own for four runs since: what an error
+says, and where it says it happened. 311 bodies matched entirely before those
+runs and 406 do now, with the other three columns unchanged the whole way --
+which is what a change to error text should look like. 27 cases are left in
 the gap between the third column and the fourth, down from 101.
 
 The five runs before those moved nineteen cases between them and moved nothing
@@ -278,17 +278,17 @@ wrong one.
 
 ## Open, ordered by consequence
 
-1. **What is left of the error text: 35 cases, and almost no two alike.** The
-   families are gone; what remains is one-offs. Hasura parses an integer
-   literal itself and says `The value 2.147483648e9 lies outside the bounds`
-   where PostgreSQL says `integer out of range`; it answers `not a valid
-   graphql query` at `$.query` for a parse failure where async-graphql prints
-   the offending line with a caret under it, which is the largest thing left
-   at four cases; it detects a fragment cycle by name where async-graphql
-   reports a recursion depth; it validates `limit: -1` as `expected a
-   non-negative 32-bit integer` where this server lets `LIMIT must not be
-   negative` come back from PostgreSQL. Six more differ in how many errors
-   they answer with rather than in what any of them says.
+1. **What is left of the error text: 27 cases, and no two alike.** The
+   families are gone; what remains is one-offs, and the largest of them is
+   two. Hasura parses an integer literal itself and says `The value
+   2.147483648e9 lies outside the bounds` where PostgreSQL says `integer out
+   of range`; it validates `limit: -1` as `expected a non-negative 32-bit
+   integer for type 'Int'` where this server lets `LIMIT must not be negative`
+   come back from the database; it detects a fragment cycle by name where
+   async-graphql reports a recursion depth; it reads a raster's hex before
+   sending it. Six more differ in how many errors they answer with rather than
+   in what any of them says, and four are cases where Hasura has no mutation
+   root and this server does, so the two are refusing different things.
 
 2. **`_stream` subscriptions.** The cursor-based half of Hasura's subscription
    surface: `article_stream(cursor: {initial_value: {id: 0}}, batch_size: 10)`
@@ -428,6 +428,24 @@ wrong one.
   with no members reached through an argument. 286 -> 290 real agreements, and
   the status column to 100%.
 
+
+- **A document that does not parse is not a query.** async-graphql reports a
+  parse failure the way a compiler does -- the offending line, a caret under
+  the column, and what it expected instead. Hasura says the document is not a
+  query and names the document, at `$.query`. Nothing further can run either
+  way, so that is the whole of the answer. Five cases, three of them in the
+  `ltree` group and about the query text rather than about trees.
+
+  Two came out beside it. A quoted enum value is a mistake about the language
+  rather than about the members: `_eq: "red"` is `expected an enum value for
+  type 'colors_enum', but found a string` whatever it spells, and the member
+  list belongs to the unquoted form and to a variable, where a string is how
+  JSON carries an enum. And two codes now come from the SQLSTATE: class 22 is
+  `data-exception`, and 22025 -- a `LIKE` pattern ending mid-escape -- is
+  `bad-request`, because the pattern came from the request. Only the codes the
+  corpus pins are set; the rest is left to the classification that guesses
+  from the message and says so, since replacing that guess wholesale would be
+  the same guess with fewer places to notice it.
 
 - **An `ltree` path is read before it is sent.** PostgreSQL refuses
   `Tree.Collections.` with `ltree syntax error` and nothing else; Hasura reads
