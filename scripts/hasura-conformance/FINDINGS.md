@@ -8,9 +8,9 @@ harness itself, divergences kept on purpose, and the gaps still open.
 
 | | status | same outcome | same data | full body |
 |---|---|---|---|---|
-| all (468) | 100.0% | 96.2% | **92.5%** | 87.2% |
+| all (468) | 100.0% | 96.2% | **92.5%** | 87.4% |
 | reads (271) | 100.0% | 94.8% | 88.6% | 85.6% |
-| writes (197) | 100.0% | 98.0% | **98.0%** | 89.3% |
+| writes (197) | 100.0% | 98.0% | **98.0%** | 89.8% |
 
 Of the 433 cases the third column counts, **304 agree about data and 129 agree
 only because both servers answered with errors.** A further 2 are cases where
@@ -70,8 +70,8 @@ subsystem.
 
 The fourth column has moved on its own for four runs since: what an error
 says, and where it says it happened. 311 bodies matched entirely before those
-runs and 408 do now, with the other three columns unchanged the whole way --
-which is what a change to error text should look like. 25 cases are left in
+runs and 409 do now, with the other three columns unchanged the whole way --
+which is what a change to error text should look like. 24 cases are left in
 the gap between the third column and the fourth, down from 101.
 
 The five runs before those moved nineteen cases between them and moved nothing
@@ -278,17 +278,18 @@ wrong one.
 
 ## Open, ordered by consequence
 
-1. **What is left of the error text: 25 cases, and no two alike.** The
-   families are gone; what remains is one-offs. Hasura parses an integer
-   literal itself and says `The value 2.147483648e9 lies outside the bounds`
-   where PostgreSQL says `integer out of range`; it detects a fragment cycle
-   by name where async-graphql reports a recursion depth; it reads a raster's
-   hex before sending it; it refuses an insert naming a column the role cannot
-   write before the statement runs, where this server lets PostgreSQL answer
-   `cannot insert a non-DEFAULT value into column "id"`. Six more differ in
-   how many errors they answer with rather than in what any of them says, and
-   four are cases where Hasura has no mutation root and this server does, so
-   the two are refusing genuinely different things.
+1. **What is left of the error text: 24 cases, and no two alike.** The
+   families are gone; what remains is one-offs. Hasura detects a fragment
+   cycle by name where async-graphql reports a recursion depth; it reads a
+   raster's hex before sending it and this server lets PostGIS answer
+   `rt_raster_from_wkb: wkb size (14) < min size (61)`; it refuses an insert
+   naming a column the role cannot write before the statement runs, where this
+   server lets PostgreSQL answer `cannot insert a non-DEFAULT value into
+   column "id"`; it names a computed field's absence from a boolean expression
+   where this server calls the function and finds it missing. Six more differ
+   in how many errors they answer with rather than in what any of them says,
+   and four are cases where Hasura has no mutation root and this server does,
+   so the two are refusing genuinely different things.
 
 2. **`_stream` subscriptions.** The cursor-based half of Hasura's subscription
    surface: `article_stream(cursor: {initial_value: {id: 0}}, batch_size: 10)`
@@ -428,6 +429,21 @@ wrong one.
   with no members reached through an argument. 286 -> 290 real agreements, and
   the status column to 100%.
 
+
+- **A number that is not an `Int` is refused as one.** GraphQL's `Int` is a
+  signed 32-bit integer and `2147483648` is not one. PostgreSQL says `integer
+  out of range` when the statement runs; Hasura says so while reading the
+  request, and names the value at the column it was written under. An `int8`
+  column is a `bigint` scalar rather than an `Int`, so nothing that
+  legitimately holds a large number is caught by this.
+
+  Matching the message meant matching how Hasura spells the value:
+  `2147483648` comes back as `2.147483648e9`, which is Haskell's `show` for a
+  `Double` -- fixed notation while the magnitude is in `[0.1, 10^7)` and
+  scientific otherwise, always with a decimal point in the mantissa. Rust's
+  two float formats are the same two spellings and both give the shortest
+  digits that read back exactly, so choosing between them is the whole of what
+  the helper adds.
 
 - **A `limit` is a number of rows, not any integer.** It is typed `Int` in the
   schema either server publishes and is not any `Int`: a page of -1 rows is
