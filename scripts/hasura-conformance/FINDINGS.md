@@ -8,8 +8,8 @@ harness itself, divergences kept on purpose, and the gaps still open.
 
 | | status | same outcome | same data | full body |
 |---|---|---|---|---|
-| all (468) | 100.0% | 96.2% | **92.5%** | 84.6% |
-| reads (271) | 100.0% | 94.8% | 88.6% | 81.5% |
+| all (468) | 100.0% | 96.2% | **92.5%** | 85.0% |
+| reads (271) | 100.0% | 94.8% | 88.6% | 82.3% |
 | writes (197) | 100.0% | 98.0% | **98.0%** | 88.8% |
 
 Of the 433 cases the third column counts, **304 agree about data and 129 agree
@@ -70,8 +70,8 @@ subsystem.
 
 The fourth column has moved twice since, and on its own both times: what an
 error says, and where it says it happened. 311 bodies matched entirely before
-those two runs and 396 do now, with the other three columns unchanged --
-which is what a change to error text should look like. 37 cases are left in
+those two runs and 398 do now, with the other three columns unchanged --
+which is what a change to error text should look like. 35 cases are left in
 the gap between the third column and the fourth, down from 101.
 
 The five runs before those moved nineteen cases between them and moved nothing
@@ -278,16 +278,17 @@ wrong one.
 
 ## Open, ordered by consequence
 
-1. **What is left of the error text: 37 cases, and no two alike.** The
+1. **What is left of the error text: 35 cases, and almost no two alike.** The
    families are gone; what remains is one-offs. Hasura parses an integer
    literal itself and says `The value 2.147483648e9 lies outside the bounds`
-   where PostgreSQL says `integer out of range`; it reads an `ltree` pattern
-   before sending it and this server lets PostgreSQL refuse it; it answers
-   `not a valid graphql query` for a parse failure where async-graphql prints
-   the offending line with a caret under it; it detects a fragment cycle by
-   name where async-graphql reports a recursion depth. Six more differ in how
-   many errors they answer with rather than in what any of them says. Each is
-   its own small piece of Hasura reimplemented, and none is a family.
+   where PostgreSQL says `integer out of range`; it answers `not a valid
+   graphql query` at `$.query` for a parse failure where async-graphql prints
+   the offending line with a caret under it, which is the largest thing left
+   at four cases; it detects a fragment cycle by name where async-graphql
+   reports a recursion depth; it validates `limit: -1` as `expected a
+   non-negative 32-bit integer` where this server lets `LIMIT must not be
+   negative` come back from PostgreSQL. Six more differ in how many errors
+   they answer with rather than in what any of them says.
 
 2. **`_stream` subscriptions.** The cursor-based half of Hasura's subscription
    surface: `article_stream(cursor: {initial_value: {id: 0}}, batch_size: 10)`
@@ -427,6 +428,20 @@ wrong one.
   with no members reached through an argument. 286 -> 290 real agreements, and
   the status column to 100%.
 
+
+- **An `ltree` path is read before it is sent.** PostgreSQL refuses
+  `Tree.Collections.` with `ltree syntax error` and nothing else; Hasura reads
+  the path first and says what a path is, which is also what puts the refusal
+  at `...where.path._ancestor` rather than at the request as a whole.
+
+  Only an *empty label* is refused, and the narrowness is the finding. What
+  counts as a label character is the database's locale to decide: `a-b`,
+  `a_b`, `1.2` and `Ünï` are all valid paths on the image the harness runs,
+  and in C locale the last of those is not -- checked against
+  `postgis/postgis:16-3.4` rather than assumed. Refusing a character this
+  server merely doubts would turn a working query into an error, and the
+  reward for guessing would have been zero measured cases. What is refused is
+  the one thing no locale accepts: a label with nothing in it.
 
 - **An error says what Hasura says it says.** 101 cases agreed about the data
   and not about the whole body, and every one of them differed by the message
