@@ -8,11 +8,11 @@ harness itself, divergences kept on purpose, and the gaps still open.
 
 | | status | same outcome | same data | full body |
 |---|---|---|---|---|
-| all (468) | 100.0% | 95.9% | **91.7%** | 65.6% |
-| reads (271) | 100.0% | 94.5% | 87.1% | 67.5% |
+| all (468) | 100.0% | 95.9% | **92.3%** | 66.2% |
+| reads (271) | 100.0% | 94.5% | 88.2% | 68.6% |
 | writes (197) | 100.0% | 98.0% | **98.0%** | 62.9% |
 
-Of the 429 cases the third column counts, **300 agree about data and 129 agree
+Of the 432 cases the third column counts, **303 agree about data and 129 agree
 only because both servers answered with errors.** A further 2 are cases where
 Hasura refused and this server answered -- down from 115 before the permission
 layer existed.
@@ -20,7 +20,7 @@ layer existed.
 The status column reaching 100% is not a rounding: it was a rule read out of
 the corpus wrongly and is described below.
 
-**300 is the figure that tracks the work.** It counts the cases where the same
+**303 is the figure that tracks the work.** It counts the cases where the same
 query came back with the same rows, which is the only thing a client can feel.
 
 Over the permission work, measured at each step: 321/464 (69.2%, 214 real)
@@ -29,7 +29,8 @@ actually authenticated and this server could read a session variable ->
 402/468 (85.9%, 278) with the permission layer whole -> 403/468 (86.1%, 274)
 -> 413/468 (88.2%, 285) -> 414/468 (88.5%, 286) -> 419/468 (89.5%, 290)
 once a role could write what it cannot read -> 426/468 (91.0%, 297) with
-`_exists` -> 429/468 (**91.7%, 300**) once a preset reached an update.
+`_exists` -> 429/468 (91.7%, 300) once a preset reached an update ->
+432/468 (**92.3%, 303**) once a ceiling stopped answering `count`.
 
 The dip in the fourth of those is worth keeping. Three roles lost their entire
 API to one input type that was named and never registered, and the run-to-run
@@ -54,20 +55,20 @@ measuring the instrument. The guard against it recurring is below.
 The corpus is 468 cases rather than 464 because a batched request -- a body
 that is a JSON array of operations -- is a case the extractor now reads.
 
-Where the remaining 39 divergences are:
+Where the remaining 36 divergences are:
 
 | | count |
 |---|---|
 | Hasura answered, this server refused | 17 |
-| both answered with data, and the data differs | 20 |
+| both answered with data, and the data differs | 17 |
 | Hasura refused, this server answered | 2 |
 | status differs | 0 |
 
 Each is named in the open list rather than attributed to one missing
 subsystem.
 
-The last three runs moved fifteen cases between them and moved nothing back.
-The first of the three took three attempts to get there, and the two discarded
+The last four runs moved eighteen cases between them and moved nothing back.
+The first of the four took three attempts to get there, and the two discarded
 ones are the record worth keeping: the first read +3 on the headline and hid
 seven regressions underneath, four of them in a group with no permissions at
 all -- the signature of a change that was supposed to touch only roles. The
@@ -76,10 +77,10 @@ the branch that runs for a role and the fault was in the branch that runs for
 everyone. Both were found by the per-case comparison against the previous run,
 not by the percentages, which moved the right way each time.
 
-The permission model is finished as far as the corpus can measure it. What is
-left of it in the open list is three cases of an aggregate that should ignore
-a limit and one table granted only a count; everything above them is schema
-shape, library internals, or a metadata API this server does not offer.
+The permission model is finished as far as the corpus can measure it. One case
+of it is left in the open list -- a table granted only a count -- and
+everything else there is schema shape, library internals, or a metadata API
+this server does not offer.
 
 ## Faults in the harness, found by their symptoms
 
@@ -266,15 +267,7 @@ wrong one.
 
 ## Open, ordered by consequence
 
-1. **A permission's `limit` is not the aggregate's.** Hasura applies a select
-   permission's row ceiling to the rows it returns and not to the numbers it
-   reports: a role limited to one row of `article` still counts three of them,
-   and still gets `max(id)` over all three. Here the ceiling is applied once,
-   to the query, so both halves shrink together. Three cases, and the fix is a
-   distinction rather than a subsystem -- `nodes` takes the limit and
-   `aggregate` does not.
-
-2. **A table a role may count and not read.** A select permission naming no
+1. **A table a role may count and not read.** A select permission naming no
    columns at all, with `allow_aggregations`, is Hasura's way of granting
    "how many" without granting "which": `article_aggregate { aggregate {
    count } }` answers, `count(columns: ...)` is not offered, and the functions
@@ -284,33 +277,33 @@ wrong one.
    the same "no row type" shape the write-only tables now have and the same
    place to hang it. One case.
 
-3. **The path in an error is `$` where Hasura writes the selection.** Hasura
+2. **The path in an error is `$` where Hasura writes the selection.** Hasura
    answers `$.selectionSet.insert_computer.args.objects` for a refused write;
    this answers `$`, because the refusal is raised where the rows come back
    rather than where the argument was read. Costs nothing at the data level and
    is why those cases do not reach full-body agreement.
 
-4. **`_stream` subscriptions.** The cursor-based half of Hasura's subscription
+3. **`_stream` subscriptions.** The cursor-based half of Hasura's subscription
    surface: `article_stream(cursor: {initial_value: {id: 0}}, batch_size: 10)`
    sends rows *after* a cursor rather than the whole answer, which is what a
    client tailing an append-only table wants. The live queries beside it are
    done; this is a second shape with its own cursor types, and nothing in the
    corpus exercises it -- it shows up in introspection only.
 
-5. **What is left of the enum tables.** They work: a marked table's rows are a
+4. **What is left of the enum tables.** They work: a marked table's rows are a
    generated enum, referencing columns are typed as it, and no relationship
    points at one. What remains is the metadata API around them —
    `v1/set_table_is_enum` is four cases of turning the flag on and off through
    `/v1/query`, which is the contract this server does not offer.
 
-6. **A manual relationship** -- one Hasura maps column by column rather than by
+5. **A manual relationship** -- one Hasura maps column by column rather than by
    a foreign key -- has no constraint to key a name by, so
    `PGRST_GRAPHQL_NAMES` cannot carry its name and the converter says so rather
    than guessing. In the corpus it is also a *second* name for a foreign key
    that already has one, which reflection can only produce once. Two cases, one
    of them the only remaining insert this server refuses and Hasura performs.
 
-7. **Which relationships exist is metadata's to say.** Hasura exposes the
+6. **Which relationships exist is metadata's to say.** Hasura exposes the
    relationships its metadata declares; this server exposes one per foreign
    key. Where a fixture tracks a table without naming all of its keys, the
    extra fields are here and not there. No query breaks on a field it does not
@@ -319,7 +312,7 @@ wrong one.
    would mean letting the names document say which relationships exist, not
    just what they are called, which is a different kind of directive.
 
-8. **A function taking a table's row, tracked as a root field.** Hasura lets a
+7. **A function taking a table's row, tracked as a root field.** Hasura lets a
    client write `fetch_articles(args: {search: "Art", author_row: "(1, 'Roger',
    'Chris')"})` -- the row as a literal. Here such a function is a computed
    field and nothing else, on the grounds that a row type is not something a
@@ -327,12 +320,12 @@ wrong one.
    table's composite type as a scalar under the table's own name, which is a
    name the object type already has. One case, and the position is deliberate.
 
-9. **A function returning one row, as a mutation.** `add_to_score_by_user_id`
+8. **A function returning one row, as a mutation.** `add_to_score_by_user_id`
    returns `"user"` rather than `SETOF "user"`; Hasura exposes it as a root
    field yielding one row. Here only a set-returning function becomes a root
    field.
 
-10. **Every generated description is this server's wording, not Hasura's.**
+9. **Every generated description is this server's wording, not Hasura's.**
     `article_bool_exp` is described here as "Filter rows of article. Fields are
     combined with AND unless _or says otherwise." and there as "Boolean
     expression to filter rows from the table \"article\"...". Nothing breaks
@@ -342,19 +335,19 @@ wrong one.
     arguments come back in: Hasura sorts them, this server lists them as
     declared.
 
-11. **Introspection shape, inside async-graphql.** It publishes five directives
+10. **Introspection shape, inside async-graphql.** It publishes five directives
     where Hasura publishes three, registers `ID` and `__DirectiveLocation`
     where Hasura has neither, and answers `__TypeKind`'s members in
     specification order rather than alphabetically. Six cases, and none of them
     is reachable without forking the library.
 
-12. **An enum value beginning with `null`, `true` or `false`.** The parser
+11. **An enum value beginning with `null`, `true` or `false`.** The parser
     mis-lexes `nullPrefixTestTable_pkey` as the literal `null` followed by
     something it cannot read, so an upsert naming that constraint is answered
     with a parse error. This is async-graphql's lexer, not this server. One
     case.
 
-13. **Actions and Apollo federation** are subsystems rather than gaps:
+12. **Actions and Apollo federation** are subsystems rather than gaps:
     `actions/*` describes handlers Hasura calls out to over HTTP, and
     `apollo_federation` describes the `_service`/`_entities` surface a
     federated gateway composes. Five cases between them.
@@ -428,6 +421,21 @@ wrong one.
   with no members reached through an argument. 286 -> 290 real agreements, and
   the status column to 100%.
 
+
+- **A ceiling bounds the page and not the count.** The aggregate read the same
+  rows `nodes` did, so a permission's `limit` became the answer to `count`: a
+  role limited to one row of `article` counted one of three, and `max(id)` was
+  the maximum of the row it was allowed to see rather than of the rows that are
+  there. A ceiling exists to bound how many rows travel, and answering "how
+  many are there" with "as many as I would have sent you" is not an answer to
+  the question.
+
+  The aggregate reads its own source now -- the same filter, the same order,
+  and only the limit and offset the request itself asked for, because
+  `article_aggregate(limit: 2)` is a question about two rows. The corpus proves
+  this for the permission's ceiling; `PGRST_MAX_ROWS` is treated the same way
+  because the reason is the same, and that half is pinned by an integration
+  test rather than by the harness.
 
 - **A preset reaches an update, and the update half of an upsert.** They were
   applied on insert and nowhere else, which made an update whose whole
