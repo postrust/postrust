@@ -8,8 +8,8 @@ harness itself, divergences kept on purpose, and the gaps still open.
 
 | | status | same outcome | same data | full body |
 |---|---|---|---|---|
-| all (468) | 100.0% | 96.2% | **92.5%** | 87.6% |
-| reads (271) | 100.0% | 94.8% | 88.6% | 86.0% |
+| all (468) | 100.0% | 96.2% | **92.5%** | 87.8% |
+| reads (271) | 100.0% | 94.8% | 88.6% | 86.3% |
 | writes (197) | 100.0% | 98.0% | **98.0%** | 89.8% |
 
 Of the 433 cases the third column counts, **304 agree about data and 129 agree
@@ -70,8 +70,8 @@ subsystem.
 
 The fourth column has moved on its own for four runs since: what an error
 says, and where it says it happened. 311 bodies matched entirely before those
-runs and 410 do now, with the other three columns unchanged the whole way --
-which is what a change to error text should look like. 23 cases are left in
+runs and 411 do now, with the other three columns unchanged the whole way --
+which is what a change to error text should look like. 22 cases are left in
 the gap between the third column and the fourth, down from 101.
 
 The five runs before those moved nineteen cases between them and moved nothing
@@ -278,17 +278,22 @@ wrong one.
 
 ## Open, ordered by consequence
 
-1. **What is left of the error text: 23 cases, and no two alike.** The
-   families are gone; what remains is one-offs. Hasura reads a raster's hex
-   before sending it and this server lets PostGIS answer
-   `rt_raster_from_wkb: wkb size (14) < min size (61)`; it refuses an insert
+1. **What is left of the error text: 22 cases, and no two alike.** The
+   families are gone; what remains is one-offs. Hasura refuses an insert
    naming a column the role cannot write before the statement runs, where this
    server lets PostgreSQL answer `cannot insert a non-DEFAULT value into
    column "id"`; it names a computed field's absence from a boolean expression
-   where this server calls the function and finds it missing. Six more differ
-   in how many errors they answer with rather than in what any of them says,
-   and four are cases where Hasura has no mutation root and this server does,
-   so the two are refusing genuinely different things.
+   where this server calls the function and finds it missing; it reads a
+   header's boolean text itself. Six more differ in how many errors they
+   answer with rather than in what any of them says, and four are cases where
+   Hasura has no mutation root and this server does, so the two are refusing
+   genuinely different things.
+
+   A pattern worth naming, since six of the fixes above share it: Hasura reads
+   a value against what the column will do with it *before* the statement
+   runs, and this server used to let PostgreSQL be the one to complain. The
+   walk over the request is where that reading belongs, because it is the only
+   place that still knows which argument the value came from.
 
 2. **`_stream` subscriptions.** The cursor-based half of Hasura's subscription
    surface: `article_stream(cursor: {initial_value: {id: 0}}, batch_size: 10)`
@@ -428,6 +433,19 @@ wrong one.
   with no members reached through an argument. 286 -> 290 real agreements, and
   the status column to 100%.
 
+
+- **A raster's hex is read before it is sent.** A raster travels as the hex of
+  its well-known binary, and PostGIS answers `rt_raster_from_wkb: wkb size
+  (14) < min size (61)` for something that is not one -- a complaint about the
+  bytes it managed to decode rather than about the text it was given, which in
+  the corpus is `this is invalid raster value`. Hasura reads the text first
+  and says it is not hexadecimal.
+
+  Only what is certainly not hexadecimal is refused: a character outside
+  `0-9A-Fa-f`, or an odd number of them, since a byte takes two. Well-formed
+  hex too short to be a raster still goes to PostGIS and comes back in
+  PostGIS's words -- the same narrowness the `ltree` rule takes, and for the
+  same reason.
 
 - **Fragments that spread each other are named as a cycle.** A fragment that
   spreads its way back to itself describes no finite selection.
