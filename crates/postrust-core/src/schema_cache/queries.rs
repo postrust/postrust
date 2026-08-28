@@ -196,6 +196,16 @@ async fn load_columns(
                     AND rel.relname = c.table_name
                   LIMIT 1)
             ) AS column_default,
+            -- What a write may not name at all. `GENERATED ALWAYS AS
+            -- IDENTITY` and a stored generated column both belong to
+            -- PostgreSQL, which answers `cannot insert a non-DEFAULT value`
+            -- to anything that names one. `BY DEFAULT` is deliberately not
+            -- here: it has a default, and a value given for it is taken.
+            COALESCE(
+                (c.is_identity = 'YES' AND c.identity_generation = 'ALWAYS')
+                    OR c.is_generated = 'ALWAYS',
+                false
+            ) AS always_generated,
             pg_catalog.col_description(
                 (quote_ident(c.table_schema) || '.' || quote_ident(c.table_name))::regclass,
                 c.ordinal_position
@@ -210,7 +220,8 @@ async fn load_columns(
         WHERE c.table_schema = $1 AND c.table_name = $2
         GROUP BY c.table_schema, c.table_name, c.column_name, c.ordinal_position, c.is_nullable,
                  c.data_type, c.udt_name, c.domain_name, c.character_maximum_length,
-                 c.column_default, t.oid, e.enumtypid
+                 c.column_default, c.is_identity, c.identity_generation, c.is_generated,
+                 t.oid, e.enumtypid
         ORDER BY c.ordinal_position
         "#,
     )
@@ -248,6 +259,7 @@ async fn load_columns(
             enum_values,
             is_pk: pk_cols.contains(&name),
             position,
+            always_generated: row.get("always_generated"),
         };
 
         columns.insert(name, column);
@@ -859,6 +871,7 @@ async fn load_catalog_columns(
             CASE WHEN t.typtype = 'd' THEN t.typname END AS domain_name,
             NULL::int AS character_maximum_length,
             pg_catalog.pg_get_expr(d.adbin, d.adrelid) AS column_default,
+            (a.attidentity = 'a' OR a.attgenerated <> '') AS always_generated,
             pg_catalog.col_description(c.oid, a.attnum) AS description,
             COALESCE(
                 (SELECT array_agg(e.enumlabel ORDER BY e.enumsortorder)

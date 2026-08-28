@@ -160,6 +160,15 @@ pub struct Column {
     pub is_pk: bool,
     /// Column position (1-based)
     pub position: i32,
+    /// Whether PostgreSQL generates this column's value and refuses any other.
+    ///
+    /// `GENERATED ALWAYS AS IDENTITY` and `GENERATED ALWAYS AS (...) STORED`
+    /// both mean the same thing to a writer: naming the column at all is an
+    /// error, not merely unnecessary. A `BY DEFAULT` identity is not this --
+    /// it has a default and accepts a value -- which is why the flag is about
+    /// what a write may say rather than about how a value is produced.
+    #[serde(default)]
+    pub always_generated: bool,
 }
 
 impl Column {
@@ -237,6 +246,7 @@ mod tests {
             enum_values: vec![],
             is_pk: true,
             position: 1,
+            always_generated: false,
             domain_type: None,
         };
         assert!(col1.is_auto());
@@ -252,6 +262,7 @@ mod tests {
             enum_values: vec![],
             is_pk: false,
             position: 2,
+            always_generated: false,
             domain_type: None,
         };
         assert!(col2.is_auto());
@@ -267,6 +278,7 @@ mod tests {
             enum_values: vec![],
             is_pk: false,
             position: 3,
+            always_generated: false,
             domain_type: None,
         };
         assert!(!col3.is_auto());

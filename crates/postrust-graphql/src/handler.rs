@@ -1234,27 +1234,26 @@ fn create_mutation_response_type(base_name: &str, returning: bool) -> Object {
     if !returning {
         return response;
     }
-    response
-        .field(Field::new(
-            "returning",
-            TypeRef::named_nn_list_nn(row_type),
-            |ctx| {
-                FieldFuture::new(async move {
-                    let rows = match ctx.parent_value.as_value() {
-                        Some(Value::Object(map)) => {
-                            match map.get(&async_graphql::Name::new("returning")) {
-                                Some(Value::List(items)) => items.clone(),
-                                _ => Vec::new(),
-                            }
+    response.field(Field::new(
+        "returning",
+        TypeRef::named_nn_list_nn(row_type),
+        |ctx| {
+            FieldFuture::new(async move {
+                let rows = match ctx.parent_value.as_value() {
+                    Some(Value::Object(map)) => {
+                        match map.get(&async_graphql::Name::new("returning")) {
+                            Some(Value::List(items)) => items.clone(),
+                            _ => Vec::new(),
                         }
-                        _ => Vec::new(),
-                    };
-                    Ok(Some(FieldValue::list(
-                        rows.into_iter().map(FieldValue::value),
-                    )))
-                })
-            },
-        ))
+                    }
+                    _ => Vec::new(),
+                };
+                Ok(Some(FieldValue::list(
+                    rows.into_iter().map(FieldValue::value),
+                )))
+            })
+        },
+    ))
 }
 
 /// Build every aggregate type for one table.
@@ -1304,10 +1303,10 @@ fn create_aggregate_types(base_name: &str, object: &TableObjectType) -> Vec<Obje
 
     // `<t>_aggregate_fields`: count, and one field per function.
     let mut count = Field::new("count", TypeRef::named_nn(TypeRef::INT), |ctx| {
-                // Read under the name it was asked for, not under `count`.
-                // Two counts of different things sit in one selection --
-                // `count` beside `distinct_authors: count(columns: [author_id],
-                // distinct: true)` -- and they are different numbers.
+        // Read under the name it was asked for, not under `count`.
+        // Two counts of different things sit in one selection --
+        // `count` beside `distinct_authors: count(columns: [author_id],
+        // distinct: true)` -- and they are different numbers.
         let key = ctx.ctx.field().alias().unwrap_or("count").to_string();
         FieldFuture::new(async move {
             Ok(Some(FieldValue::value(
@@ -2051,7 +2050,17 @@ fn write_fields<'a>(
         .iter()
         .filter(|field| {
             let column = table_column_for(names, &object.table, &field.name);
-            object.table.get_column(column).is_some()
+            // A column PostgreSQL generates always is not one a write may
+            // name. Leaving it in the input type moved the refusal to the
+            // database, which answers `cannot insert a non-DEFAULT value into
+            // column "id"` and has by then forgotten which argument the value
+            // came from. Out of the type, the walk over the request says
+            // `field 'id' not found in type: 'author_insert_input'` and can
+            // still point at it.
+            object
+                .table
+                .get_column(column)
+                .is_some_and(|c| !c.always_generated)
                 && allowed.is_none_or(|set| set.allows(column))
         })
         .collect()
@@ -5151,12 +5160,8 @@ async fn execute_update(
     .map_err(|fault| coded_error(fault.code(), fault.to_string()))?;
     let preset_columns: HashSet<&str> = preset.iter().map(|(name, _)| name.as_str()).collect();
     for (column, value) in &preset {
-        let placeholder = write_expression(
-            &column_types,
-            column,
-            value,
-            &format!("${}", param_idx),
-        );
+        let placeholder =
+            write_expression(&column_types, column, value, &format!("${}", param_idx));
         set_parts.push(format!(
             "{} = {}",
             postrust_sql::escape_ident(column),
@@ -8693,6 +8698,7 @@ mod tests {
                 enum_values: vec![],
                 is_pk: true,
                 position: 1,
+                always_generated: false,
                 domain_type: None,
             },
         );
@@ -8709,6 +8715,7 @@ mod tests {
                 enum_values: vec![],
                 is_pk: false,
                 position: 2,
+                always_generated: false,
                 domain_type: None,
             },
         );
@@ -8925,7 +8932,11 @@ mod tests {
             &mut 0,
         )
         .expect_err("a table that is not there is an error");
-        assert!(error.message.contains("public.nowhere"), "{}", error.message);
+        assert!(
+            error.message.contains("public.nowhere"),
+            "{}",
+            error.message
+        );
     }
 
     /// A role granted "how many" and not "which" gets the count and no rows.
@@ -8944,10 +8955,7 @@ mod tests {
         )
         .unwrap();
         let view = crate::role::cache_for_role(&cache, &names, "counter", false);
-        assert!(
-            !view.tables.is_empty(),
-            "the table is there to be counted"
-        );
+        assert!(!view.tables.is_empty(), "the table is there to be counted");
 
         let config = SchemaConfig {
             names: names.clone(),
@@ -8967,11 +8975,19 @@ mod tests {
         .expect("a role that may only count still has a buildable schema");
         let sdl = schema.sdl();
 
-        assert!(sdl.contains("users_aggregate"), "the count is there:\n{}", sdl);
+        assert!(
+            sdl.contains("users_aggregate"),
+            "the count is there:\n{}",
+            sdl
+        );
         assert!(sdl.contains("count: Int!"), "and it is a count:\n{}", sdl);
         // No row type, so nothing that would answer with one.
         assert!(!sdl.contains("type users "), "no row type:\n{}", sdl);
-        assert!(!sdl.contains("nodes"), "and no rows beside the numbers:\n{}", sdl);
+        assert!(
+            !sdl.contains("nodes"),
+            "and no rows beside the numbers:\n{}",
+            sdl
+        );
         assert!(
             !sdl.contains("users_select_column"),
             "no column enum to order by or count over:\n{}",
@@ -9015,12 +9031,24 @@ mod tests {
         .expect("a role that may only write still has a buildable schema");
         let sdl = schema.sdl();
 
-        assert!(sdl.contains("insert_users("), "the write is there:\n{}", sdl);
-        assert!(sdl.contains("users_insert_input"), "and its input:\n{}", sdl);
+        assert!(
+            sdl.contains("insert_users("),
+            "the write is there:\n{}",
+            sdl
+        );
+        assert!(
+            sdl.contains("users_insert_input"),
+            "and its input:\n{}",
+            sdl
+        );
         // No row type, and so none of the three fields that answer with one.
         assert!(!sdl.contains("type users "), "no row type:\n{}", sdl);
         assert!(!sdl.contains("insert_users_one"), "no insert_one:\n{}", sdl);
-        assert!(!sdl.contains("returning"), "and nothing to return:\n{}", sdl);
+        assert!(
+            !sdl.contains("returning"),
+            "and nothing to return:\n{}",
+            sdl
+        );
         assert!(
             sdl.contains("users_mutation_response"),
             "the count is still answered:\n{}",
@@ -9053,7 +9081,11 @@ mod tests {
         let generated = build_schema(&view, &config);
         let object = &generated.object_types["users"];
         assert_eq!(
-            object.fields.iter().map(|f| f.name.as_str()).collect::<Vec<_>>(),
+            object
+                .fields
+                .iter()
+                .map(|f| f.name.as_str())
+                .collect::<Vec<_>>(),
             vec!["id"],
             "the type shows what may be read"
         );
@@ -9079,6 +9111,74 @@ mod tests {
             .and_then(|rest| rest.split('}').next())
             .expect("the insert input is registered");
         assert!(input.contains("name:"), "settable without being readable");
+    }
+
+    /// A column PostgreSQL generates always is in the row type and in no
+    /// write input. It is not a permission -- no role may name it -- so the
+    /// refusal belongs to the schema rather than to the database.
+    #[test]
+    fn a_generated_column_is_readable_and_not_writable() {
+        let mut cache = create_test_schema_cache();
+        cache
+            .tables
+            .get_mut(&postrust_core::api_request::QualifiedIdentifier::new(
+                "public", "users",
+            ))
+            .expect("the fixture has users")
+            .columns
+            .get_mut("id")
+            .expect("with an id")
+            .always_generated = true;
+
+        let names = crate::names::NameOverrides::default();
+        let config = SchemaConfig {
+            names: names.clone(),
+            ..SchemaConfig::default()
+        };
+        let generated = build_schema(&cache, &config);
+        let schema = build_dynamic_schema(
+            &generated,
+            &cache,
+            None,
+            None,
+            Arc::new(names),
+            std::time::Duration::from_secs(30),
+            None,
+        )
+        .expect("schema builds");
+        let sdl = schema.sdl();
+
+        let block = |header: &str| {
+            sdl.split(header)
+                .nth(1)
+                .and_then(|rest| rest.split('}').next())
+                .unwrap_or_else(|| panic!("{} is registered:\n{}", header, sdl))
+                .to_string()
+        };
+        assert!(
+            block("type users ").contains("id:"),
+            "still readable:\n{}",
+            sdl
+        );
+        for header in ["input users_insert_input", "input users_set_input"] {
+            assert!(
+                !block(header).contains("id:"),
+                "{} may not name it:\n{}",
+                header,
+                block(header)
+            );
+        }
+        // The table's only number was the generated column, so there is
+        // nothing left to add to and no type for adding to it.
+        assert!(
+            !sdl.contains("users_inc_input"),
+            "and nothing is left to increment:\n{}",
+            sdl
+        );
+        assert!(
+            block("input users_insert_input").contains("name:"),
+            "and the rest of the table is untouched",
+        );
     }
 
     #[test]

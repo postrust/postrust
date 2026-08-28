@@ -1065,7 +1065,8 @@ pub fn build_schema(schema_cache: &SchemaCache, config: &SchemaConfig) -> Genera
         // the type was first made would leave it behind every rewrite since.
         object.writable_fields = object.fields.clone();
         if let Some(role) = &config.role {
-            let (schema_name, table_name) = (object.table.schema.clone(), object.table.name.clone());
+            let (schema_name, table_name) =
+                (object.table.schema.clone(), object.table.name.clone());
             let Some(granted) = config.names.permissions(&schema_name, &table_name, role) else {
                 continue;
             };
@@ -1223,6 +1224,7 @@ mod tests {
                 enum_values: vec![],
                 is_pk: true,
                 position: 1,
+                always_generated: false,
                 domain_type: None,
             },
         );
@@ -1239,6 +1241,7 @@ mod tests {
                 enum_values: vec![],
                 is_pk: false,
                 position: 2,
+                always_generated: false,
                 domain_type: None,
             },
         );

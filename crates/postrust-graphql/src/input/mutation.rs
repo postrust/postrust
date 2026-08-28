@@ -282,6 +282,7 @@ mod tests {
                 enum_values: vec![],
                 is_pk: true,
                 position: 1,
+                always_generated: false,
                 domain_type: None,
             },
         );
@@ -298,6 +299,7 @@ mod tests {
                 enum_values: vec![],
                 is_pk: false,
                 position: 2,
+                always_generated: false,
                 domain_type: None,
             },
         );
@@ -314,6 +316,7 @@ mod tests {
                 enum_values: vec![],
                 is_pk: false,
                 position: 3,
+                always_generated: false,
                 domain_type: None,
             },
         );
@@ -330,6 +333,7 @@ mod tests {
                 enum_values: vec![],
                 is_pk: false,
                 position: 4,
+                always_generated: false,
                 domain_type: None,
             },
         );

@@ -201,7 +201,8 @@ pub fn reads_anything(granted: &crate::names::RolePermissions, table: &Table) ->
     let Some(select) = &granted.select else {
         return false;
     };
-    !table.computed_columns.is_empty() || table.columns.keys().any(|name| select.columns.allows(name))
+    !table.computed_columns.is_empty()
+        || table.columns.keys().any(|name| select.columns.allows(name))
 }
 
 /// Whether any of this role's permissions is reachable only by a backend.
@@ -580,7 +581,10 @@ fn rewrite(
                 // spelled in *that* table's names rather than in this one's.
                 // Everything else here carries the outer table down.
                 if key == "_exists" {
-                    out.insert("_exists".to_string(), rewrite_exists(child, session, names, schema)?);
+                    out.insert(
+                        "_exists".to_string(),
+                        rewrite_exists(child, session, names, schema)?,
+                    );
                     continue;
                 }
 
@@ -641,10 +645,7 @@ fn rewrite(
 /// {schema: public, name: user}` -- and its own corpus uses the first. An
 /// unqualified name is read in the schema of the table the permission is on,
 /// which is where a permission written without a schema means to look.
-pub fn exists_target(
-    spec: &serde_json::Value,
-    default_schema: &str,
-) -> Option<(String, String)> {
+pub fn exists_target(spec: &serde_json::Value, default_schema: &str) -> Option<(String, String)> {
     match spec.get("_table")? {
         serde_json::Value::String(name) => Some((default_schema.to_string(), name.clone())),
         serde_json::Value::Object(qualified) => {
@@ -777,6 +778,7 @@ mod tests {
             is_pk: name == "id",
             position,
             domain_type: None,
+            always_generated: false,
         }
     }
 
