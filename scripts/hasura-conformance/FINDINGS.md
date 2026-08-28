@@ -8,9 +8,9 @@ harness itself, divergences kept on purpose, and the gaps still open.
 
 | | status | same outcome | same data | full body |
 |---|---|---|---|---|
-| all (468) | 100.0% | 96.2% | **92.5%** | 87.8% |
+| all (468) | 100.0% | 96.2% | **92.5%** | 88.2% |
 | reads (271) | 100.0% | 94.8% | 88.6% | 86.3% |
-| writes (197) | 100.0% | 98.0% | **98.0%** | 89.8% |
+| writes (197) | 100.0% | 98.0% | **98.0%** | 90.9% |
 
 Of the 433 cases the third column counts, **304 agree about data and 129 agree
 only because both servers answered with errors.** A further 2 are cases where
@@ -68,10 +68,10 @@ Where the remaining 35 divergences are:
 Each is named in the open list rather than attributed to one missing
 subsystem.
 
-The fourth column has moved on its own for four runs since: what an error
+The fourth column has moved on its own for five runs since: what an error
 says, and where it says it happened. 311 bodies matched entirely before those
-runs and 411 do now, with the other three columns unchanged the whole way --
-which is what a change to error text should look like. 22 cases are left in
+runs and 413 do now, with the other three columns unchanged the whole way --
+which is what a change to error text should look like. 20 cases are left in
 the gap between the third column and the fourth, down from 101.
 
 The five runs before those moved nineteen cases between them and moved nothing
@@ -278,22 +278,21 @@ wrong one.
 
 ## Open, ordered by consequence
 
-1. **What is left of the error text: 22 cases, and no two alike.** The
-   families are gone; what remains is one-offs. Hasura refuses an insert
-   naming a column the role cannot write before the statement runs, where this
-   server lets PostgreSQL answer `cannot insert a non-DEFAULT value into
-   column "id"`; it names a computed field's absence from a boolean expression
-   where this server calls the function and finds it missing; it reads a
-   header's boolean text itself. Six more differ in how many errors they
-   answer with rather than in what any of them says, and four are cases where
-   Hasura has no mutation root and this server does, so the two are refusing
-   genuinely different things.
+1. **What is left of the error text: 20 cases, and no two alike.** The
+   families are gone; what remains is one-offs. Hasura names a computed
+   field's absence from a boolean expression where this server calls the
+   function and finds it missing; it reads a header's boolean text itself. Six
+   more differ in how many errors they answer with rather than in what any of
+   them says, and four are cases where Hasura has no mutation root and this
+   server does, so the two are refusing genuinely different things.
 
-   A pattern worth naming, since six of the fixes above share it: Hasura reads
-   a value against what the column will do with it *before* the statement
-   runs, and this server used to let PostgreSQL be the one to complain. The
-   walk over the request is where that reading belongs, because it is the only
-   place that still knows which argument the value came from.
+   A pattern worth naming, since seven of the fixes above share it: Hasura
+   reads a value against what the column will do with it *before* the
+   statement runs, and this server used to let PostgreSQL be the one to
+   complain. The walk over the request is where that reading belongs, because
+   it is the only place that still knows which argument the value came from --
+   and where the answer does not depend on the value at all, the column has no
+   business being in the input type.
 
 2. **`_stream` subscriptions.** The cursor-based half of Hasura's subscription
    surface: `article_stream(cursor: {initial_value: {id: 0}}, batch_size: 10)`
@@ -433,6 +432,27 @@ wrong one.
   with no members reached through an argument. 286 -> 290 real agreements, and
   the status column to 100%.
 
+
+- **A column PostgreSQL generates always is in no write input.** `author.id`
+  is `GENERATED ALWAYS AS IDENTITY`, which means naming it in an insert is an
+  error rather than merely unnecessary -- PostgreSQL answers `cannot insert a
+  non-DEFAULT value into column "id"`. By then the statement has been built
+  and the request forgotten, so the path could only point at the row, not at
+  the field: `$.selectionSet.insert_author.args.objects` where Hasura says
+  `$.selectionSet.insert_author.args.objects[0].id`.
+
+  The column leaves every write shape instead. It is not a permission -- no
+  role may name it -- so the flag lives on the column in the schema cache,
+  beside `is_pk`, and is read in the one place the write inputs are built
+  from. `_insert_input`, `_set_input`, `_inc_input` and the `_update_column`
+  enum all lose it together, the row type keeps it, and the walk over the
+  request then produces Hasura's own answer without being told anything:
+  `field 'id' not found in type: 'author_insert_input'`, pointed at the field
+  it was written on and at whatever depth a nested write put it.
+
+  `GENERATED ALWAYS AS (...) STORED` is the same flag for the same reason. A
+  `BY DEFAULT` identity is deliberately not: it has a default, and a value
+  given for it is taken.
 
 - **A raster's hex is read before it is sent.** A raster travels as the hex of
   its well-known binary, and PostGIS answers `rt_raster_from_wkb: wkb size
