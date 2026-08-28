@@ -56,8 +56,18 @@ pub struct TableObjectType {
     pub table: Table,
     /// GraphQL type name (PascalCase).
     pub name: String,
-    /// Fields derived from columns.
+    /// Fields derived from columns: the ones a read may name.
+    ///
+    /// Empty where the role may write this table and not read it, which is a
+    /// table with no GraphQL type -- see [`crate::role`].
     pub fields: Vec<GraphQLField>,
+    /// Fields a write may name, before the write permission narrows them.
+    ///
+    /// The same list before the read permission was applied, which is what
+    /// makes a column a role may set without seeing expressible: `fields` is
+    /// what the type shows and this is what the insert and update inputs are
+    /// built from. Equal to `fields` where nothing narrowed them.
+    pub writable_fields: Vec<GraphQLField>,
     /// The type's description: the table's comment, or the one metadata gave
     /// instead. `Some("")` is a description that was given and is empty, which
     /// is how metadata says the type has none.
@@ -166,6 +176,9 @@ impl TableObjectType {
         Self {
             table: table.clone(),
             name,
+            // Nothing has narrowed the read yet, so the two lists start equal.
+            // A role's schema splits them where its object type is built.
+            writable_fields: fields.clone(),
             fields,
             description,
         }

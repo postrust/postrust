@@ -445,7 +445,14 @@ fn build_dynamic_schema(
     // Create object types for each table
     let mut object_types: HashMap<String, Object> = HashMap::new();
 
+    // A table with no readable field gets no type at all. That is not an
+    // empty table -- it is one this role may write and not read, and a GraphQL
+    // object type with no fields is not a legal type. Everything that would
+    // have returned it is left out with it.
     for (type_name, obj) in &generated.object_types {
+        if obj.fields.is_empty() {
+            continue;
+        }
         let relationships = generated
             .relationship_fields
             .get(type_name)
@@ -455,9 +462,12 @@ fn build_dynamic_schema(
         object_types.insert(type_name.clone(), table_obj);
     }
 
-    // Aggregate types: every table gets them, because every table has a count
-    // even when it has nothing to sum.
+    // Aggregate types: every readable table gets them, because every table has
+    // a count even when it has nothing to sum.
     for (type_name, obj) in &generated.object_types {
+        if obj.fields.is_empty() {
+            continue;
+        }
         for aggregate_type in create_aggregate_types(type_name, obj) {
             object_types.insert(aggregate_type.type_name().to_string(), aggregate_type);
         }
@@ -470,14 +480,29 @@ fn build_dynamic_schema(
         .mutation_fields
         .iter()
         .map(|f| {
+            // The table's own name. A bulk write already answers with the
+            // response type, and trimming the suffix here is what keeps
+            // `<t>_mutation_response_mutation_response` from being built: the
+            // set used to be carried by `insert_one` and `update_by_pk`
+            // naming the bare type, so a table with only bulk writes -- which
+            // is what a role that cannot read one has -- registered the wrong
+            // name and left the right one missing.
             f.return_type
                 .trim_matches(|c| c == '[' || c == ']' || c == '!')
+                .trim_end_matches("_mutation_response")
         })
         .collect();
     for base_name in mutable {
+        // Whether it has rows to give back. A write to a table this role
+        // cannot read answers with `affected_rows` and nothing else -- there
+        // is no row type for `returning` to be a list of.
+        let returning = generated
+            .object_types
+            .get(base_name)
+            .is_some_and(|object| !object.fields.is_empty());
         object_types.insert(
             mutation_response_type_name(base_name),
-            create_mutation_response_type(base_name),
+            create_mutation_response_type(base_name, returning),
         );
     }
 
@@ -593,7 +618,12 @@ fn build_dynamic_schema(
 
     let mut scalar_names: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
     for object in generated.object_types.values() {
-        for field in &object.fields {
+        // Both halves. A column a role may set without seeing is named by the
+        // insert input and by nothing a read produces, so collecting only the
+        // readable fields leaves its scalar unregistered -- and a scalar the
+        // schema mentions but never registers makes the whole schema
+        // unbuildable, which costs the role every field it has.
+        for field in object.fields.iter().chain(&object.writable_fields) {
             scalar_names.insert(leaf_scalar_name(&field.graphql_type));
         }
     }
@@ -716,7 +746,7 @@ fn build_dynamic_schema(
         // row and a relationship is handled separately below.
         let writable_named = |allowed: Option<&crate::names::ColumnSet>| {
             object
-                .fields
+                .writable_fields
                 .iter()
                 .filter(|field| {
                     let column = table_column_for(&names, table, &field.name);
@@ -1048,7 +1078,13 @@ fn build_dynamic_schema(
     // and a GraphQL enum may not be empty, so it gets none of these types
     // rather than an unusable set of them.
     for (type_name, object) in &generated.object_types {
-        if object.table.unique_constraints.is_empty() || object.fields.is_empty() {
+        // What an upsert may write, which is the update permission's answer
+        // and not the read permission's: `update_columns` names columns to
+        // overwrite, so a role that may set a column without seeing it may
+        // name it here. Where no update permission narrows them these are the
+        // table's own columns, which is what the enum listed before.
+        let updatable_columns = write_fields(object, &names, role, crate::role::Verb::Update);
+        if object.table.unique_constraints.is_empty() {
             continue;
         }
 
@@ -1063,8 +1099,22 @@ fn build_dynamic_schema(
 
         let mut updatable = Enum::new(format!("{}_update_column", type_name))
             .description(format!("A column of {} an upsert may write.", type_name));
-        for field in &object.fields {
+        for field in &updatable_columns {
             updatable = updatable.item(EnumItem::new(&field.name));
+        }
+        // An update permission granting no column leaves the enum with no
+        // members, which is not a legal type -- and dropping the enum would
+        // drop `on_conflict` with it, so an insert that names one would fail
+        // to build rather than be refused. Hasura's answer is a member that
+        // names no column: the upsert is still expressible, `update_columns:
+        // []` still means `DO NOTHING`, and naming the placeholder is refused
+        // where it is used. `article_on_conflict_restricted_role.yaml` tests
+        // both halves.
+        if updatable_columns.is_empty() {
+            updatable = updatable.item(
+                EnumItem::new(PLACEHOLDER_COLUMN)
+                    .description("No column may be written by this upsert."),
+            );
         }
 
         let on_conflict = InputObject::new(format!("{}_on_conflict", type_name))
@@ -1131,6 +1181,13 @@ fn build_dynamic_schema(
 }
 
 /// Create an object type from a TableObjectType.
+/// The enum member that stands in for an update permission granting no column.
+///
+/// Hasura's spelling, and it is load-bearing: `article_update_column` must be
+/// a legal enum for `article_on_conflict` to exist, and `on_conflict` must
+/// exist for an insert that carries one to be refused rather than unbuildable.
+const PLACEHOLDER_COLUMN: &str = "_PLACEHOLDER";
+
 /// The name of a table's mutation response type.
 pub fn mutation_response_type_name(base_name: &str) -> String {
     format!("{}_mutation_response", base_name)
@@ -1142,11 +1199,11 @@ pub fn mutation_response_type_name(base_name: &str) -> String {
 /// `affected_rows` is the count PostgreSQL reports, which is not the length of
 /// `returning`: a client may ask for no rows back at all and still need to know
 /// how many were touched, and that is the usual case for a delete.
-fn create_mutation_response_type(base_name: &str) -> Object {
+fn create_mutation_response_type(base_name: &str, returning: bool) -> Object {
     let response_name = mutation_response_type_name(base_name);
     let row_type = base_name.to_string();
 
-    Object::new(&response_name)
+    let response = Object::new(&response_name)
         .description(format!("The rows {} changed, and how many.", base_name))
         .field(Field::new(
             "affected_rows",
@@ -1161,7 +1218,14 @@ fn create_mutation_response_type(base_name: &str) -> Object {
                     Ok(Some(FieldValue::value(Value::from(0))))
                 })
             },
-        ))
+        ));
+    // A table this role may write and not read has no row type, so there is
+    // nothing for `returning` to be a list of. Hasura answers such a write
+    // with the count alone, and the corpus asks for nothing else.
+    if !returning {
+        return response;
+    }
+    response
         .field(Field::new(
             "returning",
             TypeRef::named_nn_list_nn(row_type),
@@ -1871,7 +1935,7 @@ fn write_fields<'a>(
             .and_then(|granted| granted.write_columns(verb))
     });
     object
-        .fields
+        .writable_fields
         .iter()
         .filter(|field| {
             let column = table_column_for(names, &object.table, &field.name);
@@ -4232,6 +4296,12 @@ fn insert_row<'life>(
                     .and_then(|v| v.as_array())
                     .map(|items| items.iter().filter_map(|i| i.as_str()).collect())
                     .unwrap_or_default();
+                // The member that stands for the columns this role has none
+                // of. It is in the enum so that `on_conflict` exists at all;
+                // naming it is the one thing it cannot be used for.
+                if updates.contains(&PLACEHOLDER_COLUMN) {
+                    return Err(coded_error("validation-failed", "erroneous column name"));
+                }
 
                 if updates.is_empty() {
                     format!(
@@ -4254,8 +4324,25 @@ fn insert_row<'life>(
                     // already there is overwritten -- "only if what I am
                     // writing is newer". It reads the existing row, which is
                     // what the statement's alias names.
-                    let condition = match spec.get("where") {
-                        Some(filter) if !filter.is_null() => {
+                    //
+                    // The update permission's own filter is ANDed into it: an
+                    // upsert that overwrites a row is an update, and a role
+                    // that may not update a row may not reach it by inserting
+                    // over it. Compiling that filter is also where a session
+                    // variable it names and the caller does not carry is
+                    // noticed -- which is the answer Hasura gives before it
+                    // writes anything.
+                    let granted = permission_filter(
+                        &context.caller,
+                        context.names,
+                        schema_name,
+                        table_name,
+                        crate::role::Verb::Update,
+                    )?;
+                    let requested = spec.get("where").filter(|f| !f.is_null()).cloned();
+                    let condition = match and_predicates(requested, granted) {
+                        Some(filter) => {
+                            let filter = &filter;
                             let type_name = context
                                 .type_names
                                 .get(&(schema_name.to_string(), table_name.to_string()))
@@ -4281,7 +4368,7 @@ fn insert_row<'life>(
                             .map(|sql| format!(" WHERE {}", sql))
                             .unwrap_or_default()
                         }
-                        _ => String::new(),
+                        None => String::new(),
                     };
                     format!(
                         " ON CONFLICT ON CONSTRAINT {} DO UPDATE SET {}{}",
@@ -8370,6 +8457,106 @@ mod tests {
             eprintln!("Schema build error: {:?}", e);
         }
         assert!(result.is_ok(), "Schema build failed: {:?}", result.err());
+    }
+
+    /// A role granted `insert` and no `select` gets the write and no type.
+    ///
+    /// Hasura's own corpus does this eight times over. What has to hold is
+    /// that the schema still builds: `insert_users` is there, `users` is not,
+    /// and the response the insert answers with has no `returning` to name a
+    /// type that does not exist.
+    #[test]
+    fn a_table_a_role_may_only_write_gets_the_write_and_no_type() {
+        let cache = create_test_schema_cache();
+        let names = crate::names::NameOverrides::parse(
+            r#"{"tables": {"public.users": {"permissions":
+                 {"writer": {"insert": {"columns": "*", "check": {}}}}}}}"#,
+        )
+        .unwrap();
+        let view = crate::role::cache_for_role(&cache, &names, "writer", false);
+        let config = SchemaConfig {
+            names: names.clone(),
+            role: Some("writer".to_string()),
+            ..SchemaConfig::default()
+        };
+        let generated = build_schema(&view, &config);
+
+        let schema = build_dynamic_schema(
+            &generated,
+            &view,
+            None,
+            None,
+            Arc::new(names),
+            std::time::Duration::from_secs(30),
+            Some("writer"),
+        )
+        .expect("a role that may only write still has a buildable schema");
+        let sdl = schema.sdl();
+
+        assert!(sdl.contains("insert_users("), "the write is there:\n{}", sdl);
+        assert!(sdl.contains("users_insert_input"), "and its input:\n{}", sdl);
+        // No row type, and so none of the three fields that answer with one.
+        assert!(!sdl.contains("type users "), "no row type:\n{}", sdl);
+        assert!(!sdl.contains("insert_users_one"), "no insert_one:\n{}", sdl);
+        assert!(!sdl.contains("returning"), "and nothing to return:\n{}", sdl);
+        assert!(
+            sdl.contains("users_mutation_response"),
+            "the count is still answered:\n{}",
+            sdl
+        );
+        assert!(
+            !sdl.contains("_mutation_response_mutation_response"),
+            "and no type is named twice over:\n{}",
+            sdl
+        );
+    }
+
+    /// A column the role may write and not read is in the input and not in the
+    /// type. The two column sets are the point: one schema cache, two answers.
+    #[test]
+    fn a_column_a_role_may_set_without_seeing_is_in_the_input_alone() {
+        let cache = create_test_schema_cache();
+        let names = crate::names::NameOverrides::parse(
+            r#"{"tables": {"public.users": {"permissions":
+                 {"user": {"select": {"columns": ["id"], "filter": {}},
+                           "insert": {"columns": "*", "check": {}}}}}}}"#,
+        )
+        .unwrap();
+        let view = crate::role::cache_for_role(&cache, &names, "user", false);
+        let config = SchemaConfig {
+            names: names.clone(),
+            role: Some("user".to_string()),
+            ..SchemaConfig::default()
+        };
+        let generated = build_schema(&view, &config);
+        let object = &generated.object_types["users"];
+        assert_eq!(
+            object.fields.iter().map(|f| f.name.as_str()).collect::<Vec<_>>(),
+            vec!["id"],
+            "the type shows what may be read"
+        );
+        assert!(
+            object.writable_fields.iter().any(|f| f.name == "name"),
+            "and the input keeps what may be written"
+        );
+
+        let schema = build_dynamic_schema(
+            &generated,
+            &view,
+            None,
+            None,
+            Arc::new(names),
+            std::time::Duration::from_secs(30),
+            Some("user"),
+        )
+        .expect("schema builds");
+        let sdl = schema.sdl();
+        let input = sdl
+            .split("input users_insert_input")
+            .nth(1)
+            .and_then(|rest| rest.split('}').next())
+            .expect("the insert input is registered");
+        assert!(input.contains("name:"), "settable without being readable");
     }
 
     #[test]

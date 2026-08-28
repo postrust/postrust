@@ -3,9 +3,9 @@
 //! Hasura builds a separate GraphQL schema for every role, and the difference
 //! between them is not cosmetic. A role with no `select` permission on a table
 //! does not get a table it is refused access to -- it gets a schema with no
-//! such field in it, and naming one is a validation failure rather than a
-//! denial. The same goes one level down: a column outside the permission is
-//! absent from the type, not merely null.
+//! such field to read it by, and naming one is a validation failure rather
+//! than a denial. The same goes one level down: a column outside the
+//! permission is absent from the type, not merely null.
 //!
 //! That shape is what the corpus tests. `artist_select_query_Track_fail.yaml`
 //! expects `field "Track" not found in type: 'query_root'`, which no amount of
@@ -25,14 +25,36 @@
 //! places a name is emitted -- has to be right every time, and is wrong the
 //! moment someone adds a place. This has to be right once.
 //!
-//! What a cache cannot express is carried on [`SchemaConfig`] instead, and
-//! there is one such thing: `allow_aggregations`, which is a fact about a
-//! permission rather than about a table.
+//! # The one thing a cache cannot hold: two column sets
+//!
+//! Hasura grants reading and writing separately, so a role may be allowed to
+//! set a column it is not allowed to see -- ten permissions in the corpus do
+//! -- and may be allowed to write a table it cannot read at all, which eight
+//! more do. A schema cache has one column list per table and no place to say
+//! which half of it is which.
+//!
+//! The union goes in the cache, and the split is made once, where the object
+//! type's fields are built: [`crate::schema::object::TableObjectType::fields`]
+//! is what may be read and `writable_fields` is what may be written. That
+//! keeps the property above -- everything a read is made of (the type, its
+//! boolean expression, its ordering, its column enum, its aggregates) is
+//! derived from `fields` and narrows with it, and the write inputs are built
+//! from the other list and narrowed again by the permission that names them.
+//!
+//! A table with no readable field is the limit of that: it has no GraphQL type
+//! at all, because a type with no fields is not a legal one. Its bulk writes
+//! remain and answer with `affected_rows` alone -- there is no `returning` to
+//! hang rows on -- and everything that would return a row of it (the query
+//! roots, `insert_one`, the `_by_pk` writes, a relationship pointing at it, a
+//! function returning it) is left out with the type.
+//!
+//! What is left over goes on [`SchemaConfig`]: `allow_aggregations`, which is
+//! a fact about a permission rather than about a table.
 //!
 //! [`SchemaConfig`]: crate::schema::SchemaConfig
 
 use crate::names::NameOverrides;
-use postrust_core::schema_cache::SchemaCache;
+use postrust_core::schema_cache::{SchemaCache, Table};
 
 /// Reduce a schema cache to what one role may see.
 ///
@@ -53,53 +75,13 @@ pub fn cache_for_role(
             // play that is a statement, not a silence: the role cannot see it.
             return false;
         };
-        let Some(select) = &granted.select else {
-            // Reading is what makes a table exist here.
-            //
-            // Hasura is looser: a role may insert into a table it cannot read,
-            // and 6 permissions in its corpus do exactly that. Reproducing it
-            // means two column sets per table -- one for the type, one for the
-            // input -- where a schema cache has one, and until the write
-            // permissions are compiled there is nothing to hang the second on.
-            //
-            // So this is deliberately the stricter reading, in the direction
-            // that withholds: such a role loses the write rather than gaining
-            // a readable column. Recorded rather than pretended, and the
-            // corpus cases it costs are counted.
-            return false;
-        };
 
-        // A permission granting no columns is not a narrower view of the
-        // table; it is no view of it. A GraphQL type with no fields is not a
-        // legal type, and the enum of its columns is not a legal enum, so
-        // there is nothing to build and the role is told the table is not
-        // there -- which is the same answer, in the direction that withholds.
-        if select.columns.is_empty() {
-            return false;
-        }
-
-        // The columns the role may see. Everything else is not merely
-        // unreadable but absent, which is what makes this a schema question.
+        // Which of the four grants apply, decided before the columns because
+        // the columns depend on the answer.
         //
-        // The same one-column-set limit as above, and the same direction: 27
-        // permissions in the corpus name a write column the role cannot read,
-        // and here such a column is not writable either. Narrower than Hasura,
-        // never wider.
-        table.columns.retain(|name, _| select.columns.allows(name));
-
-        // A computed field runs a function over the whole row, so it can
-        // answer questions the column list was written to prevent. Hasura
-        // grants them one at a time and grants none by default.
-        table
-            .computed_columns
-            .retain(|name, _| select.computed_fields.iter().any(|f| f == name));
-
-        // A write the role was not granted is a root field that does not
-        // exist, and the builders already gate on these three.
-        //
-        // `backend_only` narrows it once more: such an insert is reachable
-        // only by a caller that proved it holds the admin secret and asked for
-        // it by name, so for everyone else the field is not there at all --
+        // `backend_only` narrows the insert once more: such a field is
+        // reachable only by a caller that proved it holds the admin secret and
+        // asked for it by name, so for everyone else it is not there at all --
         // which is the point of the flag. A client must not be able to reach
         // it by naming a role.
         table.insertable = table.insertable
@@ -109,23 +91,110 @@ pub fn cache_for_role(
                 .is_some_and(|insert| backend || !insert.backend_only);
         table.updatable = table.updatable && granted.update.is_some();
         table.deletable = table.deletable && granted.delete.is_some();
+        let writes = table.insertable || table.updatable || table.deletable;
 
-        true
+        // Reading is not what makes a table exist here, and that is the whole
+        // of this change. Hasura lets a role write a table it cannot read, and
+        // eight permissions in its corpus do exactly that: `insert_account`
+        // for `user`, `insert_leads` for `sales`, `insert_author` for
+        // `student`. Such a mutation answers `affected_rows` and has no
+        // `returning` to hang rows on, because there is no type to read the
+        // written row out of.
+        if granted.select.is_none() && !writes {
+            return false;
+        }
+
+        // The columns the role may read, together with the ones it may write
+        // without reading. Everything else is not merely unreadable but
+        // absent, which is what makes a permission a statement about the
+        // schema rather than about a request.
+        //
+        // This is the one place both column sets are held at once, and the
+        // reason they can be: a schema cache has a single column list, so the
+        // union goes in it and the narrower read set is applied once, where
+        // the object type's fields are built. Everything a read is made of --
+        // the type, its boolean expression, its ordering, its column enum, its
+        // aggregates -- is derived from those fields and narrows with them.
+        // The write inputs are built from the union instead and narrowed again
+        // by the write permission that names them.
+        let (insertable, updatable) = (table.insertable, table.updatable);
+        table.columns.retain(|name, _| {
+            let read = granted
+                .select
+                .as_ref()
+                .is_some_and(|select| select.columns.allows(name));
+            let written = insertable
+                && granted
+                    .insert
+                    .as_ref()
+                    .is_some_and(|insert| insert.columns.allows(name))
+                || updatable
+                    && granted
+                        .update
+                        .as_ref()
+                        .is_some_and(|update| update.columns.allows(name));
+            read || written
+        });
+
+        // A computed field runs a function over the whole row, so it can
+        // answer questions the column list was written to prevent. Hasura
+        // grants them one at a time and grants none by default -- and grants
+        // none at all to a role that cannot read the table, since there is
+        // nowhere for the answer to appear.
+        table.computed_columns.retain(|name, _| {
+            granted
+                .select
+                .as_ref()
+                .is_some_and(|select| select.computed_fields.iter().any(|f| f == name))
+        });
+
+        // Nothing to read and nothing to write is nothing at all: the role is
+        // told the table is not there, which is the same answer in the
+        // direction that withholds. A select permission naming no columns and
+        // granting no computed field is the case this catches -- Hasura keeps
+        // such a table for the sake of `count`, and that is recorded as open
+        // rather than pretended.
+        !table.columns.is_empty() || !table.computed_columns.is_empty() || writes
     });
 
-    // A relationship whose other end the role cannot see is not a field it
-    // gets a null for -- there is nothing to name it after. Both ends are
-    // checked: the map is keyed by the source, and the target may have gone
-    // even where the source stayed.
+    // A relationship whose other end the role cannot *read* is not a field it
+    // gets a null for -- there is nothing to name it after, because a table
+    // this role may only write has no type. Both ends are checked: the map is
+    // keyed by the source, and the target may have gone even where the source
+    // stayed.
+    let readable: std::collections::HashSet<_> = view
+        .tables
+        .iter()
+        .filter(|(_, table)| {
+            names
+                .permissions(&table.schema, &table.name, role)
+                .is_some_and(|granted| reads_anything(granted, table))
+        })
+        .map(|(key, _)| key.clone())
+        .collect();
     view.relationships.retain(|(source, _), links| {
         if !view.tables.contains_key(source) {
             return false;
         }
-        links.retain(|link| view.tables.contains_key(link.foreign_table()));
+        links.retain(|link| readable.contains(link.foreign_table()));
         !links.is_empty()
     });
 
     view
+}
+
+/// Whether this role can read anything of this table at all.
+///
+/// The question a relationship target has to answer, and the question that
+/// decides whether the table gets a GraphQL type: a role with a write grant
+/// and no select permission keeps the table in the cache, and a type with no
+/// fields is not a legal type. Asked of an already-reduced table, so the
+/// computed fields it still carries are the granted ones.
+pub fn reads_anything(granted: &crate::names::RolePermissions, table: &Table) -> bool {
+    let Some(select) = &granted.select else {
+        return false;
+    };
+    !table.computed_columns.is_empty() || table.columns.keys().any(|name| select.columns.allows(name))
 }
 
 /// Whether any of this role's permissions is reachable only by a backend.
@@ -687,6 +756,10 @@ mod tests {
                     },
                     "reader": {
                         "select": {"columns": "*", "filter": {}}
+                    },
+                    "narrow": {
+                        "select": {"columns": ["id", "title"], "filter": {}},
+                        "insert": {"columns": ["title"], "check": {}}
                     }
                 }
             },
@@ -722,6 +795,24 @@ mod tests {
 
     #[test]
     fn a_column_outside_the_permission_is_absent_rather_than_null() {
+        // `narrow` reads id and title and writes title. `content` is named by
+        // neither, so it is not in the cache under any heading.
+        let view = cache_for_role(
+            &cache(vec![table("article", &["id", "title", "content"])]),
+            &names(),
+            "narrow",
+            false,
+        );
+        let article = &view.tables[&QualifiedIdentifier::new("public", "article")];
+        assert!(article.has_column("title"));
+        assert!(!article.has_column("content"));
+    }
+
+    #[test]
+    fn a_column_the_role_may_write_and_not_read_is_kept_for_the_write() {
+        // `user` reads id and title and inserts every column. `content` is in
+        // the cache because the insert names it -- the read half is taken out
+        // where the object type's fields are built, not here.
         let view = cache_for_role(
             &cache(vec![table("article", &["id", "title", "content"])]),
             &names(),
@@ -729,8 +820,7 @@ mod tests {
             false,
         );
         let article = &view.tables[&QualifiedIdentifier::new("public", "article")];
-        assert!(article.has_column("title"));
-        assert!(!article.has_column("content"));
+        assert!(article.has_column("content"));
     }
 
     #[test]
@@ -792,10 +882,10 @@ mod tests {
     }
 
     #[test]
-    fn a_table_that_can_only_be_written_is_withheld_rather_than_half_built() {
-        // `writer` may insert and not read. Hasura exposes the insert; here
-        // the table has no readable columns to build a type from, and the
-        // stricter answer is the one that withholds. See `cache_for_role`.
+    fn a_table_that_can_only_be_written_keeps_the_write_and_gets_no_type() {
+        // `writer` may insert and not read. The table stays, with the columns
+        // the insert may name and nothing to read them back with: nothing this
+        // role asks can produce a row of it.
         let names = NameOverrides::parse(
             r#"{"tables": {"public.article": {"permissions":
                  {"writer": {"insert": {"columns": "*", "check": {}}}}}}}"#,
@@ -807,7 +897,52 @@ mod tests {
             "writer",
             false,
         );
-        assert!(view.tables.is_empty());
+        let article = &view.tables[&QualifiedIdentifier::new("public", "article")];
+        assert!(article.insertable);
+        assert!(!article.updatable);
+        assert!(!article.deletable);
+        assert!(article.has_column("id"));
+        let granted = names.permissions("public", "article", "writer").unwrap();
+        assert!(!reads_anything(granted, article));
+    }
+
+    #[test]
+    fn a_relationship_pointing_at_a_table_the_role_may_only_write_is_dropped() {
+        // There is nothing to name such a field after: the far side has no
+        // type, and naming one that was never registered is a schema that will
+        // not build.
+        let names = NameOverrides::parse(
+            r#"{"tables": {
+                 "public.article": {"permissions":
+                   {"writer": {"select": {"columns": "*", "filter": {}}}}},
+                 "public.author": {"permissions":
+                   {"writer": {"insert": {"columns": "*", "check": {}}}}}}}"#,
+        )
+        .unwrap();
+        let mut base = cache(vec![table("article", &["id"]), table("author", &["id"])]);
+        base.relationships.insert(
+            (
+                QualifiedIdentifier::new("public", "article"),
+                "public".to_string(),
+            ),
+            vec![postrust_core::schema_cache::Relationship::ForeignKey {
+                table: QualifiedIdentifier::new("public", "article"),
+                foreign_table: QualifiedIdentifier::new("public", "author"),
+                is_self: false,
+                cardinality: postrust_core::schema_cache::Cardinality::M2O {
+                    constraint: "article_author_id_fkey".to_string(),
+                    columns: vec![("author_id".to_string(), "id".to_string())],
+                },
+                table_is_view: false,
+                foreign_table_is_view: false,
+                constraint_name: "article_author_id_fkey".to_string(),
+            }],
+        );
+        let view = cache_for_role(&base, &names, "writer", false);
+        assert!(view
+            .tables
+            .contains_key(&QualifiedIdentifier::new("public", "author")));
+        assert!(view.relationships.is_empty());
     }
 
     fn session(pairs: &[(&str, &str)]) -> HashMap<String, String> {

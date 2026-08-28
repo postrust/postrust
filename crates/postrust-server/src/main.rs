@@ -300,14 +300,25 @@ async fn main() -> Result<()> {
             /// several root fields in one mutation is for.
             async fn handle_graphql(
                 AxumState(app_state): AxumState<GraphQLAppState>,
+                // Which of the three addresses this arrived at. The routes are
+                // nested, so the request's own path is `/` by the time it gets
+                // here and the original is the only thing that still says.
+                axum::extract::OriginalUri(uri): axum::extract::OriginalUri,
                 headers: HeaderMap,
                 req: GqlRequest,
             ) -> (axum::http::StatusCode, Json<serde_json::Value>) {
+                // The status a refused write is answered with belongs to the
+                // endpoint rather than to the refusal: `/v1alpha1/graphql`
+                // reports it in the transport and `/v1/graphql` does not.
+                let endpoint = match uri.path().starts_with("/v1alpha1/") {
+                    true => postrust_graphql::hasura::Endpoint::Legacy,
+                    false => postrust_graphql::hasura::Endpoint::Current,
+                };
                 match req.0 {
                     async_graphql::BatchRequest::Single(request) => {
                         let body = one_graphql(app_state, headers, request).await;
                         let status = axum::http::StatusCode::from_u16(
-                            postrust_graphql::hasura::status_for(&body),
+                            postrust_graphql::hasura::status_for(&body, endpoint),
                         )
                         .unwrap_or(axum::http::StatusCode::OK);
                         (status, Json(body))

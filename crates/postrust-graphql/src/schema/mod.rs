@@ -11,7 +11,7 @@ use crate::input::mutation::{is_deletable, is_insertable, is_updatable};
 use crate::schema::object::TableObjectType;
 use crate::schema::relationship::RelationshipField;
 use postrust_core::schema_cache::{SchemaCache, Table};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 /// Configuration for schema generation.
 #[derive(Debug, Clone)]
@@ -784,6 +784,10 @@ pub fn build_schema(schema_cache: &SchemaCache, config: &SchemaConfig) -> Genera
         );
     }
 
+    // The tables this role may read, by base name. Needed after the loop, by
+    // anything that would answer with a row of one.
+    let mut readable_bases: HashSet<String> = HashSet::new();
+
     for table in tables {
         let base_name = base_names
             .get(&(table.schema.clone(), table.name.clone()))
@@ -792,6 +796,24 @@ pub fn build_schema(schema_cache: &SchemaCache, config: &SchemaConfig) -> Genera
 
         // Create object type
         let mut obj_type = TableObjectType::from_table_named(table, &base_name, &config.names);
+        // Whether this role can read the table at all. A table it may only
+        // write has no GraphQL type -- a type with no fields is not a legal
+        // one -- so nothing that would return that type is generated: no query
+        // root, no `_by_pk`, no `insert_one`. The bulk write stays, and
+        // answers with the count alone.
+        //
+        // Asked of the permission rather than of the fields, because the
+        // fields are not split into the readable and the writable half until
+        // every rewrite below has been applied to both.
+        let readable = config.role.as_deref().is_none_or(|role| {
+            config
+                .names
+                .permissions(&table.schema, &table.name, role)
+                .is_none_or(|granted| crate::role::reads_anything(granted, table))
+        });
+        if readable {
+            readable_bases.insert(base_name.clone());
+        }
         // What each computed field takes from the caller. Read from the
         // routine, for the reason `caller_arguments` gives.
         for field in &mut obj_type.fields {
@@ -843,10 +865,12 @@ pub fn build_schema(schema_cache: &SchemaCache, config: &SchemaConfig) -> Genera
             list.aggregates =
                 crate::role::allows_aggregations(&config.names, &table.schema, &table.name, role);
         }
-        query_fields.push(list);
-        if let Some(mut by_pk) = QueryField::by_pk_named(table, &base_name) {
-            rename(&mut by_pk, "select_by_pk");
-            query_fields.push(by_pk);
+        if readable {
+            query_fields.push(list);
+            if let Some(mut by_pk) = QueryField::by_pk_named(table, &base_name) {
+                rename(&mut by_pk, "select_by_pk");
+                query_fields.push(by_pk);
+            }
         }
 
         // Add mutation fields if enabled
@@ -855,6 +879,17 @@ pub fn build_schema(schema_cache: &SchemaCache, config: &SchemaConfig) -> Genera
             fields.extend(MutationField::insert_fields_named(table, &base_name));
             fields.extend(MutationField::update_fields_named(table, &base_name));
             fields.extend(MutationField::delete_fields_named(table, &base_name));
+            // The three that answer with a row rather than with a count.
+            if !readable {
+                fields.retain(|field| {
+                    !matches!(
+                        field.mutation_type,
+                        MutationType::InsertOne
+                            | MutationType::UpdateByPk
+                            | MutationType::DeleteByPk
+                    )
+                });
+            }
             for field in &mut fields {
                 let kind = match field.mutation_type {
                     MutationType::Insert => "insert",
@@ -998,6 +1033,43 @@ pub fn build_schema(schema_cache: &SchemaCache, config: &SchemaConfig) -> Genera
         }
     }
 
+    // Split each type's fields into the half that may be read and the half
+    // that may be written. Last, so that everything above -- the computed
+    // fields' arguments, the retyping of an enum table's columns -- has been
+    // applied to the whole list before either half is taken out of it.
+    //
+    // A role may be granted a column to set that it is not granted to see, so
+    // the cache carries the union and this is where the two part company. See
+    // [`crate::role`].
+    for object in object_types.values_mut() {
+        // Taken unconditionally, even where no role narrows anything: the
+        // write inputs are built from this list, and leaving it as it was when
+        // the type was first made would leave it behind every rewrite since.
+        object.writable_fields = object.fields.clone();
+        if let Some(role) = &config.role {
+            let (schema_name, table_name) = (object.table.schema.clone(), object.table.name.clone());
+            let Some(granted) = config.names.permissions(&schema_name, &table_name, role) else {
+                continue;
+            };
+            let table = object.table.clone();
+            object.fields.retain(|field| {
+                let column = config
+                    .names
+                    .column_source(&schema_name, &table_name, &field.name)
+                    .unwrap_or(&field.name);
+                match table.get_column(column) {
+                    // A computed field rather than a column, and those were
+                    // reduced to the granted ones with the cache.
+                    None => true,
+                    Some(_) => granted
+                        .select
+                        .as_ref()
+                        .is_some_and(|select| select.columns.allows(column)),
+                }
+            });
+        }
+    }
+
     // Functions that answer with rows of a table it already exposes. One
     // returning anything else has no type here to return: a scalar-returning
     // function is not a root field, it is an RPC, which the REST surface
@@ -1041,6 +1113,12 @@ pub fn build_schema(schema_cache: &SchemaCache, config: &SchemaConfig) -> Genera
             let Some(((target_schema, target_table), base)) = found else {
                 continue;
             };
+            // A function returning rows of a table this role cannot read has
+            // nowhere to put them: that table has no GraphQL type, and naming
+            // one that was never registered is a schema that will not build.
+            if !readable_bases.contains(base) {
+                continue;
+            }
             let target = (target_schema.clone(), target_table.clone());
 
             function_fields.push(FunctionField {

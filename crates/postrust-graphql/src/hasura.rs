@@ -17,17 +17,22 @@
 //! switches on to tell a permission failure from a constraint violation, and
 //! the message text is only for a human.
 //!
-//! The status code is 200 for almost all of this. Of the 468 cases in Hasura's
-//! own corpus that this server is measured against, 465 expect 200 --
+//! The status code is 200 for almost all of this: a GraphQL error is a value
+//! in the response body, not a transport failure. Of the 468 cases in Hasura's
+//! own corpus that this server is measured against, 465 answer 200 --
 //! including every constraint violation, every refusal to authenticate, and
-//! all but one kind of permission failure. A GraphQL error is a value in the
-//! response body, not a transport failure.
+//! every permission failure at `/v1/graphql`.
 //!
-//! The exception is narrow enough to be worth stating exactly: a write refused
-//! by the `check` of an insert or update permission is answered 400. Not
-//! `permission-error` in general -- four cases carry that code with a 200 --
-//! but that one failure, which Hasura raises while executing a mutation rather
-//! than while resolving a schema. [`status_for`] is the whole rule.
+//! The exception belongs to the *endpoint*, not to the error. All three cases
+//! that answer 400 were sent to `/v1alpha1/graphql`, the address Hasura served
+//! before `/v1`, and all three are a write refused by the `check` of an insert
+//! or update permission. The same refusal at `/v1/graphql` is a 200. Five
+//! cases prove the second half: identical bodies, identical codes, different
+//! status, and the only thing that differs is where they were sent.
+//!
+//! This was read out of the corpus's declared statuses once and read wrongly:
+//! taking it for a rule about the error meant answering 400 at `/v1/graphql`,
+//! which is three cases' worth of wrong. [`status_for`] takes the endpoint.
 
 use async_graphql::{Response, ServerError};
 use serde_json::{json, Map, Value};
@@ -153,12 +158,28 @@ pub fn envelope(response: Response) -> Value {
     Value::Object(body)
 }
 
+/// Which address the request came in on.
+///
+/// The only thing that decides a status here, so it is passed rather than
+/// guessed. `/api/graphql` is this server's own name for the endpoint and
+/// follows `/v1`, which is what a client pointed at it expects.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Endpoint {
+    /// `/v1/graphql` and `/api/graphql`: every answer is a 200.
+    Current,
+    /// `/v1alpha1/graphql`: a check refused by a permission is a 400.
+    Legacy,
+}
+
 /// The HTTP status a body is answered with.
 ///
-/// 200 unless the body reports a write refused by a permission's `check`. See
-/// the note at the top of this module for why that one error is different, and
-/// why the code alone does not decide it.
-pub fn status_for(body: &Value) -> u16 {
+/// 200, unless a write refused by a permission's `check` reached the legacy
+/// endpoint. See the note at the top of this module: the status belongs to the
+/// address, and the same refusal at `/v1/graphql` is a 200.
+pub fn status_for(body: &Value, endpoint: Endpoint) -> u16 {
+    if endpoint == Endpoint::Current {
+        return 200;
+    }
     let refused = body
         .get("errors")
         .and_then(Value::as_array)
@@ -208,13 +229,18 @@ mod tests {
         // on it: this one error is 400 and every other refusal is 200.
         let refused = json!({"errors": [{"message": crate::role::CHECK_FAILED,
                                          "extensions": {"code": "permission-error"}}]});
-        assert_eq!(status_for(&refused), 400);
+        assert_eq!(status_for(&refused, Endpoint::Legacy), 400);
+        // The same refusal at the address a Hasura client actually uses.
+        assert_eq!(status_for(&refused, Endpoint::Current), 200);
 
         // The same code, a different error: four cases in the corpus.
         let denied = json!({"errors": [{"message": "not allowed",
                                         "extensions": {"code": "permission-error"}}]});
-        assert_eq!(status_for(&denied), 200);
-        assert_eq!(status_for(&json!({"data": {"article": []}})), 200);
+        assert_eq!(status_for(&denied, Endpoint::Legacy), 200);
+        assert_eq!(
+            status_for(&json!({"data": {"article": []}}), Endpoint::Legacy),
+            200
+        );
     }
 
     #[test]
