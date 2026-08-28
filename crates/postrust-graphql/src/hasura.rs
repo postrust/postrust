@@ -1002,6 +1002,13 @@ impl Usage<'_> {
                         // writing the argument.
                         let expected = relax(&argument.ty, argument.default_value.is_some());
                         let at = format!("{}.args.{}", here, name.node);
+                        self.rows_asked_for(
+                            name.node.as_str(),
+                            &value.node,
+                            &expected,
+                            value.pos,
+                            &at,
+                        );
                         self.value(&value.node, &expected, value.pos, &at);
                     }
                     self.directives(&field.node.directives, &here);
@@ -1186,6 +1193,62 @@ impl Usage<'_> {
 }
 
 impl Usage<'_> {
+    /// How many rows a query asked for, which `Int` alone does not say.
+    ///
+    /// `limit` is typed `Int` in the schema either server publishes and is not
+    /// any `Int`: a page of -1 rows is not a page, and Hasura refuses it
+    /// before the query is built rather than letting `LIMIT must not be
+    /// negative` come back from the database. A string is refused there too,
+    /// even one that reads as a number.
+    ///
+    /// `offset` is *not* the same rule, and that asymmetry is Hasura's rather
+    /// than an omission here: its own corpus sends `offset: "1"` and expects
+    /// rows back, and sends `offset: -1` and expects PostgreSQL's own
+    /// `OFFSET must not be negative`. So this is about the argument named
+    /// `limit` and nothing else.
+    fn rows_asked_for(
+        &mut self,
+        argument: &str,
+        value: &async_graphql_value::Value,
+        expected: &str,
+        pos: async_graphql::Pos,
+        path: &str,
+    ) {
+        use async_graphql::registry::MetaTypeName;
+        use async_graphql_value::Value;
+
+        if argument != "limit" || MetaTypeName::concrete_typename(expected) != "Int" {
+            return;
+        }
+        // Through a variable, what matters is the value it stands for.
+        let value = match value {
+            Value::Variable(name) => {
+                match self.variables.get(&async_graphql::Name::new(name.as_str())) {
+                    Some(given) => std::borrow::Cow::Owned(given.clone().into()),
+                    None => return,
+                }
+            }
+            other => std::borrow::Cow::Borrowed(other),
+        };
+
+        let found = match value.as_ref() {
+            Value::String(_) => "a string",
+            Value::Number(number) => match number.as_u64().is_some_and(|n| n <= u32::MAX as u64) {
+                true => return,
+                false => "an integer",
+            },
+            _ => return,
+        };
+        self.errors.push(coded(
+            format!(
+                "expected a non-negative 32-bit integer for type 'Int', but found {}",
+                found
+            ),
+            pos,
+            path,
+        ));
+    }
+
     /// A value written where an `ltree` is expected, as a label path.
     ///
     /// PostgreSQL refuses `Tree.Collections.` with `ltree syntax error` and
@@ -1513,6 +1576,37 @@ mod variable_position_tests {
             ),
             vec!["$.selectionSet.insert_author.args.objects[1].name"]
         );
+    }
+
+    /// `limit` is typed `Int` and is not any `Int`, and `offset` is -- which
+    /// is Hasura's asymmetry, not an omission.
+    #[test]
+    fn a_limit_is_a_number_of_rows_and_not_any_integer() {
+        let refused = |q: &str| refusals(q, "{}");
+        assert_eq!(
+            refused("{ author(limit: -1) { id } }"),
+            vec!["expected a non-negative 32-bit integer for type 'Int', but found an integer"]
+        );
+        assert_eq!(
+            refused("{ author(limit: \"3\") { id } }"),
+            vec!["expected a non-negative 32-bit integer for type 'Int', but found a string"]
+        );
+        assert_eq!(
+            refusals_with_paths("{ author(limit: -1) { id } }", "{}"),
+            vec!["$.selectionSet.author.args.limit"]
+        );
+        // A variable is the value it stands for.
+        assert_eq!(
+            refusals(
+                "query ($n: Int) { author(limit: $n) { id } }",
+                r#"{"n": -1}"#
+            ),
+            vec!["expected a non-negative 32-bit integer for type 'Int', but found an integer"]
+        );
+        // Zero is a number of rows. So is a large one, up to 32 bits.
+        assert!(refused("{ author(limit: 0) { id } }").is_empty());
+        assert!(refused("{ author(limit: 4294967295) { id } }").is_empty());
+        assert!(refused("{ author(limit: null) { id } }").is_empty());
     }
 
     /// A quoted enum value is a mistake about the language; an unquoted one
