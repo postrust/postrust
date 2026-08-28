@@ -466,13 +466,22 @@ async fn main() -> Result<()> {
                 // A role may be told it cannot read the schema as data. Not a
                 // permission on a table, so it is not settled by which schema
                 // answers -- the schema is the thing being withheld.
-                let introspection_disabled_for = hasura_role.as_deref().filter(|role| {
-                    app_state
-                        .gql_state
-                        .config
-                        .names
-                        .introspection_disabled(role)
-                });
+                //
+                // Not withheld from a caller holding the admin secret, whatever
+                // role it then names. That is measured rather than assumed: a
+                // v2.50.1 reference given `set_graphql_schema_introspection_
+                // options` answers `__schema` for the named role when the
+                // secret is sent beside the role header, and answers it from
+                // that role's own restricted schema. Reading the schema is an
+                // administrator's to do; the permissions still apply to it.
+                let introspection_disabled_for =
+                    hasura_role.as_deref().filter(|_| !elevated).filter(|role| {
+                        app_state
+                            .gql_state
+                            .config
+                            .names
+                            .introspection_disabled(role)
+                    });
                 let prepared = postrust_graphql::hasura::prepare(
                     Some(schema),
                     req,
