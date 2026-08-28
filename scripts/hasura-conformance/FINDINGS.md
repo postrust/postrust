@@ -8,9 +8,9 @@ harness itself, divergences kept on purpose, and the gaps still open.
 
 | | status | same outcome | same data | full body |
 |---|---|---|---|---|
-| all (468) | 100.0% | 96.2% | **92.5%** | 88.2% |
-| reads (271) | 100.0% | 94.8% | 88.6% | 86.3% |
-| writes (197) | 100.0% | 98.0% | **98.0%** | 90.9% |
+| all (468) | 100.0% | 96.2% | **92.5%** | 89.3% |
+| reads (271) | 100.0% | 94.8% | 88.6% | 87.5% |
+| writes (197) | 100.0% | 98.0% | **98.0%** | 91.9% |
 
 Of the 433 cases the third column counts, **304 agree about data and 129 agree
 only because both servers answered with errors.** A further 2 are cases where
@@ -68,10 +68,10 @@ Where the remaining 35 divergences are:
 Each is named in the open list rather than attributed to one missing
 subsystem.
 
-The fourth column has moved on its own for five runs since: what an error
+The fourth column has moved on its own for six runs since: what an error
 says, and where it says it happened. 311 bodies matched entirely before those
-runs and 413 do now, with the other three columns unchanged the whole way --
-which is what a change to error text should look like. 20 cases are left in
+runs and 418 do now, with the other three columns unchanged the whole way --
+which is what a change to error text should look like. 15 cases are left in
 the gap between the third column and the fourth, down from 101.
 
 The five runs before those moved nineteen cases between them and moved nothing
@@ -278,13 +278,16 @@ wrong one.
 
 ## Open, ordered by consequence
 
-1. **What is left of the error text: 20 cases, and no two alike.** The
+1. **What is left of the error text: 15 cases, and no two alike.** The
    families are gone; what remains is one-offs. Hasura names a computed
    field's absence from a boolean expression where this server calls the
-   function and finds it missing; it reads a header's boolean text itself. Six
-   more differ in how many errors they answer with rather than in what any of
-   them says, and four are cases where Hasura has no mutation root and this
-   server does, so the two are refusing genuinely different things.
+   function and finds it missing; it reads a header's boolean text itself; it
+   refuses two operators naming one column where this server lets PostgreSQL
+   refuse the statement; and it reports a duplicate key against the constraint
+   the row conflicts with first, which is not the one PostgreSQL names. Four
+   are cases where Hasura has no mutation root and this server does, so the
+   two are refusing genuinely different things -- the largest group left, and
+   not a wording question at all.
 
    A pattern worth naming, since seven of the fixes above share it: Hasura
    reads a value against what the column will do with it *before* the
@@ -432,6 +435,24 @@ wrong one.
   with no members reached through an argument. 286 -> 290 real agreements, and
   the status column to 100%.
 
+
+- **A request is refused once, however many faults it has.** In 468 replayed
+  cases Hasura never answered with a second error. It validates a request the
+  way a parser reads one -- it stops where it cannot go on -- so a query
+  naming two fields that do not exist is refused for the first of them, and an
+  `on_conflict` carrying an unknown key beside a missing required one is
+  refused for the key.
+
+  This server reported everything the walk found, which is the more useful
+  answer and the wrong one here: a client written against Hasura reads
+  `errors[0]`, and the rest of the list is text it will never show. Five cases
+  differed in nothing else -- their first error already matched Hasura's
+  whole body.
+
+  The walk still runs to the end and the truncation happens where the refusal
+  is answered. Stopping the walk itself would put the stopping condition in
+  every arm of it, for no gain: the walk is over a document that has already
+  parsed.
 
 - **A column PostgreSQL generates always is in no write input.** `author.id`
   is `GENERATED ALWAYS AS IDENTITY`, which means naming it in an insert is an
