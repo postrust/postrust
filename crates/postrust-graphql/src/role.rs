@@ -187,11 +187,24 @@ pub fn cache_for_role(
         })
         .map(|(key, _)| key.clone())
         .collect();
+    // A table whose rows are a generated enum is the exception. A column with
+    // a key to one is *typed* as that enum, and the type is not the table's
+    // data: `colors_enum` is published to a role that may not read `colors` at
+    // all, and Hasura publishes it too. The key is what says which column is
+    // typed by which enum, so it has to survive here -- and no field comes of
+    // it, since a relationship to an enum table is never exposed.
+    let enumerated: std::collections::HashSet<_> = names
+        .enum_tables()
+        .into_iter()
+        .map(|(schema, table)| postrust_core::api_request::QualifiedIdentifier::new(schema, table))
+        .collect();
     view.relationships.retain(|(source, _), links| {
         if !view.tables.contains_key(source) {
             return false;
         }
-        links.retain(|link| readable.contains(link.foreign_table()));
+        links.retain(|link| {
+            readable.contains(link.foreign_table()) || enumerated.contains(link.foreign_table())
+        });
         !links.is_empty()
     });
 
@@ -1047,6 +1060,60 @@ mod tests {
         assert!(article.has_column("id"));
         let granted = names.permissions("public", "article", "writer").unwrap();
         assert!(!reads_anything(granted, article));
+    }
+
+    /// A generated enum is a type, not the table's data. A role granted
+    /// nothing on the table still sees the enum, and still has a column typed
+    /// by it -- so the key that says which column is kept.
+    #[test]
+    fn a_key_to_an_enum_table_survives_a_role_that_cannot_read_it() {
+        let users = table("users", &["id", "favorite_color"]);
+        let colors = table("colors", &["value"]);
+        let mut base = cache(vec![users, colors]);
+        base.relationships.insert(
+            (
+                postrust_core::api_request::QualifiedIdentifier::new("public", "users"),
+                "public".to_string(),
+            ),
+            vec![postrust_core::schema_cache::Relationship::ForeignKey {
+                table: postrust_core::api_request::QualifiedIdentifier::new("public", "users"),
+                foreign_table: postrust_core::api_request::QualifiedIdentifier::new(
+                    "public", "colors",
+                ),
+                is_self: false,
+                cardinality: postrust_core::schema_cache::Cardinality::M2O {
+                    constraint: "users_favorite_color_fkey".to_string(),
+                    columns: vec![("favorite_color".to_string(), "value".to_string())],
+                },
+                table_is_view: false,
+                foreign_table_is_view: false,
+                constraint_name: "users_favorite_color_fkey".to_string(),
+            }],
+        );
+
+        let names = NameOverrides::parse(
+            r#"{"tables": {
+                 "public.colors": {"enum": true},
+                 "public.users": {"permissions": {"anonymous":
+                    {"select": {"columns": "*", "filter": {}}}}}}}"#,
+        )
+        .unwrap();
+        let view = cache_for_role(&base, &names, "anonymous", false);
+
+        assert!(
+            !view
+                .tables
+                .contains_key(&postrust_core::api_request::QualifiedIdentifier::new(
+                    "public", "colors"
+                )),
+            "the table itself is not readable"
+        );
+        assert_eq!(
+            view.relationships.len(),
+            1,
+            "and the key to it is kept anyway: {:?}",
+            view.relationships
+        );
     }
 
     #[test]

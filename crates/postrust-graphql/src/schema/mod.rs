@@ -1178,8 +1178,22 @@ pub fn build_schema(schema_cache: &SchemaCache, config: &SchemaConfig) -> Genera
     let mut enum_type_of: HashMap<(String, String), String> = HashMap::new();
 
     for (schema_name, table_name) in config.names.enum_tables() {
-        let Some(base) = base_names.get(&(schema_name.clone(), table_name.clone())) else {
-            continue;
+        // A role that may not read the table's rows still sees the enum. The
+        // values are a *type*, and a column typed by it is readable -- Hasura
+        // publishes `colors_enum` to a role granted nothing on `colors`, and
+        // the query `where: {favorite_color: {_eq: red}}` is one it answers.
+        // So the name is derived rather than looked up, since a table the
+        // role cannot read has no entry to look up.
+        let base = match base_names.get(&(schema_name.clone(), table_name.clone())) {
+            Some(found) => found.clone(),
+            None => config
+                .names
+                .base_name(&schema_name, &table_name)
+                .map(str::to_string)
+                .unwrap_or_else(|| match schema_name == config.default_schema() {
+                    true => table_name.clone(),
+                    false => format!("{}_{}", schema_name, table_name),
+                }),
         };
         let key = format!("{}.{}", schema_name, table_name);
         let members: Vec<(String, Option<String>)> = config
