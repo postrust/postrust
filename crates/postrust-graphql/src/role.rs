@@ -148,13 +148,20 @@ pub fn cache_for_role(
                 .is_some_and(|select| select.computed_fields.iter().any(|f| f == name))
         });
 
-        // Nothing to read and nothing to write is nothing at all: the role is
-        // told the table is not there, which is the same answer in the
-        // direction that withholds. A select permission naming no columns and
-        // granting no computed field is the case this catches -- Hasura keeps
-        // such a table for the sake of `count`, and that is recorded as open
-        // rather than pretended.
-        !table.columns.is_empty() || !table.computed_columns.is_empty() || writes
+        // A select permission naming no columns at all, with
+        // `allow_aggregations`, is how Hasura grants "how many" without
+        // granting "which": the table is there to be counted and has nothing
+        // to read. It gets an aggregate root and no row type, the same shape a
+        // table this role may only write has.
+        let counts = granted
+            .select
+            .as_ref()
+            .is_some_and(|select| select.allow_aggregations);
+
+        // Nothing to read, nothing to write and nothing to count is nothing at
+        // all: the role is told the table is not there, which is the same
+        // answer in the direction that withholds.
+        !table.columns.is_empty() || !table.computed_columns.is_empty() || writes || counts
     });
 
     // A relationship whose other end the role cannot *read* is not a field it

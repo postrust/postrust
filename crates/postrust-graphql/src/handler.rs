@@ -463,9 +463,18 @@ fn build_dynamic_schema(
     }
 
     // Aggregate types: every readable table gets them, because every table has
-    // a count even when it has nothing to sum.
+    // a count even when it has nothing to sum -- and so does a table a role may
+    // count and not read, which is the whole of what such a role was granted.
+    // Read from the roots that were generated rather than worked out again,
+    // for the reason the write inputs are: two answers to one question drift.
+    let countable: HashSet<&str> = generated
+        .query_fields
+        .iter()
+        .filter(|field| field.aggregates && !field.is_by_pk)
+        .map(|field| field.type_name.as_str())
+        .collect();
     for (type_name, obj) in &generated.object_types {
-        if obj.fields.is_empty() {
+        if obj.fields.is_empty() && !countable.contains(type_name.as_str()) {
             continue;
         }
         for aggregate_type in create_aggregate_types(type_name, obj) {
@@ -1260,58 +1269,68 @@ fn create_aggregate_types(base_name: &str, object: &TableObjectType) -> Vec<Obje
 
     // `<t>_aggregate`: the rows, and the numbers about them.
     let fields_type = agg::aggregate_fields_type_name(base_name);
-    types.push(
-        Object::new(agg::aggregate_type_name(base_name))
-            .description(format!(
-                "Aggregates over {}, with the rows themselves.",
-                base_name
-            ))
-            .field(Field::new(
-                "aggregate",
-                TypeRef::named(&fields_type),
-                |ctx| FieldFuture::new(async move { Ok(child_of(&ctx, "aggregate")) }),
-            ))
-            .field(Field::new(
-                "nodes",
-                TypeRef::named_nn_list_nn(base_name.to_string()),
-                |ctx| {
-                    FieldFuture::new(async move {
-                        let rows = match child_value(&ctx, "nodes") {
-                            Some(Value::List(items)) => items,
-                            _ => Vec::new(),
-                        };
-                        Ok(Some(FieldValue::list(
-                            rows.into_iter().map(FieldValue::value),
-                        )))
-                    })
-                },
-            )),
-    );
+    // Whether there are rows to hand back beside the numbers. A role granted
+    // "how many" and not "which" has no row type, so `nodes` has nothing to be
+    // a list of.
+    let has_rows = !object.fields.is_empty();
+    let mut over = Object::new(agg::aggregate_type_name(base_name))
+        .description(match has_rows {
+            true => format!("Aggregates over {}, with the rows themselves.", base_name),
+            false => format!("Aggregates over {}.", base_name),
+        })
+        .field(Field::new(
+            "aggregate",
+            TypeRef::named(&fields_type),
+            |ctx| FieldFuture::new(async move { Ok(child_of(&ctx, "aggregate")) }),
+        ));
+    if has_rows {
+        over = over.field(Field::new(
+            "nodes",
+            TypeRef::named_nn_list_nn(base_name.to_string()),
+            |ctx| {
+                FieldFuture::new(async move {
+                    let rows = match child_value(&ctx, "nodes") {
+                        Some(Value::List(items)) => items,
+                        _ => Vec::new(),
+                    };
+                    Ok(Some(FieldValue::list(
+                        rows.into_iter().map(FieldValue::value),
+                    )))
+                })
+            },
+        ));
+    }
+    types.push(over);
 
     // `<t>_aggregate_fields`: count, and one field per function.
-    let mut aggregate_fields = Object::new(&fields_type)
-        .description(format!("Aggregate functions over {}.", base_name))
-        .field(
-            Field::new("count", TypeRef::named_nn(TypeRef::INT), |ctx| {
+    let mut count = Field::new("count", TypeRef::named_nn(TypeRef::INT), |ctx| {
                 // Read under the name it was asked for, not under `count`.
                 // Two counts of different things sit in one selection --
                 // `count` beside `distinct_authors: count(columns: [author_id],
                 // distinct: true)` -- and they are different numbers.
-                let key = ctx.ctx.field().alias().unwrap_or("count").to_string();
-                FieldFuture::new(async move {
-                    Ok(Some(FieldValue::value(
-                        child_value(&ctx, &key).unwrap_or(Value::from(0)),
-                    )))
-                })
-            })
-            // `count(columns:)` counts the rows where those columns are not
-            // null, and `distinct` counts distinct values among them.
+        let key = ctx.ctx.field().alias().unwrap_or("count").to_string();
+        FieldFuture::new(async move {
+            Ok(Some(FieldValue::value(
+                child_value(&ctx, &key).unwrap_or(Value::from(0)),
+            )))
+        })
+    });
+    // `count(columns:)` counts the rows where those columns are not null, and
+    // `distinct` counts distinct values among them. Neither is offered where
+    // the role may name no column: `count` is then a count of rows and nothing
+    // else, and the corpus tests exactly that -- `'count' has no argument
+    // named 'columns'`.
+    if has_rows {
+        count = count
             .argument(InputValue::new(
                 "columns",
                 TypeRef::named_nn_list(agg_select_column(base_name)),
             ))
-            .argument(InputValue::new("distinct", TypeRef::named("Boolean"))),
-        );
+            .argument(InputValue::new("distinct", TypeRef::named("Boolean")));
+    }
+    let mut aggregate_fields = Object::new(&fields_type)
+        .description(format!("Aggregate functions over {}.", base_name))
+        .field(count);
 
     for (function, returns, columns) in agg::functions_for(object) {
         let function_type = agg::function_fields_type_name(base_name, function);
@@ -1697,21 +1716,37 @@ impl RootField for SubscriptionField {
 /// The five arguments that narrow a set of rows, in the order Hasura lists
 /// them.
 fn with_row_arguments<F: RootField>(field: F, type_name: &str) -> F {
-    field
-        .with_argument(InputValue::new(
+    with_row_arguments_named(field, type_name, true)
+}
+
+/// The same, where `columns` says whether the table has any to name.
+///
+/// A table a role may count and not read has none: there is no column enum to
+/// order by and none to be distinct on, so those two arguments are not there
+/// -- and could not be, since the types they name are not built either. What
+/// is left still narrows the set being counted, which is the whole of what
+/// such a root is for.
+fn with_row_arguments_named<F: RootField>(field: F, type_name: &str, columns: bool) -> F {
+    let mut field = field;
+    if columns {
+        field = field.with_argument(InputValue::new(
             "distinct_on",
             TypeRef::named_nn_list(crate::input::order_by::select_column_type_name(type_name)),
-        ))
+        ));
+    }
+    field = field
         .with_argument(InputValue::new("limit", TypeRef::named("Int")))
-        .with_argument(InputValue::new("offset", TypeRef::named("Int")))
-        .with_argument(InputValue::new(
+        .with_argument(InputValue::new("offset", TypeRef::named("Int")));
+    if columns {
+        field = field.with_argument(InputValue::new(
             "order_by",
             TypeRef::named_nn_list(crate::input::order_by::order_by_type_name(type_name)),
-        ))
-        .with_argument(InputValue::new(
-            "where",
-            TypeRef::named(crate::input::bool_exp::bool_exp_type_name(type_name)),
-        ))
+        ));
+    }
+    field.with_argument(InputValue::new(
+        "where",
+        TypeRef::named(crate::input::bool_exp::bool_exp_type_name(type_name)),
+    ))
 }
 
 /// One argument per primary key column, named and typed after the column
@@ -1790,7 +1825,13 @@ fn create_query_type(
             gql_field = gql_field.description(desc);
         }
 
-        roots.push((field.name.clone(), gql_field));
+        // A table this role may count and not read has no row type, so the
+        // list root that would answer with one is not built. The entry is
+        // still here for the aggregate root below, which is what such a role
+        // was granted.
+        if field.rows {
+            roots.push((field.name.clone(), gql_field));
+        }
 
         // The same rows, with numbers about them. Same arguments as the list
         // field, because `author_aggregate(where: ...)` counts the set the
@@ -1824,7 +1865,7 @@ fn create_query_type(
                     FieldFuture::new(async move { resolve_aggregate(&ctx, &agg_spec).await })
                 },
             );
-            agg_field = with_row_arguments(agg_field, &spec_type_name);
+            agg_field = with_row_arguments_named(agg_field, &spec_type_name, field.rows);
             agg_field = match field.aggregate_description.as_deref() {
                 Some("") => agg_field,
                 Some(given) => agg_field.description(given),
@@ -2205,7 +2246,10 @@ fn create_subscription_type(
         if let Some(desc) = &field.description {
             gql_field = gql_field.description(desc);
         }
-        roots.push((field.name.clone(), gql_field));
+        // No row type, no root that answers with one -- see the query root.
+        if field.rows {
+            roots.push((field.name.clone(), gql_field));
+        }
 
         // A live query mirrors the query root, so an aggregate the role may not
         // ask for once is not one it may ask for continuously either.
@@ -2245,7 +2289,7 @@ fn create_subscription_type(
                 })
             },
         );
-        agg_field = with_row_arguments(agg_field, &spec_type_name);
+        agg_field = with_row_arguments_named(agg_field, &spec_type_name, field.rows);
         agg_field = match field.aggregate_description.as_deref() {
             Some("") => agg_field,
             Some(given) => agg_field.description(given),
@@ -8698,6 +8742,59 @@ mod tests {
         )
         .expect_err("a table that is not there is an error");
         assert!(error.message.contains("public.nowhere"), "{}", error.message);
+    }
+
+    /// A role granted "how many" and not "which" gets the count and no rows.
+    ///
+    /// A select permission naming no columns, with `allow_aggregations`, is
+    /// Hasura's way of writing that. The table has an aggregate root and no
+    /// row type, so `nodes` is not there to be a list of one -- and `count`
+    /// takes no `columns`, because there are none to name.
+    #[test]
+    fn a_table_a_role_may_count_and_not_read_has_a_count_and_no_rows() {
+        let cache = create_test_schema_cache();
+        let names = crate::names::NameOverrides::parse(
+            r#"{"tables": {"public.users": {"permissions":
+                 {"counter": {"select": {"columns": [], "filter": {},
+                                         "allow_aggregations": true}}}}}}"#,
+        )
+        .unwrap();
+        let view = crate::role::cache_for_role(&cache, &names, "counter", false);
+        assert!(
+            !view.tables.is_empty(),
+            "the table is there to be counted"
+        );
+
+        let config = SchemaConfig {
+            names: names.clone(),
+            role: Some("counter".to_string()),
+            ..SchemaConfig::default()
+        };
+        let generated = build_schema(&view, &config);
+        let schema = build_dynamic_schema(
+            &generated,
+            &view,
+            None,
+            None,
+            Arc::new(names),
+            std::time::Duration::from_secs(30),
+            Some("counter"),
+        )
+        .expect("a role that may only count still has a buildable schema");
+        let sdl = schema.sdl();
+
+        assert!(sdl.contains("users_aggregate"), "the count is there:\n{}", sdl);
+        assert!(sdl.contains("count: Int!"), "and it is a count:\n{}", sdl);
+        // No row type, so nothing that would answer with one.
+        assert!(!sdl.contains("type users "), "no row type:\n{}", sdl);
+        assert!(!sdl.contains("nodes"), "and no rows beside the numbers:\n{}", sdl);
+        assert!(
+            !sdl.contains("users_select_column"),
+            "no column enum to order by or count over:\n{}",
+            sdl
+        );
+        // The functions that read column data are absent with the columns.
+        assert!(!sdl.contains("users_max_fields"), "no max:\n{}", sdl);
     }
 
     /// A role granted `insert` and no `select` gets the write and no type.

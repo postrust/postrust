@@ -465,6 +465,14 @@ pub struct QueryField {
     /// permission says otherwise, which is what leaves an unconfigured server
     /// exactly as it was.
     pub aggregates: bool,
+    /// Whether the rows themselves can be asked for.
+    ///
+    /// False for a table a role may count and not read: Hasura's way of
+    /// granting "how many" without granting "which" is a select permission
+    /// naming no columns, and such a table has an aggregate root and no row
+    /// type to hang a list root on. The field is still carried so that the
+    /// aggregate root beside it is built.
+    pub rows: bool,
 }
 
 impl QueryField {
@@ -491,6 +499,7 @@ impl QueryField {
             aggregate_name: None,
             aggregate_description: None,
             aggregates: true,
+            rows: true,
         }
     }
 
@@ -528,6 +537,7 @@ impl QueryField {
             aggregate_name: None,
             aggregate_description: None,
             aggregates: true,
+            rows: true,
         })
     }
 }
@@ -865,8 +875,16 @@ pub fn build_schema(schema_cache: &SchemaCache, config: &SchemaConfig) -> Genera
             list.aggregates =
                 crate::role::allows_aggregations(&config.names, &table.schema, &table.name, role);
         }
-        if readable {
+        // A table with no readable field still gets its list entry when the
+        // role may count it: the aggregate root is built beside that entry
+        // rather than being one of its own, and `rows` is what says the list
+        // root itself is not there. By key there is nothing to answer with at
+        // all.
+        list.rows = readable;
+        if readable || list.aggregates {
             query_fields.push(list);
+        }
+        if readable {
             if let Some(mut by_pk) = QueryField::by_pk_named(table, &base_name) {
                 rename(&mut by_pk, "select_by_pk");
                 query_fields.push(by_pk);
