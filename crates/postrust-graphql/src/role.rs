@@ -569,6 +569,14 @@ fn rewrite(
                     _ => std::borrow::Cow::Borrowed(key.as_str()),
                 };
 
+                // A predicate over another table, so what is inside it is
+                // spelled in *that* table's names rather than in this one's.
+                // Everything else here carries the outer table down.
+                if key == "_exists" {
+                    out.insert("_exists".to_string(), rewrite_exists(child, session, names, schema)?);
+                    continue;
+                }
+
                 if key.starts_with('_') {
                     // An operator. Its operand may be a session variable, and
                     // whether that is one value or several depends on which
@@ -618,6 +626,63 @@ fn rewrite(
 
         other => Ok(other.clone()),
     }
+}
+
+/// The table `_exists` looks in, as `(schema, table)`.
+///
+/// Hasura's metadata writes the name two ways -- `_table: user` and `_table:
+/// {schema: public, name: user}` -- and its own corpus uses the first. An
+/// unqualified name is read in the schema of the table the permission is on,
+/// which is where a permission written without a schema means to look.
+pub fn exists_target(
+    spec: &serde_json::Value,
+    default_schema: &str,
+) -> Option<(String, String)> {
+    match spec.get("_table")? {
+        serde_json::Value::String(name) => Some((default_schema.to_string(), name.clone())),
+        serde_json::Value::Object(qualified) => {
+            let name = qualified.get("name").and_then(|v| v.as_str())?;
+            let schema = qualified
+                .get("schema")
+                .and_then(|v| v.as_str())
+                .unwrap_or(default_schema);
+            Some((schema.to_string(), name.to_string()))
+        }
+        _ => None,
+    }
+}
+
+/// `_exists`, rewritten so that its predicate reads against the table it names.
+///
+/// The `_table` is a name and not a predicate, so it is copied through
+/// untouched: rewriting it would read a table called `x-hasura-anything` as a
+/// session variable, and would wrap it in an `_eq` besides.
+fn rewrite_exists(
+    spec: &serde_json::Value,
+    session: &std::collections::HashMap<String, String>,
+    names: &NameOverrides,
+    default_schema: &str,
+) -> Result<serde_json::Value, String> {
+    let Some(map) = spec.as_object() else {
+        return Err("\"_exists\" takes a table and a predicate over it".to_string());
+    };
+    let Some((schema, table)) = exists_target(spec, default_schema) else {
+        return Err("\"_exists\" needs a \"_table\" to look in".to_string());
+    };
+
+    let mut out = serde_json::Map::with_capacity(2);
+    if let Some(named) = map.get("_table") {
+        out.insert("_table".to_string(), named.clone());
+    }
+    let predicate = map
+        .get("_where")
+        .cloned()
+        .unwrap_or_else(|| serde_json::json!({}));
+    out.insert(
+        "_where".to_string(),
+        rewrite(&predicate, session, names, &schema, &table, None)?,
+    );
+    Ok(serde_json::Value::Object(out))
 }
 
 /// The session variable a string names, if it names one.
@@ -943,6 +1008,45 @@ mod tests {
             .tables
             .contains_key(&QualifiedIdentifier::new("public", "author")));
         assert!(view.relationships.is_empty());
+    }
+
+    #[test]
+    fn exists_keeps_its_table_and_rewrites_its_predicate() {
+        // The table is a name, not a value: it must survive untouched, while
+        // the predicate beside it gets the session variable and the `_eq` that
+        // metadata leaves implicit.
+        let session = session(&[("user_id", "2")]);
+        let rewritten = compiled(
+            serde_json::json!({
+                "_exists": {"_table": "user",
+                            "_where": {"id": "X-Hasura-User-Id", "is_admin": true}}
+            }),
+            &session,
+        );
+        assert_eq!(
+            rewritten,
+            serde_json::json!({
+                "_exists": {"_table": "user",
+                            "_where": {"id": {"_eq": "2"},
+                                       "is_admin": {"_eq": true}}}
+            })
+        );
+    }
+
+    #[test]
+    fn exists_names_its_table_either_way() {
+        assert_eq!(
+            exists_target(&serde_json::json!({"_table": "user"}), "public"),
+            Some(("public".to_string(), "user".to_string()))
+        );
+        assert_eq!(
+            exists_target(
+                &serde_json::json!({"_table": {"schema": "auth", "name": "user"}}),
+                "public"
+            ),
+            Some(("auth".to_string(), "user".to_string()))
+        );
+        assert_eq!(exists_target(&serde_json::json!({}), "public"), None);
     }
 
     fn session(pairs: &[(&str, &str)]) -> HashMap<String, String> {

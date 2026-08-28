@@ -5595,6 +5595,18 @@ fn build_condition(
                     conditions.push(format!("NOT ({})", sql));
                 }
             }
+            // A question about a table nothing relates this one to. Only a
+            // permission writes it; no client can, because no boolean
+            // expression has the field.
+            "_exists" => {
+                conditions.push(table_exists_sql(
+                    val,
+                    scope,
+                    param_idx,
+                    values,
+                    alias_counter,
+                )?);
+            }
             // A relationship is filtered by filtering the rows at its other
             // end. `where: {articles: {title: {_eq: "x"}}}` keeps the authors
             // that have such an article -- an `EXISTS` correlated back to the
@@ -5787,6 +5799,87 @@ fn exists_sql(
         source,
         postrust_sql::escape_ident(&alias),
         correlation.join(" AND ")
+    ))
+}
+
+/// `_exists`, the predicate only a permission can write, as SQL.
+///
+/// ```json
+/// {"_exists": {"_table": "user", "_where": {"id": "X-Hasura-User-Id",
+///                                           "is_admin": true}}}
+/// ```
+///
+/// It asks whether a row exists in *another* table -- one no foreign key
+/// relates to this one. That is how Hasura writes "the caller is an
+/// administrator" without asking the caller to say so: the row that decides it
+/// lives in a table of its own, and whether the account this predicate guards
+/// is readable does not depend on which account it is.
+///
+/// So the subselect is **uncorrelated**, which is the whole difference from
+/// the `EXISTS` a relationship predicate builds. There are no key columns to
+/// join on -- if there were, the permission would have been written as a
+/// relationship -- and the `_where` is read against the named table's columns
+/// alone.
+///
+/// The caller's own permissions are not applied inside it, and that is not an
+/// oversight. The point of `_exists` is to consult a table the role has no
+/// access to: in Hasura's corpus the role that reads `account` through this
+/// predicate may not read `public.user` at all. Narrowing the subselect to
+/// what the caller may read would make the predicate refuse itself.
+fn table_exists_sql(
+    spec: &serde_json::Value,
+    scope: &WhereScope<'_>,
+    param_idx: &mut usize,
+    values: &mut Vec<serde_json::Value>,
+    alias_counter: &mut usize,
+) -> Result<String, async_graphql::Error> {
+    let Some((schema, table)) = crate::role::exists_target(spec, &scope.qualified.schema) else {
+        return Err(async_graphql::Error::new(
+            "\"_exists\" needs a \"_table\" to look in",
+        ));
+    };
+
+    // The name comes from a permission document rather than from a request,
+    // but it still reaches SQL, and a table that is not there would reach it as
+    // a syntax error at the far end rather than as an answer here.
+    let qualified = postrust_core::api_request::QualifiedIdentifier::new(&schema, &table);
+    if scope
+        .resolution
+        .as_ref()
+        .is_some_and(|r| r.cache.get_table(&qualified).is_none())
+    {
+        return Err(async_graphql::Error::new(format!(
+            "\"_exists\" names a table this server does not have: \"{}.{}\"",
+            schema, table
+        )));
+    }
+
+    *alias_counter += 1;
+    let alias = format!("pgrst_exists_{}", alias_counter);
+    // The type this table is exposed as, which is the key into the
+    // relationship map -- so a `_where` may follow the named table's own
+    // relationships, the way any other predicate over it could.
+    let type_name = scope
+        .names
+        .base_name(&schema, &table)
+        .unwrap_or(&table)
+        .to_string();
+    let mut inner = WhereScope::aliased(&schema, &table, &alias, &type_name, scope);
+    // See above: the predicate is the permission, so it is not itself
+    // subject to one.
+    inner.caller = None;
+
+    let condition = match spec.get("_where") {
+        Some(predicate) => build_condition(predicate, &inner, param_idx, values, alias_counter)?,
+        None => None,
+    };
+
+    Ok(format!(
+        "EXISTS (SELECT 1 FROM {}.{} AS {} WHERE {})",
+        postrust_sql::escape_ident(&schema),
+        postrust_sql::escape_ident(&table),
+        postrust_sql::escape_ident(&alias),
+        condition.unwrap_or_else(|| "true".to_string())
     ))
 }
 
@@ -8457,6 +8550,58 @@ mod tests {
             eprintln!("Schema build error: {:?}", e);
         }
         assert!(result.is_ok(), "Schema build failed: {:?}", result.err());
+    }
+
+    /// `_exists` becomes a subselect over the table it names, correlated with
+    /// nothing -- which is the difference between it and a relationship.
+    #[test]
+    fn exists_is_a_subselect_over_another_table() {
+        let cache = create_test_schema_cache();
+        let names = crate::names::NameOverrides::default();
+        let relationships: HashMap<String, Vec<RelationshipField>> = HashMap::new();
+        let scope = WhereScope::table("public", "users", "users", &names)
+            .with_resolution(&cache, &relationships);
+
+        let mut param_idx = 1usize;
+        let mut values: Vec<serde_json::Value> = Vec::new();
+        let mut aliases = 0usize;
+        let sql = build_condition(
+            &serde_json::json!({
+                "_exists": {"_table": "users", "_where": {"name": {"_eq": "Ann"}}}
+            }),
+            &scope,
+            &mut param_idx,
+            &mut values,
+            &mut aliases,
+        )
+        .expect("compiles")
+        .expect("constrains something");
+
+        assert_eq!(
+            sql,
+            "EXISTS (SELECT 1 FROM \"public\".\"users\" AS \"pgrst_exists_1\" \
+             WHERE \"pgrst_exists_1\".\"name\" = $1::text)"
+        );
+        assert_eq!(values, vec![serde_json::json!("Ann")]);
+    }
+
+    /// A `_table` nobody has is refused rather than written into the query.
+    #[test]
+    fn exists_names_a_table_the_server_has() {
+        let cache = create_test_schema_cache();
+        let names = crate::names::NameOverrides::default();
+        let relationships: HashMap<String, Vec<RelationshipField>> = HashMap::new();
+        let scope = WhereScope::table("public", "users", "users", &names)
+            .with_resolution(&cache, &relationships);
+        let error = build_condition(
+            &serde_json::json!({"_exists": {"_table": "nowhere", "_where": {}}}),
+            &scope,
+            &mut 1,
+            &mut Vec::new(),
+            &mut 0,
+        )
+        .expect_err("a table that is not there is an error");
+        assert!(error.message.contains("public.nowhere"), "{}", error.message);
     }
 
     /// A role granted `insert` and no `select` gets the write and no type.
