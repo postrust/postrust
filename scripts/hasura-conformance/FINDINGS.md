@@ -8,11 +8,11 @@ harness itself, divergences kept on purpose, and the gaps still open.
 
 | | status | same outcome | same data | full body |
 |---|---|---|---|---|
-| all (468) | 100.0% | 98.7% | **95.3%** | 94.4% |
-| reads (271) | 100.0% | 98.5% | 92.6% | 92.3% |
+| all (468) | 100.0% | 99.4% | **97.2%** | 96.4% |
+| reads (271) | 100.0% | 99.6% | 95.9% | 95.6% |
 | writes (197) | 100.0% | 99.0% | **99.0%** | 97.5% |
 
-Of the 446 cases the third column counts, **315 agree about data and 130 agree
+Of the 455 cases the third column counts, **324 agree about data and 130 agree
 only because both servers answered with errors.** A further 1 is a case where
 Hasura refused and this server answered -- down from 115 before the permission
 layer existed.
@@ -70,13 +70,17 @@ subsystem.
 
 The fourth column moved on its own for seven runs after that: what an error
 says, and where it says it happened. 311 bodies matched entirely before those
-runs and 442 do now. **4 cases are left in the gap between the third column
+runs and 451 do now. **4 cases are left in the gap between the third column
 and the fourth, down from 101 -- and none of the four is a wording question.**
 Two are the constraint-order artefact described under the harness, one is a
 deliberate divergence, and one is metadata this harness cannot follow.
 
-Writes are at 97.5% on the full body and 99.0% on data, against 92.3% and
-92.6% for reads. Two write cases are left in the whole corpus that do not
+**17 cases diverge at all, and 10 of them are one thing: introspection, inside
+async-graphql.** What is left is described below, item by item, and most of it
+is not this server's to change.
+
+Writes are at 97.5% on the full body and 99.0% on data, against 95.6% and
+95.9% for reads. Two write cases are left in the whole corpus that do not
 agree about data.
 
 The five runs before those moved nineteen cases between them and moved nothing
@@ -116,6 +120,14 @@ server. Every fault in the instrument either invents work or hides it.
   `/v1/metadata`, and posting one to the other's endpoint is rejected outright.
   Commands are now sent individually rather than as the `bulk` they arrive in,
   because a file mixing the two has no single endpoint that would accept it.
+
+- **`track_table` takes its argument as a bare name, and the converter read
+  it as a document.** `- type: track_table` / `args: employees` is how the
+  corpus tracks a table with nothing to configure, and `args` is then a string
+  rather than a map. The converter skipped anything whose `args` was not a
+  map, so those tables were missing from the names document entirely -- and
+  since a missing table means "reflect", the difference was invisible until
+  the document started saying which relationships a table has.
 
 - **`pg_dump` restores constraints in a different order than the fixture
   created them, and PostgreSQL names whichever it checks first.** Two cases,
@@ -331,60 +343,66 @@ wrong one.
 
 ## Open, ordered by consequence
 
-1. **What is left of the error text: 4 cases, and none of them is wording.**
-   Two are the `pg_dump` constraint-order artefact under the harness above --
-   two databases naming different constraints for the same violation. One is a
-   deliberate divergence: a nested write into a view that selects from more
-   than one table is refused here for having no insert input, where Hasura
-   reaches the database and answers with PostgreSQL's own complaint wrapped in
-   an `internal` object this server does not produce. The last is a computed
-   field added and dropped through the metadata API inside a single case,
-   which a static names document cannot follow.
+The 17 cases that diverge, and why each does. Ten of them are one item.
 
-   A pattern worth naming, since seven of the fixes above share it: Hasura
-   reads a value against what the column will do with it *before* the
-   statement runs, and this server used to let PostgreSQL be the one to
-   complain. The walk over the request is where that reading belongs, because
-   it is the only place that still knows which argument the value came from --
-   and where the answer does not depend on the value at all, the column has no
-   business being in the input type.
+1. **Introspection, inside async-graphql: 10 cases.** Not reachable from
+   outside the library, and now traced rather than assumed.
+   `Registry::add_system_types` installs five directives -- `skip`, `include`,
+   `deprecated`, `specifiedBy`, `oneOf` -- where Hasura publishes three:
+   `include`, `skip` and its own `cached`. `create_introspection_types`
+   installs `ID` and `__DirectiveLocation`, which Hasura has neither of, and
+   answers `__TypeKind`'s members in specification order where Hasura sorts
+   them. `SchemaBuilder::finish` builds that registry itself and `Schema`
+   keeps it private, so there is no hook: `Registry::directives` is a public
+   field on a value this server never holds.
+
+   Every large introspection case needs at least one of those, so none of
+   them can be closed by anything here. Three more ingredients would be
+   needed even then, and they are open items of their own: the `_stream`
+   cursor types (item 2), a function returning one row as a root field (item
+   7), and Hasura's own wording for every generated description (item 8).
 
 2. **`_stream` subscriptions.** The cursor-based half of Hasura's subscription
    surface: `article_stream(cursor: {initial_value: {id: 0}}, batch_size: 10)`
    sends rows *after* a cursor rather than the whole answer, which is what a
    client tailing an append-only table wants. The live queries beside it are
-   done; this is a second shape with its own cursor types, and nothing in the
-   corpus exercises it -- it shows up in introspection only.
+   done; this is a second shape with its own cursor types. No case exercises
+   it directly -- it shows up as five missing types inside the introspection
+   cases above.
 
-3. **What is left of the enum tables.** They work: a marked table's rows are a
-   generated enum, referencing columns are typed as it, and no relationship
-   points at one. What remains is the metadata API around them —
-   `v1/set_table_is_enum` is four cases of turning the flag on and off through
-   `/v1/query`, which is the contract this server does not offer.
+3. **A nested insert through a manual relationship, and which row goes
+   first.** `author.detail_manual` maps `author.id` to `author_detail.id`, and
+   a nested insert has to write the author before the detail so the generated
+   key exists to copy. A column mapping does not say which side owns the key,
+   and Hasura carries an `insertion_order` for exactly that reason. The
+   relationship itself now works -- the read, the filter and the permission
+   through it -- and only the nested write is left. One case.
 
-4. **A manual relationship** -- one Hasura maps column by column rather than by
-   a foreign key -- has no constraint to key a name by, so
-   `PGRST_GRAPHQL_NAMES` cannot carry its name and the converter says so rather
-   than guessing. In the corpus it is also a *second* name for a foreign key
-   that already has one, which reflection can only produce once.
+4. **An enum value beginning with `null`, `true` or `false`.** One line of
+   async-graphql's grammar:
 
-   Four cases now, and the shape of the fix is clearer than it was. Two are
-   `message.members`, declared with `manual_configuration` over
-   `channel_id`, and a permission on `message` is written through it -- so the
-   filter cannot be compiled at all and the read is refused rather than
-   narrowed. One is the only remaining insert this server refuses and Hasura
-   performs. Closing it means the names document carrying a relationship's
-   *columns* and not just its name, which is the first directive here that
-   would describe a join rather than rename one.
+   ```text
+   enum_value = ${ !(boolean | null) ~ name }
+   ```
 
-5. **Which relationships exist is metadata's to say.** Hasura exposes the
-   relationships its metadata declares; this server exposes one per foreign
-   key. Where a fixture tracks a table without naming all of its keys, the
-   extra fields are here and not there. No query breaks on a field it does not
-   ask for, so this shows up only where a schema is compared field by field --
-   `graphql_introspection/nullable_object_relationship` is the case. Closing it
-   would mean letting the names document say which relationships exist, not
-   just what they are called, which is a different kind of directive.
+   The negative lookahead rejects any name that *starts with* one of the three
+   literals, where the specification excludes only the three tokens
+   themselves. So `nullPrefixTestTable_pkey` is not lexed as an enum value and
+   an upsert naming that constraint is answered with a parse error. Identical
+   in 7.2.1, so an upgrade does not carry the fix. One case, and closing it
+   means either a patched fork of the parser or rewriting the document text
+   and restoring every name in the parsed tree -- machinery that could corrupt
+   a document that was valid to begin with.
+
+5. **Four cases that are not this server's to close.** Two are the `pg_dump`
+   constraint-order artefact under the harness above: two databases naming
+   different constraints for the same violation, proven there with the SQL.
+   One is a deliberate divergence -- a nested write into a view that selects
+   from more than one table is refused here for having no insert input, where
+   Hasura reaches the database and wraps PostgreSQL's complaint in an
+   `internal` object this server does not produce. The last is a computed
+   field added and dropped through the metadata API inside a single case,
+   which a static names document cannot follow.
 
 6. **A function taking a table's row, tracked as a root field.** Hasura lets a
    client write `fetch_articles(args: {search: "Art", author_row: "(1, 'Roger',
@@ -397,34 +415,23 @@ wrong one.
 7. **A function returning one row, as a mutation.** `add_to_score_by_user_id`
    returns `"user"` rather than `SETOF "user"`; Hasura exposes it as a root
    field yielding one row. Here only a set-returning function becomes a root
-   field.
+   field. No case of its own left -- it is one of the ingredients item 1
+   needs.
 
 8. **Every generated description is this server's wording, not Hasura's.**
    `article_bool_exp` is described here as "Filter rows of article. Fields are
    combined with AND unless _or says otherwise." and there as "Boolean
-   expression to filter rows from the table \"article\"...". Nothing breaks
-   on it -- a description is documentation -- but it is why no large
-   introspection case reaches full-body agreement, and adopting Hasura's
-   strings verbatim is the only way it would. The same goes for the order
-   arguments come back in: Hasura sorts them, this server lists them as
-   declared.
+   expression to filter rows from the table \"article\"...". Nothing breaks on
+   it -- a description is documentation -- but it is one of the reasons no
+   large introspection case reaches agreement, and adopting Hasura's strings
+   verbatim is the only way it would. The same goes for the order arguments
+   come back in: Hasura sorts them, this server lists them as declared.
 
-9. **Introspection shape, inside async-graphql.** It publishes five directives
-   where Hasura publishes three, registers `ID` and `__DirectiveLocation`
-   where Hasura has neither, and answers `__TypeKind`'s members in
-   specification order rather than alphabetically. Six cases, and none of them
-   is reachable without forking the library.
-
-10. **An enum value beginning with `null`, `true` or `false`.** The parser
-    mis-lexes `nullPrefixTestTable_pkey` as the literal `null` followed by
-    something it cannot read, so an upsert naming that constraint is answered
-    with a parse error. This is async-graphql's lexer, not this server. One
-    case.
-
-11. **Actions and Apollo federation** are subsystems rather than gaps:
-    `actions/*` describes handlers Hasura calls out to over HTTP, and
-    `apollo_federation` describes the `_service`/`_entities` surface a
-    federated gateway composes. Five cases between them.
+9. **Actions and Apollo federation** are subsystems rather than gaps:
+   `actions/*` describes handlers Hasura calls out to over HTTP, and
+   `apollo_federation` describes the `_service`/`_entities` surface a
+   federated gateway composes. Three of the introspection cases in item 1 are
+   `actions/*`, and would need the subsystem before the library.
 
 ## Fixed since the first run
 
@@ -495,6 +502,47 @@ wrong one.
   with no members reached through an argument. 286 -> 290 real agreements, and
   the status column to 100%.
 
+
+- **Which relationships a table has is metadata's to say, and a relationship
+  is a join rather than a name.** Two open items that turned out to be one.
+  The names document could rename a relationship and not describe one, so a
+  **manual** relationship -- Hasura maps it column to column, with no
+  constraint to be keyed by -- could not be carried at all; and a rename map
+  cannot say what is *absent*, so reflection went on offering one relationship
+  per foreign key where Hasura offers the ones its metadata declares.
+
+  `declared_relationships` answers both. An entry is reached either by a key
+  reflection already found or by a column mapping no key describes, and where
+  the list is present it is what the table has. Absent still means "reflect",
+  which is what a document saying nothing about a table has always meant --
+  so an empty list is how a converted document says "Hasura tracks this table
+  and declares no relationship for it", which is a different statement and
+  the one four of these cases turned on.
+
+  Three things the measurement found, none of which reasoning had:
+
+  * A computed relationship is declared by `add_computed_field`, not by
+    `create_object_relationship`, so it is not in the list and is not what
+    the list is exhaustive about. Six cases lost `author.get_articles` before
+    it was exempted.
+  * A permission written through a declared relationship has to resolve it
+    too: once the declaration carries the name, that is the only place the
+    name is written down.
+  * An enum table's columns were retyped by walking the relationships the
+    schema *exposes*. Declaring a table's relationships away untyped its enum
+    columns with them -- eleven cases -- and the two are unrelated questions,
+    since a relationship to an enum table is never exposed at all. The
+    retyping reads the catalogue's foreign keys now.
+
+- **A generated enum is a type, not the table's data.** A role granted nothing
+  on `colors` still sees `colors_enum` and still has a `favorite_color` typed
+  by it; Hasura publishes both and answers `where: {favorite_color: {_eq:
+  red}}` for that role. Here the enum went with the table, and a valid query
+  came back `Invalid value for argument "where.favorite_color._eq", expected
+  type "String"`. The type's name is derived rather than looked up -- a table
+  the role cannot read has no entry to look one up in -- and the key that says
+  which column is typed by which enum survives the reduction, which costs
+  nothing because no field comes of it either way.
 
 - **Seven one-offs, and the last of the error text.** No two shared a cause,
   which is what made them the end of that list.
