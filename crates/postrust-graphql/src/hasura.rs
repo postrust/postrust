@@ -115,19 +115,38 @@ fn value_of(value: &async_graphql::Value) -> Value {
 fn path_for(error: &ServerError) -> String {
     use async_graphql::PathSegment;
 
+    // Written where the error was raised, when whoever raised it knew where it
+    // was. That is the only way to reach an *argument*: `$.selectionSet.
+    // insert_author.args.objects[0].bio` names a place inside a value the
+    // client sent, and a response path only ever names a field of the answer.
+    if let Some(given) = error
+        .extensions
+        .as_ref()
+        .and_then(|extensions| extensions.get("path"))
+        .map(value_of)
+    {
+        if let Value::String(path) = given {
+            return path;
+        }
+    }
+
     if error.path.is_empty() {
         return "$".to_string();
     }
-    let mut rendered = String::from("$.selectionSet");
+    // Otherwise the response path, in Hasura's spelling: a field of a field is
+    // written with the selection set that holds it between them, so `author`
+    // then `articles` is `$.selectionSet.author.selectionSet.articles` rather
+    // than `$.selectionSet.author.articles`.
+    //
+    // Which row of a list the error came from is dropped. A response path has
+    // it and Hasura's selection paths never do -- an index appears in one of
+    // its paths only inside an argument, where it names a row the client
+    // *sent*. Naming a field is what a selection path is for.
+    let mut rendered = String::from("$");
     for segment in &error.path {
-        match segment {
-            PathSegment::Field(name) => {
-                rendered.push('.');
-                rendered.push_str(name);
-            }
-            PathSegment::Index(index) => {
-                rendered.push_str(&format!("[{}]", index));
-            }
+        if let PathSegment::Field(name) = segment {
+            rendered.push_str(".selectionSet.");
+            rendered.push_str(name);
         }
     }
     rendered
@@ -284,7 +303,26 @@ mod tests {
                 PathSegment::Field("name".to_string()),
             ],
         );
-        assert_eq!(path_for(&error), "$.selectionSet.insert_author[0].name");
+        assert_eq!(
+            path_for(&error),
+            "$.selectionSet.insert_author.selectionSet.name"
+        );
+    }
+
+    /// A path written where the error was raised wins over the response path,
+    /// because it can name a place the response path cannot: inside an
+    /// argument the client sent.
+    #[test]
+    fn a_path_given_with_the_error_is_the_one_answered() {
+        let mut error = error_at("boom", vec![PathSegment::Field("insert_author".to_string())]);
+        let mut extensions = async_graphql::ErrorExtensionValues::default();
+        extensions.set("code", "permission-error");
+        extensions.set("path", "$.selectionSet.insert_author.args.objects");
+        error.extensions = Some(extensions);
+        assert_eq!(
+            path_for(&error),
+            "$.selectionSet.insert_author.args.objects"
+        );
     }
 
     #[test]
@@ -837,6 +875,7 @@ fn variable_errors(
                 errors.push(coded(
                     format!("null value found for non-nullable type: \"{}\"", written),
                     definition.pos,
+                    "$",
                 ));
             }
         }
@@ -851,7 +890,7 @@ fn variable_errors(
             errors: &mut errors,
             seen: HashSet::new(),
         };
-        scope.selection_set(&operation.node.selection_set.node, root);
+        scope.selection_set(&operation.node.selection_set.node, root, "$");
     }
 
     errors
@@ -875,7 +914,16 @@ struct Usage<'a> {
 }
 
 impl Usage<'_> {
-    fn selection_set(&mut self, set: &async_graphql::parser::types::SelectionSet, type_name: &str) {
+    /// `path` is where this selection set is, in Hasura's spelling: `$` at the
+    /// root, and `$.selectionSet.author` for the set inside that field. A
+    /// fragment carries its spread site's path, since that is where the fields
+    /// it contributes actually are.
+    fn selection_set(
+        &mut self,
+        set: &async_graphql::parser::types::SelectionSet,
+        type_name: &str,
+        path: &str,
+    ) {
         use async_graphql::parser::types::Selection;
         use async_graphql::registry::MetaTypeName;
 
@@ -887,6 +935,7 @@ impl Usage<'_> {
                         .types
                         .get(type_name)
                         .and_then(|ty| ty.field_by_name(field.node.name.node.as_str()));
+                    let here = format!("{}.selectionSet.{}", path, field.node.name.node);
                     for (name, value) in &field.node.arguments {
                         let Some(argument) =
                             meta.and_then(|meta| meta.args.get(name.node.as_str()))
@@ -898,12 +947,13 @@ impl Usage<'_> {
                         // leaving the variable out is then the same as not
                         // writing the argument.
                         let expected = relax(&argument.ty, argument.default_value.is_some());
-                        self.value(&value.node, &expected, value.pos);
+                        let at = format!("{}.args.{}", here, name.node);
+                        self.value(&value.node, &expected, value.pos, &at);
                     }
-                    self.directives(&field.node.directives);
+                    self.directives(&field.node.directives, &here);
                     if let Some(meta) = meta {
                         let inner = MetaTypeName::concrete_typename(&meta.ty).to_string();
-                        self.selection_set(&field.node.selection_set.node, &inner);
+                        self.selection_set(&field.node.selection_set.node, &inner, &here);
                     }
                 }
                 Selection::InlineFragment(fragment) => {
@@ -913,18 +963,18 @@ impl Usage<'_> {
                         .as_ref()
                         .map(|condition| condition.node.on.node.to_string())
                         .unwrap_or_else(|| type_name.to_string());
-                    self.directives(&fragment.node.directives);
-                    self.selection_set(&fragment.node.selection_set.node, &inner);
+                    self.directives(&fragment.node.directives, path);
+                    self.selection_set(&fragment.node.selection_set.node, &inner, path);
                 }
                 Selection::FragmentSpread(spread) => {
                     let name = spread.node.fragment_name.node.to_string();
-                    self.directives(&spread.node.directives);
+                    self.directives(&spread.node.directives, path);
                     if !self.seen.insert(name.clone()) {
                         continue;
                     }
                     if let Some(fragment) = self.fragments.get(&async_graphql::Name::new(&name)) {
                         let on = fragment.node.type_condition.node.on.node.to_string();
-                        self.selection_set(&fragment.node.selection_set.node, &on);
+                        self.selection_set(&fragment.node.selection_set.node, &on, path);
                     }
                 }
             }
@@ -934,6 +984,7 @@ impl Usage<'_> {
     fn directives(
         &mut self,
         directives: &[async_graphql::Positioned<async_graphql::parser::types::Directive>],
+        path: &str,
     ) {
         for directive in directives {
             let meta = self
@@ -945,7 +996,8 @@ impl Usage<'_> {
                     continue;
                 };
                 let expected = relax(&argument.ty, argument.default_value.is_some());
-                self.value(&value.node, &expected, value.pos);
+                let at = format!("{}.args.{}", path, name.node);
+                self.value(&value.node, &expected, value.pos, &at);
             }
         }
     }
@@ -974,6 +1026,7 @@ impl Usage<'_> {
         value: &async_graphql_value::Value,
         expected: &str,
         pos: async_graphql::Pos,
+        path: &str,
     ) {
         use async_graphql::registry::{MetaType, MetaTypeName};
         use async_graphql_value::Value;
@@ -991,6 +1044,7 @@ impl Usage<'_> {
                             name, declared, expected
                         ),
                         pos,
+                        path,
                     ));
                 }
             }
@@ -1002,8 +1056,8 @@ impl Usage<'_> {
                     MetaTypeName::List(inner) => inner.to_string(),
                     _ => expected.to_string(),
                 };
-                for item in items {
-                    self.value(item, &inner, pos);
+                for (index, item) in items.iter().enumerate() {
+                    self.value(item, &inner, pos, &format!("{}[{}]", path, index));
                 }
             }
             Value::Object(fields) => {
@@ -1021,10 +1075,19 @@ impl Usage<'_> {
                 // server publishes, so this is the only place it can be
                 // refused.
                 let comparison = name.ends_with("_comparison_exp");
+                // One object written where a list was expected is that list's
+                // first item -- input coercion says so, and the path says so
+                // too: `insert_author(objects: {location: $x})` is refused at
+                // `args.objects[0].location`, not at `args.objects.location`.
+                let base = match MetaTypeName::create(expected).unwrap_non_null() {
+                    MetaTypeName::List(_) => format!("{}[0]", path),
+                    _ => path.to_string(),
+                };
                 for (key, item) in fields {
                     let Some(field) = input_fields.get(key.as_str()) else {
                         continue;
                     };
+                    let at = format!("{}.{}", base, key.as_str());
                     if comparison && self.stands_for_null(item) {
                         self.errors.push(coded(
                             format!(
@@ -1032,11 +1095,12 @@ impl Usage<'_> {
                                 MetaTypeName::concrete_typename(&field.ty)
                             ),
                             pos,
+                            &at,
                         ));
                         continue;
                     }
                     let ty = relax(&field.ty, field.default_value.is_some());
-                    self.value(item, &ty, pos);
+                    self.value(item, &ty, pos, &at);
                 }
             }
             _ => {}
@@ -1056,11 +1120,17 @@ fn relax(ty: &str, has_default: bool) -> String {
     }
 }
 
-/// A validation failure, coded as one.
-fn coded(message: String, pos: async_graphql::Pos) -> ServerError {
+/// A validation failure, coded as one, at the place it was found.
+///
+/// The path is carried on the error rather than derived from it: this walk
+/// happens before execution, so there is no response path to read, and what
+/// has to be named is a place inside the request -- an argument, a key of an
+/// input object, an item of a list.
+fn coded(message: String, pos: async_graphql::Pos, path: &str) -> ServerError {
     let mut error = ServerError::new(message, Some(pos));
     let mut extensions = async_graphql::ErrorExtensionValues::default();
     extensions.set("code", "validation-failed");
+    extensions.set("path", path);
     error.extensions = Some(extensions);
     error
 }
@@ -1140,6 +1210,18 @@ mod variable_position_tests {
         }
     }
 
+    /// The same, answering with where each refusal says it happened.
+    fn refusals_with_paths(query: &str, variables: &str) -> Vec<String> {
+        let request =
+            async_graphql::Request::new(query).variables(async_graphql::Variables::from_json(
+                serde_json::from_str(variables).expect("the variables are JSON"),
+            ));
+        match prepare(Some(&schema()), request, None) {
+            Ok(_) => Vec::new(),
+            Err((_, errors)) => errors.iter().map(path_for).collect(),
+        }
+    }
+
     /// `where: {name: {_eq: null}}` reads as `name = NULL`, which is never
     /// true. Hasura refuses it, and so does this.
     #[test]
@@ -1163,6 +1245,46 @@ mod variable_position_tests {
 
     /// An absent variable makes the comparison itself absent, which is a
     /// query with no such filter rather than one filtering on nothing.
+    /// Where a refusal says it happened, which is a place in the request and
+    /// not in the answer.
+    #[test]
+    fn a_refusal_names_the_argument_it_was_found_in() {
+        let paths = |query: &str, variables: &str| -> Vec<String> {
+            refusals_with_paths(query, variables)
+        };
+        // A key of an input object, under the argument that carried it.
+        assert_eq!(
+            paths(
+                "mutation ($n: Int!) { insert_author_one(object: {name: $n}) { id } }",
+                r#"{"n": 1}"#
+            ),
+            vec!["$.selectionSet.insert_author_one.args.object.name"]
+        );
+        // A comparison against a null names the operator it was written in.
+        assert_eq!(
+            paths("{ author(where: {name: {_eq: null}}) { id } }", "{}"),
+            vec!["$.selectionSet.author.args.where.name._eq"]
+        );
+        // One object written where a list was expected is that list's first
+        // item, and the path says so.
+        assert_eq!(
+            paths(
+                "mutation ($n: Int!) { insert_author(objects: {name: $n}) { id } }",
+                r#"{"n": 1}"#
+            ),
+            vec!["$.selectionSet.insert_author.args.objects[0].name"]
+        );
+        // And an actual list is indexed by where the value really is.
+        assert_eq!(
+            paths(
+                "mutation ($n: Int!) { insert_author(objects: [{name: \"a\"}, \
+                 {name: $n}]) { id } }",
+                r#"{"n": 1}"#
+            ),
+            vec!["$.selectionSet.insert_author.args.objects[1].name"]
+        );
+    }
+
     #[test]
     fn a_variable_that_was_not_given_is_not_a_null() {
         assert!(refusals(

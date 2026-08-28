@@ -1408,6 +1408,21 @@ fn validation_error(message: impl Into<String>) -> async_graphql::Error {
     coded_error("validation-failed", message)
 }
 
+/// The same error, told where in the request it happened.
+///
+/// Hasura names the place a write went wrong inside the *arguments* --
+/// `$.selectionSet.insert_author.args.objects[0].bio` -- and a response path
+/// cannot say that: it names fields of the answer, and the answer has no
+/// `objects`. So the path is written where the error is raised, by whoever
+/// knows which row and which column it is about, and
+/// [`crate::hasura::path_for`] prefers it over the response path.
+fn at_path(mut error: async_graphql::Error, path: &str) -> async_graphql::Error {
+    let mut extensions = error.extensions.take().unwrap_or_default();
+    extensions.set("path", path);
+    error.extensions = Some(extensions);
+    error
+}
+
 fn create_object_type(obj: &TableObjectType, relationships: &[RelationshipField]) -> Object {
     let mut object = Object::new(&obj.name);
 
@@ -3269,7 +3284,17 @@ async fn query_rows(
     // first term and sorts ascending.
     let (distinct_sql, order_sql) = {
         let written = order_sql.strip_prefix(" ORDER BY ");
-        let (prefix, order) = distinct_on_clause(&distinct_on, written)?;
+        // Reported against the field's arguments as a whole: the rule is about
+        // two of them disagreeing, so neither one is where it went wrong.
+        let (prefix, order) = distinct_on_clause(&distinct_on, written).map_err(|error| {
+            at_path(
+                error,
+                &format!(
+                    "$.selectionSet.{}.args",
+                    ctx.ctx.field().alias().unwrap_or(ctx.ctx.field().name())
+                ),
+            )
+        })?;
         (
             prefix,
             match order {
@@ -3592,6 +3617,19 @@ async fn resolve_mutation<'a>(
             let cache = guard
                 .as_ref()
                 .ok_or_else(|| async_graphql::Error::new("schema cache is not loaded"))?;
+            // Where this write is, in the document the client sent. The
+            // field as it was written -- an alias if there was one, since that
+            // is what names this selection.
+            let here = format!(
+                "$.selectionSet.{}",
+                ctx.ctx.field().alias().unwrap_or(ctx.ctx.field().name())
+            );
+            // `insert_x(objects: [...])` against `insert_x_one(object: {...})`:
+            // the same write under two spellings, and the path says which.
+            let named = match mutation_type {
+                MutationType::InsertOne => "object",
+                _ => "objects",
+            };
             let context = InsertContext {
                 on_conflict: ctx
                     .args
@@ -3604,9 +3642,23 @@ async fn resolve_mutation<'a>(
                 type_names: type_names.as_ref(),
                 names: names.as_ref(),
                 caller: gql_ctx.caller(),
+                // Filled in per row by `execute_insert`, which is where the
+                // index is known.
+                row: String::new(),
+                objects: format!("{}.args.{}", here, named),
+                conflict: format!("{}.args.on_conflict", here),
             };
 
-            execute_insert(pool, gql_ctx, schema_name, table_name, objects, &context).await?
+            execute_insert(
+                pool,
+                gql_ctx,
+                schema_name,
+                table_name,
+                objects,
+                &context,
+                mutation_type == MutationType::InsertOne,
+            )
+            .await?
         }
         // `UpdateMany` answered above: it is a list of responses rather than
         // one, so it does not share this shape.
@@ -4265,7 +4317,15 @@ fn insert_row<'life>(
                 column_types.get(column).map(String::as_str),
                 Some("geometry") | Some("geography")
             ) {
-                check_geojson(value)?;
+                // Under the name the client wrote it under, which is the
+                // exposed one rather than the column's where they differ.
+                check_geojson(value).map_err(|error| {
+                    let field = context
+                        .names
+                        .column(schema_name, table_name, column)
+                        .unwrap_or(column);
+                    at_path(error, &format!("{}.{}", context.row, field))
+                })?;
             }
         }
 
@@ -4286,13 +4346,19 @@ fn insert_row<'life>(
             // question and one of them would be silently discarded.
             for (local, _) in &plan.columns {
                 if columns.get(local).is_some_and(|v| !v.is_null()) {
-                    return Err(validation_error(format!(
-                        "cannot insert object relationship \"{}\" as \"{}\" column \
-                         values are already determined",
-                        relationship.name, local
-                    )));
+                    return Err(at_path(
+                        validation_error(format!(
+                            "cannot insert object relationship \"{}\" as \"{}\" column \
+                             values are already determined",
+                            relationship.name, local
+                        )),
+                        &format!("{}.{}", context.row, relationship.name),
+                    ));
                 }
             }
+            // A to-one row is written under the relationship's own name:
+            // `...objects[0].author.data`, and its `on_conflict` beside it.
+            let under = format!("{}.{}", context.row, relationship.name);
             let nested = InsertContext {
                 on_conflict: conflict,
                 cache: context.cache,
@@ -4300,6 +4366,9 @@ fn insert_row<'life>(
                 type_names: context.type_names,
                 names: context.names,
                 caller: context.caller,
+                row: format!("{}.data", under),
+                objects: format!("{}.data", under),
+                conflict: format!("{}.on_conflict", under),
             };
             let written = insert_row(
                 conn,
@@ -4368,7 +4437,10 @@ fn insert_row<'life>(
                 // of. It is in the enum so that `on_conflict` exists at all;
                 // naming it is the one thing it cannot be used for.
                 if updates.contains(&PLACEHOLDER_COLUMN) {
-                    return Err(coded_error("validation-failed", "erroneous column name"));
+                    return Err(at_path(
+                        coded_error("validation-failed", "erroneous column name"),
+                        &context.conflict,
+                    ));
                 }
 
                 if updates.is_empty() {
@@ -4611,7 +4683,8 @@ fn insert_row<'life>(
         let Some(written) = written else {
             return Ok(serde_json::Value::Null);
         };
-        refuse_unchecked_rows(std::slice::from_ref(&written), !check_sql.is_empty())?;
+        refuse_unchecked_rows(std::slice::from_ref(&written), !check_sql.is_empty())
+            .map_err(|error| at_path(error, &context.objects))?;
         let row: serde_json::Value = written.try_get(0).unwrap_or(serde_json::Value::Null);
         *written_count += 1;
 
@@ -4631,7 +4704,7 @@ fn insert_row<'life>(
                     )))
                 }
             };
-            for child in children {
+            for (child_index, child) in children.into_iter().enumerate() {
                 let serde_json::Value::Object(mut child) = child else {
                     continue;
                 };
@@ -4640,16 +4713,25 @@ fn insert_row<'life>(
                     // child that writes it too is asking for a different
                     // parent than the one it is nested inside.
                     if child.get(foreign).is_some_and(|v| !v.is_null()) {
-                        return Err(validation_error(format!(
-                            "cannot insert \"{}\" columns as their values are already \
-                             being determined by parent insert",
-                            foreign
-                        )));
+                        return Err(at_path(
+                            validation_error(format!(
+                                "cannot insert \"{}\" columns as their values are already \
+                                 being determined by parent insert",
+                                foreign
+                            )),
+                            &format!(
+                                "{}.{}.data[{}]",
+                                context.row, relationship.name, child_index
+                            ),
+                        ));
                     }
                     if let Some(value) = row.get(local) {
                         child.insert(foreign.clone(), value.clone());
                     }
                 }
+                // `...objects[0].articles.data[0]`, which is the path
+                // Hasura answers for a child that writes its parent's key.
+                let under = format!("{}.{}", context.row, relationship.name);
                 let nested = InsertContext {
                     on_conflict: conflict.clone(),
                     cache: context.cache,
@@ -4657,6 +4739,9 @@ fn insert_row<'life>(
                     type_names: context.type_names,
                     names: context.names,
                     caller: context.caller,
+                    row: format!("{}.data[{}]", under, child_index),
+                    objects: format!("{}.data", under),
+                    conflict: format!("{}.on_conflict", under),
                 };
                 insert_row(
                     conn,
@@ -4675,6 +4760,11 @@ fn insert_row<'life>(
 }
 
 /// What a nested insert needs to follow a relationship.
+///
+/// Cloned per row and per nested row, which costs three strings: the paths are
+/// the only part that differs between them, and the rest is references and a
+/// `Caller`.
+#[derive(Clone)]
 struct InsertContext<'a> {
     /// What to do when this row conflicts. A nested row carries its own, from
     /// the `on_conflict` beside its `data`.
@@ -4692,6 +4782,17 @@ struct InsertContext<'a> {
     /// every row this insert writes -- including the nested ones, which are
     /// rows of other tables under other rules.
     caller: crate::role::Caller<'a>,
+    /// Where this row is in the request, as Hasura writes such a place:
+    /// `$.selectionSet.insert_author.args.objects[0]`, and one level down
+    /// `$.selectionSet.insert_author.args.objects[0].articles.data[0]`. A
+    /// column of it is that with the field's name appended.
+    row: String,
+    /// Where the rows this statement writes were named. What a refused `check`
+    /// is reported against -- the argument, not the row inside it, which is
+    /// what Hasura answers.
+    objects: String,
+    /// Where this statement's `on_conflict` was named.
+    conflict: String,
 }
 
 /// Re-read written rows so that a mutation's `returning` can carry
@@ -4837,6 +4938,10 @@ async fn execute_insert(
     table_name: &str,
     objects: serde_json::Value,
     context: &InsertContext<'_>,
+    // Whether the client wrote one row rather than a list of them. Only the
+    // error paths care: `insert_x_one(object: {...})` has no row to index, so
+    // its rows are named `args.object` and not `args.object[0]`.
+    single: bool,
 ) -> Result<(Vec<Value>, usize), async_graphql::Error> {
     trace!("Insert mutation for {}: {:?}", table_name, objects);
 
@@ -4861,13 +4966,22 @@ async fn execute_insert(
     let mut inserted: Vec<Value> = Vec::new();
     let mut written = 0usize;
 
-    for object in objects_array {
+    for (index, object) in objects_array.into_iter().enumerate() {
         let serde_json::Value::Object(map) = object else {
             return Err(async_graphql::Error::new(
                 "each object to insert is an object",
             ));
         };
-        let row = insert_row(conn, schema_name, table_name, map, context, &mut written).await?;
+        // This row's own place in the request, which is what an error inside
+        // it is reported against.
+        let context = InsertContext {
+            row: match single {
+                true => context.objects.clone(),
+                false => format!("{}[{}]", context.objects, index),
+            },
+            ..context.clone()
+        };
+        let row = insert_row(conn, schema_name, table_name, map, &context, &mut written).await?;
         // A row `DO NOTHING` left alone is not in `returning` and is not in
         // `affected_rows` either: nothing was written, and the row that was
         // already there is not this mutation's to report.
