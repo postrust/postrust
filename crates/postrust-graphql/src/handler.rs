@@ -52,6 +52,19 @@ pub struct GraphQLState {
     /// backend may name -- which is a second schema rather than a check,
     /// because `backend_only` decides whether a field exists.
     pub role_schemas: HashMap<(String, bool), Schema>,
+    /// What a role the document never names is answered from.
+    ///
+    /// Not a refusal. To Hasura an unrecognised role is a role with nothing
+    /// granted, so it gets a schema with nothing in it -- and a request is
+    /// answered `field 'user' not found in type: 'query_root'`, or `no
+    /// mutations exist` where there is no mutation root at all, rather than
+    /// with a complaint about the role. `address_permission_error` sends
+    /// `X-Hasura-Role: merchant`, which no permission mentions, and expects
+    /// exactly that.
+    ///
+    /// One schema for every such role rather than one each: they are all the
+    /// same schema, since what they were granted is the same nothing.
+    pub ungranted_schema: Option<Schema>,
     /// Schema configuration
     pub config: SchemaConfig,
     /// Subscription fields
@@ -144,6 +157,49 @@ fn build_role_schemas(
     Ok(schemas)
 }
 
+/// The schema a role the document never names is answered from.
+///
+/// Built the same way every other role's is, from a cache reduced by a role
+/// nothing was granted to -- which leaves no tables, so it is the same schema
+/// whatever the unrecognised role is called. `None` where there is no
+/// permission document, since then no role is unrecognised.
+fn build_ungranted_schema(
+    schema_cache: &Arc<SchemaCache>,
+    config: &SchemaConfig,
+) -> Option<Schema> {
+    if !config.names.has_permissions() {
+        return None;
+    }
+    // A name no permission can carry: `roles()` reads them out of the
+    // document, and this one is not a role anybody wrote down.
+    const NOBODY: &str = "\u{0}ungranted";
+    let view = Arc::new(crate::role::cache_for_role(
+        schema_cache,
+        &config.names,
+        NOBODY,
+        false,
+    ));
+    let mut role_config = config.clone();
+    role_config.role = Some(NOBODY.to_string());
+    let generated = build_schema(&view, &role_config);
+    build_dynamic_schema(
+        &generated,
+        &view,
+        None,
+        role_config.max_rows,
+        Arc::new(role_config.names.clone()),
+        role_config.subscription_refresh(),
+        Some(NOBODY),
+    )
+    .map_err(|e| {
+        tracing::error!(
+            "the schema for a role with nothing granted could not be built,              so such a role is refused instead: {}",
+            e
+        )
+    })
+    .ok()
+}
+
 impl GraphQLState {
     /// Create new GraphQL state from schema cache.
     pub fn new(
@@ -172,6 +228,7 @@ impl GraphQLState {
         )?;
 
         let role_schemas = build_role_schemas(&schema_cache, &config)?;
+        let ungranted_schema = build_ungranted_schema(&schema_cache, &config);
 
         Ok(Self {
             pool: pool.clone(),
@@ -179,6 +236,7 @@ impl GraphQLState {
             generated_schema,
             schema,
             role_schemas,
+            ungranted_schema,
             config,
             subscription_fields,
             broker: Arc::new(RwLock::new(None)),
@@ -187,11 +245,16 @@ impl GraphQLState {
 
     /// Which schema answers for a caller speaking as this role.
     ///
-    /// `None` for a role the document does not name, which the caller turns
-    /// into a refusal. Three things are deliberately not that: a server with no
-    /// permission document answers everyone from the unrestricted schema, an
-    /// administrator is answered from it too -- permissions are rules for
-    /// everyone else -- and so is a request on a server where the layer is off.
+    /// A role the document does not name is answered from the schema with
+    /// nothing in it, which is Hasura's reading: an unrecognised role is a
+    /// role that was granted nothing, not an error. Three things are
+    /// deliberately not that: a server with no permission document answers
+    /// everyone from the unrestricted schema, an administrator is answered
+    /// from it too -- permissions are rules for everyone else -- and so is a
+    /// request on a server where the layer is off.
+    ///
+    /// `None` only where the empty schema itself could not be built, which the
+    /// caller still turns into a refusal.
     pub fn schema_for(&self, role: Option<&str>, backend: bool) -> Option<&Schema> {
         if !self.config.names.has_permissions() {
             return Some(&self.schema);
@@ -203,7 +266,8 @@ impl GraphQLState {
                 .get(&(role.to_string(), backend))
                 // A role with nothing backend-only has one schema, under
                 // `false`, and it answers a backend caller too.
-                .or_else(|| self.role_schemas.get(&(role.to_string(), false))),
+                .or_else(|| self.role_schemas.get(&(role.to_string(), false)))
+                .or(self.ungranted_schema.as_ref()),
         }
     }
 
@@ -211,6 +275,7 @@ impl GraphQLState {
     #[allow(clippy::needless_update)]
     pub fn rebuild(&mut self) -> Result<(), GraphQLError> {
         self.role_schemas = build_role_schemas(&self.schema_cache, &self.config)?;
+        self.ungranted_schema = build_ungranted_schema(&self.schema_cache, &self.config);
         self.generated_schema = build_schema(&self.schema_cache, &self.config);
         self.subscription_fields = if self.config.enable_subscriptions {
             generate_subscription_fields(&self.schema_cache, &self.generated_schema)
@@ -9059,6 +9124,122 @@ mod tests {
             "and no type is named twice over:\n{}",
             sdl
         );
+    }
+
+    /// A cache with one VOLATILE function returning rows of `users`, which is
+    /// the shape `add_to_score` has in Hasura's corpus.
+    fn cache_with_a_mutation_function() -> SchemaCache {
+        use postrust_core::schema_cache::{FuncVolatility, RetType, Routine};
+
+        let mut cache = create_test_schema_cache();
+        let routine = Routine {
+            schema: "public".into(),
+            name: "add_to_score".into(),
+            description: None,
+            params: Vec::new(),
+            return_type: RetType::SetOf("users".into()),
+            returns_composite: true,
+            volatility: FuncVolatility::Volatile,
+            has_variadic: false,
+            isolation_level: None,
+            settings: Vec::new(),
+            is_procedure: false,
+            media_type: None,
+            media_base_type: None,
+            output_columns: Vec::new(),
+        };
+        cache
+            .routines
+            .insert(routine.qualified_identifier(), vec![routine]);
+        cache
+    }
+
+    /// A function with side effects is not granted by permission to read the
+    /// table it returns. Hasura infers a query function's permission from
+    /// that select and infers nothing for a mutation, so a role never named
+    /// by a function permission has no mutation root at all.
+    #[test]
+    fn a_mutation_function_needs_the_role_to_be_named() {
+        let cache = cache_with_a_mutation_function();
+        let withheld = crate::names::NameOverrides::parse(
+            r#"{"tables": {"public.users": {"permissions":
+                 {"reader": {"select": {"columns": "*", "filter": {}}}}}},
+                "functions": {"public.add_to_score": {"exposed_as": "mutation"}}}"#,
+        )
+        .unwrap();
+        let granted = crate::names::NameOverrides::parse(
+            r#"{"tables": {"public.users": {"permissions":
+                 {"reader": {"select": {"columns": "*", "filter": {}}}}}},
+                "functions": {"public.add_to_score":
+                  {"exposed_as": "mutation", "roles": ["reader"]}}}"#,
+        )
+        .unwrap();
+
+        let sdl_for = |names: &crate::names::NameOverrides| {
+            let view = crate::role::cache_for_role(&cache, names, "reader", false);
+            let config = SchemaConfig {
+                names: names.clone(),
+                role: Some("reader".to_string()),
+                ..SchemaConfig::default()
+            };
+            let generated = build_schema(&view, &config);
+            build_dynamic_schema(
+                &generated,
+                &view,
+                None,
+                None,
+                Arc::new(names.clone()),
+                std::time::Duration::from_secs(30),
+                Some("reader"),
+            )
+            .expect("schema builds")
+            .sdl()
+        };
+
+        let without = sdl_for(&withheld);
+        assert!(
+            !without.contains("add_to_score"),
+            "not granted, so not there:\n{}",
+            without
+        );
+        // And with no mutation of any kind left, there is no mutation root --
+        // which is what `no mutations exist` is answered from.
+        assert!(
+            !without.contains("mutation: mutation_root"),
+            "and no mutation root at all:\n{}",
+            without
+        );
+
+        let with = sdl_for(&granted);
+        assert!(
+            with.contains("add_to_score"),
+            "named by a function permission, so it is:\n{}",
+            with
+        );
+    }
+
+    /// An unrecognised role is a role that was granted nothing, not an error.
+    #[test]
+    fn a_role_the_document_never_names_is_granted_nothing() {
+        let cache = Arc::new(create_test_schema_cache());
+        let config = SchemaConfig {
+            names: crate::names::NameOverrides::parse(
+                r#"{"tables": {"public.users": {"permissions":
+                     {"reader": {"select": {"columns": "*", "filter": {}}}}}}}"#,
+            )
+            .unwrap(),
+            ..SchemaConfig::default()
+        };
+        let empty = build_ungranted_schema(&cache, &config).expect("it builds");
+        let sdl = empty.sdl();
+        assert!(
+            sdl.contains("no_queries_available"),
+            "nothing to read:\n{}",
+            sdl
+        );
+        assert!(!sdl.contains("type users "), "and no table:\n{}", sdl);
+        // A document with no permissions at all has no unrecognised roles.
+        assert!(build_ungranted_schema(&cache, &SchemaConfig::default()).is_none());
     }
 
     /// A column the role may write and not read is in the input and not in the

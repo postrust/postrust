@@ -372,6 +372,16 @@ pub struct FunctionNames {
     /// The root this function is exposed on: `query` or `mutation`.
     #[serde(default)]
     pub exposed_as: Option<String>,
+    /// The roles a function permission names.
+    ///
+    /// Hasura infers a *query* function's permission from the select
+    /// permission on the table it returns -- a role that may read the rows may
+    /// ask the function for them. A function exposed as a **mutation** is not
+    /// inferred from anything: it has side effects, and a permission to read a
+    /// table is not a permission to change it, so the role has to be named by
+    /// a `pg_create_function_permission`.
+    #[serde(default)]
+    pub roles: Vec<String>,
 }
 
 impl NameOverrides {
@@ -473,6 +483,16 @@ impl NameOverrides {
             .get(&format!("{}.{}", schema, function))?
             .exposed_as
             .as_deref()
+    }
+
+    /// Whether a role was granted this function by a function permission.
+    ///
+    /// Only asked of a function exposed as a mutation -- see [`FunctionNames`]
+    /// for why the query side is inferred instead.
+    pub fn function_grants(&self, schema: &str, function: &str, role: &str) -> bool {
+        self.functions
+            .get(&format!("{}.{}", schema, function))
+            .is_some_and(|given| given.roles.iter().any(|named| named == role))
     }
 
     /// How many tables were named, for the line the server logs at startup.

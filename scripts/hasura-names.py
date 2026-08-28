@@ -170,6 +170,16 @@ def tables_from_commands(paths):
                     "configuration": args.get("configuration"),
                 })
                 continue
+            # A function permission is about a function and a role, and is
+            # the only thing that grants a mutation-exposed function to one.
+            # Folded in order, since the suite grants and revokes.
+            if kind in ("create_function_permission", "drop_function_permission"):
+                functions.append({
+                    "function": args.get("function") or args.get("name"),
+                    ("permissions" if kind.startswith("create_") else "revoked"):
+                        [{"role": args.get("role")}],
+                })
+                continue
             # Nor is this: it names roles and nothing else.
             if kind == "set_graphql_schema_introspection_options":
                 introspection_disabled.extend(args.get("disabled_for_roles") or [])
@@ -595,10 +605,17 @@ def convert_permissions(entry):
 def convert_functions(functions):
     """What metadata says about a function that reflection cannot derive.
 
-    Only one thing so far: which root it is exposed on. This server places a
-    function by its volatility, which is what the catalogue records; Hasura
-    lets `track_function` override it, and a VOLATILE function tracked with
+    Two things. Which root it is exposed on: this server places a function by
+    its volatility, which is what the catalogue records; Hasura lets
+    `track_function` override it, and a VOLATILE function tracked with
     `exposed_as: query` is a decision no schema remembers.
+
+    And which roles may call it. Hasura infers a *query* function's permission
+    from the select permission on the table it returns -- a role that may read
+    the rows may ask the function for them, which reflection can derive. A
+    function exposed as a **mutation** is not inferred from anything: it has
+    side effects, and permission to read a table is not permission to change
+    it. `pg_create_function_permission` is the only thing that says so.
 
     A function whose placement matches what volatility would give is left out,
     for the same reason a derived name is -- but that cannot be checked here
@@ -611,13 +628,29 @@ def convert_functions(functions):
         if not name:
             continue
         configuration = entry.get("configuration")
-        if not isinstance(configuration, dict):
-            continue
-        exposed = configuration.get("exposed_as")
-        if exposed not in ("query", "mutation"):
-            continue
-        given[f"{schema}.{name}"] = {"exposed_as": exposed}
-    return given
+        exposed = None
+        if isinstance(configuration, dict):
+            exposed = configuration.get("exposed_as")
+        # Folded rather than replaced: a document carries a function once,
+        # but a sequence of commands tracks it and then grants it, and may
+        # revoke afterwards.
+        placed = given.setdefault(f"{schema}.{name}", {})
+        if exposed in ("query", "mutation"):
+            placed["exposed_as"] = exposed
+        roles = placed.get("roles") or []
+        for granted in entry.get("permissions") or []:
+            if isinstance(granted, dict) and granted.get("role") not in (None, *roles):
+                roles.append(granted["role"])
+        for revoked in entry.get("revoked") or []:
+            if isinstance(revoked, dict):
+                roles = [role for role in roles if role != revoked.get("role")]
+        if roles:
+            placed["roles"] = roles
+        else:
+            placed.pop("roles", None)
+    # A function nothing was actually said about is left out, for the same
+    # reason a derived name is.
+    return {key: placed for key, placed in given.items() if placed}
 
 
 def main():

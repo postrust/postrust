@@ -1140,6 +1140,36 @@ pub fn build_schema(schema_cache: &SchemaCache, config: &SchemaConfig) -> Genera
             }
             let target = (target_schema.clone(), target_table.clone());
 
+            // Placed by what PostgreSQL says it does, unless metadata said
+            // otherwise: `track_function` with `configuration: {exposed_as:
+            // query}` puts a VOLATILE function on the query root, which is a
+            // decision a person made and no catalogue remembers.
+            let volatile = match config.names.exposed_as(&routine.schema, &routine.name) {
+                Some("query") => false,
+                Some("mutation") => true,
+                _ => matches!(
+                    routine.volatility,
+                    postrust_core::schema_cache::FuncVolatility::Volatile
+                ),
+            };
+            // A mutation a role was never granted. Hasura infers a query
+            // function's permission from the select permission on the table it
+            // returns -- which is the check just above -- and infers nothing
+            // for a mutation: reading a table is not permission to change it,
+            // so the role has to be named. A role granted no mutation at all
+            // then has no mutation root, and a request for one is answered
+            // `no mutations exist` rather than by a field that is missing.
+            if volatile {
+                if let Some(role) = config.role.as_deref() {
+                    if !config
+                        .names
+                        .function_grants(&routine.schema, &routine.name, role)
+                    {
+                        continue;
+                    }
+                }
+            }
+
             function_fields.push(FunctionField {
                 name: routine.name.clone(),
                 schema_name: routine.schema.clone(),
@@ -1158,19 +1188,7 @@ pub fn build_schema(schema_cache: &SchemaCache, config: &SchemaConfig) -> Genera
                     .iter()
                     .find(|param| is_session_argument(param))
                     .map(|param| param.name.clone()),
-                // Placed by what PostgreSQL says it does, unless metadata
-                // said otherwise: `track_function` with `configuration:
-                // {exposed_as: query}` puts a VOLATILE function on the query
-                // root, which is a decision a person made and no catalogue
-                // remembers.
-                volatile: match config.names.exposed_as(&routine.schema, &routine.name) {
-                    Some("query") => false,
-                    Some("mutation") => true,
-                    _ => matches!(
-                        routine.volatility,
-                        postrust_core::schema_cache::FuncVolatility::Volatile
-                    ),
-                },
+                volatile,
                 description: routine.description.clone(),
             });
         }
