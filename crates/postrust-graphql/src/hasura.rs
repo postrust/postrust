@@ -1157,11 +1157,13 @@ impl Usage<'_> {
                     let given: async_graphql_value::Value = given.clone().into();
                     self.enumerated(&given, expected, pos, path, true);
                     self.label_path(&given, expected, pos, path);
+                    self.raster_hex(&given, expected, pos, path);
                 }
             }
             Value::Enum(_) | Value::String(_) => {
                 self.enumerated(value, expected, pos, path, false);
                 self.label_path(value, expected, pos, path);
+                self.raster_hex(value, expected, pos, path);
             }
             Value::Number(_) => self.integral(value, expected, pos, path),
             Value::List(items) => {
@@ -1332,6 +1334,46 @@ impl Usage<'_> {
                 "expected a non-negative 32-bit integer for type 'Int', but found {}",
                 found
             ),
+            pos,
+            path,
+        ));
+    }
+
+    /// A value written where a `raster` is expected, as hexadecimal.
+    ///
+    /// A raster travels as the hex of its well-known binary, and PostGIS
+    /// answers `rt_raster_from_wkb: wkb size (14) < min size (61)` for
+    /// something that is not one -- a complaint about the bytes it managed to
+    /// decode rather than about the text it was given. Hasura reads the text
+    /// first and says it is not hexadecimal.
+    ///
+    /// Only what is certainly not hexadecimal is refused: a character outside
+    /// `0-9A-Fa-f`, or an odd number of them, since a byte takes two. A
+    /// well-formed hex string that is too short to be a raster still goes to
+    /// PostGIS and comes back in PostGIS's words, which is what happens today
+    /// and is not something the corpus has an opinion about.
+    fn raster_hex(
+        &mut self,
+        value: &async_graphql_value::Value,
+        expected: &str,
+        pos: async_graphql::Pos,
+        path: &str,
+    ) {
+        use async_graphql::registry::MetaTypeName;
+        use async_graphql_value::Value;
+
+        if MetaTypeName::concrete_typename(expected) != "raster" {
+            return;
+        }
+        let Value::String(written) = value else {
+            return;
+        };
+        if written.len() % 2 == 0 && written.chars().all(|c| c.is_ascii_hexdigit()) {
+            return;
+        }
+        self.errors.push(coded_as(
+            "parse-failed",
+            "invalid hexadecimal representation of raster well known binary format".to_string(),
             pos,
             path,
         ));
@@ -1562,7 +1604,12 @@ mod variable_position_tests {
         let kind = Enum::new("kind_enum").item("leaf").item("branch");
         let kind_comparison = InputObject::new("kind_enum_comparison_exp")
             .field(InputValue::new("_eq", TypeRef::named("kind_enum")));
+        let raster_comparison = InputObject::new("raster_comparison_exp").field(InputValue::new(
+            "_st_intersects_rast",
+            TypeRef::named("raster"),
+        ));
         let tree_filter = InputObject::new("tree_bool_exp")
+            .field(InputValue::new("rast", TypeRef::named("raster_comparison_exp")))
             .field(InputValue::new("path", TypeRef::named("ltree_comparison_exp")))
             .field(InputValue::new(
                 "kind",
@@ -1615,6 +1662,8 @@ mod variable_position_tests {
         }));
         Schema::build("query_root", Some("mutation_root"), None)
             .register(Scalar::new("ltree"))
+            .register(Scalar::new("raster"))
+            .register(raster_comparison)
             .register(kind)
             .register(kind_comparison)
             .register(filter)
@@ -1714,6 +1763,42 @@ mod variable_position_tests {
             ),
             vec!["$.selectionSet.insert_author.args.objects[1].name"]
         );
+    }
+
+    /// A raster travels as the hex of its well-known binary. What is
+    /// certainly not hex is refused here; the rest is still PostGIS's.
+    #[test]
+    fn a_raster_that_is_not_hexadecimal_is_refused_as_that() {
+        let invalid = "invalid hexadecimal representation of raster well known binary format";
+        assert_eq!(
+            refusals(
+                "query ($r: raster) { tree(where: {rast: {_st_intersects_rast: $r}}) { path } }",
+                r#"{"r": "this is invalid raster value"}"#
+            ),
+            vec![invalid]
+        );
+        assert_eq!(
+            refusals_with_paths(
+                "{ tree(where: {rast: {_st_intersects_rast: \"zz\"}}) { path } }",
+                "{}"
+            ),
+            vec!["$.selectionSet.tree.args.where.rast._st_intersects_rast"]
+        );
+        // A byte takes two characters.
+        assert_eq!(
+            refusals(
+                "{ tree(where: {rast: {_st_intersects_rast: \"abc\"}}) { path } }",
+                "{}"
+            ),
+            vec![invalid]
+        );
+        // Hex that is too short to be a raster is PostGIS's to refuse, in
+        // PostGIS's words.
+        assert!(refusals(
+            "{ tree(where: {rast: {_st_intersects_rast: \"0100\"}}) { path } }",
+            "{}"
+        )
+        .is_empty());
     }
 
     /// A fragment that spreads its way back to itself describes no finite
