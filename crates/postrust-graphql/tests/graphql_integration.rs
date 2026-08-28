@@ -1513,6 +1513,60 @@ async fn count_answers_each_alias_with_what_that_alias_asked_for() {
     drop_schema(&pool, &schema).await;
 }
 
+/// A ceiling bounds the page and not the count.
+///
+/// `PGRST_MAX_ROWS` and a permission's `limit` both exist to bound how many
+/// rows travel; neither is an answer to "how many are there". Hasura's own
+/// corpus proves this for the permission half -- a role limited to one row of
+/// `article` still counts three -- and the configured ceiling is treated the
+/// same way, which is what this pins.
+#[tokio::test]
+#[ignore = "requires PostgreSQL"]
+async fn a_ceiling_bounds_the_page_and_not_the_count() {
+    let pool = connect().await;
+    let schema = unique_schema_name("aggceiling");
+    create_widgets_schema(&pool, &schema).await;
+
+    // Four widgets, and a server that will send at most two of them.
+    let state = build_state(&pool, &schema, Some(2), false).await;
+    let data = execute_ok(
+        &state,
+        &pool,
+        &schema,
+        "{ widgets_aggregate(order_by: [{id: asc}])          { aggregate { count } nodes { id } } }",
+    )
+    .await;
+
+    assert_eq!(
+        data["widgets_aggregate"]["aggregate"]["count"],
+        serde_json::json!(4),
+        "the count is of what is there"
+    );
+    assert_eq!(
+        data["widgets_aggregate"]["nodes"]
+            .as_array()
+            .map(Vec::len),
+        Some(2),
+        "the page is of what may be sent"
+    );
+
+    // A limit the request asked for is a different thing, and does reach the
+    // count: `widgets_aggregate(limit: 3)` is a question about three rows.
+    let data = execute_ok(
+        &state,
+        &pool,
+        &schema,
+        "{ widgets_aggregate(order_by: [{id: asc}], limit: 3) { aggregate { count } } }",
+    )
+    .await;
+    assert_eq!(
+        data["widgets_aggregate"]["aggregate"]["count"],
+        serde_json::json!(3)
+    );
+
+    drop_schema(&pool, &schema).await;
+}
+
 /// A live query answers now, and answers again when what it answered stops
 /// being true. This drives the refresh rather than the notifications, because
 /// the test schema carries no trigger -- which is exactly the case the refresh

@@ -2758,12 +2758,36 @@ async fn aggregate_value(
         (None, ceiling) => ceiling,
     };
 
-    let mut inner = format!("SELECT * FROM {}{}{}", source, where_sql, order_sql);
+    let rows = format!("SELECT * FROM {}{}{}", source, where_sql, order_sql);
+
+    // What `nodes` reads: the page, bounded by whichever ceiling is lowest.
+    let mut inner = rows.clone();
     if let Some(limit) = limit {
         inner.push_str(&format!(" LIMIT {}", limit));
     }
     if let Some(offset) = offset {
         inner.push_str(&format!(" OFFSET {}", offset));
+    }
+
+    // What `aggregate` reads, which is not the same rows. A count is not a
+    // page: a ceiling exists to bound how many rows travel, and answering
+    // "how many are there" with "as many as I would have sent you" is not an
+    // answer to the question. Hasura says so too -- a role limited to one row
+    // of `article` still counts three of them and still gets `max(id)` over
+    // all three, which is what `agg_perm` tests.
+    //
+    // The request's own `limit` and `offset` do still apply: those were asked
+    // for, and `article_aggregate(limit: 2)` is a question about two rows. The
+    // corpus proves this only for the permission's ceiling; the configured one
+    // is treated the same way because the reason is the same, and because a
+    // server whose `PGRST_MAX_ROWS` silently became the answer to `count`
+    // would be wrong in the way that is hardest to notice.
+    let mut counted = rows;
+    if let Some(limit) = requested_limit {
+        counted.push_str(&format!(" LIMIT {}", limit));
+    }
+    if let Some(offset) = offset {
+        counted.push_str(&format!(" OFFSET {}", offset));
     }
 
     // What the client actually asked for. Two selections of one aggregate are
@@ -2856,7 +2880,7 @@ async fn aggregate_value(
         let sql = format!(
             "SELECT json_build_object({}) FROM ({}) AS pgrst_agg",
             parts.join(", "),
-            inner
+            counted
         );
         let mut conn =
             begin_with_session(pool, gql_ctx.role(), &gql_ctx.session_settings()).await?;
