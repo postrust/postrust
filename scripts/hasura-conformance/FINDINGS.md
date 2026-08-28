@@ -8,11 +8,11 @@ harness itself, divergences kept on purpose, and the gaps still open.
 
 | | status | same outcome | same data | full body |
 |---|---|---|---|---|
-| all (468) | 100.0% | 97.9% | **94.2%** | 92.9% |
-| reads (271) | 100.0% | 97.0% | 90.8% | 90.0% |
-| writes (197) | 100.0% | 99.0% | **99.0%** | 97.0% |
+| all (468) | 100.0% | 98.7% | **95.3%** | 94.4% |
+| reads (271) | 100.0% | 98.5% | 92.6% | 92.3% |
+| writes (197) | 100.0% | 99.0% | **99.0%** | 97.5% |
 
-Of the 441 cases the third column counts, **311 agree about data and 130 agree
+Of the 446 cases the third column counts, **315 agree about data and 130 agree
 only because both servers answered with errors.** A further 1 is a case where
 Hasura refused and this server answered -- down from 115 before the permission
 layer existed.
@@ -70,13 +70,13 @@ subsystem.
 
 The fourth column moved on its own for seven runs after that: what an error
 says, and where it says it happened. 311 bodies matched entirely before those
-runs and 435 do now. 6 cases are left in the gap between the third column and
-the fourth, down from 101. The two runs since are the first to move the third
-column again -- a role's mutation root existing at all is not a question about
-error text, and neither is a permission that refuses itself.
+runs and 442 do now. **4 cases are left in the gap between the third column
+and the fourth, down from 101 -- and none of the four is a wording question.**
+Two are the constraint-order artefact described under the harness, one is a
+deliberate divergence, and one is metadata this harness cannot follow.
 
-Writes are at 97.0% on the full body and 99.0% on data, against 90.0% and
-90.8% for reads. Two write cases are left in the whole corpus that do not
+Writes are at 97.5% on the full body and 99.0% on data, against 92.3% and
+92.6% for reads. Two write cases are left in the whole corpus that do not
 agree about data.
 
 The five runs before those moved nineteen cases between them and moved nothing
@@ -116,6 +116,34 @@ server. Every fault in the instrument either invents work or hides it.
   `/v1/metadata`, and posting one to the other's endpoint is rejected outright.
   Commands are now sent individually rather than as the `bulk` they arrive in,
   because a file mixing the two has no single endpoint that would accept it.
+
+- **`pg_dump` restores constraints in a different order than the fixture
+  created them, and PostgreSQL names whichever it checks first.** Two cases,
+  and neither is a server difference. `transaction_revert_http` inserts a row
+  that violates both the primary key and a unique index; the reference answers
+  `author_pkey` and this server answers `author_name_key`.
+
+  The fixture is `create table author(id serial primary key, name text
+  unique)`, so the reference's database has `author_pkey` first. `pg_dump`
+  emits constraints alphabetically, so the candidate's restored database has
+  `author_name_key` first -- and PostgreSQL reports the constraint whose index
+  it reaches first. Run against one PostgreSQL:
+
+  ```text
+  create table fixture(id serial primary key, name text unique);
+  -- duplicate key value violates unique constraint "fixture_pkey"
+
+  create table restored(id integer not null, name text);
+  alter table restored add constraint restored_name_key unique (name);
+  alter table restored add constraint restored_pkey primary key (id);
+  -- duplicate key value violates unique constraint "restored_name_key"
+  ```
+
+  Same server, same statement, two answers, decided by creation order alone.
+  Nothing in the dump records the original order, so the only fix would be to
+  build the candidate's database from the fixture SQL rather than from a dump
+  of it -- which is the one thing this harness deliberately does not do, for
+  the reason at the top of `conformance.sh`. Recorded rather than closed.
 
 - **Metadata commands the Python suite applies between cases are not applied
   here, and four cases agree by both servers lacking them.** A group's setup is
@@ -303,14 +331,15 @@ wrong one.
 
 ## Open, ordered by consequence
 
-1. **What is left of the error text: 6 cases, and no two alike.** Hasura reads
-   a header's boolean text itself; it reports a duplicate key against a
-   different constraint than PostgreSQL names; it reaches the database for a
-   nested write into a view this server has already refused for having no
-   insert input; and it has no `books_by_pk` for a role that cannot read
-   `books`, where this server has the field and refuses its argument. Two more
-   are metadata this harness cannot follow: a computed field added and dropped
-   inside a single case, and an enum table whose visibility changes.
+1. **What is left of the error text: 4 cases, and none of them is wording.**
+   Two are the `pg_dump` constraint-order artefact under the harness above --
+   two databases naming different constraints for the same violation. One is a
+   deliberate divergence: a nested write into a view that selects from more
+   than one table is refused here for having no insert input, where Hasura
+   reaches the database and answers with PostgreSQL's own complaint wrapped in
+   an `internal` object this server does not produce. The last is a computed
+   field added and dropped through the metadata API inside a single case,
+   which a static names document cannot follow.
 
    A pattern worth naming, since seven of the fixes above share it: Hasura
    reads a value against what the column will do with it *before* the
@@ -466,6 +495,40 @@ wrong one.
   with no members reached through an argument. 286 -> 290 real agreements, and
   the status column to 100%.
 
+
+- **Seven one-offs, and the last of the error text.** No two shared a cause,
+  which is what made them the end of that list.
+
+  A role granted `book_name` and not `id` was still offered `books_by_pk(id:
+  ..., book_name: ...)`, because the key columns were read off the table and
+  the one that was missing fell back to `text` -- so the field existed and
+  typed its argument `String`. A `_by_pk` addresses a row by its key, and half
+  a key is not one: Hasura does not publish the field, and neither does this
+  now, for the query root and both write roots alike.
+
+  A computed field is granted under **the name the client sees**, and the map
+  is keyed by the function. Comparing them directly -- `student_total_marks`
+  against `total_marks` -- withheld every computed field a schema had renamed,
+  from a permission that had granted it.
+
+  An operator's operand is a value, not a boolean expression. `_st_d_within`
+  takes `{distance, from}` and this server read those keys as *columns*: it
+  renamed them, wrapped their values in `_eq`, and handed PostGIS something
+  that was no longer GeoJSON -- `invalid GeoJson representation`, about a
+  shape it had taken apart itself. Session variables inside an operand are
+  still resolved, which is the one thing a permission's operand does need.
+
+  `x-hasura-use-backend-only-permissions: random` is not false. The accepted
+  texts are a closed set Hasura names in the refusal itself, and `1` is not
+  among them; reading anything else as false would send a backend-only write
+  down the path meant for everyone else, on a header the client thought it
+  had set.
+
+  And a request carrying `extensions.persistedQuery` is an Apollo handshake
+  neither server implements. Hasura says `PersistedQueryNotSupported`; this
+  server ran whatever document was beside the hash, which is the answer that
+  looks like the handshake worked -- after which a client sends hash-only
+  requests into silence.
 
 - **A permission's filter is the server's predicate, not the caller's.** Eight
   cases, and the largest thing wrong with reads. A permission written over a
