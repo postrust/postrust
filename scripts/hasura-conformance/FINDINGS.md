@@ -8,12 +8,12 @@ harness itself, divergences kept on purpose, and the gaps still open.
 
 | | status | same outcome | same data | full body |
 |---|---|---|---|---|
-| all (468) | 100.0% | 96.2% | **92.5%** | 90.0% |
+| all (468) | 100.0% | 96.4% | **92.7%** | 91.2% |
 | reads (271) | 100.0% | 94.8% | 88.6% | 87.8% |
-| writes (197) | 100.0% | 98.0% | **98.0%** | 92.9% |
+| writes (197) | 100.0% | 98.5% | **98.5%** | 95.9% |
 
-Of the 433 cases the third column counts, **304 agree about data and 129 agree
-only because both servers answered with errors.** A further 2 are cases where
+Of the 434 cases the third column counts, **304 agree about data and 130 agree
+only because both servers answered with errors.** A further 1 is a case where
 Hasura refused and this server answered -- down from 115 before the permission
 layer existed.
 
@@ -68,11 +68,16 @@ Where the remaining 35 divergences are:
 Each is named in the open list rather than attributed to one missing
 subsystem.
 
-The fourth column has moved on its own for seven runs since: what an error
+The fourth column moved on its own for seven runs after that: what an error
 says, and where it says it happened. 311 bodies matched entirely before those
-runs and 421 do now, with the other three columns unchanged the whole way --
-which is what a change to error text should look like. 12 cases are left in
-the gap between the third column and the fourth, down from 101.
+runs and 427 do now. 7 cases are left in the gap between the third column and
+the fourth, down from 101. The eighth of those runs is the first since to move
+the third column too -- a role's mutation root existing at all is not a
+question about error text.
+
+Writes are at 95.9% on the full body and 98.5% on data, against 87.8% and
+88.6% for reads. Three write cases are left in the whole corpus that do not
+agree about data.
 
 The five runs before those moved nineteen cases between them and moved nothing
 back.
@@ -111,6 +116,26 @@ server. Every fault in the instrument either invents work or hides it.
   `/v1/metadata`, and posting one to the other's endpoint is rejected outright.
   Commands are now sent individually rather than as the `bulk` they arrive in,
   because a file mixing the two has no single endpoint that would accept it.
+
+- **Metadata commands the Python suite applies between cases are not applied
+  here, and four cases agree by both servers lacking them.** A group's setup is
+  a `setup.yaml` the harness restores; but Hasura's own suite also calls
+  `hge_ctx.v1metadataq_f(...)` from inside a test method, granting a function
+  permission before one case and revoking it after. `TestGraphQLMutationFunctions`
+  does exactly that for `add_to_score` and `add_to_score_by_user_id`.
+
+  The reference never sees those commands, so it answers `no mutations exist`
+  where the corpus file itself expects rows. Since the candidate is configured
+  from the same metadata, it now answers the same thing, and the four cases
+  count as agreements. They are agreements about a configuration neither server
+  was given -- which is a true statement about two servers configured alike,
+  and not a true statement about the case. Two more in the same group are
+  genuine: `function_without_function_permission` and `address_permission_error`
+  expect `no mutations exist` in the corpus and get it from both.
+
+  Closing it means reading the per-test commands out of the Python and
+  attaching them to the case they precede, which is the first thing in this
+  harness that would parse the suite rather than its data.
 
 - **A reference recorded by a different harness was reused for eleven runs.**
   `run.py` attaches the admin secret to every case, because a case that names
@@ -278,30 +303,16 @@ wrong one.
 
 ## Open, ordered by consequence
 
-1. **A role whose mutations are all withheld has no mutation root: 5 cases.**
-   The largest group left, and not a wording question. Hasura answers `no
-   mutations exist` at `$` -- its `mutation_root` is absent altogether, not
-   merely short of the field. Here the root exists and refuses the field, so
-   both servers refuse and say different things.
-
-   Three parts to it, each visible in one of the cases. A function exposed as
-   a mutation needs the role's function permission, which is why
-   `add_to_score` is in this server's root and not Hasura's. A function
-   returning one row rather than a set is a mutation field there and nothing
-   here, which is open item 8 below. And an unrecognised role is, to Hasura, a
-   role with nothing granted rather than an error -- `address_permission_error`
-   sends `merchant`, which no permission mentions, and gets an empty schema
-   where this server answers `role "merchant" is not defined in the
-   permissions`.
-
-2. **What is left of the error text: 7 cases, and no two alike.** Hasura reads
+1. **What is left of the error text: 6 cases, and no two alike.** Hasura reads
    a header's boolean text itself; it reports a check-constraint failure where
-   this server cannot compile the comparison the check is written in; it
-   reports a duplicate key against a different constraint than PostgreSQL
-   names; and it reaches the database for a nested write into a view this
-   server has already refused for having no insert input. One more is a
-   computed field added and dropped through the metadata API within a single
-   case, which a static names document cannot follow.
+   this server cannot compile the comparison the check is written in (`_and`
+   inside a relationship filter, which is also two of the `graphql_query/
+   functions/permissions` cases); it reports a duplicate key against a
+   different constraint than PostgreSQL names; and it reaches the database for
+   a nested write into a view this server has already refused for having no
+   insert input. One more is a computed field added and dropped through the
+   metadata API within a single case, which a static names document cannot
+   follow.
 
    A pattern worth naming, since seven of the fixes above share it: Hasura
    reads a value against what the column will do with it *before* the
@@ -311,27 +322,27 @@ wrong one.
    and where the answer does not depend on the value at all, the column has no
    business being in the input type.
 
-3. **`_stream` subscriptions.** The cursor-based half of Hasura's subscription
+2. **`_stream` subscriptions.** The cursor-based half of Hasura's subscription
    surface: `article_stream(cursor: {initial_value: {id: 0}}, batch_size: 10)`
    sends rows *after* a cursor rather than the whole answer, which is what a
    client tailing an append-only table wants. The live queries beside it are
    done; this is a second shape with its own cursor types, and nothing in the
    corpus exercises it -- it shows up in introspection only.
 
-4. **What is left of the enum tables.** They work: a marked table's rows are a
+3. **What is left of the enum tables.** They work: a marked table's rows are a
    generated enum, referencing columns are typed as it, and no relationship
    points at one. What remains is the metadata API around them —
    `v1/set_table_is_enum` is four cases of turning the flag on and off through
    `/v1/query`, which is the contract this server does not offer.
 
-5. **A manual relationship** -- one Hasura maps column by column rather than by
+4. **A manual relationship** -- one Hasura maps column by column rather than by
    a foreign key -- has no constraint to key a name by, so
    `PGRST_GRAPHQL_NAMES` cannot carry its name and the converter says so rather
    than guessing. In the corpus it is also a *second* name for a foreign key
    that already has one, which reflection can only produce once. Two cases, one
    of them the only remaining insert this server refuses and Hasura performs.
 
-6. **Which relationships exist is metadata's to say.** Hasura exposes the
+5. **Which relationships exist is metadata's to say.** Hasura exposes the
    relationships its metadata declares; this server exposes one per foreign
    key. Where a fixture tracks a table without naming all of its keys, the
    extra fields are here and not there. No query breaks on a field it does not
@@ -340,7 +351,7 @@ wrong one.
    would mean letting the names document say which relationships exist, not
    just what they are called, which is a different kind of directive.
 
-7. **A function taking a table's row, tracked as a root field.** Hasura lets a
+6. **A function taking a table's row, tracked as a root field.** Hasura lets a
    client write `fetch_articles(args: {search: "Art", author_row: "(1, 'Roger',
    'Chris')"})` -- the row as a literal. Here such a function is a computed
    field and nothing else, on the grounds that a row type is not something a
@@ -348,12 +359,12 @@ wrong one.
    table's composite type as a scalar under the table's own name, which is a
    name the object type already has. One case, and the position is deliberate.
 
-8. **A function returning one row, as a mutation.** `add_to_score_by_user_id`
+7. **A function returning one row, as a mutation.** `add_to_score_by_user_id`
    returns `"user"` rather than `SETOF "user"`; Hasura exposes it as a root
    field yielding one row. Here only a set-returning function becomes a root
    field.
 
-9. **Every generated description is this server's wording, not Hasura's.**
+8. **Every generated description is this server's wording, not Hasura's.**
    `article_bool_exp` is described here as "Filter rows of article. Fields are
    combined with AND unless _or says otherwise." and there as "Boolean
    expression to filter rows from the table \"article\"...". Nothing breaks
@@ -363,19 +374,19 @@ wrong one.
    arguments come back in: Hasura sorts them, this server lists them as
    declared.
 
-10. **Introspection shape, inside async-graphql.** It publishes five directives
-    where Hasura publishes three, registers `ID` and `__DirectiveLocation`
-    where Hasura has neither, and answers `__TypeKind`'s members in
-    specification order rather than alphabetically. Six cases, and none of them
-    is reachable without forking the library.
+9. **Introspection shape, inside async-graphql.** It publishes five directives
+   where Hasura publishes three, registers `ID` and `__DirectiveLocation`
+   where Hasura has neither, and answers `__TypeKind`'s members in
+   specification order rather than alphabetically. Six cases, and none of them
+   is reachable without forking the library.
 
-11. **An enum value beginning with `null`, `true` or `false`.** The parser
+10. **An enum value beginning with `null`, `true` or `false`.** The parser
     mis-lexes `nullPrefixTestTable_pkey` as the literal `null` followed by
     something it cannot read, so an upsert naming that constraint is answered
     with a parse error. This is async-graphql's lexer, not this server. One
     case.
 
-12. **Actions and Apollo federation** are subsystems rather than gaps:
+11. **Actions and Apollo federation** are subsystems rather than gaps:
     `actions/*` describes handlers Hasura calls out to over HTTP, and
     `apollo_federation` describes the `_service`/`_entities` surface a
     federated gateway composes. Five cases between them.
@@ -449,6 +460,29 @@ wrong one.
   with no members reached through an argument. 286 -> 290 real agreements, and
   the status column to 100%.
 
+
+- **A role granted no mutation has no mutation root.** Hasura answers `no
+  mutations exist` at `$`, which is not a field that is missing: the
+  `mutation_root` type is absent from that role's schema altogether. Six cases,
+  and two separate readings behind them.
+
+  A function with side effects is not granted by permission to read the table
+  it returns. Hasura infers a *query* function's permission from the select
+  permission on its return table -- which is a rule this server already had,
+  since a function returning a table the role cannot read has nowhere to put
+  the rows -- and infers nothing at all for a function exposed as a mutation.
+  `pg_create_function_permission` is the only thing that grants one. The
+  evidence is in the reference rather than in the documentation: `anonymous`
+  holds `select` on `user`, `add_to_score` returns `SETOF user`, and the
+  reference still has no mutation root for that role.
+
+  And an unrecognised role is, to Hasura, a role that was granted nothing
+  rather than an error. This server refused it -- `role "merchant" is not
+  defined in the permissions` -- which is the more useful answer for an
+  operator and the wrong one for a client. Such a role is now answered from a
+  schema with nothing in it, built once at startup rather than one per name a
+  caller invents. Both answers refuse everything; only one of them is a
+  refusal Hasura's clients know how to read.
 
 - **Three singletons, one shape between them.** Each was this server letting
   something further down answer a question the request had already settled.
