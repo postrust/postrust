@@ -8,8 +8,8 @@ harness itself, divergences kept on purpose, and the gaps still open.
 
 | | status | same outcome | same data | full body |
 |---|---|---|---|---|
-| all (468) | 100.0% | 96.2% | **92.5%** | 87.4% |
-| reads (271) | 100.0% | 94.8% | 88.6% | 85.6% |
+| all (468) | 100.0% | 96.2% | **92.5%** | 87.6% |
+| reads (271) | 100.0% | 94.8% | 88.6% | 86.0% |
 | writes (197) | 100.0% | 98.0% | **98.0%** | 89.8% |
 
 Of the 433 cases the third column counts, **304 agree about data and 129 agree
@@ -70,8 +70,8 @@ subsystem.
 
 The fourth column has moved on its own for four runs since: what an error
 says, and where it says it happened. 311 bodies matched entirely before those
-runs and 409 do now, with the other three columns unchanged the whole way --
-which is what a change to error text should look like. 24 cases are left in
+runs and 410 do now, with the other three columns unchanged the whole way --
+which is what a change to error text should look like. 23 cases are left in
 the gap between the third column and the fourth, down from 101.
 
 The five runs before those moved nineteen cases between them and moved nothing
@@ -278,10 +278,9 @@ wrong one.
 
 ## Open, ordered by consequence
 
-1. **What is left of the error text: 24 cases, and no two alike.** The
-   families are gone; what remains is one-offs. Hasura detects a fragment
-   cycle by name where async-graphql reports a recursion depth; it reads a
-   raster's hex before sending it and this server lets PostGIS answer
+1. **What is left of the error text: 23 cases, and no two alike.** The
+   families are gone; what remains is one-offs. Hasura reads a raster's hex
+   before sending it and this server lets PostGIS answer
    `rt_raster_from_wkb: wkb size (14) < min size (61)`; it refuses an insert
    naming a column the role cannot write before the statement runs, where this
    server lets PostgreSQL answer `cannot insert a non-DEFAULT value into
@@ -429,6 +428,25 @@ wrong one.
   with no members reached through an argument. 286 -> 290 real agreements, and
   the status column to 100%.
 
+
+- **Fragments that spread each other are named as a cycle.** A fragment that
+  spreads its way back to itself describes no finite selection.
+  async-graphql notices that something went too deep -- `The recursion depth
+  of the query cannot be greater than 32` -- which says a limit was reached
+  rather than what was wrong. Hasura names the fragments that went round.
+
+  The walk already held a *set* of fragments to stop itself looping; a stack
+  replaces it, because what a cycle is named after is the run of fragments
+  from the first occurrence to the repeat, and because a fragment spread twice
+  in sibling positions is not a cycle and should be checked at both. A budget
+  bounds the walk instead, since fragments that each spread the next twice
+  double the work per level without any name repeating.
+
+  The case also settles something the walk had been guessing: **a spread is a
+  step in Hasura's path**, named after the fragment --
+  `$.selectionSet.author.selectionSet.authorFragment.selectionSet.articles`
+  -- and the cycle is reported against the selection set the offending spread
+  is in, which by then has no selection set of its own to name.
 
 - **A number that is not an `Int` is refused as one.** GraphQL's `Int` is a
   signed 32-bit integer and `2147483648` is not one. PostgreSQL says `integer
