@@ -1123,6 +1123,7 @@ impl Usage<'_> {
                 self.enumerated(value, expected, pos, path, false);
                 self.label_path(value, expected, pos, path);
             }
+            Value::Number(_) => self.integral(value, expected, pos, path),
             Value::List(items) => {
                 // A list may be written where one value is expected, in which
                 // case each item is checked against that same type -- which is
@@ -1193,6 +1194,47 @@ impl Usage<'_> {
 }
 
 impl Usage<'_> {
+    /// A number written where an `Int` is expected, against what an `Int` is.
+    ///
+    /// GraphQL's `Int` is a signed 32-bit integer, and `2147483648` is not
+    /// one. PostgreSQL says `integer out of range` when the statement runs;
+    /// Hasura says so while reading the request, and names the value it could
+    /// not read. `int8` columns are a `bigint` scalar rather than an `Int`, so
+    /// nothing that legitimately holds a large number is caught here.
+    fn integral(
+        &mut self,
+        value: &async_graphql_value::Value,
+        expected: &str,
+        pos: async_graphql::Pos,
+        path: &str,
+    ) {
+        use async_graphql::registry::MetaTypeName;
+        use async_graphql_value::Value;
+
+        if MetaTypeName::concrete_typename(expected) != "Int" {
+            return;
+        }
+        let Value::Number(number) = value else {
+            return;
+        };
+        if number.as_i64().is_some_and(|n| i32::try_from(n).is_ok()) {
+            return;
+        }
+        let Some(shown) = number.as_f64().map(shown_as_haskell_would) else {
+            return;
+        };
+        self.errors.push(coded_as(
+            "parse-failed",
+            format!(
+                "The value {} lies outside the bounds or is not an integer. \
+                 Maybe it is a float, or is there integer overflow?",
+                shown
+            ),
+            pos,
+            path,
+        ));
+    }
+
     /// How many rows a query asked for, which `Int` alone does not say.
     ///
     /// `limit` is typed `Int` in the schema either server publishes and is not
@@ -1233,9 +1275,15 @@ impl Usage<'_> {
 
         let found = match value.as_ref() {
             Value::String(_) => "a string",
-            Value::Number(number) => match number.as_u64().is_some_and(|n| n <= u32::MAX as u64) {
-                true => return,
-                false => "an integer",
+            Value::Number(number) => match number.as_i64() {
+                // A number that is not an `Int` at all is left to the rule
+                // about `Int`: that is the more specific complaint, and both
+                // rules firing would answer one mistake twice.
+                None => return,
+                Some(written) if i32::try_from(written).is_err() => return,
+                // What is left is a number of rows, and a negative one is not.
+                Some(written) if written >= 0 => return,
+                Some(_) => "an integer",
             },
             _ => return,
         };
@@ -1359,6 +1407,36 @@ impl Usage<'_> {
     }
 }
 
+/// A number as Haskell's `show` renders a `Double`, which is how the value in
+/// Hasura's message is spelled.
+///
+/// `2147483648` comes back as `2.147483648e9` rather than as its digits, and
+/// the message quotes it, so matching the message means matching the
+/// rendering. Haskell writes a `Double` in fixed notation while its magnitude
+/// is in `[0.1, 10^7)` and in scientific notation otherwise, always with a
+/// decimal point in the mantissa. Rust's own two formats are the same two
+/// spellings and both give the shortest digits that read back exactly, so the
+/// choice between them is the whole of what this adds.
+fn shown_as_haskell_would(value: f64) -> String {
+    if !value.is_finite() {
+        return value.to_string();
+    }
+    let magnitude = value.abs();
+    let with_a_point = |rendered: String| match rendered.contains('.') {
+        true => rendered,
+        false => format!("{}.0", rendered),
+    };
+    if magnitude != 0.0 && (magnitude < 0.1 || magnitude >= 1e7) {
+        let rendered = format!("{:e}", value);
+        let (mantissa, exponent) = match rendered.split_once('e') {
+            Some(halves) => halves,
+            None => return with_a_point(rendered),
+        };
+        return format!("{}e{}", with_a_point(mantissa.to_string()), exponent);
+    }
+    with_a_point(format!("{}", value))
+}
+
 /// A location type as it accepts a variable, given whether it has a default.
 ///
 /// A non-null location with a default takes a nullable variable: leaving that
@@ -1432,7 +1510,8 @@ mod variable_position_tests {
                 TypeRef::named("kind_enum_comparison_exp"),
             ));
         let insert = InputObject::new("author_insert_input")
-            .field(InputValue::new("name", TypeRef::named("String")));
+            .field(InputValue::new("name", TypeRef::named("String")))
+            .field(InputValue::new("count", TypeRef::named("Int")));
         let query = Object::new("query_root").field(
             Field::new("author", TypeRef::named_nn_list_nn("author"), |_| {
                 FieldFuture::new(async move { Ok(Some(async_graphql::Value::List(vec![]))) })
@@ -1578,6 +1657,62 @@ mod variable_position_tests {
         );
     }
 
+    /// GraphQL's `Int` is a signed 32-bit integer, and a number that is not
+    /// one is refused while the request is read rather than by the database.
+    #[test]
+    fn a_number_that_is_not_an_int_is_refused_as_one() {
+        let bounds = |value: &str| {
+            format!(
+                "The value {} lies outside the bounds or is not an integer. \
+                 Maybe it is a float, or is there integer overflow?",
+                value
+            )
+        };
+        assert_eq!(
+            refusals(
+                "mutation { insert_author_one(object: {count: 2147483648}) { id } }",
+                "{}"
+            ),
+            vec![bounds("2.147483648e9")]
+        );
+        assert_eq!(
+            refusals_with_paths(
+                "mutation { insert_author(objects: [{count: 2147483648}]) { id } }",
+                "{}"
+            ),
+            vec!["$.selectionSet.insert_author.args.objects[0].count"]
+        );
+        // The edges of the type are inside it.
+        for good in ["2147483647", "-2147483648", "0"] {
+            assert!(
+                refusals(
+                    &format!("mutation {{ insert_author_one(object: {{count: {}}}) {{ id }} }}", good),
+                    "{}"
+                )
+                .is_empty(),
+                "{} was refused",
+                good
+            );
+        }
+    }
+
+    /// Haskell writes a `Double` in fixed notation while it is neither very
+    /// large nor very small, and Hasura quotes what Haskell wrote.
+    #[test]
+    fn a_number_is_shown_the_way_the_message_spells_it() {
+        assert_eq!(shown_as_haskell_would(2147483648.0), "2.147483648e9");
+        assert_eq!(shown_as_haskell_would(1.5), "1.5");
+        assert_eq!(shown_as_haskell_would(1.0), "1.0");
+        assert_eq!(shown_as_haskell_would(0.0), "0.0");
+        assert_eq!(shown_as_haskell_would(-2147483649.0), "-2.147483649e9");
+        assert_eq!(shown_as_haskell_would(1e-3), "1.0e-3");
+        // The boundaries of the fixed range, which are Haskell's and not
+        // Rust's.
+        assert_eq!(shown_as_haskell_would(9999999.0), "9999999.0");
+        assert_eq!(shown_as_haskell_would(10000000.0), "1.0e7");
+        assert_eq!(shown_as_haskell_would(0.1), "0.1");
+    }
+
     /// `limit` is typed `Int` and is not any `Int`, and `offset` is -- which
     /// is Hasura's asymmetry, not an omission.
     #[test]
@@ -1603,10 +1738,17 @@ mod variable_position_tests {
             ),
             vec!["expected a non-negative 32-bit integer for type 'Int', but found an integer"]
         );
-        // Zero is a number of rows. So is a large one, up to 32 bits.
+        // Zero is a number of rows, and so is the largest `Int` there is.
         assert!(refused("{ author(limit: 0) { id } }").is_empty());
-        assert!(refused("{ author(limit: 4294967295) { id } }").is_empty());
+        assert!(refused("{ author(limit: 2147483647) { id } }").is_empty());
         assert!(refused("{ author(limit: null) { id } }").is_empty());
+        // Beyond that it is not a number of rows because it is not an `Int`,
+        // and it is answered as that rather than as both.
+        assert_eq!(
+            refused("{ author(limit: 4294967295) { id } }"),
+            vec!["The value 4.294967295e9 lies outside the bounds or is not an \
+                  integer. Maybe it is a float, or is there integer overflow?"]
+        );
     }
 
     /// A quoted enum value is a mistake about the language; an unquoted one
