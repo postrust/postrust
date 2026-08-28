@@ -1543,9 +1543,7 @@ async fn a_ceiling_bounds_the_page_and_not_the_count() {
         "the count is of what is there"
     );
     assert_eq!(
-        data["widgets_aggregate"]["nodes"]
-            .as_array()
-            .map(Vec::len),
+        data["widgets_aggregate"]["nodes"].as_array().map(Vec::len),
         Some(2),
         "the page is of what may be sent"
     );

@@ -314,7 +314,10 @@ mod tests {
     /// argument the client sent.
     #[test]
     fn a_path_given_with_the_error_is_the_one_answered() {
-        let mut error = error_at("boom", vec![PathSegment::Field("insert_author".to_string())]);
+        let mut error = error_at(
+            "boom",
+            vec![PathSegment::Field("insert_author".to_string())],
+        );
         let mut extensions = async_graphql::ErrorExtensionValues::default();
         extensions.set("code", "permission-error");
         extensions.set("path", "$.selectionSet.insert_author.args.objects");
@@ -997,10 +1000,7 @@ impl Usage<'_> {
                             // at, which is the complaint.
                             if meta.is_some() {
                                 self.errors.push(coded(
-                                    format!(
-                                        "'{}' has no argument named '{}'",
-                                        named, name.node
-                                    ),
+                                    format!("'{}' has no argument named '{}'", named, name.node),
                                     name.pos,
                                     &here,
                                 ));
@@ -1051,10 +1051,7 @@ impl Usage<'_> {
                         let cycle: Vec<&str> =
                             self.spreading[began..].iter().map(String::as_str).collect();
                         self.errors.push(coded(
-                            format!(
-                                "the fragment definition(s) {} form a cycle",
-                                listed(&cycle)
-                            ),
+                            format!("the fragment definition(s) {} form a cycle", listed(&cycle)),
                             spread.pos,
                             // The selection set the offending spread is in,
                             // rather than the spread itself: by then the
@@ -1609,8 +1606,14 @@ mod variable_position_tests {
             TypeRef::named("raster"),
         ));
         let tree_filter = InputObject::new("tree_bool_exp")
-            .field(InputValue::new("rast", TypeRef::named("raster_comparison_exp")))
-            .field(InputValue::new("path", TypeRef::named("ltree_comparison_exp")))
+            .field(InputValue::new(
+                "rast",
+                TypeRef::named("raster_comparison_exp"),
+            ))
+            .field(InputValue::new(
+                "path",
+                TypeRef::named("ltree_comparison_exp"),
+            ))
             .field(InputValue::new(
                 "kind",
                 TypeRef::named("kind_enum_comparison_exp"),
@@ -1618,19 +1621,20 @@ mod variable_position_tests {
         let insert = InputObject::new("author_insert_input")
             .field(InputValue::new("name", TypeRef::named("String")))
             .field(InputValue::new("count", TypeRef::named("Int")));
-        let query = Object::new("query_root").field(
-            Field::new("author", TypeRef::named_nn_list_nn("author"), |_| {
-                FieldFuture::new(async move { Ok(Some(async_graphql::Value::List(vec![]))) })
-            })
-            .argument(InputValue::new("limit", TypeRef::named("Int")))
-            .argument(InputValue::new("where", TypeRef::named("author_bool_exp"))),
-        )
-        .field(
-            Field::new("tree", TypeRef::named_nn_list_nn("tree"), |_| {
-                FieldFuture::new(async move { Ok(Some(async_graphql::Value::List(vec![]))) })
-            })
-            .argument(InputValue::new("where", TypeRef::named("tree_bool_exp"))),
-        );
+        let query = Object::new("query_root")
+            .field(
+                Field::new("author", TypeRef::named_nn_list_nn("author"), |_| {
+                    FieldFuture::new(async move { Ok(Some(async_graphql::Value::List(vec![]))) })
+                })
+                .argument(InputValue::new("limit", TypeRef::named("Int")))
+                .argument(InputValue::new("where", TypeRef::named("author_bool_exp"))),
+            )
+            .field(
+                Field::new("tree", TypeRef::named_nn_list_nn("tree"), |_| {
+                    FieldFuture::new(async move { Ok(Some(async_graphql::Value::List(vec![]))) })
+                })
+                .argument(InputValue::new("where", TypeRef::named("tree_bool_exp"))),
+            );
         let mutation = Object::new("mutation_root")
             .field(
                 Field::new("insert_author_one", TypeRef::named("author"), |_| {
@@ -1729,9 +1733,8 @@ mod variable_position_tests {
     /// not in the answer.
     #[test]
     fn a_refusal_names_the_argument_it_was_found_in() {
-        let paths = |query: &str, variables: &str| -> Vec<String> {
-            refusals_with_paths(query, variables)
-        };
+        let paths =
+            |query: &str, variables: &str| -> Vec<String> { refusals_with_paths(query, variables) };
         // A key of an input object, under the argument that carried it.
         assert_eq!(
             paths(
@@ -1865,7 +1868,10 @@ mod variable_position_tests {
         for good in ["2147483647", "-2147483648", "0"] {
             assert!(
                 refusals(
-                    &format!("mutation {{ insert_author_one(object: {{count: {}}}) {{ id }} }}", good),
+                    &format!(
+                        "mutation {{ insert_author_one(object: {{count: {}}}) {{ id }} }}",
+                        good
+                    ),
                     "{}"
                 )
                 .is_empty(),
@@ -1925,8 +1931,10 @@ mod variable_position_tests {
         // and it is answered as that rather than as both.
         assert_eq!(
             refused("{ author(limit: 4294967295) { id } }"),
-            vec!["The value 4.294967295e9 lies outside the bounds or is not an \
-                  integer. Maybe it is a float, or is there integer overflow?"]
+            vec![
+                "The value 4.294967295e9 lies outside the bounds or is not an \
+                  integer. Maybe it is a float, or is there integer overflow?"
+            ]
         );
     }
 
@@ -1987,15 +1995,24 @@ mod variable_position_tests {
         let empty = "Expecting label path: a sequence of zero or more labels \
                      separated by dots, for example L1.L2.L3";
         assert_eq!(
-            refusals("{ tree(where: {path: {_ancestor: \"a.b.\"}}) { path } }", "{}"),
+            refusals(
+                "{ tree(where: {path: {_ancestor: \"a.b.\"}}) { path } }",
+                "{}"
+            ),
             vec![empty]
         );
         assert_eq!(
-            refusals("{ tree(where: {path: {_ancestor: \".a\"}}) { path } }", "{}"),
+            refusals(
+                "{ tree(where: {path: {_ancestor: \".a\"}}) { path } }",
+                "{}"
+            ),
             vec![empty]
         );
         assert_eq!(
-            refusals("{ tree(where: {path: {_ancestor: \"a..b\"}}) { path } }", "{}"),
+            refusals(
+                "{ tree(where: {path: {_ancestor: \"a..b\"}}) { path } }",
+                "{}"
+            ),
             vec![empty]
         );
         // The list form says which item, which is what its path is for.
@@ -2011,7 +2028,10 @@ mod variable_position_tests {
         for good in ["a", "a.b", "", "a-b", "a_b", "1.2", "Ünï", "a@b"] {
             assert!(
                 refusals(
-                    &format!("{{ tree(where: {{path: {{_ancestor: \"{}\"}}}}) {{ path }} }}", good),
+                    &format!(
+                        "{{ tree(where: {{path: {{_ancestor: \"{}\"}}}}) {{ path }} }}",
+                        good
+                    ),
                     "{}"
                 )
                 .is_empty(),
