@@ -8,11 +8,11 @@ harness itself, divergences kept on purpose, and the gaps still open.
 
 | | status | same outcome | same data | full body |
 |---|---|---|---|---|
-| all (468) | 100.0% | 96.4% | **92.7%** | 91.2% |
-| reads (271) | 100.0% | 94.8% | 88.6% | 87.8% |
-| writes (197) | 100.0% | 98.5% | **98.5%** | 95.9% |
+| all (468) | 100.0% | 97.9% | **94.2%** | 92.9% |
+| reads (271) | 100.0% | 97.0% | 90.8% | 90.0% |
+| writes (197) | 100.0% | 99.0% | **99.0%** | 97.0% |
 
-Of the 434 cases the third column counts, **304 agree about data and 130 agree
+Of the 441 cases the third column counts, **311 agree about data and 130 agree
 only because both servers answered with errors.** A further 1 is a case where
 Hasura refused and this server answered -- down from 115 before the permission
 layer existed.
@@ -70,13 +70,13 @@ subsystem.
 
 The fourth column moved on its own for seven runs after that: what an error
 says, and where it says it happened. 311 bodies matched entirely before those
-runs and 427 do now. 7 cases are left in the gap between the third column and
-the fourth, down from 101. The eighth of those runs is the first since to move
-the third column too -- a role's mutation root existing at all is not a
-question about error text.
+runs and 435 do now. 6 cases are left in the gap between the third column and
+the fourth, down from 101. The two runs since are the first to move the third
+column again -- a role's mutation root existing at all is not a question about
+error text, and neither is a permission that refuses itself.
 
-Writes are at 95.9% on the full body and 98.5% on data, against 87.8% and
-88.6% for reads. Three write cases are left in the whole corpus that do not
+Writes are at 97.0% on the full body and 99.0% on data, against 90.0% and
+90.8% for reads. Two write cases are left in the whole corpus that do not
 agree about data.
 
 The five runs before those moved nineteen cases between them and moved nothing
@@ -304,15 +304,13 @@ wrong one.
 ## Open, ordered by consequence
 
 1. **What is left of the error text: 6 cases, and no two alike.** Hasura reads
-   a header's boolean text itself; it reports a check-constraint failure where
-   this server cannot compile the comparison the check is written in (`_and`
-   inside a relationship filter, which is also two of the `graphql_query/
-   functions/permissions` cases); it reports a duplicate key against a
-   different constraint than PostgreSQL names; and it reaches the database for
-   a nested write into a view this server has already refused for having no
-   insert input. One more is a computed field added and dropped through the
-   metadata API within a single case, which a static names document cannot
-   follow.
+   a header's boolean text itself; it reports a duplicate key against a
+   different constraint than PostgreSQL names; it reaches the database for a
+   nested write into a view this server has already refused for having no
+   insert input; and it has no `books_by_pk` for a role that cannot read
+   `books`, where this server has the field and refuses its argument. Two more
+   are metadata this harness cannot follow: a computed field added and dropped
+   inside a single case, and an enum table whose visibility changes.
 
    A pattern worth naming, since seven of the fixes above share it: Hasura
    reads a value against what the column will do with it *before* the
@@ -339,8 +337,16 @@ wrong one.
    a foreign key -- has no constraint to key a name by, so
    `PGRST_GRAPHQL_NAMES` cannot carry its name and the converter says so rather
    than guessing. In the corpus it is also a *second* name for a foreign key
-   that already has one, which reflection can only produce once. Two cases, one
-   of them the only remaining insert this server refuses and Hasura performs.
+   that already has one, which reflection can only produce once.
+
+   Four cases now, and the shape of the fix is clearer than it was. Two are
+   `message.members`, declared with `manual_configuration` over
+   `channel_id`, and a permission on `message` is written through it -- so the
+   filter cannot be compiled at all and the read is refused rather than
+   narrowed. One is the only remaining insert this server refuses and Hasura
+   performs. Closing it means the names document carrying a relationship's
+   *columns* and not just its name, which is the first directive here that
+   would describe a join rather than rename one.
 
 5. **Which relationships exist is metadata's to say.** Hasura exposes the
    relationships its metadata declares; this server exposes one per foreign
@@ -460,6 +466,37 @@ wrong one.
   with no members reached through an argument. 286 -> 290 real agreements, and
   the status column to 100%.
 
+
+- **A permission's filter is the server's predicate, not the caller's.** Eight
+  cases, and the largest thing wrong with reads. A permission written over a
+  relationship -- `{"Artist": {"id": "X-Hasura-Artist-Id"}}` on `Track` --
+  refused itself: role `Artist` has no permission on `Artist` at all, so that
+  relationship is in no schema it is served, and the compiler read the key as
+  a column and answered `unsupported comparison "id" on "Artist"`.
+
+  Consulting a table is not exposing it. `_exists` already worked this way and
+  said so where it is built; this is the same rule for the relationship a
+  permission follows. The permission half of a `where` is now marked on its
+  way to the compiler, and compiled with no caller: relationships resolve
+  against the unreduced catalogue rather than against the role's schema, and
+  the far side's own filter is not applied on top. A client cannot reach a
+  hidden table this way -- a key that is not a field of the boolean expression
+  is refused before any of this runs, and the only writer of such a key is a
+  permission.
+
+  Two more pieces went in with it. **A column compared against another
+  column**: `_ceq`, `_cne`, `_cgt`, `_cgte`, `_clt`, `_clte`, written either
+  as a bare name -- `{"bid_price": {"$cgt": "price"}}`, two columns of one
+  auction -- or as `["$", "name"]`, a column of the table the permission is
+  written on. No client can write these, because no client can name the row a
+  comparison would be against.
+
+  And `$` names the table the *permission* is written on, not the table the
+  query started at. Reading `dml_rbp_tasks` through a project's `where:
+  {tasks: {...}}` compared the task's grant against a column of
+  `dml_rbp_projects` and answered with rows the role may not see -- the one
+  fault in this work that was wrong rather than merely refused, and the reason
+  the integration test that pins it checks a row *count* rather than an error.
 
 - **A role granted no mutation has no mutation root.** Hasura answers `no
   mutations exist` at `$`, which is not a field that is missing: the
