@@ -8,9 +8,9 @@ harness itself, divergences kept on purpose, and the gaps still open.
 
 | | status | same outcome | same data | full body |
 |---|---|---|---|---|
-| all (468) | 100.0% | 96.2% | **92.5%** | 66.5% |
-| reads (271) | 100.0% | 94.8% | 88.6% | 69.0% |
-| writes (197) | 100.0% | 98.0% | **98.0%** | 62.9% |
+| all (468) | 100.0% | 96.2% | **92.5%** | 70.9% |
+| reads (271) | 100.0% | 94.8% | 88.6% | 69.4% |
+| writes (197) | 100.0% | 98.0% | **98.0%** | 73.1% |
 
 Of the 433 cases the third column counts, **304 agree about data and 129 agree
 only because both servers answered with errors.** A further 2 are cases where
@@ -68,7 +68,13 @@ Where the remaining 35 divergences are:
 Each is named in the open list rather than attributed to one missing
 subsystem.
 
-The last five runs moved nineteen cases between them and moved nothing back.
+The fourth column moved last, and on its own: error paths. 21 cases agreed
+about everything except where the error said it happened, and none does now --
+311 bodies matched entirely, and 332 do. Nothing else moved, which is what a
+change to error paths should look like.
+
+The five runs before that moved nineteen cases between them and moved nothing
+back.
 The first of the five took three attempts to get there, and the two discarded
 ones are the record worth keeping: the first read +3 on the headline and hid
 seven regressions underneath, four of them in a group with no permissions at
@@ -271,11 +277,15 @@ wrong one.
 
 ## Open, ordered by consequence
 
-1. **The path in an error is `$` where Hasura writes the selection.** Hasura
-   answers `$.selectionSet.insert_computer.args.objects` for a refused write;
-   this answers `$`, because the refusal is raised where the rows come back
-   rather than where the argument was read. Costs nothing at the data level and
-   is why those cases do not reach full-body agreement.
+1. **Every error's wording is this server's, not Hasura's.** All 101 cases
+   that agree about the data and not about the whole body now differ by the
+   message text alone: `Unknown field "delete_resident" on type
+   "mutation_root"` against `field 'delete_resident' not found in type:
+   'mutation_root'`, and 100 more of that kind. Most are async-graphql's own
+   validation messages, which is what makes this a bigger job than it reads
+   as -- the codes already match, and a client switching on
+   `extensions.code` cannot tell the difference. It is the whole of the gap
+   between the third column and the fourth.
 
 2. **`_stream` subscriptions.** The cursor-based half of Hasura's subscription
    surface: `article_stream(cursor: {initial_value: {id: 0}}, batch_size: 10)`
@@ -415,6 +425,28 @@ wrong one.
   with no members reached through an argument. 286 -> 290 real agreements, and
   the status column to 100%.
 
+
+- **An error says where in the request it happened.** Hasura answers
+  `$.selectionSet.insert_author.args.objects[0].bio` for a write it refused;
+  this answered `$` for all of it. The reason is worth keeping: the only path
+  available was async-graphql's *response* path, which names fields of the
+  answer -- and the answer has no `objects` to name. A place inside an argument
+  cannot be reached from the response at all.
+
+  So the path is written where the error is raised, by whoever knows which row
+  and which column it is about. Three places know: the variable walk, which
+  threads a path as it descends; the insert, whose context carries each row's
+  own place and extends it for a nested one; and the `distinct_on` rule, which
+  names the field's arguments as a whole because it is about two of them
+  disagreeing. The response path is still the fallback, spelled Hasura's way
+  now.
+
+  Two details the corpus settled rather than taste. One object written where a
+  list is expected is that list's first item -- `objects: {location: $x}` is
+  refused at `objects[0].location` -- because input coercion says so. And a
+  refused `check` names the argument, `args.objects`, not the row inside it.
+
+  21 cases, all of them already agreeing about the data.
 
 - **A role may be granted "how many" without being granted "which".** A select
   permission naming no columns, with `allow_aggregations`, is how Hasura says
