@@ -1435,7 +1435,33 @@ fn database_error(error: sqlx::Error) -> async_graphql::Error {
         // be a difference rather than a match.
         _ => "",
     };
-    async_graphql::Error::new(format!("{}{}", described, db.message()))
+    let error = async_graphql::Error::new(format!("{}{}", described, db.message()));
+    // And the code, where the SQLSTATE says which one. Only the codes Hasura's
+    // corpus pins are set: everything else is left for `code_for` to classify,
+    // which is a guess from the message text and says so. Replacing that guess
+    // wholesale would be the same guess with fewer places to notice it.
+    let coded = match db.code().as_deref() {
+        Some(code) if code.starts_with("23") => Some("constraint-violation"),
+        // A `LIKE` pattern that ends mid-escape. Not a data exception to
+        // Hasura -- the pattern came from the request, so the request is what
+        // was wrong.
+        Some("22025") => Some("bad-request"),
+        // A negative `OFFSET`, and the rest of class 22 with it.
+        Some(code) if code.starts_with("22") => Some("data-exception"),
+        _ => None,
+    };
+    match coded {
+        Some(code) => at_code(error, code),
+        None => error,
+    }
+}
+
+/// The same error, coded as Hasura codes it.
+fn at_code(mut error: async_graphql::Error, code: &'static str) -> async_graphql::Error {
+    let mut extensions = error.extensions.take().unwrap_or_default();
+    extensions.set("code", code);
+    error.extensions = Some(extensions);
+    error
 }
 
 /// The same error, told where in the request it happened.

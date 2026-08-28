@@ -391,20 +391,38 @@ pub fn prepare(
     introspection_disabled_for: Option<&str>,
 ) -> Result<async_graphql::Request, (async_graphql::Request, Vec<ServerError>)> {
     let mut request = rewrite_document(schema, request);
+    // Parsed again rather than threaded through: `set_parsed_query` takes the
+    // document by value and gives nothing back, and re-parsing a document that
+    // has already parsed once is not where the time goes.
+    //
+    // A document that does not parse is answered here rather than left to
+    // async-graphql, which reports it the way a compiler does -- the offending
+    // line, a caret under the column, and what it expected instead. Hasura
+    // says the document is not a query and names the document, and a client
+    // showing that to a user is showing text it already ships. Nothing further
+    // can run either way, so this is the whole of the answer.
+    let doc = match async_graphql::parser::parse_query(&request.query) {
+        Ok(doc) => doc,
+        Err(_) => {
+            return Err((
+                request,
+                vec![coded(
+                    "not a valid graphql query".to_string(),
+                    async_graphql::Pos::default(),
+                    "$.query",
+                )],
+            ))
+        }
+    };
     if let Some(schema) = schema {
-        // Parsed again rather than threaded through: `set_parsed_query` takes
-        // the document by value and gives nothing back, and re-parsing a
-        // document that has already parsed once is not where the time goes.
-        if let Ok(doc) = async_graphql::parser::parse_query(&request.query) {
-            if let Some(role) = introspection_disabled_for {
-                if let Some(error) = introspection_refusal(&doc, role) {
-                    return Err((request, vec![error]));
-                }
+        if let Some(role) = introspection_disabled_for {
+            if let Some(error) = introspection_refusal(&doc, role) {
+                return Err((request, vec![error]));
             }
-            let errors = variable_errors(&doc, schema.registry(), &request.variables);
-            if !errors.is_empty() {
-                return Err((request, errors));
-            }
+        }
+        let errors = variable_errors(&doc, schema.registry(), &request.variables);
+        if !errors.is_empty() {
+            return Err((request, errors));
         }
     }
     let _ = &mut request;
@@ -1090,12 +1108,12 @@ impl Usage<'_> {
                 // one of the colours.
                 if let Some(given) = self.variables.get(&async_graphql::Name::new(name)) {
                     let given: async_graphql_value::Value = given.clone().into();
-                    self.enumerated(&given, expected, pos, path);
+                    self.enumerated(&given, expected, pos, path, true);
                     self.label_path(&given, expected, pos, path);
                 }
             }
             Value::Enum(_) | Value::String(_) => {
-                self.enumerated(value, expected, pos, path);
+                self.enumerated(value, expected, pos, path, false);
                 self.label_path(value, expected, pos, path);
             }
             Value::List(items) => {
@@ -1225,6 +1243,12 @@ impl Usage<'_> {
         expected: &str,
         pos: async_graphql::Pos,
         path: &str,
+        // Whether the value arrived through a variable. JSON has no enum, so a
+        // variable carries one as a string and the question is which member it
+        // names. Written into the document, a string is not an enum value at
+        // all -- `_eq: "red"` is a mistake about the language rather than
+        // about the colours, and Hasura says which mistake it was.
+        from_variable: bool,
     ) {
         use async_graphql::registry::{MetaType, MetaTypeName};
         use async_graphql_value::Value;
@@ -1235,7 +1259,18 @@ impl Usage<'_> {
         };
         let written = match value {
             Value::Enum(written) => written.as_str(),
-            Value::String(written) => written.as_str(),
+            Value::String(written) if from_variable => written.as_str(),
+            Value::String(_) => {
+                self.errors.push(coded(
+                    format!(
+                        "expected an enum value for type '{}', but found a string",
+                        name
+                    ),
+                    pos,
+                    path,
+                ));
+                return;
+            }
             _ => return,
         };
         if enum_values.contains_key(written) {
@@ -1324,8 +1359,15 @@ mod variable_position_tests {
                 "_ancestor_any",
                 TypeRef::named_list("ltree"),
             ));
+        let kind = Enum::new("kind_enum").item("leaf").item("branch");
+        let kind_comparison = InputObject::new("kind_enum_comparison_exp")
+            .field(InputValue::new("_eq", TypeRef::named("kind_enum")));
         let tree_filter = InputObject::new("tree_bool_exp")
-            .field(InputValue::new("path", TypeRef::named("ltree_comparison_exp")));
+            .field(InputValue::new("path", TypeRef::named("ltree_comparison_exp")))
+            .field(InputValue::new(
+                "kind",
+                TypeRef::named("kind_enum_comparison_exp"),
+            ));
         let insert = InputObject::new("author_insert_input")
             .field(InputValue::new("name", TypeRef::named("String")));
         let query = Object::new("query_root").field(
@@ -1372,6 +1414,8 @@ mod variable_position_tests {
         }));
         Schema::build("query_root", Some("mutation_root"), None)
             .register(Scalar::new("ltree"))
+            .register(kind)
+            .register(kind_comparison)
             .register(filter)
             .register(comparison)
             .register(ltree)
@@ -1468,6 +1512,55 @@ mod variable_position_tests {
                 r#"{"n": 1}"#
             ),
             vec!["$.selectionSet.insert_author.args.objects[1].name"]
+        );
+    }
+
+    /// A quoted enum value is a mistake about the language; an unquoted one
+    /// that names nothing is a mistake about the members. Hasura says which.
+    #[test]
+    fn a_quoted_enum_value_is_not_a_member_that_is_missing() {
+        assert_eq!(
+            refusals("{ tree(where: {kind: {_eq: \"leaf\"}}) { path } }", "{}"),
+            vec!["expected an enum value for type 'kind_enum', but found a string"]
+        );
+        assert_eq!(
+            refusals("{ tree(where: {kind: {_eq: twig}}) { path } }", "{}"),
+            vec!["expected one of the values ['branch', 'leaf'] for type 'kind_enum', but found 'twig'"]
+        );
+        // Through a variable, a string is how JSON carries an enum, so the
+        // question is which member it names.
+        assert_eq!(
+            refusals(
+                "query ($k: kind_enum) { tree(where: {kind: {_eq: $k}}) { path } }",
+                r#"{"k": "twig"}"#
+            ),
+            vec!["expected one of the values ['branch', 'leaf'] for type 'kind_enum', but found 'twig'"]
+        );
+        assert!(refusals(
+            "query ($k: kind_enum) { tree(where: {kind: {_eq: $k}}) { path } }",
+            r#"{"k": "leaf"}"#
+        )
+        .is_empty());
+    }
+
+    /// A document that does not parse is not a query, and that is all the
+    /// answer there is: async-graphql reports it the way a compiler does, and
+    /// Hasura names the document.
+    #[test]
+    fn a_document_that_does_not_parse_is_not_a_query() {
+        assert_eq!(
+            refusals("{ author(where: {name: {_eq: \"unclosed}}) { id } }", "{}"),
+            vec!["not a valid graphql query"]
+        );
+        assert_eq!(
+            refusals_with_paths("query { author(", "{}"),
+            vec!["$.query"]
+        );
+        // The rule is only about parsing. A document that parses and is wrong
+        // about the schema is answered by the rules that know the schema.
+        assert_eq!(
+            refusals("{ nothing_here { id } }", "{}"),
+            vec!["field 'nothing_here' not found in type: 'query_root'"]
         );
     }
 
