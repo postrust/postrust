@@ -134,6 +134,19 @@ pub fn comparison_type_name(scalar: &str) -> String {
     format!("{}_comparison_exp", scalar)
 }
 
+/// Whether a filter has no way to call this relationship.
+///
+/// A computed relationship with a required argument of its own: the parent row
+/// is not the whole call, and a boolean expression is not a place a client can
+/// write the rest. Every relationship reached by a foreign key answers false,
+/// having no arguments at all.
+fn uncallable_from_a_filter(relationship: &RelationshipField) -> bool {
+    relationship
+        .arguments
+        .iter()
+        .any(|(_, _, required)| *required)
+}
+
 /// The name of a table's boolean expression input.
 pub fn bool_exp_type_name(base_name: &str) -> String {
     format!("{}_bool_exp", base_name)
@@ -368,7 +381,23 @@ pub fn build_inputs(
         // A relationship is filtered by filtering the rows at its other end:
         // `where: {articles: {…}}` keeps the authors that have a matching
         // article.
+        //
+        // Except one this server could not call. A computed relationship is a
+        // function of the parent row, and `fetch_articles(search text,
+        // author_row author)` also wants a search term -- which a selection
+        // writes as `get_articles(args: {search: "..."})` and a filter has
+        // nowhere to write at all. Filtering on it used to reach PostgreSQL as
+        // `fetch_articles(author)` and come back `function
+        // public.fetch_articles(author) does not exist`, an answer about a
+        // call this server composed. Hasura's answer is that the field is not
+        // there: `field 'get_articles' not found in type: 'author_bool_exp'`.
+        //
+        // An *optional* argument is not this. The call with the row alone is
+        // the call the function is written to accept, so it stays filterable.
         for relationship in relationship_fields.get(type_name).into_iter().flatten() {
+            if uncallable_from_a_filter(relationship) {
+                continue;
+            }
             if !taken.insert(relationship.name.clone()) {
                 continue;
             }
@@ -384,7 +413,7 @@ pub fn build_inputs(
         // can express. Only a relationship to many -- there is nothing to
         // aggregate over one row.
         for relationship in relationship_fields.get(type_name).into_iter().flatten() {
-            if !relationship.is_list {
+            if !relationship.is_list || uncallable_from_a_filter(relationship) {
                 continue;
             }
             let name = format!("{}_aggregate", relationship.name);

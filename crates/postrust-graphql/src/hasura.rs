@@ -1033,8 +1033,10 @@ impl Usage<'_> {
                             value.pos,
                             &at,
                         );
+                        self.object_expected(&value.node, &expected, value.pos, &at);
                         self.value(&value.node, &expected, value.pos, &at);
                     }
+                    self.one_operator_per_column(&field.node.arguments, &here);
                     self.directives(&field.node.directives, &here);
                     if let Some(meta) = meta {
                         let inner = MetaTypeName::concrete_typename(&meta.ty).to_string();
@@ -1246,6 +1248,116 @@ impl Usage<'_> {
 }
 
 impl Usage<'_> {
+    /// `null` written where an object is required.
+    ///
+    /// `update_author(where: null)` says nothing about which rows, and `where`
+    /// is non-null in the schema either server publishes. async-graphql calls
+    /// it `Invalid value for argument "where", expected type
+    /// "author_bool_exp"`, which names the argument and not what was wrong
+    /// with it; Hasura names the type it wanted and the thing it got.
+    ///
+    /// Only a *required* input object is refused here. A nullable one written
+    /// as `null` is the same as leaving it out, which is a request this server
+    /// has no business turning into an error.
+    fn object_expected(
+        &mut self,
+        value: &async_graphql_value::Value,
+        expected: &str,
+        pos: async_graphql::Pos,
+        path: &str,
+    ) {
+        use async_graphql::registry::{MetaType, MetaTypeName};
+
+        if !matches!(MetaTypeName::create(expected), MetaTypeName::NonNull(_)) {
+            return;
+        }
+        if !self.stands_for_null(value) {
+            return;
+        }
+        let name = MetaTypeName::concrete_typename(expected);
+        if !matches!(
+            self.registry.types.get(name),
+            Some(MetaType::InputObject { .. })
+        ) {
+            return;
+        }
+        self.errors.push(coded(
+            format!("expected an object for type '{}', but found null", name),
+            pos,
+            path,
+        ));
+    }
+
+    /// A column named by two of an update's operators.
+    ///
+    /// `_set: {id: 1}` beside `_inc: {id: 2}` asks for one column to be two
+    /// things in one statement, and the order they would be applied in is not
+    /// something the request says. PostgreSQL refuses the statement -- a
+    /// column may appear once in a `SET` list -- and by then the answer names
+    /// the column alone. Hasura names every column written twice, and reports
+    /// it against the arguments rather than against any one of them, since no
+    /// single operator is the wrong one.
+    ///
+    /// The operators are Hasura's own seven. A duplicate *within* one of them
+    /// is not this: an object cannot have a key twice.
+    fn one_operator_per_column(
+        &mut self,
+        arguments: &[(
+            async_graphql::Positioned<async_graphql::Name>,
+            async_graphql::Positioned<async_graphql_value::Value>,
+        )],
+        path: &str,
+    ) {
+        use async_graphql_value::Value;
+
+        const OPERATORS: [&str; 7] = [
+            "_set",
+            "_inc",
+            "_append",
+            "_prepend",
+            "_delete_key",
+            "_delete_elem",
+            "_delete_at_path",
+        ];
+
+        let mut seen: Vec<&str> = Vec::new();
+        let mut twice: Vec<&str> = Vec::new();
+        for (name, value) in arguments {
+            if !OPERATORS.contains(&name.node.as_str()) {
+                continue;
+            }
+            let Value::Object(columns) = &value.node else {
+                continue;
+            };
+            for column in columns.keys() {
+                let column = column.as_str();
+                match seen.contains(&column) {
+                    true if !twice.contains(&column) => twice.push(column),
+                    true => {}
+                    false => seen.push(column),
+                }
+            }
+        }
+        if twice.is_empty() {
+            return;
+        }
+        // Haskell's `show` for a list of strings, which is what the message is
+        // rendered by: single quotes are what Hasura's own output has.
+        let listed = twice
+            .iter()
+            .map(|column| format!("'{}'", column))
+            .collect::<Vec<String>>()
+            .join(", ");
+        self.errors.push(coded(
+            format!("Column found in multiple operators: [{}].", listed),
+            arguments
+                .first()
+                .map(|(name, _)| name.pos)
+                .unwrap_or_default(),
+            &format!("{}.args", path),
+        ));
+    }
+
     /// A number written where an `Int` is expected, against what an `Int` is.
     ///
     /// GraphQL's `Int` is a signed 32-bit integer, and `2147483648` is not
@@ -1670,13 +1782,41 @@ mod variable_position_tests {
                     InputValue::new("update_columns", TypeRef::named_nn_list_nn("String"))
                         .default_value(async_graphql::Value::List(Vec::new())),
                 ),
+            )
+            .field(
+                Field::new(
+                    "update_author",
+                    TypeRef::named("author_mutation_response"),
+                    |_| FieldFuture::new(async move { Ok(None::<async_graphql::Value>) }),
+                )
+                .argument(InputValue::new(
+                    "where",
+                    TypeRef::named_nn("author_bool_exp"),
+                ))
+                .argument(InputValue::new("_set", TypeRef::named("author_set_input")))
+                .argument(InputValue::new("_inc", TypeRef::named("author_inc_input"))),
             );
         let author = Object::new("author").field(Field::new("id", TypeRef::named("Int"), |_| {
             FieldFuture::new(async move { Ok(None::<async_graphql::Value>) })
         }));
-        let tree = Object::new("tree").field(Field::new("path", TypeRef::named("ltree"), |_| {
-            FieldFuture::new(async move { Ok(None::<async_graphql::Value>) })
-        }));
+        let tree = Object::new("tree")
+            .field(Field::new("id", TypeRef::named("Int"), |_| {
+                FieldFuture::new(async move { Ok(None::<async_graphql::Value>) })
+            }))
+            .field(Field::new("path", TypeRef::named("ltree"), |_| {
+                FieldFuture::new(async move { Ok(None::<async_graphql::Value>) })
+            }));
+        // What an update writes, and the one required `where` in the fixture.
+        let set = InputObject::new("author_set_input")
+            .field(InputValue::new("name", TypeRef::named("String")))
+            .field(InputValue::new("count", TypeRef::named("Int")));
+        let inc = InputObject::new("author_inc_input")
+            .field(InputValue::new("count", TypeRef::named("Int")));
+        let response = Object::new("author_mutation_response").field(Field::new(
+            "affected_rows",
+            TypeRef::named_nn("Int"),
+            |_| FieldFuture::new(async move { Ok(None::<async_graphql::Value>) }),
+        ));
         Schema::build("query_root", Some("mutation_root"), None)
             .register(Scalar::new("ltree"))
             .register(Scalar::new("raster"))
@@ -1688,6 +1828,9 @@ mod variable_position_tests {
             .register(ltree)
             .register(tree_filter)
             .register(insert)
+            .register(set)
+            .register(inc)
+            .register(response)
             .register(author)
             .register(tree)
             .register(query)
@@ -1778,6 +1921,80 @@ mod variable_position_tests {
                 r#"{"n": 1}"#
             ),
             vec!["$.selectionSet.insert_author.args.objects[1].name"]
+        );
+    }
+
+    /// `where: null` says nothing about which rows, and an update's `where`
+    /// is required. Hasura names the type it wanted and what it got instead.
+    #[test]
+    fn a_null_written_where_an_object_is_required_is_refused_as_one() {
+        assert_eq!(
+            refusals(
+                "mutation { update_author(where: null, _set: {name: \"a\"}) \
+                 { affected_rows } }",
+                "{}"
+            ),
+            vec!["expected an object for type 'author_bool_exp', but found null"]
+        );
+        assert_eq!(
+            refusals_with_paths(
+                "mutation { update_author(where: null, _set: {name: \"a\"}) \
+                 { affected_rows } }",
+                "{}"
+            ),
+            vec!["$.selectionSet.update_author.args.where"]
+        );
+        // A *variable* carrying the null is a different complaint, and
+        // already had Hasura's own words for it: the fault is in the
+        // variable's declaration, which is where it is reported.
+        assert_eq!(
+            refusals(
+                "mutation ($w: author_bool_exp!) { update_author(where: $w, \
+                 _set: {name: \"a\"}) { affected_rows } }",
+                r#"{"w": null}"#
+            ),
+            vec!["null value found for non-nullable type: \"author_bool_exp!\""]
+        );
+    }
+
+    /// A nullable argument written as `null` is the same as leaving it out,
+    /// which is not something to refuse.
+    #[test]
+    fn a_null_written_where_an_object_is_optional_is_left_alone() {
+        assert_eq!(
+            refusals("{ author(where: null) { id } }", "{}"),
+            Vec::<String>::new()
+        );
+    }
+
+    /// One column named by two of an update's operators asks for it to be two
+    /// things at once, and the order is not something the request says.
+    #[test]
+    fn a_column_written_by_two_operators_is_refused_before_the_statement() {
+        assert_eq!(
+            refusals(
+                "mutation { update_author(_set: {name: \"a\", count: 1}, \
+                 _inc: {count: 2}, where: {}) { affected_rows } }",
+                "{}"
+            ),
+            vec!["Column found in multiple operators: ['count']."]
+        );
+        assert_eq!(
+            refusals_with_paths(
+                "mutation { update_author(_set: {count: 1}, _inc: {count: 2}, \
+                 where: {}) { affected_rows } }",
+                "{}"
+            ),
+            vec!["$.selectionSet.update_author.args"]
+        );
+        // Two operators naming different columns is an ordinary update.
+        assert_eq!(
+            refusals(
+                "mutation { update_author(_set: {name: \"a\"}, _inc: {count: 2}, \
+                 where: {}) { affected_rows } }",
+                "{}"
+            ),
+            Vec::<String>::new()
         );
     }
 
