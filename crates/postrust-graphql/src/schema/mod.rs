@@ -131,6 +131,22 @@ impl SchemaConfig {
 ///
 /// `nominal_type` (the underlying `udt_name`) is used because it is always a
 /// castable type name.
+/// Whether the whole primary key is present on this table.
+///
+/// A `_by_pk` field addresses a row by its key, so a key the caller cannot see
+/// is a field it cannot use: `books_by_pk(id: 1, book_name: "...")` for a role
+/// granted `book_name` and not `id` asks for a row by half a key. Hasura does
+/// not publish the field at all, and neither does this -- which is also what
+/// stops `pk_columns_of` falling back to `text` for a column it cannot find
+/// and typing the argument `String`.
+fn has_whole_key(table: &Table) -> bool {
+    !table.pk_cols.is_empty()
+        && table
+            .pk_cols
+            .iter()
+            .all(|column| table.get_column(column).is_some())
+}
+
 fn pk_columns_of(table: &Table) -> Vec<(String, String)> {
     table
         .pk_cols
@@ -510,7 +526,7 @@ impl QueryField {
 
     /// Create a by-PK query field using an explicit base name.
     pub fn by_pk_named(table: &Table, base_name: &str) -> Option<Self> {
-        if table.pk_cols.is_empty() {
+        if !has_whole_key(table) {
             return None;
         }
 
@@ -674,7 +690,7 @@ impl MutationField {
         });
 
         // update_user_by_pk (single update by PK)
-        if !table.pk_cols.is_empty() {
+        if has_whole_key(table) {
             let name = format!("update_{}_by_pk", base_name);
             fields.push(Self {
                 name,
@@ -722,7 +738,7 @@ impl MutationField {
         });
 
         // delete_user_by_pk (single delete by PK)
-        if !table.pk_cols.is_empty() {
+        if has_whole_key(table) {
             let name = format!("delete_{}_by_pk", base_name);
             fields.push(Self {
                 name,

@@ -207,7 +207,45 @@ pub fn unauthenticated(config: &HasuraAuthConfig) -> Option<HasuraIdentity> {
 pub fn backend_only_requested(headers: &[(&str, &str)], elevated: bool) -> bool {
     elevated
         && header(headers, "x-hasura-use-backend-only-permissions")
-            .is_some_and(|value| matches!(value.trim().to_ascii_lowercase().as_str(), "true" | "1"))
+            .and_then(boolean_text)
+            .unwrap_or(false)
+}
+
+/// What Hasura reads as true and false in a header, and the words it uses when
+/// a header is neither.
+///
+/// Not Rust's `bool` parser and not a truthiness test: the accepted texts are
+/// a closed set Hasura documents in the refusal itself, and `1` is not among
+/// them. A value outside it is a client mistake, and answering it as `false`
+/// would send a backend-only write down the path meant for everyone else --
+/// silently, on a header the client thought it had set.
+pub fn boolean_text(value: &str) -> Option<bool> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "true" | "t" | "yes" | "y" => Some(true),
+        "false" | "f" | "no" | "n" => Some(false),
+        _ => None,
+    }
+}
+
+/// The header whose value is read as a boolean, and Hasura's refusal for one
+/// that is not.
+///
+/// The two spaces after the colon and before `False` are Hasura's own, and a
+/// client showing this to a person is showing text it already ships.
+pub const BACKEND_ONLY_HEADER: &str = "x-hasura-use-backend-only-permissions";
+
+/// Whether a request carries that header with something unreadable in it.
+pub fn unreadable_boolean_header<'a>(headers: &[(&'a str, &'a str)]) -> Option<String> {
+    let given = header(headers, BACKEND_ONLY_HEADER)?;
+    if boolean_text(given).is_some() {
+        return None;
+    }
+    Some(format!(
+        "\"{}\":  Not a valid boolean text. True values are \
+         [\"true\",\"t\",\"yes\",\"y\"] and  False values are \
+         [\"false\",\"f\",\"no\",\"n\"]. All values are case insensitive",
+        BACKEND_ONLY_HEADER
+    ))
 }
 
 /// Compare two secrets without letting the time taken say how much of the
@@ -358,6 +396,30 @@ mod tests {
         // The same header from a caller that never held the secret says
         // nothing, which is what makes the flag worth having.
         assert!(!backend_only_requested(&headers[..], false));
+    }
+
+    /// The accepted texts are a closed set, and `1` is not in it.
+    #[test]
+    fn a_header_that_is_not_a_boolean_text_is_neither_true_nor_false() {
+        for yes in ["true", "T", "yes", " Y "] {
+            assert_eq!(boolean_text(yes), Some(true), "{}", yes);
+        }
+        for no in ["false", "F", "no", "N"] {
+            assert_eq!(boolean_text(no), Some(false), "{}", no);
+        }
+        for neither in ["1", "0", "random", ""] {
+            assert_eq!(boolean_text(neither), None, "{}", neither);
+        }
+
+        let headers = [(BACKEND_ONLY_HEADER, "random")];
+        let refusal = unreadable_boolean_header(&headers[..]).expect("it is refused");
+        assert!(refusal.starts_with("\"x-hasura-use-backend-only-permissions\":  Not a valid"));
+        // And a request that does not carry it at all is not a bad request.
+        assert_eq!(unreadable_boolean_header(&[][..]), None);
+        assert_eq!(
+            unreadable_boolean_header(&[(BACKEND_ONLY_HEADER, "yes")][..]),
+            None
+        );
     }
 
     #[test]

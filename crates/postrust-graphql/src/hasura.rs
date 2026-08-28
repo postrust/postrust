@@ -230,6 +230,48 @@ pub fn denied(message: &str) -> Value {
     envelope(response)
 }
 
+/// Whether the request is an Apollo persisted-query handshake.
+///
+/// A client with automatic persisted queries sends the hash alone, and sends
+/// the document only when the server says it has not seen that hash. Neither
+/// server implements the protocol; the difference is that Hasura says so --
+/// `PersistedQueryNotSupported` -- and this used to run whatever document was
+/// beside the hash, which is the answer that looks like the handshake worked.
+/// A client would then send hash-only requests and get nothing back.
+pub fn persisted_query(request: &async_graphql::Request) -> bool {
+    request.extensions.contains_key("persistedQuery")
+}
+
+/// Hasura's refusal for one, which is the whole answer.
+pub fn not_supported(message: &str) -> Value {
+    let mut error = ServerError::new(message, None);
+    let mut extensions = async_graphql::ErrorExtensionValues::default();
+    extensions.set("code", "not-supported");
+    extensions.set("path", "$");
+    error.extensions = Some(extensions);
+
+    let mut response = Response::new(async_graphql::Value::Null);
+    response.errors = vec![error];
+    envelope(response)
+}
+
+/// A refusal about the request itself rather than about what it asked for.
+///
+/// `bad-request` at `$`: nothing in the document is wrong, so there is no part
+/// of it to point at. A header Hasura reads and cannot parse is the case that
+/// needs it.
+pub fn malformed(message: &str) -> Value {
+    let mut error = ServerError::new(message, None);
+    let mut extensions = async_graphql::ErrorExtensionValues::default();
+    extensions.set("code", "bad-request");
+    extensions.set("path", "$");
+    error.extensions = Some(extensions);
+
+    let mut response = Response::new(async_graphql::Value::Null);
+    response.errors = vec![error];
+    envelope(response)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -312,6 +354,30 @@ mod tests {
     /// A path written where the error was raised wins over the response path,
     /// because it can name a place the response path cannot: inside an
     /// argument the client sent.
+    /// A hash beside the document is a handshake, and neither server speaks
+    /// it. Saying so is the difference between a client that falls back and
+    /// one that sends hash-only requests into silence.
+    #[test]
+    fn a_persisted_query_is_refused_as_unsupported() {
+        let plain = async_graphql::Request::new("{ author { id } }");
+        assert!(!persisted_query(&plain));
+
+        let mut carried = async_graphql::Request::new("{ author { id } }");
+        carried.extensions.0.insert(
+            "persistedQuery".to_string(),
+            async_graphql::Value::Object(Default::default()),
+        );
+        assert!(persisted_query(&carried));
+
+        assert_eq!(
+            not_supported("PersistedQueryNotSupported"),
+            json!({"errors": [{
+                "message": "PersistedQueryNotSupported",
+                "extensions": {"path": "$", "code": "not-supported"}
+            }]})
+        );
+    }
+
     #[test]
     fn a_path_given_with_the_error_is_the_one_answered() {
         let mut error = error_at(

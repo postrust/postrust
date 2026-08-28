@@ -141,11 +141,19 @@ pub fn cache_for_role(
         // grants them one at a time and grants none by default -- and grants
         // none at all to a role that cannot read the table, since there is
         // nowhere for the answer to appear.
+        //
+        // Named as the client sees it. The map is keyed by the *function*,
+        // and a permission grants the *field* -- `student_total_marks` and
+        // `total_marks` are the same thing under the two names, and comparing
+        // them directly withheld every computed field a schema had renamed.
         table.computed_columns.retain(|name, _| {
+            let exposed = names
+                .computed_field(&table.schema, &table.name, name)
+                .unwrap_or(name);
             granted
                 .select
                 .as_ref()
-                .is_some_and(|select| select.computed_fields.iter().any(|f| f == name))
+                .is_some_and(|select| select.computed_fields.iter().any(|f| f == exposed))
         });
 
         // A select permission naming no columns at all, with
@@ -557,6 +565,27 @@ fn rewrite(
     operator: Option<&str>,
 ) -> Result<serde_json::Value, String> {
     match value {
+        // Inside an operator, an object is the operator's *operand* and not a
+        // nested boolean expression: `_st_d_within` takes `{distance, from}`
+        // and `_contains` takes a whole document. Reading their keys as
+        // columns renamed them, wrapped their values in `_eq`, and handed
+        // PostGIS something that was no longer GeoJSON -- `invalid GeoJson
+        // representation`, about a shape this server had taken apart.
+        //
+        // Session variables inside one are still resolved. That is the only
+        // thing a permission's operand needs rewriting for, and `{"from":
+        // "X-Hasura-Geom-Val"}` is how the corpus writes it.
+        serde_json::Value::Object(map) if operator.is_some() => {
+            let mut out = serde_json::Map::with_capacity(map.len());
+            for (key, child) in map {
+                out.insert(
+                    key.clone(),
+                    rewrite(child, session, names, schema, table, operator)?,
+                );
+            }
+            Ok(serde_json::Value::Object(out))
+        }
+
         serde_json::Value::Object(map) => {
             let mut out = serde_json::Map::with_capacity(map.len());
             for (key, child) in map {
@@ -935,6 +964,46 @@ mod tests {
         assert!(!article.insertable);
     }
 
+    /// A permission grants the field, and the map is keyed by the function.
+    /// Comparing the two directly withheld every renamed computed field.
+    #[test]
+    fn a_computed_field_is_granted_under_the_name_it_is_exposed_as() {
+        let mut table = table("student_marks", &["id", "name"]);
+        table.computed_columns.insert(
+            "student_total_marks".to_string(),
+            postrust_core::schema_cache::ComputedColumn {
+                function: postrust_core::api_request::QualifiedIdentifier::new(
+                    "public",
+                    "student_total_marks",
+                ),
+                data_type: "integer".to_string(),
+                description: None,
+                row_argument: None,
+                session_argument: None,
+                takes_arguments: false,
+            },
+        );
+        let cache = cache(vec![table]);
+        let names = NameOverrides::parse(
+            r#"{"tables": {"public.student_marks": {
+                 "computed_fields": {"student_total_marks": "total_marks"},
+                 "permissions": {"tutor": {"select": {
+                    "columns": ["name"], "computed_fields": ["total_marks"], "filter": {}}}}}}}"#,
+        )
+        .unwrap();
+        let view = cache_for_role(&cache, &names, "tutor", false);
+        let table = view
+            .get_table(&postrust_core::api_request::QualifiedIdentifier::new(
+                "public",
+                "student_marks",
+            ))
+            .expect("the table survives");
+        assert!(
+            table.computed_columns.contains_key("student_total_marks"),
+            "granted under the name the client sees"
+        );
+    }
+
     #[test]
     fn a_computed_field_is_granted_one_at_a_time() {
         let mut article = table("article", &["id"]);
@@ -1017,6 +1086,61 @@ mod tests {
             .tables
             .contains_key(&QualifiedIdentifier::new("public", "author")));
         assert!(view.relationships.is_empty());
+    }
+
+    /// An operator's operand is a value, not a boolean expression. Reading
+    /// its keys as columns took a shape apart before PostGIS ever saw it.
+    #[test]
+    fn an_operand_that_is_an_object_is_carried_through_whole() {
+        let filter = serde_json::json!({
+            "geom_col": {"$st_d_within": {
+                "distance": 1,
+                "from": {"type": "Polygon", "coordinates": [[[2, 0], [2, 1]]]}
+            }}
+        });
+        let rewritten = permission_where(
+            &filter,
+            &HashMap::new(),
+            &NameOverrides::default(),
+            "public",
+            "geom_table",
+        )
+        .expect("it rewrites")
+        .expect("it restricts something");
+        assert_eq!(
+            rewritten,
+            serde_json::json!({
+                "geom_col": {"_st_d_within": {
+                    "distance": 1,
+                    "from": {"type": "Polygon", "coordinates": [[[2, 0], [2, 1]]]}
+                }}
+            }),
+            "only the operator's own spelling changes"
+        );
+    }
+
+    /// And a session variable inside such an operand is still resolved, which
+    /// is the one thing it does need rewriting for.
+    #[test]
+    fn a_session_variable_inside_an_operand_is_still_resolved() {
+        let mut session = HashMap::new();
+        session.insert("geom_val".to_string(), "{\"type\":\"Point\"}".to_string());
+        let filter = serde_json::json!({
+            "geom_col": {"$st_d_within": {"distance": 1, "from": "X-Hasura-Geom-Val"}}
+        });
+        let rewritten = permission_where(
+            &filter,
+            &session,
+            &NameOverrides::default(),
+            "public",
+            "geom_table",
+        )
+        .expect("it rewrites")
+        .expect("it restricts something");
+        assert_eq!(
+            rewritten["geom_col"]["_st_d_within"]["from"],
+            serde_json::json!("{\"type\":\"Point\"}")
+        );
     }
 
     #[test]

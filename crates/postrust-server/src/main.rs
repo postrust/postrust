@@ -438,6 +438,22 @@ async fn main() -> Result<()> {
                 // decides anything about a row: a role the document does not
                 // name has no schema at all, and is refused here rather than
                 // being answered from someone else's.
+                // A protocol neither server implements, which only one of
+                // them says. See `hasura::persisted_query`.
+                if postrust_graphql::hasura::persisted_query(&req) {
+                    return postrust_graphql::hasura::not_supported("PersistedQueryNotSupported");
+                }
+
+                // A header Hasura reads itself, before it reads the
+                // document. `x-hasura-use-backend-only-permissions: random` is
+                // not false, and treating it as false would send a
+                // backend-only write down the path meant for everyone else on
+                // a header the client thought it had set.
+                if let Some(message) = postrust_auth::hasura::unreadable_boolean_header(&pairs[..])
+                {
+                    return postrust_graphql::hasura::malformed(&message);
+                }
+
                 let Some(schema) = app_state.gql_state.schema_for(
                     hasura_role.as_deref(),
                     postrust_auth::hasura::backend_only_requested(&pairs[..], elevated),
