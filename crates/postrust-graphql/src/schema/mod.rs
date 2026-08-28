@@ -156,7 +156,7 @@ fn pk_columns_of(table: &Table) -> Vec<(String, String)> {
 /// for a relationship to one row, and `table.column` on the far side for a
 /// relationship to many. All of them are accepted, so a converted document
 /// needs no database to turn a column into the constraint that carries it.
-fn relationship_keys(rel: &postrust_core::schema_cache::Relationship) -> Vec<String> {
+pub(crate) fn relationship_keys(rel: &postrust_core::schema_cache::Relationship) -> Vec<String> {
     use postrust_core::schema_cache::Relationship;
 
     if let Relationship::Computed { function, .. } = rel {

@@ -1675,3 +1675,215 @@ async fn a_subscription_is_a_live_query() {
     drop(stream);
     drop_schema(&pool, &schema).await;
 }
+
+/// A permission's filter is the server's own predicate, not the caller's.
+///
+/// Two things this pins, both of which used to make such a permission refuse
+/// itself rather than apply:
+///
+///   * it may follow a relationship to a table the role has no permission on
+///     at all -- consulting a table is not exposing it, which is the point of
+///     writing the permission that way; and
+///   * it may compare two columns, either on one table or across the
+///     relationship it followed, with `["$", "name"]` meaning the table the
+///     permission is written on.
+///
+/// Both are checked against real SQL, because both are about what the
+/// generated statement refers to and nothing else can see that.
+#[tokio::test]
+#[ignore = "requires PostgreSQL"]
+async fn a_permission_may_consult_a_table_the_role_cannot_read() {
+    let pool = connect().await;
+    let schema = unique_schema_name("permfilter");
+    create_permission_schema(&pool, &schema).await;
+
+    // `listener` reads tracks, and only those whose artist is the caller's and
+    // whose artist outranks what the track asks for. It is granted nothing on
+    // `artist`.
+    let names = format!(
+        r#"{{"tables": {{
+             "{schema}.track": {{"permissions": {{"listener": {{"select": {{
+                "columns": "*",
+                "filter": {{"_and": [
+                   {{"artist": {{"id": "X-Hasura-Artist-Id"}}}},
+                   {{"artist": {{"rank": {{"_cgte": ["$", "min_rank"]}}}}}},
+                   {{"price": {{"_cgte": "floor"}}}}
+                ]}}
+             }}}}}}}},
+             "{schema}.playlist": {{"permissions": {{"listener": {{"select": {{
+                "columns": "*", "filter": {{}}
+             }}}}}}}}
+           }}}}"#
+    );
+    let state = build_state_with_names(&pool, &schema, &names).await;
+
+    let data = execute_as(
+        &state,
+        &pool,
+        &schema,
+        "{ track(order_by: [{id: asc}]) { id } }",
+    )
+    .await;
+    assert_eq!(
+        ids_of(&data, "track"),
+        vec![1],
+        "artist 1, rank at least the track's floor, and price at or above it"
+    );
+
+    // And the table the filter consulted is still not one this role can read.
+    let refused = execute_as_err(&state, &pool, &schema, "{ artist { id } }").await;
+    assert!(
+        refused.contains("artist"),
+        "the consulted table stays hidden -- got: {}",
+        refused
+    );
+
+    // Reached through somebody else's filter, `$` still names the table the
+    // permission is written on. Playlist 2 holds only track 5, whose artist
+    // does not outrank *the track's* `min_rank` -- but does outrank the
+    // playlist's, so a `$` bound to the query's root would let it through.
+    let data = execute_as(
+        &state,
+        &pool,
+        &schema,
+        "{ playlist(where: {tracks: {id: {_gt: 0}}}, order_by: [{id: asc}]) { id } }",
+    )
+    .await;
+    assert_eq!(
+        ids_of(&data, "playlist"),
+        vec![1],
+        "the far side's permission is read against its own table"
+    );
+
+    drop_schema(&pool, &schema).await;
+}
+
+/// Two tables, one key between them, and the columns a comparison needs.
+async fn create_permission_schema(pool: &PgPool, schema: &str) {
+    drop_schema(pool, schema).await;
+    pool.execute(format!("CREATE SCHEMA {}", schema).as_str())
+        .await
+        .expect("failed to create schema");
+    pool.execute(
+        format!(
+            "CREATE TABLE {schema}.artist (
+                 id integer PRIMARY KEY,
+                 rank integer NOT NULL
+             );
+             CREATE TABLE {schema}.playlist (
+                 id integer PRIMARY KEY,
+                 min_rank integer NOT NULL
+             );
+             CREATE TABLE {schema}.track (
+                 id integer PRIMARY KEY,
+                 artist_id integer NOT NULL REFERENCES {schema}.artist(id),
+                 playlist_id integer NOT NULL REFERENCES {schema}.playlist(id),
+                 min_rank integer NOT NULL,
+                 price numeric NOT NULL,
+                 floor numeric NOT NULL
+             );
+             INSERT INTO {schema}.artist (id, rank) VALUES (1, 5), (2, 5);
+             -- The second playlist asks for a rank every artist clears,
+             -- while the only track on it asks for one none of them does.
+             -- That is what tells the two roots apart: read against the
+             -- playlist the track passes, read against the track it does not.
+             INSERT INTO {schema}.playlist (id, min_rank) VALUES (1, 3), (2, 1);
+             INSERT INTO {schema}.track
+                 (id, artist_id, playlist_id, min_rank, price, floor) VALUES
+                 (1, 1, 1, 3, 10, 10),
+                 (2, 1, 1, 9, 10, 10),
+                 (3, 1, 1, 3,  9, 10),
+                 (4, 2, 1, 3, 10, 10),
+                 (5, 1, 2, 9, 10, 10);"
+        )
+        .as_str(),
+    )
+    .await
+    .expect("failed to create the permission fixture");
+}
+
+/// Build state over the schema with a permission document in play.
+async fn build_state_with_names(pool: &PgPool, schema: &str, names: &str) -> Arc<GraphQLState> {
+    let schemas = vec![schema.to_string()];
+    let cache = SchemaCache::load(pool, &schemas)
+        .await
+        .expect("failed to load schema cache");
+    let config = SchemaConfig {
+        exposed_schemas: schemas.clone(),
+        enable_mutations: true,
+        names: postrust_graphql::names::NameOverrides::parse(names).expect("the names parse"),
+        ..SchemaConfig::default()
+    };
+    Arc::new(
+        GraphQLState::new(pool.clone(), Arc::new(cache), config)
+            .expect("failed to build GraphQL schema"),
+    )
+}
+
+/// Execute as the `listener` role, carrying the session the filter reads.
+async fn execute_as_response(
+    state: &Arc<GraphQLState>,
+    pool: &PgPool,
+    schema: &str,
+    query: &str,
+) -> async_graphql::Response {
+    let cache = SchemaCache::load(pool, &[schema.to_string()])
+        .await
+        .expect("failed to load schema cache");
+    let mut session = HashMap::new();
+    session.insert("artist_id".to_string(), "1".to_string());
+    let ctx = GraphQLContext::new(
+        pool.clone(),
+        SchemaCacheRef::from_static(cache),
+        AuthResult {
+            role: TEST_ROLE.to_string(),
+            claims: HashMap::new(),
+        },
+    )
+    .with_session(session)
+    .with_identity(Some("listener".to_string()), false);
+
+    let schema_for_role = state
+        .schema_for(Some("listener"), false)
+        .expect("the role has a schema");
+    schema_for_role
+        .execute(Request::new(query).data(ctx).data(pool.clone()))
+        .await
+}
+
+async fn execute_as(
+    state: &Arc<GraphQLState>,
+    pool: &PgPool,
+    schema: &str,
+    query: &str,
+) -> serde_json::Value {
+    let response = execute_as_response(state, pool, schema, query).await;
+    assert!(
+        response.errors.is_empty(),
+        "expected no GraphQL errors for {} -- got: {:?}",
+        query,
+        response.errors
+    );
+    serde_json::to_value(&response.data).expect("data was not serialisable")
+}
+
+async fn execute_as_err(
+    state: &Arc<GraphQLState>,
+    pool: &PgPool,
+    schema: &str,
+    query: &str,
+) -> String {
+    let response = execute_as_response(state, pool, schema, query).await;
+    assert!(
+        !response.errors.is_empty(),
+        "expected a GraphQL error for {} -- got data: {:?}",
+        query,
+        response.data
+    );
+    response
+        .errors
+        .iter()
+        .map(|e| e.message.clone())
+        .collect::<Vec<_>>()
+        .join("; ")
+}

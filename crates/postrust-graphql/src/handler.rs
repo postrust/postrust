@@ -2894,13 +2894,30 @@ async fn aggregate_value(
             let cache = guard
                 .as_ref()
                 .ok_or_else(|| async_graphql::Error::new("schema cache is not loaded"))?;
-            let scope = WhereScope::table(
-                &spec.schema_name,
-                &spec.table_name,
-                &spec.type_name,
-                spec.names.as_ref(),
-            )
-            .with_resolution(cache, spec.relationships.as_ref())
+            // A function's rows are read under the table's name as an alias,
+            // not from the table itself -- the same split the row read makes.
+            // Counting them under the qualified name answered `invalid
+            // reference to FROM-clause entry for table "Track"` the moment a
+            // permission referred to a column, which is any permission that
+            // follows a relationship.
+            let scope = match &spec.call {
+                None => WhereScope::table(
+                    &spec.schema_name,
+                    &spec.table_name,
+                    &spec.type_name,
+                    spec.names.as_ref(),
+                )
+                .with_resolution(cache, spec.relationships.as_ref()),
+                Some(_) => WhereScope::for_alias(
+                    &spec.schema_name,
+                    &spec.table_name,
+                    &spec.table_name,
+                    &spec.type_name,
+                    cache,
+                    spec.relationships.as_ref(),
+                    spec.names.as_ref(),
+                ),
+            }
             .for_caller(gql_ctx.caller());
             let (sql, values) =
                 build_where_clause(Some(&predicate), bound_values.len() + 1, &scope)?;
@@ -5659,8 +5676,31 @@ fn permission_filter(
     verb: crate::role::Verb,
 ) -> Result<Option<serde_json::Value>, async_graphql::Error> {
     crate::role::row_filter(caller, names, schema, table, verb)
+        .map(|filter| filter.map(|predicate| serde_json::json!({ PERMISSION: predicate })))
         .map_err(|fault| coded_error(fault.code(), fault.to_string()))
 }
+
+/// The key a permission's own predicate is wrapped in on its way to the
+/// compiler.
+///
+/// The two halves of a `where` are the same language and are compiled by the
+/// same code, which is what keeps a permission able to say everything a client
+/// can. They are not evaluated by the same party: a client's half asks what
+/// *this caller* may see, and a permission's half is the server's own
+/// predicate, evaluated as the server.
+///
+/// The difference shows on a relationship. `{"Artist": {"id":
+/// "X-Hasura-Artist-Id"}}` on `Track` grants the tracks belonging to the
+/// caller's artist -- to a role that has no permission on `Artist` at all, and
+/// is not meant to have one: the predicate consults that table, it does not
+/// expose it. Compiled as the caller, it needs a permission that does not
+/// exist and refuses itself; compiled as the server, it says what it was
+/// written to say. `_exists` has always worked this way and says so where it
+/// is built; this is the same rule for the relationship a permission follows.
+///
+/// The name cannot collide with a column: no boolean expression a client can
+/// write has this field, because no input type declares it.
+const PERMISSION: &str = "_permission";
 
 /// How many rows a permission lets one read return.
 ///
@@ -5752,6 +5792,15 @@ pub struct WhereScope<'a> {
     row_ref: String,
     /// The GraphQL type name, which is the key into the relationship map.
     type_name: String,
+    /// How to refer to the columns of the table the predicate started at, and
+    /// which table that is.
+    ///
+    /// A column comparison written `["$", "name"]` means that table's column,
+    /// however many relationships the predicate has descended through since --
+    /// which is what makes the form worth having. Equal to this table's own
+    /// until an `EXISTS` is entered.
+    root_ref: String,
+    root_qualified: postrust_core::api_request::QualifiedIdentifier,
     /// The names this table's columns are exposed under, so a predicate
     /// written against a field can be written as SQL against a column.
     names: &'a crate::names::NameOverrides,
@@ -5788,6 +5837,12 @@ impl<'a> WhereScope<'a> {
             ),
             row_ref: postrust_sql::escape_ident(table),
             type_name: type_name.to_string(),
+            root_ref: format!(
+                "{}.{}",
+                postrust_sql::escape_ident(schema),
+                postrust_sql::escape_ident(table)
+            ),
+            root_qualified: postrust_core::api_request::QualifiedIdentifier::new(schema, table),
             names,
             resolution: None,
             caller: None,
@@ -5802,6 +5857,11 @@ impl<'a> WhereScope<'a> {
     /// `to_jsonb("area")` the shape rather than the row. The alias is a name
     /// no column has.
     fn under_alias(mut self, alias: &str) -> Self {
+        // The root moves with it: this is the outermost table being renamed,
+        // not a step into another one.
+        if self.root_ref == self.sql_ref {
+            self.root_ref = postrust_sql::escape_ident(alias);
+        }
         self.sql_ref = postrust_sql::escape_ident(alias);
         self.row_ref = postrust_sql::escape_ident(alias);
         self
@@ -5836,6 +5896,8 @@ impl<'a> WhereScope<'a> {
             sql_ref: postrust_sql::escape_ident(alias),
             row_ref: postrust_sql::escape_ident(alias),
             type_name: type_name.to_string(),
+            root_ref: postrust_sql::escape_ident(alias),
+            root_qualified: postrust_core::api_request::QualifiedIdentifier::new(schema, table),
             names,
             resolution: Some(WhereResolution {
                 cache,
@@ -5863,6 +5925,10 @@ impl<'a> WhereScope<'a> {
             sql_ref: postrust_sql::escape_ident(alias),
             row_ref: postrust_sql::escape_ident(alias),
             type_name: type_name.to_string(),
+            // Carried, not replaced: `$` names the table the predicate began
+            // at, which is the whole point of descending with it.
+            root_ref: from.root_ref.clone(),
+            root_qualified: from.root_qualified.clone(),
             names: from.names,
             resolution: from.resolution.as_ref().map(|r| WhereResolution {
                 cache: r.cache,
@@ -5879,6 +5945,31 @@ impl<'a> WhereScope<'a> {
     pub fn for_caller(mut self, caller: crate::role::Caller<'a>) -> Self {
         self.caller = Some(caller);
         self
+    }
+
+    /// The same scope with no caller: what a permission's own predicate is
+    /// evaluated as. See `PERMISSION`.
+    fn as_system(&self) -> WhereScope<'a> {
+        WhereScope {
+            qualified: self.qualified.clone(),
+            sql_ref: self.sql_ref.clone(),
+            row_ref: self.row_ref.clone(),
+            type_name: self.type_name.clone(),
+            // The root moves here. `$` in a permission names the table the
+            // permission is *written on*, which is this one -- not whatever
+            // table the query happened to start at. Reading `dml_rbp_tasks`
+            // through a project's `where: {tasks: {...}}` compared the task's
+            // grant against a column of `dml_rbp_projects` until this, and
+            // answered with rows the role may not see.
+            root_ref: self.sql_ref.clone(),
+            root_qualified: self.qualified.clone(),
+            names: self.names,
+            resolution: self.resolution.as_ref().map(|r| WhereResolution {
+                cache: r.cache,
+                relationships: r.relationships,
+            }),
+            caller: None,
+        }
     }
 
     /// What a field name refers to, as SQL: a column of this table, or the
@@ -5930,14 +6021,119 @@ impl<'a> WhereScope<'a> {
             .map(|c| c.nominal_type.clone())
     }
 
-    fn relationship(&self, name: &str) -> Option<&'a RelationshipField> {
-        self.resolution
-            .as_ref()?
-            .relationships
-            .get(&self.type_name)?
-            .iter()
-            .find(|r| r.name == name)
+    /// The other side of a column-to-column comparison, as SQL.
+    ///
+    /// Hasura writes the operand two ways. A bare name is a column of *this*
+    /// table -- `{"bid_price": {"$cgt": "price"}}` compares two columns of one
+    /// auction. `["$", "name"]` is a column of the table the permission is
+    /// written on, which is what makes the form useful inside a predicate over
+    /// a relationship: `{"item": {"item_quantity": {"_cgte": ["$",
+    /// "order_cart_quantity"]}}}` asks whether the item has as many in stock
+    /// as the cart is asking for, and the cart is the outer row.
+    ///
+    /// Nothing else is accepted. A longer path would walk relationships to
+    /// reach the column, which Hasura allows and no case here writes -- and
+    /// reading it wrongly would widen a permission rather than narrow it.
+    fn other_column(
+        &self,
+        operand: &serde_json::Value,
+        op: &str,
+    ) -> Result<String, async_graphql::Error> {
+        use serde_json::Value;
+
+        let refused = |what: &str| {
+            async_graphql::Error::new(format!(
+                "the \"{}\" comparison takes the name of a column, {}",
+                op, what
+            ))
+        };
+        let (against, qualified, name) = match operand {
+            Value::String(name) => (&self.sql_ref, &self.qualified, name.as_str()),
+            Value::Array(path) => match path.as_slice() {
+                [Value::String(name)] => (&self.sql_ref, &self.qualified, name.as_str()),
+                [Value::String(root), Value::String(name)] if root == "$" => {
+                    (&self.root_ref, &self.root_qualified, name.as_str())
+                }
+                _ => return Err(refused("or [\"$\", \"a column\"]")),
+            },
+            _ => return Err(refused("written as a string")),
+        };
+        // Read against whichever table it belongs to, since a rename is
+        // per-table and the two are not the same table.
+        let column = self
+            .names
+            .column_source(&qualified.schema, &qualified.name, name)
+            .unwrap_or(name);
+        Ok(format!(
+            "{}.{}",
+            against,
+            postrust_sql::escape_ident(column)
+        ))
     }
+
+    /// The relationship a predicate is following, where there is one.
+    ///
+    /// Looked up in the schema's own map first, which is the answer for every
+    /// relationship the role can read. A permission may name one it cannot:
+    /// role `Artist` reads `Track` and filters it by `{"Artist": {"id": ...}}`
+    /// while having no permission on `Artist` at all, so that relationship is
+    /// in no schema this role is served. The catalogue still has it -- the
+    /// cache a scope resolves against is the unreduced one -- and the
+    /// relationship is derived from it there.
+    ///
+    /// Deriving it cannot let a client reach a hidden table: a key that is not
+    /// a field of the boolean expression is refused before any of this runs,
+    /// and the only writer of such a key is a permission.
+    fn relationship(&self, name: &str) -> Option<std::borrow::Cow<'a, RelationshipField>> {
+        let resolution = self.resolution.as_ref()?;
+        let published = resolution
+            .relationships
+            .get(&self.type_name)
+            .and_then(|fields| fields.iter().find(|r| r.name == name));
+        if let Some(found) = published {
+            return Some(std::borrow::Cow::Borrowed(found));
+        }
+
+        let table = resolution.cache.get_table(&self.qualified)?;
+        resolution
+            .cache
+            .get_relationships(&self.qualified, &table.schema)?
+            .iter()
+            .find_map(|rel| {
+                let given = crate::schema::relationship_keys(rel)
+                    .iter()
+                    .find_map(|key| self.names.relationship(&table.schema, &table.name, key));
+                // The target's own name stands in for its GraphQL type, which
+                // this role has none of. Nothing reads it but the lookup
+                // above, and that lookup will land here again.
+                let field = RelationshipField::from_relationship_named(
+                    rel,
+                    &rel.foreign_table().name,
+                    given,
+                );
+                (field.name == name).then_some(std::borrow::Cow::Owned(field))
+            })
+    }
+}
+
+/// The SQL operator behind a column-to-column comparison, where this is one.
+///
+/// `_ceq`, `_cne`, `_cgt`, `_cgte`, `_clt`, `_clte`: the `c` is for column.
+/// Only a permission writes these -- no boolean expression a client can write
+/// has them, because a client has no way to name the row a comparison would be
+/// against. A permission does: `{"bid_price": {"$cgt": "price"}}` on `auction`
+/// grants the rows whose bid has passed the reserve, which is a fact about the
+/// row rather than about the caller.
+fn column_comparison(op: &str) -> Option<&'static str> {
+    Some(match op {
+        "_ceq" => "=",
+        "_cne" => "<>",
+        "_cgt" => ">",
+        "_cgte" => ">=",
+        "_clt" => "<",
+        "_clte" => "<=",
+        _ => return None,
+    })
 }
 
 /// One boolean expression, as SQL. `None` where it constrains nothing.
@@ -5985,6 +6181,15 @@ fn build_condition(
                     conditions.push(format!("NOT ({})", sql));
                 }
             }
+            // A permission's own predicate, which is the server's rather
+            // than the caller's. See `PERMISSION`.
+            PERMISSION => {
+                if let Some(sql) =
+                    build_condition(val, &scope.as_system(), param_idx, values, alias_counter)?
+                {
+                    conditions.push(sql);
+                }
+            }
             // A question about a table nothing relates this one to. Only a
             // permission writes it; no client can, because no boolean
             // expression has the field.
@@ -6005,7 +6210,7 @@ fn build_condition(
             name if scope.relationship(name).is_some() => {
                 let relationship = scope.relationship(name).expect("just checked");
                 conditions.push(exists_sql(
-                    relationship,
+                    &relationship,
                     val,
                     scope,
                     param_idx,
@@ -6028,7 +6233,7 @@ fn build_condition(
                     .and_then(|rel| scope.relationship(rel))
                     .expect("just checked");
                 conditions.push(aggregate_predicate_sql(
-                    relationship,
+                    &relationship,
                     val,
                     scope,
                     param_idx,
@@ -6042,6 +6247,20 @@ fn build_condition(
                     serde_json::Value::Object(ops) => {
                         let column_type = scope.column_type(column);
                         for (op, operand) in ops {
+                            // A comparison against another column rather than
+                            // against a value, which only a permission can
+                            // write. It needs the scope to say *which* column,
+                            // so it is answered here rather than in
+                            // `comparison_sql`, which sees one side.
+                            if let Some(other) = column_comparison(op) {
+                                conditions.push(format!(
+                                    "{} {} {}",
+                                    quoted,
+                                    other,
+                                    scope.other_column(operand, op)?
+                                ));
+                                continue;
+                            }
                             conditions.push(comparison_sql(
                                 &quoted,
                                 column,
@@ -6165,13 +6384,18 @@ fn exists_sql(
     // one it may not learn the existence of either -- so the child's filter
     // narrows the EXISTS exactly as it narrows a read of the same table.
     if let Some(caller) = &child_scope.caller {
-        let permission = crate::role::read_predicate(
+        // Through `permission_predicate` rather than `role::read_predicate`,
+        // so the far side's filter is marked as the server's own -- see
+        // `PERMISSION`. Without the mark it was compiled as the caller, and a
+        // filter that follows a relationship of its own then needed a
+        // permission on *that* table: `dml_rbp_tasks` is filtered through
+        // `grants`, which the role reading tasks may not read.
+        let permission = permission_predicate(
             caller,
             child_scope.names,
             &plan.foreign_schema,
             &plan.foreign_table,
-        )
-        .map_err(|fault| coded_error(fault.code(), fault.to_string()))?;
+        )?;
         if let Some(predicate) = permission {
             if let Some(sql) =
                 build_condition(&predicate, &child_scope, param_idx, values, alias_counter)?
