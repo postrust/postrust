@@ -1091,9 +1091,13 @@ impl Usage<'_> {
                 if let Some(given) = self.variables.get(&async_graphql::Name::new(name)) {
                     let given: async_graphql_value::Value = given.clone().into();
                     self.enumerated(&given, expected, pos, path);
+                    self.label_path(&given, expected, pos, path);
                 }
             }
-            Value::Enum(_) | Value::String(_) => self.enumerated(value, expected, pos, path),
+            Value::Enum(_) | Value::String(_) => {
+                self.enumerated(value, expected, pos, path);
+                self.label_path(value, expected, pos, path);
+            }
             Value::List(items) => {
                 // A list may be written where one value is expected, in which
                 // case each item is checked against that same type -- which is
@@ -1164,6 +1168,52 @@ impl Usage<'_> {
 }
 
 impl Usage<'_> {
+    /// A value written where an `ltree` is expected, as a label path.
+    ///
+    /// PostgreSQL refuses `Tree.Collections.` with `ltree syntax error` and
+    /// nothing else; Hasura reads the path before sending it and says what a
+    /// path is. Reading it here is also what puts the refusal at
+    /// `...where.path._ancestor` rather than at the request as a whole.
+    ///
+    /// Only an *empty label* is refused, and the narrowness is the point.
+    /// PostgreSQL's idea of a label character comes from the database's
+    /// locale -- `a-b`, `a_b`, `1.2` and `Ünï` are all paths on the image the
+    /// harness runs, and in C locale the last of those is not. Refusing a
+    /// character this server merely doubts would turn a working query into an
+    /// error, so what is refused here is the one thing no locale accepts: a
+    /// label with nothing in it. Everything else is still PostgreSQL's to
+    /// judge, in PostgreSQL's words.
+    fn label_path(
+        &mut self,
+        value: &async_graphql_value::Value,
+        expected: &str,
+        pos: async_graphql::Pos,
+        path: &str,
+    ) {
+        use async_graphql::registry::MetaTypeName;
+        use async_graphql_value::Value;
+
+        if MetaTypeName::concrete_typename(expected) != "ltree" {
+            return;
+        }
+        let Value::String(written) = value else {
+            return;
+        };
+        // The empty string is the empty path, which is a path: "zero or more
+        // labels" is what the message this raises says, and PostgreSQL agrees.
+        if written.is_empty() || written.split('.').all(|label| !label.is_empty()) {
+            return;
+        }
+        self.errors.push(coded_as(
+            "parse-failed",
+            "Expecting label path: a sequence of zero or more labels separated by \
+             dots, for example L1.L2.L3"
+                .to_string(),
+            pos,
+            path,
+        ));
+    }
+
     /// A value written where an enum is expected, against that enum's members.
     ///
     /// async-graphql reports this too, in its own words and against the
@@ -1230,9 +1280,19 @@ fn relax(ty: &str, has_default: bool) -> String {
 /// has to be named is a place inside the request -- an argument, a key of an
 /// input object, an item of a list.
 fn coded(message: String, pos: async_graphql::Pos, path: &str) -> ServerError {
+    coded_as("validation-failed", message, pos, path)
+}
+
+/// The same, for a rule whose failure Hasura codes as something else.
+fn coded_as(
+    code: &'static str,
+    message: String,
+    pos: async_graphql::Pos,
+    path: &str,
+) -> ServerError {
     let mut error = ServerError::new(message, Some(pos));
     let mut extensions = async_graphql::ErrorExtensionValues::default();
-    extensions.set("code", "validation-failed");
+    extensions.set("code", code);
     extensions.set("path", path);
     error.extensions = Some(extensions);
     error
@@ -1256,6 +1316,16 @@ mod variable_position_tests {
         let comparison = InputObject::new("String_comparison_exp")
             .field(InputValue::new("_eq", TypeRef::named("String")))
             .field(InputValue::new("_in", TypeRef::named_nn_list("String")));
+        // A tree, for the rules that are about a scalar's own shape rather
+        // than about the type it is written under.
+        let ltree = InputObject::new("ltree_comparison_exp")
+            .field(InputValue::new("_ancestor", TypeRef::named("ltree")))
+            .field(InputValue::new(
+                "_ancestor_any",
+                TypeRef::named_list("ltree"),
+            ));
+        let tree_filter = InputObject::new("tree_bool_exp")
+            .field(InputValue::new("path", TypeRef::named("ltree_comparison_exp")));
         let insert = InputObject::new("author_insert_input")
             .field(InputValue::new("name", TypeRef::named("String")));
         let query = Object::new("query_root").field(
@@ -1264,6 +1334,12 @@ mod variable_position_tests {
             })
             .argument(InputValue::new("limit", TypeRef::named("Int")))
             .argument(InputValue::new("where", TypeRef::named("author_bool_exp"))),
+        )
+        .field(
+            Field::new("tree", TypeRef::named_nn_list_nn("tree"), |_| {
+                FieldFuture::new(async move { Ok(Some(async_graphql::Value::List(vec![]))) })
+            })
+            .argument(InputValue::new("where", TypeRef::named("tree_bool_exp"))),
         );
         let mutation = Object::new("mutation_root")
             .field(
@@ -1291,11 +1367,18 @@ mod variable_position_tests {
         let author = Object::new("author").field(Field::new("id", TypeRef::named("Int"), |_| {
             FieldFuture::new(async move { Ok(None::<async_graphql::Value>) })
         }));
+        let tree = Object::new("tree").field(Field::new("path", TypeRef::named("ltree"), |_| {
+            FieldFuture::new(async move { Ok(None::<async_graphql::Value>) })
+        }));
         Schema::build("query_root", Some("mutation_root"), None)
+            .register(Scalar::new("ltree"))
             .register(filter)
             .register(comparison)
+            .register(ltree)
+            .register(tree_filter)
             .register(insert)
             .register(author)
+            .register(tree)
             .register(query)
             .register(mutation)
             .finish()
@@ -1386,6 +1469,48 @@ mod variable_position_tests {
             ),
             vec!["$.selectionSet.insert_author.args.objects[1].name"]
         );
+    }
+
+    /// An `ltree` with an empty label is refused before it is sent, in the
+    /// words Hasura uses -- and nothing else is, because what a label may
+    /// contain is the database's locale to decide.
+    #[test]
+    fn a_label_path_with_an_empty_label_is_refused() {
+        let empty = "Expecting label path: a sequence of zero or more labels \
+                     separated by dots, for example L1.L2.L3";
+        assert_eq!(
+            refusals("{ tree(where: {path: {_ancestor: \"a.b.\"}}) { path } }", "{}"),
+            vec![empty]
+        );
+        assert_eq!(
+            refusals("{ tree(where: {path: {_ancestor: \".a\"}}) { path } }", "{}"),
+            vec![empty]
+        );
+        assert_eq!(
+            refusals("{ tree(where: {path: {_ancestor: \"a..b\"}}) { path } }", "{}"),
+            vec![empty]
+        );
+        // The list form says which item, which is what its path is for.
+        assert_eq!(
+            refusals_with_paths(
+                "{ tree(where: {path: {_ancestor_any: [\"a\", \"b.\"]}}) { path } }",
+                "{}"
+            ),
+            vec!["$.selectionSet.tree.args.where.path._ancestor_any[1]"]
+        );
+        // Everything PostgreSQL accepts is still sent to it, including the
+        // characters a stricter reading would have refused.
+        for good in ["a", "a.b", "", "a-b", "a_b", "1.2", "Ünï", "a@b"] {
+            assert!(
+                refusals(
+                    &format!("{{ tree(where: {{path: {{_ancestor: \"{}\"}}}}) {{ path }} }}", good),
+                    "{}"
+                )
+                .is_empty(),
+                "{} was refused",
+                good
+            );
+        }
     }
 
     #[test]
