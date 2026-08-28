@@ -423,7 +423,20 @@ pub fn prepare(
                 return Err((request, vec![error]));
             }
         }
-        let errors = variable_errors(&doc, schema.registry(), &request.variables);
+        let mut errors = variable_errors(&doc, schema.registry(), &request.variables);
+        // The first refusal is the whole answer. Hasura validates a request
+        // as a parser reads one -- it stops where it cannot go on -- and in
+        // 468 replayed cases it never answered with a second error. A query
+        // naming two fields that do not exist is refused for the first of
+        // them, and so is one whose `on_conflict` carries an unknown key
+        // beside a missing required one.
+        //
+        // Reporting all of them is the more useful answer and the wrong one
+        // here: a client written against Hasura reads `errors[0]`, and the
+        // rest of the list is text it will not show. The walk still runs to
+        // the end, because it is cheap and because stopping it would put the
+        // stopping condition in every arm.
+        errors.truncate(1);
         if !errors.is_empty() {
             return Err((request, errors));
         }
@@ -1765,6 +1778,26 @@ mod variable_position_tests {
                 r#"{"n": 1}"#
             ),
             vec!["$.selectionSet.insert_author.args.objects[1].name"]
+        );
+    }
+
+    /// Two things wrong with one request is one refusal. Hasura stops at the
+    /// first, and a client written against it reads `errors[0]`.
+    #[test]
+    fn a_request_is_refused_once_however_many_faults_it_has() {
+        assert_eq!(
+            refusals("{ author { nope } tree { alsoNope } }", "{}"),
+            vec!["field 'nope' not found in type: 'author'"]
+        );
+        // The second fault is a different kind from the first, and is still
+        // not answered: what is reported is where the walk stopped, not one
+        // error of each sort.
+        assert_eq!(
+            refusals(
+                "mutation { insert_author(objects: [{nope: 1}],                  unknownArg: 2) { id } }",
+                "{}"
+            ),
+            vec!["field 'nope' not found in type: 'author_insert_input'"]
         );
     }
 
