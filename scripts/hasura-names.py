@@ -160,6 +160,12 @@ def tables_from_commands(paths):
             if kind.startswith("pg_"):
                 kind = kind[len("pg_"):]
             args = command.get("args") or {}
+            # `track_table` and `track_function` accept the bare name as their
+            # whole argument -- `args: employees` -- and the corpus writes it
+            # that way. Read as a dict it is nothing at all, which is how a
+            # tracked table came to be missing from a converted document.
+            if isinstance(args, str):
+                args = {"function" if kind.endswith("_function") else "table": args}
             if not isinstance(args, dict):
                 continue
             # A tracked function is not about a table, so it is collected
@@ -287,67 +293,6 @@ def relationship_key(entry, kind):
     mapping = manual.get("column_mapping") or {}
     if kind == "object" and len(mapping) == 1:
         return next(iter(mapping))
-    return None
-
-
-def pluralize(word):
-    """The server's own rule, in schema/relationship.rs."""
-    if word.endswith("s") and not word.endswith("ss"):
-        return word
-    if word.endswith(("x", "ch", "sh", "ss")):
-        return word + "es"
-    if word.endswith("y") and not word.endswith(("ey", "ay", "oy")):
-        return word[:-1] + "ies"
-    return word + "s"
-
-
-def singularize(word):
-    """The server's own rule, in schema/relationship.rs."""
-    if word.endswith("ies"):
-        return word[:-3] + "y"
-    if word.endswith(("ses", "xes", "ches", "shes")):
-        return word[:-2]
-    if word.endswith("s") and not word.endswith("ss"):
-        return word[:-1]
-    return word
-
-
-def derived_relationship_name(entry, kind, bases):
-    """What this server would call it without being told.
-
-    A relationship to many rows takes the target's exposed base name
-    pluralised, one to a single row its singular -- the same two rules the
-    server applies. `bases` maps `schema.table` to that exposed name, because a
-    table given a custom name changes what every relationship *to* it derives
-    to: a `Articles`-named table is reached as `Articles`, not as `articles`.
-
-    An entry that matches is left out: writing down a name reflection already
-    produces makes the document longer to read and gives it something to go
-    stale against.
-    """
-    using = entry.get("using") or {}
-    on = using.get("foreign_key_constraint_on")
-    if kind == "array" and isinstance(on, dict):
-        schema, table = qualified(on.get("table"))
-        if not table:
-            return None
-        return pluralize(bases.get(f"{schema}.{table}", table))
-    if kind == "object":
-        # The object side names the table it points at, which the metadata
-        # does not carry -- only the column carrying the key. `author_id`
-        # pointing at `author` is the ordinary spelling, and the only one that
-        # can be checked without a database.
-        #
-        # `None` where it cannot be checked, which the caller reads as "write
-        # the name down". A column that is not `<table>_id` -- `parent_id` on a
-        # self-reference -- points at a table this cannot name, and guessing
-        # that the derived name matches is how `parent` came to be left out of
-        # a document that needed it.
-        if isinstance(on, str) and on.endswith("_id"):
-            target = on[: -len("_id")]
-            base = bases.get(f"public.{target}")
-            if base is not None:
-                return singularize(base)
     return None
 
 
@@ -501,33 +446,62 @@ def convert(tables):
         if comments:
             given["comments"] = comments
 
-        relationships = {}
+        # Which relationships the table has, and how each is reached. Written
+        # whenever metadata declares any, because the declaration is the whole
+        # list: Hasura offers the relationships it was told about, where
+        # reflection offers one per foreign key. A table nothing is declared
+        # for is left to reflection, which is what a document that says
+        # nothing about it has always meant.
+        declared = []
+        seen = set()
         for kind, field in (("object", "object_relationships"),
                             ("array", "array_relationships")):
             for relationship in entry.get(field) or []:
                 name = relationship.get("name")
-                if not name:
+                if not name or name in seen:
+                    if name in seen:
+                        print(
+                            f"note: {key} declares \"{name}\" twice; keeping the first",
+                            file=sys.stderr,
+                        )
+                    continue
+                seen.add(name)
+                using = relationship.get("using") or {}
+                manual = using.get("manual_configuration") or {}
+                mapping = manual.get("column_mapping") or {}
+                if mapping:
+                    schema, table = qualified(manual.get("remote_table"))
+                    if not table:
+                        print(
+                            f"note: {key}.{name} maps columns to a table this cannot "
+                            f"name; it is left out",
+                            file=sys.stderr,
+                        )
+                        continue
+                    declared.append({
+                        "name": name,
+                        "table": f"{schema}.{table}",
+                        "columns": dict(mapping),
+                        "to_one": kind == "object",
+                    })
                     continue
                 lookup = relationship_key(relationship, kind)
                 if lookup is None:
                     print(
-                        f"note: {key}.{name} is a manual relationship this cannot key; "
-                        f"name it by its constraint if it needs one",
+                        f"note: {key}.{name} is reached in a way this cannot describe; "
+                        f"it is left out",
                         file=sys.stderr,
                     )
                     continue
-                if derived_relationship_name(relationship, kind, bases) == name:
-                    continue          # reflection already produces this name
-                if lookup in relationships and relationships[lookup] != name:
-                    print(
-                        f"note: {key} names one foreign key twice, as "
-                        f"\"{relationships[lookup]}\" and \"{name}\"; keeping the first",
-                        file=sys.stderr,
-                    )
-                    continue
-                relationships[lookup] = name
-        if relationships:
-            given["relationships"] = relationships
+                declared.append({"name": name, "using": lookup,
+                                 "to_one": kind == "object"})
+        # Written even when empty, and that is the point: metadata mentioning a
+        # table and declaring no relationship for it is Hasura saying the table
+        # has none. Absent means "reflect", which is what a hand-written
+        # document that says nothing about a table has always meant -- so the
+        # empty list is the only way a converted document can say the
+        # difference.
+        given["declared_relationships"] = declared
 
         computed = {}
         for field in entry.get("computed_fields") or []:

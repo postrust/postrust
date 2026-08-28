@@ -322,6 +322,213 @@ pub struct FunctionField {
 /// than from the relationship because the relationship loader knows only which
 /// argument is the row -- the rest are the same parameters any function has,
 /// and they are already loaded.
+/// One relationship field per foreign key the catalogue carries.
+fn reflected_fields(
+    table: &Table,
+    schema_cache: &SchemaCache,
+    config: &SchemaConfig,
+    base_names: &HashMap<(String, String), String>,
+) -> Vec<RelationshipField> {
+    schema_cache
+        .get_relationships(&table.qualified_identifier(), &table.schema)
+        .map(|relationships| {
+            relationships
+                .iter()
+                .filter_map(|rel| {
+                    // A relationship whose target is not exposed would
+                    // reference a GraphQL type that was never registered.
+                    let foreign = rel.foreign_table();
+                    let target_base =
+                        base_names.get(&(foreign.schema.clone(), foreign.name.clone()))?;
+                    let mut field = RelationshipField::from_relationship_named(
+                        rel,
+                        target_base,
+                        relationship_keys(rel).iter().find_map(|key| {
+                            config.names.relationship(&table.schema, &table.name, key)
+                        }),
+                    );
+                    field.arguments = caller_arguments(rel, schema_cache);
+                    Some(field)
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// One relationship field per relationship metadata declares, and no others.
+///
+/// A declaration reached by a key names a relationship reflection already
+/// found, so the catalogue's own cardinality and columns are used -- a key
+/// says which side has one row and which has many, and guessing that from a
+/// name would be guessing. One reached by a column mapping is not in the
+/// catalogue at all and is built from the mapping, with the direction taken
+/// from the declaration: Hasura writes object and array relationships
+/// separately, which is where `to_one` comes from.
+///
+/// A declaration this server cannot resolve is left out rather than guessed
+/// at. It is a field that would not work; the ones beside it still do.
+fn declared_fields(
+    declared: &[crate::names::DeclaredRelationship],
+    table: &Table,
+    schema_cache: &SchemaCache,
+    config: &SchemaConfig,
+    base_names: &HashMap<(String, String), String>,
+) -> Vec<RelationshipField> {
+    use postrust_core::schema_cache::Relationship;
+
+    let reflected = schema_cache
+        .get_relationships(&table.qualified_identifier(), &table.schema)
+        .map(|found| found.to_vec())
+        .unwrap_or_default();
+
+    let mut fields = Vec::with_capacity(declared.len());
+    for entry in declared {
+        // Reached by a key reflection already found.
+        if let Some(key) = entry.using.as_deref() {
+            let Some(rel) = reflected
+                .iter()
+                .find(|rel| relationship_keys(rel).iter().any(|found| found == key))
+            else {
+                tracing::warn!(
+                    "GraphQL: {}.{} declares the relationship \"{}\" through \"{}\", \
+                     which no foreign key carries; it is left out",
+                    table.schema,
+                    table.name,
+                    entry.name,
+                    key
+                );
+                continue;
+            };
+            let foreign = rel.foreign_table();
+            let Some(target_base) = base_names.get(&(foreign.schema.clone(), foreign.name.clone()))
+            else {
+                continue;
+            };
+            let mut field =
+                RelationshipField::from_relationship_named(rel, target_base, Some(&entry.name));
+            field.arguments = caller_arguments(rel, schema_cache);
+            fields.push(field);
+            continue;
+        }
+
+        // Reached by a column mapping, which is a join no key describes.
+        let Some((schema, name)) = entry.target(config.default_schema()) else {
+            tracing::warn!(
+                "GraphQL: {}.{} declares the relationship \"{}\" with neither a key \
+                 nor a table to join to; it is left out",
+                table.schema,
+                table.name,
+                entry.name
+            );
+            continue;
+        };
+        let Some(target_base) = base_names.get(&(schema, name)) else {
+            continue;
+        };
+        match mapped_relationship_field(
+            entry,
+            table,
+            schema_cache,
+            config.default_schema(),
+            target_base,
+        ) {
+            Some(field) => fields.push(field),
+            None => tracing::warn!(
+                "GraphQL: {}.{} declares the relationship \"{}\" with no columns to \
+                 join on; it is left out",
+                table.schema,
+                table.name,
+                entry.name
+            ),
+        }
+    }
+
+    // A computed relationship is declared by `add_computed_field`, not by
+    // `create_object_relationship`, so it is not in this list and is not what
+    // the list is exhaustive about. Leaving it to reflection is what keeps
+    // `author.get_articles` on a table whose foreign keys are all declared.
+    let already: std::collections::HashSet<String> =
+        fields.iter().map(|field| field.name.clone()).collect();
+    for rel in reflected
+        .iter()
+        .filter(|rel| matches!(rel, Relationship::Computed { .. }))
+    {
+        let foreign = rel.foreign_table();
+        let Some(target_base) = base_names.get(&(foreign.schema.clone(), foreign.name.clone()))
+        else {
+            continue;
+        };
+        let mut field = RelationshipField::from_relationship_named(
+            rel,
+            target_base,
+            relationship_keys(rel)
+                .iter()
+                .find_map(|key| config.names.relationship(&table.schema, &table.name, key)),
+        );
+        if already.contains(&field.name) {
+            continue;
+        }
+        field.arguments = caller_arguments(rel, schema_cache);
+        fields.push(field);
+    }
+    fields
+}
+
+/// One relationship field for a declaration that maps column to column.
+///
+/// The join is the declaration's, the direction is the declaration's, and the
+/// constraint name is this server's -- nothing reads it back, and a mapped
+/// join has no constraint to borrow. `None` where the declaration names no
+/// columns to join on, which is not a join.
+pub(crate) fn mapped_relationship_field(
+    entry: &crate::names::DeclaredRelationship,
+    table: &Table,
+    schema_cache: &SchemaCache,
+    default_schema: &str,
+    target_base: &str,
+) -> Option<RelationshipField> {
+    use postrust_core::schema_cache::{Cardinality, Relationship};
+
+    let (schema, name) = entry.target(default_schema)?;
+    if entry.columns.is_empty() {
+        return None;
+    }
+    let foreign_table = postrust_core::api_request::QualifiedIdentifier::new(&schema, &name);
+    let here = table.qualified_identifier();
+    let columns: Vec<(String, String)> = entry
+        .columns
+        .iter()
+        .map(|(mine, theirs)| (mine.clone(), theirs.clone()))
+        .collect();
+    let constraint = format!("{}.{}", table.name, entry.name);
+    let cardinality = match entry.to_one {
+        true => Cardinality::M2O {
+            constraint: constraint.clone(),
+            columns,
+        },
+        false => Cardinality::O2M {
+            constraint: constraint.clone(),
+            columns,
+        },
+    };
+    let rel = Relationship::ForeignKey {
+        is_self: here == foreign_table,
+        table: here,
+        foreign_table_is_view: schema_cache
+            .get_table(&foreign_table)
+            .is_some_and(|t| t.is_view),
+        foreign_table,
+        cardinality,
+        table_is_view: table.is_view,
+        constraint_name: constraint,
+    };
+    Some(RelationshipField::from_relationship_named(
+        &rel,
+        target_base,
+        Some(&entry.name),
+    ))
+}
+
 fn caller_arguments(
     relationship: &postrust_core::schema_cache::Relationship,
     schema_cache: &SchemaCache,
@@ -814,7 +1021,7 @@ pub fn build_schema(schema_cache: &SchemaCache, config: &SchemaConfig) -> Genera
     // anything that would answer with a row of one.
     let mut readable_bases: HashSet<String> = HashSet::new();
 
-    for table in tables {
+    for table in &tables {
         let base_name = base_names
             .get(&(table.schema.clone(), table.name.clone()))
             .expect("every visited table has a resolved base name")
@@ -944,31 +1151,17 @@ pub fn build_schema(schema_cache: &SchemaCache, config: &SchemaConfig) -> Genera
             mutation_fields.extend(fields);
         }
 
-        // Add relationship fields
-        let rels: Vec<RelationshipField> = schema_cache
-            .get_relationships(&table.qualified_identifier(), &table.schema)
-            .map(|relationships| {
-                relationships
-                    .iter()
-                    .filter_map(|rel| {
-                        // A relationship whose target is not exposed would
-                        // reference a GraphQL type that was never registered.
-                        let foreign = rel.foreign_table();
-                        let target_base =
-                            base_names.get(&(foreign.schema.clone(), foreign.name.clone()))?;
-                        let mut field = RelationshipField::from_relationship_named(
-                            rel,
-                            target_base,
-                            relationship_keys(rel).iter().find_map(|key| {
-                                config.names.relationship(&table.schema, &table.name, key)
-                            }),
-                        );
-                        field.arguments = caller_arguments(rel, schema_cache);
-                        Some(field)
-                    })
-                    .collect()
-            })
-            .unwrap_or_default();
+        // Add relationship fields. Where metadata declares them, they are
+        // what the table has; otherwise reflection offers one per foreign
+        // key, which is what a document saying nothing about a table has
+        // always meant. See `TableNames::declared_relationships`.
+        let rels = match config
+            .names
+            .declared_relationships(&table.schema, &table.name)
+        {
+            Some(declared) => declared_fields(declared, table, schema_cache, config, &base_names),
+            None => reflected_fields(table, schema_cache, config, &base_names),
+        };
 
         if !rels.is_empty() {
             relationship_fields.insert(type_name.clone(), rels);
@@ -1019,19 +1212,35 @@ pub fn build_schema(schema_cache: &SchemaCache, config: &SchemaConfig) -> Genera
     }
 
     // Retype the columns that point at one.
+    //
+    // Read from the catalogue's foreign keys rather than from the
+    // relationships this schema exposes, which are two different questions: a
+    // relationship *to* an enum table is never exposed at all -- see just
+    // below -- and a column's type has nothing to do with whether the row at
+    // the other end can be traversed to. Keying one on the other meant a table
+    // whose relationships metadata had declared away lost its enum columns'
+    // type with them.
     if !enum_type_of.is_empty() {
-        for (type_name, relationships) in &relationship_fields {
-            for relationship in relationships {
-                if relationship.is_list {
+        for table in &tables {
+            let Some(type_name) = base_names.get(&(table.schema.clone(), table.name.clone()))
+            else {
+                continue;
+            };
+            let found = schema_cache
+                .get_relationships(&table.qualified_identifier(), &table.schema)
+                .map(|found| found.to_vec())
+                .unwrap_or_default();
+            for relationship in &found {
+                if !relationship.is_to_one() {
                     continue;
                 }
-                let foreign = relationship.relationship.foreign_table();
+                let foreign = relationship.foreign_table();
                 let Some(enum_type) =
                     enum_type_of.get(&(foreign.schema.clone(), foreign.name.clone()))
                 else {
                     continue;
                 };
-                let Some(column) = relationship.relationship.single_local_column() else {
+                let Some(column) = relationship.single_local_column() else {
                     continue;
                 };
                 if let Some(object) = object_types.get_mut(type_name) {

@@ -75,6 +75,27 @@ pub struct TableNames {
     #[serde(default)]
     pub relationships: HashMap<String, String>,
 
+    /// The relationships this table has, where metadata says which.
+    ///
+    /// `relationships` above renames what reflection found; this replaces it.
+    /// Two things need that, and they are the same thing seen from either end.
+    ///
+    /// A **manual** relationship maps column to column and has no constraint
+    /// to be keyed by, so `relationships` cannot carry it at all -- and a
+    /// permission written through one could not be compiled, which is a read
+    /// refused rather than narrowed.
+    ///
+    /// And **which** relationships exist is metadata's to say. Reflection
+    /// offers one per foreign key; Hasura offers the ones its metadata
+    /// declares, which is usually fewer. A table whose keys are all declared
+    /// looks the same either way, and one that tracks only some of them does
+    /// not.
+    ///
+    /// Absent means "reflect", which is what a document that says nothing
+    /// about a table has always meant. Present means "these, and no others".
+    #[serde(default)]
+    pub declared_relationships: Option<Vec<DeclaredRelationship>>,
+
     /// Computed field names, keyed by the function behind them.
     #[serde(default)]
     pub computed_fields: HashMap<String, String>,
@@ -366,6 +387,46 @@ struct Sections {
     introspection_disabled_for: Vec<String>,
 }
 
+/// One relationship metadata declares, and how it is reached.
+///
+/// Either by a key reflection already found -- `using` names the constraint or
+/// the column, the same spellings [`TableNames::relationships`] accepts -- or
+/// by a column mapping, which is a join no key describes.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct DeclaredRelationship {
+    /// The field name this relationship is exposed under.
+    pub name: String,
+    /// The key it is reached by, where it is reached by one.
+    #[serde(default)]
+    pub using: Option<String>,
+    /// The table it points at, as `schema.table`, for a mapped join.
+    #[serde(default)]
+    pub table: Option<String>,
+    /// The join, as this table's column to the other table's column.
+    #[serde(default)]
+    pub columns: std::collections::BTreeMap<String, String>,
+    /// Whether it yields one row rather than many.
+    ///
+    /// A key says this for itself; a column mapping does not, which is why
+    /// Hasura declares object and array relationships separately.
+    #[serde(default)]
+    pub to_one: bool,
+}
+
+impl DeclaredRelationship {
+    /// The table a mapped join points at, as `(schema, table)`.
+    ///
+    /// `None` for one reached by a key, which needs no target written down:
+    /// the key already says where it goes.
+    pub fn target(&self, default_schema: &str) -> Option<(String, String)> {
+        let written = self.table.as_deref()?;
+        Some(match written.split_once('.') {
+            Some((schema, table)) => (schema.to_string(), table.to_string()),
+            None => (default_schema.to_string(), written.to_string()),
+        })
+    }
+}
+
 /// What metadata says about one function, beyond what the catalogue knows.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 pub struct FunctionNames {
@@ -493,6 +554,15 @@ impl NameOverrides {
         self.functions
             .get(&format!("{}.{}", schema, function))
             .is_some_and(|given| given.roles.iter().any(|named| named == role))
+    }
+
+    /// The relationships metadata declares for a table, where it declares any.
+    pub fn declared_relationships(
+        &self,
+        schema: &str,
+        table: &str,
+    ) -> Option<&[DeclaredRelationship]> {
+        self.table(schema, table)?.declared_relationships.as_deref()
     }
 
     /// How many tables were named, for the line the server logs at startup.
@@ -807,6 +877,46 @@ mod tests {
             names.enum_tables(),
             vec![("public".to_string(), "colors".to_string())]
         );
+    }
+
+    /// A declaration is the whole list, and it may describe a join.
+    #[test]
+    fn declared_relationships_carry_a_join_and_not_just_a_name() {
+        let names = NameOverrides::parse(
+            r#"{"tables": {"public.message": {"declared_relationships": [
+                 {"name": "members", "table": "public.channel_member",
+                  "columns": {"channel_id": "channel_id"}},
+                 {"name": "author", "using": "message_author_id_fkey", "to_one": true}
+               ]}}}"#,
+        )
+        .unwrap();
+        let declared = names
+            .declared_relationships("public", "message")
+            .expect("the table declares some");
+        assert_eq!(declared.len(), 2);
+        assert_eq!(declared[0].name, "members");
+        assert_eq!(
+            declared[0].target("public"),
+            Some(("public".to_string(), "channel_member".to_string()))
+        );
+        assert_eq!(
+            declared[0].columns.get("channel_id").map(String::as_str),
+            Some("channel_id")
+        );
+        assert!(!declared[0].to_one, "an array relationship by default");
+        assert_eq!(declared[1].using.as_deref(), Some("message_author_id_fkey"));
+        assert!(declared[1].to_one);
+        // An unqualified table is read in the table's own schema.
+        assert_eq!(
+            crate::names::DeclaredRelationship {
+                table: Some("channel_member".to_string()),
+                ..Default::default()
+            }
+            .target("other"),
+            Some(("other".to_string(), "channel_member".to_string()))
+        );
+        // And a table that declares nothing is left to reflection.
+        assert_eq!(names.declared_relationships("public", "author"), None);
     }
 
     #[test]

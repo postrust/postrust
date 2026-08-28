@@ -6095,6 +6095,58 @@ impl<'a> WhereScope<'a> {
         }
 
         let table = resolution.cache.get_table(&self.qualified)?;
+
+        // A relationship metadata declares, which may be a mapped join the
+        // catalogue has never heard of. `message.members` is one, and a
+        // permission on `message` is written through it -- so this is not a
+        // convenience: without it that filter cannot be compiled at all and
+        // the read is refused rather than narrowed.
+        if let Some(declared) = self
+            .names
+            .declared_relationships(&table.schema, &table.name)
+        {
+            if let Some(entry) = declared.iter().find(|entry| entry.name == name) {
+                // Reached by a mapping, which the catalogue has never heard
+                // of.
+                if let Some(field) = crate::schema::mapped_relationship_field(
+                    entry,
+                    table,
+                    resolution.cache,
+                    &table.schema,
+                    &entry
+                        .target(&table.schema)
+                        .map(|(_, target)| target)
+                        .unwrap_or_default(),
+                ) {
+                    return Some(std::borrow::Cow::Owned(field));
+                }
+                // Or by a key, under the name the declaration gives it --
+                // which is the only place that name is written down now that
+                // a declaration carries it.
+                if let Some(key) = entry.using.as_deref() {
+                    if let Some(found) = resolution
+                        .cache
+                        .get_relationships(&self.qualified, &table.schema)
+                        .into_iter()
+                        .flatten()
+                        .find(|rel| {
+                            crate::schema::relationship_keys(rel)
+                                .iter()
+                                .any(|found| found == key)
+                        })
+                    {
+                        return Some(std::borrow::Cow::Owned(
+                            crate::schema::relationship::RelationshipField::from_relationship_named(
+                                found,
+                                &found.foreign_table().name,
+                                Some(&entry.name),
+                            ),
+                        ));
+                    }
+                }
+            }
+        }
+
         resolution
             .cache
             .get_relationships(&self.qualified, &table.schema)?
