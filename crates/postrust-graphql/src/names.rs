@@ -411,6 +411,20 @@ pub struct DeclaredRelationship {
     /// Hasura declares object and array relationships separately.
     #[serde(default)]
     pub to_one: bool,
+    /// Whether a nested insert writes this row *after* the row it hangs off.
+    ///
+    /// A key says which side holds it: `article.author_id` references
+    /// `author`, so the author is written first and its key fills the
+    /// article's column. A column mapping says only that two columns are
+    /// equal, and `author.id = author_detail.id` is equal in both directions
+    /// -- so which row can be written first is not recoverable from it, and
+    /// Hasura writes `insertion_order` down for exactly that reason.
+    ///
+    /// `false` is `before_parent`, which is what an object relationship means
+    /// without being told otherwise. Ignored for a relationship to many,
+    /// which can only be written after the row it hangs off.
+    #[serde(default)]
+    pub after_parent: bool,
 }
 
 impl DeclaredRelationship {

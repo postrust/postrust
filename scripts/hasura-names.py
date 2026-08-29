@@ -478,11 +478,16 @@ def convert(tables):
                             file=sys.stderr,
                         )
                         continue
+                    # Which row a nested insert writes first. A mapping says
+                    # only that two columns are equal, which is equal in both
+                    # directions, so Hasura writes the order down.
                     declared.append({
                         "name": name,
                         "table": f"{schema}.{table}",
                         "columns": dict(mapping),
                         "to_one": kind == "object",
+                        "after_parent":
+                            manual.get("insertion_order") == "after_parent",
                     })
                     continue
                 lookup = relationship_key(relationship, kind)

@@ -501,12 +501,22 @@ pub(crate) fn mapped_relationship_field(
         .map(|(mine, theirs)| (mine.clone(), theirs.clone()))
         .collect();
     let constraint = format!("{}.{}", table.name, entry.name);
-    let cardinality = match entry.to_one {
-        true => Cardinality::M2O {
+    // Which side holds the key, which is what a nested insert needs and a
+    // column mapping does not say. `M2O` is "this row's column carries their
+    // key", so the related row is written first; `O2O { is_parent: true }` is
+    // the other way round, and is how `after_parent` is spelled here. A
+    // relationship to many is written after its parent either way.
+    let cardinality = match (entry.to_one, entry.after_parent) {
+        (true, false) => Cardinality::M2O {
             constraint: constraint.clone(),
             columns,
         },
-        false => Cardinality::O2M {
+        (true, true) => Cardinality::O2O {
+            constraint: constraint.clone(),
+            columns,
+            is_parent: true,
+        },
+        (false, _) => Cardinality::O2M {
             constraint: constraint.clone(),
             columns,
         },

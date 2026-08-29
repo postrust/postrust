@@ -4877,8 +4877,13 @@ fn insert_row<'life>(
                                 foreign
                             )),
                             &format!(
-                                "{}.{}.data[{}]",
-                                context.row, relationship.name, child_index
+                                "{}.{}{}",
+                                context.row,
+                                relationship.name,
+                                match relationship.is_list {
+                                    true => format!(".data[{}]", child_index),
+                                    false => ".data".to_string(),
+                                }
                             ),
                         ));
                     }
@@ -4888,6 +4893,13 @@ fn insert_row<'life>(
                 }
                 // `...objects[0].articles.data[0]`, which is the path
                 // Hasura answers for a child that writes its parent's key.
+                // One row written after its parent -- a mapped object
+                // relationship with `after_parent` -- has no index: there is
+                // no list for it to be an item of.
+                let at = match relationship.is_list {
+                    true => format!(".data[{}]", child_index),
+                    false => ".data".to_string(),
+                };
                 let under = format!("{}.{}", context.row, relationship.name);
                 let nested = InsertContext {
                     on_conflict: conflict.clone(),
@@ -4896,7 +4908,7 @@ fn insert_row<'life>(
                     type_names: context.type_names,
                     names: context.names,
                     caller: context.caller,
-                    row: format!("{}.data[{}]", under, child_index),
+                    row: format!("{}{}", under, at),
                     objects: format!("{}.data", under),
                     conflict: format!("{}.on_conflict", under),
                 };
