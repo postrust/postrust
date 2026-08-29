@@ -10,17 +10,17 @@ harness itself, divergences kept on purpose, and the gaps still open.
 |---|---|---|---|---|
 | all (468) | 100.0% | 99.6% | **97.4%** | 96.6% |
 | reads (271) | 100.0% | 99.6% | 95.9% | 95.6% |
-| writes (197) | 100.0% | 99.0% | **99.0%** | 97.5% |
+| writes (197) | 100.0% | 99.5% | **99.5%** | 98.0% |
 
-Of the 456 cases the third column counts, **325 agree about data and 130 agree
-only because both servers answered with errors.** A further 1 is a case where
-Hasura refused and this server answered -- down from 115 before the permission
-layer existed.
+Of the 456 cases the third column counts, **325 agree about data and 131 agree
+only because both servers answered with errors.** No case is left where Hasura
+refused and this server answered -- down from 115 before the permission layer
+existed.
 
 The status column reaching 100% is not a rounding: it was a rule read out of
 the corpus wrongly and is described below.
 
-**304 is the figure that tracks the work.** It counts the cases where the same
+**325 is the figure that tracks the work.** It counts the cases where the same
 query came back with the same rows, which is the only thing a client can feel.
 
 Over the permission work, measured at each step: 321/464 (69.2%, 214 real)
@@ -31,7 +31,8 @@ actually authenticated and this server could read a session variable ->
 once a role could write what it cannot read -> 426/468 (91.0%, 297) with
 `_exists` -> 429/468 (91.7%, 300) once a preset reached an update ->
 432/468 (92.3%, 303) once a ceiling stopped answering `count` -> 433/468
-(**92.5%, 304**) with the last of the permission model.
+(92.5%, 304) with the last of the permission model -> 456/468 (**97.4%, 325**)
+at run 78, after main was merged in and the shape questions below were closed.
 
 The dip in the fourth of those is worth keeping. Three roles lost their entire
 API to one input type that was named and never registered, and the run-to-run
@@ -39,7 +40,7 @@ comparison is the only thing that showed it: the headline moved by one case
 while eleven real agreements turned into refusals underneath it. That fault is
 described below.
 
-Writes are the stronger half now, at 98.0% against 87.1% for reads. They were
+Writes are the stronger half now, at 98.0% against 95.6% for reads. They were
 the weaker half six runs earlier. Four of the 197 write cases are left, and
 every one of them is a shape question rather than a permission one.
 
