@@ -54,8 +54,26 @@ fn needs_encoding(b: u8) -> bool {
 /// bound; hyper applies its own, smaller limits once it sees the bytes.
 const MAX_LINE: usize = 64 * 1024;
 
+/// The bytes a client sends to open an HTTP/2 connection without negotiating.
+///
+/// Nothing serves HTTP/2 here today: `axum::serve` builds on hyper-util's
+/// automatic builder, which speaks it only with `hyper-util/http2` on, and
+/// this workspace does not enable it -- so such a connection is refused
+/// before it starts.
+///
+/// Recognised anyway, because of what happens if it ever is enabled, which is
+/// the kind of thing feature unification does without anyone deciding it.
+/// Everything after this preface is binary frames, and HPACK sets the high bit
+/// constantly; read as request lines they are full of bytes this adapter would
+/// percent-encode, so the connections would be quietly corrupted rather than
+/// refused. This costs a comparison of at most one byte per connection -- no
+/// HTTP method but `PRI` shares even a first character with it.
+const H2_PREFACE: &[u8] = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
+
 #[derive(Debug)]
 enum State {
+    /// At the very start of the connection, deciding whether this is HTTP/2.
+    Preface,
     /// At the start of a message, reading the request line.
     RequestLine,
     /// Reading the header block that follows a request line.
@@ -82,7 +100,7 @@ impl<T> LenientStream<T> {
     pub fn new(inner: T) -> Self {
         Self {
             inner,
-            state: State::RequestLine,
+            state: State::Preface,
             out: Vec::new(),
             out_pos: 0,
             line: Vec::new(),
@@ -103,6 +121,29 @@ impl<T> LenientStream<T> {
                 State::PassThrough => {
                     self.out.extend_from_slice(data);
                     return;
+                }
+                State::Preface => {
+                    // Held back rather than emitted, because until enough of
+                    // it has arrived to rule the preface out these bytes might
+                    // not be a request line at all.
+                    let want = H2_PREFACE.len() - self.line.len();
+                    let take = std::cmp::min(want, data.len());
+                    self.line.extend_from_slice(&data[..take]);
+
+                    if !H2_PREFACE.starts_with(&self.line) {
+                        // An ordinary request line, and one byte is usually
+                        // enough to know it. Read it as one, from the start.
+                        self.state = State::RequestLine;
+                        let mut buffered = std::mem::take(&mut self.line);
+                        buffered.extend_from_slice(&data[take..]);
+                        self.process(&buffered);
+                        return;
+                    }
+
+                    data = &data[take..];
+                    if self.line.len() == H2_PREFACE.len() {
+                        self.give_up();
+                    }
                 }
                 State::Body(remaining) => {
                     let take = std::cmp::min(remaining, data.len() as u64) as usize;
@@ -183,7 +224,9 @@ impl<T> LenientStream<T> {
                 self.out.extend_from_slice(&line);
                 self.state = State::Headers { content_length };
             }
-            State::Body(_) | State::PassThrough => unreachable!("not a line state"),
+            State::Preface | State::Body(_) | State::PassThrough => {
+                unreachable!("not a line state")
+            }
         }
     }
 }
@@ -441,5 +484,50 @@ mod tests {
     fn a_malformed_request_line_is_left_for_hyper_to_reject() {
         let raw: &[u8] = b"nonsense\r\n";
         assert_eq!(run(&[raw]), raw.to_vec());
+    }
+
+    /// HPACK sets the high bit constantly, so a frame read as a request line
+    /// is full of bytes this would otherwise percent-encode.
+    #[test]
+    fn an_http2_connection_is_passed_through_untouched() {
+        let mut raw = Vec::new();
+        raw.extend_from_slice(H2_PREFACE);
+        // A SETTINGS frame, then header-block bytes with the high bit set and
+        // a `>` and a newline among them, which is what would be mangled.
+        raw.extend_from_slice(b"\x00\x00\x00\x04\x00\x00\x00\x00\x00");
+        raw.extend_from_slice(b"\x82\x86\x84\x41\x8a > \n\xff\xfe HTTP/1.1\r\n");
+        assert_eq!(run(&[&raw]), raw);
+    }
+
+    /// The preface is decided on the bytes as they arrive, not on a whole
+    /// read landing at once.
+    #[test]
+    fn an_http2_preface_split_across_reads_is_still_recognised() {
+        let out = run(&[b"PRI * HTTP/2.0\r\n", b"\r\nSM\r\n\r\n", b"\xff\xfe->\n"]);
+        assert_eq!(
+            out,
+            [H2_PREFACE, b"\xff\xfe->\n"].concat(),
+            "an HTTP/2 connection was rewritten"
+        );
+    }
+
+    /// Holding bytes back to check for the preface must not lose them.
+    #[test]
+    fn a_request_beginning_like_the_preface_is_read_as_http1() {
+        let out = run(&[b"PRI /t?s=a->b HTTP/1.1\r\n\r\n"]);
+        assert_eq!(
+            String::from_utf8(out).unwrap(),
+            "PRI /t?s=a-%3Eb HTTP/1.1\r\n\r\n"
+        );
+    }
+
+    /// Including where it is split inside the shared prefix.
+    #[test]
+    fn a_request_beginning_like_the_preface_survives_being_split() {
+        let out = run(&[b"P", b"OST /t?s=a->b HTTP/1.1\r\n", b"\r\n"]);
+        assert_eq!(
+            String::from_utf8(out).unwrap(),
+            "POST /t?s=a-%3Eb HTTP/1.1\r\n\r\n"
+        );
     }
 }
