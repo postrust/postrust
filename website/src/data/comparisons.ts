@@ -65,6 +65,7 @@ export const comparisons: Comparison[] = [
     versionTested: "v16.1",
     intro: [
       "PostgREST is the project that established this idea: point a server at a PostgreSQL schema and get a REST API, with permissions left to the database. Postrust follows its URL grammar deliberately, so `?select=`, `?order=`, the filter operators and the `Prefer` headers mean the same thing in both.",
+      "How closely is measured rather than asserted: replaying PostgREST's own test cases against both servers gives 96.1% agreement on status and body, and 94.3% once every header that is part of the answer is compared too. The [conformance report](/docs/conformance) says what that covers and where the two differ on purpose.",
       "The differences are not in the query language. They are in what ships in the process and what the deployment looks like.",
     ],
     features: [
@@ -125,10 +126,13 @@ export const comparisons: Comparison[] = [
     migration: [
       "The URL grammar is the same, so existing query strings generally work unchanged.",
       "Configuration uses the same `PGRST_*` environment variable names, including `PGRST_DB_ANON_ROLE` and `PGRST_JWT_SECRET`.",
-      "Tables are mounted under `/api` by default rather than at the root. Check your base URL before assuming a 404 is something worse.",
+      "Tables are mounted under `/api` by default rather than at the root. Check your base URL before assuming a 404 is something worse. CORS preflight and the `Allow` header work at both mounts.",
       "NUMERIC columns come back as JSON numbers, as they do from PostgREST, though the scale can differ: 4.2000 where PostgREST gives 4.20. Both parse to the same value.",
       "Object keys come back alphabetically rather than in select order. Build with the compat-key-order feature to match PostgREST; it is off by default because it costs up to 15% on wide rows.",
-      "Verify the specific PostgREST features you depend on against Postrust's test suite before switching anything that matters.",
+      "`Location` is sent only for `Prefer: return=headers-only`, as PostgREST sends it. A caller taking the row back reads the key out of the body.",
+      "`Prefer: tx=rollback` is not implemented. It is no longer reported as applied either, which it briefly was while committing the write.",
+      "Postrust allows 30 seconds of clock skew on a token's `nbf` and `iat`, and none on its `exp`. PostgREST checks all three to the second.",
+      "Verify the specific PostgREST features you depend on against Postrust's test suite before switching anything that matters. The conformance report says what is measured and where the two disagree on purpose.",
     ],
     faq: [
       {
