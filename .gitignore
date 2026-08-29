@@ -32,4 +32,4 @@ gen_private.json
 scripts/conformance/.work
 scripts/conformance/.work-probe
 scripts/hasura-conformance/.work
-scripts/hasura-conformance/.work-run.log
+scripts/hasura-conformance/.work-run*.log
