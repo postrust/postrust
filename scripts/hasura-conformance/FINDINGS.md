@@ -8,11 +8,11 @@ harness itself, divergences kept on purpose, and the gaps still open.
 
 | | status | same outcome | same data | full body |
 |---|---|---|---|---|
-| all (468) | 100.0% | 99.4% | **97.2%** | 96.4% |
+| all (468) | 100.0% | 99.6% | **97.4%** | 96.6% |
 | reads (271) | 100.0% | 99.6% | 95.9% | 95.6% |
 | writes (197) | 100.0% | 99.0% | **99.0%** | 97.5% |
 
-Of the 455 cases the third column counts, **324 agree about data and 130 agree
+Of the 456 cases the third column counts, **325 agree about data and 130 agree
 only because both servers answered with errors.** A further 1 is a case where
 Hasura refused and this server answered -- down from 115 before the permission
 layer existed.
@@ -70,12 +70,12 @@ subsystem.
 
 The fourth column moved on its own for seven runs after that: what an error
 says, and where it says it happened. 311 bodies matched entirely before those
-runs and 451 do now. **4 cases are left in the gap between the third column
+runs and 452 do now. **4 cases are left in the gap between the third column
 and the fourth, down from 101 -- and none of the four is a wording question.**
 Two are the constraint-order artefact described under the harness, one is a
 deliberate divergence, and one is metadata this harness cannot follow.
 
-**17 cases diverge at all, and 10 of them are one thing: introspection, inside
+**16 cases diverge at all, and 10 of them are one thing: introspection, inside
 async-graphql.** What is left is described below, item by item, and most of it
 is not this server's to change.
 
@@ -343,7 +343,7 @@ wrong one.
 
 ## Open, ordered by consequence
 
-The 17 cases that diverge, and why each does. Ten of them are one item.
+The 16 cases that diverge, and why each does. Ten of them are one item.
 
 1. **Introspection, inside async-graphql: 10 cases.** Not reachable from
    outside the library, and now traced rather than assumed.
@@ -360,7 +360,7 @@ The 17 cases that diverge, and why each does. Ten of them are one item.
    them can be closed by anything here. Three more ingredients would be
    needed even then, and they are open items of their own: the `_stream`
    cursor types (item 2), a function returning one row as a root field (item
-   7), and Hasura's own wording for every generated description (item 8).
+   6), and Hasura's own wording for every generated description (item 7).
 
 2. **`_stream` subscriptions.** The cursor-based half of Hasura's subscription
    surface: `article_stream(cursor: {initial_value: {id: 0}}, batch_size: 10)`
@@ -370,15 +370,7 @@ The 17 cases that diverge, and why each does. Ten of them are one item.
    it directly -- it shows up as five missing types inside the introspection
    cases above.
 
-3. **A nested insert through a manual relationship, and which row goes
-   first.** `author.detail_manual` maps `author.id` to `author_detail.id`, and
-   a nested insert has to write the author before the detail so the generated
-   key exists to copy. A column mapping does not say which side owns the key,
-   and Hasura carries an `insertion_order` for exactly that reason. The
-   relationship itself now works -- the read, the filter and the permission
-   through it -- and only the nested write is left. One case.
-
-4. **An enum value beginning with `null`, `true` or `false`.** One line of
+3. **An enum value beginning with `null`, `true` or `false`.** One line of
    async-graphql's grammar:
 
    ```text
@@ -394,7 +386,7 @@ The 17 cases that diverge, and why each does. Ten of them are one item.
    and restoring every name in the parsed tree -- machinery that could corrupt
    a document that was valid to begin with.
 
-5. **Four cases that are not this server's to close.** Two are the `pg_dump`
+4. **Four cases that are not this server's to close.** Two are the `pg_dump`
    constraint-order artefact under the harness above: two databases naming
    different constraints for the same violation, proven there with the SQL.
    One is a deliberate divergence -- a nested write into a view that selects
@@ -404,7 +396,7 @@ The 17 cases that diverge, and why each does. Ten of them are one item.
    field added and dropped through the metadata API inside a single case,
    which a static names document cannot follow.
 
-6. **A function taking a table's row, tracked as a root field.** Hasura lets a
+5. **A function taking a table's row, tracked as a root field.** Hasura lets a
    client write `fetch_articles(args: {search: "Art", author_row: "(1, 'Roger',
    'Chris')"})` -- the row as a literal. Here such a function is a computed
    field and nothing else, on the grounds that a row type is not something a
@@ -412,13 +404,13 @@ The 17 cases that diverge, and why each does. Ten of them are one item.
    table's composite type as a scalar under the table's own name, which is a
    name the object type already has. One case, and the position is deliberate.
 
-7. **A function returning one row, as a mutation.** `add_to_score_by_user_id`
+6. **A function returning one row, as a mutation.** `add_to_score_by_user_id`
    returns `"user"` rather than `SETOF "user"`; Hasura exposes it as a root
    field yielding one row. Here only a set-returning function becomes a root
    field. No case of its own left -- it is one of the ingredients item 1
    needs.
 
-8. **Every generated description is this server's wording, not Hasura's.**
+7. **Every generated description is this server's wording, not Hasura's.**
    `article_bool_exp` is described here as "Filter rows of article. Fields are
    combined with AND unless _or says otherwise." and there as "Boolean
    expression to filter rows from the table \"article\"...". Nothing breaks on
@@ -427,7 +419,7 @@ The 17 cases that diverge, and why each does. Ten of them are one item.
    verbatim is the only way it would. The same goes for the order arguments
    come back in: Hasura sorts them, this server lists them as declared.
 
-9. **Actions and Apollo federation** are subsystems rather than gaps:
+8. **Actions and Apollo federation** are subsystems rather than gaps:
    `actions/*` describes handlers Hasura calls out to over HTTP, and
    `apollo_federation` describes the `_service`/`_entities` surface a
    federated gateway composes. Three of the introspection cases in item 1 are
@@ -533,6 +525,15 @@ The 17 cases that diverge, and why each does. Ten of them are one item.
     columns with them -- eleven cases -- and the two are unrelated questions,
     since a relationship to an enum table is never exposed at all. The
     retyping reads the catalogue's foreign keys now.
+
+- **A mapped join says which row a nested insert writes first.** A key says
+  which side holds it -- `article.author_id` references `author`, so the
+  author is written first and its key fills the article's column. A column
+  mapping says only that two columns are equal, and `author.id =
+  author_detail.id` is equal in both directions, so Hasura writes
+  `insertion_order` down and this reads it. `after_parent` is spelled here as
+  a one-to-one whose parent is this row, which is a shape the writer already
+  understood; nothing in the write path needed teaching.
 
 - **A generated enum is a type, not the table's data.** A role granted nothing
   on `colors` still sees `colors_enum` and still has a `favorite_color` typed
