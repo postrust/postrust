@@ -1528,7 +1528,6 @@ fn api_path(path: &str, compat_mode: bool) -> Option<&str> {
 
 /// The request again, with an empty body and the API's own path, for the
 /// parser to read.
-#[allow(clippy::result_large_err)] // consistent with the crate's error type
 fn probe_request(
     request: &Request,
     path: &str,
@@ -1976,7 +1975,6 @@ fn is_read_only(api_request: &ApiRequest) -> bool {
 ///
 /// Only reads and calls are counted. A mutation's `Content-Range` reports the
 /// rows it affected, which is the result set itself.
-#[allow(clippy::result_large_err)] // consistent with the crate's error type
 fn unpaged_sql(
     db_plan: &postrust_core::plan::DbActionPlan,
     role: &str,
@@ -2164,7 +2162,6 @@ fn mutation_status(
 /// Returns the columns that were added purely to make the join possible, so
 /// they can be removed from the response afterwards. An empty select list means
 /// "all columns", in which case nothing needs adding.
-#[allow(clippy::result_large_err)] // consistent with the crate's error type
 fn add_embed_join_columns(
     api_request: &mut postrust_core::api_request::ApiRequest,
     schema_cache: &postrust_core::SchemaCache,
@@ -2287,7 +2284,6 @@ fn add_embed_join_columns(
 ///
 /// `alias_counter` hands out a distinct alias per level, so a self-referential
 /// relationship stays unambiguous.
-#[allow(clippy::result_large_err)] // consistent with the crate's error type
 /// Filters addressed at embedded resources, and the parameters they bind.
 ///
 /// The embed expressions are assembled as SQL text and wrapped around a main
@@ -2361,7 +2357,6 @@ impl EmbedFilters<'_> {
     }
 
     /// The `WHERE` fragment for one embedded resource, or `None` if unfiltered.
-    #[allow(clippy::result_large_err)] // consistent with the crate's error type
     /// The row window an embedded resource was asked for.
     ///
     /// The server's own cap still applies, so an embed cannot be asked for
@@ -2381,7 +2376,6 @@ impl EmbedFilters<'_> {
         (limit, offset)
     }
 
-    #[allow(clippy::result_large_err)] // consistent with the crate's error type
     fn predicate_for(
         &mut self,
         path: &[String],
@@ -2666,7 +2660,6 @@ fn embedded_by_name<'a>(
 /// `order=clients(name)` orders by a column the parent does not have, so each
 /// term becomes a scalar subselect fetched per parent row -- the same shape as
 /// the embed itself, reduced to one column.
-#[allow(clippy::result_large_err)] // consistent with the crate's error type
 fn build_embed_orders(
     schema_cache: &postrust_core::SchemaCache,
     parent_qi: &postrust_core::api_request::QualifiedIdentifier,
@@ -2762,7 +2755,6 @@ fn build_embed_orders(
 /// rendered as a bare column name orders by a column of the wrong table --
 /// silently, where the parent happens to have a column of that name, and with
 /// `column "cost" does not exist` where it does not.
-#[allow(clippy::result_large_err)] // consistent with the crate's error type
 fn related_order_target(
     schema_cache: &postrust_core::SchemaCache,
     parent_qi: &postrust_core::api_request::QualifiedIdentifier,
@@ -2822,7 +2814,6 @@ fn related_order_target(
 /// `tasks.order=projects(id).desc` orders them by a column of a table the
 /// child embeds in turn -- so it is resolved against the child, and rendered
 /// as the same correlated subselect the top level uses.
-#[allow(clippy::result_large_err)] // consistent with the crate's error type
 #[allow(clippy::too_many_arguments)] // each names one part of where the embed sits
 fn embed_order_sql(
     schema_cache: &postrust_core::SchemaCache,
@@ -2904,7 +2895,6 @@ fn embed_order_sql(
     Ok(Some(rendered.join(", ")))
 }
 
-#[allow(clippy::result_large_err)] // consistent with the crate's error type
 #[allow(clippy::too_many_arguments)] // each names one part of where the embed sits
 fn build_embed_expressions(
     schema_cache: &postrust_core::SchemaCache,

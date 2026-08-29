@@ -2,6 +2,11 @@
 //!
 //! Deploys Postrust as an AWS Lambda function.
 
+// As in `postrust-core` and `postrust-server`: `postrust_core::Error` is wide
+// on purpose, and boxing it would put an allocation on the error path of every
+// request to save a return slot on the success path.
+#![allow(clippy::result_large_err)]
+
 use lambda_http::{run, service_fn, Body, Error, Request, Response};
 use sqlx::postgres::PgPoolOptions;
 use sqlx::PgPool;
