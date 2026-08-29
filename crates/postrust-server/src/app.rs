@@ -1544,8 +1544,24 @@ fn api_path(path: &str, compat_mode: bool) -> Option<&str> {
         path == mount || path.strip_prefix(mount).is_some_and(|r| r.starts_with('/'))
     }
 
-    if under(path, "/admin") || under(path, "/_") || under(path, "/api/graphql") {
-        return None;
+    // Every mount this server answers itself. In compatibility mode the REST
+    // surface sits at the root, so a path not named here is read as a table:
+    // `/healthz` becomes a question about a table called `healthz`, and the
+    // two-segment ones are not a valid resource at all. Either way the
+    // refusal replaces the preflight the CORS layer wrote, which is how a
+    // browser comes to report a working endpoint as blocked.
+    for mount in [
+        "/admin",
+        "/_",
+        "/api/graphql",
+        "/healthz",
+        "/v1/version",
+        "/v1/graphql",
+        "/v1alpha1/graphql",
+    ] {
+        if under(path, mount) {
+            return None;
+        }
     }
     if under(path, "/api") {
         return Some(match path.strip_prefix("/api") {
@@ -3779,10 +3795,28 @@ mod tests {
             "/_",
             "/_/health",
             "/api/graphql",
+            // The endpoints a Hasura deployment has. `/v1/graphql` is the one
+            // every generated client is pointed at, so answering its preflight
+            // with "no such table" breaks the surface this branch exists to
+            // offer -- and only in compatibility mode, where nothing else
+            // looks wrong.
+            "/healthz",
+            "/v1/version",
+            "/v1/graphql",
+            "/v1/graphql/ws",
+            "/v1alpha1/graphql",
         ] {
             assert_eq!(super::api_path(path, false), None, "{path}");
             assert_eq!(super::api_path(path, true), None, "{path}");
         }
+    }
+
+    /// The mounts are whole segments here too: a table may be called `v1`.
+    #[test]
+    fn a_hasura_mount_does_not_swallow_a_table_beside_it() {
+        assert_eq!(super::api_path("/v1", true), Some("/v1"));
+        assert_eq!(super::api_path("/healthzz", true), Some("/healthzz"));
+        assert_eq!(super::api_path("/v1alpha1", true), Some("/v1alpha1"));
     }
 
     /// Outside the mounts the surface exists only in compatibility mode,

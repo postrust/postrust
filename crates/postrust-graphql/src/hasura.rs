@@ -119,15 +119,13 @@ fn path_for(error: &ServerError) -> String {
     // was. That is the only way to reach an *argument*: `$.selectionSet.
     // insert_author.args.objects[0].bio` names a place inside a value the
     // client sent, and a response path only ever names a field of the answer.
-    if let Some(given) = error
+    if let Some(Value::String(path)) = error
         .extensions
         .as_ref()
         .and_then(|extensions| extensions.get("path"))
         .map(value_of)
     {
-        if let Value::String(path) = given {
-            return path;
-        }
+        return path;
     }
 
     if error.path.is_empty() {

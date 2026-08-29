@@ -6612,7 +6612,7 @@ fn aggregate_predicate_sql(
             continue;
         };
         let Some(predicate) = spec.get("predicate").filter(|p| !p.is_null()) else {
-            return Err(validation_error(&format!(
+            return Err(validation_error(format!(
                 "\"{}\" over \"{}\" needs a predicate",
                 function, relationship.name
             )));
@@ -6698,7 +6698,7 @@ fn aggregate_predicate_sql(
             }
             "bool_and" | "bool_or" => {
                 let Some(column) = arguments.and_then(|a| a.as_str()) else {
-                    return Err(validation_error(&format!(
+                    return Err(validation_error(format!(
                         "\"{}\" over \"{}\" needs the column to fold",
                         function, relationship.name
                     )));
@@ -6709,7 +6709,7 @@ fn aggregate_predicate_sql(
                 )
             }
             other => {
-                return Err(validation_error(&format!(
+                return Err(validation_error(format!(
                     "\"{}\" is not an aggregate a predicate can be written over",
                     other
                 )))
@@ -6724,7 +6724,7 @@ fn aggregate_predicate_sql(
             correlation.join(" AND ")
         );
         let serde_json::Value::Object(operators) = predicate else {
-            return Err(validation_error(&format!(
+            return Err(validation_error(format!(
                 "the predicate on \"{}\" is not a comparison",
                 function
             )));
