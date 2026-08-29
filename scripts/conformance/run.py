@@ -30,8 +30,20 @@ writes = [c for c in cases if c["mutating"]]
 def encode_path(p):
     """hspec-wai accepts raw spaces in a URL; urllib does not. Encode only the
     characters that are illegal on the wire, leaving PostgREST's query syntax
-    (parens, commas, stars, dots) untouched."""
-    return "".join("%%%02X" % ord(ch) if ch == " " or ord(ch) < 0x21 else ch for ch in p)
+    (parens, commas, stars, dots) untouched.
+
+    `#` is encoded too, and for a different reason: urllib reads it as starting
+    a fragment and drops it and everything after it, so
+    `?select=data->!@#$%^&*_d` reached both servers as `?select=data->!@`.
+    They agreed, on a request neither spec wrote. A fragment is a client-side
+    notion that never appears in a request target, so the character is a
+    literal here and `%23` is how urllib can be made to send one.
+
+    Both servers percent-decode the query, so `%23` arrives as `#` at the
+    parser -- which is what the case means. What it does not exercise is a raw
+    `#` on the wire; that needs a client that writes its own request line.
+    """
+    return "".join("%%%02X" % ord(ch) if ch in " #" or ord(ch) < 0x21 else ch for ch in p)
 
 
 def reset():

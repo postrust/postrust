@@ -14,6 +14,10 @@ ref = json.load(open(sys.argv[1]))
 cand = {r["id"] + "|" + r["method"] + r["path"]: r for r in json.load(open(sys.argv[2]))}
 OUT = sys.argv[3]
 
+# The headers that are part of the answer rather than of the transport.
+# Named rather than compared wholesale: `Date`, `Server` and `Connection`
+# differ between any two servers and say nothing about conformance. So "full
+# contract" below means status, body, and these six -- not every header.
 CONTRACT = ["content-type", "content-range", "location",
             "preference-applied", "allow", "www-authenticate"]
 
@@ -46,9 +50,15 @@ def code_of(body):
 
 
 rows = []
+missing = []
 for r in ref:
     c = cand.get(r["id"] + "|" + r["method"] + r["path"])
+    # A case the candidate has no answer for is not a case that passed, and
+    # dropping it from the denominator can only move every figure up. It is
+    # counted and named instead; the two runs replay the same file, so this
+    # should always be empty.
     if c is None:
+        missing.append(r["id"])
         continue
     hdr = {}
     for h in CONTRACT:
@@ -75,7 +85,7 @@ LEVELS = [
     ("status + body", lambda r: r["status_ok"] and r["body_ok"]),
     ("+ headers, ignoring Content-Range",
      lambda r: r["status_ok"] and r["body_ok"] and r["hdr_ok_excl_range"]),
-    ("full contract (strict)",
+    ("full contract (status, body, the six headers above)",
      lambda r: r["status_ok"] and r["body_ok"] and r["hdr_ok"]),
 ]
 
@@ -89,6 +99,11 @@ def table(subset, title):
         k = sum(1 for r in subset if fn(r))
         print(f"  {100*k/n:5.1f}%  {k:>4}/{n:<4} {'#' * round(30 * k / n):<30} {label}")
 
+
+if missing:
+    print(f"\n!! {len(missing)} of {len(ref)} reference cases have no candidate "
+          f"answer and are not counted below: {', '.join(missing[:10])}"
+          f"{' ...' if len(missing) > 10 else ''}")
 
 table(rows, "ALL")
 table([r for r in rows if not r["mutating"]], "READS (GET / HEAD / OPTIONS)")
