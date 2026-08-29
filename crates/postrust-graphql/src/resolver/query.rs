@@ -84,6 +84,10 @@ impl QueryArgs {
         Range {
             offset: self.offset.unwrap_or(0),
             limit: self.limit,
+            // There is no `Range` header for a GraphQL argument to compete
+            // with, so whether the offset was written or defaulted decides
+            // nothing here.
+            offset_explicit: self.offset.is_some(),
         }
     }
 

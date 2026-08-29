@@ -88,7 +88,9 @@ pub fn parse_query_params(query: &str, is_rpc: bool) -> Result<QueryParams> {
                     let offset: i64 = decoded_value
                         .parse()
                         .map_err(|_| Error::InvalidQueryParam("offset".into()))?;
-                    params.ranges.entry(path.join(".")).or_default().offset = offset;
+                    let range = params.ranges.entry(path.join(".")).or_default();
+                    range.offset = offset;
+                    range.offset_explicit = true;
                 }
                 Modifier::Logic(op, negated) => {
                     params
@@ -1689,5 +1691,4 @@ mod tests {
             "\"failed to parse logic tree ((,))\" (line 1, column 4)"
         );
     }
-
 }

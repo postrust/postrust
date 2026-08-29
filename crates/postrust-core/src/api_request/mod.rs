@@ -371,21 +371,55 @@ fn parse_content_type(headers: &http::HeaderMap) -> Result<MediaType> {
 }
 
 /// Parse Range header for pagination.
+///
+/// `0-9`, `10-19` and `10-` are all ranges. Only the first of those was read
+/// before, by matching the literal prefix `0-`; every other range was dropped
+/// on the floor and the request answered with the whole relation. A client
+/// paging with `Range: 1000-1999` was handed all of it and a `Content-Range`
+/// saying so, which is the sort of disagreement a client discovers in
+/// production rather than in a test.
+///
+/// A range that is not a range at all is left alone, as before: hyper accepts
+/// header values this never has to make sense of, and the query parameters
+/// remain the way to page.
 fn parse_range(headers: &http::HeaderMap) -> Result<Range> {
-    if let Some(range) = headers.get(http::header::RANGE) {
-        let range_str = range.to_str().map_err(|_| Error::InvalidHeader("Range"))?;
-        // Parse "0-9" or "10-" format
-        if let Some(range_value) = range_str.strip_prefix("0-") {
-            if range_value.is_empty() {
-                return Ok(Range::new(0, None));
-            }
-            if let Ok(end) = range_value.parse::<i64>() {
-                return Ok(Range::from_bounds(0, Some(end)));
-            }
-        }
-        // More complex range parsing would go here
+    let Some(range) = headers.get(http::header::RANGE) else {
+        return Ok(Range::default());
+    };
+    let range_str = range.to_str().map_err(|_| Error::InvalidHeader("Range"))?;
+
+    // PostgREST writes the unit in `Range-Unit` and the bounds bare, but a
+    // client following RFC 9110 puts the unit here. Both name the same rows.
+    let bounds = range_str
+        .split_once('=')
+        .map_or(range_str, |(_unit, bounds)| bounds)
+        .trim();
+
+    let Some((start, end)) = bounds.split_once('-') else {
+        return Ok(Range::default());
+    };
+    let Ok(start) = start.trim().parse::<i64>() else {
+        return Ok(Range::default());
+    };
+    if start < 0 {
+        return Ok(Range::default());
     }
-    Ok(Range::default())
+
+    let end = end.trim();
+    if end.is_empty() {
+        // Open-ended: from here to the end of the relation.
+        return Ok(Range::new(start, None));
+    }
+    let Ok(end) = end.parse::<i64>() else {
+        return Ok(Range::default());
+    };
+    if end < start {
+        return Err(Error::InvalidRange(
+            "Requested range not satisfiable".into(),
+        ));
+    }
+
+    Ok(Range::from_bounds(start, Some(end)))
 }
 
 /// Extract headers for GUC passthrough.
@@ -416,6 +450,43 @@ fn extract_cookies(headers: &http::HeaderMap) -> indexmap::IndexMap<String, Stri
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn range_of(value: &str) -> Result<Range> {
+        let mut headers = http::HeaderMap::new();
+        headers.insert(http::header::RANGE, value.parse().unwrap());
+        parse_range(&headers)
+    }
+
+    /// Every range, not only the ones that begin at the first row.
+    #[test]
+    fn a_range_header_names_the_rows_it_says() {
+        assert_eq!(range_of("0-9").unwrap(), Range::from_bounds(0, Some(9)));
+        assert_eq!(range_of("5-9").unwrap(), Range::from_bounds(5, Some(9)));
+        assert_eq!(range_of("10-19").unwrap(), Range::from_bounds(10, Some(19)));
+        // Open-ended: from there to the end of the relation.
+        assert_eq!(range_of("10-").unwrap(), Range::new(10, None));
+        assert_eq!(range_of("0-").unwrap(), Range::new(0, None));
+        // A unit, for a client that follows RFC 9110 rather than PostgREST.
+        assert_eq!(
+            range_of("items=5-9").unwrap(),
+            Range::from_bounds(5, Some(9))
+        );
+    }
+
+    /// A range whose end precedes its start names no rows at all.
+    #[test]
+    fn an_inverted_range_is_refused_rather_than_widened() {
+        assert!(matches!(range_of("9-5"), Err(Error::InvalidRange(_))));
+    }
+
+    /// Anything that is not a range leaves paging to the query parameters,
+    /// rather than being guessed at.
+    #[test]
+    fn a_header_that_is_not_a_range_is_left_alone() {
+        for value in ["", "nonsense", "-5", "a-b", "5"] {
+            assert_eq!(range_of(value).unwrap(), Range::default(), "{value:?}");
+        }
+    }
 
     /// A plan is named back with everything that made it that plan.
     ///

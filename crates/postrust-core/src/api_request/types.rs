@@ -639,11 +639,24 @@ impl OrderTerm {
 pub struct Range {
     pub offset: i64,
     pub limit: Option<i64>,
+    /// Whether `offset` was asked for rather than defaulted to.
+    ///
+    /// A query parameter takes precedence over the `Range` header, and
+    /// `?offset=0` is a request to start at the first row -- not the absence
+    /// of one. Without this the two are the same value and `?limit=10` with a
+    /// `Range: 5-9` header starts at the header's row, which is neither what
+    /// was asked for nor where the reported `Content-Range` says it began.
+    #[serde(default)]
+    pub offset_explicit: bool,
 }
 
 impl Range {
     pub fn new(offset: i64, limit: Option<i64>) -> Self {
-        Self { offset, limit }
+        Self {
+            offset,
+            limit,
+            offset_explicit: false,
+        }
     }
 
     /// Create a range from HTTP Range header format (0-9 means rows 0-9 inclusive).
@@ -651,6 +664,7 @@ impl Range {
         Self {
             offset: start,
             limit: end.map(|e| e - start + 1),
+            offset_explicit: false,
         }
     }
 
