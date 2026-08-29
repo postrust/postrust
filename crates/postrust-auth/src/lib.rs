@@ -7,7 +7,7 @@ pub mod hasura;
 mod jwt;
 
 pub use claims::Claims;
-pub use hasura::{HasuraAuthConfig, HasuraIdentity, SecretOutcome};
+pub use hasura::{HasuraAuthConfig, HasuraIdentity, SecretOutcome, TokenRole};
 pub use jwt::validate_token;
 
 use serde::{Deserialize, Serialize};

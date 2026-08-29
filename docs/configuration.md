@@ -120,6 +120,45 @@ in any catalogue: what the role decides is what `x-hasura-role` reads as, and
 (once permissions land) which rules apply. Which database user the transaction
 runs as is still `PGRST_DB_ANON_ROLE` or the JWT's role claim.
 
+### Choosing a role with a token
+
+A token that allows more than one identity carries both claims Hasura mints for
+it: `x-hasura-default-role`, who the caller is when it asks for nothing, and
+`x-hasura-allowed-roles`, the list it may ask for instead.
+
+```json
+{
+  "https://hasura.io/jwt/claims": {
+    "x-hasura-default-role": "user",
+    "x-hasura-allowed-roles": ["user", "editor"],
+    "x-hasura-user-id": "1"
+  }
+}
+```
+
+The asking is done with a header, and no admin secret is needed for it:
+
+```bash
+curl localhost:3000/v1/graphql \
+  -H 'Authorization: Bearer <token>' \
+  -H 'X-Hasura-Role: editor' \
+  -d '{"query":"{ article { id title } }"}'
+```
+
+This is the one header read without the secret beside it, and the list is why
+it is safe to read: it sits inside the signature, so a caller may choose among
+the identities it was issued and cannot add one. Asking for a role the token
+does not list is refused:
+
+```json
+{"errors":[{"message":"Your requested role is not in allowed roles",
+            "extensions":{"path":"$","code":"access-denied"}}]}
+```
+
+A token carrying no list allows only the role it already names — an absent list
+is not permission to be anyone. Every other `x-hasura-*` header is still
+ignored on this path, for the reason below.
+
 ### One place this deliberately differs from Hasura
 
 Hasura with no admin secret configured treats every caller as an

@@ -407,15 +407,32 @@ async fn main() -> Result<()> {
                             );
                         }
                         // Nothing settled by the secret. A verified token speaks
-                        // next, and session variables come from its claims -- the
-                        // headers are not read here, because on a server with no
-                        // secret to gate them they would let any caller name its
-                        // own identity.
-                        _ if token_verified => (
-                            hasura_role_from_claims(&auth_result.claims),
-                            hasura_session_from_claims(&auth_result.claims),
-                            false,
-                        ),
+                        // next, and session variables come from its claims.
+                        //
+                        // One header is read here and only here: `X-Hasura-Role`,
+                        // against the `x-hasura-allowed-roles` the token carries.
+                        // That list is inside the signature, so it lets a caller
+                        // choose among the identities it was issued and not add
+                        // one. Every other `x-hasura-*` header is still ignored --
+                        // on a server with no secret to gate them they would let
+                        // any caller name its own identity.
+                        _ if token_verified => {
+                            match postrust_auth::hasura::role_for_token(
+                                &auth_result.claims,
+                                &pairs[..],
+                            ) {
+                                postrust_auth::hasura::TokenRole::Is(role) => (
+                                    role,
+                                    postrust_auth::hasura::session_from_claims(&auth_result.claims),
+                                    false,
+                                ),
+                                postrust_auth::hasura::TokenRole::NotAllowed => {
+                                    return postrust_graphql::hasura::denied(
+                                        postrust_auth::hasura::ROLE_NOT_ALLOWED,
+                                    );
+                                }
+                            }
+                        }
                         // A secret is configured and nothing authenticated this
                         // request. Answering it as a stranger is a choice the
                         // deployment makes; refusing is the default.
@@ -432,8 +449,8 @@ async fn main() -> Result<()> {
                         // No Hasura auth configured at all: unchanged from before
                         // any of this existed.
                         _ => (
-                            hasura_role_from_claims(&auth_result.claims),
-                            hasura_session_from_claims(&auth_result.claims),
+                            postrust_auth::hasura::role_from_claims(&auth_result.claims),
+                            postrust_auth::hasura::session_from_claims(&auth_result.claims),
                             false,
                         ),
                     };
@@ -554,89 +571,6 @@ async fn main() -> Result<()> {
                 }
 
                 postrust_graphql::hasura::envelope(response)
-            }
-
-            /// The Hasura role a verified token names, if it names one.
-            ///
-            /// `x-hasura-role` where the token fixes the role outright, and
-            /// `x-hasura-default-role` where it offers a default beside the
-            /// `x-hasura-allowed-roles` it may choose among -- which is the
-            /// shape Hasura's own documentation mints. Either spelling may sit
-            /// at the top level or under the namespace, and both are read.
-            ///
-            /// `None` leaves the database role standing in, which is what
-            /// happened before the two were told apart.
-            fn hasura_role_from_claims(
-                claims: &std::collections::HashMap<String, serde_json::Value>,
-            ) -> Option<String> {
-                const NAMESPACE: &str = "https://hasura.io/jwt/claims";
-
-                let read = |source: &std::collections::HashMap<String, serde_json::Value>| {
-                    for wanted in ["x-hasura-role", "x-hasura-default-role"] {
-                        let found = source.iter().find_map(|(key, value)| {
-                            (key.to_ascii_lowercase() == wanted)
-                                .then(|| value.as_str())
-                                .flatten()
-                        });
-                        if let Some(role) = found.filter(|role| !role.is_empty()) {
-                            return Some(role.to_string());
-                        }
-                    }
-                    None
-                };
-
-                if let Some(serde_json::Value::Object(namespaced)) = claims.get(NAMESPACE) {
-                    let namespaced: std::collections::HashMap<String, serde_json::Value> =
-                        namespaced.clone().into_iter().collect();
-                    if let Some(role) = read(&namespaced) {
-                        return Some(role);
-                    }
-                }
-                read(claims)
-            }
-
-            /// Collect `x-hasura-*` claims from a verified token.
-            ///
-            /// Hasura puts them under `https://hasura.io/jwt/claims` by default and
-            /// allows them at the top level; both spellings are read, and the
-            /// prefix is dropped so a policy names `hasura.user_id` rather than
-            /// `hasura.x-hasura-user-id`. `x-hasura-role` is left out: the role is
-            /// what the token was authenticated as, and re-reading it here would
-            /// let a claim override that decision.
-            fn hasura_session_from_claims(
-                claims: &std::collections::HashMap<String, serde_json::Value>,
-            ) -> std::collections::HashMap<String, String> {
-                const NAMESPACE: &str = "https://hasura.io/jwt/claims";
-                let mut session = std::collections::HashMap::new();
-
-                let mut take = |key: &str, value: &serde_json::Value| {
-                    let lowered = key.to_ascii_lowercase();
-                    let Some(name) = lowered.strip_prefix("x-hasura-") else {
-                        return;
-                    };
-                    if name == "role" || name.is_empty() {
-                        return;
-                    }
-                    // A claim may be a string, a number or a list of ids; the
-                    // setting is text either way, and a string keeps its own
-                    // spelling rather than gaining quotes.
-                    let rendered = match value {
-                        serde_json::Value::String(text) => text.clone(),
-                        other => other.to_string(),
-                    };
-                    session.insert(name.replace('-', "_"), rendered);
-                };
-
-                if let Some(serde_json::Value::Object(namespaced)) = claims.get(NAMESPACE) {
-                    for (key, value) in namespaced {
-                        take(key, value);
-                    }
-                }
-                for (key, value) in claims {
-                    take(key, value);
-                }
-
-                session
             }
 
             // Add GraphQL routes with WebSocket support for subscriptions

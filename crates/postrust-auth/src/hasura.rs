@@ -248,6 +248,153 @@ pub fn unreadable_boolean_header<'a>(headers: &[(&'a str, &'a str)]) -> Option<S
     ))
 }
 
+/// Hasura's wording for a caller that asked to be a role its token does not
+/// list.
+pub const ROLE_NOT_ALLOWED: &str = "Your requested role is not in allowed roles";
+
+/// Where Hasura puts its claims in a token unless it is told otherwise.
+const NAMESPACE: &str = "https://hasura.io/jwt/claims";
+
+/// One claim, from under the namespace if it is there and from the top level
+/// otherwise. Hasura mints the namespaced spelling and accepts both, so both
+/// are read here; a name is compared without regard to case, as a header is.
+fn claim<'a>(
+    claims: &'a HashMap<String, serde_json::Value>,
+    wanted: &str,
+) -> Option<&'a serde_json::Value> {
+    if let Some(serde_json::Value::Object(namespaced)) = claims.get(NAMESPACE) {
+        let found = namespaced
+            .iter()
+            .find(|(key, _)| key.eq_ignore_ascii_case(wanted))
+            .map(|(_, value)| value);
+        if found.is_some() {
+            return found;
+        }
+    }
+    claims
+        .iter()
+        .find(|(key, _)| key.eq_ignore_ascii_case(wanted))
+        .map(|(_, value)| value)
+}
+
+/// The role a verified token names, if it names one.
+///
+/// `x-hasura-role` where the token fixes the role outright, and
+/// `x-hasura-default-role` where it offers a default beside the
+/// `x-hasura-allowed-roles` it may choose among -- which is the shape Hasura's
+/// own documentation mints.
+///
+/// `None` leaves the database role standing in, which is what happened before
+/// the two were told apart.
+pub fn role_from_claims(claims: &HashMap<String, serde_json::Value>) -> Option<String> {
+    ["x-hasura-role", "x-hasura-default-role"]
+        .into_iter()
+        .find_map(|wanted| {
+            claim(claims, wanted)
+                .and_then(serde_json::Value::as_str)
+                .filter(|role| !role.is_empty())
+                .map(str::to_string)
+        })
+}
+
+/// The roles a token allows its bearer to ask to be.
+///
+/// Empty where the claim is absent or is not a list of names, which is the
+/// reading that grants nothing: the list is what widens an identity, so a
+/// value that cannot be read as one must not widen it.
+pub fn allowed_roles(claims: &HashMap<String, serde_json::Value>) -> Vec<String> {
+    match claim(claims, "x-hasura-allowed-roles") {
+        Some(serde_json::Value::Array(items)) => items
+            .iter()
+            .filter_map(serde_json::Value::as_str)
+            .map(str::to_string)
+            .collect(),
+        _ => Vec::new(),
+    }
+}
+
+/// Who a verified token's bearer speaks as.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum TokenRole {
+    /// Who the caller is. `None` leaves the database role standing in.
+    Is(Option<String>),
+    /// The caller asked to be a role its token does not list.
+    NotAllowed,
+}
+
+/// Settle which role a verified token speaks as, given what the caller asked
+/// for.
+///
+/// A token that allows more than one identity carries both
+/// `x-hasura-default-role` -- who the caller is when it asks for nothing --
+/// and `x-hasura-allowed-roles`, the list it may ask for instead. The asking
+/// is done with an `X-Hasura-Role` header, and the list is what makes reading
+/// that header safe: it sits inside the signature, so a caller can choose
+/// among the identities it was issued and cannot add one.
+///
+/// This is the one place a header names a role without the admin secret beside
+/// it, and it is safe for that reason alone. A token with no list allows only
+/// the role it already names -- an absent list is not permission to be anyone.
+pub fn role_for_token(
+    claims: &HashMap<String, serde_json::Value>,
+    headers: &[(&str, &str)],
+) -> TokenRole {
+    let named = role_from_claims(claims);
+
+    let Some(asked) = header(headers, "x-hasura-role").filter(|role| !role.is_empty()) else {
+        return TokenRole::Is(named);
+    };
+
+    // Asking to be who you already are needs no list: a token that fixes one
+    // role and a client that names that role agree, and refusing them would
+    // break a client that sets the header on every request.
+    if named.as_deref() == Some(asked) || allowed_roles(claims).iter().any(|role| role == asked) {
+        return TokenRole::Is(Some(asked.to_string()));
+    }
+
+    TokenRole::NotAllowed
+}
+
+/// Collect `x-hasura-*` claims from a verified token as session variables.
+///
+/// Hasura puts them under the namespace by default and allows them at the top
+/// level; both spellings are read, and the prefix is dropped so a policy names
+/// `hasura.user_id` rather than `hasura.x-hasura-user-id`. `x-hasura-role` is
+/// left out: the role is what the token was authenticated as, and re-reading
+/// it here would let a claim override that decision.
+pub fn session_from_claims(claims: &HashMap<String, serde_json::Value>) -> HashMap<String, String> {
+    let mut session = HashMap::new();
+
+    let mut take = |key: &str, value: &serde_json::Value| {
+        let lowered = key.to_ascii_lowercase();
+        let Some(name) = lowered.strip_prefix("x-hasura-") else {
+            return;
+        };
+        if name == "role" || name.is_empty() {
+            return;
+        }
+        // A claim may be a string, a number or a list of ids; the setting is
+        // text either way, and a string keeps its own spelling rather than
+        // gaining quotes.
+        let rendered = match value {
+            serde_json::Value::String(text) => text.clone(),
+            other => other.to_string(),
+        };
+        session.insert(name.replace('-', "_"), rendered);
+    };
+
+    if let Some(serde_json::Value::Object(namespaced)) = claims.get(NAMESPACE) {
+        for (key, value) in namespaced {
+            take(key, value);
+        }
+    }
+    for (key, value) in claims {
+        take(key, value);
+    }
+
+    session
+}
+
 /// Compare two secrets without letting the time taken say how much of the
 /// first one was right.
 fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
@@ -419,6 +566,142 @@ mod tests {
         assert_eq!(
             unreadable_boolean_header(&[(BACKEND_ONLY_HEADER, "yes")][..]),
             None
+        );
+    }
+
+    fn claims(value: serde_json::Value) -> HashMap<String, serde_json::Value> {
+        match value {
+            serde_json::Value::Object(map) => map.into_iter().collect(),
+            other => panic!("claims must be an object, got {other}"),
+        }
+    }
+
+    /// The default is who the caller is when it asks for nothing.
+    #[test]
+    fn a_token_that_asks_for_nothing_speaks_as_its_default() {
+        let token = claims(serde_json::json!({
+            "https://hasura.io/jwt/claims": {
+                "x-hasura-default-role": "user",
+                "x-hasura-allowed-roles": ["user", "editor"],
+            }
+        }));
+        assert_eq!(
+            role_for_token(&token, &[][..]),
+            TokenRole::Is(Some("user".into()))
+        );
+    }
+
+    /// The list inside the signature is what makes the header safe to read.
+    #[test]
+    fn a_role_the_token_lists_may_be_asked_for() {
+        let token = claims(serde_json::json!({
+            "https://hasura.io/jwt/claims": {
+                "x-hasura-default-role": "user",
+                "x-hasura-allowed-roles": ["user", "editor"],
+            }
+        }));
+        let headers = [("X-Hasura-Role", "editor")];
+        assert_eq!(
+            role_for_token(&token, &headers[..]),
+            TokenRole::Is(Some("editor".into()))
+        );
+    }
+
+    /// A caller cannot widen what it was issued.
+    #[test]
+    fn a_role_outside_the_list_is_refused() {
+        let token = claims(serde_json::json!({
+            "https://hasura.io/jwt/claims": {
+                "x-hasura-default-role": "user",
+                "x-hasura-allowed-roles": ["user", "editor"],
+            }
+        }));
+        for wanted in ["admin", "Editor", "anonymous"] {
+            let headers = [("x-hasura-role", wanted)];
+            assert_eq!(
+                role_for_token(&token, &headers[..]),
+                TokenRole::NotAllowed,
+                "{wanted}"
+            );
+        }
+    }
+
+    /// An absent list is not permission to be anyone.
+    #[test]
+    fn a_token_without_a_list_allows_only_the_role_it_names() {
+        let token = claims(serde_json::json!({ "x-hasura-role": "user" }));
+
+        let same = [("x-hasura-role", "user")];
+        assert_eq!(
+            role_for_token(&token, &same[..]),
+            TokenRole::Is(Some("user".into()))
+        );
+
+        let other = [("x-hasura-role", "admin")];
+        assert_eq!(role_for_token(&token, &other[..]), TokenRole::NotAllowed);
+    }
+
+    /// A list that is not a list of names grants nothing.
+    #[test]
+    fn a_list_that_cannot_be_read_widens_no_identity() {
+        for unreadable in [
+            serde_json::json!("editor"),
+            serde_json::json!({"0": "editor"}),
+            serde_json::json!(null),
+        ] {
+            let token = claims(serde_json::json!({
+                "x-hasura-default-role": "user",
+                "x-hasura-allowed-roles": unreadable,
+            }));
+            let headers = [("x-hasura-role", "editor")];
+            assert_eq!(role_for_token(&token, &headers[..]), TokenRole::NotAllowed);
+        }
+    }
+
+    /// Both spellings are read, and the namespace wins where both are present.
+    #[test]
+    fn a_claim_is_read_from_the_namespace_or_the_top_level() {
+        let top = claims(serde_json::json!({
+            "x-hasura-default-role": "user",
+            "x-hasura-allowed-roles": ["user", "editor"],
+        }));
+        let headers = [("x-hasura-role", "editor")];
+        assert_eq!(
+            role_for_token(&top, &headers[..]),
+            TokenRole::Is(Some("editor".into()))
+        );
+
+        let both = claims(serde_json::json!({
+            "https://hasura.io/jwt/claims": { "x-hasura-default-role": "namespaced" },
+            "x-hasura-default-role": "top",
+        }));
+        assert_eq!(role_from_claims(&both), Some("namespaced".into()));
+    }
+
+    /// A token naming no role at all leaves the database role standing in.
+    #[test]
+    fn a_token_that_names_no_role_names_none() {
+        let token = claims(serde_json::json!({ "sub": "1" }));
+        assert_eq!(role_for_token(&token, &[][..]), TokenRole::Is(None));
+    }
+
+    /// The role is reported separately; a claim repeating it must not become a
+    /// session variable a policy could read instead.
+    #[test]
+    fn the_role_claim_is_not_a_session_variable() {
+        let token = claims(serde_json::json!({
+            "https://hasura.io/jwt/claims": {
+                "x-hasura-role": "user",
+                "x-hasura-user-id": 7,
+                "x-hasura-org-ids": ["1", "2"],
+            }
+        }));
+        let session = session_from_claims(&token);
+        assert!(!session.contains_key("role"));
+        assert_eq!(session.get("user_id").map(String::as_str), Some("7"));
+        assert_eq!(
+            session.get("org_ids").map(String::as_str),
+            Some("[\"1\",\"2\"]")
         );
     }
 
