@@ -379,7 +379,7 @@ fn jwt_error(error: postrust_auth::JwtError) -> postrust_core::Error {
     use postrust_auth::JwtError;
 
     match error {
-        JwtError::MissingHeader => postrust_core::Error::MissingAuth,
+        JwtError::NoIdentity => postrust_core::Error::MissingAuth,
         JwtError::SecretMissing => postrust_core::Error::JwtSecretMissing,
         // Read, and found wanting: the token itself is intact, and what it
         // claims is what was not accepted.
@@ -1451,13 +1451,21 @@ pub async fn options_allow(
         return next.run(request).await;
     }
 
+    // Not every route is the API's. A layer added to the router wraps every
+    // one of them, so `/admin` and `/_` arrive here too, and answering those
+    // with what a table allows -- or with "no such table" -- takes a working
+    // preflight and turns it into a 404.
+    let Some(path) = api_path(request.uri().path(), state.config.compat_mode) else {
+        return next.run(request).await;
+    };
+
     let verbatim_db_errors = state.config.compat_mode;
 
     // Built here, from borrows, before anything is awaited: `axum::body::Body`
     // is `Send` but not `Sync`, and `&T` is `Send` only where `T` is `Sync`, so
     // a `&Request` held across an await makes the whole future not `Send` --
     // which a middleware has to be.
-    let probe = probe_request(&request);
+    let probe = probe_request(&request, path);
     let allow = match probe {
         Ok(probe) => resolve_allow(&state, probe).await,
         Err(error) => Err(error),
@@ -1474,15 +1482,64 @@ pub async fn options_allow(
         }
         // Asking what may be done with a table that is not there is answered
         // the same way as asking for the table.
-        Err(error) => error_response(error, verbatim_db_errors).into_response(),
+        Err(error) => {
+            let mut refusal = error_response(error, verbatim_db_errors).into_response();
+            // The CORS layer wrote its headers on the response this replaces.
+            // Without them a browser reports the request as blocked by CORS
+            // rather than as the 404 it earned, which is a different thing to
+            // go and fix.
+            for (name, value) in response.headers() {
+                if name.as_str().starts_with("access-control-") || name == http::header::VARY {
+                    refusal.headers_mut().append(name, value.clone());
+                }
+            }
+            refusal
+        }
     }
 }
 
-/// The request again, with an empty body, for the parser to read.
-fn probe_request(request: &Request) -> Result<http::Request<bytes::Bytes>, postrust_core::Error> {
+/// The path the API parser should read, or `None` where the request names
+/// something that is not the REST surface.
+///
+/// A layer added with `Router::layer` wraps each endpoint, and `nest` puts its
+/// prefix-stripping *inside* that endpoint -- so the path seen here is the one
+/// the client wrote and still carries the mount it arrived under, unlike the
+/// one the handler reads.
+fn api_path(path: &str, compat_mode: bool) -> Option<&str> {
+    /// Whether a path names a mount point or something under it.
+    fn under(path: &str, mount: &str) -> bool {
+        path == mount || path.strip_prefix(mount).is_some_and(|r| r.starts_with('/'))
+    }
+
+    if under(path, "/admin") || under(path, "/_") || under(path, "/api/graphql") {
+        return None;
+    }
+    if under(path, "/api") {
+        return Some(match path.strip_prefix("/api") {
+            None | Some("") => "/",
+            Some(rest) => rest,
+        });
+    }
+    // Everywhere else the REST surface exists only in compatibility mode,
+    // where it answers at the root. Without it `/` is this server's own
+    // directory of endpoints, which allows what its handler allows.
+    compat_mode.then_some(path)
+}
+
+/// The request again, with an empty body and the API's own path, for the
+/// parser to read.
+#[allow(clippy::result_large_err)] // consistent with the crate's error type
+fn probe_request(
+    request: &Request,
+    path: &str,
+) -> Result<http::Request<bytes::Bytes>, postrust_core::Error> {
+    let target = match request.uri().query() {
+        Some(query) => format!("{path}?{query}"),
+        None => path.to_string(),
+    };
     let mut builder = http::Request::builder()
         .method(request.method().clone())
-        .uri(request.uri().clone());
+        .uri(target);
     for (name, value) in request.headers() {
         builder = builder.header(name, value);
     }
@@ -1720,6 +1777,16 @@ fn round_coordinates(value: &mut serde_json::Value) {
     }
 }
 
+/// Where the response's window starts.
+///
+/// The same resolution the plan itself used, asked again rather than restated:
+/// the JSON path and the rendered-media path both report a `Content-Range`,
+/// and a `Content-Range` that disagrees with the rows underneath it is worse
+/// than none at all.
+fn top_level_offset(api_request: &ApiRequest) -> i64 {
+    postrust_core::plan::resolve_top_level_range(api_request).offset
+}
+
 /// The first column of a row, as the bytes the client should receive.
 ///
 /// A media type the schema declared is carried by a domain, and a domain is a
@@ -1727,21 +1794,6 @@ fn round_coordinates(value: &mut serde_json::Value) {
 /// own text rendering. For text, xml or json that rendering is the value. For
 /// `bytea` it is `\x` followed by hex, which is a description of the bytes
 /// and not the bytes, so it is decoded back.
-/// Where the response's window starts.
-///
-/// An explicit top-level `?offset=` if there is one, and the range taken from
-/// the `Range` header otherwise. Both the JSON path and the rendered-media
-/// path report a `Content-Range` and must agree on where it begins.
-fn top_level_offset(api_request: &ApiRequest) -> i64 {
-    api_request
-        .query_params
-        .ranges
-        .get("")
-        .map(|range| range.offset)
-        .filter(|offset| *offset != 0)
-        .unwrap_or(api_request.top_level_range.offset)
-}
-
 fn raw_column(row: &sqlx::postgres::PgRow, base_type: &str) -> Option<Vec<u8>> {
     use sqlx::{Row, ValueRef};
 
@@ -2736,7 +2788,12 @@ fn related_order_target(
     let rel = schema_cache
         .find_relationship(parent_qi, embedded.0, embedded.1, &parent_qi.schema)?
         .ok_or_else(|| {
-            schema_cache.relationship_not_found(parent_qi, embedded.0, embedded.1, &parent_qi.schema)
+            schema_cache.relationship_not_found(
+                parent_qi,
+                embedded.0,
+                embedded.1,
+                &parent_qi.schema,
+            )
         })?;
 
     // A resource that yields many rows per parent has no single value to order
@@ -3678,6 +3735,52 @@ fn sanitize_error_message(error: &postrust_core::Error) -> String {
 
 #[cfg(test)]
 mod tests {
+    /// The REST surface is mounted at `/api`, and an `OPTIONS` reaches the
+    /// layer before the mount is stripped off.
+    #[test]
+    fn the_api_path_is_the_one_below_the_mount() {
+        assert_eq!(super::api_path("/api/items", false), Some("/items"));
+        assert_eq!(super::api_path("/api/rpc/f", false), Some("/rpc/f"));
+        assert_eq!(super::api_path("/api", false), Some("/"));
+        assert_eq!(super::api_path("/api/", false), Some("/"));
+    }
+
+    /// Answering for a route that is not the API's turns a working preflight
+    /// into a 404 for a table nobody asked about.
+    #[test]
+    fn a_route_that_is_not_the_api_is_left_alone() {
+        for path in [
+            "/admin",
+            "/admin/swagger",
+            "/_",
+            "/_/health",
+            "/api/graphql",
+        ] {
+            assert_eq!(super::api_path(path, false), None, "{path}");
+            assert_eq!(super::api_path(path, true), None, "{path}");
+        }
+    }
+
+    /// Outside the mounts the surface exists only in compatibility mode,
+    /// where PostgREST's own paths answer at the root.
+    #[test]
+    fn the_root_is_the_api_only_in_compatibility_mode() {
+        assert_eq!(super::api_path("/items", true), Some("/items"));
+        assert_eq!(super::api_path("/", true), Some("/"));
+        assert_eq!(super::api_path("/items", false), None);
+        assert_eq!(super::api_path("/", false), None);
+    }
+
+    /// A mount is a path segment: `/apiary` is not under `/api`.
+    #[test]
+    fn a_mount_matches_whole_segments_only() {
+        assert_eq!(super::api_path("/apiary", true), Some("/apiary"));
+        assert_eq!(
+            super::api_path("/administrators", true),
+            Some("/administrators")
+        );
+    }
+
     /// A data-modifying `WITH` may only appear at the top level, so anything
     /// that wraps the statement has to leave the clause where it is.
     #[test]
