@@ -535,6 +535,16 @@ impl QueryBuilder {
         } else {
             let mut frag = SqlFragment::new();
             push_field_ref(&mut frag, &term.field);
+            // `OrderExpr` carries SQL and no parameters, so anything bound
+            // here would be dropped and every `$n` after it would be reading
+            // the wrong value -- silently, and only for the requests that take
+            // this branch. Nothing on this path binds today; this is what says
+            // so when something starts to.
+            debug_assert!(
+                frag.params().is_empty(),
+                "an ORDER BY term bound a parameter, which this discards: {}",
+                frag.sql()
+            );
             OrderExpr::raw(frag.sql())
         };
 

@@ -73,6 +73,10 @@ pub async fn load_tables(pool: &PgPool, schemas: &[String]) -> Result<TablesMap>
                 WHERE tp.table_schema = t.table_schema
                   AND tp.table_name = t.table_name
                   AND tp.privilege_type = 'DELETE'
+            -- `is_updatable`, not a typo for a column that does not exist:
+            -- `information_schema.views` has no `is_deletable`, because a view
+            -- PostgreSQL can write through automatically is one it can delete
+            -- through as well. Only the trigger half is asked separately.
             ) AND COALESCE(
                 v.is_updatable = 'YES' OR v.is_trigger_deletable = 'YES',
                 true

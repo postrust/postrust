@@ -50,8 +50,8 @@ async fn handler(event: Request) -> Result<Response<Body>, Error> {
                 &config.db_schemas,
                 &config.db_extra_search_path,
             )
-                .await
-                .expect("Failed to load schema cache");
+            .await
+            .expect("Failed to load schema cache");
             Arc::new(RwLock::new(cache))
         })
         .await;
