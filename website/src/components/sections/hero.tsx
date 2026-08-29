@@ -40,7 +40,7 @@ export const HeroSection = component$(() => {
             </Link>
             , and it speaks{" "}
             <Link
-              href="/docs/hasura-conformance"
+              href="/docs/conformance/hasura"
               class="underline decoration-neutral-300 underline-offset-4 hover:decoration-primary-600 hover:text-primary-700"
             >
               Hasura&rsquo;s GraphQL dialect

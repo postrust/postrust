@@ -17,9 +17,9 @@ export const Footer = component$(() => {
       { href: "/docs/api-reference", label: "API Reference" },
       { href: "/packages", label: "Packages" },
       { href: "/docs/benchmarks", label: "Benchmarks" },
-      { href: "/docs/conformance", label: "PostgREST Conformance" },
-      { href: "/docs/hasura-conformance", label: "Hasura Conformance" },
+      { href: "/docs/conformance", label: "Conformance" },
       { href: "/docs/deployment", label: "Deployment" },
+      { href: "/releases", label: "Releases" },
     ],
     community: [
       { href: "https://github.com/postrust/postrust", label: "GitHub", external: true },

@@ -65,7 +65,7 @@ export const comparisons: Comparison[] = [
     versionTested: "v16.1",
     intro: [
       "PostgREST is the project that established this idea: point a server at a PostgreSQL schema and get a REST API, with permissions left to the database. Postrust follows its URL grammar deliberately, so `?select=`, `?order=`, the filter operators and the `Prefer` headers mean the same thing in both.",
-      "How closely is measured rather than asserted: replaying PostgREST's own test cases against both servers gives 96.7% agreement on status and body, and 94.9% once every header that is part of the answer is compared too. The [conformance report](/docs/conformance) says what that covers and where the two differ on purpose.",
+      "How closely is measured rather than asserted: replaying PostgREST's own test cases against both servers gives 96.7% agreement on status and body, and 94.9% once every header that is part of the answer is compared too. The [conformance report](/docs/conformance/postgrest) says what that covers and where the two differ on purpose.",
       "The differences are not in the query language. They are in what ships in the process and what the deployment looks like.",
     ],
     features: [
@@ -162,7 +162,7 @@ export const comparisons: Comparison[] = [
     versionTested: "v2.44.0",
     intro: [
       "Hasura generates a GraphQL API from a PostgreSQL schema and models permissions as metadata rather than as database roles. It is a platform: a console, event triggers, remote schemas, and joins across more than one data source.",
-      "Postrust speaks Hasura's GraphQL dialect. A client generated against Hasura — its queries, its codegen output, its endpoint at `/v1/graphql` — points at Postrust unchanged, and the permission model comes with it: a schema per role, row filters, separate read and write columns, presets and `backend_only`. How closely the two agree is measured by replaying Hasura's own test corpus against both servers; the [conformance report](/docs/hasura-conformance) says what that covers and where they differ on purpose.",
+      "Postrust speaks Hasura's GraphQL dialect. A client generated against Hasura — its queries, its codegen output, its endpoint at `/v1/graphql` — points at Postrust unchanged, and the permission model comes with it: a schema per role, row filters, separate read and write columns, presets and `backend_only`. How closely the two agree is measured by replaying Hasura's own test corpus against both servers; the [conformance report](/docs/conformance/hasura) says what that covers and where they differ on purpose.",
       "Postrust is still a smaller thing on purpose. It is one binary against one PostgreSQL, configured by environment variables rather than by state a server owns, and the permissions it reads are a document you supply rather than a console you operate.",
     ],
     features: [

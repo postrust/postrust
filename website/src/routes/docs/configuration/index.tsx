@@ -360,7 +360,7 @@ curl 'localhost:3000/api/users?select=status,name,id&limit=1'
             </p>
             <p class="text-neutral-600">
               See{" "}
-              <Link href="/docs/hasura-conformance" class="text-primary-600 hover:underline">
+              <Link href="/docs/conformance/hasura" class="text-primary-600 hover:underline">
                 Hasura conformance
               </Link>{" "}
               for how much of the dialect this covers, measured.

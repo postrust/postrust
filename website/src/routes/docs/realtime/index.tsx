@@ -67,7 +67,7 @@ export default component$(() => {
               Each subscription field mirrors the query root and is a <em>live query</em>: the
               answer now, and the answer again whenever it changes. Hasura&rsquo;s cursor-based{" "}
               <code class="font-mono">_stream</code> subscriptions are not implemented — see{" "}
-              <Link href="/docs/hasura-conformance" class="text-primary-600 hover:underline">
+              <Link href="/docs/conformance/hasura" class="text-primary-600 hover:underline">
                 Hasura conformance
               </Link>
               .

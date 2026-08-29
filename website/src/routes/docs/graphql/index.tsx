@@ -96,7 +96,7 @@ export default component$(() => {
             points at this server unchanged.
           </p>
           <p class="mt-4">
-            <Link href="/docs/hasura-conformance" class="text-primary-600 hover:underline font-medium">
+            <Link href="/docs/conformance/hasura" class="text-primary-600 hover:underline font-medium">
               How closely the two agree, measured →
             </Link>
           </p>
@@ -332,7 +332,7 @@ export default component$(() => {
               </svg>
               API Reference
             </Link>
-            <Link href="/docs/hasura-conformance" class="flex items-center gap-2 text-neutral-600 hover:text-primary-600">
+            <Link href="/docs/conformance/hasura" class="flex items-center gap-2 text-neutral-600 hover:text-primary-600">
               Hasura Conformance
               <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                 <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 5l7 7-7 7"/>

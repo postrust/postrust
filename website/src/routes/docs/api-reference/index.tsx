@@ -243,7 +243,7 @@ GET /orders?select=*,customer!inner(*)&customer.country=eq.US`}</code>
               queries and, for most generated clients, the only address they can be told about.
               See <Link href="/docs/graphql" class="text-primary-600 hover:underline">GraphQL</Link>{" "}
               for the schema shape, filters and mutations, and{" "}
-              <Link href="/docs/hasura-conformance" class="text-primary-600 hover:underline">
+              <Link href="/docs/conformance/hasura" class="text-primary-600 hover:underline">
                 Hasura conformance
               </Link>{" "}
               for how closely the two agree, measured.

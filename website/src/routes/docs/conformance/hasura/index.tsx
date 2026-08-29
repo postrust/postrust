@@ -252,7 +252,7 @@ node scripts/gen-hasura-conformance.mjs scripts/hasura-conformance/.work/diff.js
 
 export const head: DocumentHead = {
   title: "Hasura Conformance - Postrust Documentation",
-  links: [{ rel: "canonical", href: "https://postrust.org/docs/hasura-conformance" }],
+  links: [{ rel: "canonical", href: "https://postrust.org/docs/conformance/hasura" }],
   meta: [
     {
       name: "description",
