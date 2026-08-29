@@ -135,11 +135,18 @@ wants() {
 # Scenarios
 #
 # Each tool expresses the same request in its own dialect: PostgREST serves
-# tables at the root where Postrust mounts them under /api, and the two GraphQL
-# engines inflect field names differently (bench_items vs allBenchItems). The
+# tables at the root where Postrust mounts them under /api, and PostGraphile
+# inflects field names its own way (allBenchItems, benchItemByRowId). The
 # request being measured is the same; only the spelling differs. That is a
 # property of the tools, and is stated on the published comparison rather than
 # smoothed over.
+#
+# Postrust and Hasura are now the exception: they are sent the *same query
+# text*, byte for byte, because Postrust answers Hasura's dialect. That is the
+# claim the conformance harness measures, and sending one string to both is
+# the cheapest possible restatement of it -- if the dialects ever drift, this
+# benchmark stops running rather than quietly measuring two different
+# questions.
 # ---------------------------------------------------------------------------
 
 # name|postrust path|postgrest path
@@ -157,16 +164,16 @@ gql_query() {
     local target="$1" scenario="$2"
 
     case "$target:$scenario" in
-    postrust:row)     echo '{ benchItems(filter: {id: {eq: 42}}) { id name price } }' ;;
-    hasura:row)       echo '{ bench_items(where: {id: {_eq: 42}}) { id name price } }' ;;
+    postrust:row|hasura:row)
+                      echo '{ bench_items(where: {id: {_eq: 42}}) { id name price } }' ;;
     postgraphile:row) echo '{ benchItemByRowId(rowId: 42) { rowId name price } }' ;;
 
-    postrust:page)     echo '{ benchItems(limit: 25) { id name price } }' ;;
-    hasura:page)       echo '{ bench_items(limit: 25) { id name price } }' ;;
+    postrust:page|hasura:page)
+                      echo '{ bench_items(limit: 25) { id name price } }' ;;
     postgraphile:page) echo '{ allBenchItems(first: 25) { nodes { rowId name price } } }' ;;
 
-    postrust:embed)     echo '{ benchItems(limit: 25) { id name bench_reviews { id rating } } }' ;;
-    hasura:embed)       echo '{ bench_items(limit: 25) { id name bench_reviews { id rating } } }' ;;
+    postrust:embed|hasura:embed)
+                      echo '{ bench_items(limit: 25) { id name bench_reviews { id rating } } }' ;;
     postgraphile:embed) echo '{ allBenchItems(first: 25) { nodes { rowId name benchReviewsByItemId { nodes { rowId rating } } } } }' ;;
 
     *) return 1 ;;
@@ -181,7 +188,10 @@ GQL_SCENARIOS=(
 
 gql_endpoint() {
     case "$1" in
-        postrust)     echo "http://127.0.0.1:$PORT_POSTRUST/api/graphql" ;;
+        # `/v1/graphql`, not `/api/graphql`: same handler either way, but this
+        # is the address a Hasura client is pointed at, so the benchmark
+        # exercises the migration path rather than one beside it.
+        postrust)     echo "http://127.0.0.1:$PORT_POSTRUST/v1/graphql" ;;
         hasura)       echo "http://127.0.0.1:$PORT_HASURA/v1/graphql" ;;
         postgraphile) echo "http://127.0.0.1:$PORT_POSTGRAPHILE/graphql" ;;
     esac
