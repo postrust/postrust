@@ -4,7 +4,7 @@
 
 mod builder;
 
-pub use builder::{QueryBuilder, INSERTED_COLUMN};
+pub use builder::{QueryBuilder, INSERTED_COLUMN, PARENT_ROW_COLUMN};
 
 use crate::error::Result;
 use crate::plan::{ActionPlan, DbActionPlan};

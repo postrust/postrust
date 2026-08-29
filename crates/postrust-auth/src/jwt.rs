@@ -10,11 +10,18 @@ use super::{AuthResult, ClaimFault, JwtConfig, JwtError};
 use jsonwebtoken::{decode, Algorithm, DecodingKey, Validation};
 use std::collections::HashMap;
 
-/// How far out of step with the server a token's clock may be.
+/// How far ahead of the server a token's clock may be.
 ///
 /// A token minted a moment ago on a machine whose clock runs a little fast is
 /// not a forgery, and rejecting it would make a working deployment fail
 /// intermittently and unreproducibly.
+///
+/// Only in that direction. `exp` is checked to the second, because leniency
+/// there is leniency about a token that has been *withdrawn* -- it keeps a
+/// revoked session alive past the moment its issuer said it ended, and it is a
+/// window an attacker holding a stale token gets for free. `nbf` and `iat`
+/// describe a token that is not valid *yet*, where the same slack costs
+/// nothing and is the only remedy for a clock nobody controls.
 const ALLOWED_SKEW: i64 = 30;
 
 /// Validate a JWT token and extract claims.
@@ -48,16 +55,24 @@ pub fn validate_token(token: &str, config: &JwtConfig) -> Result<AuthResult, Jwt
 
     // The role decides what the request may do, so a token naming none, on a
     // server with no anonymous role, is a request with no identity at all.
-    let role = claims
-        .get(&config.role_claim_key)
-        .map(|value| match value {
-            serde_json::Value::String(role) => role.clone(),
-            other => other.to_string(),
-        })
-        .or_else(|| config.anon_role.clone())
-        .ok_or(JwtError::MissingHeader)?;
+    let role = role_of(&claims, config).ok_or(JwtError::NoIdentity)?;
 
     Ok(AuthResult { role, claims })
+}
+
+/// The role a token names, or the anonymous one where it names none.
+///
+/// A role is a name, and only a string is one. Rendering anything else --
+/// `"role": 42`, `"role": {"a": 1}` -- would make a database role nobody
+/// created out of a claim that does not name one, so a claim of the wrong
+/// shape is read as a token that named no role at all and falls back the same
+/// way an absent claim does.
+fn role_of(claims: &HashMap<String, serde_json::Value>, config: &JwtConfig) -> Option<String> {
+    claims
+        .get(&config.role_claim_key)
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_string)
+        .or_else(|| config.anon_role.clone())
 }
 
 /// The registered claims, checked in the order the contract checks them.
@@ -84,7 +99,7 @@ fn check_claims(
     };
 
     if let Some(exp) = number("exp")? {
-        if now - ALLOWED_SKEW > exp {
+        if now > exp {
             return Err(JwtError::Claim(ClaimFault::Expired));
         }
     }
@@ -237,22 +252,60 @@ mod tests {
         ));
     }
 
-    /// A clock a few seconds out of step is not a forgery.
+    /// A clock a few seconds ahead is not a forgery.
     #[test]
-    fn a_small_clock_difference_is_tolerated_at_both_ends() {
-        let expired_moments_ago = claims(serde_json::json!({"exp": 1_000}));
-        assert!(check_claims(&expired_moments_ago, &config(), 1_010).is_ok());
-        assert!(matches!(
-            check_claims(&expired_moments_ago, &config(), 1_100),
-            Err(JwtError::Claim(ClaimFault::Expired))
-        ));
-
+    fn a_token_that_is_not_valid_yet_is_given_the_benefit_of_the_clock() {
         let issued_moments_hence = claims(serde_json::json!({"iat": 1_000}));
         assert!(check_claims(&issued_moments_hence, &config(), 990).is_ok());
         assert!(matches!(
             check_claims(&issued_moments_hence, &config(), 900),
             Err(JwtError::Claim(ClaimFault::IssuedInFuture))
         ));
+
+        let valid_moments_hence = claims(serde_json::json!({"nbf": 1_000}));
+        assert!(check_claims(&valid_moments_hence, &config(), 990).is_ok());
+        assert!(matches!(
+            check_claims(&valid_moments_hence, &config(), 900),
+            Err(JwtError::Claim(ClaimFault::NotYetValid))
+        ));
+    }
+
+    /// The same slack the other way would keep a withdrawn token alive past
+    /// the second its issuer said it ended.
+    #[test]
+    fn an_expiry_is_honoured_to_the_second() {
+        let expires_at = claims(serde_json::json!({"exp": 1_000}));
+        assert!(check_claims(&expires_at, &config(), 1_000).is_ok());
+        assert!(matches!(
+            check_claims(&expires_at, &config(), 1_001),
+            Err(JwtError::Claim(ClaimFault::Expired))
+        ));
+    }
+
+    /// A role is a name, and a claim that is not a string does not carry one.
+    #[test]
+    fn a_role_claim_that_is_not_a_string_names_no_role() {
+        let configured = JwtConfig {
+            anon_role: Some("anon".into()),
+            ..config()
+        };
+        for value in [
+            serde_json::json!(42),
+            serde_json::json!({"a": 1}),
+            serde_json::json!(["admin"]),
+        ] {
+            let mut claims = HashMap::new();
+            claims.insert("role".to_string(), value.clone());
+            assert_eq!(
+                role_of(&claims, &configured),
+                Some("anon".to_string()),
+                "{value}"
+            );
+        }
+
+        let mut named = HashMap::new();
+        named.insert("role".to_string(), serde_json::json!("web_user"));
+        assert_eq!(role_of(&named, &configured), Some("web_user".to_string()));
     }
 
     /// The first thing wrong with the token is what the client is told.

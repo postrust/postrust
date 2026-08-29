@@ -14,6 +14,7 @@ Welcome to the Postrust documentation. Postrust is a high-performance, serverles
 - [SaaS Domain Management](./saas-domains.md) - Multi-tenant custom domains with automatic SSL (Beta)
 - [Deployment](./deployment.md) - Deploy to various platforms
 - [Benchmarking](./benchmarking.md) - Measured size, latency and memory, and how to reproduce them
+- [PostgREST Conformance](./postgrest-conformance.md) - How closely the two agree, measured against PostgREST itself
 
 ## What is Postrust?
 

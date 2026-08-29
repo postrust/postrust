@@ -31,8 +31,14 @@ export const HeroSection = component$(() => {
           {/* Subheadline */}
           <p class="text-lg md:text-xl text-neutral-600 max-w-2xl mx-auto mb-10">
             High-performance REST & GraphQL API server for PostgreSQL,
-            written in Rust. Native AWS Lambda support with ~50ms cold starts.
-            Drop-in PostgREST replacement.
+            written in Rust. Native AWS Lambda support with ~50ms cold starts.{" "}
+            <Link
+              href="/docs/conformance"
+              class="underline decoration-neutral-300 underline-offset-4 hover:decoration-primary-600 hover:text-primary-700"
+            >
+              Drop-in PostgREST replacement
+            </Link>
+            .
           </p>
 
           {/* CTAs */}

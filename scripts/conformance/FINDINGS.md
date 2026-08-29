@@ -23,13 +23,42 @@ Three things are recorded here that the commit history does not hold:
 ## Results
 
 Measured over 1499 replayed cases. "Strict" is the full contract: status, body,
-and every header including `Content-Range`.
+and the six headers that are part of the answer rather than of the transport —
+`Content-Type`, `Content-Range`, `Location`, `Preference-Applied`, `Allow`,
+`WWW-Authenticate`. Not *every* header: `Date`, `Server` and `Connection`
+differ between any two servers and say nothing about conformance.
 
 | run | status + body | strict | note |
 |-----|---------------|--------|------|
 | 12  | 90.3% | 83.0% | before the harness configuration was corrected |
 | 13  | —     | —     | reference only; candidate half cut short (see below) |
 | 14  | 96.0% | 87.1% | committed binary, corrected reference |
+| 4   | 95.9% | 93.1% | **not publishable** — measured without `compat-key-order` |
+| 8   | —     | —     | died at `writes 300/431`; the machine had filled its disk |
+| 9   | 96.1% | 94.3% | clean: both halves complete, 0 transport failures, features verified at runtime |
+| 10  | 96.7% | 94.9% | computed relationships; 1 unanswered request, counted against us |
+
+Run 10 by group: reads 96.3% / 94.5%, writes 97.9% / 96.1%. It reused run 9's
+reference, which is what `CONFORMANCE_REUSE_REF=1` is for: nothing that shapes
+a request had changed, only the candidate. Run 9's own reference had to be
+re-recorded, because `run.py`'s `encode_path` had changed and a reference
+records the answers to requests *as they were sent*.
+
+Run 9 by group: reads 95.6% / 93.8%, writes 97.2% / 95.4%. It is the first run
+whose provenance was recorded rather than remembered — see below; run 10 is
+the first where the harness wrote that record itself.
+
+**One request in run 10 got no answer at all.** `Query/InsertSpec.hs:604`, a
+`POST` carrying multibyte UTF-8, failed with `BadStatusLine` naming its own
+request line back — the signature of a socket carrying somebody else's
+leftovers. It did not reproduce in 440 attempts of the identical request, the
+server logged no error, and the code path is untouched by anything in that
+run; 400 requests leave 440 sockets in `TIME_WAIT` on this host, which is how
+a reused ephemeral port becomes possible over 1499 of them. Treated as
+environmental, and counted as a failure regardless, so the figures understate
+by one case. `report.py` now names such a case rather than letting it dissolve
+into the totals: a flaky socket must not read as a conformance gap, and a real
+one must not read as a flaky socket.
 
 Run 14 confirmed the three specs `0d8ef2f` claimed: CustomMedia 19/50 → 50/50,
 PostGIS 1/13 → 13/13, Plan 4/29 → 29/29, ExtraSearchPath 8/9 → 9/9.
@@ -93,6 +122,43 @@ quietly measuring something other than what it claims. The harness now builds
 the binary itself rather than requiring one to exist, and asserts against the
 server's own startup warning once it is up, so neither half can drift again.
 
+**The replay client dropped everything after a `#`.** `run.py` builds requests
+with `urllib.request.Request`, which reads `#` as beginning a fragment and
+strips it and the rest of the URL:
+
+    Request('http://h/items?select=data->!@#$%^&*_d').full_url
+    -> 'http://h/items?select=data->!@'
+
+A fragment is a client-side notion that never appears in a request target, so
+in a PostgREST query the character is a literal — and `lenient_uri.rs` carries
+a paragraph about handling exactly that. It was never exercised. Both servers
+received the truncated URL, agreed, and the case scored as a pass on a request
+neither spec wrote. `encode_path` now sends `%23`, which both servers decode
+back to `#` at the parser. What that still does not exercise is a *raw* `#` on
+the wire; that needs a client that writes its own request line.
+
+**A case the candidate never answered was dropped from the denominator.**
+`report.py` skipped any reference case with no matching candidate record, which
+can only move every percentage up. It counts and names them now. The two halves
+replay the same file, so the count should always be zero — which is the point:
+a silent zero and a silent skip look identical until one of them isn't.
+
+**A run did not record what it had measured.** Run 4's figures were quoted for
+weeks before anyone could say which features its binary carried, and the answer
+turned out to be "not the ones that matter". The harness now writes
+`run-meta.json` beside `diff.json` — reference version, build features, commit,
+date — and `scripts/gen-conformance.mjs` refuses to publish a run without it,
+or one whose features do not include `compat-key-order`. A number that cannot
+say what produced it is not a measurement.
+
+**Non-compatibility mode is not measured at all.** The harness runs
+`PGRST_COMPAT_MODE=true`, where the REST surface answers at the root. In the
+default mode it is mounted under `/api`, and a bug that only shows there is
+invisible here however green the report is — as one was: every `OPTIONS`
+preflight outside compatibility mode answered `404 PGRST125`, because the
+`Allow` middleware read the path before the mount prefix was stripped off it.
+Found by review, not by the harness.
+
 ## Part 2 — divergences kept on purpose
 
 **These cases fail by choice. Do not "fix" them without deciding to.**
@@ -134,6 +200,26 @@ does not promise.
 
 *Cost: 2 cases. The harness is over-reporting here, not the server
 under-performing.*
+
+### Clock skew on `nbf` and `iat`, and none on `exp`
+
+PostgREST checks all three to the second. This server allows thirty seconds of
+slack on `nbf` and `iat` and none on `exp`, which is a deliberate asymmetry
+rather than an oversight in either direction.
+
+`nbf` and `iat` describe a token that is not valid *yet*. A client whose clock
+runs a little fast mints one a few seconds in the future through no fault of
+anyone's, and refusing it makes a working deployment fail intermittently and
+unreproducibly. Slack there costs nothing an attacker can use.
+
+`exp` is the other way round. Leniency about an expiry is leniency about a
+token that has been *withdrawn*: it keeps a session alive past the second its
+issuer said it ended, and hands anyone holding a stale token a window for free.
+The RFC permits leeway there; this does not take it.
+
+*Cost: 0 cases — no case in the suite mints a token near either boundary,
+which is why this is recorded here rather than left to be inferred from a
+green report.*
 
 ## Part 3 — known gaps, in the order worth doing them
 
@@ -284,3 +370,15 @@ still 200, now under a different name. It took `Err::Failure` to stop it, which
 is also the semantically correct signal: once `->>` is consumed, no other rule
 should get to reinterpret it. The test asserting `is_err()` mattered more than
 the code change did.
+
+**A measurement only covers the configuration it runs in.** Every number here
+is for compatibility mode. The `OPTIONS` bug above was a whole class of request
+answered `404` in the *default* configuration while the report said the `Allow`
+work had landed — because in compatibility mode the surface is at the root, and
+the middleware's mistake was reading a path that still had `/api` on the front
+of it. A 93% that does not say what it is 93% *of* invites exactly this.
+
+The general shape: `Router::layer` wraps each endpoint, and `nest` puts its
+prefix-stripping **inside** that endpoint. Anything added with `layer` sees the
+path the client wrote, not the path the handler reads. Middleware that parses
+the path has to account for the mount it is running above.

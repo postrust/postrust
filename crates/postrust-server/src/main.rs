@@ -2,6 +2,11 @@
 //!
 //! A PostgREST-compatible REST API server for PostgreSQL.
 
+// This binary compiles `app` and `state` again as modules of its own crate,
+// so the crate-level allow in `lib.rs` does not reach them. See the note
+// there for why the lint is not worth satisfying.
+#![allow(clippy::result_large_err)]
+
 use anyhow::Result;
 use axum::{http::Method, response::Json, routing::any, Router};
 use sqlx::postgres::PgPoolOptions;

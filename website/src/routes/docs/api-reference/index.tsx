@@ -141,7 +141,7 @@ GET /orders?select=*,customer!inner(*)&customer.country=eq.US`}</code>
             <div class="space-y-4">
               {[
                 { header: "return=representation", desc: "Return created/updated records in response" },
-                { header: "return=headers-only", desc: "Return only headers (for count)" },
+                { header: "return=headers-only", desc: "No body. The only case that gets a Location header naming the created row." },
                 { header: "count=exact", desc: "Include exact row count in response" },
                 { header: "resolution=merge-duplicates", desc: "Upsert (insert or update)" },
               ].map((item) => (
@@ -153,6 +153,55 @@ GET /orders?select=*,customer!inner(*)&customer.country=eq.US`}</code>
                 </div>
               ))}
             </div>
+          </section>
+
+          {/* Response headers */}
+          <section class="mb-12">
+            <h2 class="text-2xl font-bold text-neutral-900 mb-4">Response Headers</h2>
+            <div class="overflow-x-auto">
+              <table class="w-full text-sm">
+                <thead>
+                  <tr class="border-b border-neutral-200">
+                    <th class="text-left py-2 pr-4 font-semibold text-neutral-900">Header</th>
+                    <th class="text-left py-2 pr-4 font-semibold text-neutral-900">When</th>
+                    <th class="text-left py-2 font-semibold text-neutral-900">Description</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {[
+                    ["Content-Range", "Reads, and writes reporting a count", "The window returned and the total: 0-24/100"],
+                    ["Range-Unit", "With Content-Range", "Always items"],
+                    ["Location", "POST with Prefer: return=headers-only", "The created row's key: /users?id=eq.42"],
+                    ["Preference-Applied", "When a Prefer was honoured", "The preferences actually applied"],
+                    ["Allow", "OPTIONS", "The methods this resource answers"],
+                    ["WWW-Authenticate", "401", "Bearer, plus what was wrong with a token that was read and refused"],
+                  ].map(([header, when, desc]) => (
+                    <tr key={header} class="border-b border-neutral-100">
+                      <td class="py-2 pr-4"><code class="font-mono text-primary-700">{header}</code></td>
+                      <td class="py-2 pr-4 text-neutral-500">{when}</td>
+                      <td class="py-2 text-neutral-600">{desc}</td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          </section>
+
+          {/* OPTIONS */}
+          <section class="mb-12">
+            <h2 class="text-2xl font-bold text-neutral-900 mb-4">OPTIONS and Allow</h2>
+            <p class="text-neutral-600 mb-4">
+              <code class="font-mono">OPTIONS</code> reports what a resource actually answers,
+              derived from the schema rather than fixed. A table offers what its grants allow; a
+              view offers what PostgreSQL can genuinely write through it, which is not the same as
+              what it has been granted. <code class="font-mono">PUT</code> replaces one row named
+              by its key, so a relation without a primary key does not offer it however writable
+              it otherwise is. A <code class="font-mono">VOLATILE</code> function is{" "}
+              <code class="font-mono">OPTIONS,POST</code>; a stable one adds{" "}
+              <code class="font-mono">GET,HEAD</code>.
+            </p>
+            <pre class="bg-neutral-900 text-neutral-100 rounded-lg p-4 text-sm overflow-x-auto"><code>{`curl -i -X OPTIONS http://localhost:3000/api/users
+# Allow: OPTIONS,GET,HEAD,POST,PUT,PATCH,DELETE`}</code></pre>
           </section>
 
           {/* Next */}

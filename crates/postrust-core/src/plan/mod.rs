@@ -10,7 +10,7 @@ mod types;
 
 pub use call_plan::{CallParams, CallPlan};
 pub use mutate_plan::MutatePlan;
-pub use read_plan::{ReadPlan, ReadPlanTree};
+pub use read_plan::{resolve_top_level_range, ReadPlan, ReadPlanTree};
 pub use types::*;
 
 use crate::api_request::{Action, ApiRequest, DbAction, QualifiedIdentifier};

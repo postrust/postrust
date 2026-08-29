@@ -535,6 +535,16 @@ impl QueryBuilder {
         } else {
             let mut frag = SqlFragment::new();
             push_field_ref(&mut frag, &term.field);
+            // `OrderExpr` carries SQL and no parameters, so anything bound
+            // here would be dropped and every `$n` after it would be reading
+            // the wrong value -- silently, and only for the requests that take
+            // this branch. Nothing on this path binds today; this is what says
+            // so when something starts to.
+            debug_assert!(
+                frag.params().is_empty(),
+                "an ORDER BY term bound a parameter, which this discards: {}",
+                frag.sql()
+            );
             OrderExpr::raw(frag.sql())
         };
 
@@ -1093,6 +1103,17 @@ fn push_json_body(
 /// that produces it.
 pub const AFFECTED_COLUMN: &str = "pgrst_affected";
 
+/// Column carrying the written row whole, for a computed relationship.
+///
+/// A computed relationship is a function of the parent row, and after a
+/// mutation the parent is a CTE whose row type is anonymous -- `record`, which
+/// PostgreSQL will not cast to the table's composite type. Inside the
+/// statement the real table is still in scope, so the row is taken there,
+/// where a bare reference to it yields the composite, and travels out through
+/// `RETURNING` as an ordinary column. It is stripped from the response like
+/// any other column added for embedding.
+pub const PARENT_ROW_COLUMN: &str = "pgrst_parent_row";
+
 /// The `RETURNING` list, qualified by the relation being written.
 ///
 /// `RETURNING` sees everything in the statement's scope, which for an
@@ -1112,6 +1133,17 @@ fn push_returning(frag: &mut SqlFragment, relation: &str, returning: &[String]) 
     for (i, column) in returning.iter().enumerate() {
         if i > 0 {
             frag.push(", ");
+        }
+        // The row itself, not a column of it. A bare reference to the relation
+        // is the whole row typed as the table's composite, which is the one
+        // thing a computed relationship can be called with -- and this is the
+        // only place it can be taken, because one level up the CTE has turned
+        // it into a `record`.
+        if column == PARENT_ROW_COLUMN {
+            frag.push(&escape_ident(relation));
+            frag.push(" AS ");
+            frag.push(&escape_ident(PARENT_ROW_COLUMN));
+            continue;
         }
         frag.push(&escape_ident(relation));
         frag.push(".");

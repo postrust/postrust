@@ -21,7 +21,7 @@ Complete reference for the Postrust REST and GraphQL APIs.
 | `PUT` | `/{table}` | Upsert row |
 | `DELETE` | `/{table}` | Delete rows |
 | `HEAD` | `/{table}` | Get headers only |
-| `OPTIONS` | `/{table}` | Get table info |
+| `OPTIONS` | `/{table}` | The methods this table allows, in `Allow` |
 
 ### RPC Functions
 
@@ -30,12 +30,48 @@ Complete reference for the Postrust REST and GraphQL APIs.
 | `GET` | `/rpc/{function}` | Call read-only function |
 | `POST` | `/rpc/{function}` | Call any function |
 | `HEAD` | `/rpc/{function}` | Get function headers |
-| `OPTIONS` | `/rpc/{function}` | Get function info |
+| `OPTIONS` | `/rpc/{function}` | The methods this function allows, in `Allow` |
 
 By default, RPC results are array-wrapped and keyed by function name
 (`[{"my_func": ...}]`). In [compatibility mode](configuration.md#compatibility-settings)
 they match PostgREST: a bare object/scalar for non-set-returning functions and a
 top-level array for set-returning ones.
+
+### OPTIONS and Allow
+
+`OPTIONS` reports what a resource actually answers, in the `Allow` header. It
+is derived from the schema rather than fixed, so it is worth reading before
+assuming a `405`.
+
+For a table or view:
+
+- `OPTIONS, GET, HEAD` always.
+- `POST` where the relation is insertable, `PATCH` where it is updatable,
+  `DELETE` where it is deletable.
+- `PUT` only where the relation is both insertable and updatable **and** has a
+  primary key. `PUT` replaces one row named by its key, so a keyless view that
+  is otherwise fully writable offers `POST`, `PATCH` and `DELETE` and not
+  `PUT`.
+
+A view's writability is what PostgreSQL can actually do with it — whether it
+is simple enough to write through automatically, or carries an `INSTEAD OF`
+trigger that says how. Being granted `INSERT` on a view does not make it
+insertable, and Postrust no longer reports it as such.
+
+For a function:
+
+- `OPTIONS, POST` for a `VOLATILE` function, which may change data.
+- `OPTIONS, GET, HEAD, POST` for a `STABLE` or `IMMUTABLE` one. An overloaded
+  name is readable when any of its overloads is.
+
+```bash
+curl -i -X OPTIONS http://localhost:3000/api/users
+# Allow: OPTIONS,GET,HEAD,POST,PUT,PATCH,DELETE
+```
+
+This works under `/api` and, in compatibility mode, at the root as well. A
+CORS preflight to either keeps its `Access-Control-*` headers; naming a table
+that does not exist is a `404`, the same answer as asking for the table.
 
 ### GraphQL
 
@@ -195,7 +231,8 @@ GET /users?limit=10&offset=20
 
 ### Range Header
 
-Alternative pagination using HTTP Range header:
+Alternative pagination using the HTTP `Range` header. Rows are counted from
+zero and both bounds are inclusive, so `0-9` is the first ten.
 
 ```bash
 # Rows 0-9 (first 10)
@@ -205,13 +242,36 @@ Range: 0-9
 # Rows 100-149
 GET /users
 Range: 100-149
+
+# Row 100 to the end
+GET /users
+Range: 100-
+
+# The unit may be named, for a client that follows RFC 9110
+GET /users
+Range: items=100-149
 ```
 
-Response includes `Content-Range` header:
+A range whose end precedes its start names no rows, and is refused rather
+than widened into all of them:
 
 ```
-Content-Range: 0-9/100
+HTTP/1.1 416 Range Not Satisfiable
+{"code":"PGRST103","message":"Requested range not satisfiable", ...}
 ```
+
+The response reports the window it actually returned, and `206` rather than
+`200` when that window is a part of the whole:
+
+```
+HTTP/1.1 206 Partial Content
+Content-Range: 100-149/1000
+```
+
+`?limit=` and `?offset=` take precedence over the header where both are
+given, which is also PostgREST's rule. Note that `?offset=0` is an offset:
+it starts at the first row and overrides a `Range` that would have started
+later.
 
 ## Resource Embedding
 
@@ -358,12 +418,23 @@ Accept: application/openapi+json
 
 ## Response Headers
 
-| Header | Description |
-|--------|-------------|
-| `Content-Range` | Pagination info: `0-24/100` |
-| `Range-Unit` | Always `items` |
-| `Content-Location` | URL of created resource |
-| `Preference-Applied` | Applied Prefer values |
+| Header | When | Description |
+|--------|------|-------------|
+| `Content-Range` | Reads, and writes reporting a count | The window returned and the total: `0-24/100`, or `*/100` where no rows were returned |
+| `Range-Unit` | With `Content-Range` | Always `items` |
+| `Location` | `POST` with `Prefer: return=headers-only` | The primary key of the created row, as a query string: `/users?id=eq.42` |
+| `Preference-Applied` | When a `Prefer` was honoured | The preferences actually applied — see the note below |
+| `Allow` | `OPTIONS` | The methods this resource answers; see [OPTIONS and Allow](#options-and-allow) |
+| `WWW-Authenticate` | `401` | `Bearer`, and for a token that was read and refused, `error="invalid_token"` with an `error_description` naming what was wrong with it |
+
+**`Location` is sent only for `Prefer: return=headers-only`.** This matches
+PostgREST: a caller asking for the row back reads the key out of the body, and
+one asking for neither asked for a minimal response and gets one. Earlier
+versions of Postrust sent it on every insert.
+
+**`Preference-Applied` never reports `tx=`.** `Prefer: tx=rollback` is not
+implemented. Reporting it as applied while committing the write was worse than
+not offering it, so it is no longer named in the response.
 
 ## HTTP Status Codes
 

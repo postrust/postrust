@@ -104,8 +104,9 @@ pub enum ClaimFault {
 /// JWT validation error.
 #[derive(Debug, thiserror::Error)]
 pub enum JwtError {
+    /// Nothing said who is asking, and there is no anonymous role to be.
     #[error("Anonymous access is disabled")]
-    MissingHeader,
+    NoIdentity,
 
     #[error("Unsupported token type")]
     InvalidHeaderFormat,
@@ -133,7 +134,7 @@ pub fn authenticate(auth_header: Option<&str>, config: &JwtConfig) -> Result<Aut
         None => {
             return match &config.anon_role {
                 Some(role) => Ok(AuthResult::anonymous(role)),
-                None => Err(JwtError::MissingHeader),
+                None => Err(JwtError::NoIdentity),
             };
         }
     };

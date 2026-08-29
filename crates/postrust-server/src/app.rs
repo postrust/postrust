@@ -24,7 +24,10 @@ use tracing::{debug, error};
 /// is still in scope and a bare reference to it yields the composite, and the
 /// embed expression reads it from there. It is stripped from the response like
 /// any other column added for embedding.
-const PARENT_ROW_COLUMN: &str = "pgrst_parent_row";
+///
+/// Defined in `postrust-core` beside the `RETURNING` that emits it for a
+/// mutation, so the two spellings cannot drift.
+use postrust_core::query::PARENT_ROW_COLUMN;
 
 /// Marks an embedded object whose columns belong to its parent.
 ///
@@ -272,16 +275,6 @@ const LOCATION_KEY_PREFIX: &str = "pgrst_location_";
 /// rendered value, read from the first column.
 const MEDIA_ROW_COUNT_COLUMN: &str = "pgrst_media_rows";
 
-/// Whether this request writes rows of a table.
-fn is_relation_mutation(api_request: &ApiRequest) -> bool {
-    use postrust_core::api_request::{Action, DbAction};
-
-    matches!(
-        &api_request.action,
-        Action::Db(DbAction::RelationMut { .. })
-    )
-}
-
 /// Whether this request writes the row its URL names.
 fn is_upsert(api_request: &ApiRequest) -> bool {
     use postrust_core::api_request::{Action, DbAction, Mutation};
@@ -379,7 +372,7 @@ fn jwt_error(error: postrust_auth::JwtError) -> postrust_core::Error {
     use postrust_auth::JwtError;
 
     match error {
-        JwtError::MissingHeader => postrust_core::Error::MissingAuth,
+        JwtError::NoIdentity => postrust_core::Error::MissingAuth,
         JwtError::SecretMissing => postrust_core::Error::JwtSecretMissing,
         // Read, and found wanting: the token itself is intact, and what it
         // claims is what was not accepted.
@@ -480,20 +473,63 @@ async fn execute_plan(
                 || matches!(&media_handler, Some((_, _, true, _)));
             let db_plan = &if needs_parent_row {
                 let mut adjusted = db_plan.clone();
-                // A function's result is a relation too, named after the
-                // function, so the row is reachable there by exactly the same
-                // means -- which is what makes a computed relationship work on
+                // A function's result is a relation too, so the row is
+                // reachable there by exactly the same means -- which is what
+                // makes a computed relationship work on
                 // `/rpc/getallvideogames` and not only on a table.
+                //
+                // Named after the table it returns, not after the function.
+                // The builder aliases the call to that table (`FROM
+                // test.getallvideogames() AS videogames`), because a computed
+                // *column* has to be able to name the row it is a function of.
+                // Naming the function here instead asks for a relation that is
+                // no longer in scope, and the request that used to work --
+                // `?select=name,designer:computed_designers(name)` -- answers
+                // `column "getallvideogames" does not exist`.
                 let (tree, relation) = match &mut adjusted {
                     DbActionPlan::Read(tree) => {
                         let relation = tree.root.from.name.clone();
                         (Some(tree), relation)
                     }
-                    DbActionPlan::Call { call, read } => {
-                        let relation = call.function.name.clone();
+                    DbActionPlan::Call { read, .. } => {
+                        let relation = read
+                            .as_ref()
+                            .map(|tree| tree.root.from.name.clone())
+                            .unwrap_or_default();
                         (read.as_mut(), relation)
                     }
-                    DbActionPlan::MutateRead { .. } => (None, String::new()),
+                    // The row is taken inside the statement, by `RETURNING`,
+                    // and read back off the CTE as an ordinary column -- so
+                    // unlike the two above there is no relation to name here,
+                    // and the read tree selects the column rather than a row.
+                    DbActionPlan::MutateRead { mutate, read } => {
+                        let returning = match mutate {
+                            postrust_core::plan::MutatePlan::Insert { returning, .. }
+                            | postrust_core::plan::MutatePlan::Update { returning, .. }
+                            | postrust_core::plan::MutatePlan::Delete { returning, .. } => {
+                                returning
+                            }
+                        };
+                        if !returning.iter().any(|c| c == PARENT_ROW_COLUMN) {
+                            returning.push(PARENT_ROW_COLUMN.to_string());
+                        }
+                        // A mutation that returns no body has no read tree,
+                        // and nothing to embed into either.
+                        if let Some(read) = read.as_mut() {
+                            if !read.root.select.iter().any(|field| {
+                                field.alias.as_deref() == Some(PARENT_ROW_COLUMN)
+                                    || field.field.name == PARENT_ROW_COLUMN
+                            }) {
+                                read.root.select.push(
+                                    postrust_core::plan::CoercibleSelectField::simple(
+                                        PARENT_ROW_COLUMN,
+                                        "",
+                                    ),
+                                );
+                            }
+                        }
+                        (None, String::new())
+                    }
                 };
 
                 if let Some(tree) = tree {
@@ -650,15 +686,12 @@ async fn execute_plan(
                     }) =>
                 {
                     let schema_cache = state.schema_cache().await;
-                    // A computed relationship takes the parent's row, and a
-                    // mutation's result is a CTE whose row type is anonymous
-                    // -- there is nothing to pass it. Saying so here leaves
-                    // the embed out rather than referring to a column the
-                    // query does not have.
-                    let parent_row = match is_mutation(db_plan) {
-                        true => "",
-                        false => PARENT_ROW_COLUMN_REF,
-                    };
+                    // A computed relationship takes the parent's row, which
+                    // now reaches here on every path: a read names the table,
+                    // and a mutation returns the row out of the statement
+                    // where it still has the table's type rather than the
+                    // CTE's anonymous one.
+                    let parent_row = PARENT_ROW_COLUMN_REF;
                     build_embed_expressions(
                         &schema_cache,
                         &parent_qi,
@@ -1451,13 +1484,21 @@ pub async fn options_allow(
         return next.run(request).await;
     }
 
+    // Not every route is the API's. A layer added to the router wraps every
+    // one of them, so `/admin` and `/_` arrive here too, and answering those
+    // with what a table allows -- or with "no such table" -- takes a working
+    // preflight and turns it into a 404.
+    let Some(path) = api_path(request.uri().path(), state.config.compat_mode) else {
+        return next.run(request).await;
+    };
+
     let verbatim_db_errors = state.config.compat_mode;
 
     // Built here, from borrows, before anything is awaited: `axum::body::Body`
     // is `Send` but not `Sync`, and `&T` is `Send` only where `T` is `Sync`, so
     // a `&Request` held across an await makes the whole future not `Send` --
     // which a middleware has to be.
-    let probe = probe_request(&request);
+    let probe = probe_request(&request, path);
     let allow = match probe {
         Ok(probe) => resolve_allow(&state, probe).await,
         Err(error) => Err(error),
@@ -1474,15 +1515,63 @@ pub async fn options_allow(
         }
         // Asking what may be done with a table that is not there is answered
         // the same way as asking for the table.
-        Err(error) => error_response(error, verbatim_db_errors).into_response(),
+        Err(error) => {
+            let mut refusal = error_response(error, verbatim_db_errors).into_response();
+            // The CORS layer wrote its headers on the response this replaces.
+            // Without them a browser reports the request as blocked by CORS
+            // rather than as the 404 it earned, which is a different thing to
+            // go and fix.
+            for (name, value) in response.headers() {
+                if name.as_str().starts_with("access-control-") || name == http::header::VARY {
+                    refusal.headers_mut().append(name, value.clone());
+                }
+            }
+            refusal
+        }
     }
 }
 
-/// The request again, with an empty body, for the parser to read.
-fn probe_request(request: &Request) -> Result<http::Request<bytes::Bytes>, postrust_core::Error> {
+/// The path the API parser should read, or `None` where the request names
+/// something that is not the REST surface.
+///
+/// A layer added with `Router::layer` wraps each endpoint, and `nest` puts its
+/// prefix-stripping *inside* that endpoint -- so the path seen here is the one
+/// the client wrote and still carries the mount it arrived under, unlike the
+/// one the handler reads.
+fn api_path(path: &str, compat_mode: bool) -> Option<&str> {
+    /// Whether a path names a mount point or something under it.
+    fn under(path: &str, mount: &str) -> bool {
+        path == mount || path.strip_prefix(mount).is_some_and(|r| r.starts_with('/'))
+    }
+
+    if under(path, "/admin") || under(path, "/_") || under(path, "/api/graphql") {
+        return None;
+    }
+    if under(path, "/api") {
+        return Some(match path.strip_prefix("/api") {
+            None | Some("") => "/",
+            Some(rest) => rest,
+        });
+    }
+    // Everywhere else the REST surface exists only in compatibility mode,
+    // where it answers at the root. Without it `/` is this server's own
+    // directory of endpoints, which allows what its handler allows.
+    compat_mode.then_some(path)
+}
+
+/// The request again, with an empty body and the API's own path, for the
+/// parser to read.
+fn probe_request(
+    request: &Request,
+    path: &str,
+) -> Result<http::Request<bytes::Bytes>, postrust_core::Error> {
+    let target = match request.uri().query() {
+        Some(query) => format!("{path}?{query}"),
+        None => path.to_string(),
+    };
     let mut builder = http::Request::builder()
         .method(request.method().clone())
-        .uri(request.uri().clone());
+        .uri(target);
     for (name, value) in request.headers() {
         builder = builder.header(name, value);
     }
@@ -1720,6 +1809,16 @@ fn round_coordinates(value: &mut serde_json::Value) {
     }
 }
 
+/// Where the response's window starts.
+///
+/// The same resolution the plan itself used, asked again rather than restated:
+/// the JSON path and the rendered-media path both report a `Content-Range`,
+/// and a `Content-Range` that disagrees with the rows underneath it is worse
+/// than none at all.
+fn top_level_offset(api_request: &ApiRequest) -> i64 {
+    postrust_core::plan::resolve_top_level_range(api_request).offset
+}
+
 /// The first column of a row, as the bytes the client should receive.
 ///
 /// A media type the schema declared is carried by a domain, and a domain is a
@@ -1727,21 +1826,6 @@ fn round_coordinates(value: &mut serde_json::Value) {
 /// own text rendering. For text, xml or json that rendering is the value. For
 /// `bytea` it is `\x` followed by hex, which is a description of the bytes
 /// and not the bytes, so it is decoded back.
-/// Where the response's window starts.
-///
-/// An explicit top-level `?offset=` if there is one, and the range taken from
-/// the `Range` header otherwise. Both the JSON path and the rendered-media
-/// path report a `Content-Range` and must agree on where it begins.
-fn top_level_offset(api_request: &ApiRequest) -> i64 {
-    api_request
-        .query_params
-        .ranges
-        .get("")
-        .map(|range| range.offset)
-        .filter(|offset| *offset != 0)
-        .unwrap_or(api_request.top_level_range.offset)
-}
-
 fn raw_column(row: &sqlx::postgres::PgRow, base_type: &str) -> Option<Vec<u8>> {
     use sqlx::{Row, ValueRef};
 
@@ -1924,7 +2008,6 @@ fn is_read_only(api_request: &ApiRequest) -> bool {
 ///
 /// Only reads and calls are counted. A mutation's `Content-Range` reports the
 /// rows it affected, which is the result set itself.
-#[allow(clippy::result_large_err)] // consistent with the crate's error type
 fn unpaged_sql(
     db_plan: &postrust_core::plan::DbActionPlan,
     role: &str,
@@ -2112,7 +2195,6 @@ fn mutation_status(
 /// Returns the columns that were added purely to make the join possible, so
 /// they can be removed from the response afterwards. An empty select list means
 /// "all columns", in which case nothing needs adding.
-#[allow(clippy::result_large_err)] // consistent with the crate's error type
 fn add_embed_join_columns(
     api_request: &mut postrust_core::api_request::ApiRequest,
     schema_cache: &postrust_core::SchemaCache,
@@ -2182,12 +2264,10 @@ fn add_embed_join_columns(
 
         // A computed relationship joins on nothing -- the parent row is the
         // function's argument. That row has to be carried out of the inner
-        // query, which is a column of its own rather than a join key. A
-        // mutation has no such row to carry, so the embed is left out there.
+        // query, which is a column of its own rather than a join key. After a
+        // mutation it is carried out of the statement itself, by `RETURNING`,
+        // because that is the last place the row still has the table's type.
         if plan.function.is_some() {
-            if is_relation_mutation(api_request) {
-                continue;
-            }
             if !added.iter().any(|c| c == PARENT_ROW_COLUMN) {
                 added.push(PARENT_ROW_COLUMN.to_string());
             }
@@ -2235,7 +2315,6 @@ fn add_embed_join_columns(
 ///
 /// `alias_counter` hands out a distinct alias per level, so a self-referential
 /// relationship stays unambiguous.
-#[allow(clippy::result_large_err)] // consistent with the crate's error type
 /// Filters addressed at embedded resources, and the parameters they bind.
 ///
 /// The embed expressions are assembled as SQL text and wrapped around a main
@@ -2309,7 +2388,6 @@ impl EmbedFilters<'_> {
     }
 
     /// The `WHERE` fragment for one embedded resource, or `None` if unfiltered.
-    #[allow(clippy::result_large_err)] // consistent with the crate's error type
     /// The row window an embedded resource was asked for.
     ///
     /// The server's own cap still applies, so an embed cannot be asked for
@@ -2329,7 +2407,6 @@ impl EmbedFilters<'_> {
         (limit, offset)
     }
 
-    #[allow(clippy::result_large_err)] // consistent with the crate's error type
     fn predicate_for(
         &mut self,
         path: &[String],
@@ -2614,7 +2691,6 @@ fn embedded_by_name<'a>(
 /// `order=clients(name)` orders by a column the parent does not have, so each
 /// term becomes a scalar subselect fetched per parent row -- the same shape as
 /// the embed itself, reduced to one column.
-#[allow(clippy::result_large_err)] // consistent with the crate's error type
 fn build_embed_orders(
     schema_cache: &postrust_core::SchemaCache,
     parent_qi: &postrust_core::api_request::QualifiedIdentifier,
@@ -2710,7 +2786,6 @@ fn build_embed_orders(
 /// rendered as a bare column name orders by a column of the wrong table --
 /// silently, where the parent happens to have a column of that name, and with
 /// `column "cost" does not exist` where it does not.
-#[allow(clippy::result_large_err)] // consistent with the crate's error type
 fn related_order_target(
     schema_cache: &postrust_core::SchemaCache,
     parent_qi: &postrust_core::api_request::QualifiedIdentifier,
@@ -2770,7 +2845,6 @@ fn related_order_target(
 /// `tasks.order=projects(id).desc` orders them by a column of a table the
 /// child embeds in turn -- so it is resolved against the child, and rendered
 /// as the same correlated subselect the top level uses.
-#[allow(clippy::result_large_err)] // consistent with the crate's error type
 #[allow(clippy::too_many_arguments)] // each names one part of where the embed sits
 fn embed_order_sql(
     schema_cache: &postrust_core::SchemaCache,
@@ -2852,7 +2926,6 @@ fn embed_order_sql(
     Ok(Some(rendered.join(", ")))
 }
 
-#[allow(clippy::result_large_err)] // consistent with the crate's error type
 #[allow(clippy::too_many_arguments)] // each names one part of where the embed sits
 fn build_embed_expressions(
     schema_cache: &postrust_core::SchemaCache,
@@ -3686,6 +3759,52 @@ fn sanitize_error_message(error: &postrust_core::Error) -> String {
 
 #[cfg(test)]
 mod tests {
+    /// The REST surface is mounted at `/api`, and an `OPTIONS` reaches the
+    /// layer before the mount is stripped off.
+    #[test]
+    fn the_api_path_is_the_one_below_the_mount() {
+        assert_eq!(super::api_path("/api/items", false), Some("/items"));
+        assert_eq!(super::api_path("/api/rpc/f", false), Some("/rpc/f"));
+        assert_eq!(super::api_path("/api", false), Some("/"));
+        assert_eq!(super::api_path("/api/", false), Some("/"));
+    }
+
+    /// Answering for a route that is not the API's turns a working preflight
+    /// into a 404 for a table nobody asked about.
+    #[test]
+    fn a_route_that_is_not_the_api_is_left_alone() {
+        for path in [
+            "/admin",
+            "/admin/swagger",
+            "/_",
+            "/_/health",
+            "/api/graphql",
+        ] {
+            assert_eq!(super::api_path(path, false), None, "{path}");
+            assert_eq!(super::api_path(path, true), None, "{path}");
+        }
+    }
+
+    /// Outside the mounts the surface exists only in compatibility mode,
+    /// where PostgREST's own paths answer at the root.
+    #[test]
+    fn the_root_is_the_api_only_in_compatibility_mode() {
+        assert_eq!(super::api_path("/items", true), Some("/items"));
+        assert_eq!(super::api_path("/", true), Some("/"));
+        assert_eq!(super::api_path("/items", false), None);
+        assert_eq!(super::api_path("/", false), None);
+    }
+
+    /// A mount is a path segment: `/apiary` is not under `/api`.
+    #[test]
+    fn a_mount_matches_whole_segments_only() {
+        assert_eq!(super::api_path("/apiary", true), Some("/apiary"));
+        assert_eq!(
+            super::api_path("/administrators", true),
+            Some("/administrators")
+        );
+    }
+
     /// A data-modifying `WITH` may only appear at the top level, so anything
     /// that wraps the statement has to leave the clause where it is.
     #[test]

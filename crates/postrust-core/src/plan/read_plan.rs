@@ -265,14 +265,14 @@ fn build_select_fields(items: &[SelectItem], table: &Table) -> Result<Vec<Coerci
 /// server-configured `max_rows` is then applied as a ceiling, so a request that
 /// asks for no limit -- or for more rows than the server permits -- cannot pull
 /// an unbounded result set into memory.
-fn resolve_top_level_range(request: &ApiRequest) -> Range {
+pub fn resolve_top_level_range(request: &ApiRequest) -> Range {
     let mut range = request.top_level_range.clone();
 
     if let Some(from_params) = request.query_params.ranges.get("") {
         if from_params.limit.is_some() {
             range.limit = from_params.limit;
         }
-        if from_params.offset != 0 {
+        if from_params.offset_explicit {
             range.offset = from_params.offset;
         }
     }

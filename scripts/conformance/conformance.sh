@@ -206,6 +206,24 @@ assert_key_order
 python3 "$HERE/run.py" "$WORK/cases.json" "http://localhost:$CAND_PORT" \
     "$WORK/cand.json" "$RESET_CMD >/dev/null 2>&1"
 
+# What was actually measured, written beside the diff so that anything
+# publishing these numbers reads it from the run rather than from whatever was
+# typed on a command line. The features are the ones this script built with a
+# few lines up, and `assert_key_order` has already confirmed the running binary
+# agrees; the commit is what produced it.
+#
+# Run 4 is why: it was measured with a binary `cargo test --workspace` had
+# quietly rebuilt without `compat-key-order`, and nothing in its output said so.
+cat > "$WORK/run-meta.json" <<META
+{
+  "postgrest": "$PGRST_VERSION",
+  "features": "admin-ui,compat-key-order",
+  "compatMode": true,
+  "commit": "$(git -C "$REPO_ROOT" rev-parse HEAD)",
+  "measured": "$(date -u +%Y-%m-%d)"
+}
+META
+
 say "Report"
 python3 "$HERE/report.py" "$WORK/ref.json" "$WORK/cand.json" "$WORK/diff.json" \
     | tee "$WORK/report.txt"

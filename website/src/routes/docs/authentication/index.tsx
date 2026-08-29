@@ -53,6 +53,47 @@ export default component$(() => {
             </div>
           </section>
 
+          {/* How claims are checked */}
+          <section class="mb-12">
+            <h2 class="text-2xl font-bold text-neutral-900 mb-4">How the claims are checked</h2>
+            <p class="text-neutral-600 mb-4">
+              A claim that is absent is not a claim that is wrong: a token carrying no{" "}
+              <code class="font-mono">exp</code> does not expire, and one carrying no{" "}
+              <code class="font-mono">aud</code> is for anybody. Only a claim that is present and
+              is not the kind of thing that claim is gets rejected.
+            </p>
+            <ul class="space-y-3 text-neutral-600">
+              <li class="flex gap-3">
+                <span class="text-primary-600 font-mono text-sm mt-0.5">exp</span>
+                <span>
+                  Checked to the second. Forgiving an expiry keeps a session alive past the moment
+                  its issuer said it ended, so no slack is given here.
+                </span>
+              </li>
+              <li class="flex gap-3">
+                <span class="text-primary-600 font-mono text-sm mt-0.5">nbf, iat</span>
+                <span>
+                  Thirty seconds of clock skew allowed. These describe a token that is not valid
+                  yet, and a client whose clock runs slightly fast mints one through nobody's
+                  fault; refusing it makes a working deployment fail intermittently.
+                </span>
+              </li>
+              <li class="flex gap-3">
+                <span class="text-primary-600 font-mono text-sm mt-0.5">role</span>
+                <span>
+                  Must be a string. A role claim of any other shape names no role and falls back to
+                  the anonymous role, rather than asking PostgreSQL for a role of that spelling.
+                </span>
+              </li>
+            </ul>
+            <p class="text-neutral-600 mt-4">
+              A <code class="font-mono">401</code> names which refusal in its{" "}
+              <code class="font-mono">WWW-Authenticate</code> challenge, so a client can tell
+              &ldquo;rotate your key&rdquo; from &ldquo;fix your clock&rdquo; without reading the
+              body.
+            </p>
+          </section>
+
           {/* Configuration */}
           <section class="mb-12">
             <h2 class="text-2xl font-bold text-neutral-900 mb-4">Configuration</h2>
