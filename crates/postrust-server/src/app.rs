@@ -24,7 +24,10 @@ use tracing::{debug, error};
 /// is still in scope and a bare reference to it yields the composite, and the
 /// embed expression reads it from there. It is stripped from the response like
 /// any other column added for embedding.
-const PARENT_ROW_COLUMN: &str = "pgrst_parent_row";
+///
+/// Defined in `postrust-core` beside the `RETURNING` that emits it for a
+/// mutation, so the two spellings cannot drift.
+use postrust_core::query::PARENT_ROW_COLUMN;
 
 /// Marks an embedded object whose columns belong to its parent.
 ///
@@ -272,16 +275,6 @@ const LOCATION_KEY_PREFIX: &str = "pgrst_location_";
 /// rendered value, read from the first column.
 const MEDIA_ROW_COUNT_COLUMN: &str = "pgrst_media_rows";
 
-/// Whether this request writes rows of a table.
-fn is_relation_mutation(api_request: &ApiRequest) -> bool {
-    use postrust_core::api_request::{Action, DbAction};
-
-    matches!(
-        &api_request.action,
-        Action::Db(DbAction::RelationMut { .. })
-    )
-}
-
 /// Whether this request writes the row its URL names.
 fn is_upsert(api_request: &ApiRequest) -> bool {
     use postrust_core::api_request::{Action, DbAction, Mutation};
@@ -480,20 +473,63 @@ async fn execute_plan(
                 || matches!(&media_handler, Some((_, _, true, _)));
             let db_plan = &if needs_parent_row {
                 let mut adjusted = db_plan.clone();
-                // A function's result is a relation too, named after the
-                // function, so the row is reachable there by exactly the same
-                // means -- which is what makes a computed relationship work on
+                // A function's result is a relation too, so the row is
+                // reachable there by exactly the same means -- which is what
+                // makes a computed relationship work on
                 // `/rpc/getallvideogames` and not only on a table.
+                //
+                // Named after the table it returns, not after the function.
+                // The builder aliases the call to that table (`FROM
+                // test.getallvideogames() AS videogames`), because a computed
+                // *column* has to be able to name the row it is a function of.
+                // Naming the function here instead asks for a relation that is
+                // no longer in scope, and the request that used to work --
+                // `?select=name,designer:computed_designers(name)` -- answers
+                // `column "getallvideogames" does not exist`.
                 let (tree, relation) = match &mut adjusted {
                     DbActionPlan::Read(tree) => {
                         let relation = tree.root.from.name.clone();
                         (Some(tree), relation)
                     }
-                    DbActionPlan::Call { call, read } => {
-                        let relation = call.function.name.clone();
+                    DbActionPlan::Call { read, .. } => {
+                        let relation = read
+                            .as_ref()
+                            .map(|tree| tree.root.from.name.clone())
+                            .unwrap_or_default();
                         (read.as_mut(), relation)
                     }
-                    DbActionPlan::MutateRead { .. } => (None, String::new()),
+                    // The row is taken inside the statement, by `RETURNING`,
+                    // and read back off the CTE as an ordinary column -- so
+                    // unlike the two above there is no relation to name here,
+                    // and the read tree selects the column rather than a row.
+                    DbActionPlan::MutateRead { mutate, read } => {
+                        let returning = match mutate {
+                            postrust_core::plan::MutatePlan::Insert { returning, .. }
+                            | postrust_core::plan::MutatePlan::Update { returning, .. }
+                            | postrust_core::plan::MutatePlan::Delete { returning, .. } => {
+                                returning
+                            }
+                        };
+                        if !returning.iter().any(|c| c == PARENT_ROW_COLUMN) {
+                            returning.push(PARENT_ROW_COLUMN.to_string());
+                        }
+                        // A mutation that returns no body has no read tree,
+                        // and nothing to embed into either.
+                        if let Some(read) = read.as_mut() {
+                            if !read.root.select.iter().any(|field| {
+                                field.alias.as_deref() == Some(PARENT_ROW_COLUMN)
+                                    || field.field.name == PARENT_ROW_COLUMN
+                            }) {
+                                read.root.select.push(
+                                    postrust_core::plan::CoercibleSelectField::simple(
+                                        PARENT_ROW_COLUMN,
+                                        "",
+                                    ),
+                                );
+                            }
+                        }
+                        (None, String::new())
+                    }
                 };
 
                 if let Some(tree) = tree {
@@ -650,15 +686,12 @@ async fn execute_plan(
                     }) =>
                 {
                     let schema_cache = state.schema_cache().await;
-                    // A computed relationship takes the parent's row, and a
-                    // mutation's result is a CTE whose row type is anonymous
-                    // -- there is nothing to pass it. Saying so here leaves
-                    // the embed out rather than referring to a column the
-                    // query does not have.
-                    let parent_row = match is_mutation(db_plan) {
-                        true => "",
-                        false => PARENT_ROW_COLUMN_REF,
-                    };
+                    // A computed relationship takes the parent's row, which
+                    // now reaches here on every path: a read names the table,
+                    // and a mutation returns the row out of the statement
+                    // where it still has the table's type rather than the
+                    // CTE's anonymous one.
+                    let parent_row = PARENT_ROW_COLUMN_REF;
                     build_embed_expressions(
                         &schema_cache,
                         &parent_qi,
@@ -2231,12 +2264,10 @@ fn add_embed_join_columns(
 
         // A computed relationship joins on nothing -- the parent row is the
         // function's argument. That row has to be carried out of the inner
-        // query, which is a column of its own rather than a join key. A
-        // mutation has no such row to carry, so the embed is left out there.
+        // query, which is a column of its own rather than a join key. After a
+        // mutation it is carried out of the statement itself, by `RETURNING`,
+        // because that is the last place the row still has the table's type.
         if plan.function.is_some() {
-            if is_relation_mutation(api_request) {
-                continue;
-            }
             if !added.iter().any(|c| c == PARENT_ROW_COLUMN) {
                 added.push(PARENT_ROW_COLUMN.to_string());
             }
