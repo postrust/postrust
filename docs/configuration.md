@@ -103,6 +103,10 @@ PGRST_SERVER_CORS_ORIGINS="*"
 
 ## Compatibility Settings
 
+How closely Postrust matches PostgREST is measured against PostgREST itself;
+see [PostgREST conformance](postgrest-conformance.md) for what is covered and
+where the two differ deliberately.
+
 | Variable | Description | Default |
 |----------|-------------|---------|
 | `PGRST_COMPAT_MODE` | PostgREST compatibility mode (alias: `POSTRUST_COMPAT_MODE`) | `false` |

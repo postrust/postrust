@@ -36,7 +36,7 @@ Postrust is a high-performance, serverless-first REST API server for PostgreSQL 
 | **Filtering** | ✅ | `eq`, `neq`, `gt`, `lt`, `gte`, `lte`, `like`, `ilike`, `in`, `is` |
 | **Full-Text Search** | ✅ | `fts`, `plfts`, `phfts`, `wfts` operators |
 | **Ordering** | ✅ | `order=column.asc`, `order=column.desc.nullsfirst` |
-| **Pagination** | ✅ | `limit`, `offset`, Range headers |
+| **Pagination** | ✅ | `limit`, `offset`, and `Range` headers (`0-9`, `100-149`, `100-`) |
 | **Column Selection** | ✅ | `select=col1,col2,relation(nested)` |
 | **Resource Embedding** | ✅ | Nested resources via foreign keys |
 | **RPC Functions** | ✅ | Call stored procedures via `/api/rpc/function_name` (`/rpc/...` in [compatibility mode](#postgrest-compatibility)) |
@@ -182,8 +182,14 @@ curl "http://localhost:3000/users?order=role.asc,name.desc"
 # Pagination
 curl "http://localhost:3000/users?limit=10&offset=20"
 
-# Range header
+# Range header -- any window, not only one starting at the first row
 curl http://localhost:3000/users -H "Range: 0-9"
+curl http://localhost:3000/users -H "Range: 100-149"   # -> 206, Content-Range: 100-149/1000
+curl http://localhost:3000/users -H "Range: 100-"      # row 100 to the end
+
+# What a resource allows, derived from the schema
+curl -i -X OPTIONS http://localhost:3000/users
+# Allow: OPTIONS,GET,HEAD,POST,PUT,PATCH,DELETE
 ```
 
 #### Resource Embedding
@@ -580,11 +586,19 @@ the rest are documented here so you don't assume bit-for-bit compatibility.
 | REST base path | `/` (e.g. `POST /rpc/foo`) | Nested under `/api` (e.g. `POST /api/rpc/foo`) — leaves room for `/api/graphql`, `/admin` on the same server | Also served at `/` |
 | RPC response shape | Bare result: `{...}` for a single/scalar return, a top-level array for set-returning functions | Array-wrapped, function-name-keyed: `[{"foo": {...}}]` | Un-wrapped to match PostgREST |
 | Config source | Config file **and** env vars | Environment variables only | — |
-| Root endpoint `/` | OpenAPI spec | Small JSON server-info document | Unchanged |
+| Root endpoint `/` | OpenAPI spec | Small JSON server-info document | Serves neither yet — see below |
+| Object key order | Select order | Alphabetical, or select order with the `compat-key-order` build feature | Unchanged — it is a build-time choice |
+| `Prefer: tx=rollback` | Honoured | Not implemented, and not reported as applied | — |
+| JWT `exp` / `nbf` | All checked to the second | `exp` to the second; 30s clock skew on `nbf` and `iat` | — |
 
-Other known gaps (contributions welcome): the OpenAPI spec lives under
-`/admin` (behind the `admin-ui` feature) rather than at `/`, and not every
-PostgREST config knob is implemented yet.
+The differences that are deliberate — including cases where PostgREST is the
+one that is wrong — are listed with their evidence in
+[PostgREST conformance](docs/postgrest-conformance.md).
+
+The largest gap is the OpenAPI document. PostgREST serves Swagger 2.0 at `/`;
+Postrust serves OpenAPI 3.0 for its own surface under `/admin`, behind the
+`admin-ui` feature, and does not yet generate PostgREST's. Not every PostgREST
+config knob is implemented either. Contributions welcome.
 
 ### PostgREST compatibility
 
@@ -611,6 +625,14 @@ curl -X POST http://localhost:3000/rpc/get_statistics
 ```
 
 This is opt-in so existing Postrust deployments keep their current behavior.
+
+How closely the two agree is measured rather than asserted: the harness in
+`scripts/conformance/` replays PostgREST's own test cases over HTTP against
+both servers on identically loaded fixture databases. Over 1499 cases against
+PostgREST v16.1, **96.1% agree on status and body, and 94.3% on the full
+contract** — status, body, and every header that is part of the answer. See
+[PostgREST conformance](docs/postgrest-conformance.md) for what that covers,
+where the two disagree on purpose, and what is still open.
 
 ## Roadmap
 

@@ -33,6 +33,14 @@ differ between any two servers and say nothing about conformance.
 | 12  | 90.3% | 83.0% | before the harness configuration was corrected |
 | 13  | —     | —     | reference only; candidate half cut short (see below) |
 | 14  | 96.0% | 87.1% | committed binary, corrected reference |
+| 4   | 95.9% | 93.1% | **not publishable** — measured without `compat-key-order` |
+| 8   | —     | —     | died at `writes 300/431`; the machine had filled its disk |
+| 9   | 96.1% | 94.3% | clean: both halves complete, 0 transport failures, features verified at runtime |
+
+Run 9 by group: reads 95.6% / 93.8%, writes 97.2% / 95.4%. It is the first run
+whose provenance is recorded rather than remembered — see below. Its reference
+was re-recorded rather than reused, because `run.py`'s `encode_path` had
+changed and a reference records the answers to requests as they were sent.
 
 Run 14 confirmed the three specs `0d8ef2f` claimed: CustomMedia 19/50 → 50/50,
 PostGIS 1/13 → 13/13, Plan 4/29 → 29/29, ExtraSearchPath 8/9 → 9/9.
@@ -116,6 +124,14 @@ the wire; that needs a client that writes its own request line.
 can only move every percentage up. It counts and names them now. The two halves
 replay the same file, so the count should always be zero — which is the point:
 a silent zero and a silent skip look identical until one of them isn't.
+
+**A run did not record what it had measured.** Run 4's figures were quoted for
+weeks before anyone could say which features its binary carried, and the answer
+turned out to be "not the ones that matter". The harness now writes
+`run-meta.json` beside `diff.json` — reference version, build features, commit,
+date — and `scripts/gen-conformance.mjs` refuses to publish a run without it,
+or one whose features do not include `compat-key-order`. A number that cannot
+say what produced it is not a measurement.
 
 **Non-compatibility mode is not measured at all.** The harness runs
 `PGRST_COMPAT_MODE=true`, where the REST surface answers at the root. In the

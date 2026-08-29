@@ -59,6 +59,29 @@ PGRST_DB_ANON_ROLE="web_anon"
 | `aud` | Audience | Optional |
 | `sub` | Subject (user ID) | Optional |
 
+#### How the claims are checked
+
+A claim that is absent is not a claim that is wrong. A token carrying no `exp`
+does not expire; one carrying no `aud` is for anybody. Only a claim that is
+*present and not the kind of thing that claim is* is rejected — `"exp":
+"soon"` is a malformed token, and so is an `aud` that is neither a string nor
+a list of them.
+
+**`exp` is checked to the second.** `nbf` and `iat` are given thirty seconds
+of slack. The asymmetry is deliberate: `nbf` and `iat` describe a token that
+is not valid *yet*, and a client whose clock runs slightly fast mints one
+through nobody's fault, so refusing it makes a working deployment fail
+intermittently. Forgiving an `exp` is a different thing — it keeps a session
+alive past the second its issuer said it ended.
+
+**A role claim must be a string.** `"role": 42` or `"role": {"a": 1}` names no
+role; it falls back to `PGRST_DB_ANON_ROLE` exactly as an absent claim does,
+rather than asking PostgreSQL for a role of that spelling.
+
+Faults are reported in a fixed order, so a token that is both expired and out
+of audience is reported as expired — the first thing wrong with it, and the
+one the client can act on.
+
 ### Custom Claims
 
 Add any custom claims for use in RLS policies:
@@ -287,35 +310,66 @@ $$;
 
 ## Error Handling
 
-### Missing Token
+A `401` also carries a `WWW-Authenticate` challenge. Where no token was
+offered it is a plain `Bearer`; where a token was read and refused it names
+which refusal, so a client can tell "rotate your key" from "fix your clock"
+without parsing the body:
 
-```json
-{
-  "code": "PGRST301",
-  "message": "JWT token required"
-}
 ```
-HTTP Status: 401
+WWW-Authenticate: Bearer error="invalid_token", error_description="JWT expired"
+```
 
-### Invalid Token
+### No identity — `PGRST302`
+
+Nothing said who is asking, and there is no `PGRST_DB_ANON_ROLE` to be.
 
 ```json
 {
   "code": "PGRST302",
-  "message": "Invalid JWT token"
+  "message": "Anonymous access is disabled"
 }
 ```
 HTTP Status: 401
 
-### Expired Token
+### The token could not be read — `PGRST301`
+
+The signature did not verify, the key was wrong, or the `Authorization`
+header was not a bearer token.
+
+```json
+{
+  "code": "PGRST301",
+  "message": "JWT cryptographic operation failed"
+}
+```
+HTTP Status: 401
+
+### The token was read and refused — `PGRST303`
+
+The signature verified and the claims were not acceptable. The message names
+which claim: `JWT expired`, `JWT not yet valid`, `JWT issued at future`,
+`JWT not in audience`, `The JWT 'exp' claim must be a number`, or `The JWT
+'aud' claim must be a string or an array of strings`.
 
 ```json
 {
   "code": "PGRST303",
-  "message": "JWT token has expired"
+  "message": "JWT expired"
 }
 ```
 HTTP Status: 401
+
+### No JWT secret configured — `PGRST300`
+
+A token was offered and the server has nothing to verify it with.
+
+```json
+{
+  "code": "PGRST300",
+  "message": "Server lacks JWT secret"
+}
+```
+HTTP Status: 500
 
 ### Insufficient Permissions
 
