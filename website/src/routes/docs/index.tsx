@@ -69,6 +69,13 @@ const docSections = [
     href: "/docs/benchmarks",
     icon: "chart",
   },
+  {
+    title: "PostgREST Conformance",
+    description:
+      "How closely the two agree, measured by replaying PostgREST's own test cases against both servers",
+    href: "/docs/conformance",
+    icon: "chart",
+  },
 ];
 
 const iconPaths: Record<string, string> = {

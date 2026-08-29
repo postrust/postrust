@@ -3,9 +3,14 @@
 //! Handles content negotiation and response formatting for JSON, CSV, and other formats.
 
 mod headers;
+pub use headers::parse_guc_headers;
 mod json;
 
-pub use headers::{build_response_headers, ContentRange};
+pub use headers::ContentRange;
+// Re-exported for the crates.io consumers the name is public API for. Allowed
+// here so that the re-export itself does not trip the deprecation it carries.
+#[allow(deprecated)]
+pub use headers::build_response_headers;
 pub use json::format_json_response;
 
 use http::{HeaderMap, HeaderValue, StatusCode};
@@ -47,6 +52,19 @@ impl Response {
     }
 
     /// Set a header.
+    /// Add a header without replacing one of the same name.
+    ///
+    /// A response may legitimately carry two `Set-Cookie`s, which `set_header`
+    /// -- being a replace -- cannot express.
+    pub fn append_header(&mut self, name: &str, value: &str) {
+        if let (Ok(name), Ok(value)) = (
+            http::header::HeaderName::from_bytes(name.as_bytes()),
+            HeaderValue::from_str(value),
+        ) {
+            self.headers.append(name, value);
+        }
+    }
+
     pub fn set_header(&mut self, name: &str, value: &str) {
         if let Ok(v) = HeaderValue::from_str(value) {
             self.headers.insert(
@@ -83,6 +101,63 @@ pub fn format_response(
         .cloned()
         .unwrap_or(MediaType::ApplicationJson);
 
+    // A mutation the caller wanted no representation from sends no body at
+    // all -- not an empty JSON array, which is what an empty row set would
+    // otherwise render as. The headers still apply.
+    // A media type the schema renders itself: the database produced the whole
+    // payload, so there is nothing here to serialise.
+    if let Some((media_type, body)) = &result.raw_body {
+        let mut response = Response::new(result.status, body.clone());
+        // Every media type the server names is UTF-8 except the ones that are
+        // not text at all: a stream of bytes has no encoding, and one the
+        // schema named itself is not this side's to characterise.
+        let charset = match media_type.as_str() {
+            "application/octet-stream" => "",
+            already if already.contains("charset=") => "",
+            text if text.starts_with("text/") || text.contains("json") => "; charset=utf-8",
+            _ => "",
+        };
+        response.set_content_type(&format!("{}{}", media_type, charset));
+        // The body being rendered by something other than this side does not
+        // change what else the response has to say: where the created row is,
+        // which preference was honoured, what the function set. Only the body
+        // was somebody else's to write.
+        add_common_headers(&mut response, request, result);
+        return Ok(response);
+    }
+
+    if result.omit_body {
+        // Asking for a single object is a constraint on the statement, not on
+        // the payload: a caller that named one row and changed five has not
+        // had its request answered, however little of it it wanted back.
+        if let MediaType::SingularJson { nullable, .. } = &media_type {
+            match (result.affected, nullable) {
+                (1, _) | (0, true) => {}
+                (0, false) => return Err(FormatError::NotFound),
+                _ => return Err(FormatError::MultipleRows),
+            }
+        }
+        let mut response = Response::new(result.status, bytes::Bytes::new());
+        add_common_headers(&mut response, request, result);
+        return Ok(response);
+    }
+
+    // `;nulls=stripped` asks for keys with a null value to be left out
+    // entirely, rather than sent as nulls.
+    let rows = match &media_type {
+        MediaType::SingularJson {
+            strip_nulls: true, ..
+        }
+        | MediaType::ArrayJson {
+            strip_nulls: true, ..
+        } => result.rows.iter().cloned().map(strip_nulls).collect(),
+        _ => result.rows.clone(),
+    };
+    let result = &QueryResult {
+        rows,
+        ..result.clone()
+    };
+
     match &media_type {
         MediaType::ApplicationJson => {
             let body = if result.singular {
@@ -103,14 +178,14 @@ pub fn format_response(
             add_common_headers(&mut response, request, result);
             Ok(response)
         }
-        MediaType::SingularJson { nullable } => {
+        MediaType::SingularJson { nullable, .. } => {
             let body = format_singular_json(&result.rows, *nullable)?;
             let mut response = Response::new(result.status, body);
             response.set_content_type("application/vnd.pgrst.object+json; charset=utf-8");
             add_common_headers(&mut response, request, result);
             Ok(response)
         }
-        _ => {
+        other => {
             // Default to JSON (covers `*/*`, e.g. a default curl request).
             let body = if result.singular {
                 format_singular_or_null(&result.rows)?
@@ -118,15 +193,80 @@ pub fn format_response(
                 format_json_response(&result.rows)?
             };
             let mut response = Response::new(result.status, body);
-            response.set_content_type("application/json; charset=utf-8");
+            // The body is JSON either way, but a client that asked for one of
+            // PostgREST's own JSON media types is told it got that: the type
+            // is how it knows the shape it negotiated was honoured.
+            let content_type = match other {
+                MediaType::ArrayJson { .. } => "application/vnd.pgrst.array+json; charset=utf-8",
+                MediaType::OpenApi => "application/openapi+json; charset=utf-8",
+                _ => "application/json; charset=utf-8",
+            };
+            response.set_content_type(content_type);
             add_common_headers(&mut response, request, result);
             Ok(response)
         }
     }
 }
 
+/// Which preferences this request could honour.
+pub(crate) fn preference_scope(
+    request: &ApiRequest,
+) -> postrust_core::api_request::preferences::PreferenceScope {
+    use postrust_core::api_request::preferences::PreferenceScope;
+    use postrust_core::api_request::{Action, DbAction, Mutation};
+
+    let Action::Db(action) = &request.action else {
+        return PreferenceScope::read();
+    };
+
+    match action {
+        DbAction::RelationMut { mutation, .. } => PreferenceScope {
+            resolution: matches!(mutation, Mutation::Create),
+            representation: true,
+            missing: matches!(mutation, Mutation::Create | Mutation::Update),
+            max_affected: matches!(mutation, Mutation::Update | Mutation::Delete),
+        },
+        DbAction::Routine { .. } => PreferenceScope {
+            max_affected: true,
+            ..PreferenceScope::read()
+        },
+        _ => PreferenceScope::read(),
+    }
+}
+
+/// Remove every key whose value is null, at every depth.
+///
+/// `Accept: application/vnd.pgrst.array+json;nulls=stripped` asks for a body
+/// carrying only what a row actually has, which for a wide table with few
+/// populated columns is most of the response.
+fn strip_nulls(value: serde_json::Value) -> serde_json::Value {
+    match value {
+        serde_json::Value::Object(fields) => serde_json::Value::Object(
+            fields
+                .into_iter()
+                .filter(|(_, value)| !value.is_null())
+                .map(|(key, value)| (key, strip_nulls(value)))
+                .collect(),
+        ),
+        serde_json::Value::Array(items) => {
+            serde_json::Value::Array(items.into_iter().map(strip_nulls).collect())
+        }
+        other => other,
+    }
+}
+
 /// Add common response headers.
 fn add_common_headers(response: &mut Response, request: &ApiRequest, result: &QueryResult) {
+    // A function's own headers, added rather than replaced: the shape of the
+    // setting is an array precisely so that a name may repeat.
+    if let Some(guc) = &result.guc_headers {
+        if let Some(headers) = crate::headers::parse_guc_headers(guc) {
+            for (name, value) in headers {
+                response.append_header(&name, &value);
+            }
+        }
+    }
+
     // Content-Range
     if let Some(range) = &result.content_range {
         response.set_content_range(range);
@@ -137,10 +277,16 @@ fn add_common_headers(response: &mut Response, request: &ApiRequest, result: &Qu
         response.set_location(location);
     }
 
+    // Allow (for OPTIONS)
+    if let Some(allow) = &result.allow {
+        response.set_header("allow", allow);
+    }
+
     // Preference-Applied
-    if let Some(applied) =
-        postrust_core::api_request::preferences::preference_applied(&request.preferences)
-    {
+    if let Some(applied) = postrust_core::api_request::preferences::preference_applied(
+        &request.preferences,
+        preference_scope(request),
+    ) {
         response.set_header("preference-applied", &applied);
     }
 
@@ -234,16 +380,40 @@ pub struct QueryResult {
     pub content_range: Option<ContentRange>,
     /// Location header (for POST)
     pub location: Option<String>,
+    /// The methods an OPTIONS request is answering about.
+    ///
+    /// Only an OPTIONS sets this; every other response leaves it `None` and
+    /// sends no `Allow`, since the question was not asked.
+    pub allow: Option<String>,
     /// Custom headers from GUC
     pub guc_headers: Option<String>,
     /// Custom status from GUC
     pub guc_status: Option<String>,
+    /// Whether to send no body at all.
+    ///
+    /// Set for a mutation the caller asked no representation from: the
+    /// response carries headers and a status but no payload, where an empty
+    /// row set would otherwise render as `[]`.
+    pub omit_body: bool,
+    /// How many rows the statement affected.
+    ///
+    /// Distinct from `rows.len()`, which is empty when no representation was
+    /// asked for. How many rows a write touched is a fact about the write, and
+    /// a caller that asked for exactly one object is owed an answer about it
+    /// whether or not it wanted the object back.
+    pub affected: usize,
     /// Whether the result should be rendered as a single (un-arrayed) value.
     ///
     /// Set for PostgREST-compatibility RPC responses where the underlying
     /// function is not set-returning: the bare object/scalar is returned
     /// instead of a one-element array.
     pub singular: bool,
+    /// A body the database rendered in full, with the media type it is in.
+    ///
+    /// Set when the request asked for a media type the schema declares its own
+    /// renderer for. The value is the whole payload, so it replaces the usual
+    /// JSON rendering rather than being wrapped in it.
+    pub raw_body: Option<(String, Vec<u8>)>,
 }
 
 /// Response formatting error.

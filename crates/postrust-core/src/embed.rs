@@ -34,6 +34,82 @@ pub struct EmbedPlan {
     pub foreign_table: String,
     /// Whether the relationship yields many rows per parent.
     pub is_list: bool,
+    /// Every column pair the join is on, parent side first.
+    ///
+    /// Usually one. A foreign key over several columns joins on all of them,
+    /// and the pairs are ordered so each parent column sits with the child
+    /// column it actually references.
+    pub columns: Vec<(String, String)>,
+    /// The junction of a many-to-many relationship, if that is what this is.
+    ///
+    /// The parent and the child share no key; each points at a table that
+    /// exists to join them, so reaching the child means going through it.
+    pub junction: Option<EmbedJunction>,
+    /// The function behind a computed relationship, if that is what this is.
+    ///
+    /// A computed relationship is a function taking the parent row and
+    /// returning rows of the related table. There is no key to join on -- the
+    /// parent row is the argument -- so the columns above are empty and the
+    /// relationship can only be expressed as a call correlated to the parent.
+    pub function: Option<crate::api_request::QualifiedIdentifier>,
+}
+
+/// The table a many-to-many relationship is joined through.
+#[derive(Clone, Debug)]
+pub struct EmbedJunction {
+    pub schema: String,
+    pub table: String,
+    /// `(parent column, junction column)` for each column the parent joins on.
+    ///
+    /// Usually one. A junction may be keyed over several columns on each side
+    /// -- `touched_files` joins `files(project_id, filename)` to
+    /// `users_tasks(user_id, task_id)` -- and joining on the first of them
+    /// alone would relate rows that are not related.
+    pub parent_columns: Vec<(String, String)>,
+    /// `(junction column, child column)` for each column the child joins on.
+    pub child_columns: Vec<(String, String)>,
+}
+
+impl EmbedJunction {
+    /// The junction's join to the child, one equality per column pair.
+    fn child_join(&self, junction_alias: &str, child_alias: &str) -> String {
+        Self::equalities(&self.child_columns, junction_alias, child_alias, true)
+    }
+
+    /// The junction's correlation to one parent row, one equality per pair.
+    fn parent_correlation(&self, junction_alias: &str, parent_alias: &str) -> String {
+        Self::equalities(&self.parent_columns, junction_alias, parent_alias, false)
+    }
+
+    /// `junction.column = other.column` for each pair, joined with `AND`.
+    ///
+    /// `junction_first` says which half of the pair is the junction's, the two
+    /// lists running in opposite directions: the parent's own column comes
+    /// first on the way in, and the child's second on the way out.
+    fn equalities(
+        pairs: &[(String, String)],
+        junction_alias: &str,
+        other_alias: &str,
+        junction_first: bool,
+    ) -> String {
+        pairs
+            .iter()
+            .map(|(left, right)| {
+                let (junction_column, other_column) = match junction_first {
+                    true => (left, right),
+                    false => (right, left),
+                };
+                format!(
+                    "{}.{} = {}.{}",
+                    postrust_sql::escape_ident(junction_alias),
+                    postrust_sql::escape_ident(junction_column),
+                    postrust_sql::escape_ident(other_alias),
+                    postrust_sql::escape_ident(other_column),
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(" AND ")
+    }
 }
 
 impl EmbedPlan {
@@ -44,25 +120,74 @@ impl EmbedPlan {
     pub fn resolve(relationship: &Relationship, schema_cache: &SchemaCache) -> Result<Self> {
         let foreign_table_qi = relationship.foreign_table().clone();
 
-        let columns = match relationship {
-            Relationship::ForeignKey { cardinality, .. } => cardinality.columns(),
-            Relationship::Computed { .. } => {
-                return Err(Error::EmbeddingError(
-                    "embedding a computed relationship is not supported yet".into(),
-                ))
-            }
-        };
-
-        if columns.len() != 1 {
-            return Err(Error::EmbeddingError(format!(
-                "embedding \"{}\" is not supported yet: it joins on {} columns and \
-                 only single-column joins are implemented",
-                foreign_table_qi.name,
-                columns.len()
-            )));
+        // A computed relationship takes the parent row as its argument, so
+        // there is nothing to look up and nothing to join on.
+        if let Relationship::Computed {
+            function,
+            foreign_table,
+            to_one,
+            ..
+        } = relationship
+        {
+            return Ok(Self {
+                local_column: String::new(),
+                foreign_column: String::new(),
+                foreign_column_type: String::new(),
+                foreign_schema: foreign_table.schema.clone(),
+                foreign_table: foreign_table.name.clone(),
+                is_list: !to_one,
+                columns: Vec::new(),
+                junction: None,
+                function: Some(function.clone()),
+            });
         }
 
-        let (local_column, foreign_column) = columns[0].clone();
+        if let Relationship::ForeignKey {
+            cardinality: crate::schema_cache::Cardinality::M2M(junction),
+            ..
+        } = relationship
+        {
+            // The join itself is written from every column pair below. These
+            // two are the parent's and the child's first key column, which is
+            // what the batched path groups by -- and it refuses a junction
+            // keyed on more than one, rather than grouping by half a key.
+            let (local_column, _) =
+                junction.source_columns.first().cloned().ok_or_else(|| {
+                    Error::EmbeddingError("junction has no source columns".into())
+                })?;
+            let (_, foreign_column) =
+                junction.target_columns.first().cloned().ok_or_else(|| {
+                    Error::EmbeddingError("junction has no target columns".into())
+                })?;
+
+            return Ok(Self {
+                local_column,
+                foreign_column,
+                foreign_column_type: String::new(),
+                foreign_schema: foreign_table_qi.schema.clone(),
+                foreign_table: foreign_table_qi.name.clone(),
+                // A junction always yields a set: that is what it is for.
+                is_list: true,
+                columns: Vec::new(),
+                junction: Some(EmbedJunction {
+                    schema: junction.table.schema.clone(),
+                    table: junction.table.name.clone(),
+                    parent_columns: junction.source_columns.clone(),
+                    child_columns: junction.target_columns.clone(),
+                }),
+                function: None,
+            });
+        }
+
+        let columns = match relationship {
+            Relationship::ForeignKey { cardinality, .. } => cardinality.columns(),
+            Relationship::Computed { .. } => unreachable!("handled above"),
+        };
+
+        let (local_column, foreign_column) = columns
+            .first()
+            .cloned()
+            .ok_or_else(|| Error::EmbeddingError("relationship joins on no columns".into()))?;
 
         let foreign_table: &Table = schema_cache.get_table(&foreign_table_qi).ok_or_else(|| {
             Error::EmbeddingError(format!(
@@ -88,7 +213,36 @@ impl EmbedPlan {
             foreign_schema: foreign_table_qi.schema.clone(),
             foreign_table: foreign_table_qi.name.clone(),
             is_list: !relationship.is_to_one(),
+            columns,
+            junction: None,
+            function: None,
         })
+    }
+
+    /// The predicate correlating child rows to one parent row.
+    ///
+    /// A foreign key over several columns joins on all of them, so this is one
+    /// equality per pair rather than a single one.
+    fn correlation(&self, parent_alias: &str, child_alias: &str) -> String {
+        let pairs = if self.columns.is_empty() {
+            vec![(self.local_column.clone(), self.foreign_column.clone())]
+        } else {
+            self.columns.clone()
+        };
+
+        pairs
+            .iter()
+            .map(|(local, foreign)| {
+                format!(
+                    "{}.{} = {}.{}",
+                    postrust_sql::escape_ident(child_alias),
+                    postrust_sql::escape_ident(foreign),
+                    postrust_sql::escape_ident(parent_alias),
+                    postrust_sql::escape_ident(local),
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(" AND ")
     }
 
     /// SQL that fetches every related row for the given parent key values.
@@ -145,6 +299,27 @@ impl EmbedPlan {
     /// `limit` still bounds the rows scanned, not the rows per parent, so it is
     /// applied to the inner select exactly as the ungrouped form does.
     pub fn children_grouped_sql(&self, limit: Option<i64>, columns: &[String]) -> Result<String> {
+        if self
+            .junction
+            .as_ref()
+            .is_some_and(|j| j.parent_columns.len() > 1)
+        {
+            return Err(Error::EmbeddingError(format!(
+                "embedding \"{}\" this way is not supported: it joins through a junction \
+                 keyed on several columns, and grouping children by key needs a single one",
+                self.foreign_table,
+            )));
+        }
+
+        if self.columns.len() > 1 {
+            return Err(Error::EmbeddingError(format!(
+                "embedding \"{}\" this way is not supported: it joins on {} columns, and \
+                 grouping children by key needs a single one",
+                self.foreign_table,
+                self.columns.len()
+            )));
+        }
+
         let type_name = castable_type_name(&self.foreign_column_type).ok_or_else(|| {
             Error::EmbeddingError(format!(
                 "cannot embed \"{}\": join column type \"{}\" is not a plain type name",
@@ -192,27 +367,81 @@ impl EmbedPlan {
     /// request, so embedding does not change how a NUMERIC or a timestamp is
     /// rendered. Only the relationship column arrives as JSON, which is what
     /// the separate child query already returned.
+    #[allow(clippy::too_many_arguments)] // one parameter per SQL clause
     pub fn embed_expression(
         &self,
         parent_alias: &str,
+        parent_row: &str,
         child_alias: &str,
         inner_select: &str,
         limit: Option<i64>,
+        // `clients.offset=1` skips rows inside the embed. A to-one embed that
+        // is skipped past yields no row at all, which is null -- the same
+        // answer as no match, and the one PostgREST gives.
+        offset: i64,
+        child_where: Option<&str>,
+        // `clients.order=name.desc` orders the rows inside the embed, which
+        // belongs to the child's own subselect -- and has to be applied before
+        // the child's own limit, or the limit takes an unsorted window.
+        order_by: Option<&str>,
     ) -> Result<String> {
         // The child table is aliased rather than referred to by name. A
         // self-referential relationship would otherwise make the correlation
         // ambiguous, since the parent and the child are the same table.
-        let mut inner = format!(
-            "SELECT {} FROM {}.{} AS {} WHERE {}.{} = {}.{}",
-            inner_select,
-            postrust_sql::escape_ident(&self.foreign_schema),
-            postrust_sql::escape_ident(&self.foreign_table),
-            postrust_sql::escape_ident(child_alias),
-            postrust_sql::escape_ident(child_alias),
-            postrust_sql::escape_ident(&self.foreign_column),
-            postrust_sql::escape_ident(parent_alias),
-            postrust_sql::escape_ident(&self.local_column),
-        );
+        //
+        // A computed relationship is correlated by argument rather than by a
+        // key: the function takes the parent row, so the parent alias is
+        // passed to it and there is no predicate to write.
+        let mut inner = match &self.function {
+            Some(function) => format!(
+                "SELECT {} FROM {}.{}({}) AS {} WHERE true",
+                inner_select,
+                postrust_sql::escape_ident(&function.schema),
+                postrust_sql::escape_ident(&function.name),
+                parent_row,
+                postrust_sql::escape_ident(child_alias),
+            ),
+            None => match &self.junction {
+                // Two hops: the child is reached through the table that joins
+                // it to the parent, so the correlation lands on the junction.
+                Some(junction) => {
+                    let junction_alias = format!("{}_j", child_alias);
+                    format!(
+                        "SELECT {} FROM {}.{} AS {} JOIN {}.{} AS {} ON {} WHERE {}",
+                        inner_select,
+                        postrust_sql::escape_ident(&self.foreign_schema),
+                        postrust_sql::escape_ident(&self.foreign_table),
+                        postrust_sql::escape_ident(child_alias),
+                        postrust_sql::escape_ident(&junction.schema),
+                        postrust_sql::escape_ident(&junction.table),
+                        postrust_sql::escape_ident(&junction_alias),
+                        junction.child_join(&junction_alias, child_alias),
+                        junction.parent_correlation(&junction_alias, parent_alias),
+                    )
+                }
+                None => format!(
+                    "SELECT {} FROM {}.{} AS {} WHERE {}",
+                    inner_select,
+                    postrust_sql::escape_ident(&self.foreign_schema),
+                    postrust_sql::escape_ident(&self.foreign_table),
+                    postrust_sql::escape_ident(child_alias),
+                    self.correlation(parent_alias, child_alias),
+                ),
+            },
+        };
+
+        // Filters written against the embedded resource (`clients.id=eq.1`)
+        // narrow the children, exactly as they would if the child had been
+        // requested on its own.
+        if let Some(child_where) = child_where {
+            inner.push_str(" AND ");
+            inner.push_str(child_where);
+        }
+
+        if let Some(order_by) = order_by {
+            inner.push_str(" ORDER BY ");
+            inner.push_str(order_by);
+        }
 
         // A to-one relationship takes the first row; a to-many takes them all.
         // The limit bounds rows per parent here, which is what a client asking
@@ -224,23 +453,137 @@ impl EmbedPlan {
             inner.push_str(" LIMIT 1");
         }
 
+        if offset > 0 {
+            inner.push_str(&format!(" OFFSET {}", offset));
+        }
+
         let alias = postrust_sql::escape_ident(&format!("{}_j", child_alias));
 
+        // Cast to `jsonb`, as PostgREST does -- `COALESCE(json_agg(..),'[]')::jsonb`.
+        // Only visible where an embedded row is rendered as text rather than
+        // as part of a JSON body: `jsonb` normalises what `json` keeps
+        // verbatim, so a schema-declared handler that stringifies the whole
+        // row wrote `{"id":1}` where PostgREST wrote `{"id": 1}`.
         Ok(if self.is_list {
             // An empty array rather than null, so the shape does not depend on
             // whether the parent happens to have children.
             format!(
-                "COALESCE((SELECT json_agg(row_to_json({alias})) FROM ({inner}) {alias}), '[]'::json)",
+                "COALESCE((SELECT json_agg(row_to_json({alias})) FROM ({inner}) {alias}), '[]'::json)::jsonb",
                 alias = alias,
                 inner = inner
             )
         } else {
             format!(
-                "(SELECT row_to_json({alias}) FROM ({inner}) {alias})",
+                "(SELECT row_to_json({alias}) FROM ({inner}) {alias})::jsonb",
                 alias = alias,
                 inner = inner
             )
         })
+    }
+
+    /// A scalar subselect yielding one column of the related row.
+    ///
+    /// This is what `order=clients(name)` orders by: the parent has no such
+    /// column, so the value is fetched per parent row exactly as the embed
+    /// itself is. A to-many relationship has no single value to order by, so
+    /// the first row wins -- which is what `LIMIT 1` says and what PostgREST
+    /// does.
+    pub fn order_expression(
+        &self,
+        parent_alias: &str,
+        parent_row: &str,
+        child_alias: &str,
+        column_sql: &str,
+    ) -> String {
+        let source = match (&self.function, &self.junction) {
+            (Some(function), _) => format!(
+                "{}.{}({}) AS {} WHERE true",
+                postrust_sql::escape_ident(&function.schema),
+                postrust_sql::escape_ident(&function.name),
+                parent_row,
+                postrust_sql::escape_ident(child_alias),
+            ),
+            (None, Some(junction)) => {
+                let junction_alias = format!("{}_j", child_alias);
+                format!(
+                    "{}.{} AS {} JOIN {}.{} AS {} ON {} WHERE {}",
+                    postrust_sql::escape_ident(&self.foreign_schema),
+                    postrust_sql::escape_ident(&self.foreign_table),
+                    postrust_sql::escape_ident(child_alias),
+                    postrust_sql::escape_ident(&junction.schema),
+                    postrust_sql::escape_ident(&junction.table),
+                    postrust_sql::escape_ident(&junction_alias),
+                    junction.child_join(&junction_alias, child_alias),
+                    junction.parent_correlation(&junction_alias, parent_alias),
+                )
+            }
+            (None, None) => format!(
+                "{}.{} AS {} WHERE {}",
+                postrust_sql::escape_ident(&self.foreign_schema),
+                postrust_sql::escape_ident(&self.foreign_table),
+                postrust_sql::escape_ident(child_alias),
+                self.correlation(parent_alias, child_alias),
+            ),
+        };
+
+        format!("(SELECT {} FROM {} LIMIT 1)", column_sql, source)
+    }
+
+    /// An `EXISTS` predicate restricting parents to those with a matching child.
+    ///
+    /// This is what `!inner` means. The embed expression on its own only
+    /// decides what the relationship column contains; without this the parent
+    /// row survives even when the relationship matched nothing, which is a
+    /// left join. `child_where` should be the same predicate given to
+    /// [`Self::embed_expression`] -- placeholders may be referenced from both
+    /// places, so no parameter needs binding twice.
+    pub fn inner_join_predicate(
+        &self,
+        parent_alias: &str,
+        parent_row: &str,
+        child_alias: &str,
+        child_where: Option<&str>,
+    ) -> String {
+        let mut predicate = match &self.function {
+            Some(function) => format!(
+                "EXISTS (SELECT 1 FROM {}.{}({}) AS {} WHERE true",
+                postrust_sql::escape_ident(&function.schema),
+                postrust_sql::escape_ident(&function.name),
+                parent_row,
+                postrust_sql::escape_ident(child_alias),
+            ),
+            None => match &self.junction {
+                Some(junction) => {
+                    let junction_alias = format!("{}_j", child_alias);
+                    format!(
+                        "EXISTS (SELECT 1 FROM {}.{} AS {} JOIN {}.{} AS {} ON {} WHERE {}",
+                        postrust_sql::escape_ident(&self.foreign_schema),
+                        postrust_sql::escape_ident(&self.foreign_table),
+                        postrust_sql::escape_ident(child_alias),
+                        postrust_sql::escape_ident(&junction.schema),
+                        postrust_sql::escape_ident(&junction.table),
+                        postrust_sql::escape_ident(&junction_alias),
+                        junction.child_join(&junction_alias, child_alias),
+                        junction.parent_correlation(&junction_alias, parent_alias),
+                    )
+                }
+                None => format!(
+                    "EXISTS (SELECT 1 FROM {}.{} AS {} WHERE {}",
+                    postrust_sql::escape_ident(&self.foreign_schema),
+                    postrust_sql::escape_ident(&self.foreign_table),
+                    postrust_sql::escape_ident(child_alias),
+                    self.correlation(parent_alias, child_alias),
+                ),
+            },
+        };
+
+        if let Some(child_where) = child_where {
+            predicate.push_str(" AND ");
+            predicate.push_str(child_where);
+        }
+
+        predicate.push(')');
+        predicate
     }
 
     /// The child projection list: the requested columns plus the join column.
@@ -372,6 +715,64 @@ pub fn attach_to_parent(
     }
 }
 
+/// Merge a related resource's columns into the parent row itself.
+///
+/// This is what the `...` of `select=title,...directors(name)` means. Where
+/// [`attach_to_parent`] puts the related rows under a key of their own, a
+/// spread lifts their columns into the parent object, so the result stays flat.
+///
+/// Spreading a to-many relationship gives each column an array of that
+/// column's value across the matched rows, rather than an array of objects.
+///
+/// `columns` pairs each requested column with the key it should appear under,
+/// which differ when the client aliased it: `...clients(client_name:name)`
+/// reads `name` and writes `client_name`. Listing them explicitly is also what
+/// lets a parent with no matching child still carry the right keys with null
+/// values, since there is no child row to read the names off.
+///
+/// An empty list spreads nothing, which is what `...clients()` means. Falling
+/// back to every column the child happens to have would be actively wrong: the
+/// related table's own `id` would land on top of the parent's.
+pub fn spread_into_parent(
+    parent: &mut serde_json::Value,
+    plan: &EmbedPlan,
+    grouped: &HashMap<String, Vec<serde_json::Value>>,
+    columns: &[(String, String)],
+) {
+    let key = parent.get(&plan.local_column).and_then(key_to_text);
+    let matches = key
+        .as_ref()
+        .and_then(|k| grouped.get(k))
+        .cloned()
+        .unwrap_or_default();
+
+    let Some(object) = parent.as_object_mut() else {
+        return;
+    };
+
+    for (source, output) in columns {
+        let value = if plan.is_list {
+            serde_json::Value::Array(
+                matches
+                    .iter()
+                    .map(|child| {
+                        child
+                            .get(source)
+                            .cloned()
+                            .unwrap_or(serde_json::Value::Null)
+                    })
+                    .collect(),
+            )
+        } else {
+            matches
+                .first()
+                .and_then(|child| child.get(source).cloned())
+                .unwrap_or(serde_json::Value::Null)
+        };
+        object.insert(output.clone(), value);
+    }
+}
+
 /// Collect the distinct, non-null join keys of a set of parent rows.
 pub fn parent_keys(parents: &[serde_json::Value], local_column: &str) -> Vec<String> {
     let mut seen = std::collections::HashSet::new();
@@ -400,6 +801,9 @@ mod tests {
             foreign_schema: "public".into(),
             foreign_table: "posts".into(),
             is_list,
+            columns: vec![("id".into(), "user_id".into())],
+            junction: None,
+            function: None,
         }
     }
 
@@ -416,7 +820,16 @@ mod tests {
     #[test]
     fn embed_expression_aggregates_a_to_many_relation() {
         let sql = plan(true)
-            .embed_expression("p", "posts", r#""id", "title""#, None)
+            .embed_expression(
+                "p",
+                "\"p\"",
+                "posts",
+                r#""id", "title""#,
+                None,
+                0,
+                None,
+                None,
+            )
             .unwrap();
 
         assert!(sql.starts_with("COALESCE((SELECT json_agg("), "{}", sql);
@@ -436,7 +849,7 @@ mod tests {
     #[test]
     fn embed_expression_takes_one_row_for_a_to_one_relation() {
         let sql = plan(false)
-            .embed_expression("p", "author", r#""id""#, None)
+            .embed_expression("p", "\"p\"", "author", r#""id""#, None, 0, None, None)
             .unwrap();
 
         assert!(sql.contains("row_to_json"), "{}", sql);
@@ -451,7 +864,7 @@ mod tests {
     #[test]
     fn embed_expression_limits_rows_per_parent() {
         let sql = plan(true)
-            .embed_expression("p", "posts", r#""id""#, Some(25))
+            .embed_expression("p", "\"p\"", "posts", r#""id""#, Some(25), 0, None, None)
             .unwrap();
         assert!(sql.contains("LIMIT 25"), "{}", sql);
     }
@@ -574,5 +987,78 @@ mod tests {
         let mut unmatched = serde_json::json!({"id": 2});
         attach_to_parent(&mut unmatched, "author", &plan(false), &grouped);
         assert_eq!(unmatched["author"], serde_json::Value::Null);
+    }
+
+    #[test]
+    fn spread_lifts_a_to_one_relation_into_the_parent() {
+        let mut grouped = HashMap::new();
+        grouped.insert(
+            "1".to_string(),
+            vec![serde_json::json!({"first_name": "Ada", "last_name": "L"})],
+        );
+
+        let mut parent = serde_json::json!({"id": 1, "title": "Notes"});
+        spread_into_parent(
+            &mut parent,
+            &plan(false),
+            &grouped,
+            &[
+                ("first_name".into(), "first_name".into()),
+                ("last_name".into(), "last_name".into()),
+            ],
+        );
+
+        // Flat, not nested under a key of its own.
+        assert_eq!(parent["first_name"], "Ada");
+        assert_eq!(parent["last_name"], "L");
+        assert_eq!(parent["title"], "Notes");
+        assert!(parent.get("posts").is_none());
+    }
+
+    #[test]
+    fn spread_without_a_match_still_carries_the_requested_keys() {
+        let mut parent = serde_json::json!({"id": 9});
+        spread_into_parent(
+            &mut parent,
+            &plan(false),
+            &HashMap::new(),
+            &[("first_name".into(), "first_name".into())],
+        );
+        assert_eq!(parent["first_name"], serde_json::Value::Null);
+    }
+
+    #[test]
+    fn spread_of_a_to_many_relation_gives_a_column_per_array() {
+        let mut grouped = HashMap::new();
+        grouped.insert(
+            "1".to_string(),
+            vec![
+                serde_json::json!({"title": "a"}),
+                serde_json::json!({"title": "b"}),
+            ],
+        );
+
+        let mut parent = serde_json::json!({"id": 1});
+        spread_into_parent(
+            &mut parent,
+            &plan(true),
+            &grouped,
+            &[("title".into(), "title".into())],
+        );
+
+        assert_eq!(parent["title"], serde_json::json!(["a", "b"]));
+    }
+
+    #[test]
+    fn spread_without_a_column_list_adds_nothing() {
+        // `...clients()` spreads no columns. Taking every column the child has
+        // would drop the related table's `id` on top of the parent's.
+        let mut grouped = HashMap::new();
+        grouped.insert("1".to_string(), vec![serde_json::json!({"id": 7, "b": 2})]);
+
+        let mut parent = serde_json::json!({"id": 1});
+        spread_into_parent(&mut parent, &plan(false), &grouped, &[]);
+
+        assert_eq!(parent, serde_json::json!({"id": 1}));
     }
 }

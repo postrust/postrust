@@ -29,3 +29,6 @@ loadtest
 gen_targets.http
 gen_jwk.json
 gen_private.json
+scripts/conformance/.work
+scripts/conformance/.work-probe
+scripts/hasura-conformance/

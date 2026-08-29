@@ -627,6 +627,7 @@ mod tests {
                 enum_values: vec![],
                 is_pk: true,
                 position: 1,
+                domain_type: None,
             },
         );
         columns.insert(
@@ -642,6 +643,7 @@ mod tests {
                 enum_values: vec![],
                 is_pk: false,
                 position: 2,
+                domain_type: None,
             },
         );
 
@@ -655,6 +657,8 @@ mod tests {
             deletable,
             pk_cols: vec!["id".into()],
             columns,
+            computed_columns: Default::default(),
+            is_partitioned: false,
         }
     }
 
@@ -676,7 +680,9 @@ mod tests {
             relationships: HashMap::new(),
             routines: HashMap::new(),
             timezones: HashSet::new(),
+            media_handlers: HashMap::new(),
             pg_version: 150000,
+            representations: Default::default(),
         }
     }
 
@@ -951,6 +957,8 @@ mod tests {
             deletable: true,
             pk_cols: vec!["id".into()],
             columns: indexmap::IndexMap::new(),
+            computed_columns: Default::default(),
+            is_partitioned: false,
         };
         cache
             .tables

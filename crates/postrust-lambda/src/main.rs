@@ -2,6 +2,11 @@
 //!
 //! Deploys Postrust as an AWS Lambda function.
 
+// As in `postrust-core` and `postrust-server`: `postrust_core::Error` is wide
+// on purpose, and boxing it would put an allocation on the error path of every
+// request to save a return slot on the success path.
+#![allow(clippy::result_large_err)]
+
 use lambda_http::{run, service_fn, Body, Error, Request, Response};
 use sqlx::postgres::PgPoolOptions;
 use sqlx::PgPool;
@@ -45,9 +50,13 @@ async fn handler(event: Request) -> Result<Response<Body>, Error> {
     let schema_cache = SCHEMA_CACHE
         .get_or_init(|| async {
             info!("Loading schema cache");
-            let cache = postrust_core::SchemaCache::load(pool, &config.db_schemas)
-                .await
-                .expect("Failed to load schema cache");
+            let cache = postrust_core::SchemaCache::load_with_search_path(
+                pool,
+                &config.db_schemas,
+                &config.db_extra_search_path,
+            )
+            .await
+            .expect("Failed to load schema cache");
             Arc::new(RwLock::new(cache))
         })
         .await;

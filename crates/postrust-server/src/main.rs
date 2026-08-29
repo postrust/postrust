@@ -2,6 +2,11 @@
 //!
 //! A PostgREST-compatible REST API server for PostgreSQL.
 
+// This binary compiles `app` and `state` again as modules of its own crate,
+// so the crate-level allow in `lib.rs` does not reach them. See the note
+// there for why the lint is not worth satisfying.
+#![allow(clippy::result_large_err)]
+
 use anyhow::Result;
 use axum::{http::Method, response::Json, routing::any, Router};
 use sqlx::postgres::PgPoolOptions;
@@ -56,7 +61,12 @@ async fn main() -> Result<()> {
     info!("Connected to database");
 
     // Load schema cache
-    let schema_cache = postrust_core::SchemaCache::load(&pool, &config.db_schemas).await?;
+    let schema_cache = postrust_core::SchemaCache::load_with_search_path(
+        &pool,
+        &config.db_schemas,
+        &config.db_extra_search_path,
+    )
+    .await?;
     info!("{}", schema_cache.summary());
 
     // Create app state
@@ -215,21 +225,29 @@ async fn main() -> Result<()> {
         }
     }
 
-    // Add root info endpoint
-    app = app.route(
-        "/",
-        axum::routing::get(|| async {
-            Json(serde_json::json!({
-                "name": "postrust",
-                "version": env!("CARGO_PKG_VERSION"),
-                "api": "/api",
-                "custom": "/_",
-                "health": "/_/health",
-                "admin": "/admin",
-                "docs": "/admin/swagger"
-            }))
-        }),
-    );
+    // Add root info endpoint.
+    //
+    // Not in compatibility mode: there `/` is part of the API surface -- it is
+    // where PostgREST serves the schema description, and where it reports an
+    // `Accept-Profile` naming a schema that is not exposed. A directory of
+    // this server's own endpoints in its place answers a different question
+    // from the one asked.
+    if !config.compat_mode {
+        app = app.route(
+            "/",
+            axum::routing::get(|| async {
+                Json(serde_json::json!({
+                    "name": "postrust",
+                    "version": env!("CARGO_PKG_VERSION"),
+                    "api": "/api",
+                    "custom": "/_",
+                    "health": "/_/health",
+                    "admin": "/admin",
+                    "docs": "/admin/swagger"
+                }))
+            }),
+        );
+    }
 
     // Apply CORS and state
     let app = app
@@ -248,6 +266,13 @@ async fn main() -> Result<()> {
                 .allow_headers(CorsAny)
                 .expose_headers(CorsAny),
         )
+        // Outermost, so it runs before the CORS layer -- which answers every
+        // OPTIONS itself and never calls what it wraps, so nothing downstream
+        // of it can say what a resource allows.
+        .layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            app::options_allow,
+        ))
         .with_state(state);
 
     // Start server
@@ -255,7 +280,9 @@ async fn main() -> Result<()> {
     let listener = tokio::net::TcpListener::bind(&addr).await?;
     info!("Listening on http://{}", addr);
 
-    axum::serve(listener, app).await?;
+    // Wrapped so that a request target carrying a raw `>` or `"` reaches the
+    // router instead of being refused by the URI parser. See `lenient_uri`.
+    axum::serve(postrust_server::lenient_uri::LenientListener(listener), app).await?;
 
     Ok(())
 }

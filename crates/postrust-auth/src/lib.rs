@@ -67,32 +67,61 @@ impl Default for JwtConfig {
     }
 }
 
+/// What was wrong with a token's claims.
+///
+/// Separate from the failures above because a token whose claims are wrong was
+/// read successfully: the signature verified, the server has the right key,
+/// and what remains is a disagreement about the claims themselves. A client
+/// that cannot tell those apart cannot tell "rotate your key" from "your clock
+/// is wrong".
+#[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
+pub enum ClaimFault {
+    #[error("JWT expired")]
+    Expired,
+
+    #[error("JWT not yet valid")]
+    NotYetValid,
+
+    #[error("JWT issued at future")]
+    IssuedInFuture,
+
+    #[error("JWT not in audience")]
+    NotInAudience,
+
+    #[error("Parsing claims failed")]
+    Unparsable,
+
+    /// A timestamp claim that is present and is not a timestamp.
+    #[error("The JWT '{0}' claim must be a number")]
+    NotANumber(&'static str),
+
+    #[error("The JWT 'aud' claim must be a string or an array of strings")]
+    AudienceNotStrings,
+}
+
 /// JWT validation error.
 #[derive(Debug, thiserror::Error)]
 pub enum JwtError {
-    #[error("Missing authorization header")]
-    MissingHeader,
+    /// Nothing said who is asking, and there is no anonymous role to be.
+    #[error("Anonymous access is disabled")]
+    NoIdentity,
 
-    #[error("Invalid authorization header format")]
+    #[error("Unsupported token type")]
     InvalidHeaderFormat,
 
-    #[error("Token expired")]
-    Expired,
+    #[error("Server lacks JWT secret")]
+    SecretMissing,
 
-    #[error("Token not yet valid")]
-    NotYetValid,
-
-    #[error("Invalid signature")]
+    #[error("JWT cryptographic operation failed")]
     InvalidSignature,
 
-    #[error("Invalid token: {0}")]
-    InvalidToken(String),
+    /// No key this server holds could decode the token.
+    #[error("No suitable key or wrong key type")]
+    NoSuitableKey,
 
-    #[error("Missing role claim")]
-    MissingRole,
-
-    #[error("Invalid audience")]
-    InvalidAudience,
+    /// The token was read, and its claims were not acceptable.
+    #[error("{0}")]
+    Claim(#[from] ClaimFault),
 }
 
 /// Extract and validate JWT from Authorization header.
@@ -103,7 +132,7 @@ pub fn authenticate(auth_header: Option<&str>, config: &JwtConfig) -> Result<Aut
         None => {
             return match &config.anon_role {
                 Some(role) => Ok(AuthResult::anonymous(role)),
-                None => Err(JwtError::MissingHeader),
+                None => Err(JwtError::NoIdentity),
             };
         }
     };

@@ -30,6 +30,43 @@ pub struct CoercibleField {
     pub default: Option<String>,
     /// Whether to select full row
     pub full_row: bool,
+    /// A function to read this field from, rather than a column of the table.
+    ///
+    /// Carries the relation to pass it as well as the function itself: the
+    /// call is `always_true(items)`, and the name of the row is only known
+    /// where the plan was built.
+    #[serde(default)]
+    pub computed: Option<ComputedRef>,
+}
+
+/// A computed field: a function applied to the row.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ComputedRef {
+    /// The function to call.
+    pub function: QualifiedIdentifier,
+    /// The relation whose row it takes, as it is named in the query.
+    pub relation: String,
+    /// The type that row is, which is not always what the query can infer.
+    ///
+    /// A mutation reads its rows back out of a CTE, and a CTE's row is a
+    /// `record`: `computed_overload(record) is not unique` is PostgreSQL
+    /// declining to choose between the overload on `items` and the one on
+    /// `items2`, because nothing said which it had. Casting the row to the
+    /// relation's own type says so, and is a no-op everywhere it was already
+    /// unambiguous.
+    pub row_type: QualifiedIdentifier,
+}
+
+/// Whether a JSON path over a column of `pg_type` has to go through `to_jsonb`.
+///
+/// `->` and `->>` are only defined on `json` and `jsonb`. PostgREST lets them
+/// reach into anything the database can render as JSON -- a composite type, an
+/// array -- by converting the column first, so `numbers->0` indexes an
+/// `integer[]` and `num->i` reads a field of a composite. A column that is
+/// already JSON is left alone: converting it would be a no-op at best and, for
+/// `json`, a needless re-parse.
+fn needs_to_json(json_path: &JsonPath, pg_type: &str) -> bool {
+    !json_path.is_empty() && !matches!(pg_type, "json" | "jsonb")
 }
 
 impl CoercibleField {
@@ -46,6 +83,7 @@ impl CoercibleField {
             transform: None,
             default: None,
             full_row: false,
+            computed: None,
         }
     }
 
@@ -54,13 +92,14 @@ impl CoercibleField {
         Self {
             name: field.name.clone(),
             json_path: field.json_path.clone(),
-            to_json: false,
+            to_json: needs_to_json(&field.json_path, pg_type),
             to_tsvector: None,
             ir_type: pg_type.to_string(),
             base_type: pg_type.to_string(),
             transform: None,
             default: None,
             full_row: false,
+            computed: None,
         }
     }
 }

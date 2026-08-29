@@ -84,6 +84,10 @@ impl QueryArgs {
         Range {
             offset: self.offset.unwrap_or(0),
             limit: self.limit,
+            // There is no `Range` header for a GraphQL argument to compete
+            // with, so whether the offset was written or defaulted decides
+            // nothing here.
+            offset_explicit: self.offset.is_some(),
         }
     }
 
@@ -372,6 +376,7 @@ mod tests {
                 enum_values: vec![],
                 is_pk: true,
                 position: 1,
+                domain_type: None,
             },
         );
         columns.insert(
@@ -387,6 +392,7 @@ mod tests {
                 enum_values: vec![],
                 is_pk: false,
                 position: 2,
+                domain_type: None,
             },
         );
         columns.insert(
@@ -402,6 +408,7 @@ mod tests {
                 enum_values: vec![],
                 is_pk: false,
                 position: 3,
+                domain_type: None,
             },
         );
         columns.insert(
@@ -417,6 +424,7 @@ mod tests {
                 enum_values: vec![],
                 is_pk: false,
                 position: 4,
+                domain_type: None,
             },
         );
 
@@ -430,6 +438,8 @@ mod tests {
             deletable: true,
             pk_cols: vec!["id".into()],
             columns,
+            computed_columns: Default::default(),
+            is_partitioned: false,
         }
     }
 

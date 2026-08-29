@@ -1399,7 +1399,18 @@ fn build_embed_expressions(
         }
 
         let expression = plan
-            .embed_expression(parent_alias, &child_alias, &parts.join(", "), max_rows)
+            .embed_expression(
+                parent_alias,
+                // GraphQL does not expose computed relationships, so the row
+                // expression is never read; the alias is the honest value.
+                &postrust_sql::escape_ident(parent_alias),
+                &child_alias,
+                &parts.join(", "),
+                max_rows,
+                0,
+                None,
+                None,
+            )
             .map_err(|e| async_graphql::Error::new(e.to_string()))?;
 
         expressions.push((rel.name.clone(), expression));
@@ -1817,6 +1828,7 @@ mod tests {
                 enum_values: vec![],
                 is_pk: true,
                 position: 1,
+                domain_type: None,
             },
         );
         columns.insert(
@@ -1832,6 +1844,7 @@ mod tests {
                 enum_values: vec![],
                 is_pk: false,
                 position: 2,
+                domain_type: None,
             },
         );
 
@@ -1845,6 +1858,8 @@ mod tests {
             deletable: true,
             pk_cols: vec!["id".into()],
             columns,
+            computed_columns: Default::default(),
+            is_partitioned: false,
         }
     }
 
@@ -1858,7 +1873,9 @@ mod tests {
             relationships: HashMap::new(),
             routines: HashMap::new(),
             timezones: HashSet::new(),
+            media_handlers: HashMap::new(),
             pg_version: 150000,
+            representations: Default::default(),
         }
     }
 

@@ -26,7 +26,12 @@ impl AppState {
     /// Reload the schema cache.
     #[allow(dead_code)] // Public API for schema reload; wired up by the (optional) NOTIFY listener.
     pub async fn reload_schema(&self) -> Result<(), postrust_core::Error> {
-        let new_cache = SchemaCache::load(&self.pool, &self.config.db_schemas).await?;
+        let new_cache = SchemaCache::load_with_search_path(
+            &self.pool,
+            &self.config.db_schemas,
+            &self.config.db_extra_search_path,
+        )
+        .await?;
         let mut guard = self.schema_cache.write().await;
         *guard = new_cache;
         Ok(())

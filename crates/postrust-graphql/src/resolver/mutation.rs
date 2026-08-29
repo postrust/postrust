@@ -314,6 +314,7 @@ pub fn build_insert_plan(args: &InsertArgs, table: &Table) -> MutatePlan {
         returning,
         pk_cols: table.pk_cols.clone(),
         apply_defaults: true,
+        reports_inserted: false,
     }
 }
 
@@ -378,6 +379,7 @@ mod tests {
                 enum_values: vec![],
                 is_pk: true,
                 position: 1,
+                domain_type: None,
             },
         );
         columns.insert(
@@ -393,6 +395,7 @@ mod tests {
                 enum_values: vec![],
                 is_pk: false,
                 position: 2,
+                domain_type: None,
             },
         );
         columns.insert(
@@ -408,6 +411,7 @@ mod tests {
                 enum_values: vec![],
                 is_pk: false,
                 position: 3,
+                domain_type: None,
             },
         );
 
@@ -421,6 +425,8 @@ mod tests {
             deletable: true,
             pk_cols: vec!["id".into()],
             columns,
+            computed_columns: Default::default(),
+            is_partitioned: false,
         }
     }
 

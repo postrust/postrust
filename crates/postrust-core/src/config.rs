@@ -34,8 +34,14 @@ pub struct AppConfig {
     #[serde(default = "default_true")]
     pub db_prepared_statements: bool,
 
-    /// Extra search path schemas
-    #[serde(default)]
+    /// Schemas added to the `search_path` of every request, after the
+    /// request's own schema.
+    ///
+    /// These are not exposed as API endpoints; they are where a function an
+    /// exposed one calls, or a type it references, is allowed to live. An
+    /// aggregate returning a domain declared elsewhere cannot resolve that
+    /// domain without this. `public` by default, as in PostgREST.
+    #[serde(default = "default_extra_search_path")]
     pub db_extra_search_path: Vec<String>,
 
     /// LISTEN/NOTIFY channel for schema reload
@@ -52,8 +58,11 @@ pub struct AppConfig {
     /// Maximum rows allowed in a response
     pub db_max_rows: Option<i64>,
 
-    /// Enable aggregate functions
-    #[serde(default = "default_true")]
+    /// Enable aggregate functions in `select`.
+    ///
+    /// Off by default, as in PostgREST: an aggregate over a large table costs
+    /// far more than the request looks like it asks for.
+    #[serde(default)]
     pub db_aggregates_enabled: bool,
 
     // ========================================================================
@@ -150,12 +159,12 @@ impl Default for AppConfig {
             db_pool_size: default_pool_size(),
             db_pool_timeout: default_pool_timeout(),
             db_prepared_statements: true,
-            db_extra_search_path: vec![],
+            db_extra_search_path: default_extra_search_path(),
             db_channel: default_db_channel(),
             db_channel_enabled: false,
             db_pre_request: None,
             db_max_rows: None,
-            db_aggregates_enabled: true,
+            db_aggregates_enabled: false,
             server_host: default_host(),
             server_port: default_port(),
             server_unix_socket: None,
@@ -199,6 +208,18 @@ impl AppConfig {
             }
         }
         // `PGRST_MAX_ROWS` is the name used in our own documentation;
+        if let Ok(v) = std::env::var("PGRST_DB_EXTRA_SEARCH_PATH") {
+            config.db_extra_search_path = v
+                .split(',')
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .collect();
+        }
+
+        if let Ok(v) = std::env::var("PGRST_DB_AGGREGATES_ENABLED") {
+            config.db_aggregates_enabled = matches!(v.to_ascii_lowercase().as_str(), "1" | "true");
+        }
+
         // `PGRST_DB_MAX_ROWS` mirrors PostgREST's `db-max-rows`. Accept both.
         for var in ["PGRST_DB_MAX_ROWS", "PGRST_MAX_ROWS"] {
             if let Ok(max_rows) = std::env::var(var) {
@@ -328,6 +349,10 @@ fn default_pool_size() -> u32 {
 
 fn default_pool_timeout() -> u64 {
     10
+}
+
+fn default_extra_search_path() -> Vec<String> {
+    vec!["public".to_string()]
 }
 
 fn default_db_channel() -> String {

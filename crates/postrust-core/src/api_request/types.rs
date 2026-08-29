@@ -297,6 +297,7 @@ impl FtsOperator {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum IsValue {
     Null,
+    NotNull,
     True,
     False,
     Unknown,
@@ -306,6 +307,7 @@ impl IsValue {
     pub fn to_sql(&self) -> &'static str {
         match self {
             Self::Null => "NULL",
+            Self::NotNull => "NOT NULL",
             Self::True => "TRUE",
             Self::False => "FALSE",
             Self::Unknown => "UNKNOWN",
@@ -400,7 +402,42 @@ pub enum LogicTree {
     Stmt(Filter),
 }
 
+/// The names embedded resources answer to in a selection.
+///
+/// The name a filter would use is the one the response uses: the alias where
+/// there is one, the relation's own name otherwise. A spread has neither --
+/// its columns land in the parent and nothing is named -- so there is nothing
+/// to filter by.
+pub fn embedded_names(select: &[SelectItem]) -> Vec<String> {
+    select
+        .iter()
+        .filter_map(|item| match item {
+            SelectItem::Relation {
+                relation, alias, ..
+            } => Some(alias.clone().unwrap_or_else(|| relation.clone())),
+            _ => None,
+        })
+        .collect()
+}
+
 impl LogicTree {
+    /// Whether every leaf of this tree names one of `embeds`.
+    ///
+    /// `or=(clientinfo.not.is.null,contact.not.is.null)` asks about embedded
+    /// resources rather than about columns: whether the related row was
+    /// there. Those are not names the table has, so a tree made only of them
+    /// cannot be evaluated where the table's own filters are -- it has to
+    /// wait until the embeds themselves are in scope. Answering this decides
+    /// which of the two places the tree belongs to.
+    pub fn names_only(&self, embeds: &[String]) -> bool {
+        match self {
+            Self::Expr { children, .. } => {
+                !children.is_empty() && children.iter().all(|child| child.names_only(embeds))
+            }
+            Self::Stmt(filter) => embeds.contains(&filter.field.name),
+        }
+    }
+
     pub fn and(children: Vec<LogicTree>) -> Self {
         Self::Expr {
             negated: false,
@@ -481,10 +518,18 @@ pub enum SelectItem {
         select: Vec<SelectItem>,
     },
     /// Spread a related resource's columns (horizontal embedding)
+    ///
+    /// The related resource's columns land in the parent object itself rather
+    /// than under a key of their own, so unlike [`Self::Relation`] there is no
+    /// alias: nothing is being named.
     SpreadRelation {
         relation: FieldName,
         hint: Option<Hint>,
         join_type: Option<JoinType>,
+        /// Columns and further embeds selected on the related resource.
+        ///
+        /// Empty means every column, matching a bare `...relation()`.
+        select: Vec<SelectItem>,
     },
 }
 
@@ -594,11 +639,24 @@ impl OrderTerm {
 pub struct Range {
     pub offset: i64,
     pub limit: Option<i64>,
+    /// Whether `offset` was asked for rather than defaulted to.
+    ///
+    /// A query parameter takes precedence over the `Range` header, and
+    /// `?offset=0` is a request to start at the first row -- not the absence
+    /// of one. Without this the two are the same value and `?limit=10` with a
+    /// `Range: 5-9` header starts at the header's row, which is neither what
+    /// was asked for nor where the reported `Content-Range` says it began.
+    #[serde(default)]
+    pub offset_explicit: bool,
 }
 
 impl Range {
     pub fn new(offset: i64, limit: Option<i64>) -> Self {
-        Self { offset, limit }
+        Self {
+            offset,
+            limit,
+            offset_explicit: false,
+        }
     }
 
     /// Create a range from HTTP Range header format (0-9 means rows 0-9 inclusive).
@@ -606,6 +664,7 @@ impl Range {
         Self {
             offset: start,
             limit: end.map(|e| e - start + 1),
+            offset_explicit: false,
         }
     }
 
@@ -667,9 +726,16 @@ pub enum MediaType {
     /// Custom media type
     Other(String),
     /// Singular JSON object (vnd.pgrst.object)
-    SingularJson { nullable: bool },
-    /// Array JSON with nulls stripped
-    ArrayJsonStrip,
+    SingularJson {
+        nullable: bool,
+        /// `;nulls=stripped`: omit keys whose value is null.
+        strip_nulls: bool,
+    },
+    /// Array JSON (vnd.pgrst.array)
+    ArrayJson {
+        /// `;nulls=stripped`: omit keys whose value is null.
+        strip_nulls: bool,
+    },
     /// EXPLAIN plan output
     Plan {
         base: Box<MediaType>,
@@ -692,8 +758,59 @@ impl MediaType {
             Self::Any => "*/*",
             Self::Other(s) => s,
             Self::SingularJson { .. } => "application/vnd.pgrst.object+json",
-            Self::ArrayJsonStrip => "application/vnd.pgrst.array+json",
+            Self::ArrayJson { .. } => "application/vnd.pgrst.array+json",
             Self::Plan { .. } => "application/vnd.pgrst.plan+json",
+        }
+    }
+
+    /// The type's full name, parameters included.
+    ///
+    /// [`Self::content_type`] answers what a response body *is*, which never
+    /// needs the parameters. Naming a type back to a client does: a plan is
+    /// not the same request as a plan for CSV with `analyze` on, and a client
+    /// told only `application/vnd.pgrst.plan+json` has not been told which of
+    /// its requests was refused.
+    pub fn to_mime(&self) -> String {
+        match self {
+            Self::SingularJson {
+                strip_nulls: true, ..
+            } => "application/vnd.pgrst.object+json;nulls=stripped".to_string(),
+            Self::ArrayJson { strip_nulls: true } => {
+                "application/vnd.pgrst.array+json;nulls=stripped".to_string()
+            }
+            // Without the parameter there is nothing to distinguish it from
+            // plain JSON, which is the name it is known by.
+            Self::ArrayJson { strip_nulls: false } => "application/json".to_string(),
+            Self::Plan {
+                base,
+                format,
+                options,
+            } => {
+                let mut mime = format!(
+                    "application/vnd.pgrst.plan+{}; for=\"{}\"",
+                    match format {
+                        PlanFormat::Json => "json",
+                        PlanFormat::Text => "text",
+                    },
+                    base.to_mime()
+                );
+                if !options.is_empty() {
+                    let named: Vec<&str> = options
+                        .iter()
+                        .map(|option| match option {
+                            PlanOption::Analyze => "analyze",
+                            PlanOption::Verbose => "verbose",
+                            PlanOption::Settings => "settings",
+                            PlanOption::Buffers => "buffers",
+                            PlanOption::Wal => "wal",
+                        })
+                        .collect();
+                    mime.push_str("; options=");
+                    mime.push_str(&named.join("|"));
+                }
+                mime
+            }
+            other => other.content_type().to_string(),
         }
     }
 }
@@ -771,9 +888,12 @@ pub enum PreferMissing {
 #[derive(Clone, Debug, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub enum PreferHandling {
     /// Strict - fail on unknown parameters
-    #[default]
     Strict,
-    /// Lenient - ignore unknown parameters
+    /// Lenient - ignore unknown parameters.
+    ///
+    /// The default, as in PostgREST: a `Prefer` the server does not recognise
+    /// is a preference, and RFC 7240 says a preference may be ignored.
+    #[default]
     Lenient,
 }
 
@@ -789,6 +909,14 @@ pub struct Preferences {
     pub timezone: Option<String>,
     pub max_affected: Option<i64>,
     pub invalid: Vec<String>,
+    /// Every preference the server understood, in the order it was sent.
+    ///
+    /// Reported back as `Preference-Applied`. Kept as written rather than
+    /// rebuilt from the fields above, because a field cannot say whether its
+    /// value was asked for or is merely its default -- and `handling=lenient`
+    /// is worth echoing exactly when it was asked for.
+    #[serde(default)]
+    pub applied: Vec<String>,
 }
 
 // ============================================================================

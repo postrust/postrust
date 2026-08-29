@@ -10,13 +10,26 @@ use http::HeaderMap;
 pub fn parse_preferences(headers: &HeaderMap) -> Result<Preferences> {
     let mut prefs = Preferences::default();
 
-    let prefer = match headers.get("prefer") {
-        Some(v) => v.to_str().map_err(|_| Error::InvalidHeader("Prefer"))?,
-        None => return Ok(prefs),
-    };
+    // A client may send one `Prefer` header with a comma-separated list, or
+    // several headers, or both -- RFC 7240 allows all three and PostgREST's
+    // own suite uses more than one. Reading only the first drops the rest.
+    let mut seen_any = false;
+    for value in headers.get_all("prefer") {
+        let value = value.to_str().map_err(|_| Error::InvalidHeader("Prefer"))?;
+        seen_any = true;
+        for pref in value.split(',').map(|s| s.trim()) {
+            parse_preference(&mut prefs, pref);
+        }
+    }
 
-    for pref in prefer.split(',').map(|s| s.trim()) {
-        parse_preference(&mut prefs, pref);
+    if !seen_any {
+        return Ok(prefs);
+    }
+
+    // `handling=strict` asks to be told about preferences the server does not
+    // implement rather than have them quietly dropped.
+    if prefs.handling == PreferHandling::Strict && !prefs.invalid.is_empty() {
+        return Err(Error::InvalidPreferences(prefs.invalid));
     }
 
     Ok(prefs)
@@ -37,6 +50,9 @@ fn parse_preference(prefs: &mut Preferences, pref: &str) {
                     "ignore-duplicates" => Some(PreferResolution::IgnoreDuplicates),
                     _ => None,
                 };
+                if prefs.resolution.is_some() {
+                    prefs.applied.push(format!("resolution={}", value));
+                }
             }
             "return" => {
                 prefs.representation = match value {
@@ -45,6 +61,7 @@ fn parse_preference(prefs: &mut Preferences, pref: &str) {
                     "minimal" => PreferRepresentation::None,
                     _ => PreferRepresentation::None,
                 };
+                prefs.applied.push(format!("return={}", value));
             }
             "count" => {
                 prefs.count = match value {
@@ -53,6 +70,9 @@ fn parse_preference(prefs: &mut Preferences, pref: &str) {
                     "estimated" => Some(PreferCount::Estimated),
                     _ => None,
                 };
+                if prefs.count.is_some() {
+                    prefs.applied.push(format!("count={}", value));
+                }
             }
             "tx" => {
                 prefs.transaction = match value {
@@ -60,6 +80,7 @@ fn parse_preference(prefs: &mut Preferences, pref: &str) {
                     "rollback" => PreferTransaction::Rollback,
                     _ => PreferTransaction::Commit,
                 };
+                prefs.applied.push(format!("tx={}", value));
             }
             "missing" => {
                 prefs.missing = match value {
@@ -67,6 +88,7 @@ fn parse_preference(prefs: &mut Preferences, pref: &str) {
                     "null" => PreferMissing::ApplyNulls,
                     _ => PreferMissing::ApplyDefaults,
                 };
+                prefs.applied.push(format!("missing={}", value));
             }
             "handling" => {
                 prefs.handling = match value {
@@ -74,13 +96,18 @@ fn parse_preference(prefs: &mut Preferences, pref: &str) {
                     "lenient" => PreferHandling::Lenient,
                     _ => PreferHandling::Strict,
                 };
+                prefs.applied.push(format!("handling={}", value));
             }
             "timezone" => {
                 prefs.timezone = Some(value.to_string());
+                prefs.applied.push(format!("timezone={}", value));
             }
+            // Understood, and applied where the RPC path reads the body.
+            "params" => {}
             "max-affected" => {
                 if let Ok(n) = value.parse::<i64>() {
                     prefs.max_affected = Some(n);
+                    prefs.applied.push(format!("max-affected={}", n));
                 }
             }
             _ => {
@@ -112,45 +139,77 @@ fn parse_preference(prefs: &mut Preferences, pref: &str) {
     }
 }
 
-/// Build Preference-Applied header from applied preferences.
-pub fn preference_applied(prefs: &Preferences) -> Option<String> {
-    let mut applied = Vec::new();
+/// Build the `Preference-Applied` header.
+///
+/// Only preferences that were asked for, and only those the request could
+/// honour: `return=representation` says nothing on a read, and `missing`
+/// nothing on a delete. PostgREST filters the same way and in this order,
+/// and a client comparing the header against what it sent will notice.
+///
+/// `applied` records what was asked for, since a parsed field cannot say
+/// whether its value was requested or is merely its default.
+pub fn preference_applied(prefs: &Preferences, relevance: PreferenceScope) -> Option<String> {
+    let asked = |name: &str| {
+        prefs
+            .applied
+            .iter()
+            .find(|pref| pref.starts_with(name))
+            .cloned()
+    };
 
-    if prefs.resolution.is_some() {
-        let val = match prefs.resolution {
-            Some(PreferResolution::MergeDuplicates) => "resolution=merge-duplicates",
-            Some(PreferResolution::IgnoreDuplicates) => "resolution=ignore-duplicates",
-            None => "",
-        };
-        if !val.is_empty() {
-            applied.push(val);
-        }
+    let mut values = Vec::new();
+    if relevance.resolution {
+        values.extend(asked("resolution="));
+    }
+    if relevance.missing {
+        values.extend(asked("missing="));
+    }
+    if relevance.representation {
+        values.extend(asked("return="));
+    }
+    values.extend(asked("count="));
+    // `tx=` is deliberately absent. Ending the transaction the client's way
+    // is something PostgREST does only where `db-tx-end` is configured to let
+    // the request decide; by default the preference is not honoured, and so
+    // is not reported. There is no such setting here and nothing reads
+    // `Preferences::transaction`, which makes the answer the same one for a
+    // stronger reason: a rollback that was asked for and never happened must
+    // not come back described as applied.
+    values.extend(asked("handling="));
+    values.extend(asked("timezone="));
+    // `max-affected` only has an effect under strict handling, so leniently
+    // it was not applied.
+    if relevance.max_affected && prefs.handling == PreferHandling::Strict {
+        values.extend(asked("max-affected="));
     }
 
-    match prefs.representation {
-        PreferRepresentation::Full => applied.push("return=representation"),
-        PreferRepresentation::HeadersOnly => applied.push("return=headers-only"),
-        PreferRepresentation::None => {}
+    match values.is_empty() {
+        true => None,
+        false => Some(values.join(", ")),
     }
+}
 
-    if let Some(count) = &prefs.count {
-        let val = match count {
-            PreferCount::Exact => "count=exact",
-            PreferCount::Planned => "count=planned",
-            PreferCount::Estimated => "count=estimated",
-        };
-        applied.push(val);
-    }
+/// Which preferences a given request could honour.
+///
+/// A preference that cannot apply to the request is not reported back, however
+/// plainly it was asked for -- saying it was applied when it was ignored is
+/// worse than saying nothing.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct PreferenceScope {
+    /// Insert, where duplicates can be resolved.
+    pub resolution: bool,
+    /// Insert or update, where a missing column can take a default.
+    pub representation: bool,
+    /// Insert or update.
+    pub missing: bool,
+    /// Update, delete or a function call.
+    pub max_affected: bool,
+}
 
-    match prefs.transaction {
-        PreferTransaction::Rollback => applied.push("tx=rollback"),
-        PreferTransaction::Commit => {}
-    }
-
-    if applied.is_empty() {
-        None
-    } else {
-        Some(applied.join(", "))
+impl PreferenceScope {
+    /// What a read can honour: none of the write-only preferences.
+    pub fn read() -> Self {
+        Self::default()
     }
 }
 
@@ -211,14 +270,70 @@ mod tests {
 
     #[test]
     fn test_preference_applied() {
-        let prefs = Preferences {
-            representation: PreferRepresentation::Full,
-            count: Some(PreferCount::Exact),
-            ..Default::default()
+        let headers = headers_with_prefer("return=representation, count=exact");
+        let prefs = parse_preferences(&headers).unwrap();
+        let writing = PreferenceScope {
+            representation: true,
+            ..PreferenceScope::read()
         };
 
-        let applied = preference_applied(&prefs).unwrap();
+        let applied = preference_applied(&prefs, writing).unwrap();
         assert!(applied.contains("return=representation"));
         assert!(applied.contains("count=exact"));
+    }
+
+    /// A preference the request could not act on is not reported as applied.
+    #[test]
+    fn preference_applied_leaves_out_what_a_read_cannot_honour() {
+        let headers = headers_with_prefer("return=representation, count=exact");
+        let prefs = parse_preferences(&headers).unwrap();
+
+        assert_eq!(
+            preference_applied(&prefs, PreferenceScope::read()).as_deref(),
+            Some("count=exact")
+        );
+    }
+
+    /// A preference nothing here acts on is not reported as applied, however
+    /// plainly it was asked for. `tx=rollback` is parsed and then ignored --
+    /// the transaction commits either way -- so a client told the preference
+    /// was applied would believe its write had been undone.
+    #[test]
+    fn preference_applied_leaves_out_a_transaction_end_nothing_honours() {
+        let headers = headers_with_prefer("tx=rollback");
+        let prefs = parse_preferences(&headers).unwrap();
+
+        assert_eq!(
+            preference_applied(&prefs, PreferenceScope::read()),
+            None,
+            "tx= must not be reported while the transaction always commits"
+        );
+
+        let headers = headers_with_prefer("return=representation, tx=commit");
+        let prefs = parse_preferences(&headers).unwrap();
+        let writing = PreferenceScope {
+            representation: true,
+            ..PreferenceScope::read()
+        };
+        assert_eq!(
+            preference_applied(&prefs, writing).as_deref(),
+            Some("return=representation")
+        );
+    }
+
+    /// A preference the server merely defaulted to is not one it applied.
+    #[test]
+    fn preference_applied_reports_only_what_was_asked_for() {
+        let headers = headers_with_prefer("handling=lenient");
+        let prefs = parse_preferences(&headers).unwrap();
+
+        assert_eq!(
+            preference_applied(&prefs, PreferenceScope::read()).as_deref(),
+            Some("handling=lenient")
+        );
+        assert_eq!(
+            preference_applied(&Preferences::default(), PreferenceScope::read()),
+            None
+        );
     }
 }

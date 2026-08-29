@@ -16,6 +16,12 @@ pub struct Table {
     pub description: Option<String>,
     /// Whether this is a view (vs a table)
     pub is_view: bool,
+    /// Whether this is a partitioned table.
+    ///
+    /// It behaves as a table for reading and writing, but not for everything:
+    /// a system column such as `xmax` cannot be read back from one.
+    #[serde(default)]
+    pub is_partitioned: bool,
     /// Whether INSERT is allowed
     pub insertable: bool,
     /// Whether UPDATE is allowed
@@ -26,12 +32,35 @@ pub struct Table {
     pub pk_cols: Vec<String>,
     /// Columns indexed by name
     pub columns: ColumnMap,
+    /// Computed columns, indexed by name.
+    ///
+    /// Not part of the table, and never returned by `select=*`: a function of
+    /// one argument of the table's own row type, which PostgreSQL lets a query
+    /// read as though it were a column. PostgREST exposes them under the name
+    /// the function has, so `?select=id,always_true` and `?always_true=is.true`
+    /// both work on a table that has no such column.
+    #[serde(default)]
+    pub computed_columns: HashMap<String, ComputedColumn>,
+}
+
+impl Column {
+    /// The type a data representation would be declared on.
+    ///
+    /// The domain where the column has one, and the type itself otherwise.
+    pub fn representation_type(&self) -> &str {
+        self.domain_type.as_deref().unwrap_or(&self.nominal_type)
+    }
 }
 
 impl Table {
     /// Get a column by name.
     pub fn get_column(&self, name: &str) -> Option<&Column> {
         self.columns.get(name)
+    }
+
+    /// Get a computed column by name.
+    pub fn get_computed_column(&self, name: &str) -> Option<&ComputedColumn> {
+        self.computed_columns.get(name)
     }
 
     /// Check if the table has a column.
@@ -55,6 +84,15 @@ impl Table {
     }
 }
 
+/// A function of the table's row type, read as though it were a column.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ComputedColumn {
+    /// The function to call.
+    pub function: QualifiedIdentifier,
+    /// What it returns.
+    pub data_type: String,
+}
+
 /// A table column.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Column {
@@ -68,6 +106,14 @@ pub struct Column {
     pub data_type: String,
     /// Base type (for domains)
     pub nominal_type: String,
+    /// The domain this column is declared over, where it is declared over one.
+    ///
+    /// `information_schema` reports the type *underneath* a domain in
+    /// `data_type` and `udt_name`, so nothing else says that a value is a
+    /// `color` rather than an integer -- and a data representation is declared
+    /// on the domain.
+    #[serde(default)]
+    pub domain_type: Option<String>,
     /// Maximum length (for varchar, etc.)
     pub max_len: Option<i32>,
     /// Default value expression
@@ -132,6 +178,8 @@ mod tests {
             deletable: true,
             pk_cols: vec!["id".into()],
             columns: IndexMap::new(),
+            computed_columns: Default::default(),
+            is_partitioned: false,
         };
 
         let qi = table.qualified_identifier();
@@ -152,6 +200,7 @@ mod tests {
             enum_values: vec![],
             is_pk: true,
             position: 1,
+            domain_type: None,
         };
         assert!(col1.is_auto());
 
@@ -166,6 +215,7 @@ mod tests {
             enum_values: vec![],
             is_pk: false,
             position: 2,
+            domain_type: None,
         };
         assert!(col2.is_auto());
 
@@ -180,6 +230,7 @@ mod tests {
             enum_values: vec![],
             is_pk: false,
             position: 3,
+            domain_type: None,
         };
         assert!(!col3.is_auto());
     }

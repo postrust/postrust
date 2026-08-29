@@ -32,6 +32,42 @@ pub struct Routine {
     pub settings: Vec<(String, String)>,
     /// Whether this is a procedure (vs function)
     pub is_procedure: bool,
+    /// The media type this function's value already is.
+    ///
+    /// A domain named `image/png` is a declaration about the value, not a type
+    /// the API layer serialises: `returns "text/plain"` returns text, and
+    /// wrapping it in JSON would be answering a question nobody asked. `*/*`
+    /// is spelled that way in the catalogue and reaches a client as
+    /// `application/octet-stream`, which is what "some bytes" is called on the
+    /// wire.
+    #[serde(default)]
+    pub media_type: Option<String>,
+    /// The type that media-type domain is a domain over.
+    ///
+    /// A `bytea` renders as `\x` followed by hex when this side cannot name
+    /// its type, and that rendering is a description of the bytes rather than
+    /// the bytes. See [`Self::media_type`].
+    #[serde(default)]
+    pub media_base_type: Option<String>,
+    /// The columns a `RETURNS TABLE` function's rows have, as `(name, type)`.
+    ///
+    /// A function returning rows of a table is shaped by that table, whose
+    /// columns are known. One declaring its own columns is not, and this is
+    /// the only account of them -- without it the result can only be selected
+    /// with `*`, and a column of a type this process cannot decode comes back
+    /// null with nothing to say it should have been rendered by the database.
+    #[serde(default)]
+    pub output_columns: Vec<(String, String)>,
+}
+
+impl Routine {
+    /// The media type this function produces, as a client would name it.
+    pub fn produced_media_type(&self) -> Option<&str> {
+        match self.media_type.as_deref() {
+            Some("*/*") => Some("application/octet-stream"),
+            other => other,
+        }
+    }
 }
 
 impl Routine {
@@ -135,6 +171,9 @@ mod tests {
     #[test]
     fn test_routine_is_safe_for_get() {
         let mut routine = Routine {
+            output_columns: Vec::new(),
+            media_type: None,
+            media_base_type: None,
             schema: "public".into(),
             name: "get_users".into(),
             description: None,
