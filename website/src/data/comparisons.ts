@@ -65,7 +65,7 @@ export const comparisons: Comparison[] = [
     versionTested: "v16.1",
     intro: [
       "PostgREST is the project that established this idea: point a server at a PostgreSQL schema and get a REST API, with permissions left to the database. Postrust follows its URL grammar deliberately, so `?select=`, `?order=`, the filter operators and the `Prefer` headers mean the same thing in both.",
-      "How closely is measured rather than asserted: replaying PostgREST's own test cases against both servers gives 96.1% agreement on status and body, and 94.3% once every header that is part of the answer is compared too. The [conformance report](/docs/conformance) says what that covers and where the two differ on purpose.",
+      "How closely is measured rather than asserted: replaying PostgREST's own test cases against both servers gives 96.7% agreement on status and body, and 94.9% once every header that is part of the answer is compared too. The [conformance report](/docs/conformance) says what that covers and where the two differ on purpose.",
       "The differences are not in the query language. They are in what ships in the process and what the deployment looks like.",
     ],
     features: [

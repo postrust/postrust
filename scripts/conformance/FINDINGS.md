@@ -36,11 +36,29 @@ differ between any two servers and say nothing about conformance.
 | 4   | 95.9% | 93.1% | **not publishable** — measured without `compat-key-order` |
 | 8   | —     | —     | died at `writes 300/431`; the machine had filled its disk |
 | 9   | 96.1% | 94.3% | clean: both halves complete, 0 transport failures, features verified at runtime |
+| 10  | 96.7% | 94.9% | computed relationships; 1 unanswered request, counted against us |
+
+Run 10 by group: reads 96.3% / 94.5%, writes 97.9% / 96.1%. It reused run 9's
+reference, which is what `CONFORMANCE_REUSE_REF=1` is for: nothing that shapes
+a request had changed, only the candidate. Run 9's own reference had to be
+re-recorded, because `run.py`'s `encode_path` had changed and a reference
+records the answers to requests *as they were sent*.
 
 Run 9 by group: reads 95.6% / 93.8%, writes 97.2% / 95.4%. It is the first run
-whose provenance is recorded rather than remembered — see below. Its reference
-was re-recorded rather than reused, because `run.py`'s `encode_path` had
-changed and a reference records the answers to requests as they were sent.
+whose provenance was recorded rather than remembered — see below; run 10 is
+the first where the harness wrote that record itself.
+
+**One request in run 10 got no answer at all.** `Query/InsertSpec.hs:604`, a
+`POST` carrying multibyte UTF-8, failed with `BadStatusLine` naming its own
+request line back — the signature of a socket carrying somebody else's
+leftovers. It did not reproduce in 440 attempts of the identical request, the
+server logged no error, and the code path is untouched by anything in that
+run; 400 requests leave 440 sockets in `TIME_WAIT` on this host, which is how
+a reused ephemeral port becomes possible over 1499 of them. Treated as
+environmental, and counted as a failure regardless, so the figures understate
+by one case. `report.py` now names such a case rather than letting it dissolve
+into the totals: a flaky socket must not read as a conformance gap, and a real
+one must not read as a flaky socket.
 
 Run 14 confirmed the three specs `0d8ef2f` claimed: CustomMedia 19/50 → 50/50,
 PostGIS 1/13 → 13/13, Plan 4/29 → 29/29, ExtraSearchPath 8/9 → 9/9.

@@ -109,6 +109,17 @@ table(rows, "ALL")
 table([r for r in rows if not r["mutating"]], "READS (GET / HEAD / OPTIONS)")
 table([r for r in rows if r["mutating"]], "WRITES (POST / PATCH / PUT / DELETE)")
 
+# A request that got no answer at all is not a disagreement about the answer.
+# It counts as a failure, which is the safe direction, but it is called out so
+# that a flaky socket is not read as a conformance gap -- and so that a real
+# one is not read as a flaky socket.
+dead = [r for r in rows if r["cand_status"] is None]
+if dead:
+    print(f"\n!! {len(dead)} case(s) got no response from the candidate at all. "
+          f"Counted as failures, which understates the figures above by that much.")
+    for r in dead:
+        print(f"   {r['id']}  {r['method']} {r['path']}")
+
 print("\nwhere the divergences are")
 print(f"  status differs        {sum(1 for r in rows if not r['status_ok']):>4}")
 print(f"  body differs          {sum(1 for r in rows if not r['body_ok']):>4}")

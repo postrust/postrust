@@ -8,19 +8,20 @@ servers disagree on purpose.
 
 ## Where it stands
 
-Run 9, over 1499 replayed cases, against PostgREST v16.1:
+Run 10, over 1499 replayed cases, against PostgREST v16.1:
 
 | Compared on | All (1499) | Reads (1068) | Writes (431) |
 |---|---|---|---|
-| Status code | 98.2% | 97.8% | 99.1% |
-| Status and body | 96.1% | 95.6% | 97.2% |
-| …and headers, except `Content-Range` | 94.5% | 93.9% | 96.1% |
-| Full contract | **94.3%** | 93.8% | 95.4% |
+| Status code | 98.6% | 98.5% | 98.8% |
+| Status and body | 96.7% | 96.3% | 97.9% |
+| …and headers, except `Content-Range` | 95.2% | 94.6% | 96.8% |
+| Full contract | **94.9%** | 94.5% | 96.1% |
 
-Both halves completed with zero transport failures, on a binary the harness
-built itself and then verified at runtime. See
-[`FINDINGS.md`](../scripts/conformance/FINDINGS.md) for the run history,
-including the two runs whose numbers are not publishable and why.
+Measured on a binary the harness built itself and then verified at runtime.
+One case got no response at all — a socket fault that has not reproduced in
+440 attempts — and is counted as a failure, so the true figures are at or
+above these. See [`FINDINGS.md`](../scripts/conformance/FINDINGS.md) for the
+run history, including the runs whose numbers are not publishable and why.
 
 ## How it is measured
 

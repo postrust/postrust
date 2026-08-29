@@ -44,7 +44,7 @@ export const conformanceMeta = {
   "postgrest": "v16.1",
   "features": "admin-ui,compat-key-order",
   "compatMode": true,
-  "commit": "e38770f33f3ab6dab464177234e1dff77648996b",
+  "commit": "c3026ad955b8ddcbfe5054431dae30a187ae8d1c",
   "measured": "2026-08-29",
   "cases": 1499
 } as const;
@@ -53,70 +53,64 @@ export const conformance: Record<"all" | "reads" | "writes", Group> = {
   "all": {
     "cases": 1499,
     "status": {
-      "passed": 1472,
-      "pct": 98.2
+      "passed": 1478,
+      "pct": 98.6
     },
     "statusAndBody": {
-      "passed": 1440,
-      "pct": 96.1
+      "passed": 1450,
+      "pct": 96.7
     },
     "exceptContentRange": {
-      "passed": 1417,
-      "pct": 94.5
+      "passed": 1427,
+      "pct": 95.2
     },
     "fullContract": {
-      "passed": 1413,
-      "pct": 94.3
+      "passed": 1423,
+      "pct": 94.9
     }
   },
   "reads": {
     "cases": 1068,
     "status": {
-      "passed": 1045,
-      "pct": 97.8
+      "passed": 1052,
+      "pct": 98.5
     },
     "statusAndBody": {
-      "passed": 1021,
-      "pct": 95.6
+      "passed": 1028,
+      "pct": 96.3
     },
     "exceptContentRange": {
-      "passed": 1003,
-      "pct": 93.9
+      "passed": 1010,
+      "pct": 94.6
     },
     "fullContract": {
-      "passed": 1002,
-      "pct": 93.8
+      "passed": 1009,
+      "pct": 94.5
     }
   },
   "writes": {
     "cases": 431,
     "status": {
-      "passed": 427,
-      "pct": 99.1
+      "passed": 426,
+      "pct": 98.8
     },
     "statusAndBody": {
-      "passed": 419,
-      "pct": 97.2
+      "passed": 422,
+      "pct": 97.9
     },
     "exceptContentRange": {
-      "passed": 414,
-      "pct": 96.1
+      "passed": 417,
+      "pct": 96.8
     },
     "fullContract": {
-      "passed": 411,
-      "pct": 95.4
+      "passed": 414,
+      "pct": 96.1
     }
   }
 };
 
 /** Where the remaining disagreement lives, worst first. */
 export const worstSpecs = [
-  {
-    "spec": "Query/ComputedRelsSpec.hs",
-    "total": 30,
-    "passed": 22,
-    "pct": 73.3
-  },
   {
     "spec": "Query/RelatedQueriesSpec.hs",
     "total": 36,
@@ -142,12 +136,6 @@ export const worstSpecs = [
     "pct": 93.1
   },
   {
-    "spec": "Query/CustomMediaSpec.hs",
-    "total": 50,
-    "passed": 47,
-    "pct": 94
-  },
-  {
     "spec": "Query/EmbedInnerJoinSpec.hs",
     "total": 57,
     "passed": 54,
@@ -158,5 +146,17 @@ export const worstSpecs = [
     "total": 301,
     "passed": 286,
     "pct": 95
+  },
+  {
+    "spec": "Query/UpsertSpec.hs",
+    "total": 60,
+    "passed": 57,
+    "pct": 95
+  },
+  {
+    "spec": "Query/InsertSpec.hs",
+    "total": 82,
+    "passed": 78,
+    "pct": 95.1
   }
 ];
