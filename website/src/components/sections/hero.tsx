@@ -38,7 +38,14 @@ export const HeroSection = component$(() => {
             >
               Drop-in PostgREST replacement
             </Link>
-            .
+            , and it speaks{" "}
+            <Link
+              href="/docs/hasura-conformance"
+              class="underline decoration-neutral-300 underline-offset-4 hover:decoration-primary-600 hover:text-primary-700"
+            >
+              Hasura&rsquo;s GraphQL dialect
+            </Link>
+            . Both measured against the servers they replace.
           </p>
 
           {/* CTAs */}

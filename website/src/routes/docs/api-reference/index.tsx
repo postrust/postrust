@@ -204,6 +204,52 @@ GET /orders?select=*,customer!inner(*)&customer.country=eq.US`}</code>
 # Allow: OPTIONS,GET,HEAD,POST,PUT,PATCH,DELETE`}</code></pre>
           </section>
 
+          {/* GraphQL */}
+          <section class="mb-12">
+            <h2 class="text-2xl font-bold text-neutral-900 mb-4">GraphQL</h2>
+            <p class="text-neutral-600 mb-4">
+              Alongside the REST surface, Postrust serves a GraphQL API generated from the same
+              schema, in the dialect Hasura speaks. A client generated against Hasura — its
+              queries, its codegen output, its endpoint — points at this server unchanged.
+            </p>
+            <div class="overflow-x-auto mb-4">
+              <table class="w-full text-sm">
+                <thead>
+                  <tr class="border-b border-neutral-200">
+                    <th class="text-left py-2 pr-4 font-semibold text-neutral-900">Method</th>
+                    <th class="text-left py-2 pr-4 font-semibold text-neutral-900">Endpoint</th>
+                    <th class="text-left py-2 font-semibold text-neutral-900">Description</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {[
+                    ["POST", "/v1/graphql", "Execute a query or mutation"],
+                    ["GET", "/v1/graphql", "GraphQL Playground"],
+                    ["GET", "/v1/graphql/ws", "Subscriptions over WebSocket"],
+                    ["POST", "/v1alpha1/graphql", "The address Hasura served before /v1"],
+                    ["POST", "/api/graphql", "The same surface, for anything already pointed here"],
+                  ].map(([method, path, desc]) => (
+                    <tr key={method + path} class="border-b border-neutral-100">
+                      <td class="py-2 pr-4"><code class="font-mono text-primary-600">{method}</code></td>
+                      <td class="py-2 pr-4"><code class="font-mono text-neutral-700">{path}</code></td>
+                      <td class="py-2 text-neutral-600">{desc}</td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+            <p class="text-neutral-600">
+              <code class="font-mono">/v1/graphql</code> is where a Hasura client sends its
+              queries and, for most generated clients, the only address they can be told about.
+              See <Link href="/docs/graphql" class="text-primary-600 hover:underline">GraphQL</Link>{" "}
+              for the schema shape, filters and mutations, and{" "}
+              <Link href="/docs/hasura-conformance" class="text-primary-600 hover:underline">
+                Hasura conformance
+              </Link>{" "}
+              for how closely the two agree, measured.
+            </p>
+          </section>
+
           {/* Next */}
           <div class="flex items-center justify-between pt-8 border-t border-neutral-200">
             <Link

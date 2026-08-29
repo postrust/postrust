@@ -61,8 +61,17 @@ export default component$(() => {
               Connect via WebSocket to the GraphQL subscription endpoint using the <code class="font-mono text-sm">graphql-transport-ws</code> protocol:
             </p>
             <div class="p-4 bg-neutral-50 rounded-lg">
-              <code class="font-mono text-primary-600">ws://localhost:3000/api/graphql/ws</code>
+              <code class="font-mono text-primary-600">ws://localhost:3000/v1/graphql/ws</code>
             </div>
+            <p class="text-neutral-600 mt-4">
+              Each subscription field mirrors the query root and is a <em>live query</em>: the
+              answer now, and the answer again whenever it changes. Hasura&rsquo;s cursor-based{" "}
+              <code class="font-mono">_stream</code> subscriptions are not implemented — see{" "}
+              <Link href="/docs/hasura-conformance" class="text-primary-600 hover:underline">
+                Hasura conformance
+              </Link>
+              .
+            </p>
           </section>
 
           {/* Basic Subscription */}
@@ -136,7 +145,7 @@ subscription {
                 <code class="text-neutral-100">{`import { createClient } from 'graphql-ws';
 
 const client = createClient({
-  url: 'ws://localhost:3000/api/graphql/ws',
+  url: 'ws://localhost:3000/v1/graphql/ws',
   connectionParams: {
     authorization: \`Bearer \${token}\`,
   },

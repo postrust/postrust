@@ -164,6 +164,31 @@ $$ LANGUAGE SQL STABLE;`}</code>
             </div>
           </section>
 
+          {/* Hasura */}
+          <section class="mb-12">
+            <h2 class="text-2xl font-bold text-neutral-900 mb-4">The GraphQL surface</h2>
+            <p class="text-neutral-600 mb-4">
+              Everything above is how the REST surface authenticates. The GraphQL surface at{" "}
+              <code class="font-mono">/v1/graphql</code> reads Hasura&rsquo;s contract instead — an
+              admin secret, <code class="font-mono">x-hasura-*</code> session variables, and a role
+              that decides which schema answers before it decides anything about a row.
+            </p>
+            <p class="text-neutral-600">
+              The two meet at the token: a verified JWT names the role either way, and on the
+              GraphQL side an <code class="font-mono">X-Hasura-Role</code> header may select any
+              role the token&rsquo;s <code class="font-mono">x-hasura-allowed-roles</code> lists.
+              See{" "}
+              <Link href="/docs/configuration" class="text-primary-600 hover:underline">
+                Configuration
+              </Link>{" "}
+              for the settings and{" "}
+              <Link href="/docs/graphql" class="text-primary-600 hover:underline">
+                GraphQL
+              </Link>{" "}
+              for the surface itself.
+            </p>
+          </section>
+
           {/* Next */}
           <div class="flex items-center justify-between pt-8 border-t border-neutral-200">
             <Link

@@ -30,7 +30,7 @@ export const head: DocumentHead = {
     {
       name: "description",
       content:
-        "High-performance PostgreSQL REST & GraphQL API server written in Rust. Native AWS Lambda support with ~50ms cold starts. Drop-in PostgREST replacement.",
+        "High-performance PostgreSQL REST & GraphQL API server written in Rust. Native AWS Lambda support with ~50ms cold starts. Drop-in PostgREST replacement that also speaks Hasura's GraphQL dialect.",
     },
     {
       name: "keywords",

@@ -35,19 +35,27 @@ const featureCategories = [
   },
   {
     title: "GraphQL API",
-    description: "Full GraphQL support with automatic schema generation",
+    description: "Hasura's dialect, generated from your schema and measured against Hasura itself",
     features: [
       {
         name: "Dynamic Schema",
         description: "GraphQL schema automatically generated from your database",
       },
       {
+        name: "Hasura Dialect",
+        description: "A client generated against Hasura points at /v1/graphql unchanged",
+      },
+      {
         name: "Queries & Mutations",
-        description: "Full CRUD with insertOne, insert, update, delete operations",
+        description: "author, author_by_pk, author_aggregate, insert_author_one, update_author_many, on_conflict upserts and nested writes",
+      },
+      {
+        name: "Permissions",
+        description: "A schema per role, row filters, separate read and write columns, presets and backend_only",
       },
       {
         name: "Real-time Subscriptions",
-        description: "WebSocket subscriptions for live data updates",
+        description: "Live queries over WebSocket, mirroring the query root",
       },
       {
         name: "Introspection",
@@ -55,7 +63,7 @@ const featureCategories = [
       },
       {
         name: "GraphQL Playground",
-        description: "Built-in interactive IDE at /api/graphql",
+        description: "Built-in interactive IDE at /v1/graphql",
       },
       {
         name: "Same RLS",
