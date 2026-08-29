@@ -18,6 +18,7 @@ export const Footer = component$(() => {
       { href: "/packages", label: "Packages" },
       { href: "/docs/benchmarks", label: "Benchmarks" },
       { href: "/docs/conformance", label: "PostgREST Conformance" },
+      { href: "/docs/hasura-conformance", label: "Hasura Conformance" },
       { href: "/docs/deployment", label: "Deployment" },
     ],
     community: [

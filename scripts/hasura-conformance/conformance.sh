@@ -75,11 +75,23 @@ if [ -z "$PYTHON" ]; then
     exit 1
 fi
 
-if [ ! -x "$REPO_ROOT/target/release/postrust" ]; then
-    echo "error: target/release/postrust not found." >&2
-    echo "       cargo build --release -p postrust-server --features admin-ui" >&2
-    exit 1
-fi
+# Built here rather than required to exist, because which features it was built
+# with is part of what is being measured and cannot be read off the file.
+#
+# `admin-ui` is what gates the GraphQL routes at all: without it there is no
+# `/v1/graphql` to measure and every case answers 404, which reads as a total
+# failure rather than as the misconfiguration it is. `compat-key-order` makes
+# a response keep its selection-set order, which is the order GraphQL asks for.
+#
+# The trap this closes: `cargo test --workspace` rebuilds this same binary with
+# default features and overwrites it, so a build, then a test run, then a
+# conformance run measures a binary with neither feature and says nothing about
+# it. That is what invalidated run 4 of the PostgREST harness, and nothing here
+# was stopping it happening again.
+CAND_FEATURES="admin-ui,compat-key-order"
+say "Building the candidate"
+cargo build --release --manifest-path "$REPO_ROOT/Cargo.toml" \
+    -p postrust-server --features "$CAND_FEATURES" >&2
 
 say "Fetching the Hasura $HGE_VERSION test corpus"
 # A blobless sparse clone of one directory: the full repository is far larger
@@ -250,7 +262,9 @@ WANTED_STAMP="$(harness_stamp)"
 if [ "${HASURA_CONFORMANCE_REUSE_REF:-}" = "1" ] && [ -s "$WORK/ref.json" ] &&
    [ "$(cat "$STAMP" 2>/dev/null)" = "$WANTED_STAMP" ]; then
     say "Reusing the recorded Hasura $HGE_VERSION responses"
+    REF_REUSED=true
 else
+    REF_REUSED=false
     if [ "${HASURA_CONFORMANCE_REUSE_REF:-}" = "1" ] && [ -s "$WORK/ref.json" ]; then
         say "The recorded responses were produced by a different harness -- replaying"
     fi
@@ -336,6 +350,21 @@ RESTORE_CMD="docker exec -e PGPASSWORD=postgres $DB psql -q -U postgres -d $DATA
     --restore-cmd "$RESTORE_CMD" \
     --restart-cmd "$WORK/restart.sh {group}" \
     --data-reset-cmd "docker exec -e PGPASSWORD=postgres $DB psql -q -U postgres -d $DATA_DB -v ON_ERROR_STOP=1 -f /truncate.sql -f /data-{group}.sql"
+
+# What produced these numbers, beside them, so a reader of diff.json never has
+# to take a claim about the run on trust. The generator reads this file rather
+# than its own arguments: a run measured with the wrong binary produces a
+# number that looks exactly like a good one, and a flag would only stamp it as
+# correct.
+cat > "$WORK/run-meta.json" <<META
+{
+  "hasura": "$HGE_VERSION",
+  "features": "$CAND_FEATURES",
+  "referenceReused": $REF_REUSED,
+  "commit": "$(git -C "$REPO_ROOT" rev-parse HEAD)",
+  "measured": "$(date -u +%Y-%m-%d)"
+}
+META
 
 say "Report"
 {

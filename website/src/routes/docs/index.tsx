@@ -76,6 +76,13 @@ const docSections = [
     href: "/docs/conformance",
     icon: "chart",
   },
+  {
+    title: "Hasura Conformance",
+    description:
+      "How closely the GraphQL dialects agree, measured by replaying Hasura's own test corpus against both servers",
+    href: "/docs/hasura-conformance",
+    icon: "graphql",
+  },
 ];
 
 const iconPaths: Record<string, string> = {

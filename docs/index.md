@@ -15,6 +15,7 @@ Welcome to the Postrust documentation. Postrust is a high-performance, serverles
 - [Deployment](./deployment.md) - Deploy to various platforms
 - [Benchmarking](./benchmarking.md) - Measured size, latency and memory, and how to reproduce them
 - [PostgREST Conformance](./postgrest-conformance.md) - How closely the two agree, measured against PostgREST itself
+- [Hasura Conformance](./hasura-conformance.md) - How closely the GraphQL dialects agree, measured against graphql-engine itself
 
 ## What is Postrust?
 

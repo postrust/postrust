@@ -1284,6 +1284,19 @@ The 16 cases that diverge, and why each does. Ten of them are one item.
 
 ## Not measured
 
+**Choosing a role with a token.** A token that allows more than one identity
+carries `x-hasura-allowed-roles` beside `x-hasura-default-role`, and a client
+selects among them with an `X-Hasura-Role` header. That path is implemented and
+unit-tested, and no case here exercises it: `check_query` sends the admin
+secret with every request that names a role, because that is how Hasura's own
+suite authenticates. So the corpus measures role selection by an administrator
+and never role selection by a bearer.
+
+It was found by reading rather than by running, which is worth recording on its
+own -- the corpus is a good instrument for what it covers and says nothing
+about what it does not, and a gap that no case can reach looks identical to a
+gap that does not exist.
+
 The GraphQL surface still builds its own SQL by string concatenation, parallel
 to the `ReadPlan` → `ReadPlanTree` → `QueryBuilder` path that serves REST. It
 has now grown its own relationship predicates, its own correlated ordering, its
