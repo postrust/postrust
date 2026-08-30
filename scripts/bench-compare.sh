@@ -83,8 +83,13 @@ PG_CONTAINER="postrust-cmp-pg"
 # Pinned so a re-run measures the same thing. Bump deliberately, not by drift.
 # Each is the current release: benchmarking an old version of someone else's
 # tool produces a number that is not worth publishing.
+#
+# The Hasura pin must match the one scripts/hasura-conformance/conformance.sh
+# measures against. It did not for a while -- this benchmarked v2.44.0 while
+# conformance reported v2.50.1 -- which put two numbers about "Hasura" on the
+# same website that were not about the same Hasura.
 POSTGREST_IMAGE="${POSTGREST_IMAGE:-postgrest/postgrest:v16.1}"
-HASURA_IMAGE="${HASURA_IMAGE:-hasura/graphql-engine:v2.44.0}"
+HASURA_IMAGE="${HASURA_IMAGE:-hasura/graphql-engine:v2.50.1}"
 POSTGRAPHILE_NODE_IMAGE="${POSTGRAPHILE_NODE_IMAGE:-$POSTGRAPHILE_NODE_DEFAULT}"
 POSTGRAPHILE_VERSION="${POSTGRAPHILE_VERSION:-5}"
 
