@@ -83,8 +83,13 @@ PG_CONTAINER="postrust-cmp-pg"
 # Pinned so a re-run measures the same thing. Bump deliberately, not by drift.
 # Each is the current release: benchmarking an old version of someone else's
 # tool produces a number that is not worth publishing.
+#
+# The Hasura pin must match the one scripts/hasura-conformance/conformance.sh
+# measures against. It did not for a while -- this benchmarked v2.44.0 while
+# conformance reported v2.50.1 -- which put two numbers about "Hasura" on the
+# same website that were not about the same Hasura.
 POSTGREST_IMAGE="${POSTGREST_IMAGE:-postgrest/postgrest:v16.1}"
-HASURA_IMAGE="${HASURA_IMAGE:-hasura/graphql-engine:v2.44.0}"
+HASURA_IMAGE="${HASURA_IMAGE:-hasura/graphql-engine:v2.50.1}"
 POSTGRAPHILE_NODE_IMAGE="${POSTGRAPHILE_NODE_IMAGE:-$POSTGRAPHILE_NODE_DEFAULT}"
 POSTGRAPHILE_VERSION="${POSTGRAPHILE_VERSION:-5}"
 
@@ -97,7 +102,13 @@ PORT_POSTGREST="${PORT_POSTGREST:-3992}"
 PORT_HASURA="${PORT_HASURA:-3993}"
 PORT_POSTGRAPHILE="${PORT_POSTGRAPHILE:-3994}"
 
-REQUESTS="${REQUESTS:-3000}"
+# 3000 requests completes in roughly a third of a second at the throughputs
+# these tools reach, and a window that short measures scheduling and cache
+# warmth as much as steady-state throughput. Repeating it does not help: five
+# medians of a biased sample share the bias. Measured directly, going from
+# 3000 to 30000 pulled the run-to-run spread on one scenario from 1.33x down
+# to 1.25x for this server and 1.39x to 1.17x for PostGraphile.
+REQUESTS="${REQUESTS:-30000}"
 CONCURRENCY="${CONCURRENCY:-50}"
 # Requests issued against every target before anything is measured. This is a
 # real number of requests, not a token few: a cold connection pool, an unplanned
@@ -135,11 +146,18 @@ wants() {
 # Scenarios
 #
 # Each tool expresses the same request in its own dialect: PostgREST serves
-# tables at the root where Postrust mounts them under /api, and the two GraphQL
-# engines inflect field names differently (bench_items vs allBenchItems). The
+# tables at the root where Postrust mounts them under /api, and PostGraphile
+# inflects field names its own way (allBenchItems, benchItemByRowId). The
 # request being measured is the same; only the spelling differs. That is a
 # property of the tools, and is stated on the published comparison rather than
 # smoothed over.
+#
+# Postrust and Hasura are now the exception: they are sent the *same query
+# text*, byte for byte, because Postrust answers Hasura's dialect. That is the
+# claim the conformance harness measures, and sending one string to both is
+# the cheapest possible restatement of it -- if the dialects ever drift, this
+# benchmark stops running rather than quietly measuring two different
+# questions.
 # ---------------------------------------------------------------------------
 
 # name|postrust path|postgrest path
@@ -157,16 +175,16 @@ gql_query() {
     local target="$1" scenario="$2"
 
     case "$target:$scenario" in
-    postrust:row)     echo '{ benchItems(filter: {id: {eq: 42}}) { id name price } }' ;;
-    hasura:row)       echo '{ bench_items(where: {id: {_eq: 42}}) { id name price } }' ;;
+    postrust:row|hasura:row)
+                      echo '{ bench_items(where: {id: {_eq: 42}}) { id name price } }' ;;
     postgraphile:row) echo '{ benchItemByRowId(rowId: 42) { rowId name price } }' ;;
 
-    postrust:page)     echo '{ benchItems(limit: 25) { id name price } }' ;;
-    hasura:page)       echo '{ bench_items(limit: 25) { id name price } }' ;;
+    postrust:page|hasura:page)
+                      echo '{ bench_items(limit: 25) { id name price } }' ;;
     postgraphile:page) echo '{ allBenchItems(first: 25) { nodes { rowId name price } } }' ;;
 
-    postrust:embed)     echo '{ benchItems(limit: 25) { id name bench_reviews { id rating } } }' ;;
-    hasura:embed)       echo '{ bench_items(limit: 25) { id name bench_reviews { id rating } } }' ;;
+    postrust:embed|hasura:embed)
+                      echo '{ bench_items(limit: 25) { id name bench_reviews { id rating } } }' ;;
     postgraphile:embed) echo '{ allBenchItems(first: 25) { nodes { rowId name benchReviewsByItemId { nodes { rowId rating } } } } }' ;;
 
     *) return 1 ;;
@@ -181,7 +199,10 @@ GQL_SCENARIOS=(
 
 gql_endpoint() {
     case "$1" in
-        postrust)     echo "http://127.0.0.1:$PORT_POSTRUST/api/graphql" ;;
+        # `/v1/graphql`, not `/api/graphql`: same handler either way, but this
+        # is the address a Hasura client is pointed at, so the benchmark
+        # exercises the migration path rather than one beside it.
+        postrust)     echo "http://127.0.0.1:$PORT_POSTRUST/v1/graphql" ;;
         hasura)       echo "http://127.0.0.1:$PORT_HASURA/v1/graphql" ;;
         postgraphile) echo "http://127.0.0.1:$PORT_POSTGRAPHILE/graphql" ;;
     esac
@@ -194,6 +215,40 @@ container_of() {
         hasura)       echo "postrust-cmp-hasura" ;;
         postgraphile) echo "postrust-cmp-postgraphile" ;;
     esac
+}
+
+# Only the server being measured should be running.
+#
+# Every candidate used to stay up for the whole run, so each measurement was
+# taken with the other three idling beside it on the same host. That is not a
+# fixed overhead shared equally: it moved this server's GraphQL throughput from
+# ~9000 rps measured alone to 3938-5111 measured alongside, while PostGraphile
+# barely shifted -- so the comparison was reporting a difference in how the
+# tools respond to a busy host, on top of the difference being asked about.
+#
+# Paused rather than stopped: `docker pause` freezes the processes through the
+# cgroup freezer without touching their state, so nothing pays a cold start or
+# loses a warm connection pool between scenarios.
+isolate() {
+    local keep="$1" t c
+    for t in postrust postgrest hasura postgraphile; do
+        wants "$t" || continue
+        c="$(container_of "$t")"
+        if [ "$t" = "$keep" ]; then
+            docker unpause "$c" >/dev/null 2>&1 || true
+        else
+            docker pause "$c" >/dev/null 2>&1 || true
+        fi
+    done
+}
+
+# Everything running again, for warmup and for the memory reading at the end.
+unisolate() {
+    local t
+    for t in postrust postgrest hasura postgraphile; do
+        wants "$t" || continue
+        docker unpause "$(container_of "$t")" >/dev/null 2>&1 || true
+    done
 }
 
 image_of() {
@@ -219,6 +274,11 @@ ALL_CONTAINERS=(
 
 cleanup() {
     local exit_code=$?
+
+    # A run that dies mid-measurement leaves one server frozen by `isolate`.
+    # Unfreezing first means neither KEEP=1 nor the next run inherits a
+    # container that is up but answers nothing.
+    unisolate 2>/dev/null || true
 
     if [[ "$KEEP" == "1" ]]; then
         log "KEEP=1: leaving containers and network $NETWORK running"
@@ -331,7 +391,10 @@ done
 
 cleanup_quiet() {
     local c
-    for c in "${ALL_CONTAINERS[@]}"; do docker rm -f "$c" >/dev/null 2>&1 || true; done
+    for c in "${ALL_CONTAINERS[@]}"; do
+        docker unpause "$c" >/dev/null 2>&1 || true
+        docker rm -f "$c" >/dev/null 2>&1 || true
+    done
 }
 cleanup_quiet
 docker network rm "$NETWORK" >/dev/null 2>&1 || true
@@ -575,9 +638,11 @@ bench_rest() {
             target="${entry%%|*}"
             url="${entry#*|}"
             log "rest: $name -- $target"
+            isolate "$target"
             measured="$(measure_median "$url" "")"
             record rest "$name" "$target" "$measured" ok
         done
+        unisolate
     done
 }
 
@@ -615,9 +680,11 @@ bench_gql() {
         for entry in "${posts[@]}"; do
             IFS='|' read -r target url body <<<"$entry"
             log "graphql: $label -- $target"
+            isolate "$target"
             measured="$(measure_median "$url" "" "$body")"
             record graphql "$label" "$target" "$measured" ok
         done
+        unisolate
     done
 }
 
