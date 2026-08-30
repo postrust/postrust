@@ -159,7 +159,7 @@ export const comparisons: Comparison[] = [
     url: "https://hasura.io/",
     language: "Haskell",
     license: "Apache 2.0 (v2 core engine)",
-    versionTested: "v2.44.0",
+    versionTested: "v2.50.1",
     intro: [
       "Hasura generates a GraphQL API from a PostgreSQL schema and models permissions as metadata rather than as database roles. It is a platform: a console, event triggers, remote schemas, and joins across more than one data source.",
       "Postrust speaks Hasura's GraphQL dialect. A client generated against Hasura — its queries, its codegen output, its endpoint at `/v1/graphql` — points at Postrust unchanged, and the permission model comes with it: a schema per role, row filters, separate read and write columns, presets and `backend_only`. How closely the two agree is measured by replaying Hasura's own test corpus against both servers; the [conformance report](/docs/conformance/hasura) says what that covers and where they differ on purpose.",

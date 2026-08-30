@@ -536,36 +536,38 @@ postrust/
 
 ## Benchmarks
 
-Measured by [`scripts/bench.sh`](scripts/bench.sh) against a 100,000-row table,
-3,000 requests per scenario at concurrency 50:
+**Throughput figures are withdrawn pending re-measurement.**
 
-| Scenario | Request | req/s | p50 | p95 | p99 |
-|----------|---------|------:|----:|----:|----:|
-| Point lookup | `?id=eq.42` | 6,065 | 8 ms | 10 ms | 22 ms |
-| 25-row page | `?select=id,name,price&limit=25` | 6,065 | 8 ms | 11 ms | 13 ms |
-| Filtered + ordered page | `?category=eq.cat-5&order=id.desc&limit=25` | 5,025 | 9 ms | 14 ms | 23 ms |
-| Page with exact count | `Prefer: count=exact` | 6,373 | 7 ms | 11 ms | 19 ms |
-| Range filter on numeric | `?price=gt.50&limit=25` | 6,468 | 7 ms | 10 ms | 14 ms |
+The comparison benchmark was found to report the order of a run as much as the
+speed of a server: the same server, in the same container, measured seconds
+apart differed by about a factor of two, and scenarios measured earlier in a
+run read lower than ones measured later. The mechanism is not identified.
+Thermal throttling, measurement order, host load, a cold database, the bulk
+load, checkpointing, server and PostgreSQL start-up, container pausing and
+Docker's port forwarding are each ruled out by direct test.
+
+[`scripts/BENCH-FINDINGS.md`](scripts/BENCH-FINDINGS.md) records the
+investigation. Numbers will return once they reproduce on a host without a
+virtualised Docker network, and once a measurement repeated at the start and
+the end of a run agrees with itself.
+
+Size is not affected by any of this, and is deterministic:
 
 | Resource | Measured |
 |----------|----------|
 | Binary size (`--features admin-ui`, as shipped) | 5,220,864 bytes (4.98 MiB) |
 | Binary size (default features) | 3,070,080 bytes (2.93 MiB) |
-| Memory, idle | 10.0 MB RSS |
-| Memory, after 15,000 requests | 13.3 MB RSS |
 
-Reproduce on your own hardware:
+The method is unchanged and documented in
+[Benchmarking](docs/benchmarking.md), and the harness still runs:
 
 ```bash
-./scripts/bench.sh                              # defaults
-REQUESTS=20000 CONCURRENCY=100 ./scripts/bench.sh
+./scripts/bench.sh
 ```
 
-These figures come from an Apple M-series laptop with PostgreSQL 18 in Docker,
-`ab` as the load generator, everything over loopback — so the database, the
-server and the load generator all compete for the same cores. Use them to
-compare Postrust against itself across changes, not for capacity planning. See
-[Benchmarking](docs/benchmarking.md) for the methodology and full caveats.
+What it measures against other servers is trustworthy in shape but not yet in
+number. Conformance is a separate matter and is unaffected: it measures whether
+two servers give the same answer, not how fast.
 
 ## Comparison with PostgREST
 
@@ -573,8 +575,6 @@ compare Postrust against itself across changes, not for capacity planning. See
 |---------|----------|-----------|
 | Language | Rust | Haskell |
 | Binary Size | ~5 MB (~3 MB without `admin-ui`) | ~20 MB |
-| Cold Start (Lambda) | ~50ms | N/A |
-| Memory Usage | ~10 MB idle | Higher |
 | Serverless Support | Native | Via containers |
 | Configuration | Env vars | Config file + env |
 | OpenAPI | ✅ (admin-ui feature) | ✅ |
@@ -582,10 +582,11 @@ compare Postrust against itself across changes, not for capacity planning. See
 | Admin UI | ✅ (Swagger, Scalar) | ❌ |
 | Object key order | Alphabetical, or select order with `compat-key-order` | Select order |
 
-Every Postrust number above is measured by `scripts/bench.sh` — see
-[Benchmarking](docs/benchmarking.md) for the methodology and how to reproduce
-them on your own hardware. The PostgREST column is not measured by this
-harness.
+Binary sizes are measured; the rest of this table is a feature comparison
+rather than a measurement. Throughput is deliberately absent — see
+[Benchmarks](#benchmarks) above. How closely Postrust matches PostgREST's
+behaviour *is* measured, by replaying PostgREST's own test suite against both:
+see [PostgREST Conformance](docs/postgrest-conformance.md).
 
 ## Differences from PostgREST
 

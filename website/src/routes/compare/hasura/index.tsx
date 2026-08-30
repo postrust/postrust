@@ -12,7 +12,7 @@ export default component$(() => {
 
 const title = "Postrust vs Hasura: GraphQL from PostgreSQL compared";
 const description =
-  "How Postrust compares to Hasura: permissions in the database rather than metadata, one binary rather than a platform, measured GraphQL throughput on the same schema, and where Hasura is the better choice.";
+  "How Postrust compares to Hasura: permissions in the database rather than metadata, one binary rather than a platform, conformance measured by replaying Hasura's own test corpus, and where Hasura is the better choice.";
 const url = "https://postrust.org/compare/hasura";
 
 export const head: DocumentHead = {
