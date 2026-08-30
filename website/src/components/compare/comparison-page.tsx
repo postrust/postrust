@@ -18,7 +18,17 @@ export const ComparisonPage = component$<Props>(({ comparison: c }) => {
   const rest = measuredFor(c.slug, "rest");
   const graphql = measuredFor(c.slug, "graphql");
   const footprint = footprintFor(c.slug);
-  const hasNumbers = rest.length > 0 || graphql.length > 0;
+  // Throughput figures are withheld pending a re-measurement.
+  //
+  // The comparison benchmark was found to report a server as much as 2x slower
+  // while a run is in progress than the same server measured moments later, and
+  // scenarios measured earlier in a run read lower than ones measured later --
+  // so the position of a scenario, not the tool, was moving the ratio. The
+  // mechanism is not identified; scripts/BENCH-FINDINGS.md records what has
+  // been ruled out. Publishing a ratio we cannot stand behind is worse than
+  // publishing none, so this section stays closed until the numbers reproduce
+  // on a host without a virtualised Docker network.
+  const hasNumbers = false;
 
   // FAQ structured data. The questions on the page and the questions in the
   // markup are the same list, so they cannot drift apart.
