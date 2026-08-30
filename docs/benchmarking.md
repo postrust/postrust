@@ -29,9 +29,10 @@ All options are environment variables:
 
 | Variable | Default | Purpose |
 |----------|---------|---------|
-| `REQUESTS` | `3000` | Requests per scenario |
+| `REQUESTS` | `30000` | Requests per scenario |
 | `CONCURRENCY` | `50` | Concurrent connections |
-| `WARMUP` | `200` | Warm-up requests before measuring |
+| `WARMUP` | `500` | Warm-up requests before measuring |
+| `REPEATS` | `3` | Measurements per scenario; the median is reported |
 | `BENCH_FEATURES` | `admin-ui` | Cargo features to build. Set to `""` for a minimal build |
 | `PG_IMAGE` | `postgres:16-alpine` | PostgreSQL image |
 | `PG_PORT` | `55432` | Host port for the database |
@@ -52,6 +53,25 @@ BENCH_FEATURES="" ./scripts/bench.sh
 # Keep everything up afterwards to run your own queries
 KEEP=1 ./scripts/bench.sh
 ```
+
+## Why the window is 30,000 requests
+
+The default used to be 3,000, and that was too few to mean anything. At these
+throughputs 3,000 requests complete in about a third of a second, which samples
+connection setup and cache warmth rather than steady state. Repeating the
+measurement does not rescue it: five medians of a biased sample share the bias.
+
+It biased the comparison rather than merely widening it, because the servers do
+not warm up at the same rate. A short window flattered this one and penalised
+the GHC-based servers, which reach steady state later. Raising the window to
+30,000 cut run-to-run spread from 1.33x to 1.25x here and 1.39x to 1.17x for
+PostGraphile -- and moved several published ratios down by more than a factor
+of two.
+
+The harness also pauses every server it is not currently measuring
+(`docker pause`, so there is no cold start and no lost connection pool). Four
+servers competing for the same cores made the measurement a report on
+scheduling.
 
 ## What it measures
 
@@ -85,7 +105,7 @@ these as a shape to compare against, not a target — see the caveats below.
 ```
  host           : Darwin 25.2.0 arm64
  postgres       : postgres:18-alpine
- load generator : ab (n=3000, c=50)
+ load generator : ab (n=30000, c=50)
  dataset        : bench_items, 100000 rows
 
  binary         : 5220864 bytes (4.98 MiB), stripped: yes
