@@ -59,7 +59,7 @@ impl SubscriptionField {
     /// Create a new subscription field for a table.
     pub fn for_table(schema: &str, table: &str, type_name: &str) -> Self {
         Self {
-            name: to_camel_case(table),
+            name: table.to_string(),
             table_name: table.to_string(),
             schema_name: schema.to_string(),
             return_type: type_name.to_string(),
@@ -94,27 +94,6 @@ pub fn generate_subscription_fields(
     }
 
     fields
-}
-
-/// Convert a snake_case string to camelCase.
-fn to_camel_case(s: &str) -> String {
-    let mut result = String::new();
-    let mut capitalize_next = false;
-
-    for (i, c) in s.chars().enumerate() {
-        if c == '_' {
-            capitalize_next = true;
-        } else if capitalize_next {
-            result.push(c.to_ascii_uppercase());
-            capitalize_next = false;
-        } else if i == 0 {
-            result.push(c.to_ascii_lowercase());
-        } else {
-            result.push(c);
-        }
-    }
-
-    result
 }
 
 /// Payload structure for table change notifications.
@@ -155,15 +134,6 @@ impl TableChangePayload {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn test_to_camel_case() {
-        assert_eq!(to_camel_case("users"), "users");
-        assert_eq!(to_camel_case("user_orders"), "userOrders");
-        assert_eq!(to_camel_case("order_items"), "orderItems");
-        // PostgreSQL identifiers are typically lowercase, but function preserves case
-        assert_eq!(to_camel_case("my_table_name"), "myTableName");
-    }
 
     #[test]
     fn test_subscription_field_channel_name() {

@@ -1,0 +1,2597 @@
+//! The response envelope Hasura clients expect.
+//!
+//! async-graphql answers in the shape the GraphQL specification describes:
+//! `data` is always present, errors carry `locations` and a `path` that is a
+//! list of segments. Hasura answers in a narrower shape of its own, and client
+//! code branches on it:
+//!
+//! ```json
+//! {"errors": [{"message": "...",
+//!              "extensions": {"path": "$.selectionSet.author", "code": "validation-failed"}}]}
+//! ```
+//!
+//! Two differences matter to a client. A failed request has no `data` key at
+//! all, rather than `"data": null` -- code written as `if (body.data)` reads
+//! the two the same way, but code written as `if ('data' in body)` does not.
+//! And `extensions.code` is the machine-readable half: it is what a client
+//! switches on to tell a permission failure from a constraint violation, and
+//! the message text is only for a human.
+//!
+//! The status code is 200 for almost all of this: a GraphQL error is a value
+//! in the response body, not a transport failure. Of the 468 cases in Hasura's
+//! own corpus that this server is measured against, 465 answer 200 --
+//! including every constraint violation, every refusal to authenticate, and
+//! every permission failure at `/v1/graphql`.
+//!
+//! The exception belongs to the *endpoint*, not to the error. All three cases
+//! that answer 400 were sent to `/v1alpha1/graphql`, the address Hasura served
+//! before `/v1`, and all three are a write refused by the `check` of an insert
+//! or update permission. The same refusal at `/v1/graphql` is a 200. Five
+//! cases prove the second half: identical bodies, identical codes, different
+//! status, and the only thing that differs is where they were sent.
+//!
+//! This was read out of the corpus's declared statuses once and read wrongly:
+//! taking it for a rule about the error meant answering 400 at `/v1/graphql`,
+//! which is three cases' worth of wrong. [`status_for`] takes the endpoint.
+
+use async_graphql::{Response, ServerError};
+use serde_json::{json, Map, Value};
+use std::collections::HashMap;
+
+/// Hasura's `extensions.code` for a server error.
+///
+/// The code is inferred from the error's own extensions where the resolver
+/// set one, and otherwise from the message. Guessing from text is not
+/// something to be proud of, but the alternative -- omitting the code -- is
+/// worse: a client that switches on it would fall through to its default
+/// branch for every error this server produces.
+fn code_for(error: &ServerError) -> &'static str {
+    if let Some(extensions) = &error.extensions {
+        if let Some(Value::String(code)) = extensions.get("code").map(value_of) {
+            return match code.as_str() {
+                "validation-failed" => "validation-failed",
+                "bad-request" => "bad-request",
+                // Nothing authenticated the request, or the role it claimed is
+                // not one it may claim. Distinct from `permission-error`,
+                // which is a rule refusing an authenticated caller.
+                "access-denied" => "access-denied",
+                // What Hasura answers when a permission needs a session
+                // variable the caller does not carry: the variable was looked
+                // for and is not there.
+                "not-found" => "not-found",
+                "permission-error" => "permission-error",
+                "constraint-violation" => "constraint-violation",
+                "data-exception" => "data-exception",
+                "not-supported" => "not-supported",
+                "parse-failed" => "parse-failed",
+                _ => "unexpected",
+            };
+        }
+    }
+
+    let message = error.message.to_ascii_lowercase();
+    // Validation is tested first: a rejected enum value says "enumeration type
+    // ... does not contain the value", which mentions no constraint but reads
+    // as one to a later test that only looks for the word.
+    if message.contains("invalid value for argument")
+        || message.contains("does not contain the value")
+        || message.contains("is not defined by operation")
+        // A role granted only reads has no mutation root, so a document naming
+        // a mutation names an operation this schema does not have. That is the
+        // document being wrong about the schema, which is what validation is.
+        // async-graphql's wording, classified here rather than there.
+        || message.contains("not configured for mutations")
+        || message.contains("not configured for subscriptions")
+    {
+        "validation-failed"
+    } else if message.contains("permission") || message.contains("not allowed") {
+        "permission-error"
+    } else if message.contains("violates") || message.contains("constraint") {
+        "constraint-violation"
+    } else if message.contains("unknown argument")
+        || message.contains("cannot query field")
+        || message.contains("expected")
+        || message.contains("unknown field")
+        // Everything the variable rules say. A document that names a variable
+        // it never declared is refused before a resolver runs, so calling it a
+        // database error sends a client looking in the wrong place.
+        || message.starts_with("variable \"")
+    {
+        "validation-failed"
+    } else {
+        "postgres-error"
+    }
+}
+
+fn value_of(value: &async_graphql::Value) -> Value {
+    serde_json::to_value(value).unwrap_or(Value::Null)
+}
+
+/// Render an error's path the way Hasura spells it.
+///
+/// Hasura writes a JSONPath-ish string rooted at the operation --
+/// `$.selectionSet.author.args.where` -- where the specification writes a list
+/// of segments. A list index stays an index; everything else is a field name.
+fn path_for(error: &ServerError) -> String {
+    use async_graphql::PathSegment;
+
+    // Written where the error was raised, when whoever raised it knew where it
+    // was. That is the only way to reach an *argument*: `$.selectionSet.
+    // insert_author.args.objects[0].bio` names a place inside a value the
+    // client sent, and a response path only ever names a field of the answer.
+    if let Some(Value::String(path)) = error
+        .extensions
+        .as_ref()
+        .and_then(|extensions| extensions.get("path"))
+        .map(value_of)
+    {
+        return path;
+    }
+
+    if error.path.is_empty() {
+        return "$".to_string();
+    }
+    // Otherwise the response path, in Hasura's spelling: a field of a field is
+    // written with the selection set that holds it between them, so `author`
+    // then `articles` is `$.selectionSet.author.selectionSet.articles` rather
+    // than `$.selectionSet.author.articles`.
+    //
+    // Which row of a list the error came from is dropped. A response path has
+    // it and Hasura's selection paths never do -- an index appears in one of
+    // its paths only inside an argument, where it names a row the client
+    // *sent*. Naming a field is what a selection path is for.
+    let mut rendered = String::from("$");
+    for segment in &error.path {
+        if let PathSegment::Field(name) = segment {
+            rendered.push_str(".selectionSet.");
+            rendered.push_str(name);
+        }
+    }
+    rendered
+}
+
+/// Convert an async-graphql response into Hasura's envelope.
+pub fn envelope(response: Response) -> Value {
+    if !response.errors.is_empty() {
+        let errors: Vec<Value> = response
+            .errors
+            .iter()
+            .map(|error| {
+                json!({
+                    "message": error.message,
+                    "extensions": {
+                        "path": path_for(error),
+                        "code": code_for(error),
+                    }
+                })
+            })
+            .collect();
+        // No `data` key. Hasura omits it entirely on failure.
+        return json!({ "errors": errors });
+    }
+
+    let mut body = Map::new();
+    body.insert("data".to_string(), value_of(&response.data));
+    Value::Object(body)
+}
+
+/// Which address the request came in on.
+///
+/// The only thing that decides a status here, so it is passed rather than
+/// guessed. `/api/graphql` is this server's own name for the endpoint and
+/// follows `/v1`, which is what a client pointed at it expects.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Endpoint {
+    /// `/v1/graphql` and `/api/graphql`: every answer is a 200.
+    Current,
+    /// `/v1alpha1/graphql`: a check refused by a permission is a 400.
+    Legacy,
+}
+
+/// The HTTP status a body is answered with.
+///
+/// 200, unless a write refused by a permission's `check` reached the legacy
+/// endpoint. See the note at the top of this module: the status belongs to the
+/// address, and the same refusal at `/v1/graphql` is a 200.
+pub fn status_for(body: &Value, endpoint: Endpoint) -> u16 {
+    if endpoint == Endpoint::Current {
+        return 200;
+    }
+    let refused = body
+        .get("errors")
+        .and_then(Value::as_array)
+        .is_some_and(|errors| {
+            errors.iter().any(|error| {
+                error.get("message").and_then(Value::as_str) == Some(crate::role::CHECK_FAILED)
+            })
+        });
+    match refused {
+        true => 400,
+        false => 200,
+    }
+}
+
+/// A request refused before it was read.
+///
+/// Nothing authenticated the caller, or the role it named is not one it may
+/// name. The document is never parsed, so there is no path into it to report
+/// and no operation to blame -- which is why Hasura answers `$` here and this
+/// does too. Still a 200: a GraphQL error is a value in the body.
+pub fn denied(message: &str) -> Value {
+    let mut error = ServerError::new(message, None);
+    let mut extensions = async_graphql::ErrorExtensionValues::default();
+    extensions.set("code", "access-denied");
+    error.extensions = Some(extensions);
+
+    let mut response = Response::new(async_graphql::Value::Null);
+    response.errors = vec![error];
+    envelope(response)
+}
+
+/// Whether the request is an Apollo persisted-query handshake.
+///
+/// A client with automatic persisted queries sends the hash alone, and sends
+/// the document only when the server says it has not seen that hash. Neither
+/// server implements the protocol; the difference is that Hasura says so --
+/// `PersistedQueryNotSupported` -- and this used to run whatever document was
+/// beside the hash, which is the answer that looks like the handshake worked.
+/// A client would then send hash-only requests and get nothing back.
+pub fn persisted_query(request: &async_graphql::Request) -> bool {
+    request.extensions.contains_key("persistedQuery")
+}
+
+/// Hasura's refusal for one, which is the whole answer.
+pub fn not_supported(message: &str) -> Value {
+    let mut error = ServerError::new(message, None);
+    let mut extensions = async_graphql::ErrorExtensionValues::default();
+    extensions.set("code", "not-supported");
+    extensions.set("path", "$");
+    error.extensions = Some(extensions);
+
+    let mut response = Response::new(async_graphql::Value::Null);
+    response.errors = vec![error];
+    envelope(response)
+}
+
+/// A refusal about the request itself rather than about what it asked for.
+///
+/// `bad-request` at `$`: nothing in the document is wrong, so there is no part
+/// of it to point at. A header Hasura reads and cannot parse is the case that
+/// needs it.
+pub fn malformed(message: &str) -> Value {
+    let mut error = ServerError::new(message, None);
+    let mut extensions = async_graphql::ErrorExtensionValues::default();
+    extensions.set("code", "bad-request");
+    extensions.set("path", "$");
+    error.extensions = Some(extensions);
+
+    let mut response = Response::new(async_graphql::Value::Null);
+    response.errors = vec![error];
+    envelope(response)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use async_graphql::{PathSegment, ServerError};
+    use pretty_assertions::assert_eq;
+
+    fn error_at(message: &str, path: Vec<PathSegment>) -> ServerError {
+        let mut error = ServerError::new(message, None);
+        error.path = path;
+        error
+    }
+
+    #[test]
+    fn only_a_refused_write_is_answered_with_a_failure_status() {
+        // Hasura's own inconsistency, reproduced because a client may branch
+        // on it: this one error is 400 and every other refusal is 200.
+        let refused = json!({"errors": [{"message": crate::role::CHECK_FAILED,
+                                         "extensions": {"code": "permission-error"}}]});
+        assert_eq!(status_for(&refused, Endpoint::Legacy), 400);
+        // The same refusal at the address a Hasura client actually uses.
+        assert_eq!(status_for(&refused, Endpoint::Current), 200);
+
+        // The same code, a different error: four cases in the corpus.
+        let denied = json!({"errors": [{"message": "not allowed",
+                                        "extensions": {"code": "permission-error"}}]});
+        assert_eq!(status_for(&denied, Endpoint::Legacy), 200);
+        assert_eq!(
+            status_for(&json!({"data": {"article": []}}), Endpoint::Legacy),
+            200
+        );
+    }
+
+    #[test]
+    fn a_role_may_be_refused_the_schema_without_being_refused_its_rows() {
+        let asked = |query: &str| {
+            let doc = async_graphql::parser::parse_query(query).unwrap();
+            introspection_refusal(&doc, "reader").map(|e| e.message)
+        };
+        let refusal = Some("introspection is disabled for role: \"reader\"".to_string());
+        assert_eq!(asked("{ __schema { types { name } } }"), refusal);
+        assert_eq!(asked("{ __type(name: \"article\") { name } }"), refusal);
+        // Not introspection in the sense that matters: every client library
+        // sends it, and Hasura answers it.
+        assert_eq!(asked("{ article { __typename id } }"), None);
+        assert_eq!(asked("{ article { id } }"), None);
+    }
+
+    #[test]
+    fn a_failed_response_has_no_data_key() {
+        let mut response = Response::new(async_graphql::Value::Null);
+        response.errors = vec![error_at("no", vec![])];
+        let body = envelope(response);
+        assert!(body.get("data").is_none());
+        assert!(body.get("errors").is_some());
+    }
+
+    #[test]
+    fn a_successful_response_has_no_errors_key() {
+        let body = envelope(Response::new(async_graphql::Value::Null));
+        assert!(body.get("errors").is_none());
+        assert!(body.get("data").is_some());
+    }
+
+    #[test]
+    fn path_is_rooted_at_the_selection_set() {
+        let error = error_at(
+            "boom",
+            vec![
+                PathSegment::Field("insert_author".to_string()),
+                PathSegment::Index(0),
+                PathSegment::Field("name".to_string()),
+            ],
+        );
+        assert_eq!(
+            path_for(&error),
+            "$.selectionSet.insert_author.selectionSet.name"
+        );
+    }
+
+    /// A path written where the error was raised wins over the response path,
+    /// because it can name a place the response path cannot: inside an
+    /// argument the client sent.
+    /// A hash beside the document is a handshake, and neither server speaks
+    /// it. Saying so is the difference between a client that falls back and
+    /// one that sends hash-only requests into silence.
+    #[test]
+    fn a_persisted_query_is_refused_as_unsupported() {
+        let plain = async_graphql::Request::new("{ author { id } }");
+        assert!(!persisted_query(&plain));
+
+        let mut carried = async_graphql::Request::new("{ author { id } }");
+        carried.extensions.0.insert(
+            "persistedQuery".to_string(),
+            async_graphql::Value::Object(Default::default()),
+        );
+        assert!(persisted_query(&carried));
+
+        assert_eq!(
+            not_supported("PersistedQueryNotSupported"),
+            json!({"errors": [{
+                "message": "PersistedQueryNotSupported",
+                "extensions": {"path": "$", "code": "not-supported"}
+            }]})
+        );
+    }
+
+    #[test]
+    fn a_path_given_with_the_error_is_the_one_answered() {
+        let mut error = error_at(
+            "boom",
+            vec![PathSegment::Field("insert_author".to_string())],
+        );
+        let mut extensions = async_graphql::ErrorExtensionValues::default();
+        extensions.set("code", "permission-error");
+        extensions.set("path", "$.selectionSet.insert_author.args.objects");
+        error.extensions = Some(extensions);
+        assert_eq!(
+            path_for(&error),
+            "$.selectionSet.insert_author.args.objects"
+        );
+    }
+
+    #[test]
+    fn an_error_with_no_path_is_rooted_at_the_document() {
+        assert_eq!(path_for(&error_at("boom", vec![])), "$");
+    }
+
+    #[test]
+    fn a_validation_message_is_coded_as_one() {
+        let error = ServerError::new("Unknown argument \"filter\" on field \"author\"", None);
+        assert_eq!(code_for(&error), "validation-failed");
+    }
+
+    #[test]
+    fn a_constraint_message_is_coded_as_one() {
+        let error = ServerError::new("duplicate key value violates unique constraint", None);
+        assert_eq!(code_for(&error), "constraint-violation");
+    }
+}
+
+/// Drop variable definitions the document never uses.
+///
+/// The specification's "All Variables Used" rule makes
+/// `query ($tags: jsonb) { article(where: {tags: {_contains: "latest"}}) { id } }`
+/// an invalid document, and async-graphql refuses it. Hasura executes it. A
+/// client that has been sending that query for years -- because a filter was
+/// edited and the declaration was left behind -- gets an answer from the server
+/// it is migrating off and an error from this one, which is the kind of
+/// difference a migration discovers in production.
+///
+/// So the document is parsed here, the unused declarations are removed, and
+/// what validation sees has nothing to complain about. Every other rule still
+/// runs: this makes one specific refusal go away, not validation in general.
+/// A document that does not parse is handed on untouched, so the parse error is
+/// reported by the executor with its own position rather than by this.
+pub fn allow_unused_variables(request: async_graphql::Request) -> async_graphql::Request {
+    prepare(None, request, None).unwrap_or_else(|(request, _)| request)
+}
+
+/// Ready a request for execution, and refuse it where async-graphql would not.
+///
+/// Two passes over the same parsed document, because parsing it twice to do
+/// them separately would be the only reason to separate them:
+///
+/// - variable declarations nothing uses are dropped, since Hasura executes
+///   such a document and the specification does not;
+/// - variables used where their declared type does not fit are refused, since
+///   the specification says so and async-graphql does not.
+///
+/// `schema` is what the second pass needs -- the types a variable is being
+/// used against. Without one only the first pass runs.
+///
+/// `Err` carries the request back beside the errors, so the caller can answer
+/// with them rather than executing.
+// The error carries the request back, which is the whole point of it: the
+// caller answers with the errors instead of executing, and needs the request
+// to do anything else with. Boxing it would hide that.
+#[allow(clippy::result_large_err)]
+pub fn prepare(
+    schema: Option<&async_graphql::dynamic::Schema>,
+    request: async_graphql::Request,
+    // The role introspection is withheld from, where it is withheld from this
+    // one. Checked here because this is where the document is already parsed,
+    // and because refusing it is the whole answer: a schema a role may not
+    // read is not one it may read a little of.
+    introspection_disabled_for: Option<&str>,
+) -> Result<async_graphql::Request, (async_graphql::Request, Vec<ServerError>)> {
+    let mut request = rewrite_document(schema, request);
+    // Parsed again rather than threaded through: `set_parsed_query` takes the
+    // document by value and gives nothing back, and re-parsing a document that
+    // has already parsed once is not where the time goes.
+    //
+    // A document that does not parse is answered here rather than left to
+    // async-graphql, which reports it the way a compiler does -- the offending
+    // line, a caret under the column, and what it expected instead. Hasura
+    // says the document is not a query and names the document, and a client
+    // showing that to a user is showing text it already ships. Nothing further
+    // can run either way, so this is the whole of the answer.
+    let doc = match async_graphql::parser::parse_query(&request.query) {
+        Ok(doc) => doc,
+        Err(_) => {
+            return Err((
+                request,
+                vec![coded(
+                    "not a valid graphql query".to_string(),
+                    async_graphql::Pos::default(),
+                    "$.query",
+                )],
+            ))
+        }
+    };
+    if let Some(schema) = schema {
+        if let Some(role) = introspection_disabled_for {
+            if let Some(error) = introspection_refusal(&doc, role) {
+                return Err((request, vec![error]));
+            }
+        }
+        let mut errors = variable_errors(&doc, schema.registry(), &request.variables);
+        // The first refusal is the whole answer. Hasura validates a request
+        // as a parser reads one -- it stops where it cannot go on -- and in
+        // 468 replayed cases it never answered with a second error. A query
+        // naming two fields that do not exist is refused for the first of
+        // them, and so is one whose `on_conflict` carries an unknown key
+        // beside a missing required one.
+        //
+        // Reporting all of them is the more useful answer and the wrong one
+        // here: a client written against Hasura reads `errors[0]`, and the
+        // rest of the list is text it will not show. The walk still runs to
+        // the end, because it is cheap and because stopping it would put the
+        // stopping condition in every arm.
+        errors.truncate(1);
+        if !errors.is_empty() {
+            return Err((request, errors));
+        }
+    }
+    let _ = &mut request;
+    Ok(request)
+}
+
+/// Whether a document asks the schema about itself, and the refusal if so.
+///
+/// `__typename` is not introspection in the sense that matters: it names the
+/// type of a row a client is already reading, every client library sends it,
+/// and Hasura answers it for a role introspection is disabled for. `__schema`
+/// and `__type` are the two that read the schema as data.
+///
+/// The message and the code are Hasura's.
+fn introspection_refusal(
+    doc: &async_graphql::parser::types::ExecutableDocument,
+    role: &str,
+) -> Option<ServerError> {
+    use async_graphql::parser::types::{OperationType, Selection};
+
+    let operations: Vec<_> = match &doc.operations {
+        async_graphql::parser::types::DocumentOperations::Single(one) => vec![one],
+        async_graphql::parser::types::DocumentOperations::Multiple(many) => many.values().collect(),
+    };
+
+    let asks = operations.iter().any(|operation| {
+        operation.node.ty == OperationType::Query
+            && operation
+                .node
+                .selection_set
+                .node
+                .items
+                .iter()
+                .any(|item| match &item.node {
+                    Selection::Field(field) => {
+                        matches!(field.node.name.node.as_str(), "__schema" | "__type")
+                    }
+                    _ => false,
+                })
+    });
+
+    match asks {
+        false => None,
+        true => {
+            let mut error = ServerError::new(
+                format!("introspection is disabled for role: \"{}\"", role),
+                None,
+            );
+            let mut extensions = async_graphql::ErrorExtensionValues::default();
+            extensions.set("code", "not-supported");
+            error.extensions = Some(extensions);
+            Some(error)
+        }
+    }
+}
+
+/// The edits made to a document before it is validated.
+///
+/// A declaration nothing uses is dropped, and a value written as a string
+/// where a number or a boolean is expected becomes one. Both are things
+/// Hasura accepts and the specification does not, and both are edits to the
+/// same parsed document -- which is why they are one pass: `set_parsed_query`
+/// takes the document by value, so a second pass would have to re-parse the
+/// source text and would undo the first.
+fn rewrite_document(
+    schema: Option<&async_graphql::dynamic::Schema>,
+    mut request: async_graphql::Request,
+) -> async_graphql::Request {
+    use async_graphql::parser::types::{
+        DocumentOperations, ExecutableDocument, Selection, SelectionSet,
+    };
+    use async_graphql::Name;
+    // The executable `Value`, which has a `Variable` case; `async_graphql::Value`
+    // is the constant one a variable has already been substituted into.
+    use async_graphql_value::Value;
+
+    let Ok(mut doc): Result<ExecutableDocument, _> =
+        async_graphql::parser::parse_query(&request.query)
+    else {
+        return request;
+    };
+
+    fn from_value(value: &Value, used: &mut std::collections::HashSet<Name>) {
+        match value {
+            Value::Variable(name) => {
+                used.insert(name.clone());
+            }
+            Value::List(items) => items.iter().for_each(|item| from_value(item, used)),
+            Value::Object(fields) => fields.values().for_each(|field| from_value(field, used)),
+            _ => {}
+        }
+    }
+
+    fn from_selection_set(set: &SelectionSet, used: &mut std::collections::HashSet<Name>) {
+        for selection in &set.items {
+            let (directives, arguments, nested) = match &selection.node {
+                Selection::Field(field) => (
+                    &field.node.directives,
+                    Some(&field.node.arguments),
+                    Some(&field.node.selection_set),
+                ),
+                Selection::FragmentSpread(spread) => (&spread.node.directives, None, None),
+                Selection::InlineFragment(fragment) => (
+                    &fragment.node.directives,
+                    None,
+                    Some(&fragment.node.selection_set),
+                ),
+            };
+            for directive in directives {
+                for (_, value) in &directive.node.arguments {
+                    from_value(&value.node, used);
+                }
+            }
+            for (_, value) in arguments.into_iter().flatten() {
+                from_value(&value.node, used);
+            }
+            if let Some(nested) = nested {
+                from_selection_set(&nested.node, used);
+            }
+        }
+    }
+
+    // Every variable named anywhere in the document, rather than per operation.
+    // Over-counting only keeps a declaration that would have been kept before,
+    // and a variable declared by one operation and used by another is exactly
+    // the case this is here to stop refusing.
+    let mut used = std::collections::HashSet::new();
+    for (_, operation) in doc.operations.iter() {
+        for directive in &operation.node.directives {
+            for (_, value) in &directive.node.arguments {
+                from_value(&value.node, &mut used);
+            }
+        }
+        from_selection_set(&operation.node.selection_set.node, &mut used);
+    }
+    for fragment in doc.fragments.values() {
+        from_selection_set(&fragment.node.selection_set.node, &mut used);
+    }
+
+    let mut edited = false;
+    {
+        let mut prune = |operation: &mut async_graphql::Positioned<
+            async_graphql::parser::types::OperationDefinition,
+        >| {
+            let before = operation.node.variable_definitions.len();
+            operation
+                .node
+                .variable_definitions
+                .retain(|definition| used.contains(&definition.node.name.node));
+            edited |= operation.node.variable_definitions.len() != before;
+        };
+        match &mut doc.operations {
+            DocumentOperations::Single(operation) => prune(operation),
+            DocumentOperations::Multiple(operations) => operations.values_mut().for_each(prune),
+        }
+    }
+
+    // A value written as a string where a number or a boolean is expected.
+    // `insert_test_types(objects: [{c1_smallint: "32767", c20_boolean:
+    // "true"}])` is a mutation Hasura performs: a column's value is read the
+    // way PostgreSQL reads a literal, which takes either spelling, while the
+    // schema still introspects as `Int`. So does `article(offset: "1")`.
+    //
+    // `limit` is the exception, and the corpus is explicit about it: `limit:
+    // "3"` is refused in the same breath that `offset: "1"` is answered. It is
+    // the one Int in the schema that is the engine's own rather than a
+    // column's, and it is the only place a string is not a number.
+    if let Some(schema) = schema {
+        let registry = schema.registry();
+        {
+            let mut coerce = |operation: &mut async_graphql::Positioned<
+                async_graphql::parser::types::OperationDefinition,
+            >| {
+                use async_graphql::parser::types::OperationType;
+                let root = match operation.node.ty {
+                    OperationType::Query => Some(registry.query_type.as_str()),
+                    OperationType::Mutation => registry.mutation_type.as_deref(),
+                    OperationType::Subscription => registry.subscription_type.as_deref(),
+                };
+                if let Some(root) = root {
+                    edited |= coerce_selection_set(
+                        registry,
+                        &mut operation.node.selection_set.node,
+                        root,
+                    );
+                }
+            };
+            match &mut doc.operations {
+                DocumentOperations::Single(operation) => coerce(operation),
+                DocumentOperations::Multiple(operations) => {
+                    operations.values_mut().for_each(coerce)
+                }
+            }
+        }
+        // A fragment names the type it is on, so it is walked on its own
+        // rather than from wherever it is spread -- which also means a cyclic
+        // spread cannot walk forever.
+        for fragment in doc.fragments.values_mut() {
+            let on = fragment.node.type_condition.node.on.node.to_string();
+            edited |= coerce_selection_set(registry, &mut fragment.node.selection_set.node, &on);
+        }
+    }
+
+    if edited {
+        request.set_parsed_query(doc);
+    }
+    request
+}
+
+/// Coerce the written values of one selection set, and of everything under it.
+///
+/// Type-directed, the same walk [`Usage`] makes: a field names its arguments,
+/// an argument names an input object, an input object names its fields, and at
+/// the leaves sits the type a written value has to be. Returns whether
+/// anything changed.
+fn coerce_selection_set(
+    registry: &async_graphql::registry::Registry,
+    set: &mut async_graphql::parser::types::SelectionSet,
+    type_name: &str,
+) -> bool {
+    use async_graphql::parser::types::Selection;
+    use async_graphql::registry::MetaTypeName;
+
+    let mut edited = false;
+    for selection in &mut set.items {
+        match &mut selection.node {
+            Selection::Field(field) => {
+                let meta = registry
+                    .types
+                    .get(type_name)
+                    .and_then(|ty| ty.field_by_name(field.node.name.node.as_str()));
+                for (name, value) in &mut field.node.arguments {
+                    // The engine's own Int, which is strict where a column's
+                    // is not.
+                    if name.node.as_str() == "limit" {
+                        continue;
+                    }
+                    let Some(argument) = meta.and_then(|meta| meta.args.get(name.node.as_str()))
+                    else {
+                        continue;
+                    };
+                    let ty = argument.ty.clone();
+                    edited |= coerce_value(registry, &mut value.node, &ty);
+                }
+                if let Some(meta) = meta {
+                    let inner = MetaTypeName::concrete_typename(&meta.ty).to_string();
+                    edited |=
+                        coerce_selection_set(registry, &mut field.node.selection_set.node, &inner);
+                }
+            }
+            Selection::InlineFragment(fragment) => {
+                let inner = fragment
+                    .node
+                    .type_condition
+                    .as_ref()
+                    .map(|condition| condition.node.on.node.to_string())
+                    .unwrap_or_else(|| type_name.to_string());
+                edited |=
+                    coerce_selection_set(registry, &mut fragment.node.selection_set.node, &inner);
+            }
+            Selection::FragmentSpread(_) => {}
+        }
+    }
+    edited
+}
+
+/// One written value, against the type of the place it was written in.
+fn coerce_value(
+    registry: &async_graphql::registry::Registry,
+    value: &mut async_graphql_value::Value,
+    expected: &str,
+) -> bool {
+    use async_graphql::registry::{MetaType, MetaTypeName};
+    use async_graphql_value::Value;
+
+    match value {
+        Value::List(items) => {
+            // A single value may be written where a list is expected, so the
+            // item type stands in for either.
+            let inner = match MetaTypeName::create(expected).unwrap_non_null() {
+                MetaTypeName::List(inner) => inner.to_string(),
+                _ => expected.to_string(),
+            };
+            let mut edited = false;
+            for item in items {
+                edited |= coerce_value(registry, item, &inner);
+            }
+            edited
+        }
+        Value::Object(fields) => {
+            let name = MetaTypeName::concrete_typename(expected);
+            let Some(MetaType::InputObject { input_fields, .. }) = registry.types.get(name) else {
+                return false;
+            };
+            let types: Vec<(async_graphql::Name, String)> = fields
+                .keys()
+                .filter_map(|key| {
+                    input_fields
+                        .get(key.as_str())
+                        .map(|field| (key.clone(), field.ty.clone()))
+                })
+                .collect();
+            let mut edited = false;
+            for (key, ty) in types {
+                if let Some(item) = fields.get_mut(&key) {
+                    edited |= coerce_value(registry, item, &ty);
+                }
+            }
+            edited
+        }
+        Value::String(text) => {
+            let Some(coerced) = as_written(text, MetaTypeName::concrete_typename(expected)) else {
+                return false;
+            };
+            *value = coerced;
+            true
+        }
+        _ => false,
+    }
+}
+
+/// A string read as the type it was written where, if it can be.
+///
+/// Only the three GraphQL scalars that are strict about it: everything else in
+/// this schema is a scalar of its own, which takes a string already.
+fn as_written(text: &str, expected: &str) -> Option<async_graphql_value::Value> {
+    use async_graphql_value::{Number, Value};
+    match expected {
+        "Int" => text.parse::<i64>().ok().map(|n| Value::Number(n.into())),
+        "Float" => text
+            .parse::<f64>()
+            .ok()
+            .and_then(Number::from_f64)
+            .map(Value::Number),
+        "Boolean" => match text {
+            "true" => Some(Value::Boolean(true)),
+            "false" => Some(Value::Boolean(false)),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+#[cfg(test)]
+mod unused_variable_tests {
+    use super::*;
+
+    fn declarations(query: &str) -> Vec<String> {
+        let request = allow_unused_variables(async_graphql::Request::new(query));
+        // A request whose declarations were all used is handed on with nothing
+        // parsed, so what the executor sees is the source text.
+        let mut request = request;
+        let doc = request.parsed_query().expect("the query parses");
+        doc.operations
+            .iter()
+            .flat_map(|(_, operation)| operation.node.variable_definitions.iter())
+            .map(|definition| definition.node.name.node.to_string())
+            .collect()
+    }
+
+    #[test]
+    fn a_variable_nothing_names_is_dropped() {
+        assert_eq!(
+            declarations("query ($tags: jsonb) { article(where: {id: {_eq: 1}}) { id } }"),
+            Vec::<String>::new()
+        );
+    }
+
+    #[test]
+    fn a_variable_an_argument_names_is_kept() {
+        assert_eq!(
+            declarations("query ($id: Int) { article(where: {id: {_eq: $id}}) { id } }"),
+            vec!["id".to_string()]
+        );
+    }
+
+    #[test]
+    fn a_variable_named_inside_a_list_is_kept() {
+        assert_eq!(
+            declarations("query ($id: Int) { article(where: {_or: [{id: {_eq: $id}}]}) { id } }"),
+            vec!["id".to_string()]
+        );
+    }
+
+    #[test]
+    fn a_variable_only_a_fragment_names_is_kept() {
+        assert_eq!(
+            declarations(
+                "query ($n: Int) { author { ...rows } } \
+                 fragment rows on author { articles(limit: $n) { id } }"
+            ),
+            vec!["n".to_string()]
+        );
+    }
+
+    #[test]
+    fn a_document_that_does_not_parse_is_left_alone() {
+        let request = allow_unused_variables(async_graphql::Request::new("query ("));
+        assert_eq!(request.query, "query (");
+    }
+}
+
+/// Refuse a variable used where its declared type does not fit.
+///
+/// The specification's "All Variable Usages Are Allowed" rule: `query
+/// ($limit: String) { author(limit: $limit) }` is invalid, because `limit` is
+/// an `Int` and a `String` is not one. async-graphql carries exactly this rule
+/// and it does not fire -- verified against 7.0.17 with a static schema, a
+/// dynamic one, and a built-in directive, none of which report -- so the check
+/// is made here instead. It is the one place where being lax is worse than
+/// being wrong: the client is answered with data when what it wrote cannot
+/// mean what it thinks, and it finds out from the rows.
+///
+/// The messages are Hasura's, since a client that shows them to a developer is
+/// showing text it already ships.
+fn variable_errors(
+    doc: &async_graphql::parser::types::ExecutableDocument,
+    registry: &async_graphql::registry::Registry,
+    variables: &async_graphql::Variables,
+) -> Vec<ServerError> {
+    use async_graphql::parser::types::{DocumentOperations, OperationType};
+
+    let mut errors: Vec<ServerError> = Vec::new();
+
+    let operations: Vec<
+        &async_graphql::Positioned<async_graphql::parser::types::OperationDefinition>,
+    > = match &doc.operations {
+        DocumentOperations::Single(operation) => vec![operation],
+        DocumentOperations::Multiple(operations) => operations.values().collect(),
+    };
+
+    for operation in operations {
+        let root = match operation.node.ty {
+            OperationType::Query => Some(registry.query_type.as_str()),
+            OperationType::Mutation => registry.mutation_type.as_deref(),
+            OperationType::Subscription => registry.subscription_type.as_deref(),
+        };
+        let Some(root) = root else {
+            // A mutation sent to a schema that has no mutation root. Hasura
+            // answers this rather than "the field you named is not there",
+            // because there is no type for it to have not been in.
+            if operation.node.ty == OperationType::Mutation {
+                errors.push(coded("no mutations exist".to_string(), operation.pos, "$"));
+            }
+            continue;
+        };
+
+        // What each variable was declared as, and what a null in it means.
+        let mut declared: HashMap<&str, String> = HashMap::new();
+        for definition in &operation.node.variable_definitions {
+            let name = definition.node.name.node.as_str();
+            let written = definition.node.var_type.node.to_string();
+            // A nullable declaration with a default behaves as a non-null
+            // one: the default stands in wherever the variable is left out.
+            // A default *of* null does not -- `$author: author_insert_input =
+            // null` still cannot be used where a non-null is expected, because
+            // what it stands in with is a null.
+            let defaulted = definition
+                .node
+                .default_value
+                .as_ref()
+                .is_some_and(|value| !matches!(value.node, async_graphql::Value::Null));
+            let effective = match (definition.node.var_type.node.nullable, defaulted) {
+                (true, true) => format!("{}!", written),
+                _ => written.clone(),
+            };
+            declared.insert(name, effective);
+
+            // An explicit null for a non-null variable. The default does not
+            // save it: a default stands in for a variable that was not given,
+            // not for one that was given as null.
+            let given = variables.get(&async_graphql::Name::new(name));
+            if !definition.node.var_type.node.nullable
+                && matches!(given, Some(async_graphql::Value::Null))
+            {
+                errors.push(coded(
+                    format!("null value found for non-nullable type: \"{}\"", written),
+                    definition.pos,
+                    "$",
+                ));
+            }
+        }
+        // Walked even with nothing declared: the second thing this looks for
+        // is a null written straight into a comparison, which needs no
+        // variable to be written.
+        let mut scope = Usage {
+            registry,
+            fragments: &doc.fragments,
+            declared: &declared,
+            variables,
+            errors: &mut errors,
+            spreading: Vec::new(),
+            expansions: 0,
+        };
+        scope.selection_set(&operation.node.selection_set.node, root, "$");
+    }
+
+    errors
+}
+
+/// One walk of a document, checking every variable against where it is used.
+struct Usage<'a> {
+    registry: &'a async_graphql::registry::Registry,
+    fragments: &'a std::collections::HashMap<
+        async_graphql::Name,
+        async_graphql::Positioned<async_graphql::parser::types::FragmentDefinition>,
+    >,
+    declared: &'a HashMap<&'a str, String>,
+    /// What the request gave for each variable, which is the only way to tell
+    /// a variable standing for a null from one standing for a value.
+    variables: &'a async_graphql::Variables,
+    errors: &'a mut Vec<ServerError>,
+    /// Fragments already walked, so a cycle terminates. async-graphql refuses
+    /// cyclic fragments too, but this runs first.
+    /// The fragments currently being spread, outermost first.
+    ///
+    /// A stack rather than a set, because what a cycle is named after is the
+    /// run of fragments from the first occurrence to the repeat -- and because
+    /// a fragment spread twice in sibling positions is not a cycle and its
+    /// contents should be checked at both.
+    spreading: Vec<String>,
+    /// How many spreads have been expanded. A document whose fragments each
+    /// spread the next twice doubles the work per level without ever
+    /// repeating a name, so the stack alone does not bound this.
+    expansions: usize,
+}
+
+impl Usage<'_> {
+    /// `path` is where this selection set is, in Hasura's spelling: `$` at the
+    /// root, and `$.selectionSet.author` for the set inside that field. A
+    /// fragment carries its spread site's path, since that is where the fields
+    /// it contributes actually are.
+    fn selection_set(
+        &mut self,
+        set: &async_graphql::parser::types::SelectionSet,
+        type_name: &str,
+        path: &str,
+    ) {
+        use async_graphql::parser::types::Selection;
+        use async_graphql::registry::MetaTypeName;
+
+        for selection in &set.items {
+            match &selection.node {
+                Selection::Field(field) => {
+                    let named = field.node.name.node.as_str();
+                    let parent = self.registry.types.get(type_name);
+                    let meta = parent.and_then(|ty| ty.field_by_name(named));
+                    let here = format!("{}.selectionSet.{}", path, field.node.name.node);
+                    // A field the type does not have. async-graphql reports
+                    // this too, and in its own words -- `Unknown field "x" on
+                    // type "y". Did you mean ...` -- so saying it here is what
+                    // makes the answer Hasura's: this walk runs first and a
+                    // document with an error in it never reaches validation.
+                    //
+                    // Only where the parent type is one this registry knows.
+                    // Not knowing it is not evidence that the field is absent.
+                    if meta.is_none() && parent.is_some() && !named.starts_with("__") {
+                        self.errors.push(coded(
+                            format!("field '{}' not found in type: '{}'", named, type_name),
+                            field.pos,
+                            &here,
+                        ));
+                        continue;
+                    }
+                    for (name, value) in &field.node.arguments {
+                        let Some(argument) =
+                            meta.and_then(|meta| meta.args.get(name.node.as_str()))
+                        else {
+                            // An argument the field does not take. Reported
+                            // against the field rather than against the
+                            // argument -- there is no such argument to point
+                            // at, which is the complaint.
+                            if meta.is_some() {
+                                self.errors.push(coded(
+                                    format!("'{}' has no argument named '{}'", named, name.node),
+                                    name.pos,
+                                    &here,
+                                ));
+                            }
+                            continue;
+                        };
+                        // A location with a default of its own accepts a
+                        // nullable variable where it says non-null, since
+                        // leaving the variable out is then the same as not
+                        // writing the argument.
+                        let expected = relax(&argument.ty, argument.default_value.is_some());
+                        let at = format!("{}.args.{}", here, name.node);
+                        self.rows_asked_for(
+                            name.node.as_str(),
+                            &value.node,
+                            &expected,
+                            value.pos,
+                            &at,
+                        );
+                        self.object_expected(&value.node, &expected, value.pos, &at);
+                        self.value(&value.node, &expected, value.pos, &at);
+                    }
+                    self.one_operator_per_column(&field.node.arguments, &here);
+                    self.directives(&field.node.directives, &here);
+                    if let Some(meta) = meta {
+                        let inner = MetaTypeName::concrete_typename(&meta.ty).to_string();
+                        self.selection_set(&field.node.selection_set.node, &inner, &here);
+                    }
+                }
+                Selection::InlineFragment(fragment) => {
+                    let inner = fragment
+                        .node
+                        .type_condition
+                        .as_ref()
+                        .map(|condition| condition.node.on.node.to_string())
+                        .unwrap_or_else(|| type_name.to_string());
+                    self.directives(&fragment.node.directives, path);
+                    self.selection_set(&fragment.node.selection_set.node, &inner, path);
+                }
+                Selection::FragmentSpread(spread) => {
+                    let name = spread.node.fragment_name.node.to_string();
+                    self.directives(&spread.node.directives, path);
+                    // A fragment that spreads its way back to itself. Nothing
+                    // can be checked inside it -- there is no inside, the
+                    // document does not describe a finite selection -- so this
+                    // is reported and the walk stops here. async-graphql finds
+                    // it too, as a recursion depth, which says that something
+                    // went too deep rather than what it was.
+                    if let Some(began) = self.spreading.iter().position(|held| held == &name) {
+                        let cycle: Vec<&str> =
+                            self.spreading[began..].iter().map(String::as_str).collect();
+                        self.errors.push(coded(
+                            format!("the fragment definition(s) {} form a cycle", listed(&cycle)),
+                            spread.pos,
+                            // The selection set the offending spread is in,
+                            // rather than the spread itself: by then the
+                            // spread has no selection set of its own to name.
+                            &format!("{}.selectionSet", path),
+                        ));
+                        continue;
+                    }
+                    self.expansions += 1;
+                    if self.expansions > SPREAD_BUDGET {
+                        continue;
+                    }
+                    if let Some(fragment) = self.fragments.get(&async_graphql::Name::new(&name)) {
+                        let on = fragment.node.type_condition.node.on.node.to_string();
+                        // A spread is a step in Hasura's path, named after the
+                        // fragment: `...selectionSet.author.selectionSet.
+                        // authorFragment.selectionSet.articles`.
+                        let here = format!("{}.selectionSet.{}", path, name);
+                        self.spreading.push(name);
+                        self.selection_set(&fragment.node.selection_set.node, &on, &here);
+                        self.spreading.pop();
+                    }
+                }
+            }
+        }
+    }
+
+    fn directives(
+        &mut self,
+        directives: &[async_graphql::Positioned<async_graphql::parser::types::Directive>],
+        path: &str,
+    ) {
+        for directive in directives {
+            let meta = self
+                .registry
+                .directives
+                .get(directive.node.name.node.as_str());
+            for (name, value) in &directive.node.arguments {
+                let Some(argument) = meta.and_then(|meta| meta.args.get(name.node.as_str())) else {
+                    continue;
+                };
+                let expected = relax(&argument.ty, argument.default_value.is_some());
+                let at = format!("{}.args.{}", path, name.node);
+                self.value(&value.node, &expected, value.pos, &at);
+            }
+        }
+    }
+
+    /// Whether a written value is a null, however it was written.
+    ///
+    /// A literal one, or a variable the request gave a null for. A variable
+    /// the request left out is not: an absent variable makes the field itself
+    /// absent, which is a query with no such comparison rather than one
+    /// comparing against nothing.
+    fn stands_for_null(&self, value: &async_graphql_value::Value) -> bool {
+        use async_graphql_value::Value;
+        match value {
+            Value::Null => true,
+            Value::Variable(name) => matches!(
+                self.variables.get(&async_graphql::Name::new(name)),
+                Some(async_graphql::Value::Null)
+            ),
+            _ => false,
+        }
+    }
+
+    /// One written value, against the type of the place it was written in.
+    fn value(
+        &mut self,
+        value: &async_graphql_value::Value,
+        expected: &str,
+        pos: async_graphql::Pos,
+        path: &str,
+    ) {
+        use async_graphql::registry::{MetaType, MetaTypeName};
+        use async_graphql_value::Value;
+
+        match value {
+            Value::Variable(name) => {
+                let Some(declared) = self.declared.get(name.as_str()) else {
+                    // Undefined, which async-graphql reports itself.
+                    return;
+                };
+                if !MetaTypeName::create(expected).is_subtype(&MetaTypeName::create(declared)) {
+                    self.errors.push(coded(
+                        format!(
+                            "variable '{}' is declared as '{}', but used where '{}' is expected",
+                            name, declared, expected
+                        ),
+                        pos,
+                        path,
+                    ));
+                    return;
+                }
+                // A variable of the right type may still carry a value the
+                // type does not have: `$color: colors_enum` given
+                // `"not_a_real_color"` is declared correctly and is still not
+                // one of the colours.
+                if let Some(given) = self.variables.get(&async_graphql::Name::new(name)) {
+                    let given: async_graphql_value::Value = given.clone().into();
+                    self.enumerated(&given, expected, pos, path, true);
+                    self.label_path(&given, expected, pos, path);
+                    self.raster_hex(&given, expected, pos, path);
+                }
+            }
+            Value::Enum(_) | Value::String(_) => {
+                self.enumerated(value, expected, pos, path, false);
+                self.label_path(value, expected, pos, path);
+                self.raster_hex(value, expected, pos, path);
+            }
+            Value::Number(_) => self.integral(value, expected, pos, path),
+            Value::List(items) => {
+                // A list may be written where one value is expected, in which
+                // case each item is checked against that same type -- which is
+                // what list input coercion means.
+                let inner = match MetaTypeName::create(expected).unwrap_non_null() {
+                    MetaTypeName::List(inner) => inner.to_string(),
+                    _ => expected.to_string(),
+                };
+                for (index, item) in items.iter().enumerate() {
+                    self.value(item, &inner, pos, &format!("{}[{}]", path, index));
+                }
+            }
+            Value::Object(fields) => {
+                let name = MetaTypeName::concrete_typename(expected);
+                let Some(MetaType::InputObject { input_fields, .. }) =
+                    self.registry.types.get(name)
+                else {
+                    return;
+                };
+                // A comparison against null. `where: {id: {_eq: null}}` reads
+                // as `id = NULL`, which is never true -- so a client that
+                // wrote it meant something the query cannot mean, and gets
+                // every row or no rows depending on which. Hasura refuses it,
+                // and the operand is a nullable `Int` in the schema either
+                // server publishes, so this is the only place it can be
+                // refused.
+                let comparison = name.ends_with("_comparison_exp");
+                // One object written where a list was expected is that list's
+                // first item -- input coercion says so, and the path says so
+                // too: `insert_author(objects: {location: $x})` is refused at
+                // `args.objects[0].location`, not at `args.objects.location`.
+                let base = match MetaTypeName::create(expected).unwrap_non_null() {
+                    MetaTypeName::List(_) => format!("{}[0]", path),
+                    _ => path.to_string(),
+                };
+                for (key, item) in fields {
+                    let at = format!("{}.{}", base, key.as_str());
+                    let Some(field) = input_fields.get(key.as_str()) else {
+                        // A key the input object does not have, in the same
+                        // words a missing selection field gets: Hasura writes
+                        // `field 'action' not found in type:
+                        // 'article_on_conflict'` for both.
+                        self.errors.push(coded(
+                            format!("field '{}' not found in type: '{}'", key.as_str(), name),
+                            pos,
+                            &at,
+                        ));
+                        continue;
+                    };
+                    if comparison && self.stands_for_null(item) {
+                        self.errors.push(coded(
+                            format!(
+                                "unexpected null value for type '{}'",
+                                MetaTypeName::concrete_typename(&field.ty)
+                            ),
+                            pos,
+                            &at,
+                        ));
+                        continue;
+                    }
+                    let ty = relax(&field.ty, field.default_value.is_some());
+                    self.value(item, &ty, pos, &at);
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+impl Usage<'_> {
+    /// `null` written where an object is required.
+    ///
+    /// `update_author(where: null)` says nothing about which rows, and `where`
+    /// is non-null in the schema either server publishes. async-graphql calls
+    /// it `Invalid value for argument "where", expected type
+    /// "author_bool_exp"`, which names the argument and not what was wrong
+    /// with it; Hasura names the type it wanted and the thing it got.
+    ///
+    /// Only a *required* input object is refused here. A nullable one written
+    /// as `null` is the same as leaving it out, which is a request this server
+    /// has no business turning into an error.
+    fn object_expected(
+        &mut self,
+        value: &async_graphql_value::Value,
+        expected: &str,
+        pos: async_graphql::Pos,
+        path: &str,
+    ) {
+        use async_graphql::registry::{MetaType, MetaTypeName};
+
+        if !matches!(MetaTypeName::create(expected), MetaTypeName::NonNull(_)) {
+            return;
+        }
+        if !self.stands_for_null(value) {
+            return;
+        }
+        let name = MetaTypeName::concrete_typename(expected);
+        if !matches!(
+            self.registry.types.get(name),
+            Some(MetaType::InputObject { .. })
+        ) {
+            return;
+        }
+        self.errors.push(coded(
+            format!("expected an object for type '{}', but found null", name),
+            pos,
+            path,
+        ));
+    }
+
+    /// A column named by two of an update's operators.
+    ///
+    /// `_set: {id: 1}` beside `_inc: {id: 2}` asks for one column to be two
+    /// things in one statement, and the order they would be applied in is not
+    /// something the request says. PostgreSQL refuses the statement -- a
+    /// column may appear once in a `SET` list -- and by then the answer names
+    /// the column alone. Hasura names every column written twice, and reports
+    /// it against the arguments rather than against any one of them, since no
+    /// single operator is the wrong one.
+    ///
+    /// The operators are Hasura's own seven. A duplicate *within* one of them
+    /// is not this: an object cannot have a key twice.
+    fn one_operator_per_column(
+        &mut self,
+        arguments: &[(
+            async_graphql::Positioned<async_graphql::Name>,
+            async_graphql::Positioned<async_graphql_value::Value>,
+        )],
+        path: &str,
+    ) {
+        use async_graphql_value::Value;
+
+        const OPERATORS: [&str; 7] = [
+            "_set",
+            "_inc",
+            "_append",
+            "_prepend",
+            "_delete_key",
+            "_delete_elem",
+            "_delete_at_path",
+        ];
+
+        let mut seen: Vec<&str> = Vec::new();
+        let mut twice: Vec<&str> = Vec::new();
+        for (name, value) in arguments {
+            if !OPERATORS.contains(&name.node.as_str()) {
+                continue;
+            }
+            let Value::Object(columns) = &value.node else {
+                continue;
+            };
+            for column in columns.keys() {
+                let column = column.as_str();
+                match seen.contains(&column) {
+                    true if !twice.contains(&column) => twice.push(column),
+                    true => {}
+                    false => seen.push(column),
+                }
+            }
+        }
+        if twice.is_empty() {
+            return;
+        }
+        // Haskell's `show` for a list of strings, which is what the message is
+        // rendered by: single quotes are what Hasura's own output has.
+        let listed = twice
+            .iter()
+            .map(|column| format!("'{}'", column))
+            .collect::<Vec<String>>()
+            .join(", ");
+        self.errors.push(coded(
+            format!("Column found in multiple operators: [{}].", listed),
+            arguments
+                .first()
+                .map(|(name, _)| name.pos)
+                .unwrap_or_default(),
+            &format!("{}.args", path),
+        ));
+    }
+
+    /// A number written where an `Int` is expected, against what an `Int` is.
+    ///
+    /// GraphQL's `Int` is a signed 32-bit integer, and `2147483648` is not
+    /// one. PostgreSQL says `integer out of range` when the statement runs;
+    /// Hasura says so while reading the request, and names the value it could
+    /// not read. `int8` columns are a `bigint` scalar rather than an `Int`, so
+    /// nothing that legitimately holds a large number is caught here.
+    fn integral(
+        &mut self,
+        value: &async_graphql_value::Value,
+        expected: &str,
+        pos: async_graphql::Pos,
+        path: &str,
+    ) {
+        use async_graphql::registry::MetaTypeName;
+        use async_graphql_value::Value;
+
+        if MetaTypeName::concrete_typename(expected) != "Int" {
+            return;
+        }
+        let Value::Number(number) = value else {
+            return;
+        };
+        if number.as_i64().is_some_and(|n| i32::try_from(n).is_ok()) {
+            return;
+        }
+        let Some(shown) = number.as_f64().map(shown_as_haskell_would) else {
+            return;
+        };
+        self.errors.push(coded_as(
+            "parse-failed",
+            format!(
+                "The value {} lies outside the bounds or is not an integer. \
+                 Maybe it is a float, or is there integer overflow?",
+                shown
+            ),
+            pos,
+            path,
+        ));
+    }
+
+    /// How many rows a query asked for, which `Int` alone does not say.
+    ///
+    /// `limit` is typed `Int` in the schema either server publishes and is not
+    /// any `Int`: a page of -1 rows is not a page, and Hasura refuses it
+    /// before the query is built rather than letting `LIMIT must not be
+    /// negative` come back from the database. A string is refused there too,
+    /// even one that reads as a number.
+    ///
+    /// `offset` is *not* the same rule, and that asymmetry is Hasura's rather
+    /// than an omission here: its own corpus sends `offset: "1"` and expects
+    /// rows back, and sends `offset: -1` and expects PostgreSQL's own
+    /// `OFFSET must not be negative`. So this is about the argument named
+    /// `limit` and nothing else.
+    fn rows_asked_for(
+        &mut self,
+        argument: &str,
+        value: &async_graphql_value::Value,
+        expected: &str,
+        pos: async_graphql::Pos,
+        path: &str,
+    ) {
+        use async_graphql::registry::MetaTypeName;
+        use async_graphql_value::Value;
+
+        if argument != "limit" || MetaTypeName::concrete_typename(expected) != "Int" {
+            return;
+        }
+        // Through a variable, what matters is the value it stands for.
+        let value = match value {
+            Value::Variable(name) => {
+                match self.variables.get(&async_graphql::Name::new(name.as_str())) {
+                    Some(given) => std::borrow::Cow::Owned(given.clone().into()),
+                    None => return,
+                }
+            }
+            other => std::borrow::Cow::Borrowed(other),
+        };
+
+        let found = match value.as_ref() {
+            Value::String(_) => "a string",
+            Value::Number(number) => match number.as_i64() {
+                // A number that is not an `Int` at all is left to the rule
+                // about `Int`: that is the more specific complaint, and both
+                // rules firing would answer one mistake twice.
+                None => return,
+                Some(written) if i32::try_from(written).is_err() => return,
+                // What is left is a number of rows, and a negative one is not.
+                Some(written) if written >= 0 => return,
+                Some(_) => "an integer",
+            },
+            _ => return,
+        };
+        self.errors.push(coded(
+            format!(
+                "expected a non-negative 32-bit integer for type 'Int', but found {}",
+                found
+            ),
+            pos,
+            path,
+        ));
+    }
+
+    /// A value written where a `raster` is expected, as hexadecimal.
+    ///
+    /// A raster travels as the hex of its well-known binary, and PostGIS
+    /// answers `rt_raster_from_wkb: wkb size (14) < min size (61)` for
+    /// something that is not one -- a complaint about the bytes it managed to
+    /// decode rather than about the text it was given. Hasura reads the text
+    /// first and says it is not hexadecimal.
+    ///
+    /// Only what is certainly not hexadecimal is refused: a character outside
+    /// `0-9A-Fa-f`, or an odd number of them, since a byte takes two. A
+    /// well-formed hex string that is too short to be a raster still goes to
+    /// PostGIS and comes back in PostGIS's words, which is what happens today
+    /// and is not something the corpus has an opinion about.
+    fn raster_hex(
+        &mut self,
+        value: &async_graphql_value::Value,
+        expected: &str,
+        pos: async_graphql::Pos,
+        path: &str,
+    ) {
+        use async_graphql::registry::MetaTypeName;
+        use async_graphql_value::Value;
+
+        if MetaTypeName::concrete_typename(expected) != "raster" {
+            return;
+        }
+        let Value::String(written) = value else {
+            return;
+        };
+        if written.len() % 2 == 0 && written.chars().all(|c| c.is_ascii_hexdigit()) {
+            return;
+        }
+        self.errors.push(coded_as(
+            "parse-failed",
+            "invalid hexadecimal representation of raster well known binary format".to_string(),
+            pos,
+            path,
+        ));
+    }
+
+    /// A value written where an `ltree` is expected, as a label path.
+    ///
+    /// PostgreSQL refuses `Tree.Collections.` with `ltree syntax error` and
+    /// nothing else; Hasura reads the path before sending it and says what a
+    /// path is. Reading it here is also what puts the refusal at
+    /// `...where.path._ancestor` rather than at the request as a whole.
+    ///
+    /// Only an *empty label* is refused, and the narrowness is the point.
+    /// PostgreSQL's idea of a label character comes from the database's
+    /// locale -- `a-b`, `a_b`, `1.2` and `Ünï` are all paths on the image the
+    /// harness runs, and in C locale the last of those is not. Refusing a
+    /// character this server merely doubts would turn a working query into an
+    /// error, so what is refused here is the one thing no locale accepts: a
+    /// label with nothing in it. Everything else is still PostgreSQL's to
+    /// judge, in PostgreSQL's words.
+    fn label_path(
+        &mut self,
+        value: &async_graphql_value::Value,
+        expected: &str,
+        pos: async_graphql::Pos,
+        path: &str,
+    ) {
+        use async_graphql::registry::MetaTypeName;
+        use async_graphql_value::Value;
+
+        if MetaTypeName::concrete_typename(expected) != "ltree" {
+            return;
+        }
+        let Value::String(written) = value else {
+            return;
+        };
+        // The empty string is the empty path, which is a path: "zero or more
+        // labels" is what the message this raises says, and PostgreSQL agrees.
+        if written.is_empty() || written.split('.').all(|label| !label.is_empty()) {
+            return;
+        }
+        self.errors.push(coded_as(
+            "parse-failed",
+            "Expecting label path: a sequence of zero or more labels separated by \
+             dots, for example L1.L2.L3"
+                .to_string(),
+            pos,
+            path,
+        ));
+    }
+
+    /// A value written where an enum is expected, against that enum's members.
+    ///
+    /// async-graphql reports this too, in its own words and against the
+    /// argument rather than against the place inside it. Hasura lists what it
+    /// would have accepted, which is the half a client can act on.
+    fn enumerated(
+        &mut self,
+        value: &async_graphql_value::Value,
+        expected: &str,
+        pos: async_graphql::Pos,
+        path: &str,
+        // Whether the value arrived through a variable. JSON has no enum, so a
+        // variable carries one as a string and the question is which member it
+        // names. Written into the document, a string is not an enum value at
+        // all -- `_eq: "red"` is a mistake about the language rather than
+        // about the colours, and Hasura says which mistake it was.
+        from_variable: bool,
+    ) {
+        use async_graphql::registry::{MetaType, MetaTypeName};
+        use async_graphql_value::Value;
+
+        let name = MetaTypeName::concrete_typename(expected);
+        let Some(MetaType::Enum { enum_values, .. }) = self.registry.types.get(name) else {
+            return;
+        };
+        let written = match value {
+            Value::Enum(written) => written.as_str(),
+            Value::String(written) if from_variable => written.as_str(),
+            Value::String(_) => {
+                self.errors.push(coded(
+                    format!(
+                        "expected an enum value for type '{}', but found a string",
+                        name
+                    ),
+                    pos,
+                    path,
+                ));
+                return;
+            }
+            _ => return,
+        };
+        if enum_values.contains_key(written) {
+            return;
+        }
+        // Alphabetical, which is the order Hasura lists them in and not
+        // necessarily the order they were declared.
+        let mut allowed: Vec<&str> = enum_values.keys().map(String::as_str).collect();
+        allowed.sort_unstable();
+        let listed = allowed
+            .iter()
+            .map(|value| format!("'{}'", value))
+            .collect::<Vec<_>>()
+            .join(", ");
+        self.errors.push(coded(
+            format!(
+                "expected one of the values [{}] for type '{}', but found '{}'",
+                listed, name, written
+            ),
+            pos,
+            path,
+        ));
+    }
+}
+
+/// How many fragment spreads one document may expand before the walk gives up.
+///
+/// Not a limit anyone should reach: it is here because fragments that spread
+/// other fragments twice each double the work per level without any name
+/// repeating, so the cycle check alone does not bound the walk. Reaching it
+/// stops the checking rather than refusing the document -- async-graphql
+/// validates it afterwards either way.
+const SPREAD_BUDGET: usize = 1000;
+
+/// Names in a sentence, the way Hasura writes them: `a`, `a and b`,
+/// `a, b and c`.
+fn listed(names: &[&str]) -> String {
+    match names {
+        [] => String::new(),
+        [one] => one.to_string(),
+        [rest @ .., last] => format!("{} and {}", rest.join(", "), last),
+    }
+}
+
+/// A number as Haskell's `show` renders a `Double`, which is how the value in
+/// Hasura's message is spelled.
+///
+/// `2147483648` comes back as `2.147483648e9` rather than as its digits, and
+/// the message quotes it, so matching the message means matching the
+/// rendering. Haskell writes a `Double` in fixed notation while its magnitude
+/// is in `[0.1, 10^7)` and in scientific notation otherwise, always with a
+/// decimal point in the mantissa. Rust's own two formats are the same two
+/// spellings and both give the shortest digits that read back exactly, so the
+/// choice between them is the whole of what this adds.
+fn shown_as_haskell_would(value: f64) -> String {
+    if !value.is_finite() {
+        return value.to_string();
+    }
+    let magnitude = value.abs();
+    let with_a_point = |rendered: String| match rendered.contains('.') {
+        true => rendered,
+        false => format!("{}.0", rendered),
+    };
+    if magnitude != 0.0 && (magnitude < 0.1 || magnitude >= 1e7) {
+        let rendered = format!("{:e}", value);
+        let (mantissa, exponent) = match rendered.split_once('e') {
+            Some(halves) => halves,
+            None => return with_a_point(rendered),
+        };
+        return format!("{}e{}", with_a_point(mantissa.to_string()), exponent);
+    }
+    with_a_point(format!("{}", value))
+}
+
+/// A location type as it accepts a variable, given whether it has a default.
+///
+/// A non-null location with a default takes a nullable variable: leaving that
+/// variable out is the same as not writing the argument, and the default then
+/// stands in. Without a default it does not.
+fn relax(ty: &str, has_default: bool) -> String {
+    match has_default {
+        true => ty.strip_suffix('!').unwrap_or(ty).to_string(),
+        false => ty.to_string(),
+    }
+}
+
+/// A validation failure, coded as one, at the place it was found.
+///
+/// The path is carried on the error rather than derived from it: this walk
+/// happens before execution, so there is no response path to read, and what
+/// has to be named is a place inside the request -- an argument, a key of an
+/// input object, an item of a list.
+fn coded(message: String, pos: async_graphql::Pos, path: &str) -> ServerError {
+    coded_as("validation-failed", message, pos, path)
+}
+
+/// The same, for a rule whose failure Hasura codes as something else.
+fn coded_as(
+    code: &'static str,
+    message: String,
+    pos: async_graphql::Pos,
+    path: &str,
+) -> ServerError {
+    let mut error = ServerError::new(message, Some(pos));
+    let mut extensions = async_graphql::ErrorExtensionValues::default();
+    extensions.set("code", code);
+    extensions.set("path", path);
+    error.extensions = Some(extensions);
+    error
+}
+
+#[cfg(test)]
+mod variable_position_tests {
+    use super::*;
+    use async_graphql::dynamic::*;
+
+    /// A schema with the shapes the rule has to reason about: a scalar
+    /// argument, a nested input object, a list, a non-null location, and a
+    /// non-null location that has a default.
+    fn schema() -> async_graphql::dynamic::Schema {
+        let filter = InputObject::new("author_bool_exp")
+            .field(InputValue::new("id", TypeRef::named("Int")))
+            .field(InputValue::new(
+                "name",
+                TypeRef::named("String_comparison_exp"),
+            ));
+        let comparison = InputObject::new("String_comparison_exp")
+            .field(InputValue::new("_eq", TypeRef::named("String")))
+            .field(InputValue::new("_in", TypeRef::named_nn_list("String")));
+        // A tree, for the rules that are about a scalar's own shape rather
+        // than about the type it is written under.
+        let ltree = InputObject::new("ltree_comparison_exp")
+            .field(InputValue::new("_ancestor", TypeRef::named("ltree")))
+            .field(InputValue::new(
+                "_ancestor_any",
+                TypeRef::named_list("ltree"),
+            ));
+        let kind = Enum::new("kind_enum").item("leaf").item("branch");
+        let kind_comparison = InputObject::new("kind_enum_comparison_exp")
+            .field(InputValue::new("_eq", TypeRef::named("kind_enum")));
+        let raster_comparison = InputObject::new("raster_comparison_exp").field(InputValue::new(
+            "_st_intersects_rast",
+            TypeRef::named("raster"),
+        ));
+        let tree_filter = InputObject::new("tree_bool_exp")
+            .field(InputValue::new(
+                "rast",
+                TypeRef::named("raster_comparison_exp"),
+            ))
+            .field(InputValue::new(
+                "path",
+                TypeRef::named("ltree_comparison_exp"),
+            ))
+            .field(InputValue::new(
+                "kind",
+                TypeRef::named("kind_enum_comparison_exp"),
+            ));
+        let insert = InputObject::new("author_insert_input")
+            .field(InputValue::new("name", TypeRef::named("String")))
+            .field(InputValue::new("count", TypeRef::named("Int")));
+        let query = Object::new("query_root")
+            .field(
+                Field::new("author", TypeRef::named_nn_list_nn("author"), |_| {
+                    FieldFuture::new(async move { Ok(Some(async_graphql::Value::List(vec![]))) })
+                })
+                .argument(InputValue::new("limit", TypeRef::named("Int")))
+                .argument(InputValue::new("where", TypeRef::named("author_bool_exp"))),
+            )
+            .field(
+                Field::new("tree", TypeRef::named_nn_list_nn("tree"), |_| {
+                    FieldFuture::new(async move { Ok(Some(async_graphql::Value::List(vec![]))) })
+                })
+                .argument(InputValue::new("where", TypeRef::named("tree_bool_exp"))),
+            );
+        let mutation = Object::new("mutation_root")
+            .field(
+                Field::new("insert_author_one", TypeRef::named("author"), |_| {
+                    FieldFuture::new(async move { Ok(None::<async_graphql::Value>) })
+                })
+                .argument(InputValue::new(
+                    "object",
+                    TypeRef::named_nn("author_insert_input"),
+                )),
+            )
+            .field(
+                Field::new("insert_author", TypeRef::named("author"), |_| {
+                    FieldFuture::new(async move { Ok(None::<async_graphql::Value>) })
+                })
+                .argument(InputValue::new(
+                    "objects",
+                    TypeRef::named_nn_list_nn("author_insert_input"),
+                ))
+                .argument(
+                    InputValue::new("update_columns", TypeRef::named_nn_list_nn("String"))
+                        .default_value(async_graphql::Value::List(Vec::new())),
+                ),
+            )
+            .field(
+                Field::new(
+                    "update_author",
+                    TypeRef::named("author_mutation_response"),
+                    |_| FieldFuture::new(async move { Ok(None::<async_graphql::Value>) }),
+                )
+                .argument(InputValue::new(
+                    "where",
+                    TypeRef::named_nn("author_bool_exp"),
+                ))
+                .argument(InputValue::new("_set", TypeRef::named("author_set_input")))
+                .argument(InputValue::new("_inc", TypeRef::named("author_inc_input"))),
+            );
+        let author = Object::new("author").field(Field::new("id", TypeRef::named("Int"), |_| {
+            FieldFuture::new(async move { Ok(None::<async_graphql::Value>) })
+        }));
+        let tree = Object::new("tree")
+            .field(Field::new("id", TypeRef::named("Int"), |_| {
+                FieldFuture::new(async move { Ok(None::<async_graphql::Value>) })
+            }))
+            .field(Field::new("path", TypeRef::named("ltree"), |_| {
+                FieldFuture::new(async move { Ok(None::<async_graphql::Value>) })
+            }));
+        // What an update writes, and the one required `where` in the fixture.
+        let set = InputObject::new("author_set_input")
+            .field(InputValue::new("name", TypeRef::named("String")))
+            .field(InputValue::new("count", TypeRef::named("Int")));
+        let inc = InputObject::new("author_inc_input")
+            .field(InputValue::new("count", TypeRef::named("Int")));
+        let response = Object::new("author_mutation_response").field(Field::new(
+            "affected_rows",
+            TypeRef::named_nn("Int"),
+            |_| FieldFuture::new(async move { Ok(None::<async_graphql::Value>) }),
+        ));
+        Schema::build("query_root", Some("mutation_root"), None)
+            .register(Scalar::new("ltree"))
+            .register(Scalar::new("raster"))
+            .register(raster_comparison)
+            .register(kind)
+            .register(kind_comparison)
+            .register(filter)
+            .register(comparison)
+            .register(ltree)
+            .register(tree_filter)
+            .register(insert)
+            .register(set)
+            .register(inc)
+            .register(response)
+            .register(author)
+            .register(tree)
+            .register(query)
+            .register(mutation)
+            .finish()
+            .expect("the test schema builds")
+    }
+
+    fn refusals(query: &str, variables: &str) -> Vec<String> {
+        let request =
+            async_graphql::Request::new(query).variables(async_graphql::Variables::from_json(
+                serde_json::from_str(variables).expect("the variables are JSON"),
+            ));
+        match prepare(Some(&schema()), request, None) {
+            Ok(_) => Vec::new(),
+            Err((_, errors)) => errors.into_iter().map(|e| e.message).collect(),
+        }
+    }
+
+    /// The same, answering with where each refusal says it happened.
+    fn refusals_with_paths(query: &str, variables: &str) -> Vec<String> {
+        let request =
+            async_graphql::Request::new(query).variables(async_graphql::Variables::from_json(
+                serde_json::from_str(variables).expect("the variables are JSON"),
+            ));
+        match prepare(Some(&schema()), request, None) {
+            Ok(_) => Vec::new(),
+            Err((_, errors)) => errors.iter().map(path_for).collect(),
+        }
+    }
+
+    /// `where: {name: {_eq: null}}` reads as `name = NULL`, which is never
+    /// true. Hasura refuses it, and so does this.
+    #[test]
+    fn a_null_written_into_a_comparison_is_refused() {
+        assert_eq!(
+            refusals("{ author(where: {name: {_eq: null}}) { id } }", "{}"),
+            vec!["unexpected null value for type 'String'"]
+        );
+    }
+
+    #[test]
+    fn a_variable_standing_for_a_null_is_refused_there_too() {
+        assert_eq!(
+            refusals(
+                "query ($n: String) { author(where: {name: {_eq: $n}}) { id } }",
+                r#"{"n": null}"#
+            ),
+            vec!["unexpected null value for type 'String'"]
+        );
+    }
+
+    /// An absent variable makes the comparison itself absent, which is a
+    /// query with no such filter rather than one filtering on nothing.
+    /// Where a refusal says it happened, which is a place in the request and
+    /// not in the answer.
+    #[test]
+    fn a_refusal_names_the_argument_it_was_found_in() {
+        let paths =
+            |query: &str, variables: &str| -> Vec<String> { refusals_with_paths(query, variables) };
+        // A key of an input object, under the argument that carried it.
+        assert_eq!(
+            paths(
+                "mutation ($n: Int!) { insert_author_one(object: {name: $n}) { id } }",
+                r#"{"n": 1}"#
+            ),
+            vec!["$.selectionSet.insert_author_one.args.object.name"]
+        );
+        // A comparison against a null names the operator it was written in.
+        assert_eq!(
+            paths("{ author(where: {name: {_eq: null}}) { id } }", "{}"),
+            vec!["$.selectionSet.author.args.where.name._eq"]
+        );
+        // One object written where a list was expected is that list's first
+        // item, and the path says so.
+        assert_eq!(
+            paths(
+                "mutation ($n: Int!) { insert_author(objects: {name: $n}) { id } }",
+                r#"{"n": 1}"#
+            ),
+            vec!["$.selectionSet.insert_author.args.objects[0].name"]
+        );
+        // And an actual list is indexed by where the value really is.
+        assert_eq!(
+            paths(
+                "mutation ($n: Int!) { insert_author(objects: [{name: \"a\"}, \
+                 {name: $n}]) { id } }",
+                r#"{"n": 1}"#
+            ),
+            vec!["$.selectionSet.insert_author.args.objects[1].name"]
+        );
+    }
+
+    /// `where: null` says nothing about which rows, and an update's `where`
+    /// is required. Hasura names the type it wanted and what it got instead.
+    #[test]
+    fn a_null_written_where_an_object_is_required_is_refused_as_one() {
+        assert_eq!(
+            refusals(
+                "mutation { update_author(where: null, _set: {name: \"a\"}) \
+                 { affected_rows } }",
+                "{}"
+            ),
+            vec!["expected an object for type 'author_bool_exp', but found null"]
+        );
+        assert_eq!(
+            refusals_with_paths(
+                "mutation { update_author(where: null, _set: {name: \"a\"}) \
+                 { affected_rows } }",
+                "{}"
+            ),
+            vec!["$.selectionSet.update_author.args.where"]
+        );
+        // A *variable* carrying the null is a different complaint, and
+        // already had Hasura's own words for it: the fault is in the
+        // variable's declaration, which is where it is reported.
+        assert_eq!(
+            refusals(
+                "mutation ($w: author_bool_exp!) { update_author(where: $w, \
+                 _set: {name: \"a\"}) { affected_rows } }",
+                r#"{"w": null}"#
+            ),
+            vec!["null value found for non-nullable type: \"author_bool_exp!\""]
+        );
+    }
+
+    /// A nullable argument written as `null` is the same as leaving it out,
+    /// which is not something to refuse.
+    #[test]
+    fn a_null_written_where_an_object_is_optional_is_left_alone() {
+        assert_eq!(
+            refusals("{ author(where: null) { id } }", "{}"),
+            Vec::<String>::new()
+        );
+    }
+
+    /// One column named by two of an update's operators asks for it to be two
+    /// things at once, and the order is not something the request says.
+    #[test]
+    fn a_column_written_by_two_operators_is_refused_before_the_statement() {
+        assert_eq!(
+            refusals(
+                "mutation { update_author(_set: {name: \"a\", count: 1}, \
+                 _inc: {count: 2}, where: {}) { affected_rows } }",
+                "{}"
+            ),
+            vec!["Column found in multiple operators: ['count']."]
+        );
+        assert_eq!(
+            refusals_with_paths(
+                "mutation { update_author(_set: {count: 1}, _inc: {count: 2}, \
+                 where: {}) { affected_rows } }",
+                "{}"
+            ),
+            vec!["$.selectionSet.update_author.args"]
+        );
+        // Two operators naming different columns is an ordinary update.
+        assert_eq!(
+            refusals(
+                "mutation { update_author(_set: {name: \"a\"}, _inc: {count: 2}, \
+                 where: {}) { affected_rows } }",
+                "{}"
+            ),
+            Vec::<String>::new()
+        );
+    }
+
+    /// Two things wrong with one request is one refusal. Hasura stops at the
+    /// first, and a client written against it reads `errors[0]`.
+    #[test]
+    fn a_request_is_refused_once_however_many_faults_it_has() {
+        assert_eq!(
+            refusals("{ author { nope } tree { alsoNope } }", "{}"),
+            vec!["field 'nope' not found in type: 'author'"]
+        );
+        // The second fault is a different kind from the first, and is still
+        // not answered: what is reported is where the walk stopped, not one
+        // error of each sort.
+        assert_eq!(
+            refusals(
+                "mutation { insert_author(objects: [{nope: 1}],                  unknownArg: 2) { id } }",
+                "{}"
+            ),
+            vec!["field 'nope' not found in type: 'author_insert_input'"]
+        );
+    }
+
+    /// A raster travels as the hex of its well-known binary. What is
+    /// certainly not hex is refused here; the rest is still PostGIS's.
+    #[test]
+    fn a_raster_that_is_not_hexadecimal_is_refused_as_that() {
+        let invalid = "invalid hexadecimal representation of raster well known binary format";
+        assert_eq!(
+            refusals(
+                "query ($r: raster) { tree(where: {rast: {_st_intersects_rast: $r}}) { path } }",
+                r#"{"r": "this is invalid raster value"}"#
+            ),
+            vec![invalid]
+        );
+        assert_eq!(
+            refusals_with_paths(
+                "{ tree(where: {rast: {_st_intersects_rast: \"zz\"}}) { path } }",
+                "{}"
+            ),
+            vec!["$.selectionSet.tree.args.where.rast._st_intersects_rast"]
+        );
+        // A byte takes two characters.
+        assert_eq!(
+            refusals(
+                "{ tree(where: {rast: {_st_intersects_rast: \"abc\"}}) { path } }",
+                "{}"
+            ),
+            vec![invalid]
+        );
+        // Hex that is too short to be a raster is PostGIS's to refuse, in
+        // PostGIS's words.
+        assert!(refusals(
+            "{ tree(where: {rast: {_st_intersects_rast: \"0100\"}}) { path } }",
+            "{}"
+        )
+        .is_empty());
+    }
+
+    /// A fragment that spreads its way back to itself describes no finite
+    /// selection. async-graphql notices that something went too deep; Hasura
+    /// says which fragments went round.
+    #[test]
+    fn fragments_that_spread_each_other_are_named_as_a_cycle() {
+        let cycle = "query { author { ...a } } \
+                     fragment a on author { id ...b } \
+                     fragment b on author { id ...a }";
+        assert_eq!(
+            refusals(cycle, "{}"),
+            vec!["the fragment definition(s) a and b form a cycle"]
+        );
+        // The selection set the offending spread is in, with each spread a
+        // step of its own.
+        assert_eq!(
+            refusals_with_paths(cycle, "{}"),
+            vec!["$.selectionSet.author.selectionSet.a.selectionSet.b.selectionSet"]
+        );
+        // A fragment that spreads itself is a cycle of one.
+        assert_eq!(
+            refusals(
+                "query { author { ...a } } fragment a on author { id ...a }",
+                "{}"
+            ),
+            vec!["the fragment definition(s) a form a cycle"]
+        );
+        // The same fragment twice in sibling positions is not a cycle.
+        assert!(refusals(
+            "query { author { ...a } articles: author { ...a } } \
+             fragment a on author { id }",
+            "{}"
+        )
+        .is_empty());
+    }
+
+    /// GraphQL's `Int` is a signed 32-bit integer, and a number that is not
+    /// one is refused while the request is read rather than by the database.
+    #[test]
+    fn a_number_that_is_not_an_int_is_refused_as_one() {
+        let bounds = |value: &str| {
+            format!(
+                "The value {} lies outside the bounds or is not an integer. \
+                 Maybe it is a float, or is there integer overflow?",
+                value
+            )
+        };
+        assert_eq!(
+            refusals(
+                "mutation { insert_author_one(object: {count: 2147483648}) { id } }",
+                "{}"
+            ),
+            vec![bounds("2.147483648e9")]
+        );
+        assert_eq!(
+            refusals_with_paths(
+                "mutation { insert_author(objects: [{count: 2147483648}]) { id } }",
+                "{}"
+            ),
+            vec!["$.selectionSet.insert_author.args.objects[0].count"]
+        );
+        // The edges of the type are inside it.
+        for good in ["2147483647", "-2147483648", "0"] {
+            assert!(
+                refusals(
+                    &format!(
+                        "mutation {{ insert_author_one(object: {{count: {}}}) {{ id }} }}",
+                        good
+                    ),
+                    "{}"
+                )
+                .is_empty(),
+                "{} was refused",
+                good
+            );
+        }
+    }
+
+    /// Haskell writes a `Double` in fixed notation while it is neither very
+    /// large nor very small, and Hasura quotes what Haskell wrote.
+    #[test]
+    fn a_number_is_shown_the_way_the_message_spells_it() {
+        assert_eq!(shown_as_haskell_would(2147483648.0), "2.147483648e9");
+        assert_eq!(shown_as_haskell_would(1.5), "1.5");
+        assert_eq!(shown_as_haskell_would(1.0), "1.0");
+        assert_eq!(shown_as_haskell_would(0.0), "0.0");
+        assert_eq!(shown_as_haskell_would(-2147483649.0), "-2.147483649e9");
+        assert_eq!(shown_as_haskell_would(1e-3), "1.0e-3");
+        // The boundaries of the fixed range, which are Haskell's and not
+        // Rust's.
+        assert_eq!(shown_as_haskell_would(9999999.0), "9999999.0");
+        assert_eq!(shown_as_haskell_would(10000000.0), "1.0e7");
+        assert_eq!(shown_as_haskell_would(0.1), "0.1");
+    }
+
+    /// `limit` is typed `Int` and is not any `Int`, and `offset` is -- which
+    /// is Hasura's asymmetry, not an omission.
+    #[test]
+    fn a_limit_is_a_number_of_rows_and_not_any_integer() {
+        let refused = |q: &str| refusals(q, "{}");
+        assert_eq!(
+            refused("{ author(limit: -1) { id } }"),
+            vec!["expected a non-negative 32-bit integer for type 'Int', but found an integer"]
+        );
+        assert_eq!(
+            refused("{ author(limit: \"3\") { id } }"),
+            vec!["expected a non-negative 32-bit integer for type 'Int', but found a string"]
+        );
+        assert_eq!(
+            refusals_with_paths("{ author(limit: -1) { id } }", "{}"),
+            vec!["$.selectionSet.author.args.limit"]
+        );
+        // A variable is the value it stands for.
+        assert_eq!(
+            refusals(
+                "query ($n: Int) { author(limit: $n) { id } }",
+                r#"{"n": -1}"#
+            ),
+            vec!["expected a non-negative 32-bit integer for type 'Int', but found an integer"]
+        );
+        // Zero is a number of rows, and so is the largest `Int` there is.
+        assert!(refused("{ author(limit: 0) { id } }").is_empty());
+        assert!(refused("{ author(limit: 2147483647) { id } }").is_empty());
+        assert!(refused("{ author(limit: null) { id } }").is_empty());
+        // Beyond that it is not a number of rows because it is not an `Int`,
+        // and it is answered as that rather than as both.
+        assert_eq!(
+            refused("{ author(limit: 4294967295) { id } }"),
+            vec![
+                "The value 4.294967295e9 lies outside the bounds or is not an \
+                  integer. Maybe it is a float, or is there integer overflow?"
+            ]
+        );
+    }
+
+    /// A quoted enum value is a mistake about the language; an unquoted one
+    /// that names nothing is a mistake about the members. Hasura says which.
+    #[test]
+    fn a_quoted_enum_value_is_not_a_member_that_is_missing() {
+        assert_eq!(
+            refusals("{ tree(where: {kind: {_eq: \"leaf\"}}) { path } }", "{}"),
+            vec!["expected an enum value for type 'kind_enum', but found a string"]
+        );
+        assert_eq!(
+            refusals("{ tree(where: {kind: {_eq: twig}}) { path } }", "{}"),
+            vec!["expected one of the values ['branch', 'leaf'] for type 'kind_enum', but found 'twig'"]
+        );
+        // Through a variable, a string is how JSON carries an enum, so the
+        // question is which member it names.
+        assert_eq!(
+            refusals(
+                "query ($k: kind_enum) { tree(where: {kind: {_eq: $k}}) { path } }",
+                r#"{"k": "twig"}"#
+            ),
+            vec!["expected one of the values ['branch', 'leaf'] for type 'kind_enum', but found 'twig'"]
+        );
+        assert!(refusals(
+            "query ($k: kind_enum) { tree(where: {kind: {_eq: $k}}) { path } }",
+            r#"{"k": "leaf"}"#
+        )
+        .is_empty());
+    }
+
+    /// A document that does not parse is not a query, and that is all the
+    /// answer there is: async-graphql reports it the way a compiler does, and
+    /// Hasura names the document.
+    #[test]
+    fn a_document_that_does_not_parse_is_not_a_query() {
+        assert_eq!(
+            refusals("{ author(where: {name: {_eq: \"unclosed}}) { id } }", "{}"),
+            vec!["not a valid graphql query"]
+        );
+        assert_eq!(
+            refusals_with_paths("query { author(", "{}"),
+            vec!["$.query"]
+        );
+        // The rule is only about parsing. A document that parses and is wrong
+        // about the schema is answered by the rules that know the schema.
+        assert_eq!(
+            refusals("{ nothing_here { id } }", "{}"),
+            vec!["field 'nothing_here' not found in type: 'query_root'"]
+        );
+    }
+
+    /// An `ltree` with an empty label is refused before it is sent, in the
+    /// words Hasura uses -- and nothing else is, because what a label may
+    /// contain is the database's locale to decide.
+    #[test]
+    fn a_label_path_with_an_empty_label_is_refused() {
+        let empty = "Expecting label path: a sequence of zero or more labels \
+                     separated by dots, for example L1.L2.L3";
+        assert_eq!(
+            refusals(
+                "{ tree(where: {path: {_ancestor: \"a.b.\"}}) { path } }",
+                "{}"
+            ),
+            vec![empty]
+        );
+        assert_eq!(
+            refusals(
+                "{ tree(where: {path: {_ancestor: \".a\"}}) { path } }",
+                "{}"
+            ),
+            vec![empty]
+        );
+        assert_eq!(
+            refusals(
+                "{ tree(where: {path: {_ancestor: \"a..b\"}}) { path } }",
+                "{}"
+            ),
+            vec![empty]
+        );
+        // The list form says which item, which is what its path is for.
+        assert_eq!(
+            refusals_with_paths(
+                "{ tree(where: {path: {_ancestor_any: [\"a\", \"b.\"]}}) { path } }",
+                "{}"
+            ),
+            vec!["$.selectionSet.tree.args.where.path._ancestor_any[1]"]
+        );
+        // Everything PostgreSQL accepts is still sent to it, including the
+        // characters a stricter reading would have refused.
+        for good in ["a", "a.b", "", "a-b", "a_b", "1.2", "Ünï", "a@b"] {
+            assert!(
+                refusals(
+                    &format!(
+                        "{{ tree(where: {{path: {{_ancestor: \"{}\"}}}}) {{ path }} }}",
+                        good
+                    ),
+                    "{}"
+                )
+                .is_empty(),
+                "{} was refused",
+                good
+            );
+        }
+    }
+
+    #[test]
+    fn a_variable_that_was_not_given_is_not_a_null() {
+        assert!(refusals(
+            "query ($n: String) { author(where: {name: {_eq: $n}}) { id } }",
+            "{}"
+        )
+        .is_empty());
+    }
+
+    /// Only comparisons. A column set to null is a column set to null.
+    #[test]
+    fn a_null_written_anywhere_else_is_left_alone() {
+        assert!(refusals(
+            "mutation { insert_author_one(object: {name: null}) { id } }",
+            "{}"
+        )
+        .is_empty());
+    }
+
+    #[test]
+    fn a_variable_of_the_wrong_type_is_refused() {
+        assert_eq!(
+            refusals("query ($s: String) { author(limit: $s) { id } }", "{}"),
+            vec!["variable 's' is declared as 'String', but used where 'Int' is expected"]
+        );
+    }
+
+    #[test]
+    fn the_check_reaches_inside_an_input_object() {
+        assert_eq!(
+            refusals(
+                "query ($s: String) { author(where: {id: $s}) { id } }",
+                "{}"
+            ),
+            vec!["variable 's' is declared as 'String', but used where 'Int' is expected"]
+        );
+    }
+
+    #[test]
+    fn the_check_reaches_inside_a_list() {
+        assert_eq!(
+            refusals(
+                "mutation ($n: Int) { insert_author(objects: [{name: $n}]) { id } }",
+                "{}"
+            ),
+            vec!["variable 'n' is declared as 'Int', but used where 'String' is expected"]
+        );
+    }
+
+    #[test]
+    fn a_nullable_variable_cannot_fill_a_non_null_place() {
+        assert_eq!(
+            refusals(
+                "mutation ($a: author_insert_input) { insert_author_one(object: $a) { id } }",
+                "{}"
+            ),
+            vec![
+                "variable 'a' is declared as 'author_insert_input', but used where \
+                 'author_insert_input!' is expected"
+            ]
+        );
+    }
+
+    #[test]
+    fn a_default_lets_it() {
+        // The default stands in wherever the variable is left out, so the
+        // place can never actually see a null.
+        assert!(refusals(
+            "mutation ($a: author_insert_input = {name: \"x\"}) \
+             { insert_author_one(object: $a) { id } }",
+            "{}"
+        )
+        .is_empty());
+    }
+
+    #[test]
+    fn a_default_of_null_does_not() {
+        assert_eq!(
+            refusals(
+                "mutation ($a: author_insert_input = null) \
+                 { insert_author_one(object: $a) { id } }",
+                "{}"
+            ),
+            vec![
+                "variable 'a' is declared as 'author_insert_input', but used where \
+                 'author_insert_input!' is expected"
+            ]
+        );
+    }
+
+    #[test]
+    fn a_default_on_the_place_lets_it_too() {
+        // `update_columns` is non-null with a default: not writing the
+        // argument is allowed, so a variable that might be absent is too.
+        assert!(refusals(
+            "mutation ($c: [String!]) { insert_author(objects: [], update_columns: $c) { id } }",
+            "{}"
+        )
+        .is_empty());
+    }
+
+    #[test]
+    fn a_non_null_variable_fits_a_nullable_place() {
+        assert!(refusals(
+            "query ($n: Int!) { author(limit: $n) { id } }",
+            "{\"n\": 1}"
+        )
+        .is_empty());
+    }
+
+    #[test]
+    fn a_non_null_variable_given_null_is_refused() {
+        assert_eq!(
+            refusals(
+                "query ($n: Int! = 1) { author(limit: $n) { id } }",
+                "{\"n\": null}"
+            ),
+            vec!["null value found for non-nullable type: \"Int!\""]
+        );
+    }
+
+    #[test]
+    fn a_nullable_variable_given_null_is_not() {
+        assert!(refusals(
+            "query ($n: Int) { author(limit: $n) { id } }",
+            "{\"n\": null}"
+        )
+        .is_empty());
+    }
+
+    #[test]
+    fn a_variable_used_through_a_fragment_is_checked() {
+        assert_eq!(
+            refusals(
+                "query ($s: String) { author { ...rows } } \
+                 fragment rows on author { id }",
+                "{}"
+            ),
+            Vec::<String>::new()
+        );
+        assert_eq!(
+            refusals(
+                "query ($s: String) { ...roots } \
+                 fragment roots on query_root { author(limit: $s) { id } }",
+                "{}"
+            ),
+            vec!["variable 's' is declared as 'String', but used where 'Int' is expected"]
+        );
+    }
+}
+
+#[cfg(test)]
+mod coercion_tests {
+    use super::*;
+    use async_graphql::dynamic::*;
+
+    /// The three places a value is written: a field argument the engine owns,
+    /// a field argument a column owns, and a column inside an input object.
+    fn schema() -> async_graphql::dynamic::Schema {
+        let insert = InputObject::new("test_types_insert_input")
+            .field(InputValue::new("c1_smallint", TypeRef::named("Int")))
+            .field(InputValue::new("c6_real", TypeRef::named("Float")))
+            .field(InputValue::new("c20_boolean", TypeRef::named("Boolean")))
+            .field(InputValue::new("c13_text", TypeRef::named("String")));
+        let row = Object::new("test_types").field(Field::new(
+            "c1_smallint",
+            TypeRef::named("Int"),
+            |_| FieldFuture::new(async move { Ok(None::<async_graphql::Value>) }),
+        ));
+        let query = Object::new("query_root").field(
+            Field::new(
+                "test_types",
+                TypeRef::named_nn_list_nn("test_types"),
+                |_| FieldFuture::new(async move { Ok(Some(async_graphql::Value::List(vec![]))) }),
+            )
+            .argument(InputValue::new("limit", TypeRef::named("Int")))
+            .argument(InputValue::new("offset", TypeRef::named("Int"))),
+        );
+        let mutation = Object::new("mutation_root").field(
+            Field::new("insert_test_types", TypeRef::named("test_types"), |_| {
+                FieldFuture::new(async move { Ok(None::<async_graphql::Value>) })
+            })
+            .argument(InputValue::new(
+                "objects",
+                TypeRef::named_nn_list_nn("test_types_insert_input"),
+            )),
+        );
+        Schema::build("query_root", Some("mutation_root"), None)
+            .register(insert)
+            .register(row)
+            .register(query)
+            .register(mutation)
+            .finish()
+            .expect("the schema builds")
+    }
+
+    fn rewritten(query: &str) -> String {
+        let schema = schema();
+        let request = prepare(Some(&schema), async_graphql::Request::new(query), None)
+            .unwrap_or_else(|(request, _)| request);
+        let mut request = request;
+        format!("{:?}", request.parsed_query().expect("the query parses"))
+    }
+
+    #[test]
+    fn an_offset_written_as_a_string_becomes_a_number() {
+        let printed = rewritten("{ test_types(offset: \"1\") { c1_smallint } }");
+        assert!(printed.contains("Number(1)"), "{}", printed);
+    }
+
+    /// The corpus refuses this one in the same breath as it answers the
+    /// offset above, so it is left exactly as written.
+    #[test]
+    fn a_limit_written_as_a_string_is_left_alone() {
+        let printed = rewritten("{ test_types(limit: \"3\") { c1_smallint } }");
+        assert!(printed.contains("String(\"3\")"), "{}", printed);
+    }
+
+    #[test]
+    fn a_column_written_as_a_string_becomes_what_the_column_is() {
+        let printed = rewritten(
+            "mutation { insert_test_types(objects: [{ \
+             c1_smallint: \"32767\", c6_real: \"0.5\", c20_boolean: \"true\" }]) \
+             { c1_smallint } }",
+        );
+        assert!(printed.contains("Number(32767)"), "{}", printed);
+        assert!(printed.contains("Number(0.5)"), "{}", printed);
+        assert!(printed.contains("Boolean(true)"), "{}", printed);
+    }
+
+    /// A text column keeps its digits. This is the whole reason the walk is
+    /// type-directed rather than a sweep over every string in the document.
+    #[test]
+    fn a_string_written_where_a_string_belongs_stays_one() {
+        let printed = rewritten(
+            "mutation { insert_test_types(objects: [{ c13_text: \"32767\" }]) { c1_smallint } }",
+        );
+        assert!(printed.contains("String(\"32767\")"), "{}", printed);
+    }
+}

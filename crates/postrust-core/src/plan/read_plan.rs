@@ -206,7 +206,12 @@ fn build_select_fields(items: &[SelectItem], table: &Table) -> Result<Vec<Coerci
                 // of its row type, which reads as a column.
                 let computed = match table.get_column(&field.name) {
                     Some(_) => None,
-                    None => table.get_computed_column(&field.name),
+                    // A computed column that takes anything besides the row
+                    // is not callable here: this surface has nowhere to write
+                    // an argument and no session document to supply.
+                    None => table
+                        .get_computed_column(&field.name)
+                        .filter(|c| !c.takes_arguments),
                 };
 
                 let pg_type = if field.name.is_empty() || legacy_count {
@@ -388,7 +393,10 @@ fn attach_computed(field: &mut CoercibleField, table: &Table) {
     if table.get_column(&field.name).is_some() {
         return;
     }
-    if let Some(computed) = table.get_computed_column(&field.name) {
+    if let Some(computed) = table
+        .get_computed_column(&field.name)
+        .filter(|c| !c.takes_arguments)
+    {
         field.ir_type = computed.data_type.clone();
         field.base_type = computed.data_type.clone();
         field.computed = Some(crate::plan::ComputedRef {

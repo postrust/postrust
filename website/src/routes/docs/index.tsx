@@ -70,11 +70,25 @@ const docSections = [
     icon: "chart",
   },
   {
-    title: "PostgREST Conformance",
+    title: "Conformance",
     description:
-      "How closely the two agree, measured by replaying PostgREST's own test cases against both servers",
+      "How closely Postrust matches PostgREST and Hasura, measured against each by replaying its own test suite",
     href: "/docs/conformance",
     icon: "chart",
+  },
+  {
+    title: "PostgREST Conformance",
+    description:
+      "The REST report: what agrees, and where the two differ on purpose",
+    href: "/docs/conformance/postgrest",
+    icon: "chart",
+  },
+  {
+    title: "Hasura Conformance",
+    description:
+      "The GraphQL report: what agrees, and where the two differ on purpose",
+    href: "/docs/conformance/hasura",
+    icon: "graphql",
   },
 ];
 

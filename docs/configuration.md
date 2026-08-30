@@ -83,6 +83,113 @@ PGRST_JWT_ROLE_CLAIM_KEY="user.role"
 # JWT payload: {"user": {"role": "admin"}}
 ```
 
+## Hasura Authentication
+
+For the GraphQL surface at `/v1/graphql`. These are what let a client written
+against Hasura keep sending the headers it already sends.
+
+| Variable | Description | Default |
+|----------|-------------|---------|
+| `PGRST_HASURA_ADMIN_SECRET` | Shared secret authenticating an administrator (alias: `HASURA_GRAPHQL_ADMIN_SECRET`) | (none) |
+| `PGRST_HASURA_UNAUTHORIZED_ROLE` | Role for a request nothing authenticated (alias: `HASURA_GRAPHQL_UNAUTHORIZED_ROLE`) | (none) |
+
+Both spellings are read, so a deployment migrating from Hasura can keep the
+names already in its compose file; the `PGRST_` name wins where both are set.
+
+### What the secret switches on
+
+Set it, and a caller that holds it is an administrator — and an administrator
+may ask to be treated as someone else:
+
+```bash
+curl localhost:3000/v1/graphql \
+  -H 'X-Hasura-Admin-Secret: shh' \
+  -H 'X-Hasura-Role: user' \
+  -H 'X-Hasura-User-Id: 1' \
+  -d '{"query":"{ article { id title } }"}'
+```
+
+That request is answered as `user`, and `x-hasura-user-id` becomes a session
+variable a row-level policy can read as `current_setting('hasura.user_id')` —
+or that a function taking `hasura_session json` receives whole, alongside
+`x-hasura-role`. The role is also available on its own as
+`current_setting('hasura.role')`.
+
+A Hasura role is not a database role. `Artist` and `anonymous` need not exist
+in any catalogue: what the role decides is what `x-hasura-role` reads as, and
+(once permissions land) which rules apply. Which database user the transaction
+runs as is still `PGRST_DB_ANON_ROLE` or the JWT's role claim.
+
+### Choosing a role with a token
+
+A token that allows more than one identity carries both claims Hasura mints for
+it: `x-hasura-default-role`, who the caller is when it asks for nothing, and
+`x-hasura-allowed-roles`, the list it may ask for instead.
+
+```json
+{
+  "https://hasura.io/jwt/claims": {
+    "x-hasura-default-role": "user",
+    "x-hasura-allowed-roles": ["user", "editor"],
+    "x-hasura-user-id": "1"
+  }
+}
+```
+
+The asking is done with a header, and no admin secret is needed for it:
+
+```bash
+curl localhost:3000/v1/graphql \
+  -H 'Authorization: Bearer <token>' \
+  -H 'X-Hasura-Role: editor' \
+  -d '{"query":"{ article { id title } }"}'
+```
+
+This is the one header read without the secret beside it, and the list is why
+it is safe to read: it sits inside the signature, so a caller may choose among
+the identities it was issued and cannot add one. Asking for a role the token
+does not list is refused:
+
+```json
+{"errors":[{"message":"Your requested role is not in allowed roles",
+            "extensions":{"path":"$","code":"access-denied"}}]}
+```
+
+A token carrying no list allows only the role it already names — an absent list
+is not permission to be anyone. Every other `x-hasura-*` header is still
+ignored on this path, for the reason below.
+
+### One place this deliberately differs from Hasura
+
+Hasura with no admin secret configured treats every caller as an
+administrator — which also means an unsecured deployment lets any caller name
+its own role and its own identity. Postrust does not:
+
+```bash
+# No PGRST_HASURA_ADMIN_SECRET set. These headers are ignored entirely.
+curl localhost:3000/v1/graphql \
+  -H 'X-Hasura-Role: user' -H 'X-Hasura-User-Id: 1' ...
+```
+
+With no secret configured, `x-hasura-*` headers carry no weight and session
+variables come only from a verified token. A policy reading a value the caller
+chose is not a policy, and the failure is silent — the query succeeds, against
+the wrong rows.
+
+### What a request with no credentials gets
+
+With a secret configured and none offered, the request is refused:
+
+```json
+{"errors":[{"message":"\"x-hasura-admin-secret\" required, but not found",
+            "extensions":{"path":"$","code":"access-denied"}}]}
+```
+
+Set `PGRST_HASURA_UNAUTHORIZED_ROLE` to answer such a request as a named role
+instead — with no session variables, since nothing established any. A wrong
+secret is always refused rather than falling back to that role: a caller that
+tried to be an administrator and failed is not then treated as a stranger.
+
 ## Server Settings
 
 | Variable | Description | Default |
@@ -199,6 +306,230 @@ RUST_LOG="postrust=debug,sqlx=info"
 |----------|-------------|---------|
 | `PGRST_MAX_ROWS` | Maximum rows returned by a single request. Caps requests that specify no `limit`, and bounds larger ones. Alias: `PGRST_DB_MAX_ROWS` | unset (unlimited) |
 | `PGRST_MAX_BODY_SIZE` | Maximum request body (bytes) | `10485760` |
+
+## GraphQL Subscriptions
+
+| Variable | Description | Default |
+|----------|-------------|---------|
+| `PGRST_SUBSCRIPTION_REFRESH` | How often a live query re-reads itself with nothing having notified it, in seconds. `0` turns the refresh off and leaves only the notifications. | `30` |
+
+A subscription is a live query: it is woken by the trigger on the table it
+reads, which is instant and costs nothing while nothing is written. The refresh
+is a floor under what a trigger cannot see — a view has none, an embedded row
+may live in a table that carries none, and a predicate written against the
+clock changes with no write at all. Every tick costs one query per subscriber,
+so raise it, or set it to `0`, where every subscribable table has a trigger and
+nothing depends on time. See [Realtime](./realtime.md).
+
+## GraphQL Names
+
+| Variable | Description | Default |
+|----------|-------------|---------|
+| `PGRST_GRAPHQL_METADATA` | Names for tables, columns, root fields, relationships and computed fields that the schema cannot supply; which root a function is exposed on; and what each role may do with each table. A JSON document, or a path to a file holding one. Also read as `PGRST_GRAPHQL_NAMES`, which is what it was called when names were all it carried. | unset (every name derived, no permission layer) |
+
+Almost everything in the generated GraphQL API is derived: a table's name gives
+its root fields, a foreign key gives a relationship, a function gives a
+computed field. Hasura derives none of it — every one of those names is written
+into metadata by a person, and reflection cannot recover a name nobody wrote
+down. This is where those names go when a schema is migrated from one.
+
+```json
+{
+  "public.author": {
+    "name": "Authors",
+    "roots": { "select_by_pk": "Author", "select_aggregate": "AuthorAgg" },
+    "columns": { "id": "AuthorId" },
+    "relationships": {
+      "article_author_id_fkey": "posts",
+      "fetch_articles_plain": "get_articles"
+    },
+    "computed_fields": { "author_upper_name": "upper_name" }
+  }
+}
+```
+
+- **`name`** replaces the base name every root field and type is built from, so
+  `Authors`, `Authors_by_pk`, `insert_Authors`, `Authors_bool_exp` and the rest
+  all follow from this one entry.
+- **`roots`** names a single root field, for the cases a base name cannot
+  reach: Hasura names each root independently, and `select_by_pk: Author`
+  beside `select: Authors` is not a pair one word derives. The keys are
+  Hasura's own — `select`, `select_by_pk`, `select_aggregate`, `insert`,
+  `insert_one`, `update`, `update_by_pk`, `delete`, `delete_by_pk`. Only the
+  field is renamed; the types keep the base name, which is what a generated
+  client reads them as.
+- **`columns`** exposes a column under another name, keyed by the column. This
+  is the one entry that reaches everywhere: the field is renamed in the rows
+  that come back, in `where`, in `order_by`, in `distinct_on`, in the key
+  arguments, in `_set` and `objects`, in `on_conflict.update_columns` and
+  inside every embed and aggregate. The database keeps its own name throughout.
+- **`relationships`** is keyed by *constraint* name, or by *function* name for a
+  computed relationship, because a constraint names exactly one relationship
+  even where two of them point at the same table. The name being replaced would
+  not: that is what this is for.
+- **`computed_fields`** is keyed by the function behind the field.
+- **`comments`** carries the descriptions Hasura keeps in metadata rather than
+  in the database, under `table`, `columns`, `roots` and `computed_fields`. A
+  description given here replaces the database's own comment; an **empty
+  string** removes it, which is how `set_table_customization` says a field has
+  no description at all. Nothing said leaves the comment — or the generated
+  default — alone.
+
+```json
+{
+  "public.author": {
+    "comments": {
+      "table": "Everyone who has written something",
+      "columns": { "name": "As it should be printed" },
+      "roots": { "select": "Every author" },
+      "computed_fields": { "author_upper_name": "Shouted" }
+    }
+  }
+}
+```
+
+Keys are `schema.table`, so a table in the default schema is still
+`public.author`. A table absent from the document is exposed exactly as before.
+
+### What each role may do
+
+The one entry that is not a name. A permission is not derived from anything, so
+unlike every other key here it is written whether or not it differs from a
+default — a role the document says nothing about has no access at all.
+
+```json
+{
+  "public.article": {
+    "permissions": {
+      "user": {
+        "select": {
+          "columns": ["id", "title", "content"],
+          "filter": { "$or": [{ "author_id": "X-Hasura-User-Id" },
+                              { "is_published": true }] },
+          "limit": 10,
+          "allow_aggregations": true,
+          "computed_fields": ["get_articles"]
+        },
+        "insert": {
+          "columns": "*",
+          "check": { "author_id": "X-Hasura-User-Id" },
+          "set": { "author_id": "X-Hasura-User-Id" },
+          "backend_only": false
+        },
+        "update": { "columns": ["title"], "filter": {}, "check": {} },
+        "delete": { "filter": { "is_published": false } }
+      },
+      "anonymous": {
+        "select": { "columns": "*", "filter": { "is_published": true } }
+      }
+    }
+  }
+}
+```
+
+- **`columns`** is a list, or `"*"` for every column the table has. The two
+  differ for a column added later: `"*"` covers it and a list does not. A
+  column outside the set is not merely unreadable — it is absent from the type,
+  which is what makes a permission a statement about the schema rather than
+  about a request.
+- **`filter`** and **`check`** are boolean expressions in the same shape a
+  `where` argument takes, with one addition: a string like `X-Hasura-User-Id`
+  stands for the caller's session variable of that name. `filter` chooses rows
+  before the operation; `check` is what a written row must satisfy after it.
+- **`set`** fills columns in from the server, overriding whatever the request
+  said — which is how `author_id` comes from the caller's identity rather than
+  from the caller.
+- **`limit`** is a ceiling, not a default: a request asking for more gets this,
+  and one asking for fewer gets what it asked for.
+- **`allow_aggregations`** is separate from reading rows because counting rows
+  you cannot see is a way of seeing them.
+- **`backend_only`** hides a mutation from anything but a caller that proved it
+  holds the admin secret (see [Hasura Authentication](#hasura-authentication)),
+  whatever role it then claims.
+
+Absent entries mean different things at different levels, and the difference
+matters:
+
+| | meaning |
+|---|---|
+| no `permissions` key anywhere in the document | no permission layer at all — database roles and RLS, as before |
+| a role absent from a table's `permissions` | that role cannot touch that table |
+| `select` absent for a role that has `insert` | it may write rows it cannot read |
+| `columns` absent from a write permission | every column, which is Hasura's own default |
+
+The third column of that table is why one permission anywhere turns the layer
+on for every table: a document granting `user` a filtered view of `article` and
+saying nothing about `author` is saying `user` cannot read `author` — not that
+`author` is open to everyone.
+
+`scripts/hasura-names.py` converts these from Hasura's own metadata alongside
+the names, from a running engine, a metadata directory, an export, or a list of
+migration commands.
+
+### Where a function is exposed
+
+A function that answers with rows of a table is a root field, and which root it
+goes on follows from what PostgreSQL says it does: `VOLATILE` may write, so it
+is a mutation; `STABLE` and `IMMUTABLE` may not, so they are queries. Hasura
+lets metadata override that, and a `VOLATILE` function tracked with
+`exposed_as: query` is a decision a person made that no catalogue remembers.
+
+Written down, the document grows a second section — and the table names move
+into one of their own, which is the only shape change. The flat document above
+is still read:
+
+```json
+{
+  "tables": {
+    "public.author": { "name": "Authors" }
+  },
+  "functions": {
+    "public.volatile_func1": { "exposed_as": "query" }
+  }
+}
+```
+
+Keys are `schema.function`. `exposed_as` is `query` or `mutation`; a function
+absent from the section is placed by its volatility as before.
+
+Set the variable to the document itself, or to a path:
+
+```bash
+PGRST_GRAPHQL_NAMES='{"public.author": {"name": "Author"}}'
+PGRST_GRAPHQL_NAMES="/etc/postrust/graphql-names.json"
+```
+
+### Converting from Hasura
+
+Nobody should write this by hand for a migration — Hasura already has every one
+of these names, and `scripts/hasura-names.py` reads them out:
+
+```bash
+scripts/hasura-names.py --url http://localhost:8080 --admin-secret "$SECRET" > graphql-names.json
+scripts/hasura-names.py --metadata-dir ./metadata > graphql-names.json
+scripts/hasura-names.py --file metadata.json > graphql-names.json
+```
+
+It emits only the names that differ from what this server derives on its own,
+so the document is the exceptions rather than the whole schema — usually a
+short file. Where a table's custom root fields all follow from one word, that
+word is carried as `name`, because it names the generated *types* as well and a
+client reads those too; whatever the word cannot account for is written down
+root by root.
+
+It converts names, descriptions and function placement, and nothing else:
+permissions, tracked-table lists, actions, remote schemas and event triggers
+are the metadata model rather than names, and this server does not have one.
+
+Relationships can be keyed by constraint name, by the foreign key column, or by
+`table.column` on the far side. That is what lets the converter work from the
+metadata alone: Hasura names a relationship by its column, and turning a column
+into the constraint that carries it would otherwise need a database connection.
+
+This is a lookup table, not a metadata model. It grants no permissions and
+tracks no tables; what a client sees something called is all it can change. A document that cannot be read
+or parsed stops the server rather than being ignored — serving derived names
+instead would answer every request under a name the client does not send.
 
 ## Example Configurations
 

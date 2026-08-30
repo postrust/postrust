@@ -145,6 +145,7 @@ pub async fn load_tables(pool: &PgPool, schemas: &[String]) -> Result<TablesMap>
             updatable: row.get("updatable"),
             deletable: row.get("deletable"),
             pk_cols: pk_cols.clone(),
+            unique_constraints: Vec::new(),
             columns: load_columns(pool, &schema, &name, &pk_cols).await?,
             computed_columns: Default::default(),
         };
@@ -199,6 +200,16 @@ async fn load_columns(
                     AND rel.relname = c.table_name
                   LIMIT 1)
             ) AS column_default,
+            -- What a write may not name at all. `GENERATED ALWAYS AS
+            -- IDENTITY` and a stored generated column both belong to
+            -- PostgreSQL, which answers `cannot insert a non-DEFAULT value`
+            -- to anything that names one. `BY DEFAULT` is deliberately not
+            -- here: it has a default, and a value given for it is taken.
+            COALESCE(
+                (c.is_identity = 'YES' AND c.identity_generation = 'ALWAYS')
+                    OR c.is_generated = 'ALWAYS',
+                false
+            ) AS always_generated,
             pg_catalog.col_description(
                 (quote_ident(c.table_schema) || '.' || quote_ident(c.table_name))::regclass,
                 c.ordinal_position
@@ -213,7 +224,8 @@ async fn load_columns(
         WHERE c.table_schema = $1 AND c.table_name = $2
         GROUP BY c.table_schema, c.table_name, c.column_name, c.ordinal_position, c.is_nullable,
                  c.data_type, c.udt_name, c.domain_name, c.character_maximum_length,
-                 c.column_default, t.oid, e.enumtypid
+                 c.column_default, c.is_identity, c.identity_generation, c.is_generated,
+                 t.oid, e.enumtypid
         ORDER BY c.ordinal_position
         "#,
     )
@@ -251,6 +263,7 @@ async fn load_columns(
             enum_values,
             is_pk: pk_cols.contains(&name),
             position,
+            always_generated: row.get("always_generated"),
         };
 
         columns.insert(name, column);
@@ -430,18 +443,29 @@ async fn load_computed_relationships(
             t.relname   AS table_name,
             fn.nspname  AS foreign_table_schema,
             f.relname   AS foreign_table_name,
-            (NOT p.proretset) OR p.prorows = 1 AS to_one
+            (NOT p.proretset) OR p.prorows = 1 AS to_one,
+            (SELECT p.proargnames[i]
+               FROM generate_series(1, p.pronargs) AS i
+              WHERE p.proargtypes[i - 1] = argt.oid
+              LIMIT 1) AS row_argument
         FROM pg_proc p
         JOIN pg_namespace pn ON pn.oid = p.pronamespace
-        -- the single argument is a table's composite type
-        JOIN pg_type argt ON argt.oid = p.proargtypes[0]
+        -- one argument is a table's composite type. Usually the only one, and
+        -- then the call is positional; a function that also takes a search
+        -- term or the caller's session has it somewhere among the rest, and is
+        -- called by name.
+        JOIN pg_type argt ON argt.oid = ANY (p.proargtypes::oid[])
         JOIN pg_class t   ON t.oid = argt.typrelid
         JOIN pg_namespace tn ON tn.oid = t.relnamespace
         -- and the return type is a table as well
         JOIN pg_type rett ON rett.oid = p.prorettype
         JOIN pg_class f   ON f.oid = rett.typrelid
         JOIN pg_namespace fn ON fn.oid = f.relnamespace
-        WHERE p.pronargs = 1
+        -- Every argument named, since one that is not cannot be given by name
+        -- and a call with more than the row has to be.
+        WHERE (p.pronargs = 1 OR (SELECT count(*)
+                                    FROM generate_series(1, p.pronargs) AS i
+                                   WHERE COALESCE(p.proargnames[i], '') = '') = 0)
           AND pn.nspname = ANY($1)
           AND tn.nspname = ANY($1)
           AND fn.nspname = ANY($1)
@@ -478,6 +502,7 @@ async fn load_computed_relationships(
                 table_alias: table,
                 to_one: row.get("to_one"),
                 is_self,
+                row_argument: row.get::<Option<String>, _>("row_argument"),
             });
     }
 
@@ -850,6 +875,7 @@ async fn load_catalog_columns(
             CASE WHEN t.typtype = 'd' THEN t.typname END AS domain_name,
             NULL::int AS character_maximum_length,
             pg_catalog.pg_get_expr(d.adbin, d.adrelid) AS column_default,
+            (a.attidentity = 'a' OR a.attgenerated <> '') AS always_generated,
             pg_catalog.col_description(c.oid, a.attnum) AS description,
             COALESCE(
                 (SELECT array_agg(e.enumlabel ORDER BY e.enumsortorder)
@@ -938,19 +964,38 @@ pub async fn load_computed_columns(
     pool: &PgPool,
     schemas: &[String],
     function_schemas: &[String],
-) -> Result<Vec<(QualifiedIdentifier, String, QualifiedIdentifier, String)>> {
+) -> Result<Vec<ComputedColumnRow>> {
+    // One argument is the table's row. The rest are the caller's, and are
+    // exposed as the field's own arguments -- except the session document
+    // Hasura fills in, `hasura_session json`, which a client never sends and
+    // which is what lets a computed field know who is asking.
+    //
+    // Every argument has to be named: one that is not cannot be given by name,
+    // and a call with more than the row has to be.
     let rows = sqlx::query(
         r#"
         SELECT tn.nspname AS table_schema,
                t.relname  AS table_name,
                fn.nspname AS function_schema,
                p.proname  AS function_name,
-               pg_catalog.format_type(p.prorettype, null) AS return_type
+               pg_catalog.format_type(p.prorettype, null) AS return_type,
+               pg_catalog.obj_description(p.oid, 'pg_proc') AS description,
+               (SELECT p.proargnames[i]
+                  FROM generate_series(1, p.pronargs) AS i
+                 WHERE p.proargtypes[i - 1] = t.reltype
+                 LIMIT 1) AS row_argument,
+               (SELECT p.proargnames[i]
+                  FROM generate_series(1, p.pronargs) AS i
+                 WHERE p.proargnames[i] = 'hasura_session'
+                 LIMIT 1) AS session_argument,
+               p.pronargs > 1 AS takes_arguments
           FROM pg_proc p
           JOIN pg_namespace fn ON fn.oid = p.pronamespace
-          JOIN pg_class t ON t.reltype = p.proargtypes[0]
+          JOIN pg_class t ON t.reltype = ANY (p.proargtypes::oid[])
           JOIN pg_namespace tn ON tn.oid = t.relnamespace
-         WHERE p.pronargs = 1
+         WHERE (p.pronargs = 1 OR (SELECT count(*)
+                                     FROM generate_series(1, p.pronargs) AS i
+                                    WHERE COALESCE(p.proargnames[i], '') = '') = 0)
            AND NOT p.proretset
            AND p.prokind = 'f'
            AND p.prorettype <> 'pg_catalog.trigger'::pg_catalog.regtype
@@ -967,21 +1012,44 @@ pub async fn load_computed_columns(
 
     Ok(rows
         .into_iter()
-        .map(|row| {
-            (
-                QualifiedIdentifier::new(
-                    row.get::<String, _>("table_schema"),
-                    row.get::<String, _>("table_name"),
-                ),
+        .map(|row| ComputedColumnRow {
+            table: QualifiedIdentifier::new(
+                row.get::<String, _>("table_schema"),
+                row.get::<String, _>("table_name"),
+            ),
+            name: row.get::<String, _>("function_name"),
+            function: QualifiedIdentifier::new(
+                row.get::<String, _>("function_schema"),
                 row.get::<String, _>("function_name"),
-                QualifiedIdentifier::new(
-                    row.get::<String, _>("function_schema"),
-                    row.get::<String, _>("function_name"),
-                ),
-                row.get::<String, _>("return_type"),
-            )
+            ),
+            return_type: row.get::<String, _>("return_type"),
+            description: row.get::<Option<String>, _>("description"),
+            row_argument: row.get::<Option<String>, _>("row_argument"),
+            session_argument: row.get::<Option<String>, _>("session_argument"),
+            takes_arguments: row.get::<bool, _>("takes_arguments"),
         })
         .collect())
+}
+
+/// One function that reads as a column of a table.
+#[derive(Clone, Debug)]
+pub struct ComputedColumnRow {
+    /// The table it belongs to.
+    pub table: QualifiedIdentifier,
+    /// The name it is read under, which is the function's.
+    pub name: String,
+    /// The function itself.
+    pub function: QualifiedIdentifier,
+    /// What it returns.
+    pub return_type: String,
+    /// The function's comment.
+    pub description: Option<String>,
+    /// The parameter that takes the row.
+    pub row_argument: Option<String>,
+    /// The parameter filled from the session, if any.
+    pub session_argument: Option<String>,
+    /// Whether it takes anything besides the row.
+    pub takes_arguments: bool,
 }
 
 /// One view column, and the base-table column it was selected from.
@@ -1142,6 +1210,60 @@ pub async fn load_view_columns(pool: &PgPool, schemas: &[String]) -> Result<Vec<
 /// table may sit in a schema which is not exposed -- the junction behind two
 /// public views. Loading the key alone keeps it out of the API surface while
 /// still letting the relationship be derived.
+/// Every unique constraint, by the table it belongs to.
+///
+/// Returned as `(constraint name, columns)`. The primary key is one of them:
+/// PostgreSQL treats it as a unique constraint and `ON CONFLICT ON CONSTRAINT`
+/// accepts it, which is what an upsert on a table's key needs.
+///
+/// Only constraints, not bare unique indexes. `ON CONFLICT ON CONSTRAINT`
+/// takes a constraint name, and a unique index created without one has no name
+/// to give it.
+pub async fn load_unique_constraints(
+    pool: &PgPool,
+    schemas: &[String],
+) -> Result<HashMap<QualifiedIdentifier, Vec<(String, Vec<String>)>>> {
+    let rows = sqlx::query(
+        r#"
+        SELECT
+            n.nspname AS table_schema,
+            c.relname AS table_name,
+            con.conname AS constraint_name,
+            (SELECT array_agg(a.attname ORDER BY k.ord)
+               FROM unnest(con.conkey) WITH ORDINALITY AS k(attnum, ord)
+               JOIN pg_attribute a
+                 ON a.attrelid = c.oid AND a.attnum = k.attnum) AS columns
+        FROM pg_constraint con
+        JOIN pg_class c     ON c.oid = con.conrelid
+        JOIN pg_namespace n ON n.oid = c.relnamespace
+        WHERE con.contype IN ('p', 'u')
+          AND n.nspname = ANY($1)
+        "#,
+    )
+    .bind(schemas)
+    .fetch_all(pool)
+    .await
+    .map_err(|e| Error::SchemaCacheLoadFailed(e.to_string()))?;
+
+    let mut by_table: HashMap<QualifiedIdentifier, Vec<(String, Vec<String>)>> = HashMap::new();
+    for row in rows {
+        let Some(columns): Option<Vec<String>> = row.get("columns") else {
+            continue;
+        };
+        by_table
+            .entry(QualifiedIdentifier::new(
+                row.get::<String, _>("table_schema"),
+                row.get::<String, _>("table_name"),
+            ))
+            .or_default()
+            .push((row.get::<String, _>("constraint_name"), columns));
+    }
+    for constraints in by_table.values_mut() {
+        constraints.sort();
+    }
+    Ok(by_table)
+}
+
 pub async fn load_primary_keys(
     pool: &PgPool,
     schemas: &[String],

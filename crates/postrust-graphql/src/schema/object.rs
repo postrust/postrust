@@ -16,6 +16,10 @@ pub struct GraphQLField {
     pub nullable: bool,
     /// Whether this is a primary key field.
     pub is_pk: bool,
+    /// The arguments a computed field takes from the caller, as `(name,
+    /// PostgreSQL type, required)`. Empty for a column, and for a computed
+    /// field that takes only the row and the session.
+    pub arguments: Vec<(String, String, bool)>,
 }
 
 impl GraphQLField {
@@ -30,6 +34,7 @@ impl GraphQLField {
             graphql_type,
             nullable,
             is_pk: column.is_pk,
+            arguments: Vec::new(),
         }
     }
 
@@ -51,8 +56,22 @@ pub struct TableObjectType {
     pub table: Table,
     /// GraphQL type name (PascalCase).
     pub name: String,
-    /// Fields derived from columns.
+    /// Fields derived from columns: the ones a read may name.
+    ///
+    /// Empty where the role may write this table and not read it, which is a
+    /// table with no GraphQL type -- see [`crate::role`].
     pub fields: Vec<GraphQLField>,
+    /// Fields a write may name, before the write permission narrows them.
+    ///
+    /// The same list before the read permission was applied, which is what
+    /// makes a column a role may set without seeing expressible: `fields` is
+    /// what the type shows and this is what the insert and update inputs are
+    /// built from. Equal to `fields` where nothing narrowed them.
+    pub writable_fields: Vec<GraphQLField>,
+    /// The type's description: the table's comment, or the one metadata gave
+    /// instead. `Some("")` is a description that was given and is empty, which
+    /// is how metadata says the type has none.
+    pub description: Option<String>,
 }
 
 impl TableObjectType {
@@ -62,22 +81,106 @@ impl TableObjectType {
     /// the name must be disambiguated (for example when the same table name
     /// appears in more than one exposed schema).
     pub fn from_table(table: &Table) -> Self {
-        Self::from_table_named(table, &table.name)
+        Self::from_table_named(table, &table.name, &crate::names::NameOverrides::default())
     }
 
     /// Create a GraphQL ObjectType using an explicit base name.
-    pub fn from_table_named(table: &Table, base_name: &str) -> Self {
-        let name = to_pascal_case(base_name);
-        let fields = table
+    /// A field for a computed column.
+    ///
+    /// A function of one argument of the table's own row type, which
+    /// PostgreSQL lets a query read as though it were a column. Always
+    /// nullable: the function decides, and nothing in the catalogue says it
+    /// cannot return null.
+    fn computed_field(
+        name: &str,
+        computed: &postrust_core::schema_cache::ComputedColumn,
+    ) -> GraphQLField {
+        GraphQLField {
+            name: name.to_string(),
+            // The function it calls, where it has no comment of its own --
+            // which is what Hasura says, and is the one thing a reader of the
+            // schema cannot otherwise find out.
+            description: computed.description.clone().or_else(|| {
+                Some(format!(
+                    "A computed field, executes function \"{}\"",
+                    computed.function.name
+                ))
+            }),
+            graphql_type: pg_type_to_graphql(&computed.data_type),
+            nullable: true,
+            is_pk: false,
+            arguments: Vec::new(),
+        }
+    }
+
+    pub fn from_table_named(
+        table: &Table,
+        base_name: &str,
+        names: &crate::names::NameOverrides,
+    ) -> Self {
+        // Named exactly like the table. A GraphQL type is conventionally
+        // PascalCase, but the schema a Hasura client was generated against
+        // spells this `author`, and a client cannot be told otherwise: the
+        // type name is in its generated types, its fragments and its cache
+        // keys.
+        let name = base_name.to_string();
+        // Columns first, then the computed ones. A computed column named
+        // after a real one is left out for the same reason a relationship is:
+        // two fields of one name abort the schema build, and the column is the
+        // table's own data.
+        let mut fields: Vec<GraphQLField> = table
             .columns
             .values()
-            .map(GraphQLField::from_column)
+            .map(|column| {
+                let mut field = GraphQLField::from_column(column);
+                // A column may be exposed under another name. This is the one
+                // place the schema decides that; every resolver reads it back
+                // the other way, from the field to the column.
+                if let Some(given) = names.column(&table.schema, &table.name, &column.name) {
+                    field.name = given.to_string();
+                }
+                // A description given in metadata replaces the column's own
+                // comment, and an empty one removes it.
+                if let Some(comment) =
+                    names.column_comment(&table.schema, &table.name, &column.name)
+                {
+                    field.description = Some(comment.to_string()).filter(|c| !c.is_empty());
+                }
+                field
+            })
             .collect();
+        let mut computed: Vec<(&String, &postrust_core::schema_cache::ComputedColumn)> =
+            table.computed_columns.iter().collect();
+        computed.sort_by_key(|(name, _)| (*name).clone());
+        for (function, definition) in computed {
+            // A computed field is named in Hasura's metadata rather than after
+            // its function, so a migrated schema says which is which.
+            let exposed = names
+                .computed_field(&table.schema, &table.name, function)
+                .unwrap_or(function);
+            if fields.iter().any(|f| f.name == exposed) {
+                continue;
+            }
+            let mut field = Self::computed_field(exposed, definition);
+            if let Some(comment) = names.computed_comment(&table.schema, &table.name, function) {
+                field.description = Some(comment.to_string()).filter(|c| !c.is_empty());
+            }
+            fields.push(field);
+        }
+
+        let description = names
+            .table_comment(&table.schema, &table.name)
+            .map(str::to_string)
+            .or_else(|| table.description.clone());
 
         Self {
             table: table.clone(),
             name,
+            // Nothing has narrowed the read yet, so the two lists start equal.
+            // A role's schema splits them where its object type is built.
+            writable_fields: fields.clone(),
             fields,
+            description,
         }
     }
 
@@ -88,7 +191,13 @@ impl TableObjectType {
 
     /// Get the description from table comment.
     pub fn description(&self) -> Option<&str> {
-        self.table.description.as_deref()
+        self.description.as_deref()
+    }
+
+    /// The name of the table itself, which is not always the type's: a
+    /// configured base name renames the type and leaves the table alone.
+    pub fn table_name(&self) -> &str {
+        &self.table.name
     }
 
     /// Get all fields.
@@ -109,29 +218,6 @@ impl TableObjectType {
     /// Get primary key fields.
     pub fn pk_fields(&self) -> Vec<&GraphQLField> {
         self.fields.iter().filter(|f| f.is_pk).collect()
-    }
-}
-
-/// Convert a snake_case string to PascalCase.
-pub fn to_pascal_case(s: &str) -> String {
-    s.split('_')
-        .map(|word| {
-            let mut chars = word.chars();
-            match chars.next() {
-                Some(first) => first.to_uppercase().collect::<String>() + chars.as_str(),
-                None => String::new(),
-            }
-        })
-        .collect()
-}
-
-/// Convert a snake_case string to camelCase.
-pub fn to_camel_case(s: &str) -> String {
-    let pascal = to_pascal_case(s);
-    let mut chars = pascal.chars();
-    match chars.next() {
-        Some(first) => first.to_lowercase().collect::<String>() + chars.as_str(),
-        None => String::new(),
     }
 }
 
@@ -156,6 +242,7 @@ mod tests {
                 enum_values: vec![],
                 is_pk: true,
                 position: 1,
+                always_generated: false,
                 domain_type: None,
             },
         );
@@ -172,6 +259,7 @@ mod tests {
                 enum_values: vec![],
                 is_pk: false,
                 position: 2,
+                always_generated: false,
                 domain_type: None,
             },
         );
@@ -188,6 +276,7 @@ mod tests {
                 enum_values: vec![],
                 is_pk: false,
                 position: 3,
+                always_generated: false,
                 domain_type: None,
             },
         );
@@ -204,6 +293,7 @@ mod tests {
                 enum_values: vec![],
                 is_pk: false,
                 position: 4,
+                always_generated: false,
                 domain_type: None,
             },
         );
@@ -217,6 +307,7 @@ mod tests {
             updatable: true,
             deletable: true,
             pk_cols: vec!["id".into()],
+            unique_constraints: Vec::new(),
             columns,
             computed_columns: Default::default(),
             is_partitioned: false,
@@ -224,26 +315,11 @@ mod tests {
     }
 
     #[test]
-    fn test_to_pascal_case() {
-        assert_eq!(to_pascal_case("users"), "Users");
-        assert_eq!(to_pascal_case("user_accounts"), "UserAccounts");
-        assert_eq!(to_pascal_case("my_table_name"), "MyTableName");
-        assert_eq!(to_pascal_case(""), "");
-    }
-
-    #[test]
-    fn test_to_camel_case() {
-        assert_eq!(to_camel_case("user_id"), "userId");
-        assert_eq!(to_camel_case("my_field"), "myField");
-        assert_eq!(to_camel_case("name"), "name");
-    }
-
-    #[test]
     fn test_table_to_graphql_object_name() {
         let table = create_test_table();
         let obj = TableObjectType::from_table(&table);
 
-        assert_eq!(obj.name(), "Users"); // PascalCase
+        assert_eq!(obj.name(), "users"); // named exactly like the table
     }
 
     #[test]
@@ -337,6 +413,6 @@ mod tests {
         table.name = "user_accounts".into();
 
         let obj = TableObjectType::from_table(&table);
-        assert_eq!(obj.name(), "UserAccounts");
+        assert_eq!(obj.name(), "user_accounts");
     }
 }

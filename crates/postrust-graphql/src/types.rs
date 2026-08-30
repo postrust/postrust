@@ -43,13 +43,17 @@ impl fmt::Display for GraphQLType {
             GraphQLType::String => write!(f, "String"),
             GraphQLType::Boolean => write!(f, "Boolean"),
             GraphQLType::Id => write!(f, "ID"),
-            GraphQLType::BigInt => write!(f, "BigInt"),
-            GraphQLType::BigDecimal => write!(f, "BigDecimal"),
-            GraphQLType::Json => write!(f, "JSON"),
-            GraphQLType::Uuid => write!(f, "UUID"),
-            GraphQLType::Date => write!(f, "Date"),
-            GraphQLType::DateTime => write!(f, "DateTime"),
-            GraphQLType::Time => write!(f, "Time"),
+            // Named as PostgreSQL names them, which is how Hasura names them
+            // and therefore how a client's own queries declare their
+            // variables: `query ($x: jsonb!)` names a type that has to exist
+            // under exactly that spelling.
+            GraphQLType::BigInt => write!(f, "bigint"),
+            GraphQLType::BigDecimal => write!(f, "numeric"),
+            GraphQLType::Json => write!(f, "jsonb"),
+            GraphQLType::Uuid => write!(f, "uuid"),
+            GraphQLType::Date => write!(f, "date"),
+            GraphQLType::DateTime => write!(f, "timestamptz"),
+            GraphQLType::Time => write!(f, "time"),
             GraphQLType::List(inner) => write!(f, "[{}]", inner),
             GraphQLType::Custom(name) => write!(f, "{}", name),
         }
@@ -94,22 +98,28 @@ pub fn pg_type_to_graphql(pg_type: &str) -> GraphQLType {
             GraphQLType::String
         }
 
-        // JSON types
-        "json" | "jsonb" => GraphQLType::Json,
+        // `json` and `jsonb` are different types to PostgreSQL and to a
+        // client declaring a variable, however alike they look here.
+        "jsonb" => GraphQLType::Json,
+        "json" => GraphQLType::Custom("json".to_string()),
 
         // UUID
         "uuid" => GraphQLType::Uuid,
 
         // Date/Time types
-        "timestamp"
-        | "timestamp without time zone"
-        | "timestamptz"
-        | "timestamp with time zone" => GraphQLType::DateTime,
+        "timestamptz" | "timestamp with time zone" => GraphQLType::DateTime,
+        "timestamp" | "timestamp without time zone" => GraphQLType::Custom("timestamp".to_string()),
         "date" => GraphQLType::Date,
-        "time" | "time without time zone" | "timetz" | "time with time zone" => GraphQLType::Time,
+        "time" | "time without time zone" => GraphQLType::Time,
+        "timetz" | "time with time zone" => GraphQLType::Custom("timetz".to_string()),
 
-        // Default to String for unknown types
-        _ => GraphQLType::String,
+        // Types with no GraphQL equivalent keep their own name. A client that
+        // was generated against Hasura declares `$point: geometry!` and
+        // `$tags: _text`, and a scalar named anything else is a type that does
+        // not exist as far as that query is concerned. This also covers user
+        // types the database defines -- an enum arrives here as its own type
+        // name and becomes a scalar under it.
+        other => GraphQLType::Custom(other.to_string()),
     }
 }
 
@@ -173,8 +183,12 @@ mod tests {
 
     #[test]
     fn test_pg_to_graphql_json() {
-        assert_eq!(pg_type_to_graphql("json"), GraphQLType::Json);
+        // Different types to PostgreSQL, and to a client declaring a variable.
         assert_eq!(pg_type_to_graphql("jsonb"), GraphQLType::Json);
+        assert_eq!(
+            pg_type_to_graphql("json"),
+            GraphQLType::Custom("json".to_string())
+        );
     }
 
     #[test]
@@ -184,7 +198,10 @@ mod tests {
 
     #[test]
     fn test_pg_to_graphql_datetime_types() {
-        assert_eq!(pg_type_to_graphql("timestamp"), GraphQLType::DateTime);
+        assert_eq!(
+            pg_type_to_graphql("timestamp"),
+            GraphQLType::Custom("timestamp".to_string())
+        );
         assert_eq!(pg_type_to_graphql("timestamptz"), GraphQLType::DateTime);
         assert_eq!(
             pg_type_to_graphql("timestamp with time zone"),
@@ -192,7 +209,7 @@ mod tests {
         );
         assert_eq!(
             pg_type_to_graphql("timestamp without time zone"),
-            GraphQLType::DateTime
+            GraphQLType::Custom("timestamp".to_string())
         );
     }
 
@@ -204,8 +221,14 @@ mod tests {
     #[test]
     fn test_pg_to_graphql_time() {
         assert_eq!(pg_type_to_graphql("time"), GraphQLType::Time);
-        assert_eq!(pg_type_to_graphql("timetz"), GraphQLType::Time);
-        assert_eq!(pg_type_to_graphql("time with time zone"), GraphQLType::Time);
+        assert_eq!(
+            pg_type_to_graphql("timetz"),
+            GraphQLType::Custom("timetz".to_string())
+        );
+        assert_eq!(
+            pg_type_to_graphql("time with time zone"),
+            GraphQLType::Custom("timetz".to_string())
+        );
     }
 
     #[test]
@@ -237,9 +260,17 @@ mod tests {
     }
 
     #[test]
-    fn test_pg_to_graphql_unknown_defaults_to_string() {
-        assert_eq!(pg_type_to_graphql("customtype"), GraphQLType::String);
-        assert_eq!(pg_type_to_graphql("my_domain"), GraphQLType::String);
+    fn test_pg_to_graphql_unknown_keeps_its_own_name() {
+        // A client generated against Hasura declares `$point: geometry!`, and
+        // a scalar named anything else is a type its query cannot name.
+        assert_eq!(
+            pg_type_to_graphql("customtype"),
+            GraphQLType::Custom("customtype".to_string())
+        );
+        assert_eq!(
+            pg_type_to_graphql("my_domain"),
+            GraphQLType::Custom("my_domain".to_string())
+        );
     }
 
     #[test]

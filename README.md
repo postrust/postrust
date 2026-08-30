@@ -42,7 +42,7 @@ Postrust is a high-performance, serverless-first REST API server for PostgreSQL 
 | **RPC Functions** | ✅ | Call stored procedures via `/api/rpc/function_name` (`/rpc/...` in [compatibility mode](#postgrest-compatibility)) |
 | **JWT Authentication** | ✅ | Role-based access with PostgreSQL RLS |
 | **Content Negotiation** | ✅ | JSON, CSV, GeoJSON responses |
-| **GraphQL API** | ✅ | Full GraphQL support via `/api/graphql` endpoint |
+| **GraphQL API** | ✅ | Hasura-dialect GraphQL at `/v1/graphql`, measured against Hasura's own corpus |
 
 ### Deployment Targets
 
@@ -116,8 +116,8 @@ PGRST_COMPAT_MODE=false              # PostgREST compatibility mode (default: fa
 ### API Examples
 
 > **Note on paths.** By default the REST API is served under `/api` (e.g.
-> `GET /api/users`, `POST /api/rpc/my_func`) and GraphQL under `/api/graphql`,
-> alongside the admin UI at `/admin`. The examples below use root-level paths
+> `GET /api/users`, `POST /api/rpc/my_func`), GraphQL under `/v1/graphql` and
+> `/api/graphql`, alongside the admin UI at `/admin`. The examples below use root-level paths
 > (`/users`, `/rpc/my_func`) — these work as-is when
 > [compatibility mode](#postgrest-compatibility) is enabled; otherwise prefix
 > them with `/api`. See [Differences from PostgREST](#differences-from-postgrest).
@@ -222,40 +222,52 @@ curl "http://localhost:3000/rpc/get_user_count"
 
 #### GraphQL API
 
-Postrust provides a full GraphQL API alongside the REST API:
+Postrust serves a GraphQL API alongside the REST one, in the dialect Hasura
+speaks — so a client generated against Hasura points at it unchanged:
 
 ```bash
 # Query users
-curl -X POST http://localhost:3000/api/graphql \
+curl -X POST http://localhost:3000/v1/graphql \
   -H "Content-Type: application/json" \
   -d '{
     "query": "{ users { id name email } }"
   }'
 
-# Query with filtering and pagination
-curl -X POST http://localhost:3000/api/graphql \
+# Filtering, ordering and pagination
+curl -X POST http://localhost:3000/v1/graphql \
   -H "Content-Type: application/json" \
   -d '{
-    "query": "{ users(filter: {status: {eq: \"active\"}}, limit: 10) { id name } }"
+    "query": "{ users(where: {status: {_eq: \"active\"}}, order_by: [{name: asc}], limit: 10) { id name } }"
   }'
 
-# Nested queries (relationships)
-curl -X POST http://localhost:3000/api/graphql \
+# Nested queries (relationships), and an aggregate of them
+curl -X POST http://localhost:3000/v1/graphql \
   -H "Content-Type: application/json" \
   -d '{
-    "query": "{ orders { id total customer { name email } items { product { name price } } } }"
+    "query": "{ orders { id total customer { name } items_aggregate { aggregate { count } } } }"
   }'
 
-# Mutations
-curl -X POST http://localhost:3000/api/graphql \
+# Mutations. Several root fields in one mutation are one transaction.
+curl -X POST http://localhost:3000/v1/graphql \
   -H "Content-Type: application/json" \
   -d '{
-    "query": "mutation { insertUsers(objects: [{name: \"John\", email: \"john@example.com\"}]) { id name } }"
+    "query": "mutation { insert_users(objects: [{name: \"John\", email: \"john@example.com\"}]) { affected_rows returning { id name } } }"
   }'
 
-# GraphQL Playground available at GET /graphql
-open http://localhost:3000/api/graphql
+# GraphQL Playground
+open http://localhost:3000/v1/graphql
 ```
+
+Everything checkable without Hasura runs from one script:
+
+```bash
+scripts/check.sh                    # formatting, lints, unit tests
+DATABASE_URL=... scripts/check.sh   # and the 82 that need a database
+```
+
+Measured against Hasura's own test corpus: see
+[the harness](scripts/hasura-conformance/) and
+[what it found](scripts/hasura-conformance/FINDINGS.md).
 
 #### Authentication
 
@@ -583,7 +595,7 @@ the rest are documented here so you don't assume bit-for-bit compatibility.
 
 | Area | PostgREST | Postrust (default) | Compatibility mode |
 |------|-----------|--------------------|--------------------|
-| REST base path | `/` (e.g. `POST /rpc/foo`) | Nested under `/api` (e.g. `POST /api/rpc/foo`) — leaves room for `/api/graphql`, `/admin` on the same server | Also served at `/` |
+| REST base path | `/` (e.g. `POST /rpc/foo`) | Nested under `/api` (e.g. `POST /api/rpc/foo`) — leaves room for `/v1/graphql`, `/admin` on the same server | Also served at `/` |
 | RPC response shape | Bare result: `{...}` for a single/scalar return, a top-level array for set-returning functions | Array-wrapped, function-name-keyed: `[{"foo": {...}}]` | Un-wrapped to match PostgREST |
 | Config source | Config file **and** env vars | Environment variables only | — |
 | Root endpoint `/` | OpenAPI spec | Small JSON server-info document | Serves neither yet — see below |

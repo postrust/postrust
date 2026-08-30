@@ -52,6 +52,9 @@ pub struct EmbedPlan {
     /// parent row is the argument -- so the columns above are empty and the
     /// relationship can only be expressed as a call correlated to the parent.
     pub function: Option<crate::api_request::QualifiedIdentifier>,
+    /// The name of the parameter that takes the parent's row, where the
+    /// function has more than one and the call has to be written by name.
+    pub row_argument: Option<String>,
 }
 
 /// The table a many-to-many relationship is joined through.
@@ -126,6 +129,7 @@ impl EmbedPlan {
             function,
             foreign_table,
             to_one,
+            row_argument,
             ..
         } = relationship
         {
@@ -139,6 +143,7 @@ impl EmbedPlan {
                 columns: Vec::new(),
                 junction: None,
                 function: Some(function.clone()),
+                row_argument: row_argument.clone(),
             });
         }
 
@@ -169,6 +174,7 @@ impl EmbedPlan {
                 // A junction always yields a set: that is what it is for.
                 is_list: true,
                 columns: Vec::new(),
+                row_argument: None,
                 junction: Some(EmbedJunction {
                     schema: junction.table.schema.clone(),
                     table: junction.table.name.clone(),
@@ -216,6 +222,7 @@ impl EmbedPlan {
             columns,
             junction: None,
             function: None,
+            row_argument: None,
         })
     }
 
@@ -350,7 +357,8 @@ impl EmbedPlan {
         ))
     }
 
-    /// A correlated subselect that yields this relationship as one JSON column.
+    /// The child rows belonging to one parent row, as a SELECT correlated
+    /// against the parent's alias.
     ///
     /// This is the single-query form of embedding: instead of fetching parents,
     /// collecting their keys and issuing a second query, the relationship is
@@ -362,13 +370,10 @@ impl EmbedPlan {
     /// this again. Only the caller knows the shape of its own selection tree, so
     /// the recursion lives there and the SQL assembly lives here.
     ///
-    /// Parent columns are deliberately left alone: they stay ordinary typed
-    /// columns and are converted to JSON by the same code as an unembedded
-    /// request, so embedding does not change how a NUMERIC or a timestamp is
-    /// rendered. Only the relationship column arrives as JSON, which is what
-    /// the separate child query already returned.
+    /// What is done with those rows is the caller's: [`embed_expression`]
+    /// renders them as JSON, [`aggregate_expression`] summarises them.
     #[allow(clippy::too_many_arguments)] // one parameter per SQL clause
-    pub fn embed_expression(
+    pub fn correlated_rows(
         &self,
         parent_alias: &str,
         parent_row: &str,
@@ -384,6 +389,9 @@ impl EmbedPlan {
         // belongs to the child's own subselect -- and has to be applied before
         // the child's own limit, or the limit takes an unsorted window.
         order_by: Option<&str>,
+        // The whole argument list of a computed relationship's function, where
+        // the parent row is not the only thing it takes.
+        function_arguments: Option<&str>,
     ) -> Result<String> {
         // The child table is aliased rather than referred to by name. A
         // self-referential relationship would otherwise make the correlation
@@ -398,7 +406,11 @@ impl EmbedPlan {
                 inner_select,
                 postrust_sql::escape_ident(&function.schema),
                 postrust_sql::escape_ident(&function.name),
-                parent_row,
+                // The parent row alone, unless the caller wrote the whole
+                // argument list: a function with more than the row -- a search
+                // term, the caller's session -- is called by name, and only the
+                // caller knows what to put in those.
+                function_arguments.unwrap_or(parent_row),
                 postrust_sql::escape_ident(child_alias),
             ),
             None => match &self.junction {
@@ -457,6 +469,39 @@ impl EmbedPlan {
             inner.push_str(&format!(" OFFSET {}", offset));
         }
 
+        Ok(inner)
+    }
+
+    /// A correlated subselect that yields this relationship as one JSON column.
+    ///
+    /// The rows come from [`correlated_rows`]; this decides how they are
+    /// rendered -- an array for a to-many relationship, one object or null for
+    /// a to-one.
+    #[allow(clippy::too_many_arguments)] // one parameter per SQL clause
+    pub fn embed_expression(
+        &self,
+        parent_alias: &str,
+        parent_row: &str,
+        child_alias: &str,
+        inner_select: &str,
+        limit: Option<i64>,
+        offset: i64,
+        child_where: Option<&str>,
+        order_by: Option<&str>,
+        function_arguments: Option<&str>,
+    ) -> Result<String> {
+        let inner = self.correlated_rows(
+            parent_alias,
+            parent_row,
+            child_alias,
+            inner_select,
+            limit,
+            offset,
+            child_where,
+            order_by,
+            function_arguments,
+        )?;
+
         let alias = postrust_sql::escape_ident(&format!("{}_j", child_alias));
 
         // Cast to `jsonb`, as PostgREST does -- `COALESCE(json_agg(..),'[]')::jsonb`.
@@ -479,6 +524,60 @@ impl EmbedPlan {
                 inner = inner
             )
         })
+    }
+
+    /// A correlated subselect that summarises this relationship as one JSON
+    /// column.
+    ///
+    /// `author { articles_aggregate { aggregate { count } } }`. The rows are
+    /// the same correlated set an embed would render, but a `limit` here bounds
+    /// what is *counted* rather than what is returned -- so the aggregate reads
+    /// from the rows as a subquery instead of selecting over them directly.
+    /// The subquery carries the child's own alias, so a predicate or an
+    /// ordering written against it goes on reading the same name.
+    ///
+    /// Parent columns are deliberately left alone: they stay ordinary typed
+    /// columns and are converted to JSON by the same code as an unembedded
+    /// request, so embedding does not change how a NUMERIC or a timestamp is
+    /// rendered.
+    #[allow(clippy::too_many_arguments)] // one parameter per SQL clause
+    pub fn aggregate_expression(
+        &self,
+        parent_alias: &str,
+        parent_row: &str,
+        child_alias: &str,
+        aggregate_select: &str,
+        limit: Option<i64>,
+        offset: i64,
+        child_where: Option<&str>,
+        order_by: Option<&str>,
+        function_arguments: Option<&str>,
+        // A `DISTINCT ON (...) ` prefix, or empty. It belongs to the rows
+        // being summarised rather than to the summary: counting the distinct
+        // titles means counting the rows that survive it.
+        distinct_on: &str,
+    ) -> Result<String> {
+        let child = postrust_sql::escape_ident(child_alias);
+        let rows = self.correlated_rows(
+            parent_alias,
+            parent_row,
+            child_alias,
+            &format!("{}{}.*", distinct_on, child),
+            limit,
+            offset,
+            child_where,
+            order_by,
+            function_arguments,
+        )?;
+        let alias = postrust_sql::escape_ident(&format!("{}_a", child_alias));
+        Ok(format!(
+            "(SELECT row_to_json({alias}) FROM \
+             (SELECT {select} FROM ({rows}) AS {child}) {alias})::jsonb",
+            alias = alias,
+            select = aggregate_select,
+            rows = rows,
+            child = child
+        ))
     }
 
     /// A scalar subselect yielding one column of the related row.
@@ -795,6 +894,7 @@ mod tests {
 
     fn plan(is_list: bool) -> EmbedPlan {
         EmbedPlan {
+            row_argument: None,
             local_column: "id".into(),
             foreign_column: "user_id".into(),
             foreign_column_type: "int4".into(),
@@ -829,6 +929,7 @@ mod tests {
                 0,
                 None,
                 None,
+                None,
             )
             .unwrap();
 
@@ -849,7 +950,7 @@ mod tests {
     #[test]
     fn embed_expression_takes_one_row_for_a_to_one_relation() {
         let sql = plan(false)
-            .embed_expression("p", "\"p\"", "author", r#""id""#, None, 0, None, None)
+            .embed_expression("p", "\"p\"", "author", r#""id""#, None, 0, None, None, None)
             .unwrap();
 
         assert!(sql.contains("row_to_json"), "{}", sql);
@@ -864,7 +965,17 @@ mod tests {
     #[test]
     fn embed_expression_limits_rows_per_parent() {
         let sql = plan(true)
-            .embed_expression("p", "\"p\"", "posts", r#""id""#, Some(25), 0, None, None)
+            .embed_expression(
+                "p",
+                "\"p\"",
+                "posts",
+                r#""id""#,
+                Some(25),
+                0,
+                None,
+                None,
+                None,
+            )
             .unwrap();
         assert!(sql.contains("LIMIT 25"), "{}", sql);
     }

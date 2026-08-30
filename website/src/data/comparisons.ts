@@ -65,7 +65,7 @@ export const comparisons: Comparison[] = [
     versionTested: "v16.1",
     intro: [
       "PostgREST is the project that established this idea: point a server at a PostgreSQL schema and get a REST API, with permissions left to the database. Postrust follows its URL grammar deliberately, so `?select=`, `?order=`, the filter operators and the `Prefer` headers mean the same thing in both.",
-      "How closely is measured rather than asserted: replaying PostgREST's own test cases against both servers gives 96.7% agreement on status and body, and 94.9% once every header that is part of the answer is compared too. The [conformance report](/docs/conformance) says what that covers and where the two differ on purpose.",
+      "How closely is measured rather than asserted: replaying PostgREST's own test cases against both servers gives 96.7% agreement on status and body, and 94.9% once every header that is part of the answer is compared too. The [conformance report](/docs/conformance/postgrest) says what that covers and where the two differ on purpose.",
       "The differences are not in the query language. They are in what ships in the process and what the deployment looks like.",
     ],
     features: [
@@ -162,10 +162,16 @@ export const comparisons: Comparison[] = [
     versionTested: "v2.44.0",
     intro: [
       "Hasura generates a GraphQL API from a PostgreSQL schema and models permissions as metadata rather than as database roles. It is a platform: a console, event triggers, remote schemas, and joins across more than one data source.",
-      "Postrust is a smaller thing on purpose. Permissions stay in PostgreSQL as roles and row-level security, and configuration stays as environment variables rather than as state a server owns.",
+      "Postrust speaks Hasura's GraphQL dialect. A client generated against Hasura — its queries, its codegen output, its endpoint at `/v1/graphql` — points at Postrust unchanged, and the permission model comes with it: a schema per role, row filters, separate read and write columns, presets and `backend_only`. How closely the two agree is measured by replaying Hasura's own test corpus against both servers; the [conformance report](/docs/conformance/hasura) says what that covers and where they differ on purpose.",
+      "Postrust is still a smaller thing on purpose. It is one binary against one PostgreSQL, configured by environment variables rather than by state a server owns, and the permissions it reads are a document you supply rather than a console you operate.",
     ],
     features: [
       { feature: "GraphQL from the schema", postrust: "Yes", other: "Yes" },
+      {
+        feature: "GraphQL dialect",
+        postrust: "Hasura's, measured against it",
+        other: "Its own",
+      },
       {
         feature: "REST API",
         postrust: "Yes, PostgREST-compatible",
@@ -173,12 +179,12 @@ export const comparisons: Comparison[] = [
       },
       {
         feature: "Subscriptions",
-        postrust: "Over LISTEN/NOTIFY",
-        other: "Yes, a core feature",
+        postrust: "Live queries over LISTEN/NOTIFY; no _stream",
+        other: "Yes, a core feature, including _stream",
       },
       {
         feature: "Permissions",
-        postrust: "PostgreSQL roles and RLS",
+        postrust: "Hasura's model from a JSON document, or PostgreSQL roles and RLS",
         other: "Metadata, per role and per field",
       },
       {
@@ -213,7 +219,7 @@ export const comparisons: Comparison[] = [
       },
     ],
     whenTheirs: [
-      "You need permissions expressed per role and per field without modelling them as database roles and RLS policies.",
+      "You need the parts of the permission model Postrust does not reach: inherited roles, or remote-schema permissions.",
       "Your API spans more than PostgreSQL. Remote schemas and cross-source joins have no equivalent here.",
       "You want event triggers, a console for exploring and editing, and the rest of a platform rather than a server.",
       "You want a GraphQL implementation with a large user base behind it. Note that Hasura's own recommendation for new projects is v3 / DDN, which is a different product from the v2 engine compared here.",
@@ -227,6 +233,10 @@ export const comparisons: Comparison[] = [
       {
         q: "Why does the benchmark compare against Hasura v2 rather than v3?",
         a: "v2 is the self-hostable engine that runs as a single container against one PostgreSQL database, which is the closest comparison to Postrust. v3 / DDN is a different architecture and Hasura recommends it for new projects.",
+      },
+      {
+        q: "Will my existing Hasura queries work against Postrust?",
+        a: "That is the question the conformance harness exists to answer rather than assert. It replays Hasura's own test corpus against both servers on identically loaded databases and diffs the live responses; the report says what agrees, what does not, and which divergences are deliberate. Introspection is the largest known gap, and it is a limitation of the GraphQL library rather than of the dialect.",
       },
       {
         q: "Does Postrust need tables tracked before they appear?",

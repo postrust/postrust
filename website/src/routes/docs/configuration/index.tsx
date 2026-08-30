@@ -113,6 +113,34 @@ const configVars = [
     ],
   },
   {
+    category: "Hasura Authentication",
+    vars: [
+      {
+        name: "PGRST_HASURA_ADMIN_SECRET",
+        required: false,
+        default: "-",
+        desc: "Shared secret authenticating an administrator. A caller holding it may ask to be treated as any role. Alias: HASURA_GRAPHQL_ADMIN_SECRET",
+      },
+      {
+        name: "PGRST_HASURA_UNAUTHORIZED_ROLE",
+        required: false,
+        default: "-",
+        desc: "Role for a request nothing authenticated. Unset means such a request is refused, which is the default. Alias: HASURA_GRAPHQL_UNAUTHORIZED_ROLE",
+      },
+    ],
+  },
+  {
+    category: "GraphQL Names and Permissions",
+    vars: [
+      {
+        name: "PGRST_GRAPHQL_METADATA",
+        required: false,
+        default: "-",
+        desc: "Names for tables, columns, root fields, relationships and computed fields that the schema cannot supply; which root a function is exposed on; and what each role may do with each table. A JSON document, or a path to a file holding one. Unset means every name is derived and there is no permission layer. Also read as PGRST_GRAPHQL_NAMES, which is what it was called when names were all it carried.",
+      },
+    ],
+  },
+  {
     category: "Logging",
     vars: [
       {
@@ -270,6 +298,77 @@ curl 'localhost:3000/api/users?select=status,name,id&limit=1'
 
           <section class="mb-12">
             <h2 class="mb-4 text-2xl font-bold text-neutral-900">
+              Hasura authentication
+            </h2>
+            <p class="mb-4 text-neutral-600">
+              The GraphQL surface reads Hasura&rsquo;s headers, so a deployment migrating from
+              Hasura keeps sending what it already sends. Both spellings of each variable are
+              read, so an existing <code class="font-mono">HASURA_GRAPHQL_*</code> environment
+              needs no renaming.
+            </p>
+            <p class="mb-4 text-neutral-600">
+              Set the secret, and a caller that holds it is an administrator — and an
+              administrator may ask to be treated as someone else:
+            </p>
+            <div class="mb-4 overflow-hidden rounded-xl bg-neutral-900">
+              <div class="border-b border-neutral-700 bg-neutral-800 px-4 py-2">
+                <span class="text-sm text-neutral-400">bash</span>
+              </div>
+              <pre class="overflow-x-auto p-4 text-sm">
+                <code class="text-neutral-100">{`curl localhost:3000/v1/graphql \\
+  -H 'X-Hasura-Admin-Secret: shh' \\
+  -H 'X-Hasura-Role: user' \\
+  -H 'X-Hasura-User-Id: 1' \\
+  -d '{"query":"{ article { id title } }"}'`}</code>
+              </pre>
+            </div>
+            <p class="mb-4 text-neutral-600">
+              That request is answered as <code class="font-mono">user</code>, and{" "}
+              <code class="font-mono">x-hasura-user-id</code> becomes a session variable a
+              row-level policy reads as{" "}
+              <code class="font-mono">current_setting(&#39;hasura.user_id&#39;)</code> — or that a
+              function taking <code class="font-mono">hasura_session json</code> receives whole.
+              A Hasura role is not a database role: <code class="font-mono">Artist</code> and{" "}
+              <code class="font-mono">anonymous</code> need not exist in any catalogue.
+            </p>
+
+            <h3 class="mb-2 mt-6 text-lg font-semibold text-neutral-900">
+              Choosing a role with a token
+            </h3>
+            <p class="mb-4 text-neutral-600">
+              A token that allows more than one identity carries{" "}
+              <code class="font-mono">x-hasura-default-role</code> — who the caller is when it asks
+              for nothing — beside <code class="font-mono">x-hasura-allowed-roles</code>, the list
+              it may ask for instead. The asking is done with an{" "}
+              <code class="font-mono">X-Hasura-Role</code> header, and no admin secret is needed
+              for it. That list sits inside the signature, so a caller may choose among the
+              identities it was issued and cannot add one. Asking for a role the token does not
+              list is refused. A token carrying no list allows only the role it already names.
+            </p>
+
+            <h3 class="mb-2 mt-6 text-lg font-semibold text-neutral-900">
+              One place this deliberately differs from Hasura
+            </h3>
+            <p class="mb-4 text-neutral-600">
+              Hasura with no admin secret configured treats every caller as an administrator —
+              which also means an unsecured deployment lets any caller name its own role and its
+              own identity. Postrust does not: with no secret configured,{" "}
+              <code class="font-mono">x-hasura-*</code> headers carry no weight and session
+              variables come only from a verified token. A policy reading a value the caller chose
+              is not a policy, and the failure is silent — the query succeeds, against the wrong
+              rows.
+            </p>
+            <p class="text-neutral-600">
+              See{" "}
+              <Link href="/docs/conformance/hasura" class="text-primary-600 hover:underline">
+                Hasura conformance
+              </Link>{" "}
+              for how much of the dialect this covers, measured.
+            </p>
+          </section>
+
+          <section class="mb-12">
+            <h2 class="mb-4 text-2xl font-bold text-neutral-900">
               Example Configuration
             </h2>
             <div class="overflow-hidden rounded-xl bg-neutral-900">
@@ -283,6 +382,10 @@ DATABASE_URL=postgres://user:password@localhost:5432/mydb
 # Authentication
 PGRST_DB_ANON_ROLE=web_anon
 PGRST_JWT_SECRET=your-secret-key-at-least-32-characters
+
+# Hasura-dialect GraphQL at /v1/graphql
+PGRST_HASURA_ADMIN_SECRET=shh
+PGRST_HASURA_UNAUTHORIZED_ROLE=anonymous
 
 # Server
 PGRST_SERVER_HOST=0.0.0.0

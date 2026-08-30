@@ -30,6 +30,13 @@ pub struct Table {
     pub deletable: bool,
     /// Primary key column names
     pub pk_cols: Vec<String>,
+    /// Unique constraints, as `(name, columns)`, the primary key among them.
+    ///
+    /// Named because `ON CONFLICT ON CONSTRAINT` takes a name: an upsert has
+    /// to say which uniqueness it is resolving against, and a table may have
+    /// several.
+    #[serde(default)]
+    pub unique_constraints: Vec<(String, Vec<String>)>,
     /// Columns indexed by name
     pub columns: ColumnMap,
     /// Computed columns, indexed by name.
@@ -91,6 +98,35 @@ pub struct ComputedColumn {
     pub function: QualifiedIdentifier,
     /// What it returns.
     pub data_type: String,
+    /// The comment on the function, which is the field's description.
+    ///
+    /// A column's description comes from a comment on the column; a computed
+    /// column has no column to comment on, so it comes from the function --
+    /// which is where a schema author would write it and where Hasura reads
+    /// it from.
+    #[serde(default)]
+    pub description: Option<String>,
+    /// The name of the parameter that takes the table's row.
+    ///
+    /// Usually the first and usually the only one, but not always: Hasura
+    /// records a `table_argument` because a function may take the row second,
+    /// after the session. Where it is not first the call has to be written in
+    /// named notation, which is why the name is kept rather than the position.
+    #[serde(default)]
+    pub row_argument: Option<String>,
+    /// The name of the parameter filled from the caller's session, if any.
+    ///
+    /// A function with one is not callable from the REST surface, which has no
+    /// session document to give it, and is skipped there.
+    #[serde(default)]
+    pub session_argument: Option<String>,
+    /// Whether the function takes anything besides the row.
+    ///
+    /// The REST surface has nowhere to write an argument and no session to
+    /// supply, so it reads only the fields that take neither: a field it could
+    /// only ever call wrongly is worse than a field that is not there.
+    #[serde(default)]
+    pub takes_arguments: bool,
 }
 
 /// A table column.
@@ -124,6 +160,15 @@ pub struct Column {
     pub is_pk: bool,
     /// Column position (1-based)
     pub position: i32,
+    /// Whether PostgreSQL generates this column's value and refuses any other.
+    ///
+    /// `GENERATED ALWAYS AS IDENTITY` and `GENERATED ALWAYS AS (...) STORED`
+    /// both mean the same thing to a writer: naming the column at all is an
+    /// error, not merely unnecessary. A `BY DEFAULT` identity is not this --
+    /// it has a default and accepts a value -- which is why the flag is about
+    /// what a write may say rather than about how a value is produced.
+    #[serde(default)]
+    pub always_generated: bool,
 }
 
 impl Column {
@@ -177,6 +222,7 @@ mod tests {
             updatable: true,
             deletable: true,
             pk_cols: vec!["id".into()],
+            unique_constraints: Vec::new(),
             columns: IndexMap::new(),
             computed_columns: Default::default(),
             is_partitioned: false,
@@ -200,6 +246,7 @@ mod tests {
             enum_values: vec![],
             is_pk: true,
             position: 1,
+            always_generated: false,
             domain_type: None,
         };
         assert!(col1.is_auto());
@@ -215,6 +262,7 @@ mod tests {
             enum_values: vec![],
             is_pk: false,
             position: 2,
+            always_generated: false,
             domain_type: None,
         };
         assert!(col2.is_auto());
@@ -230,6 +278,7 @@ mod tests {
             enum_values: vec![],
             is_pk: false,
             position: 3,
+            always_generated: false,
             domain_type: None,
         };
         assert!(!col3.is_auto());

@@ -1,6 +1,5 @@
 //! Relationship to GraphQL field conversion.
 
-use crate::schema::object::to_pascal_case;
 use postrust_core::schema_cache::Relationship;
 
 /// Extract constraint name from a Relationship.
@@ -26,13 +25,20 @@ pub struct RelationshipField {
     pub relationship: Relationship,
     /// Description for the field.
     pub description: Option<String>,
+    /// The arguments a computed relationship's function takes from the caller,
+    /// as `(name, PostgreSQL type, required)`.
+    ///
+    /// Neither the parent row nor the session is among them: the first is what
+    /// makes it a relationship and the second is the server's to supply.
+    /// Empty for every relationship reached by a key.
+    pub arguments: Vec<(String, String, bool)>,
 }
 
 impl RelationshipField {
     /// Create a GraphQL field from a database relationship.
     pub fn from_relationship(rel: &Relationship) -> Self {
         let base_name = rel.foreign_table().name.clone();
-        Self::from_relationship_named(rel, &base_name)
+        Self::from_relationship_named(rel, &base_name, None)
     }
 
     /// Create a GraphQL field using an explicit base name for the target.
@@ -40,18 +46,31 @@ impl RelationshipField {
     /// The base name must match the one the target table's object type was
     /// generated with, otherwise the field would reference a type that was
     /// never registered.
-    pub fn from_relationship_named(rel: &Relationship, target_base_name: &str) -> Self {
+    pub fn from_relationship_named(
+        rel: &Relationship,
+        target_base_name: &str,
+        given_name: Option<&str>,
+    ) -> Self {
         let is_list = !rel.is_to_one();
 
-        // Generate field name from the target's base name, so a relationship
-        // into a non-default schema is named consistently with its type.
-        let name = if is_list {
-            pluralize(target_base_name)
-        } else {
-            singularize(target_base_name)
+        // A computed relationship is named by its function, not by the table
+        // it returns. Two functions may return the same table, so the table's
+        // name would not tell them apart -- and where the schema also has a
+        // foreign key to that table, the derived name is already taken. This
+        // is the same rule the REST surface resolves embeds by.
+        let name = match given_name {
+            // Hasura's relationships are named in metadata rather than derived,
+            // and where a schema was migrated from one, the name a client
+            // already sends is whatever was written there.
+            Some(given) => given.to_string(),
+            None => match rel {
+                Relationship::Computed { function, .. } => function.name.clone(),
+                _ if is_list => pluralize(target_base_name),
+                _ => singularize(target_base_name),
+            },
         };
 
-        let target_type = to_pascal_case(target_base_name);
+        let target_type = target_base_name.to_string();
 
         let description = Some(format!(
             "Related {} via {}",
@@ -65,6 +84,7 @@ impl RelationshipField {
             is_list,
             relationship: rel.clone(),
             description,
+            arguments: Vec::new(),
         }
     }
 
@@ -197,7 +217,7 @@ mod tests {
         let field = RelationshipField::from_relationship(&rel);
 
         assert_eq!(field.name, "user"); // Singular for M2O
-        assert_eq!(field.target_type, "Users");
+        assert_eq!(field.target_type, "users");
         assert!(!field.is_list); // Returns single object
     }
 
@@ -207,7 +227,7 @@ mod tests {
         let field = RelationshipField::from_relationship(&rel);
 
         assert_eq!(field.name, "orders"); // Plural for O2M
-        assert_eq!(field.target_type, "Orders");
+        assert_eq!(field.target_type, "orders");
         assert!(field.is_list); // Returns list
     }
 
@@ -217,7 +237,7 @@ mod tests {
         let field = RelationshipField::from_relationship(&rel);
 
         assert_eq!(field.name, "user_profile"); // Singular for O2O
-        assert_eq!(field.target_type, "UserProfiles");
+        assert_eq!(field.target_type, "user_profiles");
         assert!(!field.is_list); // Returns single object
     }
 
@@ -226,7 +246,7 @@ mod tests {
         let rel = create_o2m_relationship();
         let field = RelationshipField::from_relationship(&rel);
 
-        assert_eq!(field.type_string(), "[Orders!]!");
+        assert_eq!(field.type_string(), "[orders!]!");
     }
 
     #[test]
@@ -234,7 +254,7 @@ mod tests {
         let rel = create_m2o_relationship();
         let field = RelationshipField::from_relationship(&rel);
 
-        assert_eq!(field.type_string(), "Users");
+        assert_eq!(field.type_string(), "users");
     }
 
     #[test]
@@ -282,7 +302,7 @@ mod tests {
         let field = RelationshipField::from_relationship(&rel);
 
         assert_eq!(field.name, "tags"); // Plural for M2M
-        assert_eq!(field.target_type, "Tags");
+        assert_eq!(field.target_type, "tags");
         assert!(field.is_list);
     }
 }

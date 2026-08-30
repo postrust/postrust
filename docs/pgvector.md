@@ -313,4 +313,4 @@ curl -X POST "localhost:3000/rpc/recommend_products" \
 
 - See [Custom Routes](./custom-routes.md) for building complete AI pipelines
 - See [API Reference](./api-reference.md) for full REST API documentation
-- See [GraphQL](./graphql.md) for GraphQL-specific features
+- See [GraphQL API](./api-reference.md#graphql-api) for queries and mutations

@@ -13,7 +13,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.4.0"
+version = "1.0.0-alpha.1"
 edition = "2021"
 license = "MIT"
 repository = "https://github.com/postrust/postrust"
@@ -97,12 +97,12 @@ parking_lot = "0.12"
 toml = "0.8"
 
 # Internal crates
-postrust-core = { version = "0.4.0", path = "crates/postrust-core" }
-postrust-sql = { version = "0.4.0", path = "crates/postrust-sql" }
-postrust-auth = { version = "0.4.0", path = "crates/postrust-auth" }
-postrust-response = { version = "0.4.0", path = "crates/postrust-response" }
-postrust-graphql = { version = "0.4.0", path = "crates/postrust-graphql" }
-postrust-proxy = { version = "0.4.0", path = "crates/postrust-proxy" }
+postrust-core = { version = "1.0.0-alpha.1", path = "crates/postrust-core" }
+postrust-sql = { version = "1.0.0-alpha.1", path = "crates/postrust-sql" }
+postrust-auth = { version = "1.0.0-alpha.1", path = "crates/postrust-auth" }
+postrust-response = { version = "1.0.0-alpha.1", path = "crates/postrust-response" }
+postrust-graphql = { version = "1.0.0-alpha.1", path = "crates/postrust-graphql" }
+postrust-proxy = { version = "1.0.0-alpha.1", path = "crates/postrust-proxy" }
 
 [profile.release]
 lto = true

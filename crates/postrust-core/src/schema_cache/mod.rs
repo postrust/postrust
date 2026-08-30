@@ -74,7 +74,7 @@ impl SchemaCache {
         info!("PostgreSQL version: {}", pg_version);
 
         // Load tables and columns
-        let tables = queries::load_tables(pool, schemas).await?;
+        let mut tables = queries::load_tables(pool, schemas).await?;
         info!("Loaded {} tables/views", tables.len());
 
         // Which base-table columns each view carries. Loaded before the
@@ -85,16 +85,17 @@ impl SchemaCache {
 
         // Functions that read as columns. Attached to the tables they belong
         // to, so resolving a field name has one place to look.
-        let mut tables = tables;
-        for (table, name, function, data_type) in
-            queries::load_computed_columns(pool, schemas, &function_schemas).await?
-        {
-            if let Some(table) = tables.get_mut(&table) {
+        for computed in queries::load_computed_columns(pool, schemas, &function_schemas).await? {
+            if let Some(table) = tables.get_mut(&computed.table) {
                 table.computed_columns.insert(
-                    name,
+                    computed.name,
                     ComputedColumn {
-                        function,
-                        data_type,
+                        function: computed.function,
+                        data_type: computed.return_type,
+                        description: computed.description,
+                        row_argument: computed.row_argument,
+                        session_argument: computed.session_argument,
+                        takes_arguments: computed.takes_arguments,
                     },
                 );
             }
@@ -123,6 +124,15 @@ impl SchemaCache {
         // junction is itself a relationship a view can carry, and the
         // junction may live in a schema that is not exposed.
         let primary_keys = queries::load_primary_keys(pool, &relationship_schemas).await?;
+
+        // Which uniqueness an upsert resolves against has to be named, and a
+        // table may have several.
+        let mut tables = tables;
+        for (qi, constraints) in queries::load_unique_constraints(pool, schemas).await? {
+            if let Some(table) = tables.get_mut(&qi) {
+                table.unique_constraints = constraints;
+            }
+        }
 
         let mut relationships = relationships;
         add_junction_relationships(&primary_keys, &mut relationships);

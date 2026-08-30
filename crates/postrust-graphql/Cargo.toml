@@ -14,6 +14,9 @@ keywords = ["graphql", "postgres", "subscriptions", "api", "realtime"]
 # GraphQL
 async-graphql = { version = "7", features = ["chrono", "uuid", "bigdecimal", "dynamic-schema"] }
 async-graphql-axum = "7"
+# The executable `Value`, which has a `Variable` case; async-graphql re-exports
+# only the constant one.
+async-graphql-value = "7"
 
 # HTTP
 axum.workspace = true
