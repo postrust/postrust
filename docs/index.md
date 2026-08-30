@@ -13,7 +13,7 @@ Welcome to the Postrust documentation. Postrust is a high-performance, serverles
 - [Custom Routes](./custom-routes.md) - Add webhooks, health checks, and custom endpoints
 - [SaaS Domain Management](./saas-domains.md) - Multi-tenant custom domains with automatic SSL (Beta)
 - [Deployment](./deployment.md) - Deploy to various platforms
-- [Benchmarking](./benchmarking.md) - Measured size, latency and memory, and how to reproduce them
+- [Benchmarking](./benchmarking.md) - The method, and why the throughput figures are currently withdrawn
 - [PostgREST Conformance](./postgrest-conformance.md) - How closely the two agree, measured against PostgREST itself
 - [Hasura Conformance](./hasura-conformance.md) - How closely the GraphQL dialects agree, measured against graphql-engine itself
 
