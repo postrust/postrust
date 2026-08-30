@@ -97,7 +97,13 @@ PORT_POSTGREST="${PORT_POSTGREST:-3992}"
 PORT_HASURA="${PORT_HASURA:-3993}"
 PORT_POSTGRAPHILE="${PORT_POSTGRAPHILE:-3994}"
 
-REQUESTS="${REQUESTS:-3000}"
+# 3000 requests completes in roughly a third of a second at the throughputs
+# these tools reach, and a window that short measures scheduling and cache
+# warmth as much as steady-state throughput. Repeating it does not help: five
+# medians of a biased sample share the bias. Measured directly, going from
+# 3000 to 30000 pulled the run-to-run spread on one scenario from 1.33x down
+# to 1.25x for this server and 1.39x to 1.17x for PostGraphile.
+REQUESTS="${REQUESTS:-30000}"
 CONCURRENCY="${CONCURRENCY:-50}"
 # Requests issued against every target before anything is measured. This is a
 # real number of requests, not a token few: a cold connection pool, an unplanned
@@ -206,6 +212,40 @@ container_of() {
     esac
 }
 
+# Only the server being measured should be running.
+#
+# Every candidate used to stay up for the whole run, so each measurement was
+# taken with the other three idling beside it on the same host. That is not a
+# fixed overhead shared equally: it moved this server's GraphQL throughput from
+# ~9000 rps measured alone to 3938-5111 measured alongside, while PostGraphile
+# barely shifted -- so the comparison was reporting a difference in how the
+# tools respond to a busy host, on top of the difference being asked about.
+#
+# Paused rather than stopped: `docker pause` freezes the processes through the
+# cgroup freezer without touching their state, so nothing pays a cold start or
+# loses a warm connection pool between scenarios.
+isolate() {
+    local keep="$1" t c
+    for t in postrust postgrest hasura postgraphile; do
+        wants "$t" || continue
+        c="$(container_of "$t")"
+        if [ "$t" = "$keep" ]; then
+            docker unpause "$c" >/dev/null 2>&1 || true
+        else
+            docker pause "$c" >/dev/null 2>&1 || true
+        fi
+    done
+}
+
+# Everything running again, for warmup and for the memory reading at the end.
+unisolate() {
+    local t
+    for t in postrust postgrest hasura postgraphile; do
+        wants "$t" || continue
+        docker unpause "$(container_of "$t")" >/dev/null 2>&1 || true
+    done
+}
+
 image_of() {
     case "$1" in
         postrust)     echo "$POSTRUST_IMAGE" ;;
@@ -229,6 +269,11 @@ ALL_CONTAINERS=(
 
 cleanup() {
     local exit_code=$?
+
+    # A run that dies mid-measurement leaves one server frozen by `isolate`.
+    # Unfreezing first means neither KEEP=1 nor the next run inherits a
+    # container that is up but answers nothing.
+    unisolate 2>/dev/null || true
 
     if [[ "$KEEP" == "1" ]]; then
         log "KEEP=1: leaving containers and network $NETWORK running"
@@ -341,7 +386,10 @@ done
 
 cleanup_quiet() {
     local c
-    for c in "${ALL_CONTAINERS[@]}"; do docker rm -f "$c" >/dev/null 2>&1 || true; done
+    for c in "${ALL_CONTAINERS[@]}"; do
+        docker unpause "$c" >/dev/null 2>&1 || true
+        docker rm -f "$c" >/dev/null 2>&1 || true
+    done
 }
 cleanup_quiet
 docker network rm "$NETWORK" >/dev/null 2>&1 || true
@@ -585,9 +633,11 @@ bench_rest() {
             target="${entry%%|*}"
             url="${entry#*|}"
             log "rest: $name -- $target"
+            isolate "$target"
             measured="$(measure_median "$url" "")"
             record rest "$name" "$target" "$measured" ok
         done
+        unisolate
     done
 }
 
@@ -625,9 +675,11 @@ bench_gql() {
         for entry in "${posts[@]}"; do
             IFS='|' read -r target url body <<<"$entry"
             log "graphql: $label -- $target"
+            isolate "$target"
             measured="$(measure_median "$url" "" "$body")"
             record graphql "$label" "$target" "$measured" ok
         done
+        unisolate
     done
 }
 
