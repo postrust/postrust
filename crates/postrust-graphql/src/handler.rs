@@ -3969,12 +3969,26 @@ async fn begin_with_session(
 ) -> Result<sqlx::Transaction<'static, sqlx::Postgres>, async_graphql::Error> {
     let mut tx = pool.begin().await?;
 
-    for (name, value) in settings {
-        sqlx::query("SELECT set_config($1, $2, true)")
-            .bind(name)
-            .bind(value)
-            .execute(&mut *tx)
-            .await?;
+    // One statement for all of them, which is what the REST path does. A loop
+    // here costs a round trip per session variable, and there is always at
+    // least one: `hasura.session` and `hasura.role` are set on every request,
+    // so even an anonymous read paid two. An authenticated caller with six
+    // `x-hasura-*` variables paid eight.
+    //
+    // The values stay bound rather than interpolated. `set_config` takes both
+    // as arguments, where `SET LOCAL` would need the value written into the
+    // statement text.
+    if !settings.is_empty() {
+        let calls = (0..settings.len())
+            .map(|i| format!("set_config(${}, ${}, true)", i * 2 + 1, i * 2 + 2))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let sql = format!("SELECT {calls}");
+        let mut query = sqlx::query_scalar::<_, String>(&sql);
+        for (name, value) in settings {
+            query = query.bind(name).bind(value);
+        }
+        query.fetch_optional(&mut *tx).await?;
     }
 
     sqlx::query(&format!(
