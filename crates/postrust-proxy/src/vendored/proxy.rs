@@ -11,6 +11,7 @@ use crate::vendored::handler::MessageHandler;
 use crate::vendored::hyper_ext::{IncomingBodyExt, ProxyBody};
 use crate::vendored::types::PathName;
 use hyper::body::Incoming;
+use hyper::server::conn::http2;
 use hyper::service::service_fn;
 use hyper_util::rt::{TokioExecutor, TokioIo};
 use hyper_util::server::conn::auto;
@@ -120,7 +121,12 @@ impl ProxyService {
                                 // prior-knowledge h2c on the same port, and the
                                 // _with_upgrades variant is what lets a 101 hand
                                 // the connection back to us for tunnelling.
-                                if let Err(err) = auto::Builder::new(TokioExecutor::new())
+                                // enable_connect_protocol advertises
+                                // SETTINGS_ENABLE_CONNECT_PROTOCOL, which is what
+                                // permits WebSocket over HTTP/2 (RFC 8441).
+                                let mut builder = auto::Builder::new(TokioExecutor::new());
+                                builder.http2().enable_connect_protocol();
+                                if let Err(err) = builder
                                     .serve_connection_with_upgrades(
                                         TokioIo::new(stream),
                                         service_fn,
@@ -128,6 +134,66 @@ impl ProxyService {
                                     .await
                                 {
                                     debug!("Connection error: {}", err);
+                                }
+                            });
+                        }
+                        Err(e) => {
+                            error!("Accept error: {}", e);
+                        }
+                    }
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Serve HTTP/2 only, on a dedicated port.
+    ///
+    /// The main listener negotiates by sniffing the opening bytes, which is why
+    /// a corrupted HTTP/2 preface there gets an HTTP/1 400 instead of
+    /// GOAWAY(PROTOCOL_ERROR): it cannot be told apart from a malformed HTTP/1
+    /// request (h2spec 3.5). A listener that only ever speaks HTTP/2 has no
+    /// such ambiguity and answers the way the RFC asks.
+    ///
+    /// This is additive. The main port still serves HTTP/1.1 and h2c together;
+    /// nothing is given up by enabling it.
+    pub async fn serve_h2c(
+        self: Arc<Self>,
+        addr: SocketAddr,
+        cancel_token: CancellationToken,
+    ) -> std::io::Result<()> {
+        let listener = TcpListener::bind(addr).await?;
+        info!("HTTP/2-only proxy listening on {}", addr);
+
+        loop {
+            tokio::select! {
+                _ = cancel_token.cancelled() => {
+                    info!("HTTP/2-only proxy stopped");
+                    break;
+                }
+                result = listener.accept() => {
+                    match result {
+                        Ok((stream, client_addr)) => {
+                            if let Err(e) = stream.set_nodelay(true) {
+                                debug!("Could not set TCP_NODELAY on the client socket: {}", e);
+                            }
+                            let service = self.clone();
+                            tokio::spawn(async move {
+                                let service_fn = service_fn(|req| {
+                                    let svc = service.clone();
+                                    async move {
+                                        svc.handle_request(req, client_addr, "http").await
+                                    }
+                                });
+
+                                let mut builder = http2::Builder::new(TokioExecutor::new());
+                                builder.enable_connect_protocol();
+                                if let Err(err) = builder
+                                    .serve_connection(TokioIo::new(stream), service_fn)
+                                    .await
+                                {
+                                    debug!("HTTP/2 connection error: {}", err);
                                 }
                             });
                         }
@@ -261,6 +327,9 @@ impl ProxyService {
         // An upgrade request keeps its Connection/Upgrade pair, but only after the
         // strip has removed everything else -- see restore_upgrade_headers.
         let upgrade_protocol = MessageHandler::upgrade_protocol(&forwarded_request);
+        // The HTTP/2 spelling of the same intent (RFC 8441), which carries no
+        // Upgrade header at all and so survives the strip untouched.
+        let h2_protocol = MessageHandler::h2_connect_protocol(&forwarded_request);
 
         // Drop hop-by-hop headers before anything else, so a client cannot name
         // our own X-Forwarded-* headers in Connection to suppress them.
@@ -281,6 +350,28 @@ impl ProxyService {
 
         // Rewrite host header
         MessageHandler::rewrite_host_header(&mut forwarded_request, &backend.address);
+
+        // WebSocket over HTTP/2: translate to an HTTP/1.1 upgrade for the origin.
+        if let Some(protocol) = h2_protocol {
+            debug!(
+                "Extended CONNECT to {} via {} (RFC 8441)",
+                protocol, backend.address
+            );
+            return match self
+                .forwarder
+                .forward_h2_websocket(&backend, forwarded_request, &protocol)
+                .await
+            {
+                Ok(response) => Ok(response),
+                Err(e) => {
+                    error!("Extended CONNECT error to {}: {}", backend.address, e);
+                    Ok(MessageHandler::bad_gateway(&format!(
+                        "Extended CONNECT error: {}",
+                        e
+                    )))
+                }
+            };
+        }
 
         // Tunnel an upgrade rather than treating it as request/response.
         if let Some(protocol) = upgrade_protocol {

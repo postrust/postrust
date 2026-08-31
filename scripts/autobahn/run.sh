@@ -24,8 +24,21 @@ set -uo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT="$(cd "$HERE/../.." && pwd)"
 PORT="${PORT:-9080}"
-ORIGIN_PORT="${ORIGIN_PORT:-9002}"
 IMAGE="${AUTOBAHN_IMAGE:-crossbario/autobahn-testsuite:latest}"
+
+# Which echo origin to put behind the proxy.
+#   deflate  (default) -- scripts/autobahn/origin, negotiates permessage-deflate,
+#                         so sections 12 and 13 are actually exercised
+#   autobahn           -- Autobahn's own wstest echoserver, which does not offer
+#                         the extension and leaves 216 cases UNIMPLEMENTED
+ORIGIN="${ORIGIN:-deflate}"
+if [ "$ORIGIN" = "deflate" ]; then
+    ORIGIN_PORT="${ORIGIN_PORT:-9003}"
+    ORIGIN_IMAGE="postrust-ws-origin:latest"
+else
+    ORIGIN_PORT="${ORIGIN_PORT:-9002}"
+    ORIGIN_IMAGE="$IMAGE"
+fi
 WORK="$HERE/.work"
 REPORTS="$HERE/reports"
 
@@ -59,14 +72,27 @@ stage "Building postrust-proxy"
 BIN="$ROOT/target/debug/postrust-proxy"
 [ -x "$BIN" ] || die "no binary at $BIN"
 
-stage "Starting Autobahn echoserver on 127.0.0.1:$ORIGIN_PORT"
+stage "Starting the $ORIGIN echo origin on 127.0.0.1:$ORIGIN_PORT"
 docker rm -f autobahn-echoserver >/dev/null 2>&1
-docker run -d --name autobahn-echoserver -p "$ORIGIN_PORT:9002" "$IMAGE" \
-    wstest -m echoserver -w "ws://0.0.0.0:9002" >/dev/null \
-    || die "could not start the echoserver"
+if [ "$ORIGIN" = "deflate" ]; then
+    docker image inspect "$ORIGIN_IMAGE" >/dev/null 2>&1 \
+        || docker build -t "$ORIGIN_IMAGE" "$HERE/origin" >/dev/null \
+        || die "could not build the deflate origin"
+    docker run -d --name autobahn-echoserver -p "$ORIGIN_PORT:9003" "$ORIGIN_IMAGE" >/dev/null \
+        || die "could not start the deflate origin"
+else
+    docker run -d --name autobahn-echoserver -p "$ORIGIN_PORT:9002" "$ORIGIN_IMAGE" \
+        wstest -m echoserver -w "ws://0.0.0.0:9002" >/dev/null \
+        || die "could not start the echoserver"
+fi
 
 for _ in $(seq 1 60); do
+    docker exec autobahn-echoserver true >/dev/null 2>&1 || break
     if docker logs autobahn-echoserver 2>&1 | grep -qi "listening\|running\|site starting"; then
+        break
+    fi
+    # The deflate origin logs nothing on success, so fall back to a port probe.
+    if [ "$ORIGIN" = "deflate" ] && nc -z 127.0.0.1 "$ORIGIN_PORT" 2>/dev/null; then
         break
     fi
     sleep 0.5

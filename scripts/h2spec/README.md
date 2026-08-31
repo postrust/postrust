@@ -23,30 +23,32 @@ hypothetical: when h2c was first turned on, the forwarded request kept its
 HTTP/2 version onto the HTTP/1.1 upstream connection and hyper's client rejected
 every one as `UserUnsupportedVersion` — a 502 on all h2c traffic.
 
-## Current result: 144 passed, 1 skipped, 1 failed
+## Current result: 145 passed, 1 skipped, 0 failed
 
-The one failure is **§3.5 case 2, "Sends invalid connection preface"**. h2spec
-expects `GOAWAY(PROTOCOL_ERROR)`; it gets the connection closed without one.
+`run.sh` targets a **dedicated HTTP/2-only listener** (`http2_port`, default
+19081), which is why §3.5 case 2 now passes.
 
-This is inherent to serving HTTP/1.1 and h2c on the same port, not a bug in the
-proxy. The listener sniffs the first bytes to decide which protocol it is
-speaking, and a corrupted h2 preface is indistinguishable from a malformed
-HTTP/1 request. Confirmed directly:
+That case, "sends invalid connection preface", expects
+`GOAWAY(PROTOCOL_ERROR)`. The shared port cannot give it one: it sniffs the
+opening bytes to choose a protocol, and a corrupted h2 preface is
+indistinguishable from a malformed HTTP/1 request. Confirmed directly against
+the shared port:
 
 | bytes sent | response |
 | --- | --- |
 | `PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n` | HTTP/2 `SETTINGS` frame |
 | `PRI * HTTP/2.0\r\n\r\nXX\r\n\r\n` | `HTTP/1.1 400 Bad Request`, then close |
 
-The RFC's requirement is that the endpoint terminate the connection, which it
-does; what is missing is the `GOAWAY` frame, because the server never concluded
-the connection was HTTP/2. A real h2c client sends a valid preface and is
-unaffected — this only shows up for a broken or hostile one, which still gets
-rejected and disconnected.
+A listener that only ever speaks HTTP/2 has no such ambiguity, so it answers the
+way the RFC asks. Crucially this is **additive**: the shared port still serves
+HTTP/1.1 and h2c together, so nothing was traded away for the last case. Set
+`http2_port` in the config to enable it.
 
-**145/146 is therefore the ceiling for a sniffing listener.** Getting the last
-case would mean serving HTTP/2 on a dedicated port with `http2::Builder`, giving
-up h1-and-h2c-on-one-port. That trade has not been made.
+To see the old behaviour, aim the suite at the shared port:
+
+```bash
+H2_PORT= scripts/h2spec/run.sh http2/3.5
+```
 
 ## Running part of the suite
 

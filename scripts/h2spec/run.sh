@@ -23,6 +23,11 @@ set -uo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT="$(cd "$HERE/../.." && pwd)"
 PORT="${PORT:-19080}"
+# h2spec targets the dedicated HTTP/2-only listener by default. The shared
+# port sniffs h1 vs h2c, so it cannot answer an invalid preface with GOAWAY
+# (section 3.5); a port that only ever speaks HTTP/2 can. Set H2_PORT= empty
+# to aim at the shared port instead and see the difference.
+H2_PORT="${H2_PORT-19081}"
 ORIGIN_PORT="${ORIGIN_PORT:-19001}"
 IMAGE="${H2SPEC_IMAGE:-summerwind/h2spec:latest}"
 WORK="$HERE/.work"
@@ -58,6 +63,7 @@ cat > "$WORK/h2spec.toml" <<TOML
 [server]
 http_host = "0.0.0.0"
 http_port = $PORT
+${H2_PORT:+http2_port = $H2_PORT}
 
 [[upstreams]]
 name = "origin"
@@ -85,9 +91,22 @@ for _ in $(seq 1 40); do
     sleep 0.25
 done
 grep -q "listening" "$WORK/proxy.log" || { cat "$WORK/proxy.log"; die "proxy did not start"; }
+if [ -n "$H2_PORT" ]; then
+    for _ in $(seq 1 40); do
+        grep -q "HTTP/2-only proxy listening" "$WORK/proxy.log" 2>/dev/null && break
+        sleep 0.25
+    done
+    grep -q "HTTP/2-only proxy listening" "$WORK/proxy.log" \
+        || { cat "$WORK/proxy.log"; die "http2 listener did not start"; }
+fi
 
-stage "Running h2spec against host.docker.internal:$PORT"
-docker run --rm "$IMAGE" -h host.docker.internal -p "$PORT" "$@" 2>&1 \
+TARGET_PORT="${H2_PORT:-$PORT}"
+if [ -n "$H2_PORT" ]; then
+    stage "Running h2spec against the HTTP/2-only port $TARGET_PORT"
+else
+    stage "Running h2spec against the shared h1/h2c port $TARGET_PORT"
+fi
+docker run --rm "$IMAGE" -h host.docker.internal -p "$TARGET_PORT" "$@" 2>&1 \
     | tee "$WORK/h2spec.log"
 
 stage "Summary"

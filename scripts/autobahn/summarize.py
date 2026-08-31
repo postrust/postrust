@@ -10,15 +10,21 @@ would mean a red build that says nothing about the proxy.
 
 So:
 
-  FAILED                  -> fail. Unambiguous.
-  worse than the baseline -> fail. The tunnel changed an outcome, which is the
-                             only class of result that is really about us.
-  UNIMPLEMENTED           -> reported as coverage, never a failure. It means the
-                             capability was not there to exercise, which for a
-                             tunnel is a statement about the endpoint behind it.
+  with a baseline:    a case worse than the baseline fails. That is the whole
+                      rule, and it is the only class of result really about the
+                      tunnel. A case the origin also fails is the origin's, not
+                      ours -- including FAILED. The trade is deliberate: if the
+                      origin and the proxy break the same case, the delta is
+                      zero and this stays green. The baseline is the definition
+                      of what this origin does; we measure the change.
+  without a baseline: any FAILED fails, conservatively, since there is nothing
+                      to attribute it against.
+  UNIMPLEMENTED       reported as coverage, never a failure on its own. It means
+                      the capability was not there to exercise, which for a
+                      tunnel is a statement about the endpoint behind it.
 
-Pass a baseline report (from `BASELINE=1 scripts/autobahn/run.sh`) to enable the
-second rule. Without one, only FAILED is enforced and the summary says so.
+Pass a baseline report (from `BASELINE=1 scripts/autobahn/run.sh`) to enable
+attribution. Without one the gate is conservative and the summary says so.
 """
 
 import json
@@ -85,15 +91,21 @@ def main(argv):
     problems = 0
 
     if failed:
+        # Printed either way; whether it counts depends on the baseline.
         print(f"FAILED ({len(failed)}):")
         for case in failed:
-            print(f"  {case}")
-        problems += len(failed)
+            note = ""
+            if baseline is not None:
+                there = baseline.get(case, {}).get("behavior")
+                if there == "FAILED":
+                    note = "  (origin fails this too -- not counted)"
+            print(f"  {case}{note}")
         print()
 
     if baseline is None:
-        print("no baseline given -- only FAILED is enforced.")
-        print("  run BASELINE=1 scripts/autobahn/run.sh to enable regression checking.")
+        print("no baseline given -- every FAILED counts.")
+        print("  run BASELINE=1 scripts/autobahn/run.sh to attribute them.")
+        problems += len(failed)
     else:
         regressions, excluded = [], []
         for case in sorted(set(cases) & set(baseline)):

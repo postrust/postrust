@@ -10,7 +10,7 @@ use crate::vendored::hyper_ext::{empty_body, string_body, ProxyBody};
 use hyper::header::{
     HeaderName, HeaderValue, CONNECTION, CONTENT_LENGTH, HOST, TRANSFER_ENCODING, UPGRADE,
 };
-use hyper::Version;
+use hyper::{Method, Version};
 use hyper::{Request, Response, StatusCode};
 use std::net::SocketAddr;
 
@@ -84,6 +84,22 @@ impl MessageHandler {
             .and_then(|v| v.to_str().ok())
             .map(|v| v.trim().to_ascii_lowercase())
             .filter(|v| !v.is_empty())
+    }
+
+    /// The protocol an HTTP/2 extended CONNECT is asking for (RFC 8441).
+    ///
+    /// HTTP/2 has no `Upgrade`; a WebSocket is opened with `:method = CONNECT`
+    /// plus a `:protocol` pseudo-header, which hyper surfaces as a
+    /// [`hyper::ext::Protocol`] extension. This is only ever offered when the
+    /// listener advertised SETTINGS_ENABLE_CONNECT_PROTOCOL.
+    pub fn h2_connect_protocol(request: &Request<ProxyBody>) -> Option<String> {
+        if request.version() != Version::HTTP_2 || request.method() != Method::CONNECT {
+            return None;
+        }
+        request
+            .extensions()
+            .get::<hyper::ext::Protocol>()
+            .map(|protocol| protocol.as_str().to_ascii_lowercase())
     }
 
     /// Re-apply the upgrade headers that [`Self::strip_hop_by_hop_headers`] took.
@@ -321,6 +337,56 @@ mod tests {
         MessageHandler::strip_path_prefix(&mut request, "/api");
 
         assert_eq!(request.uri().path(), "/");
+    }
+
+    #[test]
+    fn test_h2_connect_protocol_detected() {
+        // RFC 8441: :method CONNECT plus the :protocol pseudo-header, which
+        // hyper surfaces as an extension.
+        let mut request = Request::builder()
+            .method(Method::CONNECT)
+            .version(Version::HTTP_2)
+            .uri("/chat")
+            .body(empty_body())
+            .unwrap();
+        request
+            .extensions_mut()
+            .insert(hyper::ext::Protocol::from_static("websocket"));
+
+        assert_eq!(
+            MessageHandler::h2_connect_protocol(&request).as_deref(),
+            Some("websocket")
+        );
+        // The HTTP/1.1 detector must not claim it.
+        assert!(MessageHandler::upgrade_protocol(&request).is_none());
+    }
+
+    #[test]
+    fn test_h2_connect_without_protocol_is_a_plain_connect() {
+        let request = Request::builder()
+            .method(Method::CONNECT)
+            .version(Version::HTTP_2)
+            .uri("/chat")
+            .body(empty_body())
+            .unwrap();
+
+        assert!(MessageHandler::h2_connect_protocol(&request).is_none());
+    }
+
+    #[test]
+    fn test_h1_connect_is_not_extended_connect() {
+        // Extended CONNECT is an HTTP/2 mechanism; the h1 spelling is Upgrade.
+        let mut request = Request::builder()
+            .method(Method::CONNECT)
+            .version(Version::HTTP_11)
+            .uri("/chat")
+            .body(empty_body())
+            .unwrap();
+        request
+            .extensions_mut()
+            .insert(hyper::ext::Protocol::from_static("websocket"));
+
+        assert!(MessageHandler::h2_connect_protocol(&request).is_none());
     }
 
     #[test]

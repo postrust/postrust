@@ -42,6 +42,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .ok_or("usage: postrust-proxy <config.toml> (or set POSTRUST_PROXY_CONFIG)")?;
 
     let config: ProxyConfig = load_from_file(&config_path).await?;
+    let h2_port = config.server.http2_port;
+    let http_host = config.server.http_host.clone();
     let addr: SocketAddr = format!("{}:{}", config.server.http_host, config.server.http_port)
         .parse()
         .map_err(|e| format!("bad listen address in {config_path}: {e}"))?;
@@ -71,6 +73,27 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         });
     }
 
-    service.serve_http(addr, cancel).await?;
+    // An optional HTTP/2-only listener alongside the main one, which keeps
+    // serving HTTP/1.1 and h2c together. See ServerConfig::http2_port.
+    let h2_addr: Option<SocketAddr> = match h2_port {
+        Some(port) => Some(
+            format!("{http_host}:{port}")
+                .parse()
+                .map_err(|e| format!("bad http2 listen address in {config_path}: {e}"))?,
+        ),
+        None => None,
+    };
+
+    match h2_addr {
+        Some(h2_addr) => {
+            let h2_service = service.clone();
+            let h2_cancel = cancel.clone();
+            let h2 = tokio::spawn(async move { h2_service.serve_h2c(h2_addr, h2_cancel).await });
+            let main = service.serve_http(addr, cancel).await;
+            h2.await.map_err(|e| format!("http2 listener panicked: {e}"))??;
+            main?;
+        }
+        None => service.serve_http(addr, cancel).await?,
+    }
     Ok(())
 }
