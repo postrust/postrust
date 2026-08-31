@@ -236,6 +236,19 @@ impl ProxyService {
         let (parts, body) = request.into_parts();
         let mut forwarded_request = Request::from_parts(parts, body.boxed_body());
 
+        // Reject ambiguous body framing before the Transfer-Encoding that
+        // signals it is stripped below.
+        if MessageHandler::has_ambiguous_framing(&forwarded_request) {
+            warn!("Rejecting request with both Content-Length and Transfer-Encoding");
+            return Ok(MessageHandler::bad_request(
+                "Both Content-Length and Transfer-Encoding present",
+            ));
+        }
+
+        // Drop hop-by-hop headers before anything else, so a client cannot name
+        // our own X-Forwarded-* headers in Connection to suppress them.
+        MessageHandler::strip_hop_by_hop_headers(&mut forwarded_request);
+
         // Add forwarding headers
         MessageHandler::add_forwarding_headers(&mut forwarded_request, client_addr, proto);
 

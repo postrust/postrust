@@ -7,7 +7,9 @@
 
 use crate::config::Route;
 use crate::vendored::hyper_ext::{empty_body, string_body, ProxyBody};
-use hyper::header::{HeaderName, HeaderValue, HOST};
+use hyper::header::{
+    HeaderName, HeaderValue, CONNECTION, CONTENT_LENGTH, HOST, TRANSFER_ENCODING,
+};
 use hyper::{Request, Response, StatusCode};
 use std::net::SocketAddr;
 
@@ -21,10 +23,88 @@ pub mod headers {
     pub static X_REAL_IP: HeaderName = HeaderName::from_static("x-real-ip");
 }
 
+/// Headers that are hop-by-hop and must never reach an upstream.
+///
+/// RFC 9110 section 7.6.1. `Transfer-Encoding` belongs here even though it
+/// describes the body: the server side of hyper decodes the inbound body and
+/// the client side frames it again, so the inbound value describes a wire
+/// format the upstream never sees. Passing it through is what lets a client
+/// disagree with the proxy about where one request ends and the next begins.
+const HOP_BY_HOP_HEADERS: &[&str] = &[
+    "connection",
+    "keep-alive",
+    "proxy-authenticate",
+    "proxy-authorization",
+    "te",
+    "trailer",
+    "transfer-encoding",
+    "upgrade",
+];
+
+/// Headers a `Connection` token may not remove.
+///
+/// Naming these in `Connection` is not a legitimate use of the field, and
+/// honouring it would hand a client a way to strip framing or identity
+/// headers on their way through the proxy.
+const CONNECTION_TOKEN_EXEMPT: &[&str] = &["host", "content-length"];
+
 /// Message handler for request/response manipulation.
 pub struct MessageHandler;
 
 impl MessageHandler {
+    /// Whether the request's body framing is ambiguous.
+    ///
+    /// RFC 9112 section 6.1: a message carrying both `Content-Length` and
+    /// `Transfer-Encoding` is either a smuggling attempt or a broken client.
+    /// `Transfer-Encoding` wins per the spec, but a proxy that quietly
+    /// normalises the disagreement is how a smuggling chain starts, so reject
+    /// it -- which is also how hyper's own parser already treats a duplicate
+    /// `Content-Length`.
+    ///
+    /// Must be called *before* [`Self::strip_hop_by_hop_headers`], which
+    /// removes the `Transfer-Encoding` this inspects.
+    pub fn has_ambiguous_framing(request: &Request<ProxyBody>) -> bool {
+        let headers = request.headers();
+        headers.contains_key(CONTENT_LENGTH) && headers.contains_key(TRANSFER_ENCODING)
+    }
+
+    /// Remove hop-by-hop headers before forwarding, per RFC 9110 section 7.6.1.
+    ///
+    /// Two sets go: the standard hop-by-hop headers, and every header named as
+    /// a token in the incoming `Connection` field. Call this *before*
+    /// [`Self::add_forwarding_headers`] -- a client that names `x-forwarded-for`
+    /// in `Connection` then strips only its own inbound value, and we set a
+    /// fresh one afterwards, rather than being able to suppress ours.
+    pub fn strip_hop_by_hop_headers(request: &mut Request<ProxyBody>) {
+        let headers = request.headers_mut();
+
+        // Read the Connection tokens up front: removing headers invalidates any
+        // borrow of the values we would otherwise still be holding.
+        let mut named: Vec<String> = Vec::new();
+        for value in headers.get_all(CONNECTION).iter() {
+            let Ok(value) = value.to_str() else { continue };
+            for token in value.split(',') {
+                let token = token.trim().to_ascii_lowercase();
+                if !token.is_empty() {
+                    named.push(token);
+                }
+            }
+        }
+
+        for name in HOP_BY_HOP_HEADERS {
+            headers.remove(*name);
+        }
+
+        for token in named {
+            if CONNECTION_TOKEN_EXEMPT.contains(&token.as_str()) {
+                continue;
+            }
+            if let Ok(name) = HeaderName::from_bytes(token.as_bytes()) {
+                headers.remove(name);
+            }
+        }
+    }
+
     /// Add X-Forwarded-* headers to a request.
     pub fn add_forwarding_headers(
         request: &mut Request<ProxyBody>,
@@ -132,6 +212,11 @@ impl MessageHandler {
     }
 
     /// Create a 502 Bad Gateway response.
+    pub fn bad_request(message: &str) -> Response<ProxyBody> {
+        Self::error_response(StatusCode::BAD_REQUEST, message)
+    }
+
+    /// Create a 502 Bad Gateway response.
     pub fn bad_gateway(message: &str) -> Response<ProxyBody> {
         Self::error_response(StatusCode::BAD_GATEWAY, message)
     }
@@ -181,6 +266,158 @@ mod tests {
         MessageHandler::strip_path_prefix(&mut request, "/api");
 
         assert_eq!(request.uri().path(), "/");
+    }
+
+    #[test]
+    fn test_ambiguous_framing_detected() {
+        // Regression: stripping Transfer-Encoding leaves a stale Content-Length
+        // describing a body hyper has already re-framed, so this must be
+        // rejected up front rather than forwarded.
+        let request = Request::builder()
+            .uri("/test")
+            .header("host", "a")
+            .header("content-length", "6")
+            .header("transfer-encoding", "chunked")
+            .body(empty_body())
+            .unwrap();
+
+        assert!(MessageHandler::has_ambiguous_framing(&request));
+    }
+
+    #[test]
+    fn test_content_length_alone_is_not_ambiguous() {
+        let request = Request::builder()
+            .uri("/test")
+            .header("host", "a")
+            .header("content-length", "6")
+            .body(empty_body())
+            .unwrap();
+
+        assert!(!MessageHandler::has_ambiguous_framing(&request));
+    }
+
+    #[test]
+    fn test_transfer_encoding_alone_is_not_ambiguous() {
+        let request = Request::builder()
+            .uri("/test")
+            .header("host", "a")
+            .header("transfer-encoding", "chunked")
+            .body(empty_body())
+            .unwrap();
+
+        assert!(!MessageHandler::has_ambiguous_framing(&request));
+    }
+
+    #[test]
+    fn test_strips_each_hop_by_hop_header() {
+        // One assertion per header in the RFC 9110 section 7.6.1 set.
+        for name in HOP_BY_HOP_HEADERS {
+            let mut request = Request::builder()
+                .uri("/test")
+                .header("host", "example.com")
+                .header(*name, "some-value")
+                .body(empty_body())
+                .unwrap();
+
+            MessageHandler::strip_hop_by_hop_headers(&mut request);
+
+            assert!(
+                !request.headers().contains_key(*name),
+                "hop-by-hop header {} was forwarded",
+                name
+            );
+            // Stripping must not take unrelated headers with it.
+            assert_eq!(request.headers().get("host").unwrap(), "example.com");
+        }
+    }
+
+    #[test]
+    fn test_strips_headers_named_in_connection() {
+        // The live case found by the HTTP Garden probe.
+        let mut request = Request::builder()
+            .uri("/test")
+            .header("host", "example.com")
+            .header("connection", "keep-alive, X-Hop")
+            .header("x-hop", "SHOULD-BE-STRIPPED")
+            .body(empty_body())
+            .unwrap();
+
+        MessageHandler::strip_hop_by_hop_headers(&mut request);
+
+        assert!(!request.headers().contains_key("connection"));
+        assert!(!request.headers().contains_key("x-hop"));
+        assert_eq!(request.headers().get("host").unwrap(), "example.com");
+    }
+
+    #[test]
+    fn test_connection_tokens_are_case_insensitive_and_trimmed() {
+        let mut request = Request::builder()
+            .uri("/test")
+            .header("connection", "  X-UPPER  ,\tx-lower,,")
+            .header("x-upper", "a")
+            .header("x-lower", "b")
+            .body(empty_body())
+            .unwrap();
+
+        MessageHandler::strip_hop_by_hop_headers(&mut request);
+
+        assert!(!request.headers().contains_key("x-upper"));
+        assert!(!request.headers().contains_key("x-lower"));
+    }
+
+    #[test]
+    fn test_connection_token_cannot_strip_host_or_content_length() {
+        // Naming these in Connection is not legitimate; honouring it would let a
+        // client strip framing or identity headers on the way through.
+        let mut request = Request::builder()
+            .uri("/test")
+            .header("host", "example.com")
+            .header("content-length", "0")
+            .header("connection", "host, content-length")
+            .body(empty_body())
+            .unwrap();
+
+        MessageHandler::strip_hop_by_hop_headers(&mut request);
+
+        assert!(!request.headers().contains_key("connection"));
+        assert_eq!(request.headers().get("host").unwrap(), "example.com");
+        assert_eq!(request.headers().get("content-length").unwrap(), "0");
+    }
+
+    #[test]
+    fn test_connection_token_naming_forwarded_header_does_not_suppress_ours() {
+        // strip runs before add_forwarding_headers, so the client's inbound value
+        // goes and ours replaces it -- no suppression, no spoofing.
+        let mut request = Request::builder()
+            .uri("/test")
+            .header("host", "example.com")
+            .header("connection", "x-forwarded-for")
+            .header("x-forwarded-for", "1.2.3.4")
+            .body(empty_body())
+            .unwrap();
+
+        MessageHandler::strip_hop_by_hop_headers(&mut request);
+        let client_addr: SocketAddr = "192.168.1.100:12345".parse().unwrap();
+        MessageHandler::add_forwarding_headers(&mut request, client_addr, "http");
+
+        assert_eq!(
+            request.headers().get("x-forwarded-for").unwrap(),
+            "192.168.1.100"
+        );
+    }
+
+    #[test]
+    fn test_strip_is_a_no_op_without_hop_by_hop_headers() {
+        let mut request = Request::builder()
+            .uri("/test")
+            .header("host", "example.com")
+            .header("accept", "*/*")
+            .body(empty_body())
+            .unwrap();
+
+        MessageHandler::strip_hop_by_hop_headers(&mut request);
+
+        assert_eq!(request.headers().len(), 2);
     }
 
     #[test]
