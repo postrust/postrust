@@ -11,8 +11,9 @@ use crate::vendored::handler::MessageHandler;
 use crate::vendored::hyper_ext::{IncomingBodyExt, ProxyBody};
 use crate::vendored::types::PathName;
 use hyper::body::Incoming;
-use hyper::server::conn::http1;
 use hyper::service::service_fn;
+use hyper_util::rt::{TokioExecutor, TokioIo};
+use hyper_util::server::conn::auto;
 use hyper::{Request, Response};
 use std::convert::Infallible;
 use std::net::SocketAddr;
@@ -110,8 +111,15 @@ impl ProxyService {
                                     }
                                 });
 
-                                if let Err(err) = http1::Builder::new()
-                                    .serve_connection(hyper_util::rt::TokioIo::new(stream), service_fn)
+                                // The auto builder negotiates HTTP/1.1 and
+                                // prior-knowledge h2c on the same port, and the
+                                // _with_upgrades variant is what lets a 101 hand
+                                // the connection back to us for tunnelling.
+                                if let Err(err) = auto::Builder::new(TokioExecutor::new())
+                                    .serve_connection_with_upgrades(
+                                        TokioIo::new(stream),
+                                        service_fn,
+                                    )
                                     .await
                                 {
                                     debug!("Connection error: {}", err);
@@ -245,6 +253,10 @@ impl ProxyService {
             ));
         }
 
+        // An upgrade request keeps its Connection/Upgrade pair, but only after the
+        // strip has removed everything else -- see restore_upgrade_headers.
+        let upgrade_protocol = MessageHandler::upgrade_protocol(&forwarded_request);
+
         // Drop hop-by-hop headers before anything else, so a client cannot name
         // our own X-Forwarded-* headers in Connection to suppress them.
         MessageHandler::strip_hop_by_hop_headers(&mut forwarded_request);
@@ -264,6 +276,26 @@ impl ProxyService {
 
         // Rewrite host header
         MessageHandler::rewrite_host_header(&mut forwarded_request, &backend.address);
+
+        // Tunnel an upgrade rather than treating it as request/response.
+        if let Some(protocol) = upgrade_protocol {
+            MessageHandler::restore_upgrade_headers(&mut forwarded_request, &protocol);
+            debug!("Upgrading connection to {} via {}", protocol, backend.address);
+            return match self
+                .forwarder
+                .forward_upgrade(&backend, forwarded_request)
+                .await
+            {
+                Ok(response) => Ok(response),
+                Err(e) => {
+                    error!("Upgrade error to {}: {}", backend.address, e);
+                    Ok(MessageHandler::bad_gateway(&format!(
+                        "Upgrade error: {}",
+                        e
+                    )))
+                }
+            };
+        }
 
         // Forward request
         match self.forwarder.forward(&backend, forwarded_request).await {

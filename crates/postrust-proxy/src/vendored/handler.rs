@@ -8,8 +8,9 @@
 use crate::config::Route;
 use crate::vendored::hyper_ext::{empty_body, string_body, ProxyBody};
 use hyper::header::{
-    HeaderName, HeaderValue, CONNECTION, CONTENT_LENGTH, HOST, TRANSFER_ENCODING,
+    HeaderName, HeaderValue, CONNECTION, CONTENT_LENGTH, HOST, TRANSFER_ENCODING, UPGRADE,
 };
+use hyper::Version;
 use hyper::{Request, Response, StatusCode};
 use std::net::SocketAddr;
 
@@ -52,6 +53,53 @@ const CONNECTION_TOKEN_EXEMPT: &[&str] = &["host", "content-length"];
 pub struct MessageHandler;
 
 impl MessageHandler {
+    /// The protocol a request is asking to upgrade to, if it is a valid
+    /// upgrade request.
+    ///
+    /// Requires both `Upgrade: <proto>` and an `upgrade` token in `Connection`,
+    /// per RFC 9110 section 7.8 -- `Upgrade` alone is not a request to switch.
+    /// HTTP/2 is excluded deliberately: it carries no `Upgrade` header and
+    /// negotiates extended CONNECT instead (RFC 8441), which is not implemented.
+    pub fn upgrade_protocol(request: &Request<ProxyBody>) -> Option<String> {
+        if request.version() != Version::HTTP_11 {
+            return None;
+        }
+
+        let headers = request.headers();
+        let asks_for_upgrade = headers.get_all(CONNECTION).iter().any(|value| {
+            value
+                .to_str()
+                .map(|v| {
+                    v.split(',')
+                        .any(|t| t.trim().eq_ignore_ascii_case("upgrade"))
+                })
+                .unwrap_or(false)
+        });
+        if !asks_for_upgrade {
+            return None;
+        }
+
+        headers
+            .get(UPGRADE)
+            .and_then(|v| v.to_str().ok())
+            .map(|v| v.trim().to_ascii_lowercase())
+            .filter(|v| !v.is_empty())
+    }
+
+    /// Re-apply the upgrade headers that [`Self::strip_hop_by_hop_headers`] took.
+    ///
+    /// An upgrade is the one case where these headers legitimately travel to the
+    /// next hop. Only a normalised `Connection: upgrade` and the requested
+    /// protocol go back -- not whatever token list the client sent -- so the
+    /// carve-out cannot be used to smuggle other headers through.
+    pub fn restore_upgrade_headers(request: &mut Request<ProxyBody>, protocol: &str) {
+        if let Ok(value) = HeaderValue::from_str(protocol) {
+            let headers = request.headers_mut();
+            headers.insert(UPGRADE, value);
+            headers.insert(CONNECTION, HeaderValue::from_static("upgrade"));
+        }
+    }
+
     /// Whether the request's body framing is ambiguous.
     ///
     /// RFC 9112 section 6.1: a message carrying both `Content-Length` and
@@ -111,6 +159,7 @@ impl MessageHandler {
         client_addr: SocketAddr,
         proto: &str,
     ) {
+        let authority = request.uri().authority().map(|a| a.to_string());
         let headers = request.headers_mut();
         let client_ip = client_addr.ip().to_string();
 
@@ -138,8 +187,14 @@ impl MessageHandler {
             headers.insert(headers::X_FORWARDED_PROTO.clone(), value);
         }
 
-        // X-Forwarded-Host: preserve original Host
-        if let Some(host) = headers.get(HOST).cloned() {
+        // X-Forwarded-Host: preserve the original authority. HTTP/2 carries it in
+        // the :authority pseudo-header rather than Host, which reaches us on the
+        // URI, so fall back to that before giving up.
+        let original_host = headers
+            .get(HOST)
+            .cloned()
+            .or_else(|| authority.and_then(|a| HeaderValue::from_str(&a).ok()));
+        if let Some(host) = original_host {
             headers.insert(headers::X_FORWARDED_HOST.clone(), host);
         }
     }
@@ -266,6 +321,100 @@ mod tests {
         MessageHandler::strip_path_prefix(&mut request, "/api");
 
         assert_eq!(request.uri().path(), "/");
+    }
+
+    #[test]
+    fn test_upgrade_protocol_detected() {
+        let request = Request::builder()
+            .uri("/chat")
+            .header("host", "a")
+            .header("upgrade", "websocket")
+            .header("connection", "Upgrade")
+            .body(empty_body())
+            .unwrap();
+
+        assert_eq!(
+            MessageHandler::upgrade_protocol(&request).as_deref(),
+            Some("websocket")
+        );
+    }
+
+    #[test]
+    fn test_upgrade_needs_connection_token() {
+        // Upgrade alone is not a request to switch protocols (RFC 9110 s7.8).
+        let request = Request::builder()
+            .uri("/chat")
+            .header("host", "a")
+            .header("upgrade", "websocket")
+            .body(empty_body())
+            .unwrap();
+
+        assert!(MessageHandler::upgrade_protocol(&request).is_none());
+    }
+
+    #[test]
+    fn test_upgrade_token_found_among_others() {
+        let request = Request::builder()
+            .uri("/chat")
+            .header("host", "a")
+            .header("upgrade", "WebSocket")
+            .header("connection", "keep-alive, UPGRADE")
+            .body(empty_body())
+            .unwrap();
+
+        assert_eq!(
+            MessageHandler::upgrade_protocol(&request).as_deref(),
+            Some("websocket")
+        );
+    }
+
+    #[test]
+    fn test_no_upgrade_without_upgrade_header() {
+        let request = Request::builder()
+            .uri("/chat")
+            .header("host", "a")
+            .header("connection", "upgrade")
+            .body(empty_body())
+            .unwrap();
+
+        assert!(MessageHandler::upgrade_protocol(&request).is_none());
+    }
+
+    #[test]
+    fn test_http2_never_upgrades() {
+        // HTTP/2 negotiates extended CONNECT (RFC 8441), not Upgrade.
+        let request = Request::builder()
+            .uri("/chat")
+            .version(Version::HTTP_2)
+            .header("upgrade", "websocket")
+            .header("connection", "Upgrade")
+            .body(empty_body())
+            .unwrap();
+
+        assert!(MessageHandler::upgrade_protocol(&request).is_none());
+    }
+
+    #[test]
+    fn test_restore_upgrade_headers_normalises_connection() {
+        // The carve-out must put back only `upgrade`, never the client's list.
+        let mut request = Request::builder()
+            .uri("/chat")
+            .header("host", "a")
+            .header("upgrade", "websocket")
+            .header("connection", "Upgrade, X-Sneaky")
+            .header("x-sneaky", "leaked")
+            .header("x-legit", "keep-me")
+            .body(empty_body())
+            .unwrap();
+
+        let protocol = MessageHandler::upgrade_protocol(&request).unwrap();
+        MessageHandler::strip_hop_by_hop_headers(&mut request);
+        MessageHandler::restore_upgrade_headers(&mut request, &protocol);
+
+        assert_eq!(request.headers().get("upgrade").unwrap(), "websocket");
+        assert_eq!(request.headers().get("connection").unwrap(), "upgrade");
+        assert!(!request.headers().contains_key("x-sneaky"));
+        assert_eq!(request.headers().get("x-legit").unwrap(), "keep-me");
     }
 
     #[test]
