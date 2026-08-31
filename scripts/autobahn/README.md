@@ -32,66 +32,45 @@ What Autobahn genuinely tests about our code is whether the splice is faithful:
 byte-exact, ordered, and correct under fragmentation, large payloads, and the
 close handshake.
 
-## Current result: 517 cases, 0 failed
+## Current result: 517 cases, no regressions
 
-| behavior | count |
-| --- | --- |
-| OK | 289 |
-| UNIMPLEMENTED | 216 |
-| NON-STRICT | 9 |
-| INFORMATIONAL | 3 |
-| **FAILED** | **0** |
+Against the default deflate origin, proxied and baseline are identical:
 
-**The 216 UNIMPLEMENTED are all sections 12 and 13** — `permessage-deflate`
-compression — and they are the origin's limitation, not the proxy's.
-AutobahnPython 0.10.9 in `-m echoserver` mode does not negotiate the extension,
-so its 101 comes back without a `Sec-WebSocket-Extensions` header and the client
-scores every compression case UNIMPLEMENTED.
+| behavior | proxied | direct |
+| --- | --- | --- |
+| OK | 502 | 502 |
+| NON-STRICT | 11 | 11 |
+| INFORMATIONAL | 3 | 3 |
+| FAILED | 1 | 1 |
 
-The proxy forwards the negotiation faithfully. Verified by sending an offer
-through and reading what the origin received:
+The single FAILED case, 7.1.5, fails with **no proxy in the path at all**, so it
+is the origin's and the gate does not count it. Everything else matches. The
+tunnel changes nothing that Autobahn can see.
+
+For contrast, the old `ORIGIN=autobahn` echoserver gave 290 OK and 216
+UNIMPLEMENTED, because it does not negotiate `permessage-deflate`. Those 216
+compression cases were a coverage hole, not a result; they are now exercised.
+
+The proxy forwards extension negotiation faithfully — verified by reading what
+the origin receives:
 
 ```
 sec-websocket-extensions: permessage-deflate; client_max_window_bits
 sec-websocket-protocol: chat, superchat
 ```
 
-Both arrive intact, which is what you would expect: neither header is
-hop-by-hop, so extension and subprotocol negotiation stays end-to-end. Point the
-suite at an origin that offers deflate and these cases should exercise properly.
+Neither header is hop-by-hop, so negotiation stays end-to-end, which is why
+pointing the suite at a deflate-capable origin was all it took.
 
-**The 9 NON-STRICT** (3.2–3.4, 4.1.3–4.1.5, 4.2.3–4.2.4, 5.15) are reserved-bit,
-reserved-opcode, and fragmentation cases — judgements about how the endpoint
-handles invalid frames, which the proxy never inspects.
+## Case 3.4 — an origin artifact
 
-The baseline run settles which of these are ours. Comparing the two:
+Worth keeping on record, because it cost real time and looked like a proxy bug.
 
-| behavior | proxied | direct |
-| --- | --- | --- |
-| OK | 289 | 290 |
-| NON-STRICT | 9 | 8 |
-| INFORMATIONAL | 3 | 3 |
-| UNIMPLEMENTED | 216 | 216 |
-| FAILED | 0 | 0 |
-
-UNIMPLEMENTED is identical in both, and 8 of the 9 NON-STRICT appear in the
-baseline too — all origin properties, confirmed. Exactly one case is worse
-through the proxy than direct, and it turns out to be an origin property as
-well; see below.
-
-## Case 3.4 — an origin artifact, not a tunnel bug
-
-Case 3.4 scores OK direct but NON-STRICT through the proxy, intermittently. It
-looks like a proxy defect and is not one.
-
-The case sends a valid text frame, then the same frame with a reserved bit set,
-then a Ping — **in octet-wise chops** — and expects the echo of the first
-message before the connection is failed. Through the proxy the client receives
-nothing (`received: []`), and the proxy's own tunnel accounting says
-`0 bytes down`: the echo never arrives from the origin at all.
-
-The origin's behaviour depends on TCP segmentation. Sending the exact 3.4
-sequence straight at the echoserver, **with no proxy in the path**:
+Against `ORIGIN=autobahn`, case 3.4 scored OK direct but NON-STRICT proxied,
+intermittently. The client received nothing where the echo was expected, and the
+proxy's own accounting said `0 bytes down` — the echo never left the origin.
+Sending the exact 3.4 sequence straight at that echoserver, **no proxy in the
+path**:
 
 | how the bytes arrive | origin's response |
 | --- | --- |
@@ -99,24 +78,24 @@ sequence straight at the echoserver, **with no proxy in the path**:
 | one coalesced write | 0 bytes — no echo |
 
 AutobahnPython's echoserver fails the connection without flushing its echo when
-it reads the valid frame and the RSV frame in a single `read()`. A proxy relays
-through a buffer, so it naturally coalesces what the client chopped — and TCP
-does not preserve message boundaries, so any relay is entitled to. The test is
-measuring segmentation, which the proxy legitimately changes.
+it reads the valid frame and the RSV frame in a single `read()`. A relay buffers,
+so it coalesces what the client chopped, and TCP does not preserve message
+boundaries anyway — any proxy re-chunks.
 
-This is why `summarize.py` excludes 3.4 from the regression check by name, with
-that reasoning attached, and prints the exclusion on every run rather than
-applying it silently.
+The default origin confirms it from the other side: against `websockets`, 3.4
+behaves identically proxied and direct, and the exclusion in `summarize.py`
+never fires. That exclusion is therefore specific to `ORIGIN=autobahn`.
 
-Two things were changed while chasing this, both worth keeping on their own
-merits, neither of which fixed 3.4:
+Two things were changed while chasing this. Neither fixed 3.4; both are worth
+keeping anyway:
 
 - The tunnel no longer uses `copy_bidirectional`, which returns on the first
-  error in either direction and abandons the other mid-flight. Each direction
-  now drains independently and half-closes its peer.
-- `TCP_NODELAY` is now set on both legs and on the pooled client. It was set
-  nowhere, so Nagle was batching small writes and adding latency to every
-  small forwarded response, WebSocket or not.
+  error in either direction and abandons the other mid-flight — losing data when
+  the upstream closes while the client is still writing. Each direction now
+  drains independently and half-closes its peer.
+- `TCP_NODELAY` is set on both legs and the pooled connector. It was set
+  nowhere, so Nagle batched small writes and added latency to every small
+  forwarded response, WebSocket or not.
 
 ## Options
 
