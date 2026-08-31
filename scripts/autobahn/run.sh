@@ -142,8 +142,15 @@ docker run --rm \
     | tail -20
 
 stage "Summary"
+BASELINE_REPORT="$HERE/reports-baseline/index.json"
 if [ -f "$REPORTS/index.json" ]; then
-    python3 "$HERE/summarize.py" "$REPORTS/index.json"
+    # Pass the baseline when one exists: it turns on the regression check, which
+    # is the only rule that really speaks to the tunnel.
+    if [ "$BASELINE" != "1" ] && [ -f "$BASELINE_REPORT" ]; then
+        python3 "$HERE/summarize.py" "$REPORTS/index.json" "$BASELINE_REPORT"
+    else
+        python3 "$HERE/summarize.py" "$REPORTS/index.json"
+    fi
     SUMMARY_STATUS=$?
 else
     printf 'no report at %s\n' "$REPORTS/index.json"

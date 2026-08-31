@@ -102,6 +102,11 @@ impl ProxyService {
                 result = listener.accept() => {
                     match result {
                         Ok((stream, client_addr)) => {
+                            // Same reasoning as the upstream leg: relay the
+                            // client's own chunking rather than Nagle's.
+                            if let Err(e) = stream.set_nodelay(true) {
+                                debug!("Could not set TCP_NODELAY on the client socket: {}", e);
+                            }
                             let service = self.clone();
                             tokio::spawn(async move {
                                 let service_fn = service_fn(|req| {

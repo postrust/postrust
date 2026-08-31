@@ -11,6 +11,7 @@ use hyper_util::client::legacy::Client;
 use hyper_util::rt::TokioExecutor as HyperTokioExecutor;
 use hyper_util::rt::TokioIo;
 use std::time::Duration;
+use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tracing::debug;
 
@@ -28,7 +29,10 @@ pub struct ForwarderClient {
 impl ForwarderClient {
     /// Create a new forwarder client.
     pub fn new(timeout: Duration) -> Self {
-        let http_connector = HttpConnector::new();
+        let mut http_connector = HttpConnector::new();
+        // Without this, Nagle batches small writes and, paired with delayed ACK
+        // on the far side, adds latency to every small forwarded request.
+        http_connector.set_nodelay(true);
         let http_client = Client::builder(HyperTokioExecutor::new())
             .pool_idle_timeout(Duration::from_secs(30))
             .pool_max_idle_per_host(32)
@@ -106,6 +110,16 @@ impl ForwarderClient {
             .map_err(|_| ProxyError::Timeout)?
             .map_err(|e| ProxyError::Connection(e.to_string()))?;
 
+        // A tunnel relays whatever chunking the client used. With Nagle on, small
+        // writes coalesce and the upstream sees frames batched together that the
+        // client sent separately -- which changes what the upstream does, not just
+        // when it does it. Autobahn 3.4 is exactly that: the client sends a text
+        // frame and then a bad frame in one-byte chops, and a batched upstream
+        // fails the connection without ever echoing the first.
+        if let Err(e) = stream.set_nodelay(true) {
+            debug!("Could not set TCP_NODELAY on the upstream socket: {}", e);
+        }
+
         let (mut sender, conn) = hyper::client::conn::http1::handshake(TokioIo::new(stream))
             .await
             .map_err(|e| ProxyError::Connection(e.to_string()))?;
@@ -135,17 +149,11 @@ impl ForwarderClient {
         // has to outlive this call.
         tokio::spawn(async move {
             match tokio::try_join!(client_upgrade, upstream_upgrade) {
-                Ok((client_io, upstream_io)) => {
-                    let mut client_io = TokioIo::new(client_io);
-                    let mut upstream_io = TokioIo::new(upstream_io);
-                    match tokio::io::copy_bidirectional(&mut client_io, &mut upstream_io).await {
-                        Ok((from_client, from_upstream)) => debug!(
-                            "Tunnel closed: {} bytes up, {} bytes down",
-                            from_client, from_upstream
-                        ),
-                        Err(e) => debug!("Tunnel error: {}", e),
-                    }
-                }
+                Ok((client_io, upstream_io)) => Self::splice(
+                    TokioIo::new(client_io),
+                    TokioIo::new(upstream_io),
+                )
+                .await,
                 Err(e) => debug!("Upgrade handshake failed: {}", e),
             }
         });
@@ -153,6 +161,55 @@ impl ForwarderClient {
         // Hand the 101 and its headers back; the body is the tunnel, not content.
         let (parts, _) = response.into_parts();
         Ok(Response::from_parts(parts, empty_body()))
+    }
+
+    /// Splice two upgraded streams, draining both directions independently.
+    ///
+    /// Deliberately not `copy_bidirectional`, which returns on the first error
+    /// in either direction and drops the other mid-flight. That loses data in a
+    /// real and reachable case: the upstream fails the connection and closes
+    /// while the client is still writing, the client-to-upstream copy takes an
+    /// EPIPE, and whatever the upstream had already sent -- its last frames and
+    /// its close -- is discarded instead of reaching the client. Autobahn case
+    /// 3.4 caught exactly that, intermittently, because it is a race.
+    ///
+    /// Each direction here runs to its own end and half-closes the peer's write
+    /// side so the other side sees a clean EOF. `join!` rather than `try_join!`
+    /// so that one direction failing cannot cancel the other.
+    async fn splice<A, B>(client_io: A, upstream_io: B)
+    where
+        A: AsyncRead + AsyncWrite + Unpin,
+        B: AsyncRead + AsyncWrite + Unpin,
+    {
+        let (mut client_read, mut client_write) = tokio::io::split(client_io);
+        let (mut upstream_read, mut upstream_write) = tokio::io::split(upstream_io);
+
+        let to_upstream = async {
+            let result = tokio::io::copy(&mut client_read, &mut upstream_write).await;
+            // Half-close: tell the upstream the client is done, without tearing
+            // down the half still carrying its reply.
+            let _ = upstream_write.shutdown().await;
+            result
+        };
+
+        let to_client = async {
+            let result = tokio::io::copy(&mut upstream_read, &mut client_write).await;
+            let _ = client_write.shutdown().await;
+            result
+        };
+
+        let (up, down) = tokio::join!(to_upstream, to_client);
+
+        match (up, down) {
+            (Ok(up), Ok(down)) => {
+                debug!("Tunnel closed: {} bytes up, {} bytes down", up, down)
+            }
+            (up, down) => {
+                // One side erroring is normal for an abrupt close; log both
+                // outcomes rather than only the first failure.
+                debug!("Tunnel closed with errors: up={:?} down={:?}", up, down)
+            }
+        }
     }
 }
 

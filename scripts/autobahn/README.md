@@ -75,30 +75,48 @@ The baseline run settles which of these are ours. Comparing the two:
 | FAILED | 0 | 0 |
 
 UNIMPLEMENTED is identical in both, and 8 of the 9 NON-STRICT appear in the
-baseline too — all origin properties, confirmed. Exactly **one** case is worse
-through the proxy than direct.
+baseline too — all origin properties, confirmed. Exactly one case is worse
+through the proxy than direct, and it turns out to be an origin property as
+well; see below.
 
-## Known flake: case 3.4
+## Case 3.4 — an origin artifact, not a tunnel bug
 
-Case 3.4 scores OK direct but NON-STRICT through the proxy — and it is
-intermittent. Three consecutive runs of section 3:
+Case 3.4 scores OK direct but NON-STRICT through the proxy, intermittently. It
+looks like a proxy defect and is not one.
 
-```
-run 1: 3.4=NON-STRICT
-run 2: 3.4=OK
-run 3: 3.4=NON-STRICT
-```
+The case sends a valid text frame, then the same frame with a reserved bit set,
+then a Ping — **in octet-wise chops** — and expects the echo of the first
+message before the connection is failed. Through the proxy the client receives
+nothing (`received: []`), and the proxy's own tunnel accounting says
+`0 bytes down`: the echo never arrives from the origin at all.
 
-3.2 and 3.3 were NON-STRICT in all three, matching the baseline; only 3.4 moves.
+The origin's behaviour depends on TCP segmentation. Sending the exact 3.4
+sequence straight at the echoserver, **with no proxy in the path**:
 
-The case sends a valid text message, then a frame with a reserved bit set, and
-expects the endpoint to fail the connection. The intermittency points at a
-flush-versus-teardown race in the tunnel: whether the echoed text reaches the
-client before the origin's abrupt close propagates through
-`copy_bidirectional`. It is a race on an invalid-frame path, scored NON-STRICT
-rather than FAILED, so it is a candidate for follow-up rather than a defect in
-normal operation — but it is ours, not the origin's, and it should not be
-written off as noise without someone looking at the shutdown ordering.
+| how the bytes arrive | origin's response |
+| --- | --- |
+| octet-wise chops | 15 bytes — echo received |
+| one coalesced write | 0 bytes — no echo |
+
+AutobahnPython's echoserver fails the connection without flushing its echo when
+it reads the valid frame and the RSV frame in a single `read()`. A proxy relays
+through a buffer, so it naturally coalesces what the client chopped — and TCP
+does not preserve message boundaries, so any relay is entitled to. The test is
+measuring segmentation, which the proxy legitimately changes.
+
+This is why `summarize.py` excludes 3.4 from the regression check by name, with
+that reasoning attached, and prints the exclusion on every run rather than
+applying it silently.
+
+Two things were changed while chasing this, both worth keeping on their own
+merits, neither of which fixed 3.4:
+
+- The tunnel no longer uses `copy_bidirectional`, which returns on the first
+  error in either direction and abandons the other mid-flight. Each direction
+  now drains independently and half-closes its peer.
+- `TCP_NODELAY` is now set on both legs and on the pooled client. It was set
+  nowhere, so Nagle was batching small writes and adding latency to every
+  small forwarded response, WebSocket or not.
 
 ## Options
 
