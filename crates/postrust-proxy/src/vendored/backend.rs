@@ -247,17 +247,15 @@ impl BackendAppManager {
 
     /// Register an upstream.
     pub fn register_upstream(&self, upstream: Upstream) {
-        if let Some(id) = upstream.id {
-            let load_balance =
-                LoadBalance::from_strategy(&upstream.lb_strategy, &upstream.backends);
-            self.upstreams.insert(
-                id,
-                UpstreamEntry {
-                    upstream,
-                    load_balance,
-                },
-            );
-        }
+        let id = upstream.resolved_id();
+        let load_balance = LoadBalance::from_strategy(&upstream.lb_strategy, &upstream.backends);
+        self.upstreams.insert(
+            id,
+            UpstreamEntry {
+                upstream,
+                load_balance,
+            },
+        );
     }
 
     /// Register a route.

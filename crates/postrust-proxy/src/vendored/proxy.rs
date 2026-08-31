@@ -66,14 +66,13 @@ impl ProxyService {
         for route in &config.routes {
             // Find upstream by name
             if let Some(upstream) = config.upstreams.iter().find(|u| u.name == route.upstream) {
-                if let Some(upstream_id) = upstream.id {
-                    use crate::vendored::types::ServerName;
-                    let host = route.match_.host.as_deref().unwrap_or("*");
-                    let path = route.match_.path.as_deref().unwrap_or("/");
-                    let host = ServerName::new(host);
-                    let path = PathName::new(path);
-                    self.backend_manager.register_route(host, path, upstream_id);
-                }
+                use crate::vendored::types::ServerName;
+                let host = route.match_.host.as_deref().unwrap_or("*");
+                let path = route.match_.path.as_deref().unwrap_or("/");
+                let host = ServerName::new(host);
+                let path = PathName::new(path);
+                self.backend_manager
+                    .register_route(host, path, upstream.resolved_id());
             }
         }
 
@@ -180,7 +179,7 @@ impl ProxyService {
                         .upstreams
                         .iter()
                         .find(|u| u.name == r.upstream)
-                        .and_then(|u| u.id);
+                        .map(|u| u.resolved_id());
                     (Some(r), upstream_id)
                 }
                 None => (None, None),

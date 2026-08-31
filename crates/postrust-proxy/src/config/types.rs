@@ -278,6 +278,21 @@ pub struct Upstream {
     pub enabled: bool,
 }
 
+impl Upstream {
+    /// The identifier this upstream is keyed by in the routing tables.
+    ///
+    /// `id` is only set for upstreams loaded from the database. A TOML config
+    /// leaves it `None`, and both registration sites used to skip any upstream
+    /// without one -- so a file-configured proxy logged "Loaded N routes and N
+    /// upstreams" and then answered every request with 503 "Upstream not
+    /// found". Names are unique within a config, so deriving a stable UUID
+    /// from the name is enough to key the tables consistently.
+    pub fn resolved_id(&self) -> Uuid {
+        self.id
+            .unwrap_or_else(|| Uuid::new_v5(&Uuid::NAMESPACE_OID, self.name.as_bytes()))
+    }
+}
+
 /// Load balancing strategy.
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
