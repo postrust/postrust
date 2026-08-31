@@ -59,7 +59,63 @@ services:
     working_dir: /app
     command: cargo test --all
 
+  # --- ACME testing (profile: acme) ---------------------------------------
+  # Pebble is Let's Encrypt's test CA. It deliberately misbehaves -- it rejects
+  # a percentage of nonces, varies challenge ordering, and returns states a
+  # happy-path client will not expect -- which is the point: it breaks ACME
+  # clients that only handle the good case. Nothing in postrust-proxy has
+  # talked to a CA yet, so this is where that starts.
+  #
+  # Static IPs are required because pebble takes -dnsserver as an address, and
+  # challtestsrv answers every DNS query with -defaultIPv4. Point that at the
+  # container running the proxy so http-01 validation reaches it:
+  #
+  #   curl -X POST http://localhost:8055/set-default-ipv4 \
+  #        -d '{"ip":"10.30.50.4"}'
+  #
+  # The ACME directory is https://localhost:14000/dir and is served with a
+  # self-signed chain. Clients must trust pebble's root, fetched from the
+  # management API:
+  #
+  #   curl -sk https://localhost:15000/roots/0 > pebble-root.pem
+  #
+  # Start with:  docker compose --profile acme up pebble challtestsrv
+  pebble:
+    image: ghcr.io/letsencrypt/pebble:latest
+    container_name: postrust-pebble
+    profiles: ["acme"]
+    command: -config test/config/pebble-config.json -strict -dnsserver 10.30.50.3:8053
+    ports:
+      - "14000:14000"   # ACME directory (HTTPS)
+      - "15000:15000"   # management API (HTTPS)
+    networks:
+      acmenet:
+        ipv4_address: 10.30.50.2
+
+  challtestsrv:
+    image: ghcr.io/letsencrypt/pebble-challtestsrv:latest
+    container_name: postrust-challtestsrv
+    profiles: ["acme"]
+    command: -defaultIPv6 "" -defaultIPv4 10.30.50.3
+    ports:
+      - "8055:8055"     # management API (HTTP)
+    networks:
+      acmenet:
+        ipv4_address: 10.30.50.3
+
+
 volumes:
   postgres_data:
   cargo_cache:
   target_cache:
+
+networks:
+  # Fixed subnet so pebble's -dnsserver and challtestsrv's -defaultIPv4 can be
+  # written as literal addresses. 10.30.50.4 is left free for the proxy under
+  # test to join when answering http-01 challenges.
+  acmenet:
+    driver: bridge
+    ipam:
+      driver: default
+      config:
+        - subnet: 10.30.50.0/24

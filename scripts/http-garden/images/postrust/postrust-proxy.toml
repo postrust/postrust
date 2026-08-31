@@ -1,0 +1,24 @@
+# Proxy config for the HTTP Garden transducer role.
+#
+# One catch-all route to one backend: the Garden's echo server, which reports
+# how it parsed whatever the proxy forwarded. No rate limit is set, because a
+# route-level limit would throttle the fuzzer rather than the traffic it is
+# meant to characterise.
+
+[server]
+http_host = "0.0.0.0"
+http_port = 80
+
+[[upstreams]]
+name = "garden_echo"
+
+[[upstreams.backends]]
+address = "BACKEND_HOST_PLACEHOLDER:BACKEND_PORT_PLACEHOLDER"
+scheme = "http"
+
+[[routes]]
+name = "catch_all"
+upstream = "garden_echo"
+
+[routes.match]
+path = "/"
