@@ -320,13 +320,11 @@ impl ProxyService {
         let uri = request.uri().clone();
         let method = request.method().clone();
 
-        // Extract host from request
-        let host = request
-            .headers()
-            .get(hyper::header::HOST)
-            .and_then(|h| h.to_str().ok())
-            .map(|h| h.split(':').next().unwrap_or(h))
-            .unwrap_or("");
+        // Host, falling back to the URI authority. HTTP/2 has no Host header,
+        // so reading only the header routed nothing for any host-matched route
+        // over h2 or h2c. See MessageHandler::request_host.
+        let host = MessageHandler::request_host(&request);
+        let host = host.as_str();
 
         let path = uri.path();
 

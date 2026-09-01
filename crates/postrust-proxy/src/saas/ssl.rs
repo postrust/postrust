@@ -35,6 +35,22 @@ const POLL_INTERVAL: Duration = Duration::from_secs(30);
 /// below spans about a day.
 const MAX_ATTEMPTS: i32 = 10;
 
+/// How long a domain may sit in `provisioning` before it is considered
+/// abandoned and put back.
+///
+/// Nothing moves a row out of `provisioning` except this worker finishing with
+/// it, and both of those writes happen in-process after the order returns. A
+/// restart mid-order -- an order takes tens of seconds, and deploys happen --
+/// or a database error on the way to recording the result leaves the row there
+/// for ever: `claim_next` takes only `pending`, so the domain silently never
+/// gets a certificate and nothing says so.
+///
+/// Comfortably longer than [`ORDER_TIMEOUT`] plus its retries, so a live order
+/// is never stolen from the worker running it.
+///
+/// [`ORDER_TIMEOUT`]: crate::tls
+const STUCK_AFTER: chrono::TimeDelta = chrono::TimeDelta::minutes(15);
+
 /// Renew once a certificate is within this long of expiring.
 ///
 /// Let's Encrypt issues for 90 days and recommends renewing at 30, which leaves
@@ -100,8 +116,17 @@ pub async fn run(pool: PgPool, issuer: Arc<AcmeIssuer>, cancel: CancellationToke
     }
 }
 
-/// One pass: mark anything due for renewal, then issue for anything pending.
+/// One pass: recover abandoned work, mark renewals, then issue.
 async fn tick(pool: &PgPool, issuer: &AcmeIssuer) -> ProxyResult<()> {
+    let recovered = reclaim_abandoned(pool).await?;
+    if recovered > 0 {
+        tracing::warn!(
+            recovered,
+            "domains were left mid-issuance and have been requeued; \
+             a restart or a database error interrupted an order"
+        );
+    }
+
     let renewals = mark_renewals(pool).await?;
     if renewals > 0 {
         tracing::info!(renewals, "certificates due for renewal");
@@ -250,6 +275,31 @@ async fn mark_failed(pool: &PgPool, id: Uuid, error: &str, attempts: i32) -> Pro
     .execute(pool)
     .await?;
     Ok(())
+}
+
+/// Put domains abandoned mid-issuance back in the queue.
+///
+/// Returns how many. The attempt counter is incremented rather than left alone:
+/// the interrupted order was still an order, and a proxy that crash-loops
+/// during issuance would otherwise retry without limit and spend the CA's rate
+/// limit on a problem that is not the CA's.
+async fn reclaim_abandoned(pool: &PgPool) -> ProxyResult<u64> {
+    let result = sqlx::query(
+        "UPDATE proxy_domains SET \
+             ssl_status = 'pending', \
+             ssl_attempts = ssl_attempts + 1, \
+             ssl_error = 'issuance was interrupted before it finished', \
+             updated_at = NOW() \
+         WHERE ssl_status = 'provisioning' \
+           AND ssl_provider = 'acme' \
+           AND ssl_last_attempt_at IS NOT NULL \
+           AND ssl_last_attempt_at < NOW() - make_interval(secs => $1)",
+    )
+    .bind(STUCK_AFTER.num_seconds() as f64)
+    .execute(pool)
+    .await?;
+
+    Ok(result.rows_affected())
 }
 
 /// Move `active` domains whose certificate is expiring back to `pending`.
@@ -690,6 +740,108 @@ mod db_tests {
             claims_include(&pool, id).await,
             "a retried domain must be claimable straight away"
         );
+    }
+
+    #[tokio::test]
+    #[ignore = "requires PostgreSQL"]
+    async fn a_domain_abandoned_mid_issuance_is_requeued() {
+        let pool = pool().await;
+        let _exclusive = exclusive().await;
+        let t = tenant(&pool).await;
+
+        // Claimed an hour ago and never finished: a restart mid-order, or a
+        // database error on the way to recording the result. Nothing else ever
+        // moves a row out of `provisioning`, so without the reaper this domain
+        // silently never gets a certificate.
+        let (id, _) = domain(&pool, t, "provisioning", 0, Some(3600)).await;
+
+        let recovered = reclaim_abandoned(&pool).await.expect("reclaim");
+        assert_eq!(recovered, 1, "the abandoned domain was not requeued");
+
+        assert!(
+            claims_include(&pool, id).await,
+            "a requeued domain must be claimable again"
+        );
+
+        let attempts: i32 =
+            sqlx::query_scalar("SELECT ssl_attempts FROM proxy_domains WHERE id = $1")
+                .bind(id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        // The interrupted order was still an order. Without counting it, a
+        // proxy crash-looping during issuance would retry without limit.
+        assert_eq!(attempts, 1, "the interrupted attempt was not counted");
+    }
+
+    #[tokio::test]
+    #[ignore = "requires PostgreSQL"]
+    async fn a_live_order_is_not_stolen_from_the_worker_running_it() {
+        let pool = pool().await;
+        let _exclusive = exclusive().await;
+        let t = tenant(&pool).await;
+
+        // Claimed a minute ago: well inside STUCK_AFTER, so another instance
+        // is plausibly still working on it. Reclaiming here would have two
+        // workers ordering the same certificate.
+        let (id, _) = domain(&pool, t, "provisioning", 0, Some(60)).await;
+
+        let recovered = reclaim_abandoned(&pool).await.expect("reclaim");
+        assert_eq!(recovered, 0, "a live order was reclaimed");
+
+        let status: String =
+            sqlx::query_scalar("SELECT ssl_status FROM proxy_domains WHERE id = $1")
+                .bind(id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(status, "provisioning");
+    }
+
+    #[tokio::test]
+    #[ignore = "requires PostgreSQL"]
+    async fn reclaiming_leaves_other_providers_and_states_alone() {
+        let pool = pool().await;
+        let _exclusive = exclusive().await;
+        let t = tenant(&pool).await;
+
+        let (pending, _) = domain(&pool, t, "pending", 0, Some(3600)).await;
+        let (active, _) = domain(&pool, t, "active", 0, Some(3600)).await;
+
+        // Provisioning, long ago, but not an ACME domain -- this worker has no
+        // business touching it.
+        let manual: Uuid = sqlx::query_scalar(
+            "INSERT INTO proxy_domains \
+                (tenant_id, domain, verification_status, verification_token, \
+                 ssl_status, ssl_provider, ssl_last_attempt_at) \
+             VALUES ($1, $2, 'verified', 'tok', 'provisioning', 'manual', \
+                 NOW() - make_interval(secs => 3600)) RETURNING id",
+        )
+        .bind(t)
+        .bind(format!("manual-{}.example", Uuid::new_v4()))
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+
+        let recovered = reclaim_abandoned(&pool).await.expect("reclaim");
+        assert_eq!(recovered, 0, "reclaimed something it should not have");
+
+        for (id, expected) in [
+            (pending, "pending"),
+            (active, "active"),
+            (manual, "provisioning"),
+        ] {
+            let status: String =
+                sqlx::query_scalar("SELECT ssl_status FROM proxy_domains WHERE id = $1")
+                    .bind(id)
+                    .fetch_one(&pool)
+                    .await
+                    .unwrap();
+            assert_eq!(
+                status, expected,
+                "a row was changed that should not have been"
+            );
+        }
     }
 
     #[tokio::test]

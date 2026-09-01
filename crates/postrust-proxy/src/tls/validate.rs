@@ -110,10 +110,11 @@ pub fn facts(cert_pem: &[u8]) -> ProxyResult<CertificateFacts> {
 
 /// The expiry of a chain, or `None` if it cannot be read.
 ///
-/// For a certificate we obtained ourselves and are storing regardless: a
-/// missing expiry costs a renewal scan its scheduling hint, which is worth less
-/// than discarding a certificate the CA has already issued and whose rate limit
-/// we have already spent.
+/// For a certificate we obtained ourselves and are storing regardless. Callers
+/// must not store the `None` as-is: the renewal scan selects on
+/// `expires_at IS NOT NULL`, so a null expiry means the certificate is never
+/// renewed at all, not merely renewed on a worse schedule. `AcmeIssuer::issue`
+/// substitutes a deliberately short assumed lifetime.
 pub fn expiry_of(cert_pem: &[u8]) -> Option<DateTime<Utc>> {
     facts(cert_pem).ok().map(|f| f.expires_at)
 }

@@ -1,8 +1,10 @@
 //! Configuration types for the proxy.
 
 use http::HeaderMap;
+use regex::Regex;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::sync::{LazyLock, RwLock};
 use uuid::Uuid;
 
 /// Main proxy configuration.
@@ -250,6 +252,50 @@ pub struct RouteMatch {
     pub methods: Option<Vec<String>>,
 }
 
+/// Compiled route regexes, keyed by their pattern.
+///
+/// `Regex::new` is not cheap, and route matching runs on every request against
+/// every candidate route -- compiling inside the match, as this first did, put a
+/// regex compilation on the hot path for each regex route a request was
+/// compared against.
+///
+/// The cache is unbounded, which is safe because the keys come from the
+/// configuration: routes are loaded from a TOML file or the proxy's own tables,
+/// both of which an operator controls, and the set changes only when the
+/// configuration does.
+///
+/// A pattern that does not compile is cached as `None`, so a typo costs one
+/// failed compilation rather than one per request.
+static REGEX_CACHE: LazyLock<RwLock<HashMap<String, Option<Regex>>>> =
+    LazyLock::new(|| RwLock::new(HashMap::new()));
+
+/// The compiled form of `pattern`, or `None` if it does not compile.
+///
+/// Warns once per pattern rather than once per request.
+fn compiled_regex(pattern: &str) -> Option<Regex> {
+    if let Ok(cache) = REGEX_CACHE.read() {
+        if let Some(entry) = cache.get(pattern) {
+            return entry.clone();
+        }
+    }
+
+    let compiled = match Regex::new(pattern) {
+        Ok(re) => Some(re),
+        Err(error) => {
+            tracing::warn!(
+                %pattern, %error,
+                "route path regex does not compile; the route matches nothing"
+            );
+            None
+        }
+    };
+
+    if let Ok(mut cache) = REGEX_CACHE.write() {
+        cache.insert(pattern.to_owned(), compiled.clone());
+    }
+    compiled
+}
+
 impl RouteMatch {
     /// Whether a request matches these criteria.
     ///
@@ -308,15 +354,9 @@ impl RouteMatch {
         match self.path_type {
             PathMatchType::Prefix => path.starts_with(pattern),
             PathMatchType::Exact => path == pattern,
-            PathMatchType::Regex => match regex::Regex::new(pattern) {
-                Ok(re) => re.is_match(path),
-                Err(error) => {
-                    tracing::warn!(
-                        %pattern, %error,
-                        "route path regex does not compile; the route matches nothing"
-                    );
-                    false
-                }
+            PathMatchType::Regex => match compiled_regex(pattern) {
+                Some(re) => re.is_match(path),
+                None => false,
             },
         }
     }
@@ -666,6 +706,53 @@ mod upstream_version_tests {
         assert!(m.matches("h", "/v22/users", "GET", &HeaderMap::new()));
         assert!(!m.matches("h", "/v1/users/1", "GET", &HeaderMap::new()));
         assert!(!m.matches("h", "/users", "GET", &HeaderMap::new()));
+    }
+
+    #[test]
+    fn a_regex_is_compiled_once_and_reused() {
+        // The bug: `Regex::new` inside the match put a compilation on the hot
+        // path for every request compared against a regex route. Asserted via
+        // the cache rather than by timing, which would be flaky.
+        let pattern = format!("^/cache-probe-{}/[0-9]+$", uuid::Uuid::new_v4());
+        let m = RouteMatch {
+            path: Some(pattern.clone()),
+            path_type: PathMatchType::Regex,
+            ..any()
+        };
+
+        assert!(!REGEX_CACHE.read().unwrap().contains_key(&pattern));
+        assert!(m.matches("h", "/nope", "GET", &HeaderMap::new()) || true);
+        assert!(
+            REGEX_CACHE.read().unwrap().contains_key(&pattern),
+            "the compiled regex was not cached"
+        );
+
+        // And the cached one still matches correctly.
+        let path = pattern
+            .trim_start_matches('^')
+            .trim_end_matches("/[0-9]+$")
+            .to_string();
+        assert!(m.matches("h", &format!("{path}/42"), "GET", &HeaderMap::new()));
+    }
+
+    #[test]
+    fn a_broken_regex_is_cached_as_a_failure() {
+        // So a typo costs one failed compilation, not one per request.
+        let pattern = format!("/broken-{}/(unclosed", uuid::Uuid::new_v4());
+        let m = RouteMatch {
+            path: Some(pattern.clone()),
+            path_type: PathMatchType::Regex,
+            ..any()
+        };
+        assert!(!m.matches("h", "/anything", "GET", &HeaderMap::new()));
+        let cache = REGEX_CACHE.read().unwrap();
+        let entry = cache
+            .get(&pattern)
+            .expect("a pattern that does not compile should still be cached");
+        assert!(
+            entry.is_none(),
+            "it should be cached as a failure, not as a compiled regex"
+        );
     }
 
     #[test]

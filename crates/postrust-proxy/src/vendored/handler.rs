@@ -52,6 +52,23 @@ const CONNECTION_TOKEN_EXEMPT: &[&str] = &["host", "content-length"];
 /// Message handler for request/response manipulation.
 pub struct MessageHandler;
 
+/// Drop a `:port` from an authority, leaving the host.
+///
+/// Bracket-aware: the colons inside `[::1]` are part of the address, so a naive
+/// `split(':').next()` would return `[` for every IPv6 client.
+fn strip_port(authority: &str) -> &str {
+    if authority.starts_with('[') {
+        return match authority.find(']') {
+            Some(end) => &authority[..end + 1],
+            None => authority,
+        };
+    }
+    match authority.split_once(':') {
+        Some((host, _)) => host,
+        None => authority,
+    }
+}
+
 impl MessageHandler {
     /// The protocol a request is asking to upgrade to, if it is a valid
     /// upgrade request.
@@ -297,6 +314,31 @@ impl MessageHandler {
         Self::error_response(StatusCode::SERVICE_UNAVAILABLE, message)
     }
 
+    /// The host a request is for, without its port.
+    ///
+    /// **Not just the `Host` header.** HTTP/2 has no `Host`: RFC 9113 section
+    /// 8.3.1 replaces it with the `:authority` pseudo-header, which reaches us
+    /// on the URI. Reading only the header therefore yields an empty host for
+    /// every h2 and h2c request, and a route with a `match.host` matches
+    /// nothing -- confirmed against a running proxy, where the same
+    /// host-matched route answered 200 over HTTP/1.1 and 404 over HTTP/2.
+    ///
+    /// `add_forwarding_headers` already had this fallback for
+    /// `x-forwarded-host`; route selection did not.
+    pub fn request_host(request: &Request<impl hyper::body::Body>) -> String {
+        let from_header = request
+            .headers()
+            .get(hyper::header::HOST)
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_owned);
+
+        let host = from_header
+            .or_else(|| request.uri().authority().map(|a| a.to_string()))
+            .unwrap_or_default();
+
+        strip_port(&host).to_owned()
+    }
+
     /// Create a 504 Gateway Timeout response.
     ///
     /// Takes a message so the body can say how long the request waited. A bare
@@ -320,6 +362,69 @@ impl MessageHandler {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn request_with(headers: &[(&str, &str)], uri: &str) -> Request<ProxyBody> {
+        let mut builder = Request::builder().uri(uri);
+        for (name, value) in headers {
+            builder = builder.header(*name, *value);
+        }
+        builder.body(empty_body()).unwrap()
+    }
+
+    #[test]
+    fn the_host_header_gives_the_host() {
+        let r = request_with(&[("host", "api.example.com")], "/x");
+        assert_eq!(MessageHandler::request_host(&r), "api.example.com");
+    }
+
+    #[test]
+    fn the_uri_authority_is_used_when_there_is_no_host_header() {
+        // This is every HTTP/2 request: RFC 9113 section 8.3.1 replaces Host
+        // with :authority, which reaches us on the URI. Reading only the header
+        // made every host-matched route 404 over h2 -- confirmed against a
+        // running proxy before this was fixed.
+        let r = request_with(&[], "http://api.example.com/x");
+        assert_eq!(MessageHandler::request_host(&r), "api.example.com");
+    }
+
+    #[test]
+    fn the_header_wins_over_the_authority() {
+        let r = request_with(&[("host", "from-header.test")], "http://from-uri.test/x");
+        assert_eq!(MessageHandler::request_host(&r), "from-header.test");
+    }
+
+    #[test]
+    fn the_port_is_not_part_of_the_host() {
+        assert_eq!(
+            MessageHandler::request_host(&request_with(&[("host", "api.example.com:8443")], "/x")),
+            "api.example.com"
+        );
+        assert_eq!(
+            MessageHandler::request_host(&request_with(&[], "http://api.example.com:8443/x")),
+            "api.example.com"
+        );
+    }
+
+    #[test]
+    fn an_ipv6_literal_keeps_its_brackets() {
+        // `split(':').next()` would return "[" here, so every IPv6 client would
+        // be matched against a host of "[".
+        assert_eq!(
+            MessageHandler::request_host(&request_with(&[("host", "[::1]:8443")], "/x")),
+            "[::1]"
+        );
+        assert_eq!(
+            MessageHandler::request_host(&request_with(&[("host", "[::1]")], "/x")),
+            "[::1]"
+        );
+    }
+
+    #[test]
+    fn a_request_with_neither_has_an_empty_host() {
+        let r = request_with(&[], "/x");
+        assert_eq!(MessageHandler::request_host(&r), "");
+    }
+
     use crate::vendored::hyper_ext::empty_body;
 
     #[test]

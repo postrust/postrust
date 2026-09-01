@@ -120,9 +120,16 @@ async fn a_certificate_is_issued_end_to_end() {
         key_pem.contains("PRIVATE KEY"),
         "no PEM private key came back"
     );
-    assert!(
-        certificate.expires_at.is_some(),
-        "expiry could not be read from the issued chain, so renewal cannot be scheduled"
+    // Not merely present: the *chain's own* expiry. `issue` substitutes a
+    // 60-day assumed lifetime when it cannot parse one, so `is_some()` alone
+    // would pass even if parsing had silently broken -- and the certificate
+    // would then be renewed on a guess.
+    let facts =
+        postrust_proxy::tls::facts(&certificate.cert_pem).expect("the issued chain should parse");
+    assert_eq!(
+        certificate.expires_at,
+        Some(facts.expires_at),
+        "the stored expiry is not the one in the chain, so the fallback was used"
     );
 
     // The certificate the CA issued is for the domain we asked about.

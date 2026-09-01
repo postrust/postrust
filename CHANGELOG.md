@@ -7,6 +7,33 @@ releases are described by their tags and the pull requests behind them.
 
 ### Added
 
+**Host-based routing did not work over HTTP/2.** Route selection read only the
+`Host` header, and HTTP/2 has none -- RFC 9113 section 8.3.1 replaces it with
+`:authority`, which arrives on the URI. So `host` was empty for every h2 and
+h2c request and any route with a `match.host` matched nothing. Confirmed
+against a running proxy: the same host-matched route answered 200 over
+HTTP/1.1 and 404 over HTTP/2, and now answers 200 for both while still
+refusing a host that does not match.
+
+**A domain abandoned mid-issuance was never recovered.** Nothing moved a row
+out of `ssl_status = 'provisioning'` except the worker finishing with it, and
+both of those writes happen in-process after the order returns -- so a restart
+during an order, or a database error on the way to recording the result, left
+the domain there permanently with nothing retrying and nothing saying so. The
+worker now requeues rows stuck longer than 15 minutes, counting the interrupted
+attempt so a crash loop cannot spend the CA's rate limit without limit.
+
+**A certificate whose expiry could not be read was never renewed.** The renewal
+scan selects on `expires_at IS NOT NULL`, and issuance stored `None` when the
+chain would not parse -- so such a certificate was simply left to expire.
+Issuance now substitutes a deliberately short assumed lifetime and logs an
+error, and the Pebble test asserts the stored expiry is the chain's own rather
+than merely present.
+
+**The route regex was compiled on every request**, for every regex route a
+request was compared against. Now compiled once and cached by pattern, failures
+included, so a typo costs one compilation rather than one per request.
+
 **Route matching honours the whole of `RouteMatch`.** `path_type`, `methods` and
 `match.headers` were all declarable and all ignored: the filter chain compared
 host and path prefix and nothing else. Each silent no-op *widened* a route past

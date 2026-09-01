@@ -55,6 +55,13 @@ pub const LETS_ENCRYPT_STAGING: &str = "https://acme-staging-v02.api.letsencrypt
 /// rather than a failure.
 const ORDER_TIMEOUT: Duration = Duration::from_secs(60);
 
+/// The lifetime assumed when a chain's own expiry cannot be read.
+///
+/// Short on purpose. Renewal falls due 30 days before this, so a certificate
+/// with an unreadable expiry is replaced after about a month rather than left
+/// until it stops working.
+const FALLBACK_LIFETIME: chrono::TimeDelta = chrono::TimeDelta::days(60);
+
 /// Issues certificates for individual domains over ACME HTTP-01.
 pub struct AcmeIssuer {
     directory_url: String,
@@ -123,9 +130,34 @@ impl AcmeIssuer {
 
         let (cert_pem, key_pem) = result?;
 
+        // An expiry we cannot read must not mean "never renew".
+        //
+        // The renewal scan selects on `expires_at IS NOT NULL AND expires_at <
+        // deadline`, so storing `None` here would leave the certificate to
+        // expire with nothing scheduled to replace it -- silently, months
+        // later. Discarding a certificate the CA has already issued is worse
+        // (the rate limit is spent either way, and the domain would have no
+        // certificate at all), so it is stored with a deliberately short
+        // assumed lifetime instead: renewal then falls due at
+        // `FALLBACK_LIFETIME - RENEW_WITHIN`, comfortably inside the 90 days a
+        // public CA issues for.
+        let expires_at = match crate::tls::expiry_of(cert_pem.as_bytes()) {
+            Some(expiry) => expiry,
+            None => {
+                let assumed = chrono::Utc::now() + FALLBACK_LIFETIME;
+                tracing::error!(
+                    %domain,
+                    assumed_expiry = %assumed,
+                    "could not read the expiry from the issued chain; \
+                     assuming a short lifetime so renewal is still scheduled"
+                );
+                assumed
+            }
+        };
+
         let certificate = Certificate {
             domain: domain.to_owned(),
-            expires_at: crate::tls::expiry_of(cert_pem.as_bytes()),
+            expires_at: Some(expires_at),
             cert_pem: cert_pem.into_bytes(),
             key_pem: key_pem.into_bytes(),
         };
