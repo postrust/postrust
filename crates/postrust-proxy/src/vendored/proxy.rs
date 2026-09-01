@@ -148,6 +148,106 @@ impl ProxyService {
         Ok(())
     }
 
+    /// Serve HTTPS, negotiating the protocol with ALPN.
+    ///
+    /// ALPN is the whole point: without it a TLS listener negotiates nothing and
+    /// every client falls back to HTTP/1.1, which leaves HTTP/2 reachable only
+    /// as cleartext h2c and WebSocket only as `ws://`.
+    ///
+    /// Because ALPN *decides* the protocol rather than guessing it, the h2 path
+    /// can use the HTTP/2 builder directly instead of sniffing -- so, unlike the
+    /// cleartext port, an invalid preface here is answered with a proper GOAWAY.
+    pub async fn serve_https(
+        self: Arc<Self>,
+        addr: SocketAddr,
+        tls_config: Arc<tokio_rustls::rustls::ServerConfig>,
+        cancel_token: CancellationToken,
+    ) -> std::io::Result<()> {
+        let acceptor = tokio_rustls::TlsAcceptor::from(tls_config);
+        let listener = TcpListener::bind(addr).await?;
+        info!("HTTPS proxy listening on {} (ALPN: h2, http/1.1)", addr);
+
+        loop {
+            tokio::select! {
+                _ = cancel_token.cancelled() => {
+                    info!("HTTPS proxy stopped");
+                    break;
+                }
+                result = listener.accept() => {
+                    match result {
+                        Ok((stream, client_addr)) => {
+                            if let Err(e) = stream.set_nodelay(true) {
+                                debug!("Could not set TCP_NODELAY on the client socket: {}", e);
+                            }
+                            let service = self.clone();
+                            let acceptor = acceptor.clone();
+                            tokio::spawn(async move {
+                                let tls_stream = match acceptor.accept(stream).await {
+                                    Ok(s) => s,
+                                    Err(e) => {
+                                        debug!("TLS handshake failed: {}", e);
+                                        return;
+                                    }
+                                };
+
+                                let is_h2 = tls_stream
+                                    .get_ref()
+                                    .1
+                                    .alpn_protocol()
+                                    .map(|p| p == b"h2")
+                                    .unwrap_or(false);
+
+                                let service_fn = service_fn(|req| {
+                                    let svc = service.clone();
+                                    async move {
+                                        svc.handle_request(req, client_addr, "https").await
+                                    }
+                                });
+
+                                let io = TokioIo::new(tls_stream);
+                                let result = if is_h2 {
+                                    let mut builder = http2::Builder::new(TokioExecutor::new());
+                                    builder.enable_connect_protocol();
+                                    builder
+                                        .serve_connection(io, service_fn)
+                                        .await
+                                        .map_err(|e| {
+                                            Box::<dyn std::error::Error + Send + Sync>::from(
+                                                e.to_string(),
+                                            )
+                                        })
+                                } else {
+                                    // http/1.1, or a client that offered no ALPN
+                                    // at all. Upgrades stay available, which is
+                                    // what makes wss:// work.
+                                    let mut builder = auto::Builder::new(TokioExecutor::new());
+                                    builder.http2().enable_connect_protocol();
+                                    builder
+                                        .serve_connection_with_upgrades(io, service_fn)
+                                        .await
+                                        .map_err(|e| {
+                                            Box::<dyn std::error::Error + Send + Sync>::from(
+                                                e.to_string(),
+                                            )
+                                        })
+                                };
+
+                                if let Err(err) = result {
+                                    debug!("HTTPS connection error: {}", err);
+                                }
+                            });
+                        }
+                        Err(e) => {
+                            error!("Accept error: {}", e);
+                        }
+                    }
+                }
+            }
+        }
+
+        Ok(())
+    }
+
     /// Serve HTTP/2 only, on a dedicated port.
     ///
     /// The main listener negotiates by sniffing the opening bytes, which is why

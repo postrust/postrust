@@ -110,6 +110,18 @@ pub struct TlsConfig {
     /// Use staging ACME server
     #[serde(default)]
     pub acme_staging: bool,
+
+    /// PEM certificate chain for the HTTPS listener.
+    ///
+    /// Set this and `key_file` to serve TLS from a certificate on disk. Without
+    /// them there is no HTTPS listener at all, which means HTTP/2 is only
+    /// reachable as cleartext h2c and WebSocket only as `ws://`.
+    #[serde(default)]
+    pub cert_file: Option<String>,
+
+    /// PEM private key matching `cert_file`.
+    #[serde(default)]
+    pub key_file: Option<String>,
 }
 
 impl Default for TlsConfig {
@@ -120,6 +132,8 @@ impl Default for TlsConfig {
             acme_email: None,
             cert_dir: default_cert_dir(),
             acme_staging: false,
+            cert_file: None,
+            key_file: None,
         }
     }
 }

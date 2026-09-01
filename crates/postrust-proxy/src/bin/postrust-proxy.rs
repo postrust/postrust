@@ -44,6 +44,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let config: ProxyConfig = load_from_file(&config_path).await?;
     let h2_port = config.server.http2_port;
     let http_host = config.server.http_host.clone();
+    let https_host = config.server.https_host.clone();
+    let https_port = config.server.https_port;
+    let cert_file = config.tls.cert_file.clone();
+    let key_file = config.tls.key_file.clone();
     let addr: SocketAddr = format!("{}:{}", config.server.http_host, config.server.http_port)
         .parse()
         .map_err(|e| format!("bad listen address in {config_path}: {e}"))?;
@@ -84,6 +88,25 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         None => None,
     };
 
+    // HTTPS, if a certificate was configured. ALPN is what makes HTTP/2 reachable
+    // as browsers actually use it; without this listener h2 is cleartext-only
+    // and WebSocket is ws:// only.
+    let tls = match (cert_file, key_file) {
+        (Some(cert), Some(key)) => {
+            let tls_config = postrust_proxy::tls::load_server_config(&cert, &key).await?;
+            let https_addr: SocketAddr = format!("{https_host}:{https_port}")
+                .parse()
+                .map_err(|e| format!("bad https listen address in {config_path}: {e}"))?;
+            let tls_service = service.clone();
+            let tls_cancel = cancel.clone();
+            Some(tokio::spawn(async move {
+                tls_service.serve_https(https_addr, tls_config, tls_cancel).await
+            }))
+        }
+        (None, None) => None,
+        _ => return Err("tls.cert_file and tls.key_file must be set together".into()),
+    };
+
     match h2_addr {
         Some(h2_addr) => {
             let h2_service = service.clone();
@@ -94,6 +117,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             main?;
         }
         None => service.serve_http(addr, cancel).await?,
+    }
+
+    if let Some(tls) = tls {
+        tls.await.map_err(|e| format!("https listener panicked: {e}"))??;
     }
     Ok(())
 }
