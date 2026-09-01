@@ -154,7 +154,11 @@ if [ "$CASES" != '["*"]' ] || [ "$EXCLUDE_CASES" != "[]" ]; then
 fi
 
 stage "Running the Autobahn fuzzingclient"
-docker run --rm \
+# `--add-host host.docker.internal:host-gateway` is what makes this work on
+# Linux as well as on Docker Desktop: the name resolves by default only on
+# Desktop, and CI runners are Linux. Harmless on Desktop, where it resolves to
+# the same place.
+docker run --rm --add-host "host.docker.internal:host-gateway" \
     -v "$WORK:/config" \
     -v "$REPORTS:/reports" \
     "$IMAGE" \

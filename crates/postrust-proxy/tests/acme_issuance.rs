@@ -21,7 +21,11 @@
 //! - finalization, the CSR, and the certificate chain coming back
 //! - storage in `proxy_certificates`, and challenge cleanup afterwards
 
-#![cfg(feature = "acme")]
+// Gated on a non-default feature rather than skipped at runtime. A test that
+// decides for itself that it need not run is a test nobody notices has stopped
+// running; with a feature, either it is compiled and must pass, or it is not
+// there. `scripts/acme/run.sh` and the conformance workflow turn it on.
+#![cfg(feature = "pebble-tests")]
 
 use std::sync::Arc;
 
@@ -41,35 +45,6 @@ const MIGRATION_LOCK: i64 = 0x706f7374_72757374;
 fn env(name: &str) -> String {
     std::env::var(name)
         .unwrap_or_else(|_| panic!("{name} must be set; run this through scripts/acme/run.sh"))
-}
-
-/// Whether the harness is around.
-///
-/// CI's database-backed job runs `-- --ignored` across the workspace, so these
-/// would fail there for want of a CA rather than for want of correctness. They
-/// skip instead. That makes a skip possible where a run was wanted, so
-/// `scripts/acme/run.sh` asserts that both tests actually ran.
-fn harness_present() -> bool {
-    let missing: Vec<&str> = [
-        "DATABASE_URL",
-        "ACME_DIRECTORY",
-        "ACME_ROOT_PEM",
-        "ACME_TEST_DOMAIN",
-        "ACME_CHALLENGE_PORT",
-    ]
-    .into_iter()
-    .filter(|name| std::env::var(name).is_err())
-    .collect();
-
-    if !missing.is_empty() {
-        eprintln!(
-            "SKIPPED: the ACME harness is not set up ({} unset). \
-             Run scripts/acme/run.sh.",
-            missing.join(", ")
-        );
-        return false;
-    }
-    true
 }
 
 async fn migrated_pool() -> PgPool {
@@ -97,16 +72,17 @@ async fn migrated_pool() -> PgPool {
 #[tokio::test]
 #[ignore = "requires Pebble; run scripts/acme/run.sh"]
 async fn a_certificate_is_issued_end_to_end() {
-    if !harness_present() {
-        return;
-    }
     let pool = migrated_pool().await;
     let domain = env("ACME_TEST_DOMAIN");
     let challenge_port: u16 = env("ACME_CHALLENGE_PORT").parse().expect("port");
 
+    let cache = tempdir();
+
     // Serve the real router, so the challenge is answered by the handler that
     // ships rather than by something written for the test.
-    let state = SaasState::new(pool.clone(), None);
+    let state = SaasState::new(pool.clone(), None, &cache)
+        .await
+        .expect("saas state");
     let listener = tokio::net::TcpListener::bind(("0.0.0.0", challenge_port))
         .await
         .expect("could not bind the challenge port");
@@ -114,7 +90,6 @@ async fn a_certificate_is_issued_end_to_end() {
         axum::serve(listener, saas_router(state)).await.ok();
     });
 
-    let cache = tempdir();
     let cert_store = Arc::new(
         CertificateStore::new(pool.clone(), &cache)
             .await
@@ -212,9 +187,6 @@ async fn a_certificate_is_issued_end_to_end() {
 #[tokio::test]
 #[ignore = "requires Pebble; run scripts/acme/run.sh"]
 async fn a_domain_that_does_not_resolve_here_fails_with_a_useful_message() {
-    if !harness_present() {
-        return;
-    }
     let pool = migrated_pool().await;
 
     let cache = tempdir();

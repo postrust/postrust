@@ -7,6 +7,26 @@ releases are described by their tags and the pull requests behind them.
 
 ### Added
 
+**Three domain endpoints the documentation promised and the router never had.**
+`docs/saas-domains.md` listed `PUT /domains/{id}`,
+`POST /domains/{id}/ssl/provision` and `POST /domains/{id}/ssl/upload`; none was
+mounted. All three exist now.
+
+`PUT /domains/{id}` is a partial update of the verification method and the SSL
+provider. The domain name is deliberately not updatable: it is what the
+verification token proves control of, so a rename would carry a proof of
+ownership over to a name nobody has proved anything about.
+
+`ssl/upload` **checks the certificate before storing it** -- the key must match
+the chain, it must not be expired, and it must cover the domain, wildcards
+counting for exactly one label. Skipping any of those gives a listener that
+accepts the upload and then fails every handshake, with nothing pointing back at
+the cause.
+
+`ssl/provision` returns 202 and queues; the worker issues. It is also how to
+retry, so the `ssl/retry` endpoint that briefly existed in this branch is gone --
+one endpoint rather than two that overlap.
+
 **Automatic SSL via ACME, over HTTP-01.** `docs/saas-domains.md` advertised
 this as a feature and the schema tracked an `ssl_status`, but nothing in the
 crate had ever talked to a certificate authority.

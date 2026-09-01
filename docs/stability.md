@@ -49,10 +49,10 @@ Not caution for its own sake. Three specific things:
 1.0.0 would freeze all of it as it stands. `cargo clippy` with the crate-level
 `allow`s removed is the current count.
 
-**Manual certificate upload is not implemented.** ACME issuance is, and is
-tested against a real CA, but a tenant that wants to supply its own certificate
-has no endpoint to do it through. `ssl_provider = "manual"` is a state the
-schema can hold and nothing acts on.
+**The config reloader is scaffolding.** `ConfigReloader` has a channel nobody
+reads and fields nobody uses; `server.watch_config_file` is a setting that
+watches nothing. The `notify` dependency exists only for the error variant that
+watcher would have used.
 
 **It has only just grown its transport layer.** TLS, HTTP/2, WebSocket and
 RFC 8441 extended CONNECT all landed in `1.0.0-alpha.2`. They are measured, by

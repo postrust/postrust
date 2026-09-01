@@ -527,6 +527,28 @@ pub struct CreateDomainRequest {
     pub ssl_provider: SslProvider,
 }
 
+/// Fields of a domain that can be changed after it is created.
+///
+/// The domain name itself is deliberately absent. It is the identity of the
+/// record and what the verification token proves control of, so renaming would
+/// silently carry a proof of ownership over to a name nobody has proved
+/// anything about. Delete and re-add instead.
+#[derive(Clone, Debug, Deserialize, Default)]
+pub struct UpdateDomainRequest {
+    /// Switch between DNS and HTTP verification.
+    ///
+    /// Takes effect on the next verification attempt. Changing it does not
+    /// un-verify a domain that is already verified.
+    #[serde(default)]
+    pub verification_method: Option<VerificationMethod>,
+
+    /// Switch how the certificate is obtained.
+    ///
+    /// Moving a verified domain to `acme` queues it for issuance.
+    #[serde(default)]
+    pub ssl_provider: Option<SslProvider>,
+}
+
 /// Domain response with verification instructions.
 #[derive(Clone, Debug, Serialize)]
 pub struct DomainResponse {

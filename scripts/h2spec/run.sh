@@ -106,7 +106,12 @@ if [ -n "$H2_PORT" ]; then
 else
     stage "Running h2spec against the shared h1/h2c port $TARGET_PORT"
 fi
-docker run --rm "$IMAGE" -h host.docker.internal -p "$TARGET_PORT" "$@" 2>&1 \
+# `--add-host host.docker.internal:host-gateway` is what makes this work on
+# Linux as well as on Docker Desktop: the name resolves by default only on
+# Desktop, and CI runners are Linux. Harmless on Desktop, where it resolves to
+# the same place.
+docker run --rm --add-host "host.docker.internal:host-gateway" \
+  "$IMAGE" -h host.docker.internal -p "$TARGET_PORT" "$@" 2>&1 \
     | tee "$WORK/h2spec.log"
 
 stage "Summary"

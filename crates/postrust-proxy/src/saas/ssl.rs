@@ -283,29 +283,6 @@ async fn mark_renewals(pool: &PgPool) -> ProxyResult<u64> {
     Ok(result.rows_affected())
 }
 
-/// Put a failed domain back in the queue.
-///
-/// The retry endpoint's whole job. Clears the attempt count and the recorded
-/// error, so the next pass picks it up immediately rather than waiting out a
-/// backoff that was computed for a cause the operator has just fixed.
-pub async fn reset_for_retry(pool: &PgPool, id: Uuid, tenant_id: Uuid) -> ProxyResult<bool> {
-    let result = sqlx::query(
-        "UPDATE proxy_domains SET \
-             ssl_status = 'pending', \
-             ssl_attempts = 0, \
-             ssl_error = NULL, \
-             ssl_last_attempt_at = NULL, \
-             updated_at = NOW() \
-         WHERE id = $1 AND tenant_id = $2 AND ssl_provider = 'acme'",
-    )
-    .bind(id)
-    .bind(tenant_id)
-    .execute(pool)
-    .await?;
-
-    Ok(result.rows_affected() > 0)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -674,7 +651,7 @@ mod db_tests {
 
     #[tokio::test]
     #[ignore = "requires PostgreSQL"]
-    async fn retry_requeues_a_failed_domain_and_clears_its_history() {
+    async fn provision_requeues_a_failed_domain_and_clears_its_history() {
         let pool = pool().await;
         let _exclusive = exclusive().await;
         let t = tenant(&pool).await;
@@ -685,8 +662,10 @@ mod db_tests {
             .await
             .unwrap();
 
-        let requeued = reset_for_retry(&pool, id, t).await.expect("retry");
-        assert!(requeued, "retry should find the domain");
+        let requeued = crate::saas::db::queue_for_issuance(&pool, id, t)
+            .await
+            .expect("retry");
+        assert!(requeued.is_some(), "provision should find the domain");
 
         let row = sqlx::query(
             "SELECT ssl_status, ssl_attempts, ssl_error, ssl_last_attempt_at \
@@ -715,15 +694,217 @@ mod db_tests {
 
     #[tokio::test]
     #[ignore = "requires PostgreSQL"]
-    async fn retry_will_not_touch_another_tenants_domain() {
+    async fn provision_refuses_a_domain_that_is_not_verified() {
+        let pool = pool().await;
+        let _exclusive = exclusive().await;
+        let t = tenant(&pool).await;
+
+        let id: Uuid = sqlx::query_scalar(
+            "INSERT INTO proxy_domains \
+                (tenant_id, domain, verification_status, verification_token, \
+                 ssl_status, ssl_provider) \
+             VALUES ($1, $2, 'pending', 'tok', 'pending', 'acme') RETURNING id",
+        )
+        .bind(t)
+        .bind(format!("unverified-{}.example", Uuid::new_v4()))
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+
+        // Queueing an unverified domain would have the worker place an order
+        // for a name nobody has proved control of. The CA would refuse it, but
+        // the attempt still spends a rate limit.
+        let queued = crate::saas::db::queue_for_issuance(&pool, id, t)
+            .await
+            .expect("queue");
+        assert!(queued.is_none(), "queued an unverified domain");
+    }
+
+    #[tokio::test]
+    #[ignore = "requires PostgreSQL"]
+    async fn provision_refuses_a_manual_domain() {
+        let pool = pool().await;
+        let _exclusive = exclusive().await;
+        let t = tenant(&pool).await;
+
+        let id: Uuid = sqlx::query_scalar(
+            "INSERT INTO proxy_domains \
+                (tenant_id, domain, verification_status, verification_token, \
+                 ssl_status, ssl_provider) \
+             VALUES ($1, $2, 'verified', 'tok', 'pending', 'manual') RETURNING id",
+        )
+        .bind(t)
+        .bind(format!("manual-{}.example", Uuid::new_v4()))
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+
+        let queued = crate::saas::db::queue_for_issuance(&pool, id, t)
+            .await
+            .expect("queue");
+        assert!(
+            queued.is_none(),
+            "queued a domain whose certificate does not come from ACME"
+        );
+    }
+
+    #[tokio::test]
+    #[ignore = "requires PostgreSQL"]
+    async fn switching_a_verified_domain_to_acme_queues_it() {
+        let pool = pool().await;
+        let _exclusive = exclusive().await;
+        let t = tenant(&pool).await;
+
+        // Verified, manual, and nowhere near the worker's queue.
+        let id: Uuid = sqlx::query_scalar(
+            "INSERT INTO proxy_domains \
+                (tenant_id, domain, verification_status, verification_token, \
+                 ssl_status, ssl_provider, ssl_attempts, ssl_error) \
+             VALUES ($1, $2, 'verified', 'tok', 'active', 'manual', 4, 'old') \
+             RETURNING id",
+        )
+        .bind(t)
+        .bind(format!("switch-{}.example", Uuid::new_v4()))
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+
+        let updated = crate::saas::db::update_domain(
+            &pool,
+            id,
+            t,
+            None,
+            Some(&crate::saas::types::SslProvider::Acme),
+        )
+        .await
+        .expect("update")
+        .expect("domain should be found");
+
+        // Otherwise the domain would sit in whatever state the old provider
+        // left it in, and nothing would ever pick it up.
+        assert_eq!(
+            format!("{:?}", updated.ssl_status),
+            "Pending",
+            "switching to acme must queue the domain"
+        );
+        assert!(
+            claims_include(&pool, id).await,
+            "a domain switched to acme must become claimable"
+        );
+
+        let row = sqlx::query("SELECT ssl_attempts, ssl_error FROM proxy_domains WHERE id = $1")
+            .bind(id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        use sqlx::Row as _;
+        assert_eq!(row.get::<i32, _>("ssl_attempts"), 0, "history not cleared");
+        assert!(row.get::<Option<String>, _>("ssl_error").is_none());
+    }
+
+    #[tokio::test]
+    #[ignore = "requires PostgreSQL"]
+    async fn switching_an_unverified_domain_to_acme_does_not_queue_it() {
+        let pool = pool().await;
+        let _exclusive = exclusive().await;
+        let t = tenant(&pool).await;
+
+        let id: Uuid = sqlx::query_scalar(
+            "INSERT INTO proxy_domains \
+                (tenant_id, domain, verification_status, verification_token, \
+                 ssl_status, ssl_provider) \
+             VALUES ($1, $2, 'pending', 'tok', 'pending', 'manual') RETURNING id",
+        )
+        .bind(t)
+        .bind(format!("switch-unverified-{}.example", Uuid::new_v4()))
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+
+        crate::saas::db::update_domain(
+            &pool,
+            id,
+            t,
+            None,
+            Some(&crate::saas::types::SslProvider::Acme),
+        )
+        .await
+        .expect("update")
+        .expect("domain should be found");
+
+        assert!(
+            !claims_include(&pool, id).await,
+            "an unverified domain must not become claimable by changing its provider"
+        );
+    }
+
+    #[tokio::test]
+    #[ignore = "requires PostgreSQL"]
+    async fn an_update_leaves_absent_fields_alone() {
+        let pool = pool().await;
+        let _exclusive = exclusive().await;
+        let t = tenant(&pool).await;
+        let (id, _) = domain(&pool, t, "pending", 3, Some(10)).await;
+
+        // Only the verification method. The provider, and everything the
+        // provider clause would have reset, must be untouched.
+        let updated = crate::saas::db::update_domain(
+            &pool,
+            id,
+            t,
+            Some(&crate::saas::types::VerificationMethod::Http),
+            None,
+        )
+        .await
+        .expect("update")
+        .expect("domain should be found");
+
+        assert_eq!(format!("{:?}", updated.verification_method), "Http");
+        assert_eq!(format!("{:?}", updated.ssl_provider), "Acme");
+
+        let attempts: i32 =
+            sqlx::query_scalar("SELECT ssl_attempts FROM proxy_domains WHERE id = $1")
+                .bind(id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(attempts, 3, "an unrelated update reset the attempt count");
+    }
+
+    #[tokio::test]
+    #[ignore = "requires PostgreSQL"]
+    async fn an_update_will_not_cross_a_tenant_boundary() {
+        let pool = pool().await;
+        let _exclusive = exclusive().await;
+        let owner = tenant(&pool).await;
+        let stranger = tenant(&pool).await;
+        let (id, _) = domain(&pool, owner, "pending", 0, None).await;
+
+        let updated = crate::saas::db::update_domain(
+            &pool,
+            id,
+            stranger,
+            None,
+            Some(&crate::saas::types::SslProvider::None),
+        )
+        .await
+        .expect("update");
+        assert!(updated.is_none(), "update crossed a tenant boundary");
+    }
+
+    #[tokio::test]
+    #[ignore = "requires PostgreSQL"]
+    async fn provision_will_not_touch_another_tenants_domain() {
         let pool = pool().await;
         let _exclusive = exclusive().await;
         let owner = tenant(&pool).await;
         let stranger = tenant(&pool).await;
         let (id, _) = domain(&pool, owner, "failed", 10, Some(60)).await;
 
-        let requeued = reset_for_retry(&pool, id, stranger).await.expect("retry");
-        assert!(!requeued, "retry crossed a tenant boundary");
+        let requeued = crate::saas::db::queue_for_issuance(&pool, id, stranger)
+            .await
+            .expect("retry");
+        assert!(requeued.is_none(), "provision crossed a tenant boundary");
 
         let status: String =
             sqlx::query_scalar("SELECT ssl_status FROM proxy_domains WHERE id = $1")

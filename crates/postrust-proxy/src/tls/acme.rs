@@ -125,7 +125,7 @@ impl AcmeIssuer {
 
         let certificate = Certificate {
             domain: domain.to_owned(),
-            expires_at: expiry_from_pem(&cert_pem),
+            expires_at: crate::tls::expiry_of(cert_pem.as_bytes()),
             cert_pem: cert_pem.into_bytes(),
             key_pem: key_pem.into_bytes(),
         };
@@ -362,18 +362,6 @@ pub async fn find_challenge(
     }))
 }
 
-/// The `notAfter` of the first certificate in a PEM chain.
-///
-/// Returns `None` rather than failing: an expiry we cannot read costs a renewal
-/// scan its scheduling hint, which is worth less than refusing a certificate the
-/// CA has already issued and we have already paid a rate limit for.
-fn expiry_from_pem(cert_pem: &str) -> Option<chrono::DateTime<chrono::Utc>> {
-    let (_, pem) = x509_parser::pem::parse_x509_pem(cert_pem.as_bytes()).ok()?;
-    let (_, cert) = x509_parser::parse_x509_certificate(&pem.contents).ok()?;
-    let timestamp = cert.validity().not_after.timestamp();
-    chrono::DateTime::from_timestamp(timestamp, 0)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -385,30 +373,5 @@ mod tests {
             assert!(url.ends_with("/directory"), "{url}");
         }
         assert_ne!(LETS_ENCRYPT_PRODUCTION, LETS_ENCRYPT_STAGING);
-    }
-
-    #[test]
-    fn an_unparseable_certificate_has_no_expiry_rather_than_panicking() {
-        assert!(expiry_from_pem("").is_none());
-        assert!(expiry_from_pem("not a certificate").is_none());
-        assert!(
-            expiry_from_pem("-----BEGIN CERTIFICATE-----\nzzzz\n-----END CERTIFICATE-----")
-                .is_none()
-        );
-    }
-
-    #[test]
-    fn an_expiry_is_read_from_a_real_certificate() {
-        // A self-signed certificate whose notAfter is known. Generated once and
-        // pasted here, so this test needs no CA and no clock.
-        //
-        //   openssl req -x509 -newkey rsa:2048 -nodes -keyout /dev/null \
-        //     -subj /CN=expiry.test -days 3650 -out cert.pem
-        let pem = include_str!("testdata/expiry.pem");
-        let expiry = expiry_from_pem(pem).expect("a valid certificate should have an expiry");
-        // Only that it parsed to something in the future of its own notBefore;
-        // pinning the exact instant would make this fail when the fixture is
-        // regenerated.
-        assert!(expiry.timestamp() > 0, "{expiry}");
     }
 }

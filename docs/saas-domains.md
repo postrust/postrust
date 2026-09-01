@@ -69,11 +69,13 @@ API keys are prefixed with `pk_` for identification and can have restricted scop
 | `GET` | `/api/v1/domains` | List domains |
 | `POST` | `/api/v1/domains` | Add domain |
 | `GET` | `/api/v1/domains/:id` | Get domain details |
+| `PUT` | `/api/v1/domains/:id` | Update verification method or SSL provider |
 | `DELETE` | `/api/v1/domains/:id` | Remove domain |
 | `POST` | `/api/v1/domains/:id/verify` | Trigger verification |
 | `POST` | `/api/v1/domains/:id/enable` | Enable a verified domain |
 | `POST` | `/api/v1/domains/:id/disable` | Disable a domain |
-| `POST` | `/api/v1/domains/:id/ssl/retry` | Requeue a failed certificate issuance |
+| `POST` | `/api/v1/domains/:id/ssl/provision` | Queue (or requeue) ACME issuance |
+| `POST` | `/api/v1/domains/:id/ssl/upload` | Upload a certificate |
 
 ### Routes
 
@@ -228,22 +230,37 @@ to the CA plus a challenge fetch, and retrying under a rate limit is the normal
 failure mode — none of which belongs in a request. Verification queues; the
 worker works.
 
+#### Provisioning explicitly
+
+Verification queues automatically, but there are cases where you need to ask:
+a domain whose provider you have just switched to `acme`, or one that failed and
+has been fixed.
+
+```bash
+curl -X POST http://localhost:8080/api/v1/domains/<id>/ssl/provision \
+  -H "Authorization: ApiKey pk_live_abc123..."
+```
+
+Returns **202 Accepted**. It sets state and returns; the worker does the work.
+It does not issue inline, and that is deliberate — see the note above. Poll
+`GET /domains/<id>` and watch `ssl_status`.
+
+The call is idempotent, and it is also how you retry: it clears the attempt
+count, the recorded error and the backoff, so the next pass picks the domain up
+immediately rather than waiting out a wait computed for a cause you have just
+fixed.
+
+It refuses (404) a domain that is not verified, or whose `ssl_provider` is not
+`acme`. Queueing either would have the worker place an order that cannot
+succeed, and spend a rate limit doing it.
+
 #### When it fails
 
 Failures record `ssl_error` on the domain and retry with exponential backoff
 from one minute, capped at four hours, giving up after ten attempts. The usual
 cause is that the domain's DNS was never pointed at the proxy, so the CA could
-not fetch the challenge; the error says so.
-
-After fixing the cause:
-
-```bash
-curl -X POST http://localhost:8080/api/v1/domains/<id>/ssl/retry \
-  -H "Authorization: ApiKey pk_live_abc123..."
-```
-
-That clears the attempt count and the backoff, so the next pass picks it up
-immediately.
+not fetch the challenge; the error says so. Fix the cause, then call
+`ssl/provision`.
 
 #### Renewal
 
@@ -263,7 +280,51 @@ wildcards.
 [Pebble](https://github.com/letsencrypt/pebble), Let's Encrypt's test CA, which
 deliberately misbehaves. See `scripts/acme/README.md`.
 
-### Manual Certificate Upload — not implemented
+### Manual certificate upload
+
+For a certificate that comes from somewhere else — an internal CA, or one issued
+by hand.
+
+```bash
+curl -X POST http://localhost:8080/api/v1/domains/<id>/ssl/upload \
+  -H "Authorization: ApiKey pk_live_abc123..." \
+  -H "Content-Type: application/json" \
+  -d '{"cert_pem": "-----BEGIN CERTIFICATE-----\n...", "key_pem": "-----BEGIN PRIVATE KEY-----\n..."}'
+```
+
+The certificate is **checked before it is stored**, and a rejection says which
+check failed:
+
+| Check | Why it is refused |
+| --- | --- |
+| The chain and key parse | Nothing usable otherwise |
+| **The key matches the chain** | The listener would accept the upload and then fail every TLS handshake, with nothing in the logs pointing at the upload |
+| Not expired | Same, immediately |
+| Covers this domain | A certificate for another name authorises nothing here. Wildcards count, for exactly one label — `*.example.com` covers `api.example.com`, not `example.com` and not `a.b.example.com` |
+
+On success the domain's `ssl_provider` becomes `manual` and its `ssl_status`
+becomes `active`. The stored certificate has `auto_renew` turned off: nothing
+here can renew a certificate it did not obtain, so the renewal scan must not
+queue it for an ACME worker that has no authorization for the domain. Upload a
+replacement before it expires, or switch the domain to `acme`.
+
+### Changing a domain
+
+```bash
+curl -X PUT http://localhost:8080/api/v1/domains/<id> \
+  -H "Authorization: ApiKey pk_live_abc123..." \
+  -H "Content-Type: application/json" \
+  -d '{"ssl_provider": "acme"}'
+```
+
+Partial — absent fields are left alone. Two fields can change:
+`verification_method` (which takes effect on the next verification attempt, and
+does not un-verify a verified domain) and `ssl_provider`. Moving a **verified**
+domain to `acme` queues it for issuance.
+
+**The domain name is not updatable.** It is the identity of the record and what
+the verification token proves control of, so a rename would carry a proof of
+ownership over to a name nobody has proved anything about. Delete and re-add.
 
 For custom certificates:
 

@@ -81,10 +81,14 @@ echo "--- forwarding ${PROXY_ADDR}:${PEBBLE_HTTP_PORT} to the host"
 # pebble's validation request to it. socat is enough and avoids building the
 # proxy into an image for a test.
 docker rm -f postrust-acme-socat >/dev/null 2>&1 || true
+# --add-host host-gateway is what makes this work on Linux as well as on
+# Docker Desktop: `host.docker.internal` resolves by default only on Desktop,
+# and CI runners are Linux.
 docker run -d --name postrust-acme-socat \
   --network "$(docker compose --profile acme config --format json \
       | python3 -c 'import sys,json; print(json.load(sys.stdin)["networks"]["acmenet"].get("name","acmenet"))')" \
   --ip "$PROXY_ADDR" \
+  --add-host "host.docker.internal:host-gateway" \
   alpine/socat \
   "TCP-LISTEN:${PEBBLE_HTTP_PORT},fork,reuseaddr" \
   "TCP:host.docker.internal:${CHALLENGE_PORT}" >/dev/null
@@ -95,16 +99,13 @@ ACME_DIRECTORY="https://127.0.0.1:14000/dir" \
 ACME_ROOT_PEM="$(pwd)/$WORK/pebble-root.pem" \
 ACME_CHALLENGE_PORT="$CHALLENGE_PORT" \
 ACME_TEST_DOMAIN="$TEST_DOMAIN" \
-  cargo test -p postrust-proxy --test acme_issuance -- --ignored --test-threads=1 --nocapture \
+  cargo test -p postrust-proxy --features pebble-tests \
+    --test acme_issuance -- --ignored --test-threads=1 --nocapture \
   2>&1 | tee "$WORK/test.log"
 
-# The tests skip themselves when their environment is absent, so that CI's
-# workspace-wide `-- --ignored` pass does not fail for want of a CA. That makes
-# a silent skip possible here, where a run was the whole point.
-if grep -q "SKIPPED" "$WORK/test.log"; then
-  echo "error: the tests skipped themselves; the harness did not set up correctly" >&2
-  exit 1
-fi
+# The tests exist only with `pebble-tests`, and they panic rather than skip when
+# their environment is missing -- so a pass here is a real pass. Checked anyway,
+# because "0 tests ran" also exits 0.
 if ! grep -q "^test result: ok. 2 passed" "$WORK/test.log"; then
   echo "error: expected 2 passing tests; see $WORK/test.log" >&2
   exit 1

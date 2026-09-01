@@ -7,11 +7,12 @@ pub mod upstreams;
 pub mod wellknown;
 
 use crate::admin::api::ApiResponse;
-use crate::error::ProxyError;
+use crate::error::{ProxyError, ProxyResult};
 use crate::saas::api_keys::ApiKeyService;
 use crate::saas::auth::SaasAuthLayer;
 use crate::saas::manager::DomainManager;
 use crate::saas::verification::DomainVerificationService;
+use crate::tls::CertificateStore;
 use axum::{
     middleware,
     routing::{delete, get, post, put},
@@ -33,23 +34,39 @@ pub struct SaasState {
     /// `DomainManager`. The original code carried a comment saying it needed
     /// this and did not have it, and answered with a placeholder instead.
     pub pool: PgPool,
+
+    /// Where uploaded and issued certificates are kept.
+    pub cert_store: Arc<CertificateStore>,
 }
 
 impl SaasState {
     /// Create new SaaS state.
-    pub fn new(pool: PgPool, jwt_secret: Option<String>) -> Self {
+    /// Build the state.
+    ///
+    /// `cert_dir` is where certificates are cached on disk. A parameter rather
+    /// than a default, because a proxy that silently writes private keys to a
+    /// directory nobody chose is worse than one that makes you say where.
+    pub async fn new(
+        pool: PgPool,
+        jwt_secret: Option<String>,
+        cert_dir: impl AsRef<std::path::Path>,
+    ) -> ProxyResult<Self> {
         let verification_service = Arc::new(DomainVerificationService::new());
         let domain_manager = Arc::new(DomainManager::new(pool.clone(), verification_service));
         let api_key_service = Arc::new(ApiKeyService::new(pool.clone()));
         let pool_for_handlers = pool.clone();
         let auth_layer = Arc::new(SaasAuthLayer::new(pool, jwt_secret));
 
-        Self {
+        let cert_store =
+            Arc::new(CertificateStore::new(pool_for_handlers.clone(), cert_dir).await?);
+
+        Ok(Self {
             domain_manager,
             api_key_service,
             auth_layer,
             pool: pool_for_handlers,
-        }
+            cert_store,
+        })
     }
 }
 
@@ -75,12 +92,13 @@ pub fn saas_router(state: SaasState) -> Router {
     // Protected routes (require authentication)
     let protected_routes = Router::new();
 
-    // Requeue a domain whose issuance failed. Gated because the worker that
-    // would act on it only exists with the `acme` feature -- an endpoint that
-    // sets a status nothing drains would be worse than no endpoint.
+    // Queue certificate issuance -- and requeue it after a failure, which is
+    // the same operation. Gated because the worker that acts on it only exists
+    // with the `acme` feature: an endpoint that sets a status nothing drains
+    // would be worse than no endpoint.
     #[cfg(feature = "acme")]
     let protected_routes =
-        protected_routes.route("/domains/{id}/ssl/retry", post(domains::retry_ssl));
+        protected_routes.route("/domains/{id}/ssl/provision", post(domains::provision_ssl));
 
     let protected_routes = protected_routes
         // Auth / API Keys
@@ -97,7 +115,12 @@ pub fn saas_router(state: SaasState) -> Router {
         .route("/domains/{id}", delete(domains::delete_domain))
         .route("/domains/{id}/verify", post(domains::verify_domain))
         .route("/domains/{id}/enable", post(domains::enable_domain))
+        .route("/domains/{id}", put(domains::update_domain))
         .route("/domains/{id}/disable", post(domains::disable_domain))
+        .route(
+            "/domains/{id}/ssl/upload",
+            post(domains::upload_certificate),
+        )
         // Domain Routes
         .route("/domains/{domain_id}/routes", get(routes::list_routes))
         .route("/domains/{domain_id}/routes", post(routes::create_route))
