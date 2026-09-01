@@ -243,6 +243,7 @@ async fn create_upstream(
             weight: b.weight.unwrap_or(100),
             scheme: b.scheme.unwrap_or_else(|| "http".to_string()),
             enabled: true,
+            http_version: Default::default(),
         })
         .collect();
 
@@ -344,6 +345,7 @@ async fn add_backend(
             weight: req.weight.unwrap_or(100),
             scheme: req.scheme.unwrap_or_else(|| "http".to_string()),
             enabled: true,
+            http_version: Default::default(),
         };
 
         upstream.backends.push(backend.clone());

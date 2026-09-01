@@ -39,6 +39,16 @@ pub struct ServerConfig {
     #[serde(default = "default_http_port")]
     pub http_port: u16,
 
+    /// Dedicated HTTP/2-only listen port.
+    ///
+    /// Optional and additive: the main port keeps serving HTTP/1.1 and h2c by
+    /// sniffing. That sniffing is why a corrupted HTTP/2 preface gets an
+    /// HTTP/1 400 rather than GOAWAY(PROTOCOL_ERROR) -- it is indistinguishable
+    /// from a malformed HTTP/1 request. A port that only ever speaks HTTP/2 has
+    /// no such ambiguity.
+    #[serde(default)]
+    pub http2_port: Option<u16>,
+
     /// Listen address for HTTPS
     #[serde(default = "default_https_host")]
     pub https_host: String,
@@ -68,6 +78,7 @@ impl Default for ServerConfig {
         Self {
             http_host: default_http_host(),
             http_port: default_http_port(),
+            http2_port: None,
             https_host: default_https_host(),
             https_port: default_https_port(),
             https_enabled: false,
@@ -99,6 +110,18 @@ pub struct TlsConfig {
     /// Use staging ACME server
     #[serde(default)]
     pub acme_staging: bool,
+
+    /// PEM certificate chain for the HTTPS listener.
+    ///
+    /// Set this and `key_file` to serve TLS from a certificate on disk. Without
+    /// them there is no HTTPS listener at all, which means HTTP/2 is only
+    /// reachable as cleartext h2c and WebSocket only as `ws://`.
+    #[serde(default)]
+    pub cert_file: Option<String>,
+
+    /// PEM private key matching `cert_file`.
+    #[serde(default)]
+    pub key_file: Option<String>,
 }
 
 impl Default for TlsConfig {
@@ -109,6 +132,8 @@ impl Default for TlsConfig {
             acme_email: None,
             cert_dir: default_cert_dir(),
             acme_staging: false,
+            cert_file: None,
+            key_file: None,
         }
     }
 }
@@ -278,6 +303,21 @@ pub struct Upstream {
     pub enabled: bool,
 }
 
+impl Upstream {
+    /// The identifier this upstream is keyed by in the routing tables.
+    ///
+    /// `id` is only set for upstreams loaded from the database. A TOML config
+    /// leaves it `None`, and both registration sites used to skip any upstream
+    /// without one -- so a file-configured proxy logged "Loaded N routes and N
+    /// upstreams" and then answered every request with 503 "Upstream not
+    /// found". Names are unique within a config, so deriving a stable UUID
+    /// from the name is enough to key the tables consistently.
+    pub fn resolved_id(&self) -> Uuid {
+        self.id
+            .unwrap_or_else(|| Uuid::new_v5(&Uuid::NAMESPACE_OID, self.name.as_bytes()))
+    }
+}
+
 /// Load balancing strategy.
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -315,6 +355,28 @@ pub struct Backend {
     /// Backend enabled
     #[serde(default = "default_true")]
     pub enabled: bool,
+
+    /// Protocol to speak on the upstream connection.
+    ///
+    /// Defaults to HTTP/1.1 regardless of how the client arrived, because
+    /// HTTP/2 is a per-hop protocol. Set `http_version = "h2c"` for a backend
+    /// that speaks cleartext HTTP/2 with prior knowledge. There is no
+    /// negotiation: h2c has no ALPN to fall back on, so this has to be declared.
+    #[serde(default)]
+    pub http_version: UpstreamHttpVersion,
+}
+
+/// Which HTTP version to speak to an upstream.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum UpstreamHttpVersion {
+    /// HTTP/1.1. The default, and correct for almost every backend.
+    #[default]
+    #[serde(alias = "http1", alias = "http/1.1")]
+    Http11,
+    /// Cleartext HTTP/2 with prior knowledge.
+    #[serde(alias = "http2", alias = "h2")]
+    H2c,
 }
 
 /// Health check configuration.
@@ -434,4 +496,49 @@ pub struct AcmeConfig {
     /// Domains to request certificates for
     #[serde(default)]
     pub domains: Vec<String>,
+}
+
+#[cfg(test)]
+mod upstream_version_tests {
+    use super::*;
+
+    #[test]
+    fn test_backend_defaults_to_http11() {
+        // HTTP/2 is per-hop: a backend says nothing, it gets HTTP/1.1.
+        let backend: Backend = toml::from_str(r#"address = "127.0.0.1:8080""#).unwrap();
+        assert_eq!(backend.http_version, UpstreamHttpVersion::Http11);
+    }
+
+    #[test]
+    fn test_backend_h2c_aliases() {
+        // h2c has no ALPN, so it must be declared; accept the spellings someone
+        // would reasonably reach for.
+        for spelling in ["h2c", "h2", "http2"] {
+            let toml_src = format!("address = \"127.0.0.1:8080\"\nhttp_version = \"{spelling}\"");
+            let backend: Backend = toml::from_str(&toml_src).unwrap();
+            assert_eq!(
+                backend.http_version,
+                UpstreamHttpVersion::H2c,
+                "spelling {spelling} should select h2c"
+            );
+        }
+    }
+
+    #[test]
+    fn test_backend_http11_aliases() {
+        for spelling in ["http11", "http1"] {
+            let toml_src = format!("address = \"127.0.0.1:8080\"\nhttp_version = \"{spelling}\"");
+            let backend: Backend = toml::from_str(&toml_src).unwrap();
+            assert_eq!(backend.http_version, UpstreamHttpVersion::Http11);
+        }
+    }
+
+    #[test]
+    fn test_http2_port_is_optional_and_off_by_default() {
+        let server: ServerConfig = toml::from_str("").unwrap();
+        assert_eq!(server.http2_port, None);
+
+        let server: ServerConfig = toml::from_str("http2_port = 19081").unwrap();
+        assert_eq!(server.http2_port, Some(19081));
+    }
 }

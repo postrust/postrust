@@ -2,49 +2,50 @@ import { component$ } from "@builder.io/qwik";
 import type { DocumentHead } from "@builder.io/qwik-city";
 import { Link } from "@builder.io/qwik-city";
 import { conformance, conformanceMeta } from "~/data/conformance";
+import { h2spec, autobahn } from "~/data/transport-conformance";
 import {
   hasuraConformance,
   hasuraConformanceMeta,
   hasuraAgreement,
 } from "~/data/hasura-conformance";
 
-const VERSION = "1.0.0-alpha.1";
+const VERSION = "1.0.0-alpha.2";
 
 const added = [
   {
-    title: "Hasura's GraphQL dialect",
-    body: "A client generated against Hasura points at /v1/graphql unchanged: the root fields, the generated _bool_exp filter types, order_by as a list, aggregates, nested writes, on_conflict upserts, update_many, live subscriptions, and Hasura's error envelope — including the path that names a place in the request rather than in the response.",
+    title: "TLS, and with it HTTP/2 as clients actually use it",
+    body: "tls.cert_file and tls.key_file start an HTTPS listener that offers h2 and http/1.1 by ALPN and dispatches on what was negotiated rather than sniffing for it. Before this, https_host and https_port were configuration nothing listened on, which left HTTP/2 reachable only in cleartext and WebSocket only as ws://.",
   },
   {
-    title: "The permission model that comes with it",
-    body: "A schema per role, built from a schema cache already reduced to what that role can see, so nothing in the builders needs to know a permission exists. Row filters in the same language a where is written in. Reading and writing as two column sets, because a role may write a column it cannot read. Presets, ceilings, backend_only and _exists.",
+    title: "HTTP/2",
+    body: "h2c alongside HTTP/1.1 on the cleartext port, h2 over TLS by ALPN, an optional HTTP/2-only port, and a per-backend upstream protocol — h2c has no ALPN to negotiate with, so a backend that speaks it has to say so. HTTP/2 is per-hop: the version a client arrives with never carries onto the upstream connection.",
   },
   {
-    title: "Hasura's authentication contract",
-    body: "An admin secret, x-hasura-* headers as session variables a policy can read, and a token that may select among the roles its x-hasura-allowed-roles lists. One deliberate difference: with no secret configured, headers carry no weight at all — a policy reading a value the caller chose is not a policy.",
+    title: "WebSocket, including over HTTP/2",
+    body: "Over HTTP/1.1, over TLS as wss://, and over HTTP/2 by extended CONNECT (RFC 8441) translated into an HTTP/1.1 upgrade for the origin. The two handshakes are not the same conversation: HTTP/2 sends no Sec-WebSocket-Key, so the proxy generates one for the origin, and success is 200 rather than a 101 that means nothing on a multiplexed stream.",
   },
   {
-    title: "More of PostgREST's surface",
-    body: "Embedding through junction tables, spreads in the parent query, filtering and ordering an embedded list, computed relationships, Prefer: missing=default and max-affected, custom media types, and verbatim database errors in compatibility mode.",
+    title: "A runnable proxy",
+    body: "postrust-proxy <config.toml>. The crate was a library with no entry point, so nothing external could be pointed at it — not a conformance suite, not a load generator, not a browser. Most of what follows was only findable once something could be.",
   },
 ];
 
 const fixed = [
   {
-    title: "Range headers were ignored unless they began 0-",
-    body: "Every other range silently returned the whole relation — the request succeeded, so nothing looked wrong. Range: 5-9 now means rows 5 to 9, and an inverted range is refused with 416 rather than quietly widened.",
+    title: "A file-configured proxy answered every request with 503",
+    body: "Route and upstream registration both guarded on an identifier that only the database path ever sets, so a proxy started from a TOML file logged the routes it had loaded and then matched none of them.",
   },
   {
-    title: "OPTIONS never reached the handler",
-    body: "The CORS layer answers every OPTIONS itself and never calls what it wraps, so no response carried Allow and the body was empty because nothing built one.",
+    title: "Hop-by-hop headers were forwarded to origins",
+    body: "Connection is itself hop-by-hop and the headers it names must be removed before forwarding; neither happened. A client could name any header in Connection and have it arrive at the origin unchanged — a request-smuggling and cache-poisoning vector, and the first thing the differential fuzzer found.",
   },
   {
-    title: "An expiry was honoured with 30 seconds of slack",
-    body: "exp is now checked to the second. The slack remains on nbf and iat, which describe a token not yet valid rather than one its issuer withdrew.",
+    title: "Content-Length and Transfer-Encoding together were accepted",
+    body: "The spec gives Transfer-Encoding precedence, but a proxy that quietly resolves the disagreement is how a smuggling chain starts. Such a request is now refused with 400, which is how the HTTP library already treats a duplicate Content-Length.",
   },
   {
-    title: "Two error codes were documented the wrong way round",
-    body: "PGRST301 and PGRST302 had been swapped in the documentation — so anyone branching on them from the docs branched wrongly.",
+    title: "TCP_NODELAY was set on no socket at all",
+    body: "Not the accepted connection, not the upgrade connection, not the pooled upstream connector. Nagle batched small writes and, with delayed acknowledgement at the far end, added latency to every small forwarded response.",
   },
 ];
 
@@ -64,10 +65,10 @@ export default component$(() => {
           </div>
           <h1 class="text-4xl font-bold text-neutral-900 mb-4">Postrust {VERSION}</h1>
           <p class="text-lg text-neutral-600 max-w-2xl">
-            Both surfaces stop being asserted and start being measured. Postrust answers
-            PostgREST&rsquo;s REST dialect and Hasura&rsquo;s GraphQL dialect, and how closely it
-            answers each is now a number produced by replaying the other server&rsquo;s own test
-            suite against both and diffing the live responses.
+            A release about the front door. The HTTP proxy was a library with no entry point and,
+            it turned out, had never routed a request from a file config. Making it runnable made
+            it testable, and testing it found the rest &mdash; a smuggling vector, a framing
+            ambiguity, and three transports that were missing rather than broken.
           </p>
         </div>
       </div>
@@ -133,6 +134,61 @@ export default component$(() => {
             </p>
           </section>
 
+          {/* Transports */}
+          <section class="mb-12">
+            <h2 class="text-2xl font-bold text-neutral-900 mb-4">The front door, measured</h2>
+            <div class="grid sm:grid-cols-2 gap-4 mb-4">
+              <div class="p-5 rounded-lg border border-neutral-200">
+                <div class="text-sm text-neutral-500 mb-1">h2spec</div>
+                <div class="text-3xl font-bold text-neutral-900 font-mono">
+                  {h2spec.passed}/{h2spec.tests}
+                </div>
+                <div class="text-sm text-neutral-600 mt-1">
+                  passed, {h2spec.failed} failed
+                </div>
+                <div class="text-sm text-neutral-500 mt-2">
+                  {h2spec.skipped} skipped, against the HTTP/2-only listener
+                </div>
+              </div>
+              <div class="p-5 rounded-lg border border-neutral-200">
+                <div class="text-sm text-neutral-500 mb-1">Autobahn</div>
+                <div class="text-3xl font-bold text-neutral-900 font-mono">
+                  {autobahn.regressions.length}
+                </div>
+                <div class="text-sm text-neutral-600 mt-1">
+                  cases the tunnel made worse than no tunnel
+                </div>
+                <div class="text-sm text-neutral-500 mt-2">
+                  over {autobahn.cases} cases, {autobahn.ok} OK
+                </div>
+              </div>
+            </div>
+            <p class="text-neutral-600 mb-4">
+              Three suites, none of them ours. <strong>HTTP Garden</strong>, a differential fuzzer
+              that sends a payload through a proxy and shows how a set of origin servers parsed
+              what came out, is what found the hop-by-hop defect. <strong>h2spec</strong> speaks
+              HTTP/2 at the listener. <strong>Autobahn</strong> is the reference WebSocket suite.
+            </p>
+            <p class="text-neutral-600 mb-4">
+              The Autobahn figure needs its method stated, because the obvious number would be
+              misleading. Postrust splices two upgraded byte streams and never parses a WebSocket
+              frame, so most of what the suite scores belongs to the origin behind it, not to the
+              proxy. Every run therefore has a twin that bypasses the proxy entirely, and the
+              figure above is the difference: cases that are worse through the tunnel than without
+              it. Of {autobahn.cases} cases, {autobahn.failed} fails &mdash; and fails identically
+              with no proxy in the path, so it is the origin&rsquo;s.
+            </p>
+            <p class="text-neutral-600">
+              One family of cases is excluded from that comparison and named on every run rather
+              than dropped quietly: those that send a valid message, then an invalid frame, and
+              expect the echo of the first. The origin fails the connection without flushing that
+              echo when both arrive in one read, and any relay coalesces what a client chopped
+              &mdash; measured directly, with no proxy involved, the same bytes sent octet-wise
+              echo and sent as one write do not. Which member of the family trips varies between
+              runs; this one had {autobahn.intermittent.length}.
+            </p>
+          </section>
+
           {/* Alpha */}
           <section class="mb-12">
             <div class="p-5 rounded-lg bg-amber-50 border border-amber-200">
@@ -184,19 +240,31 @@ export default component$(() => {
           <section class="mb-12">
             <h2 class="text-2xl font-bold text-neutral-900 mb-4">Breaking changes</h2>
             <p class="text-neutral-600 mb-4">
-              These are why the version is 1.0.0 rather than 0.4.1. They affect Rust code that
-              depends on the crates; the HTTP and GraphQL surfaces are unaffected.
+              These affect Rust code that depends on the crates. The HTTP and GraphQL surfaces are
+              unaffected, and a proxy configuration that worked before still works &mdash; every
+              new field has a default.
             </p>
             <ul class="space-y-2 text-neutral-600">
               <li>
-                <code class="font-mono text-sm">JwtError</code> lost six variants and gained four.
+                <code class="font-mono text-sm">Backend</code> gained{" "}
+                <code class="font-mono text-sm">http_version</code>,{" "}
+                <code class="font-mono text-sm">ServerConfig</code> gained{" "}
+                <code class="font-mono text-sm">http2_port</code>, and{" "}
+                <code class="font-mono text-sm">TlsConfig</code> gained{" "}
+                <code class="font-mono text-sm">cert_file</code> and{" "}
+                <code class="font-mono text-sm">key_file</code>. None is{" "}
+                <code class="font-mono text-sm">#[non_exhaustive]</code> yet, so a struct literal
+                downstream needs updating; marking them is still planned during the alpha series.
               </li>
               <li>
-                <code class="font-mono text-sm">Range</code>,{" "}
-                <code class="font-mono text-sm">QueryResult</code> and{" "}
-                <code class="font-mono text-sm">Table</code> each gained public fields. None is{" "}
-                <code class="font-mono text-sm">#[non_exhaustive]</code> yet, so a struct literal
-                downstream needs updating; marking them is planned during the alpha series.
+                A proxy that relied on <code class="font-mono text-sm">Connection</code> or the
+                headers it names reaching the origin will no longer see them. That was the
+                vulnerability, not a feature, but it is a behaviour change.
+              </li>
+              <li>
+                A request carrying both <code class="font-mono text-sm">Content-Length</code> and{" "}
+                <code class="font-mono text-sm">Transfer-Encoding</code> is now refused rather
+                than forwarded.
               </li>
             </ul>
           </section>
@@ -205,7 +273,18 @@ export default component$(() => {
           <section class="mb-12">
             <h2 class="text-2xl font-bold text-neutral-900 mb-4">Known gaps</h2>
             <p class="text-neutral-600 mb-4">
-              The largest is <strong>introspection</strong>, and it is not reachable from here:
+              In the proxy: <strong>HTTP/3</strong> is not implemented, and neither is upstream
+              HTTP/2 over TLS &mdash; a backend can be told to speak h2c in cleartext, but there
+              is no ALPN on the upstream leg. There is no response cache and no retry or
+              circuit-breaking. One h2spec case, an invalid connection preface answered without
+              GOAWAY, fails on the shared HTTP/1.1-and-h2c port and passes on the HTTP/2-only one:
+              a port that sniffs its protocol cannot tell a corrupted preface from a malformed
+              HTTP/1 request. That is why the dedicated port exists, and why it is optional rather
+              than the default.
+            </p>
+            <p class="text-neutral-600 mb-4">
+              In the dialects, unchanged from the previous alpha: the largest gap is{" "}
+              <strong>introspection</strong>, and it is not reachable from here &mdash;
               async-graphql builds its own registry and keeps it private, so the directives it
               installs and the order it lists types in cannot be changed from outside the library.
               Eight of the sixteen remaining Hasura divergences are that one thing.
@@ -214,10 +293,8 @@ export default component$(() => {
               Beside it: <code class="font-mono text-sm">_stream</code> subscriptions, the
               cursor-based half of Hasura&rsquo;s subscription surface; and the OpenAPI document
               PostgREST serves at <code class="font-mono text-sm">/</code>. Actions and Apollo
-              federation are subsystems rather than gaps. The two{" "}
-              <code class="font-mono text-sm">FINDINGS.md</code> files record the rest, including
-              four faults found in the Hasura harness itself — one of which invalidated eleven
-              runs.
+              federation are subsystems rather than gaps. The{" "}
+              <code class="font-mono text-sm">FINDINGS.md</code> files record the rest.
             </p>
           </section>
 
@@ -259,13 +336,13 @@ export default component$(() => {
 });
 
 export const head: DocumentHead = {
-  title: `Postrust ${VERSION} — measured against PostgREST and Hasura`,
+  title: `Postrust ${VERSION} — the front door, measured`,
   links: [{ rel: "canonical", href: "https://postrust.org/releases" }],
   meta: [
     {
       name: "description",
       content:
-        "Postrust 1.0.0-alpha.1: a PostgREST-compatible REST API and a Hasura-dialect GraphQL API from your PostgreSQL schema, each measured by replaying the other server's own test suite and diffing the live responses.",
+        "Postrust 1.0.0-alpha.2: TLS with ALPN, HTTP/2 and WebSocket in the proxy, and the hop-by-hop and framing defects found by wiring up three HTTP conformance suites.",
     },
   ],
 };

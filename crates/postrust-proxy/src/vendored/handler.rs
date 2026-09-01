@@ -7,7 +7,10 @@
 
 use crate::config::Route;
 use crate::vendored::hyper_ext::{empty_body, string_body, ProxyBody};
-use hyper::header::{HeaderName, HeaderValue, HOST};
+use hyper::header::{
+    HeaderName, HeaderValue, CONNECTION, CONTENT_LENGTH, HOST, TRANSFER_ENCODING, UPGRADE,
+};
+use hyper::{Method, Version};
 use hyper::{Request, Response, StatusCode};
 use std::net::SocketAddr;
 
@@ -21,16 +24,158 @@ pub mod headers {
     pub static X_REAL_IP: HeaderName = HeaderName::from_static("x-real-ip");
 }
 
+/// Headers that are hop-by-hop and must never reach an upstream.
+///
+/// RFC 9110 section 7.6.1. `Transfer-Encoding` belongs here even though it
+/// describes the body: the server side of hyper decodes the inbound body and
+/// the client side frames it again, so the inbound value describes a wire
+/// format the upstream never sees. Passing it through is what lets a client
+/// disagree with the proxy about where one request ends and the next begins.
+const HOP_BY_HOP_HEADERS: &[&str] = &[
+    "connection",
+    "keep-alive",
+    "proxy-authenticate",
+    "proxy-authorization",
+    "te",
+    "trailer",
+    "transfer-encoding",
+    "upgrade",
+];
+
+/// Headers a `Connection` token may not remove.
+///
+/// Naming these in `Connection` is not a legitimate use of the field, and
+/// honouring it would hand a client a way to strip framing or identity
+/// headers on their way through the proxy.
+const CONNECTION_TOKEN_EXEMPT: &[&str] = &["host", "content-length"];
+
 /// Message handler for request/response manipulation.
 pub struct MessageHandler;
 
 impl MessageHandler {
+    /// The protocol a request is asking to upgrade to, if it is a valid
+    /// upgrade request.
+    ///
+    /// Requires both `Upgrade: <proto>` and an `upgrade` token in `Connection`,
+    /// per RFC 9110 section 7.8 -- `Upgrade` alone is not a request to switch.
+    /// HTTP/2 is excluded deliberately: it carries no `Upgrade` header and
+    /// negotiates extended CONNECT instead (RFC 8441), which is not implemented.
+    pub fn upgrade_protocol(request: &Request<ProxyBody>) -> Option<String> {
+        if request.version() != Version::HTTP_11 {
+            return None;
+        }
+
+        let headers = request.headers();
+        let asks_for_upgrade = headers.get_all(CONNECTION).iter().any(|value| {
+            value
+                .to_str()
+                .map(|v| {
+                    v.split(',')
+                        .any(|t| t.trim().eq_ignore_ascii_case("upgrade"))
+                })
+                .unwrap_or(false)
+        });
+        if !asks_for_upgrade {
+            return None;
+        }
+
+        headers
+            .get(UPGRADE)
+            .and_then(|v| v.to_str().ok())
+            .map(|v| v.trim().to_ascii_lowercase())
+            .filter(|v| !v.is_empty())
+    }
+
+    /// The protocol an HTTP/2 extended CONNECT is asking for (RFC 8441).
+    ///
+    /// HTTP/2 has no `Upgrade`; a WebSocket is opened with `:method = CONNECT`
+    /// plus a `:protocol` pseudo-header, which hyper surfaces as a
+    /// [`hyper::ext::Protocol`] extension. This is only ever offered when the
+    /// listener advertised SETTINGS_ENABLE_CONNECT_PROTOCOL.
+    pub fn h2_connect_protocol(request: &Request<ProxyBody>) -> Option<String> {
+        if request.version() != Version::HTTP_2 || request.method() != Method::CONNECT {
+            return None;
+        }
+        request
+            .extensions()
+            .get::<hyper::ext::Protocol>()
+            .map(|protocol| protocol.as_str().to_ascii_lowercase())
+    }
+
+    /// Re-apply the upgrade headers that [`Self::strip_hop_by_hop_headers`] took.
+    ///
+    /// An upgrade is the one case where these headers legitimately travel to the
+    /// next hop. Only a normalised `Connection: upgrade` and the requested
+    /// protocol go back -- not whatever token list the client sent -- so the
+    /// carve-out cannot be used to smuggle other headers through.
+    pub fn restore_upgrade_headers(request: &mut Request<ProxyBody>, protocol: &str) {
+        if let Ok(value) = HeaderValue::from_str(protocol) {
+            let headers = request.headers_mut();
+            headers.insert(UPGRADE, value);
+            headers.insert(CONNECTION, HeaderValue::from_static("upgrade"));
+        }
+    }
+
+    /// Whether the request's body framing is ambiguous.
+    ///
+    /// RFC 9112 section 6.1: a message carrying both `Content-Length` and
+    /// `Transfer-Encoding` is either a smuggling attempt or a broken client.
+    /// `Transfer-Encoding` wins per the spec, but a proxy that quietly
+    /// normalises the disagreement is how a smuggling chain starts, so reject
+    /// it -- which is also how hyper's own parser already treats a duplicate
+    /// `Content-Length`.
+    ///
+    /// Must be called *before* [`Self::strip_hop_by_hop_headers`], which
+    /// removes the `Transfer-Encoding` this inspects.
+    pub fn has_ambiguous_framing(request: &Request<ProxyBody>) -> bool {
+        let headers = request.headers();
+        headers.contains_key(CONTENT_LENGTH) && headers.contains_key(TRANSFER_ENCODING)
+    }
+
+    /// Remove hop-by-hop headers before forwarding, per RFC 9110 section 7.6.1.
+    ///
+    /// Two sets go: the standard hop-by-hop headers, and every header named as
+    /// a token in the incoming `Connection` field. Call this *before*
+    /// [`Self::add_forwarding_headers`] -- a client that names `x-forwarded-for`
+    /// in `Connection` then strips only its own inbound value, and we set a
+    /// fresh one afterwards, rather than being able to suppress ours.
+    pub fn strip_hop_by_hop_headers(request: &mut Request<ProxyBody>) {
+        let headers = request.headers_mut();
+
+        // Read the Connection tokens up front: removing headers invalidates any
+        // borrow of the values we would otherwise still be holding.
+        let mut named: Vec<String> = Vec::new();
+        for value in headers.get_all(CONNECTION).iter() {
+            let Ok(value) = value.to_str() else { continue };
+            for token in value.split(',') {
+                let token = token.trim().to_ascii_lowercase();
+                if !token.is_empty() {
+                    named.push(token);
+                }
+            }
+        }
+
+        for name in HOP_BY_HOP_HEADERS {
+            headers.remove(*name);
+        }
+
+        for token in named {
+            if CONNECTION_TOKEN_EXEMPT.contains(&token.as_str()) {
+                continue;
+            }
+            if let Ok(name) = HeaderName::from_bytes(token.as_bytes()) {
+                headers.remove(name);
+            }
+        }
+    }
+
     /// Add X-Forwarded-* headers to a request.
     pub fn add_forwarding_headers(
         request: &mut Request<ProxyBody>,
         client_addr: SocketAddr,
         proto: &str,
     ) {
+        let authority = request.uri().authority().map(|a| a.to_string());
         let headers = request.headers_mut();
         let client_ip = client_addr.ip().to_string();
 
@@ -58,8 +203,14 @@ impl MessageHandler {
             headers.insert(headers::X_FORWARDED_PROTO.clone(), value);
         }
 
-        // X-Forwarded-Host: preserve original Host
-        if let Some(host) = headers.get(HOST).cloned() {
+        // X-Forwarded-Host: preserve the original authority. HTTP/2 carries it in
+        // the :authority pseudo-header rather than Host, which reaches us on the
+        // URI, so fall back to that before giving up.
+        let original_host = headers
+            .get(HOST)
+            .cloned()
+            .or_else(|| authority.and_then(|a| HeaderValue::from_str(&a).ok()));
+        if let Some(host) = original_host {
             headers.insert(headers::X_FORWARDED_HOST.clone(), host);
         }
     }
@@ -132,6 +283,11 @@ impl MessageHandler {
     }
 
     /// Create a 502 Bad Gateway response.
+    pub fn bad_request(message: &str) -> Response<ProxyBody> {
+        Self::error_response(StatusCode::BAD_REQUEST, message)
+    }
+
+    /// Create a 502 Bad Gateway response.
     pub fn bad_gateway(message: &str) -> Response<ProxyBody> {
         Self::error_response(StatusCode::BAD_GATEWAY, message)
     }
@@ -181,6 +337,302 @@ mod tests {
         MessageHandler::strip_path_prefix(&mut request, "/api");
 
         assert_eq!(request.uri().path(), "/");
+    }
+
+    #[test]
+    fn test_h2_connect_protocol_detected() {
+        // RFC 8441: :method CONNECT plus the :protocol pseudo-header, which
+        // hyper surfaces as an extension.
+        let mut request = Request::builder()
+            .method(Method::CONNECT)
+            .version(Version::HTTP_2)
+            .uri("/chat")
+            .body(empty_body())
+            .unwrap();
+        request
+            .extensions_mut()
+            .insert(hyper::ext::Protocol::from_static("websocket"));
+
+        assert_eq!(
+            MessageHandler::h2_connect_protocol(&request).as_deref(),
+            Some("websocket")
+        );
+        // The HTTP/1.1 detector must not claim it.
+        assert!(MessageHandler::upgrade_protocol(&request).is_none());
+    }
+
+    #[test]
+    fn test_h2_connect_without_protocol_is_a_plain_connect() {
+        let request = Request::builder()
+            .method(Method::CONNECT)
+            .version(Version::HTTP_2)
+            .uri("/chat")
+            .body(empty_body())
+            .unwrap();
+
+        assert!(MessageHandler::h2_connect_protocol(&request).is_none());
+    }
+
+    #[test]
+    fn test_h1_connect_is_not_extended_connect() {
+        // Extended CONNECT is an HTTP/2 mechanism; the h1 spelling is Upgrade.
+        let mut request = Request::builder()
+            .method(Method::CONNECT)
+            .version(Version::HTTP_11)
+            .uri("/chat")
+            .body(empty_body())
+            .unwrap();
+        request
+            .extensions_mut()
+            .insert(hyper::ext::Protocol::from_static("websocket"));
+
+        assert!(MessageHandler::h2_connect_protocol(&request).is_none());
+    }
+
+    #[test]
+    fn test_upgrade_protocol_detected() {
+        let request = Request::builder()
+            .uri("/chat")
+            .header("host", "a")
+            .header("upgrade", "websocket")
+            .header("connection", "Upgrade")
+            .body(empty_body())
+            .unwrap();
+
+        assert_eq!(
+            MessageHandler::upgrade_protocol(&request).as_deref(),
+            Some("websocket")
+        );
+    }
+
+    #[test]
+    fn test_upgrade_needs_connection_token() {
+        // Upgrade alone is not a request to switch protocols (RFC 9110 s7.8).
+        let request = Request::builder()
+            .uri("/chat")
+            .header("host", "a")
+            .header("upgrade", "websocket")
+            .body(empty_body())
+            .unwrap();
+
+        assert!(MessageHandler::upgrade_protocol(&request).is_none());
+    }
+
+    #[test]
+    fn test_upgrade_token_found_among_others() {
+        let request = Request::builder()
+            .uri("/chat")
+            .header("host", "a")
+            .header("upgrade", "WebSocket")
+            .header("connection", "keep-alive, UPGRADE")
+            .body(empty_body())
+            .unwrap();
+
+        assert_eq!(
+            MessageHandler::upgrade_protocol(&request).as_deref(),
+            Some("websocket")
+        );
+    }
+
+    #[test]
+    fn test_no_upgrade_without_upgrade_header() {
+        let request = Request::builder()
+            .uri("/chat")
+            .header("host", "a")
+            .header("connection", "upgrade")
+            .body(empty_body())
+            .unwrap();
+
+        assert!(MessageHandler::upgrade_protocol(&request).is_none());
+    }
+
+    #[test]
+    fn test_http2_never_upgrades() {
+        // HTTP/2 negotiates extended CONNECT (RFC 8441), not Upgrade.
+        let request = Request::builder()
+            .uri("/chat")
+            .version(Version::HTTP_2)
+            .header("upgrade", "websocket")
+            .header("connection", "Upgrade")
+            .body(empty_body())
+            .unwrap();
+
+        assert!(MessageHandler::upgrade_protocol(&request).is_none());
+    }
+
+    #[test]
+    fn test_restore_upgrade_headers_normalises_connection() {
+        // The carve-out must put back only `upgrade`, never the client's list.
+        let mut request = Request::builder()
+            .uri("/chat")
+            .header("host", "a")
+            .header("upgrade", "websocket")
+            .header("connection", "Upgrade, X-Sneaky")
+            .header("x-sneaky", "leaked")
+            .header("x-legit", "keep-me")
+            .body(empty_body())
+            .unwrap();
+
+        let protocol = MessageHandler::upgrade_protocol(&request).unwrap();
+        MessageHandler::strip_hop_by_hop_headers(&mut request);
+        MessageHandler::restore_upgrade_headers(&mut request, &protocol);
+
+        assert_eq!(request.headers().get("upgrade").unwrap(), "websocket");
+        assert_eq!(request.headers().get("connection").unwrap(), "upgrade");
+        assert!(!request.headers().contains_key("x-sneaky"));
+        assert_eq!(request.headers().get("x-legit").unwrap(), "keep-me");
+    }
+
+    #[test]
+    fn test_ambiguous_framing_detected() {
+        // Regression: stripping Transfer-Encoding leaves a stale Content-Length
+        // describing a body hyper has already re-framed, so this must be
+        // rejected up front rather than forwarded.
+        let request = Request::builder()
+            .uri("/test")
+            .header("host", "a")
+            .header("content-length", "6")
+            .header("transfer-encoding", "chunked")
+            .body(empty_body())
+            .unwrap();
+
+        assert!(MessageHandler::has_ambiguous_framing(&request));
+    }
+
+    #[test]
+    fn test_content_length_alone_is_not_ambiguous() {
+        let request = Request::builder()
+            .uri("/test")
+            .header("host", "a")
+            .header("content-length", "6")
+            .body(empty_body())
+            .unwrap();
+
+        assert!(!MessageHandler::has_ambiguous_framing(&request));
+    }
+
+    #[test]
+    fn test_transfer_encoding_alone_is_not_ambiguous() {
+        let request = Request::builder()
+            .uri("/test")
+            .header("host", "a")
+            .header("transfer-encoding", "chunked")
+            .body(empty_body())
+            .unwrap();
+
+        assert!(!MessageHandler::has_ambiguous_framing(&request));
+    }
+
+    #[test]
+    fn test_strips_each_hop_by_hop_header() {
+        // One assertion per header in the RFC 9110 section 7.6.1 set.
+        for name in HOP_BY_HOP_HEADERS {
+            let mut request = Request::builder()
+                .uri("/test")
+                .header("host", "example.com")
+                .header(*name, "some-value")
+                .body(empty_body())
+                .unwrap();
+
+            MessageHandler::strip_hop_by_hop_headers(&mut request);
+
+            assert!(
+                !request.headers().contains_key(*name),
+                "hop-by-hop header {} was forwarded",
+                name
+            );
+            // Stripping must not take unrelated headers with it.
+            assert_eq!(request.headers().get("host").unwrap(), "example.com");
+        }
+    }
+
+    #[test]
+    fn test_strips_headers_named_in_connection() {
+        // The live case found by the HTTP Garden probe.
+        let mut request = Request::builder()
+            .uri("/test")
+            .header("host", "example.com")
+            .header("connection", "keep-alive, X-Hop")
+            .header("x-hop", "SHOULD-BE-STRIPPED")
+            .body(empty_body())
+            .unwrap();
+
+        MessageHandler::strip_hop_by_hop_headers(&mut request);
+
+        assert!(!request.headers().contains_key("connection"));
+        assert!(!request.headers().contains_key("x-hop"));
+        assert_eq!(request.headers().get("host").unwrap(), "example.com");
+    }
+
+    #[test]
+    fn test_connection_tokens_are_case_insensitive_and_trimmed() {
+        let mut request = Request::builder()
+            .uri("/test")
+            .header("connection", "  X-UPPER  ,\tx-lower,,")
+            .header("x-upper", "a")
+            .header("x-lower", "b")
+            .body(empty_body())
+            .unwrap();
+
+        MessageHandler::strip_hop_by_hop_headers(&mut request);
+
+        assert!(!request.headers().contains_key("x-upper"));
+        assert!(!request.headers().contains_key("x-lower"));
+    }
+
+    #[test]
+    fn test_connection_token_cannot_strip_host_or_content_length() {
+        // Naming these in Connection is not legitimate; honouring it would let a
+        // client strip framing or identity headers on the way through.
+        let mut request = Request::builder()
+            .uri("/test")
+            .header("host", "example.com")
+            .header("content-length", "0")
+            .header("connection", "host, content-length")
+            .body(empty_body())
+            .unwrap();
+
+        MessageHandler::strip_hop_by_hop_headers(&mut request);
+
+        assert!(!request.headers().contains_key("connection"));
+        assert_eq!(request.headers().get("host").unwrap(), "example.com");
+        assert_eq!(request.headers().get("content-length").unwrap(), "0");
+    }
+
+    #[test]
+    fn test_connection_token_naming_forwarded_header_does_not_suppress_ours() {
+        // strip runs before add_forwarding_headers, so the client's inbound value
+        // goes and ours replaces it -- no suppression, no spoofing.
+        let mut request = Request::builder()
+            .uri("/test")
+            .header("host", "example.com")
+            .header("connection", "x-forwarded-for")
+            .header("x-forwarded-for", "1.2.3.4")
+            .body(empty_body())
+            .unwrap();
+
+        MessageHandler::strip_hop_by_hop_headers(&mut request);
+        let client_addr: SocketAddr = "192.168.1.100:12345".parse().unwrap();
+        MessageHandler::add_forwarding_headers(&mut request, client_addr, "http");
+
+        assert_eq!(
+            request.headers().get("x-forwarded-for").unwrap(),
+            "192.168.1.100"
+        );
+    }
+
+    #[test]
+    fn test_strip_is_a_no_op_without_hop_by_hop_headers() {
+        let mut request = Request::builder()
+            .uri("/test")
+            .header("host", "example.com")
+            .header("accept", "*/*")
+            .body(empty_body())
+            .unwrap();
+
+        MessageHandler::strip_hop_by_hop_headers(&mut request);
+
+        assert_eq!(request.headers().len(), 2);
     }
 
     #[test]
