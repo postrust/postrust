@@ -127,6 +127,6 @@ the next major.
 
 Bugs and questions: [GitHub Issues](https://github.com/postrust/postrust/issues).
 
-For anything with a security impact, please report it privately through
-[GitHub's security advisory form](https://github.com/postrust/postrust/security/advisories/new)
-rather than opening a public issue.
+For anything with a security impact, see
+[SECURITY.md](https://github.com/postrust/postrust/blob/main/SECURITY.md) --
+report it privately rather than opening a public issue.

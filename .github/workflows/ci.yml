@@ -37,6 +37,63 @@ jobs:
       - name: Clippy (server, admin-ui feature)
         run: cargo clippy -p postrust-server --features admin-ui --all-targets -- -D warnings
 
+  msrv:
+    name: MSRV (1.88)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # The version here must match [workspace.package] rust-version. It is
+      # verified rather than aspirational: 1.87.0 is refused outright, because
+      # hickory 0.26 and time 0.3.55 declare 1.88. Without this job the
+      # declared MSRV is a comment -- the README claimed 1.78, the docs 1.75,
+      # and nothing caught either.
+      - name: Install Rust 1.88
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.88"
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: msrv
+
+      # --locked: an MSRV check that lets cargo pick newer dependencies is
+      # checking a different dependency set than the one that ships.
+      - name: Check (workspace)
+        run: cargo +1.88 check --workspace --all-targets --locked
+
+  audit:
+    name: dependency audit
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust (stable)
+        uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: audit
+
+      # ^0.22 specifically: 0.21 cannot parse a CVSS 4.0 advisory and dies
+      # with "unsupported CVSS version: 4.0" on the current RustSec database,
+      # which would have made this job red on its first run for a reason
+      # unrelated to our dependencies.
+      - name: Install cargo-audit
+        run: cargo install cargo-audit --locked --version ^0.22
+
+      # Advisories against the lockfile, plus yanked crates -- a yanked
+      # dependency is how a lockfile rots quietly.
+      #
+      # This reports what is *locked*, which is not the same as what is
+      # compiled: an advisory against an optional dependency that no enabled
+      # feature pulls in is worth fixing but is not an exposure. Check
+      # `cargo tree -i <crate>` before treating one as reachable. SECURITY.md
+      # explains why, with the quinn-proto case that prompted it.
+      # Ignores live in .cargo/audit.toml, one documented reason each.
+      - name: cargo audit
+        run: cargo audit --deny warnings
+
   test:
     name: build + test
     runs-on: ubuntu-latest

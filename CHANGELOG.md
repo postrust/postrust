@@ -5,6 +5,67 @@ releases are described by their tags and the pull requests behind them.
 
 ## Unreleased
 
+### Security
+
+**Twelve dependency advisories fixed** by updating the lockfile, including five
+in `aws-lc-sys` (X.509 name-constraint bypass via wildcard/Unicode CN, two
+PKCS7 signature and chain validation bypasses, a CRL distribution-point scope
+error, an AES-CCM timing side channel) and four in `rustls-webpki` (a reachable
+panic in CRL parsing, URI name constraints incorrectly accepted, and two more
+CRL and wildcard issues). All of these are in the path of a TLS-terminating
+proxy. Also `bytes`, `h2` (unbounded empty DATA frames), `time`, `anyhow`,
+`event-listener` and both `rand` majors.
+
+**`hickory-resolver` 0.24 to 0.26**, clearing an O(n²) name-compression CPU
+exhaustion in `hickory-proto`. The upgrade is a real API migration, and one
+part of it would have broken silently: 0.26 replaced the rdata iterator with
+`Lookup::answers()`, and `Record`'s `Display` renders the whole record line
+(`name ttl class type rdata`), so the previous `record.to_string()` would never
+have matched a bare challenge token again. Every DNS verification would have
+failed. The comparison now lives in a tested function, `txt_matches`, with a
+case asserting that a full record line does *not* match.
+
+**A dependency audit now runs in CI.** `cargo audit --deny warnings`, with
+three documented ignores in `.cargo/audit.toml` -- one advisory with no
+reachable code path and no upstream fix (`rsa`, not in any build graph), and
+two unmaintained crates with the migration each needs written down. The job is
+verified green rather than added and hoped for.
+
+**`SECURITY.md`** added: how to report privately, what to expect, what is in
+scope, and the known-and-documented weaknesses that are not reports.
+
+### Changed
+
+**The MSRV is declared and checked: Rust 1.88.** It was not declared anywhere,
+while the README claimed 1.78, `docs/getting-started.md` claimed 1.75 and
+`CONTRIBUTING.md` claimed 1.75 -- three different wrong numbers. The floor is
+now 1.88: `hickory-{net,proto,resolver}` 0.26 and `time` 0.3.55 all require it,
+and 1.87.0 is refused outright. Both arrived with the security updates above,
+so the floor moved from 1.86 to 1.88 as a direct cost of them, which is a trade
+worth making. Declared as `rust-version` in `[workspace.package]`, inherited by
+every crate, with a CI job that builds on 1.88 `--locked`.
+
+**`postrust-proxy` and `postrust-worker` each moved to their own `0.x` version
+line** and no longer share the workspace version. The rest of the workspace is
+heading for 1.0.0 and the semver promise that comes with it; neither of these
+is ready to make one.
+
+For the proxy: turning `missing_docs` on produces 306 warnings, and automatic
+SSL provisioning is still not implemented. (The config and admin-API stubs that
+were the other half of the reason are fixed in this release -- see Added.)
+For the worker: it is a stub that answers `{"status": "stub"}`.
+
+Nothing in the stable line depends on either, so no crate that makes a semver
+promise carries a dependency that cannot keep one. The worker is a `cdylib`,
+which cannot be a Rust library dependency at all.
+
+Both lines still release on the same git tags: the publish step reads each
+crate's own declared version rather than assuming one across the workspace, and
+skips what is already on crates.io.
+
+New: [docs/stability.md](docs/stability.md), stating what a version number
+covers and what it does not.
+
 ### Added
 
 **Database-backed proxy configuration actually reads and writes.**
@@ -50,30 +111,6 @@ has to be supplied manually.
 which are in the router, and omitted `enable` and `disable`, which are. It
 also advertised automatic ACME provisioning as a feature. Corrected against
 the router, and the SSL section now says plainly that no ACME client exists.
-
-### Changed
-
-**`postrust-worker` moved to its own `0.x` version line** as well, for a
-blunter reason: it is a stub. Its fetch handler answers `{"status": "stub"}`
-and does not parse requests, reach a database, or return data. It is built as
-a `cdylib`, so it cannot be a Rust library dependency at all.
-
-**`postrust-proxy` moved to its own `0.x` version line** and no longer shares
-the workspace version. The rest of the workspace is heading for 1.0.0 and a
-semver promise; this crate is not ready to make one. Turning `missing_docs` on
-for it produces 306 warnings, and parts of its public surface answer
-successfully without doing anything -- `config::database` returns an empty
-route set instead of querying, and the admin API's route and upstream mutations
-change only the in-memory config while replying `200`/`201`. Nothing depends on
-`postrust-proxy`, so no crate that makes a semver promise carries a dependency
-that cannot keep one.
-
-Both lines still release on the same git tags: the publish step now reads each
-crate's own declared version rather than assuming one across the workspace, and
-skips what is already on crates.io.
-
-New: [docs/stability.md](docs/stability.md), stating what a version number
-covers and what it does not.
 
 ## 1.0.0-alpha.2
 

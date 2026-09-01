@@ -15,6 +15,13 @@ members = [
 [workspace.package]
 version = "1.0.0-alpha.2"
 edition = "2021"
+# Verified, not assumed: 1.88.0 builds the workspace clean and 1.87.0 is
+# refused outright -- hickory-{net,proto,resolver} 0.26 and time 0.3.55 all
+# declare 1.88. Both arrived with security updates, and the floor moved from
+# 1.86 to 1.88 as a result; the advisories were worth more than the two
+# releases. The README claimed 1.78, and the docs 1.75, before this was
+# declared anywhere at all.
+rust-version = "1.88"
 license = "MIT"
 repository = "https://github.com/postrust/postrust"
 homepage = "https://postrust.org/"

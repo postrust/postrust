@@ -4,7 +4,7 @@
 
 **A PostgREST-inspired REST API for PostgreSQL, written in Rust**
 
-[![Rust](https://img.shields.io/badge/rust-1.78%2B-orange.svg)](https://www.rust-lang.org/)
+[![Rust](https://img.shields.io/badge/rust-1.88%2B-orange.svg)](https://www.rust-lang.org/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![Build Status](https://img.shields.io/github/actions/workflow/status/postrust/postrust/ci.yml?branch=main)](https://github.com/postrust/postrust/actions)
 
@@ -66,7 +66,7 @@ Postrust is a high-performance, serverless-first REST API server for PostgreSQL 
 
 ### Prerequisites
 
-- Rust 1.78+ (`curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh`)
+- Rust 1.88+ (`curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh`)
 - PostgreSQL 12+ (or use Docker)
 
 ### Installation
