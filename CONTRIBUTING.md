@@ -15,7 +15,7 @@ Thank you for your interest in contributing to Postrust! This document provides 
 
 ## Code of Conduct
 
-This project adheres to a code of conduct. By participating, you are expected to uphold this code. Please be respectful and constructive in all interactions.
+This project has a [Code of Conduct](CODE_OF_CONDUCT.md). By taking part you are expected to uphold it. Report unacceptable behaviour to [technology@bimaplan.co](mailto:technology@bimaplan.co).
 
 ## Getting Started
 
