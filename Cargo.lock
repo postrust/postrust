@@ -2447,7 +2447,7 @@ dependencies = [
 
 [[package]]
 name = "postrust-proxy"
-version = "1.0.0-alpha.2"
+version = "0.5.0"
 dependencies = [
  "ahash",
  "anyhow",

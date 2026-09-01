@@ -472,7 +472,14 @@ Postrust crates at the same version work together. Browse them at
 | `postrust-graphql` | GraphQL API with dynamic schema generation | [crates.io](https://crates.io/crates/postrust-graphql) · [docs](https://docs.rs/postrust-graphql) |
 | `postrust-lambda` | AWS Lambda adapter | [crates.io](https://crates.io/crates/postrust-lambda) · [docs](https://docs.rs/postrust-lambda) |
 | `postrust-worker` | Cloudflare Workers adapter | [crates.io](https://crates.io/crates/postrust-worker) · [docs](https://docs.rs/postrust-worker) |
-| `postrust-proxy` | Reverse proxy with load balancing and automatic TLS | [crates.io](https://crates.io/crates/postrust-proxy) · [docs](https://docs.rs/postrust-proxy) |
+| `postrust-proxy` | Reverse proxy with load balancing and automatic TLS — **`0.x`, no stability promise** | [crates.io](https://crates.io/crates/postrust-proxy) · [docs](https://docs.rs/postrust-proxy) |
+
+Every crate above except `postrust-proxy` shares one version and one semver
+promise. `postrust-proxy` is on its own `0.x` line: it is useful and it is
+measured against h2spec, Autobahn and the HTTP Garden differential fuzzer, but
+parts of its public surface are undocumented or not yet wired up, and a shared
+version number would promise a stability it cannot keep. Nothing else depends
+on it. See [Stability and Versioning](docs/stability.md).
 
 ## Development
 

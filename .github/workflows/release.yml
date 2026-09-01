@@ -36,13 +36,14 @@ jobs:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
         run: |
           set -euo pipefail
-          version=$(cargo metadata --no-deps --format-version 1 \
-            | jq -r '.packages[] | select(.name == "postrust-core") | .version')
+          metadata=$(cargo metadata --no-deps --format-version 1)
+          version=$(jq -r '.packages[] | select(.name == "postrust-core") | .version' <<<"${metadata}")
           echo "Workspace version: ${version}"
 
           # The tag is the source of truth for a release; refuse to publish if
           # the workspace version wasn't bumped to match it (e.g. tagging
-          # v0.2.3 while Cargo.toml still says 0.2.2).
+          # v0.2.3 while Cargo.toml still says 0.2.2). Anchored on
+          # postrust-core, which carries [workspace.package] version.
           tag_version="${GITHUB_REF_NAME#v}"
           if [ "${tag_version}" != "${version}" ]; then
             echo "::error::Tag ${GITHUB_REF_NAME} does not match workspace version ${version}." \
@@ -50,16 +51,30 @@ jobs:
             exit 1
           fi
 
-          # Dependency order: leaves first.
+          # Each crate is published at the version *it* declares, not at the
+          # workspace version: postrust-proxy sets its own, on a 0.x line that
+          # carries no stability promise (see docs/stability.md). A tag ships
+          # whatever every crate currently declares and skips what is already
+          # published, so the proxy releases on the same tags without being
+          # dragged along to 1.0.0.
+          #
+          # Dependency order: leaves first. Nothing depends on postrust-proxy,
+          # so no 1.0.0 crate carries a 0.x dependency.
           for crate in postrust-sql postrust-auth postrust-core postrust-response \
                        postrust-graphql postrust-server postrust-lambda postrust-worker \
                        postrust-proxy; do
+            crate_version=$(jq -r --arg c "${crate}" \
+              '.packages[] | select(.name == $c) | .version' <<<"${metadata}")
+            if [ -z "${crate_version}" ] || [ "${crate_version}" = "null" ]; then
+              echo "::error::No version found for ${crate} in cargo metadata."
+              exit 1
+            fi
             if curl -fsS -A "postrust-release-workflow (github.com/${GITHUB_REPOSITORY})" \
-                 "https://crates.io/api/v1/crates/${crate}/${version}" >/dev/null 2>&1; then
-              echo "${crate} ${version} already on crates.io, skipping"
+                 "https://crates.io/api/v1/crates/${crate}/${crate_version}" >/dev/null 2>&1; then
+              echo "${crate} ${crate_version} already on crates.io, skipping"
               continue
             fi
-            echo "Publishing ${crate} ${version}"
+            echo "Publishing ${crate} ${crate_version}"
             cargo publish -p "${crate}" --locked
           done
 

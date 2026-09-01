@@ -35,9 +35,17 @@
 //! ```
 
 #![warn(clippy::all)]
-// `postrust-proxy` is a beta module with wiring still in progress. The following
-// lints are relaxed until it stabilizes (tighten before GA):
-// - missing_docs / dead_code: some public items and scaffolding are not yet wired up.
+// `postrust-proxy` is on its own 0.x version line, separate from the rest of the
+// workspace, and carries no stability promise. That is not a formality: turning
+// `missing_docs` and `dead_code` on here produces 306 and 4 warnings
+// respectively, and parts of the public surface answer successfully without
+// doing anything (see `config::database`, and the admin API's route and
+// upstream mutations). Freezing that under semver would be a promise the crate
+// cannot keep, so it does not go to 1.0.0 with the others. See docs/stability.md.
+//
+// The relaxed lints, and what each is waiting on:
+// - missing_docs / dead_code: public items and scaffolding not yet wired up.
+//   Tighten as the surface is documented and the stubs are resolved.
 // - result_large_err / large_enum_variant: rooted in the rich `ProxyError` enum.
 // - type_complexity: a few internal signatures pending refactor into type aliases.
 #![allow(missing_docs)]
