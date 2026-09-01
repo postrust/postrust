@@ -40,3 +40,4 @@ scripts/http-garden/images/postrust/src/
 scripts/h2spec/.work
 scripts/autobahn/.work
 scripts/autobahn/reports
+scripts/autobahn/reports-baseline
