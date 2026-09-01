@@ -38,21 +38,57 @@ RANK = {"OK": 0, "INFORMATIONAL": 1, "NON-STRICT": 2, "UNIMPLEMENTED": 3, "FAILE
 
 # Cases excluded from the baseline-comparison rule, with the reason. These are
 # always printed, never silently applied.
+# Cases excluded from the regression check, with the reason. Always printed,
+# never silently applied.
+#
+# These all have one shape: send a valid text message, then an invalid frame,
+# and expect the echo of the first before the connection is failed. Through the
+# proxy the client sometimes receives nothing (`received: []`).
+#
+# The cause is the origin, measured with no proxy in the path: sending 3.4's
+# exact byte sequence octet-wise echoes 15 bytes, and sending it as one write
+# echoes nothing. The origin fails the connection without flushing its echo
+# when it reads the valid frame and the invalid one in a single read. A relay
+# buffers, so it coalesces what the client chopped, and TCP does not preserve
+# message boundaries anyway.
+#
+# Which member of the family trips is not stable -- 3.4 on some runs, 4.2.5 on
+# others -- which is why this is a family and not a single case id. Membership
+# is by that shared shape; the coalescing experiment was run for 3.4.
+SEGMENTATION_SENSITIVE_REASON = (
+    "invalid-frame family: the origin fails the connection without flushing its "
+    "echo when the valid frame and the invalid one arrive in one read. Measured "
+    "with no proxy in the path -- octet-wise chops echo 15 bytes, one coalesced "
+    "write echoes nothing. Any relay re-chunks. Which case trips varies per run."
+)
+
 KNOWN_ORIGIN_ARTIFACTS = {
-    "3.4": (
-        "origin is segmentation-sensitive: AutobahnPython's echoserver fails the "
-        "connection without flushing its echo when it reads the valid frame and "
-        "the RSV frame in one read. Verified with no proxy in the path -- "
-        "octet-wise chops echo 15 bytes, one coalesced write echoes nothing. Any "
-        "relay re-chunks, so this is not about the tunnel."
-    ),
+    case: SEGMENTATION_SENSITIVE_REASON
+    for case in [
+        "3.4",
+        "4.1.3",
+        "4.1.4",
+        "4.1.5",
+        "4.2.3",
+        "4.2.4",
+        "4.2.5",
+        "5.15",
+    ]
 }
 
 
 def load(path):
     with open(path) as fh:
         report = json.load(fh)
-    # One agent per report; take its cases.
+    # One agent per report; take its cases. An empty report means the run
+    # produced nothing -- the client never reached the target, most likely --
+    # which is a failure to report, not a crash to raise.
+    if not report:
+        raise SystemExit(
+            f"error: {path} contains no results.\n"
+            "  The fuzzingclient ran but tested nothing; check that the target\n"
+            "  was reachable at the URL in .work/fuzzingclient.json."
+        )
     return next(iter(report.values()))
 
 
