@@ -3,6 +3,27 @@
 Notable changes, newest first. This file starts at 1.0.0-alpha.1; earlier
 releases are described by their tags and the pull requests behind them.
 
+## Unreleased
+
+### Changed
+
+**`postrust-proxy` moved to its own `0.x` version line** and no longer shares
+the workspace version. The rest of the workspace is heading for 1.0.0 and a
+semver promise; this crate is not ready to make one. Turning `missing_docs` on
+for it produces 306 warnings, and parts of its public surface answer
+successfully without doing anything -- `config::database` returns an empty
+route set instead of querying, and the admin API's route and upstream mutations
+change only the in-memory config while replying `200`/`201`. Nothing depends on
+`postrust-proxy`, so no crate that makes a semver promise carries a dependency
+that cannot keep one.
+
+Both lines still release on the same git tags: the publish step now reads each
+crate's own declared version rather than assuming one across the workspace, and
+skips what is already on crates.io.
+
+New: [docs/stability.md](docs/stability.md), stating what a version number
+covers and what it does not.
+
 ## 1.0.0-alpha.2
 
 A release about the front door rather than the dialects. The HTTP proxy was
