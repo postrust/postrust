@@ -472,7 +472,7 @@ Postrust crates at the same version work together. Browse them at
 | `postrust-graphql` | GraphQL API with dynamic schema generation | [crates.io](https://crates.io/crates/postrust-graphql) · [docs](https://docs.rs/postrust-graphql) |
 | `postrust-lambda` | AWS Lambda adapter | [crates.io](https://crates.io/crates/postrust-lambda) · [docs](https://docs.rs/postrust-lambda) |
 | `postrust-worker` | Cloudflare Workers adapter — **stub; `0.x`, no stability promise** | [crates.io](https://crates.io/crates/postrust-worker) · [docs](https://docs.rs/postrust-worker) |
-| `postrust-proxy` | Reverse proxy with load balancing and automatic TLS — **`0.x`, no stability promise** | [crates.io](https://crates.io/crates/postrust-proxy) · [docs](https://docs.rs/postrust-proxy) |
+| `postrust-proxy` | Reverse proxy with load balancing and automatic TLS — **`0.x`, no stability promise** | [guide](docs/proxy.md) · [crates.io](https://crates.io/crates/postrust-proxy) · [docs](https://docs.rs/postrust-proxy) |
 
 The first seven crates share one version and one semver promise. The last two
 are each on their own `0.x` line and carry none:

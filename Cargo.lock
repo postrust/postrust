@@ -2556,6 +2556,7 @@ dependencies = [
  "postrust-core",
  "pretty_assertions",
  "rand 0.9.5",
+ "regex",
  "reqwest",
  "rustls",
  "rustls-pemfile",

@@ -263,28 +263,6 @@ impl BackendAppManager {
         self.routes.insert((host, path), upstream_id);
     }
 
-    /// Find the best matching upstream for a request.
-    pub fn find_upstream(&self, host: &str, path: &str) -> Option<Uuid> {
-        let _host_name = ServerName::new(host);
-        let _path_name = PathName::new(path);
-
-        // Find all matching routes and select the one with longest path prefix
-        let mut best_match: Option<(usize, Uuid)> = None;
-
-        for entry in self.routes.iter() {
-            let ((route_host, route_path), upstream_id) = entry.pair();
-
-            if route_host.matches(host) && route_path.matches(path) {
-                let path_len = route_path.len();
-                if best_match.is_none() || path_len > best_match.unwrap().0 {
-                    best_match = Some((path_len, *upstream_id));
-                }
-            }
-        }
-
-        best_match.map(|(_, id)| id)
-    }
-
     /// Select a backend from an upstream, considering health status.
     pub fn select_backend(
         &self,

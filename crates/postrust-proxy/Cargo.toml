@@ -48,6 +48,7 @@ rustls.workspace = true
 rustls-pemfile.workspace = true
 instant-acme = { workspace = true, optional = true }
 x509-parser.workspace = true
+regex.workspace = true
 
 # ACME (optional)
 

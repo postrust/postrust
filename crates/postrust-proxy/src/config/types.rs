@@ -1,5 +1,6 @@
 //! Configuration types for the proxy.
 
+use http::HeaderMap;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use uuid::Uuid;
@@ -252,6 +253,97 @@ pub struct RouteMatch {
 
     /// HTTP methods to match
     pub methods: Option<Vec<String>>,
+}
+
+impl RouteMatch {
+    /// Whether a request matches these criteria.
+    ///
+    /// Every field that is set has to match; a field left unset matches
+    /// anything. That is the only reading under which adding a criterion can
+    /// never widen a route.
+    ///
+    /// `path_type`, `methods` and `headers` were all declarable and all ignored
+    /// before this existed -- the route filter compared host and path prefix and
+    /// nothing else. Each of those silent no-ops widened a route past what its
+    /// author wrote: `path_type = "exact"` on `/health` also matched
+    /// `/health-internal`, and a route restricted to `methods = ["GET"]`
+    /// accepted `DELETE`.
+    pub fn matches(&self, host: &str, path: &str, method: &str, headers: &HeaderMap) -> bool {
+        self.host_matches(host)
+            && self.path_matches(path)
+            && self.method_matches(method)
+            && self.headers_match(headers)
+    }
+
+    /// Host, exactly or by a leading `*.` wildcard.
+    ///
+    /// `*` alone means any host, which is what an absent host also means.
+    fn host_matches(&self, host: &str) -> bool {
+        let Some(pattern) = self.host.as_deref() else {
+            return true;
+        };
+        let pattern = pattern.trim().to_ascii_lowercase();
+        let host = host.trim().to_ascii_lowercase();
+
+        if pattern == "*" || pattern.is_empty() {
+            return true;
+        }
+        if pattern == host {
+            return true;
+        }
+        // `*.example.com` covers one label, not the apex and not two labels --
+        // the same rule certificates use.
+        match pattern.strip_prefix("*.") {
+            Some(suffix) if !suffix.is_empty() => host
+                .strip_suffix(&format!(".{suffix}"))
+                .is_some_and(|label| !label.is_empty() && !label.contains('.')),
+            _ => false,
+        }
+    }
+
+    /// Path, by the declared [`PathMatchType`].
+    ///
+    /// A regex that does not compile matches nothing, and says so once. The
+    /// alternative -- treating it as a prefix, or matching everything -- turns a
+    /// typo into a route that catches traffic it was never meant to.
+    fn path_matches(&self, path: &str) -> bool {
+        let Some(pattern) = self.path.as_deref() else {
+            return true;
+        };
+        match self.path_type {
+            PathMatchType::Prefix => path.starts_with(pattern),
+            PathMatchType::Exact => path == pattern,
+            PathMatchType::Regex => match regex::Regex::new(pattern) {
+                Ok(re) => re.is_match(path),
+                Err(error) => {
+                    tracing::warn!(
+                        %pattern, %error,
+                        "route path regex does not compile; the route matches nothing"
+                    );
+                    false
+                }
+            },
+        }
+    }
+
+    /// Method, case-insensitively. An empty list means any.
+    fn method_matches(&self, method: &str) -> bool {
+        match self.methods.as_deref() {
+            None | Some([]) => true,
+            Some(allowed) => allowed.iter().any(|m| m.eq_ignore_ascii_case(method)),
+        }
+    }
+
+    /// Every named header must be present with that value, case-insensitively
+    /// on the name and exactly on the value.
+    fn headers_match(&self, headers: &HeaderMap) -> bool {
+        self.headers.iter().all(|(name, expected)| {
+            headers
+                .get(name.as_str())
+                .and_then(|value| value.to_str().ok())
+                .is_some_and(|value| value == expected)
+        })
+    }
 }
 
 /// Path matching type.
@@ -519,6 +611,199 @@ pub struct AcmeConfig {
 #[cfg(test)]
 mod upstream_version_tests {
     use super::*;
+
+    fn header_map(pairs: &[(&str, &str)]) -> HeaderMap {
+        let mut map = HeaderMap::new();
+        for (name, value) in pairs {
+            map.insert(
+                http::header::HeaderName::from_bytes(name.as_bytes()).unwrap(),
+                http::HeaderValue::from_str(value).unwrap(),
+            );
+        }
+        map
+    }
+
+    /// A match with nothing set, so each test can set only what it is about.
+    fn any() -> RouteMatch {
+        RouteMatch::default()
+    }
+
+    #[test]
+    fn an_empty_match_matches_anything() {
+        let m = any();
+        assert!(m.matches("example.com", "/anything", "GET", &HeaderMap::new()));
+        assert!(m.matches("", "/", "DELETE", &HeaderMap::new()));
+    }
+
+    #[test]
+    fn a_prefix_path_matches_by_prefix() {
+        let m = RouteMatch {
+            path: Some("/v1".into()),
+            ..any()
+        };
+        assert!(m.matches("h", "/v1", "GET", &HeaderMap::new()));
+        assert!(m.matches("h", "/v1/users", "GET", &HeaderMap::new()));
+        assert!(!m.matches("h", "/v2", "GET", &HeaderMap::new()));
+    }
+
+    #[test]
+    fn an_exact_path_does_not_match_a_longer_one() {
+        // The widening this guards against: before `path_type` was honoured,
+        // an "exact" route on /health also caught /health-internal.
+        let m = RouteMatch {
+            path: Some("/health".into()),
+            path_type: PathMatchType::Exact,
+            ..any()
+        };
+        assert!(m.matches("h", "/health", "GET", &HeaderMap::new()));
+        assert!(!m.matches("h", "/health-internal", "GET", &HeaderMap::new()));
+        assert!(!m.matches("h", "/health/deep", "GET", &HeaderMap::new()));
+    }
+
+    #[test]
+    fn a_regex_path_matches_the_pattern() {
+        let m = RouteMatch {
+            path: Some(r"^/v[0-9]+/users$".into()),
+            path_type: PathMatchType::Regex,
+            ..any()
+        };
+        assert!(m.matches("h", "/v1/users", "GET", &HeaderMap::new()));
+        assert!(m.matches("h", "/v22/users", "GET", &HeaderMap::new()));
+        assert!(!m.matches("h", "/v1/users/1", "GET", &HeaderMap::new()));
+        assert!(!m.matches("h", "/users", "GET", &HeaderMap::new()));
+    }
+
+    #[test]
+    fn a_regex_that_does_not_compile_matches_nothing() {
+        // Not "everything", and not "treat it as a prefix". Either would turn a
+        // typo into a route that catches traffic it was never meant to.
+        let m = RouteMatch {
+            path: Some("/v1/(unclosed".into()),
+            path_type: PathMatchType::Regex,
+            ..any()
+        };
+        assert!(!m.matches("h", "/v1/anything", "GET", &HeaderMap::new()));
+        assert!(!m.matches("h", "/v1/(unclosed", "GET", &HeaderMap::new()));
+    }
+
+    #[test]
+    fn methods_are_honoured_case_insensitively() {
+        let m = RouteMatch {
+            methods: Some(vec!["GET".into(), "head".into()]),
+            ..any()
+        };
+        assert!(m.matches("h", "/", "GET", &HeaderMap::new()));
+        assert!(m.matches("h", "/", "get", &HeaderMap::new()));
+        assert!(m.matches("h", "/", "HEAD", &HeaderMap::new()));
+        // The widening this guards against: a read-only route accepting writes.
+        assert!(!m.matches("h", "/", "DELETE", &HeaderMap::new()));
+        assert!(!m.matches("h", "/", "POST", &HeaderMap::new()));
+    }
+
+    #[test]
+    fn an_empty_method_list_means_any() {
+        let m = RouteMatch {
+            methods: Some(vec![]),
+            ..any()
+        };
+        assert!(m.matches("h", "/", "PATCH", &HeaderMap::new()));
+    }
+
+    #[test]
+    fn every_named_header_must_be_present_with_that_value() {
+        let m = RouteMatch {
+            headers: HashMap::from([
+                ("x-tenant".to_string(), "acme".to_string()),
+                ("x-env".to_string(), "prod".to_string()),
+            ]),
+            ..any()
+        };
+
+        assert!(m.matches(
+            "h",
+            "/",
+            "GET",
+            &header_map(&[("x-tenant", "acme"), ("x-env", "prod")])
+        ));
+        // All of them, not any of them.
+        assert!(!m.matches("h", "/", "GET", &header_map(&[("x-tenant", "acme")])));
+        // The value has to match too.
+        assert!(!m.matches(
+            "h",
+            "/",
+            "GET",
+            &header_map(&[("x-tenant", "other"), ("x-env", "prod")])
+        ));
+        assert!(!m.matches("h", "/", "GET", &HeaderMap::new()));
+    }
+
+    #[test]
+    fn header_names_are_case_insensitive() {
+        let m = RouteMatch {
+            headers: HashMap::from([("X-Tenant".to_string(), "acme".to_string())]),
+            ..any()
+        };
+        assert!(m.matches("h", "/", "GET", &header_map(&[("x-tenant", "acme")])));
+    }
+
+    #[test]
+    fn a_host_matches_exactly_or_by_a_single_label_wildcard() {
+        let exact = RouteMatch {
+            host: Some("api.example.com".into()),
+            ..any()
+        };
+        assert!(exact.matches("api.example.com", "/", "GET", &HeaderMap::new()));
+        assert!(!exact.matches("www.example.com", "/", "GET", &HeaderMap::new()));
+
+        let wild = RouteMatch {
+            host: Some("*.example.com".into()),
+            ..any()
+        };
+        assert!(wild.matches("api.example.com", "/", "GET", &HeaderMap::new()));
+        // Not the apex, and not two labels.
+        assert!(!wild.matches("example.com", "/", "GET", &HeaderMap::new()));
+        assert!(!wild.matches("a.b.example.com", "/", "GET", &HeaderMap::new()));
+        // And not a suffix match, which would catch an attacker's domain.
+        assert!(!wild.matches("api.example.com.evil.test", "/", "GET", &HeaderMap::new()));
+    }
+
+    #[test]
+    fn a_star_host_matches_anything() {
+        let m = RouteMatch {
+            host: Some("*".into()),
+            ..any()
+        };
+        assert!(m.matches("anything.test", "/", "GET", &HeaderMap::new()));
+        assert!(m.matches("", "/", "GET", &HeaderMap::new()));
+    }
+
+    #[test]
+    fn host_matching_is_case_insensitive() {
+        let m = RouteMatch {
+            host: Some("API.Example.COM".into()),
+            ..any()
+        };
+        assert!(m.matches("api.example.com", "/", "GET", &HeaderMap::new()));
+    }
+
+    #[test]
+    fn every_set_criterion_has_to_hold() {
+        // Adding a criterion must never widen a route.
+        let m = RouteMatch {
+            host: Some("api.example.com".into()),
+            path: Some("/v1".into()),
+            path_type: PathMatchType::Prefix,
+            methods: Some(vec!["POST".into()]),
+            headers: HashMap::from([("x-key".to_string(), "k".to_string())]),
+        };
+        let headers = header_map(&[("x-key", "k")]);
+
+        assert!(m.matches("api.example.com", "/v1/x", "POST", &headers));
+        assert!(!m.matches("other.example.com", "/v1/x", "POST", &headers));
+        assert!(!m.matches("api.example.com", "/v2/x", "POST", &headers));
+        assert!(!m.matches("api.example.com", "/v1/x", "GET", &headers));
+        assert!(!m.matches("api.example.com", "/v1/x", "POST", &HeaderMap::new()));
+    }
 
     #[test]
     fn test_backend_defaults_to_http11() {

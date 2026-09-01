@@ -333,17 +333,18 @@ impl ProxyService {
         // Find matching route and upstream
         let (route, upstream_id) = {
             let config = self.config.read().await;
+            // The whole of RouteMatch, not just host and path prefix. The
+            // previous filter chain ignored path_type, methods and headers,
+            // each of which silently widened a route past what its author
+            // wrote -- `path_type = "exact"` on /health also matched
+            // /health-internal, and `methods = ["GET"]` accepted DELETE.
             let matched = config
                 .routes
                 .iter()
                 .filter(|r| r.enabled)
                 .filter(|r| {
-                    let route_host = r.match_.host.as_deref().unwrap_or("*");
-                    route_host == "*" || route_host == host
-                })
-                .filter(|r| {
-                    let route_path = r.match_.path.as_deref().unwrap_or("/");
-                    path.starts_with(route_path)
+                    r.match_
+                        .matches(host, path, method.as_str(), request.headers())
                 })
                 .max_by_key(|r| {
                     let path_len = r.match_.path.as_ref().map(|p| p.len()).unwrap_or(0);

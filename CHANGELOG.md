@@ -7,6 +7,25 @@ releases are described by their tags and the pull requests behind them.
 
 ### Added
 
+**Route matching honours the whole of `RouteMatch`.** `path_type`, `methods` and
+`match.headers` were all declarable and all ignored: the filter chain compared
+host and path prefix and nothing else. Each silent no-op *widened* a route past
+what its author wrote -- `path_type = "exact"` on `/health` also caught
+`/health-internal`, and a route restricted to `methods = ["GET"]` accepted
+`DELETE`. A host may now also be a single-label wildcard (`*.example.com`).
+A regex that does not compile matches nothing and logs why, rather than being
+treated as a prefix or a match-all.
+
+Also removed `BackendManager::find_upstream`, a second route matcher that was
+never called and was worse: prefix only, no method, no headers, and it ignored
+`priority`.
+
+**Documentation for the proxy**, in [docs/proxy.md](docs/proxy.md) -- there was
+none, for a crate that had just gained TLS, HTTP/2, WebSocket and a binary. It
+includes a section naming the configuration that is declarable and does nothing
+yet (`timeout_secs`, `retry_count`, `watch_config_file`, `https_enabled`,
+`acme_directory`), because the alternative is that each one gets discovered.
+
 **Three domain endpoints the documentation promised and the router never had.**
 `docs/saas-domains.md` listed `PUT /domains/{id}`,
 `POST /domains/{id}/ssl/provision` and `POST /domains/{id}/ssl/upload`; none was

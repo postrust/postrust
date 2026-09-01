@@ -116,6 +116,10 @@ parking_lot = "0.12"
 # Config
 toml = "0.8"
 
+# Route matching: `path_type = "regex"`. Already in the tree transitively, so
+# this adds no new compilation.
+regex = "1"
+
 # Internal crates
 postrust-core = { version = "1.0.0-alpha.2", path = "crates/postrust-core" }
 postrust-sql = { version = "1.0.0-alpha.2", path = "crates/postrust-sql" }
