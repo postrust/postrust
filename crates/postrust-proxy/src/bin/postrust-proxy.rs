@@ -54,10 +54,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Lazy: no connection is attempted here, and none is needed unless the
     // health checker's background task runs.
-    let pool = PgPoolOptions::new().connect_lazy(
-        &std::env::var("DATABASE_URL")
-            .unwrap_or_else(|_| "postgres://postgres:postgres@127.0.0.1:5432/postgres".into()),
-    )?;
+    let pool =
+        PgPoolOptions::new()
+            .connect_lazy(&std::env::var("DATABASE_URL").unwrap_or_else(|_| {
+                "postgres://postgres:postgres@127.0.0.1:5432/postgres".into()
+            }))?;
 
     let rate_limiter = Arc::new(RateLimiter::new(config.rate_limit.clone()));
     let health_checker = Arc::new(HealthChecker::new(pool));
@@ -100,7 +101,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let tls_service = service.clone();
             let tls_cancel = cancel.clone();
             Some(tokio::spawn(async move {
-                tls_service.serve_https(https_addr, tls_config, tls_cancel).await
+                tls_service
+                    .serve_https(https_addr, tls_config, tls_cancel)
+                    .await
             }))
         }
         (None, None) => None,
@@ -113,14 +116,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let h2_cancel = cancel.clone();
             let h2 = tokio::spawn(async move { h2_service.serve_h2c(h2_addr, h2_cancel).await });
             let main = service.serve_http(addr, cancel).await;
-            h2.await.map_err(|e| format!("http2 listener panicked: {e}"))??;
+            h2.await
+                .map_err(|e| format!("http2 listener panicked: {e}"))??;
             main?;
         }
         None => service.serve_http(addr, cancel).await?,
     }
 
     if let Some(tls) = tls {
-        tls.await.map_err(|e| format!("https listener panicked: {e}"))??;
+        tls.await
+            .map_err(|e| format!("https listener panicked: {e}"))??;
     }
     Ok(())
 }

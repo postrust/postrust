@@ -5,15 +5,15 @@
 use crate::config::{Backend, UpstreamHttpVersion};
 use crate::vendored::hyper_ext::{empty_body, IncomingBodyExt, ProxyBody};
 use crate::vendored::types::ProxyError;
+use base64::Engine;
 use hyper::body::Incoming;
 use hyper::header::{CONNECTION, HOST, UPGRADE};
 use hyper::{Method, Request, Response, StatusCode, Version};
 use hyper_util::client::legacy::Client;
 use hyper_util::rt::TokioExecutor as HyperTokioExecutor;
 use hyper_util::rt::TokioIo;
-use std::time::Duration;
-use base64::Engine;
 use rand::RngCore;
+use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tracing::debug;
@@ -171,11 +171,9 @@ impl ForwarderClient {
         // has to outlive this call.
         tokio::spawn(async move {
             match tokio::try_join!(client_upgrade, upstream_upgrade) {
-                Ok((client_io, upstream_io)) => Self::splice(
-                    TokioIo::new(client_io),
-                    TokioIo::new(upstream_io),
-                )
-                .await,
+                Ok((client_io, upstream_io)) => {
+                    Self::splice(TokioIo::new(client_io), TokioIo::new(upstream_io)).await
+                }
                 Err(e) => debug!("Upgrade handshake failed: {}", e),
             }
         });
@@ -269,10 +267,11 @@ impl ForwarderClient {
             }
         });
 
-        let mut response = tokio::time::timeout(self.timeout, sender.send_request(upstream_request))
-            .await
-            .map_err(|_| ProxyError::Timeout)?
-            .map_err(|e| ProxyError::Connection(e.to_string()))?;
+        let mut response =
+            tokio::time::timeout(self.timeout, sender.send_request(upstream_request))
+                .await
+                .map_err(|_| ProxyError::Timeout)?
+                .map_err(|e| ProxyError::Connection(e.to_string()))?;
 
         if response.status() != StatusCode::SWITCHING_PROTOCOLS {
             // The origin declined. Pass its answer back on the HTTP/2 stream,

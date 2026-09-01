@@ -514,9 +514,7 @@ mod upstream_version_tests {
         // h2c has no ALPN, so it must be declared; accept the spellings someone
         // would reasonably reach for.
         for spelling in ["h2c", "h2", "http2"] {
-            let toml_src = format!(
-                "address = \"127.0.0.1:8080\"\nhttp_version = \"{spelling}\""
-            );
+            let toml_src = format!("address = \"127.0.0.1:8080\"\nhttp_version = \"{spelling}\"");
             let backend: Backend = toml::from_str(&toml_src).unwrap();
             assert_eq!(
                 backend.http_version,
@@ -529,9 +527,7 @@ mod upstream_version_tests {
     #[test]
     fn test_backend_http11_aliases() {
         for spelling in ["http11", "http1"] {
-            let toml_src = format!(
-                "address = \"127.0.0.1:8080\"\nhttp_version = \"{spelling}\""
-            );
+            let toml_src = format!("address = \"127.0.0.1:8080\"\nhttp_version = \"{spelling}\"");
             let backend: Backend = toml::from_str(&toml_src).unwrap();
             assert_eq!(backend.http_version, UpstreamHttpVersion::Http11);
         }

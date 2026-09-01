@@ -58,10 +58,7 @@ pub fn build_server_config(cert_pem: &[u8], key_pem: &[u8]) -> ProxyResult<Arc<S
 }
 
 /// Load a certificate and key from disk and build a `ServerConfig`.
-pub async fn load_server_config(
-    cert_file: &str,
-    key_file: &str,
-) -> ProxyResult<Arc<ServerConfig>> {
+pub async fn load_server_config(cert_file: &str, key_file: &str) -> ProxyResult<Arc<ServerConfig>> {
     let cert_pem = tokio::fs::read(cert_file)
         .await
         .map_err(|e| ProxyError::Tls(format!("could not read {}: {}", cert_file, e)))?;

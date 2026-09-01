@@ -13,9 +13,9 @@ use crate::vendored::types::PathName;
 use hyper::body::Incoming;
 use hyper::server::conn::http2;
 use hyper::service::service_fn;
+use hyper::{Request, Response};
 use hyper_util::rt::{TokioExecutor, TokioIo};
 use hyper_util::server::conn::auto;
-use hyper::{Request, Response};
 use std::convert::Infallible;
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -476,7 +476,10 @@ impl ProxyService {
         // Tunnel an upgrade rather than treating it as request/response.
         if let Some(protocol) = upgrade_protocol {
             MessageHandler::restore_upgrade_headers(&mut forwarded_request, &protocol);
-            debug!("Upgrading connection to {} via {}", protocol, backend.address);
+            debug!(
+                "Upgrading connection to {} via {}",
+                protocol, backend.address
+            );
             return match self
                 .forwarder
                 .forward_upgrade(&backend, forwarded_request)
