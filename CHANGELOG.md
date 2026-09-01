@@ -72,6 +72,29 @@ a file" -- edits stay in memory as before.
 
 ### Changed
 
+**The conformance suites run on a schedule.** `.github/workflows/conformance.yml`
+runs the transport suites nightly (h2spec, Autobahn baseline and proxied, and a
+real ACME order against Pebble) and the dialect suites weekly (PostgREST and
+Hasura, which need PostGIS and a release build). Each job then **regenerates the
+website's data module and fails if the committed one has drifted** -- which is
+the point: every figure the site publishes is generated from a run's artifacts,
+and nothing was re-running those, so the numbers could go stale silently.
+
+Not on the pull-request path: each suite starts containers and replays hundreds
+of cases against two servers. Gating every PR on that would make the common case
+slow to catch an uncommon regression.
+
+HTTP Garden is deliberately not scheduled. It is a differential fuzzer that
+clones a GPL-3.0 repository and builds images for dozens of other HTTP servers;
+its value is in exploring inputs nobody thought of -- which is how it found the
+hop-by-hop defect -- not in re-running a fixed set. The reasoning is recorded in
+the workflow.
+
+**h2spec and Autobahn now work on Linux.** Both reach the proxy through
+`host.docker.internal`, which resolves only on Docker Desktop. They pass
+`--add-host host.docker.internal:host-gateway`, so they work on a CI runner as
+well as on a developer's Mac.
+
 **The MSRV is declared and checked: Rust 1.88.** It was not declared anywhere,
 while the README claimed 1.78, `docs/getting-started.md` claimed 1.75 and
 `CONTRIBUTING.md` claimed 1.75 -- three different wrong numbers. The floor is
