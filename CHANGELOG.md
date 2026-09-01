@@ -5,6 +5,33 @@ releases are described by their tags and the pull requests behind them.
 
 ## Unreleased
 
+### Fixed
+
+**HTTP domain verification proved nothing.** The endpoint serving the
+challenge, `/.well-known/postrust-verification/{token}`, computed
+`postrust-verify={token}` from whatever token was in the path and returned it.
+No database lookup, no host check -- so every token verified, for every
+domain. It now answers only for a challenge that is in the database, is not
+expired, is not already resolved, and whose domain matches the request's
+`Host`, and it returns the value stored when the challenge was issued rather
+than one recomputed at serve time.
+
+This was a broken control rather than a demonstrated takeover:
+`proxy_domains.domain` is globally unique, so a second tenant cannot register
+a domain another tenant already holds.
+
+**A verified domain asking for ACME was marked `provisioning`** when nothing
+would ever provision it, leaving it mid-issuance forever with no way to tell
+slow from never. It is now left `pending`, with a warning saying a certificate
+has to be supplied manually.
+
+**Documentation described endpoints that do not exist.**
+`docs/saas-domains.md` documented `PUT /domains/:id`,
+`POST /domains/:id/ssl/provision` and `POST /domains/:id/ssl/upload`, none of
+which are in the router, and omitted `enable` and `disable`, which are. It
+also advertised automatic ACME provisioning as a feature. Corrected against
+the router, and the SSL section now says plainly that no ACME client exists.
+
 ### Changed
 
 **`postrust-worker` moved to its own `0.x` version line** as well, for a

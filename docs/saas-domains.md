@@ -2,12 +2,20 @@
 
 > **Beta Feature** - This feature is currently in beta and will move to stable in Q2 2026. APIs may change before the stable release.
 
-Multi-tenant domain management API for SaaS applications. Allow your customers to bring their own custom domains with automatic SSL, domain verification, and reverse proxy routing.
+Multi-tenant domain management API for SaaS applications. Allow your customers to bring their own custom domains, with domain verification and reverse proxy routing.
+
+> **Automatic SSL is not implemented.** The schema tracks an `ssl_status` and a
+> domain can be configured with `ssl_provider = "acme"`, but nothing in the
+> proxy has ever talked to a certificate authority: no ACME order is placed and
+> no certificate is issued or renewed. Serve TLS from a certificate on disk
+> (`tls.cert_file` / `tls.key_file`) until this lands. See
+> [Stability and Versioning](./stability.md) — `postrust-proxy` is on a `0.x`
+> line precisely because of gaps like this one.
 
 ## Features
 
 - **Domain Verification**: DNS TXT and HTTP challenge methods
-- **SSL/TLS**: Automatic ACME (Let's Encrypt) + manual certificate upload
+- **SSL/TLS**: Not implemented — see the note above
 - **Authentication**: JWT + API Key dual authentication
 - **Multi-tenant**: Complete tenant isolation with quotas
 - **Dynamic Routing**: Per-domain routes without server restart
@@ -65,11 +73,10 @@ API keys are prefixed with `pk_` for identification and can have restricted scop
 | `GET` | `/api/v1/domains` | List domains |
 | `POST` | `/api/v1/domains` | Add domain |
 | `GET` | `/api/v1/domains/:id` | Get domain details |
-| `PUT` | `/api/v1/domains/:id` | Update domain |
 | `DELETE` | `/api/v1/domains/:id` | Remove domain |
 | `POST` | `/api/v1/domains/:id/verify` | Trigger verification |
-| `POST` | `/api/v1/domains/:id/ssl/provision` | Provision SSL via ACME |
-| `POST` | `/api/v1/domains/:id/ssl/upload` | Upload manual certificate |
+| `POST` | `/api/v1/domains/:id/enable` | Enable a verified domain |
+| `POST` | `/api/v1/domains/:id/disable` | Disable a domain |
 
 ### Routes
 
@@ -98,7 +105,6 @@ API keys are prefixed with `pk_` for identification and can have restricted scop
 | Method | Endpoint | Description |
 |--------|----------|-------------|
 | `GET` | `/.well-known/postrust-verification/:token` | HTTP verification challenge |
-| `GET` | `/.well-known/acme-challenge/:token` | ACME challenge (Let's Encrypt) |
 
 ## Domain Verification
 
@@ -157,30 +163,45 @@ curl -X POST http://localhost:8080/api/v1/domains \
   }'
 ```
 
-2. Serve the verification file at:
+2. The proxy serves the challenge itself, at:
 
 ```
 https://app.example.com/.well-known/postrust-verification/<token>
 ```
 
-Content: `postrust-verify=<token>`
+It answers only for a challenge that is in the database, unexpired, unresolved,
+and whose domain matches the request's `Host`.
 
 3. Trigger verification (same as DNS method).
 
+### Prefer DNS verification
+
+HTTP verification asks the claimant to serve content at a path on the domain —
+but once that domain's DNS points at this proxy, this proxy is what serves that
+path. Passing therefore shows that the domain resolves here and that a
+challenge was issued for it. It does not show that the claimant controls the
+domain.
+
+DNS verification does show control, because the TXT record can only be placed
+by whoever holds the zone. It is the default (`verification_method` defaults to
+`dns`), and it is the one to use for anything that matters.
+
 ## SSL/TLS Certificates
 
-### Automatic ACME Provisioning
+### Automatic ACME Provisioning — not implemented
 
-After domain verification, provision SSL automatically:
+There is no ACME client here. A domain with `ssl_provider = "acme"` that passes
+verification is left with `ssl_status = "pending"` and a warning in the log; it
+is not queued for issuance, because there is nothing to queue it with.
 
-```bash
-curl -X POST http://localhost:8080/api/v1/domains/<id>/ssl/provision \
-  -H "Authorization: ApiKey pk_live_abc123..."
-```
+Serve TLS from a certificate on disk instead — set `tls.cert_file` and
+`tls.key_file`, which also gives you ALPN, so HTTP/2 and `wss://` work.
 
-This uses Let's Encrypt to issue and automatically renew certificates.
+`docker-compose.yml` carries a Pebble and challtestsrv pair behind the `acme`
+profile, ready for when an issuance flow is written against a CA that
+deliberately misbehaves.
 
-### Manual Certificate Upload
+### Manual Certificate Upload — not implemented
 
 For custom certificates:
 
@@ -408,24 +429,20 @@ DOMAIN_ID=$(curl -s -X POST http://localhost:8080/api/v1/domains \
 curl -X POST "http://localhost:8080/api/v1/domains/$DOMAIN_ID/verify" \
   -H "Authorization: ApiKey $API_KEY"
 
-# 4. Provision SSL
-curl -X POST "http://localhost:8080/api/v1/domains/$DOMAIN_ID/ssl/provision" \
-  -H "Authorization: ApiKey $API_KEY"
-
-# 5. Create upstream
+# 4. Create upstream
 UPSTREAM_ID=$(curl -s -X POST http://localhost:8080/api/v1/upstreams \
   -H "Authorization: ApiKey $API_KEY" \
   -H "Content-Type: application/json" \
   -d '{"name": "backend", "lb_strategy": "round_robin"}' \
   | jq -r '.data.id')
 
-# 6. Add backend server
+# 5. Add backend server
 curl -X POST "http://localhost:8080/api/v1/upstreams/$UPSTREAM_ID/backends" \
   -H "Authorization: ApiKey $API_KEY" \
   -H "Content-Type: application/json" \
   -d '{"address": "10.0.0.1:8080", "scheme": "http"}'
 
-# 7. Create route
+# 6. Create route
 curl -X POST "http://localhost:8080/api/v1/domains/$DOMAIN_ID/routes" \
   -H "Authorization: ApiKey $API_KEY" \
   -H "Content-Type: application/json" \
