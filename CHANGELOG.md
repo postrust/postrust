@@ -3,6 +3,66 @@
 Notable changes, newest first. This file starts at 1.0.0-alpha.1; earlier
 releases are described by their tags and the pull requests behind them.
 
+## 1.0.0-alpha.2
+
+A release about the front door rather than the dialects. The HTTP proxy was
+library-only and, it turned out, had never routed a request from a file
+config; fixing that made it testable, and testing it found the rest.
+
+**Still an alpha.** Same caveat as before: the surfaces are measured, the
+public Rust API is not settled.
+
+### Fixed
+
+**File-configured routing answered every request with 503.** Route and
+upstream registration both guarded on a `Uuid` that only the database path
+ever sets, so a proxy started from a TOML file logged its routes and then
+failed to match any of them.
+
+**Hop-by-hop headers were forwarded to origins**, against RFC 9110 section
+7.6.1 in two ways: `Connection` is itself hop-by-hop, and the headers it names
+must be removed. A client could smuggle arbitrary headers past the proxy.
+
+**A request carrying both `Content-Length` and `Transfer-Encoding` is now
+rejected** rather than normalised. RFC 9112 section 6.1 gives `Transfer-Encoding`
+precedence, but a proxy that quietly resolves the disagreement is how a
+smuggling chain starts.
+
+**`TCP_NODELAY` was set on no socket at all** -- not the accepted connection,
+not the upgrade connection, not the pooled connector -- so Nagle batched small
+writes and added latency to every small forwarded response.
+
+### Added
+
+**TLS with ALPN.** `tls.cert_file` and `tls.key_file` start an HTTPS listener
+that offers `h2` and `http/1.1` and dispatches on what was negotiated. Before
+this, `https_host` and `https_port` were configuration that nothing listened
+on, which left HTTP/2 reachable only as cleartext and WebSocket only as `ws://`.
+
+**HTTP/2.** h2c on the cleartext port alongside HTTP/1.1, h2 over TLS by ALPN,
+an optional HTTP/2-only port (`http2_port`), and a per-backend upstream
+protocol (`http_version = "h2c"`), since h2c has no ALPN to negotiate with.
+
+**WebSocket**, over HTTP/1.1 and over TLS, and over HTTP/2 by extended CONNECT
+(RFC 8441) translated into an HTTP/1.1 upgrade for the origin.
+
+**A runnable binary.** `postrust-proxy <config.toml>`. The crate was a library
+with no entry point, so nothing external could be pointed at it.
+
+### Measured
+
+Three conformance suites, wired up and runnable from `scripts/`:
+
+**HTTP Garden** -- a differential fuzzer for proxies; the harness that found
+the hop-by-hop defect. 7 of 7 probes correct.
+
+**h2spec** -- 146 tests, 145 passed, 1 skipped, 0 failed.
+
+**Autobahn** -- 517 cases, 502 OK, 0 failed, and no case worse than a baseline
+run that bypasses the proxy. The baseline matters: postrust splices WebSocket
+streams rather than parsing frames, so most of what Autobahn scores belongs to
+the origin behind it.
+
 ## 1.0.0-alpha.1
 
 The release where both surfaces stop being asserted and start being measured.
