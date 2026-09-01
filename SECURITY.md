@@ -53,7 +53,7 @@ a release that also breaks their API. See
 
 | Version | Supported |
 | --- | --- |
-| `1.0.0-alpha.2` and later | yes |
+| `1.0.0-beta.1` and later | yes |
 | everything earlier | no — upgrade |
 
 ## Scope

@@ -9,43 +9,51 @@ import {
   hasuraAgreement,
 } from "~/data/hasura-conformance";
 
-const VERSION = "1.0.0-alpha.2";
+const VERSION = "1.0.0-beta.1";
 
 const added = [
   {
-    title: "TLS, and with it HTTP/2 as clients actually use it",
-    body: "tls.cert_file and tls.key_file start an HTTPS listener that offers h2 and http/1.1 by ALPN and dispatches on what was negotiated rather than sniffing for it. Before this, https_host and https_port were configuration nothing listened on, which left HTTP/2 reachable only in cleartext and WebSocket only as ws://.",
+    title: "Automatic SSL, actually implemented",
+    body: "A verified domain asking for ACME is queued, and a background worker places the order, answers the HTTP-01 challenge and renews the certificate 30 days before it expires. The documentation had advertised this as a feature and the schema had tracked an ssl_status the whole time, while nothing in the crate had ever spoken to a certificate authority. Tested end to end against Pebble — Let's Encrypt's test CA, which deliberately misbehaves — through the challenge endpoint that ships.",
   },
   {
-    title: "HTTP/2",
-    body: "h2c alongside HTTP/1.1 on the cleartext port, h2 over TLS by ALPN, an optional HTTP/2-only port, and a per-backend upstream protocol — h2c has no ALPN to negotiate with, so a backend that speaks it has to say so. HTTP/2 is per-hop: the version a client arrives with never carries onto the upstream connection.",
+    title: "The endpoints the documentation promised",
+    body: "Updating a domain, uploading your own certificate, and asking for issuance were all documented and none was in the router. An uploaded certificate is checked before it is stored: the key must match the chain, it must not be expired, and it must cover the domain, wildcards counting for exactly one label. Skipping any of those gives a listener that accepts the upload and then fails every handshake.",
   },
   {
-    title: "WebSocket, including over HTTP/2",
-    body: "Over HTTP/1.1, over TLS as wss://, and over HTTP/2 by extended CONNECT (RFC 8441) translated into an HTTP/1.1 upgrade for the origin. The two handshakes are not the same conversation: HTTP/2 sends no Sec-WebSocket-Key, so the proxy generates one for the origin, and success is 200 rather than a 101 that means nothing on a multiplexed stream.",
+    title: "Database-backed configuration that reads and writes",
+    body: "Loading routes from the database returned an empty set behind a TODO, so a proxy pointed at one started, logged nothing wrong and answered every request with 503. The admin API replied 201 and persisted nothing. Both are real now, over three new tables — one of which the certificate store had been querying since it was written and which nothing had ever created.",
   },
   {
-    title: "A runnable proxy",
-    body: "postrust-proxy <config.toml>. The crate was a library with no entry point, so nothing external could be pointed at it — not a conformance suite, not a load generator, not a browser. Most of what follows was only findable once something could be.",
+    title: "A declared and enforced minimum Rust version",
+    body: "It was declared nowhere, while the README said 1.78 and the docs said 1.75. The floor is 1.88, established by building on it and by 1.87 being refused, and a CI job now checks it against the locked dependency set.",
+  },
+  {
+    title: "Conformance on a schedule, and a security policy",
+    body: "The suites that produce every figure on this site run nightly and weekly, and each regenerates the published data and fails if it has drifted. Nothing had been re-running them. SECURITY.md says how to report privately and what is in scope, and cargo audit runs on every pull request.",
   },
 ];
 
 const fixed = [
   {
-    title: "A file-configured proxy answered every request with 503",
-    body: "Route and upstream registration both guarded on an identifier that only the database path ever sets, so a proxy started from a TOML file logged the routes it had loaded and then matched none of them.",
+    title: "HTTP domain verification proved nothing",
+    body: "The endpoint serving the ownership challenge computed the expected content from whatever token was in the path and returned it, with no database lookup and no host check — so every token verified, for every domain whose DNS pointed at the proxy. It now answers only for a challenge that exists, is unexpired, is unresolved, and whose domain matches the request.",
   },
   {
-    title: "Hop-by-hop headers were forwarded to origins",
-    body: "Connection is itself hop-by-hop and the headers it names must be removed before forwarding; neither happened. A client could name any header in Connection and have it arrive at the origin unchanged — a request-smuggling and cache-poisoning vector, and the first thing the differential fuzzer found.",
+    title: "Host-based routing did not work over HTTP/2",
+    body: "Route selection read only the Host header, and HTTP/2 has none — the authority arrives on the URI instead. The same host-matched route answered 200 over HTTP/1.1 and 404 over HTTP/2. Found by running it, not by reading it.",
   },
   {
-    title: "Content-Length and Transfer-Encoding together were accepted",
-    body: "The spec gives Transfer-Encoding precedence, but a proxy that quietly resolves the disagreement is how a smuggling chain starts. Such a request is now refused with 400, which is how the HTTP library already treats a duplicate Content-Length.",
+    title: "Every parameterised route would panic when first used",
+    body: "Twenty-three routes across the admin and multi-tenant APIs used a path syntax the web framework had stopped accepting. Neither router is mounted anywhere, so none had ever been called and nothing had noticed.",
   },
   {
-    title: "TCP_NODELAY was set on no socket at all",
-    body: "Not the accepted connection, not the upgrade connection, not the pooled upstream connector. Nagle batched small writes and, with delayed acknowledgement at the far end, added latency to every small forwarded response.",
+    title: "Route matching honoured half of what you could declare",
+    body: "Path-match type, methods and header criteria were all declarable and all ignored, and each silent omission widened a route past what its author wrote: an exact match on /health also caught /health-internal, and a route restricted to GET accepted DELETE.",
+  },
+  {
+    title: "Twelve dependency advisories, five of them in certificate validation",
+    body: "An X.509 name-constraint bypass, two PKCS7 validation bypasses, a CRL scope error and a timing side channel — all in the path of a proxy that terminates TLS — plus four in the certificate-chain verifier and unbounded empty frames in the HTTP/2 library.",
   },
 ];
 
@@ -197,11 +205,19 @@ export default component$(() => {
           {/* Alpha */}
           <section class="mb-12">
             <div class="p-5 rounded-lg bg-amber-50 border border-amber-200">
-              <h2 class="text-lg font-bold text-neutral-900 mb-2">What the alpha means</h2>
+              <h2 class="text-lg font-bold text-neutral-900 mb-2">What the beta means</h2>
               <p class="text-neutral-700 mb-2">
-                The surfaces are measured. The public Rust API has not been lived with by anyone
-                outside the repository, and a prerelease carries no stability promise — expect it
-                to move before 1.0.0.
+                Everything on the checklist for a stable release is done except the one thing that
+                cannot be done from inside the repository: being used by somebody outside it. That
+                is what this beta is for.
+              </p>
+              <p class="text-neutral-700 mb-2">
+                Seven crates share this version and will carry a semver promise at 1.0.0.{" "}
+                <code class="text-sm">postrust-proxy</code> and{" "}
+                <code class="text-sm">postrust-worker</code> are on their own 0.x lines and carry
+                none — the proxy because its surface is wide and nobody outside this repository has
+                depended on it yet, the worker because it is a stub. Nothing in the stable line
+                depends on either.
               </p>
               <p class="text-neutral-700">
                 The HTTP and GraphQL surfaces are the part meant to be stable. If you are pointing
@@ -251,25 +267,33 @@ export default component$(() => {
             </p>
             <ul class="space-y-2 text-neutral-600">
               <li>
-                <code class="font-mono text-sm">Backend</code> gained{" "}
-                <code class="font-mono text-sm">http_version</code>,{" "}
-                <code class="font-mono text-sm">ServerConfig</code> gained{" "}
-                <code class="font-mono text-sm">http2_port</code>, and{" "}
-                <code class="font-mono text-sm">TlsConfig</code> gained{" "}
-                <code class="font-mono text-sm">cert_file</code> and{" "}
-                <code class="font-mono text-sm">key_file</code>. None is{" "}
-                <code class="font-mono text-sm">#[non_exhaustive]</code> yet, so a struct literal
-                downstream needs updating; marking them is still planned during the alpha series.
+                <strong>The minimum Rust version is 1.88.</strong> It was previously undeclared,
+                and the README claimed 1.78. The floor moved as a direct cost of the security
+                updates below, which was a trade worth making.
               </li>
               <li>
-                A proxy that relied on <code class="font-mono text-sm">Connection</code> or the
-                headers it names reaching the origin will no longer see them. That was the
-                vulnerability, not a feature, but it is a behaviour change.
+                <strong>
+                  <code class="font-mono text-sm">postrust-proxy</code> and{" "}
+                  <code class="font-mono text-sm">postrust-worker</code> left the shared version.
+                </strong>{" "}
+                They are on their own 0.x lines. Both still release on the same tags; nothing in
+                the stable line depends on either.
               </li>
               <li>
-                A request carrying both <code class="font-mono text-sm">Content-Length</code> and{" "}
-                <code class="font-mono text-sm">Transfer-Encoding</code> is now refused rather
-                than forwarded.
+                <code class="font-mono text-sm">POST /config/reload</code> is gone. It answered
+                &ldquo;Configuration reload requested&rdquo; and reloaded nothing, sending on a
+                channel nobody read. Changing configuration needs a restart, which is now what the
+                documentation says.
+              </li>
+              <li>
+                A route declaring a path-match type, methods or header criteria now has them
+                enforced. They were previously ignored, so such a route matched{" "}
+                <em>more</em> traffic than it asked for &mdash; narrowing it is the fix, but it is
+                a behaviour change.
+              </li>
+              <li>
+                The proxy&rsquo;s database-access layer and its row types are no longer public.
+                They mirror the schema, and publishing them would have frozen it.
               </li>
             </ul>
           </section>
@@ -286,6 +310,11 @@ export default component$(() => {
               a port that sniffs its protocol cannot tell a corrupted preface from a malformed
               HTTP/1 request. That is why the dedicated port exists, and why it is optional rather
               than the default.
+            </p>
+            <p class="text-neutral-600 mb-4">
+              Also in the proxy: <code class="font-mono text-sm">retry_count</code> on a route is
+              declarable and unread, and there is no configuration reload. Manual certificate
+              upload works; automatic issuance is HTTP-01 only, so no wildcards.
             </p>
             <p class="text-neutral-600 mb-4">
               In the dialects, unchanged from the previous alpha: the largest gap is{" "}
@@ -341,13 +370,13 @@ export default component$(() => {
 });
 
 export const head: DocumentHead = {
-  title: `Postrust ${VERSION} — the front door, measured`,
+  title: `Postrust ${VERSION} — measured, and honest about the rest`,
   links: [{ rel: "canonical", href: "https://postrust.org/releases" }],
   meta: [
     {
       name: "description",
       content:
-        "Postrust 1.0.0-alpha.2: TLS with ALPN, HTTP/2 and WebSocket in the proxy, and the hop-by-hop and framing defects found by wiring up three HTTP conformance suites.",
+        "Postrust 1.0.0-beta.1: ACME certificate issuance tested against a real CA, database-backed proxy configuration, a declared and enforced MSRV, and twelve dependency advisories closed.",
     },
   ],
 };

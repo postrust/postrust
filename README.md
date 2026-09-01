@@ -16,12 +16,12 @@
 
 ## What is Postrust?
 
-Postrust is a high-performance, serverless-first REST API server for PostgreSQL databases. Inspired by [PostgREST](https://postgrest.org), it automatically generates a RESTful API from your database schema, supporting filtering, pagination, embedding, and full CRUD operations.
+Postrust is a serverless-first REST API server for PostgreSQL databases. Inspired by [PostgREST](https://postgrest.org), it automatically generates a RESTful API from your database schema, supporting filtering, pagination, embedding, and full CRUD operations.
 
 **Why Postrust?**
 
 - **Serverless-first**: Native support for AWS Lambda and Cloudflare Workers
-- **Fast**: Written in Rust for maximum performance and minimal cold starts
+- **Measured**: Conformance against PostgREST's and Hasura's own test corpora, re-run on a schedule. Throughput figures are withdrawn until the harness can be trusted — see [Benchmarks](#benchmarks)
 - **Compatible**: Familiar PostgREST-style API; near drop-in with an opt-in [compatibility mode](#postgrest-compatibility) (see [Differences from PostgREST](#differences-from-postgrest))
 - **Type-safe**: Parameterized queries prevent SQL injection by design
 - **Lightweight**: Single binary with no runtime dependencies

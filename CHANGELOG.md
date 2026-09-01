@@ -3,7 +3,28 @@
 Notable changes, newest first. This file starts at 1.0.0-alpha.1; earlier
 releases are described by their tags and the pull requests behind them.
 
-## Unreleased
+## 1.0.0-beta.1
+
+Everything on the checklist for a stable release is done except the one thing
+that cannot be done from inside the repository: exposure to somebody outside
+it. Hence beta rather than 1.0.0.
+
+**What the version numbers now mean.** Seven crates share `1.0.0-beta.1` and a
+semver promise once it lands. `postrust-proxy` and `postrust-worker` are on
+their own `0.x` lines and carry none -- the proxy because its surface is wide
+and nobody outside this repository has depended on it yet, the worker because
+it is a stub. Nothing in the stable line depends on either. See
+[docs/stability.md](docs/stability.md).
+
+**Throughput figures remain withdrawn**, and are not restored by attributing
+them to the release that produced them. `scripts/BENCH-FINDINGS.md` records why:
+the same server measured seconds apart differed by about a factor of two, and
+whatever ran first was the most understated, so run order determined the
+published ratios. Changing only the measurement window moved point lookup
+against PostgREST from 3.35x to 1.11x. The figures are a property of the
+harness, not of a version. The precondition for publishing again is in that
+file.
+
 
 ### Added
 

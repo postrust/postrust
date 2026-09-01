@@ -13,7 +13,7 @@ members = [
 ]
 
 [workspace.package]
-version = "1.0.0-alpha.2"
+version = "1.0.0-beta.1"
 edition = "2021"
 # Verified, not assumed: 1.88.0 builds the workspace clean and 1.87.0 is
 # refused outright -- hickory-{net,proto,resolver} 0.26 and time 0.3.55 all
@@ -120,11 +120,11 @@ toml = "0.8"
 regex = "1"
 
 # Internal crates
-postrust-core = { version = "1.0.0-alpha.2", path = "crates/postrust-core" }
-postrust-sql = { version = "1.0.0-alpha.2", path = "crates/postrust-sql" }
-postrust-auth = { version = "1.0.0-alpha.2", path = "crates/postrust-auth" }
-postrust-response = { version = "1.0.0-alpha.2", path = "crates/postrust-response" }
-postrust-graphql = { version = "1.0.0-alpha.2", path = "crates/postrust-graphql" }
+postrust-core = { version = "1.0.0-beta.1", path = "crates/postrust-core" }
+postrust-sql = { version = "1.0.0-beta.1", path = "crates/postrust-sql" }
+postrust-auth = { version = "1.0.0-beta.1", path = "crates/postrust-auth" }
+postrust-response = { version = "1.0.0-beta.1", path = "crates/postrust-response" }
+postrust-graphql = { version = "1.0.0-beta.1", path = "crates/postrust-graphql" }
 
 [profile.release]
 lto = true
