@@ -7,9 +7,8 @@
 //!         cargo test -p postrust-proxy --test config_persistence -- --ignored
 //!
 //! Each test applies the migration itself rather than relying on the schema
-//! having been loaded. It is `CREATE TABLE IF NOT EXISTS` throughout, so that
-//! is idempotent, and it means these run against any empty database without a
-//! setup step to forget.
+//! having been loaded, so these run against any empty database without a setup
+//! step to forget. That needs a lock -- see [`pool`].
 //!
 //! Every test namespaces its rows by a fresh UUID so the file can run in
 //! parallel with itself and with anything else using the same database.
@@ -30,15 +29,44 @@ use uuid::Uuid;
 
 const MIGRATION: &str = include_str!("../migrations/20260901000001_proxy_config.sql");
 
+/// Advisory lock id guarding the migration. Arbitrary but fixed, so every test
+/// in every binary contends on the same one.
+const MIGRATION_LOCK: i64 = 0x706f7374_72757374;
+
+/// Connect, and make sure the schema is there.
+///
+/// The lock is not belt-and-braces. `CREATE TABLE IF NOT EXISTS` is **not**
+/// race-safe: the existence check and the insert into `pg_type` are not atomic,
+/// so two connections running it at once both pass the check and one fails with
+///
+///     duplicate key value violates unique constraint "pg_type_typname_nsp_index"
+///
+/// With ten tests running in parallel that is not a rare race, it is the normal
+/// case -- it failed three of ten on the first CI run. It passed locally only
+/// because the tables already existed there, which made every `execute` a
+/// no-op and hid the create path entirely.
+///
+/// `pg_advisory_xact_lock` serialises them and is released by the commit, so
+/// the DDL and the lock live and die in one transaction.
 async fn pool() -> PgPool {
     let url = std::env::var("DATABASE_URL")
         .expect("DATABASE_URL must be set for the database-backed tests");
     let pool = PgPool::connect(&url)
         .await
         .expect("could not connect to DATABASE_URL");
-    pool.execute(MIGRATION)
+
+    let mut tx = pool.begin().await.expect("could not begin a transaction");
+    sqlx::query("SELECT pg_advisory_xact_lock($1)")
+        .bind(MIGRATION_LOCK)
+        .execute(&mut *tx)
+        .await
+        .expect("could not take the migration lock");
+    (&mut *tx)
+        .execute(MIGRATION)
         .await
         .expect("could not apply the proxy config migration");
+    tx.commit().await.expect("could not commit the migration");
+
     pool
 }
 
