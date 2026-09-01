@@ -144,6 +144,46 @@ pub async fn create_verification_challenge(
     Ok(())
 }
 
+/// A live HTTP verification challenge, with the domain it was issued for.
+pub struct HttpChallenge {
+    /// The domain the challenge belongs to. The endpoint serving the challenge
+    /// must refuse to answer for any other host.
+    pub domain: String,
+    /// The content the verifier expects, as stored when the challenge was
+    /// issued. Never recomputed from the token at serve time.
+    pub expected_value: String,
+}
+
+/// Look up a live HTTP verification challenge by its token.
+///
+/// Returns `None` for a token that does not exist, one that has expired, and
+/// one whose challenge is already resolved. The caller must additionally check
+/// that the request arrived for [`HttpChallenge::domain`]: a token is a
+/// bearer secret for exactly one domain, and answering with it on any other
+/// host hands that secret to whoever asked.
+pub async fn find_live_http_challenge(
+    pool: &PgPool,
+    token: &str,
+) -> ProxyResult<Option<HttpChallenge>> {
+    let row = sqlx::query(
+        "SELECT d.domain, c.expected_value \
+         FROM proxy_verification_challenges c \
+         JOIN proxy_domains d ON d.id = c.domain_id \
+         WHERE c.token = $1 \
+           AND c.challenge_type = 'http' \
+           AND c.status IN ('pending', 'checking') \
+           AND c.expires_at > NOW()",
+    )
+    .bind(token)
+    .fetch_optional(pool)
+    .await?;
+
+    Ok(row.map(|row| HttpChallenge {
+        domain: row.get("domain"),
+        expected_value: row.get("expected_value"),
+    }))
+}
+
 /// Fetch a domain scoped to a tenant.
 pub async fn get_domain_for_tenant(
     pool: &PgPool,
