@@ -2,8 +2,14 @@
 //!
 //! Deploys Postrust as a Cloudflare Worker.
 //!
-//! Note: This is a stub implementation. Full implementation requires
-//! Cloudflare-specific features like Hyperdrive for database connections.
+//! **This is a stub.** The fetch handler answers with a JSON body saying so;
+//! it does not parse requests, reach a database, or return data. A real
+//! implementation needs Cloudflare-specific pieces that are not here yet:
+//! Hyperdrive for database connections, and KV or Durable Objects for the
+//! schema cache.
+//!
+//! Because of that the crate is on its own 0.x version line rather than the
+//! workspace's, and carries no stability promise. See docs/stability.md.
 
 use worker::*;
 

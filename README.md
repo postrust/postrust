@@ -471,15 +471,22 @@ Postrust crates at the same version work together. Browse them at
 | `postrust-response` | Response formatting (JSON, CSV, OpenAPI) | [crates.io](https://crates.io/crates/postrust-response) · [docs](https://docs.rs/postrust-response) |
 | `postrust-graphql` | GraphQL API with dynamic schema generation | [crates.io](https://crates.io/crates/postrust-graphql) · [docs](https://docs.rs/postrust-graphql) |
 | `postrust-lambda` | AWS Lambda adapter | [crates.io](https://crates.io/crates/postrust-lambda) · [docs](https://docs.rs/postrust-lambda) |
-| `postrust-worker` | Cloudflare Workers adapter | [crates.io](https://crates.io/crates/postrust-worker) · [docs](https://docs.rs/postrust-worker) |
+| `postrust-worker` | Cloudflare Workers adapter — **stub; `0.x`, no stability promise** | [crates.io](https://crates.io/crates/postrust-worker) · [docs](https://docs.rs/postrust-worker) |
 | `postrust-proxy` | Reverse proxy with load balancing and automatic TLS — **`0.x`, no stability promise** | [crates.io](https://crates.io/crates/postrust-proxy) · [docs](https://docs.rs/postrust-proxy) |
 
-Every crate above except `postrust-proxy` shares one version and one semver
-promise. `postrust-proxy` is on its own `0.x` line: it is useful and it is
-measured against h2spec, Autobahn and the HTTP Garden differential fuzzer, but
-parts of its public surface are undocumented or not yet wired up, and a shared
-version number would promise a stability it cannot keep. Nothing else depends
-on it. See [Stability and Versioning](docs/stability.md).
+The first seven crates share one version and one semver promise. The last two
+are each on their own `0.x` line and carry none:
+
+- `postrust-proxy` is useful and measured — h2spec, Autobahn, and the HTTP
+  Garden differential fuzzer — but parts of its public surface are
+  undocumented, and a shared version number would promise a stability it
+  cannot keep.
+- `postrust-worker` is a stub. It answers `{"status": "stub"}` and needs
+  Cloudflare Hyperdrive and a KV-backed schema cache before it does anything
+  else.
+
+Nothing in the stable line depends on either. See
+[Stability and Versioning](docs/stability.md).
 
 ## Development
 

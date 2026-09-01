@@ -7,6 +7,11 @@ releases are described by their tags and the pull requests behind them.
 
 ### Changed
 
+**`postrust-worker` moved to its own `0.x` version line** as well, for a
+blunter reason: it is a stub. Its fetch handler answers `{"status": "stub"}`
+and does not parse requests, reach a database, or return data. It is built as
+a `cdylib`, so it cannot be a Rust library dependency at all.
+
 **`postrust-proxy` moved to its own `0.x` version line** and no longer shares
 the workspace version. The rest of the workspace is heading for 1.0.0 and a
 semver promise; this crate is not ready to make one. Turning `missing_docs` on
