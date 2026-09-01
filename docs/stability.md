@@ -49,14 +49,11 @@ Not caution for its own sake. Three specific things:
 8 associated functions, 5 structs, 2 methods. `dead_code` adds 4 more. A 1.0.0
 would freeze all of it as-is.
 
-**Parts of it answer successfully without doing anything.**
-`config::database::load_from_database` returns an empty route set rather than
-querying, so a proxy configured against a database starts, logs nothing wrong,
-and refuses every request. The admin API's route and upstream mutations return
-`200`/`201` after changing only the in-memory config; a restart discards them.
-SaaS domain provisioning does not trigger ACME. These are marked in the source,
-and each needs to be implemented, made to fail loudly, or removed before the
-crate can promise anything.
+**Automatic SSL provisioning is not implemented.** A domain can be configured
+with `ssl_provider = "acme"` and the schema tracks an `ssl_status`, but nothing
+in the crate has ever talked to a certificate authority. A verified domain is
+left `pending` with a warning rather than claiming to be provisioning. See
+[SaaS Domain Management](./saas-domains.md).
 
 **It has only just grown its transport layer.** TLS, HTTP/2, WebSocket and
 RFC 8441 extended CONNECT all landed in `1.0.0-alpha.2`. They are measured, by
