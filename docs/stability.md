@@ -45,15 +45,14 @@ anything yet.
 Not caution for its own sake. Three specific things:
 
 **The public surface is largely undocumented.** Turning `missing_docs` on for
-`postrust-proxy` produces 306 warnings — 266 struct fields, 25 enum variants,
-8 associated functions, 5 structs, 2 methods. `dead_code` adds 4 more. A 1.0.0
-would freeze all of it as-is.
+`postrust-proxy` produces hundreds of warnings, most of them struct fields. A
+1.0.0 would freeze all of it as it stands. `cargo clippy` with the crate-level
+`allow`s removed is the current count.
 
-**Automatic SSL provisioning is not implemented.** A domain can be configured
-with `ssl_provider = "acme"` and the schema tracks an `ssl_status`, but nothing
-in the crate has ever talked to a certificate authority. A verified domain is
-left `pending` with a warning rather than claiming to be provisioning. See
-[SaaS Domain Management](./saas-domains.md).
+**Manual certificate upload is not implemented.** ACME issuance is, and is
+tested against a real CA, but a tenant that wants to supply its own certificate
+has no endpoint to do it through. `ssl_provider = "manual"` is a state the
+schema can hold and nothing acts on.
 
 **It has only just grown its transport layer.** TLS, HTTP/2, WebSocket and
 RFC 8441 extended CONNECT all landed in `1.0.0-alpha.2`. They are measured, by

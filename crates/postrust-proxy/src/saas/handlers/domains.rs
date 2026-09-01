@@ -165,3 +165,43 @@ pub async fn disable_domain(
         Err(e) => error_response(e).into_response(),
     }
 }
+
+/// Requeue a domain whose certificate issuance failed.
+///
+/// `POST /domains/{id}/ssl/retry`. There is deliberately no `provision`
+/// endpoint: verification already queues a domain, and issuance is a worker
+/// rather than a request. See [`crate::saas::ssl`].
+///
+/// Clears the attempt count and the recorded error so the worker picks the
+/// domain up on its next pass, rather than waiting out a backoff computed for a
+/// cause the caller has just fixed.
+#[cfg(feature = "acme")]
+pub async fn retry_ssl(
+    State(state): State<SaasState>,
+    Auth(auth): Auth,
+    Path(id): Path<Uuid>,
+) -> impl IntoResponse {
+    if !auth.can_write("domains") {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(ApiResponse::<()>::error("Insufficient permissions")),
+        )
+            .into_response();
+    }
+
+    match crate::saas::ssl::reset_for_retry(&state.pool, id, auth.tenant_id).await {
+        Ok(true) => Json(ApiResponse::success(())).into_response(),
+        // Scoped to the tenant and to ssl_provider = 'acme', so a miss is
+        // either "not yours" or "not an ACME domain". Both are a 404 here
+        // rather than a 403, so the response does not reveal that the id
+        // belongs to somebody else.
+        Ok(false) => (
+            StatusCode::NOT_FOUND,
+            Json(ApiResponse::<()>::error(
+                "No such ACME domain for this tenant",
+            )),
+        )
+            .into_response(),
+        Err(e) => error_response(e).into_response(),
+    }
+}

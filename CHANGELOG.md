@@ -5,34 +5,50 @@ releases are described by their tags and the pull requests behind them.
 
 ## Unreleased
 
-### Security
+### Added
 
-**Twelve dependency advisories fixed** by updating the lockfile, including five
-in `aws-lc-sys` (X.509 name-constraint bypass via wildcard/Unicode CN, two
-PKCS7 signature and chain validation bypasses, a CRL distribution-point scope
-error, an AES-CCM timing side channel) and four in `rustls-webpki` (a reachable
-panic in CRL parsing, URI name constraints incorrectly accepted, and two more
-CRL and wildcard issues). All of these are in the path of a TLS-terminating
-proxy. Also `bytes`, `h2` (unbounded empty DATA frames), `time`, `anyhow`,
-`event-listener` and both `rand` majors.
+**Automatic SSL via ACME, over HTTP-01.** `docs/saas-domains.md` advertised
+this as a feature and the schema tracked an `ssl_status`, but nothing in the
+crate had ever talked to a certificate authority.
 
-**`hickory-resolver` 0.24 to 0.26**, clearing an O(n²) name-compression CPU
-exhaustion in `hickory-proto`. The upgrade is a real API migration, and one
-part of it would have broken silently: 0.26 replaced the rdata iterator with
-`Lookup::answers()`, and `Record`'s `Display` renders the whole record line
-(`name ttl class type rdata`), so the previous `record.to_string()` would never
-have matched a bare challenge token again. Every DNS verification would have
-failed. The comparison now lives in a tested function, `txt_matches`, with a
-case asserting that a full record line does *not* match.
+A verified domain with `ssl_provider = "acme"` is queued, and a background
+worker (`saas::ssl`) places the order, answers the challenge, stores the
+certificate, and renews it 30 days before expiry. Failures record `ssl_error`
+and retry with exponential backoff, capped at four hours, giving up after ten
+attempts; `POST /domains/{id}/ssl/retry` requeues one. There is deliberately no
+`provision` endpoint -- issuance is several round trips plus a challenge fetch
+the CA has to make back to us, which does not belong in a request.
 
-**A dependency audit now runs in CI.** `cargo audit --deny warnings`, with
-three documented ignores in `.cargo/audit.toml` -- one advisory with no
-reachable code path and no upstream fix (`rsa`, not in any build graph), and
-two unmaintained crates with the migration each needs written down. The job is
-verified green rather than added and hoped for.
+Three tables came with it, including **`proxy_certificates`, which
+`CertificateStore` had queried since it was written and which nothing ever
+created** -- so every certificate save had failed with "relation
+proxy_certificates does not exist".
 
-**`SECURITY.md`** added: how to report privately, what to expect, what is in
-scope, and the known-and-documented weaknesses that are not reports.
+Tested end to end against [Pebble](https://github.com/letsencrypt/pebble),
+Let's Encrypt's deliberately-misbehaving test CA, through the shipped
+`/.well-known/acme-challenge/{token}` handler: `scripts/acme/run.sh`.
+
+**`rustls-acme` was replaced by `instant-acme`** rather than adding a second
+ACME client. The old wrapper took a fixed domain list, which cannot serve a
+tenant domain that arrives while the proxy is running, and was never
+constructed anywhere. Keeping both also resolved two copies of `rcgen`.
+
+**Database-backed proxy configuration actually reads and writes.**
+`config::load_from_database` was two `// TODO: Implement database query`
+comments returning `Ok(Vec::new())`, so a proxy pointed at a database started,
+logged nothing wrong, and answered every request with 503 -- the same failure
+that file-configured routing had before `1.0.0-alpha.2`. It now loads real
+routes and upstreams from three new tables
+(`migrations/20260901000001_proxy_config.sql`), and `postrust-proxy` merges
+them into a file-bootstrapped config when `DATABASE_URL` is set.
+
+**The admin API persists.** Its route, upstream and backend mutations replied
+`200`/`201` after changing only the in-memory config, behind eight
+`// TODO: Persist to database` comments, so every change vanished on restart
+while reporting success. They now write through before touching the running
+config, and report a failure to persist as a 500 rather than a success. With
+`server.database_config = false` -- an explicit "this proxy is configured from
+a file" -- edits stay in memory as before.
 
 ### Changed
 
@@ -66,26 +82,18 @@ skips what is already on crates.io.
 New: [docs/stability.md](docs/stability.md), stating what a version number
 covers and what it does not.
 
-### Added
-
-**Database-backed proxy configuration actually reads and writes.**
-`config::load_from_database` was two `// TODO: Implement database query`
-comments returning `Ok(Vec::new())`, so a proxy pointed at a database started,
-logged nothing wrong, and answered every request with 503 -- the same failure
-that file-configured routing had before `1.0.0-alpha.2`. It now loads real
-routes and upstreams from three new tables
-(`migrations/20260901000001_proxy_config.sql`), and `postrust-proxy` merges
-them into a file-bootstrapped config when `DATABASE_URL` is set.
-
-**The admin API persists.** Its route, upstream and backend mutations replied
-`200`/`201` after changing only the in-memory config, behind eight
-`// TODO: Persist to database` comments, so every change vanished on restart
-while reporting success. They now write through before touching the running
-config, and report a failure to persist as a 500 rather than a success. With
-`server.database_config = false` -- an explicit "this proxy is configured from
-a file" -- edits stay in memory as before.
-
 ### Fixed
+
+**Every parameterised route in the proxy would panic at construction.** 23
+routes across `admin_router` and `saas_router` used axum 0.7's `:param` syntax,
+which axum 0.8 -- what the workspace has depended on for some time -- rejects:
+
+```
+Path segments must not start with `:`. For capture groups, use `{capture}`.
+```
+
+Neither router is mounted anywhere, so nothing had ever called them and nothing
+noticed. Found by an ACME test that needed to serve the real router.
 
 **HTTP domain verification proved nothing.** The endpoint serving the
 challenge, `/.well-known/postrust-verification/{token}`, computed
@@ -111,6 +119,35 @@ has to be supplied manually.
 which are in the router, and omitted `enable` and `disable`, which are. It
 also advertised automatic ACME provisioning as a feature. Corrected against
 the router, and the SSL section now says plainly that no ACME client exists.
+
+### Security
+
+**Twelve dependency advisories fixed** by updating the lockfile, including five
+in `aws-lc-sys` (X.509 name-constraint bypass via wildcard/Unicode CN, two
+PKCS7 signature and chain validation bypasses, a CRL distribution-point scope
+error, an AES-CCM timing side channel) and four in `rustls-webpki` (a reachable
+panic in CRL parsing, URI name constraints incorrectly accepted, and two more
+CRL and wildcard issues). All of these are in the path of a TLS-terminating
+proxy. Also `bytes`, `h2` (unbounded empty DATA frames), `time`, `anyhow`,
+`event-listener` and both `rand` majors.
+
+**`hickory-resolver` 0.24 to 0.26**, clearing an O(n²) name-compression CPU
+exhaustion in `hickory-proto`. The upgrade is a real API migration, and one
+part of it would have broken silently: 0.26 replaced the rdata iterator with
+`Lookup::answers()`, and `Record`'s `Display` renders the whole record line
+(`name ttl class type rdata`), so the previous `record.to_string()` would never
+have matched a bare challenge token again. Every DNS verification would have
+failed. The comparison now lives in a tested function, `txt_matches`, with a
+case asserting that a full record line does *not* match.
+
+**A dependency audit now runs in CI.** `cargo audit --deny warnings`, with
+three documented ignores in `.cargo/audit.toml` -- one advisory with no
+reachable code path and no upstream fix (`rsa`, not in any build graph), and
+two unmaintained crates with the migration each needs written down. The job is
+verified green rather than added and hoped for.
+
+**`SECURITY.md`** added: how to report privately, what to expect, what is in
+scope, and the known-and-documented weaknesses that are not reports.
 
 ## 1.0.0-alpha.2
 

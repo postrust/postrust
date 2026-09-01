@@ -73,25 +73,25 @@ pub fn admin_router() -> Router<Arc<ProxyState>> {
         // Routes
         .route("/routes", get(list_routes))
         .route("/routes", post(create_route))
-        .route("/routes/:id", get(get_route))
-        .route("/routes/:id", put(update_route))
-        .route("/routes/:id", delete(delete_route))
+        .route("/routes/{id}", get(get_route))
+        .route("/routes/{id}", put(update_route))
+        .route("/routes/{id}", delete(delete_route))
         // Upstreams
         .route("/upstreams", get(list_upstreams))
         .route("/upstreams", post(create_upstream))
-        .route("/upstreams/:id", get(get_upstream))
-        .route("/upstreams/:id", put(update_upstream))
-        .route("/upstreams/:id", delete(delete_upstream))
+        .route("/upstreams/{id}", get(get_upstream))
+        .route("/upstreams/{id}", put(update_upstream))
+        .route("/upstreams/{id}", delete(delete_upstream))
         // Backends
-        .route("/upstreams/:id/backends", get(list_backends))
-        .route("/upstreams/:id/backends", post(add_backend))
+        .route("/upstreams/{id}/backends", get(list_backends))
+        .route("/upstreams/{id}/backends", post(add_backend))
         .route(
-            "/upstreams/:id/backends/:backend_id",
+            "/upstreams/{id}/backends/{backend_id}",
             delete(remove_backend),
         )
         // Health
         .route("/health", get(health_status))
-        .route("/health/:backend_id", get(backend_health))
+        .route("/health/{backend_id}", get(backend_health))
         // Config
         .route("/config/reload", post(reload_config))
         // Stats

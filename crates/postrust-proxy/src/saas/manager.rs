@@ -158,22 +158,19 @@ impl DomainManager {
                 db::update_verification_status(&self.pool, id, VerificationStatus::Verified)
                     .await?;
 
-                // A domain asking for ACME stays `pending`, not `provisioning`.
+                // A domain asking for ACME is queued, not marked
+                // `provisioning`.
                 //
-                // Nothing here has ever talked to a CA: no order is placed and
-                // `/.well-known/acme-challenge/{token}` has no authorization to
-                // serve. Writing `provisioning` claimed work was under way, so
-                // the API reported a domain as mid-issuance forever and an
-                // operator watching that field had no way to tell the
-                // difference between slow and never. `pending` is what is
-                // actually true -- verified, and waiting for a certificate
-                // somebody still has to supply.
+                // `pending` is the worker's inbox: `saas::ssl::run` claims
+                // these rows, flips them to `provisioning` itself, and records
+                // `active` or `failed` with a reason. Setting `provisioning`
+                // here would claim work was under way before anything had
+                // started, and would take the row out of the worker's own
+                // claim query -- so it would sit mid-issuance for ever.
                 if domain.ssl_provider == SslProvider::Acme {
-                    tracing::warn!(
+                    tracing::info!(
                         domain = %domain.domain,
-                        "domain verified with ssl_provider=acme, but automatic \
-                         provisioning is not implemented; certificate must be \
-                         supplied manually"
+                        "queued for ACME certificate issuance"
                     );
                     db::update_ssl_status(&self.pool, id, SslStatus::Pending, None).await?;
                 }

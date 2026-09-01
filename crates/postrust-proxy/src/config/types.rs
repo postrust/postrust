@@ -122,6 +122,22 @@ pub struct TlsConfig {
     /// PEM private key matching `cert_file`.
     #[serde(default)]
     pub key_file: Option<String>,
+
+    /// ACME directory URL.
+    ///
+    /// Defaults to Let's Encrypt production. `acme_staging = true` switches to
+    /// staging, which issues untrusted certificates against far looser rate
+    /// limits -- use it until the whole flow works, because production's limits
+    /// are per-domain-per-week and are easy to exhaust while debugging.
+    #[serde(default)]
+    pub acme_directory_url: Option<String>,
+
+    /// A PEM root to trust for the ACME directory's own TLS.
+    ///
+    /// Only for a CA with a private root, which in practice means a test CA
+    /// such as Pebble. Never needed for Let's Encrypt.
+    #[serde(default)]
+    pub acme_root_pem: Option<String>,
 }
 
 impl Default for TlsConfig {
@@ -134,6 +150,8 @@ impl Default for TlsConfig {
             acme_staging: false,
             cert_file: None,
             key_file: None,
+            acme_directory_url: None,
+            acme_root_pem: None,
         }
     }
 }

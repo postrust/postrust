@@ -86,10 +86,23 @@ pretty_assertions = "1.4"
 tokio-rustls = "0.26"
 rustls = { version = "0.23", default-features = false, features = ["std", "aws_lc_rs"] }
 rustls-pemfile = "2"
-rustls-acme = { version = "0.11", default-features = false, features = ["aws-lc-rs"] }
 
 # HTTP client
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
+
+# ACME (Let's Encrypt). The `rcgen` feature makes `Order::finalize` build the
+# CSR and hand back the private key as PEM, so rcgen does not need to be a
+# direct dependency -- declaring it separately resolved a *second* rcgen
+# alongside instant-acme's own. `aws-lc-rs` keeps it on the crypto provider
+# already in the tree rather than adding a second backend.
+instant-acme = { version = "0.8", default-features = false, features = [
+    "aws-lc-rs",
+    "hyper-rustls",
+    "rcgen",
+] }
+# Reading `notAfter` out of an issued chain, so renewal can be scheduled.
+x509-parser = "0.18"
+
 hyper-util = { version = "0.1", features = ["full"] }
 http-body-util = "0.1"
 

@@ -16,7 +16,9 @@ authors.workspace = true
 
 [features]
 default = ["acme"]
-acme = ["rustls-acme"]
+# ACME issuance over HTTP-01. instant-acme is not optional-only because the
+# issuer, the challenge endpoint and the worker are all behind this flag.
+acme = ["dep:instant-acme", "dep:x509-parser"]
 sticky-cookie = []
 
 [dependencies]
@@ -39,9 +41,10 @@ http.workspace = true
 tokio-rustls.workspace = true
 rustls.workspace = true
 rustls-pemfile.workspace = true
+instant-acme = { workspace = true, optional = true }
+x509-parser = { workspace = true, optional = true }
 
 # ACME (optional)
-rustls-acme = { workspace = true, optional = true }
 
 # Database
 sqlx.workspace = true
@@ -111,3 +114,6 @@ tokio = { workspace = true, features = ["test-util", "macros"] }
 # need these in their own right rather than through the library.
 sqlx.workspace = true
 uuid.workspace = true
+# The ACME test parses the issued chain to check its SANs.
+x509-parser.workspace = true
+axum.workspace = true
