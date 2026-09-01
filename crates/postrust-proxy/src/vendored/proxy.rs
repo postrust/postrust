@@ -8,6 +8,7 @@ use crate::ratelimit::{RateLimitKey, RateLimiter};
 use crate::vendored::backend::BackendAppManager;
 use crate::vendored::forwarder::ForwarderClient;
 use crate::vendored::handler::MessageHandler;
+use crate::vendored::hyper_ext::timer::Timeout;
 use crate::vendored::hyper_ext::{IncomingBodyExt, ProxyBody};
 use crate::vendored::types::PathName;
 use hyper::body::Incoming;
@@ -19,6 +20,7 @@ use hyper_util::server::conn::auto;
 use std::convert::Infallible;
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::net::TcpListener;
 use tokio::sync::RwLock;
 use tokio_util::sync::CancellationToken;
@@ -333,17 +335,18 @@ impl ProxyService {
         // Find matching route and upstream
         let (route, upstream_id) = {
             let config = self.config.read().await;
+            // The whole of RouteMatch, not just host and path prefix. The
+            // previous filter chain ignored path_type, methods and headers,
+            // each of which silently widened a route past what its author
+            // wrote -- `path_type = "exact"` on /health also matched
+            // /health-internal, and `methods = ["GET"]` accepted DELETE.
             let matched = config
                 .routes
                 .iter()
                 .filter(|r| r.enabled)
                 .filter(|r| {
-                    let route_host = r.match_.host.as_deref().unwrap_or("*");
-                    route_host == "*" || route_host == host
-                })
-                .filter(|r| {
-                    let route_path = r.match_.path.as_deref().unwrap_or("/");
-                    path.starts_with(route_path)
+                    r.match_
+                        .matches(host, path, method.as_str(), request.headers())
                 })
                 .max_by_key(|r| {
                     let path_len = r.match_.path.as_ref().map(|p| p.len()).unwrap_or(0);
@@ -496,17 +499,39 @@ impl ProxyService {
             };
         }
 
-        // Forward request
-        match self.forwarder.forward(&backend, forwarded_request).await {
-            Ok(response) => {
+        // Forward request, under the route's timeout.
+        //
+        // `route.timeout_secs` was declarable and unread: an upstream that
+        // accepted a connection and then never answered held the request open
+        // for as long as it liked, and the timer machinery this uses was sitting
+        // in hyper_ext with nothing calling it.
+        //
+        // 504 rather than 502: the distinction is the difference between "the
+        // upstream refused" and "the upstream is not answering", and an operator
+        // reads them differently.
+        let timeout = Duration::from_secs(u64::from(route.timeout_secs));
+        let forwarded = Timeout::new(self.forwarder.forward(&backend, forwarded_request), timeout);
+
+        match forwarded.await {
+            Ok(Ok(response)) => {
                 let (parts, body) = response.into_parts();
                 Ok(Response::from_parts(parts, body.boxed_body()))
             }
-            Err(e) => {
+            Ok(Err(e)) => {
                 error!("Forward error to {}: {}", backend.address, e);
                 Ok(MessageHandler::bad_gateway(&format!(
                     "Backend error: {}",
                     e
+                )))
+            }
+            Err(_) => {
+                error!(
+                    "Upstream {} did not answer within {}s (route {})",
+                    backend.address, route.timeout_secs, route.name
+                );
+                Ok(MessageHandler::gateway_timeout(&format!(
+                    "Upstream did not answer within {}s",
+                    route.timeout_secs
                 )))
             }
         }

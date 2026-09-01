@@ -298,8 +298,12 @@ impl MessageHandler {
     }
 
     /// Create a 504 Gateway Timeout response.
-    pub fn gateway_timeout() -> Response<ProxyBody> {
-        Self::error_response(StatusCode::GATEWAY_TIMEOUT, "Gateway Timeout")
+    ///
+    /// Takes a message so the body can say how long the request waited. A bare
+    /// "Gateway Timeout" leaves the caller unable to tell a route configured
+    /// with one second from an upstream that is genuinely wedged.
+    pub fn gateway_timeout(message: &str) -> Response<ProxyBody> {
+        Self::error_response(StatusCode::GATEWAY_TIMEOUT, message)
     }
 
     /// Create a 429 Too Many Requests response.

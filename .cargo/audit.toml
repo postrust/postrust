@@ -29,20 +29,6 @@ ignore = [
     # Revisit if sqlx ever gains a mandatory RSA path.
     "RUSTSEC-2023-0071",
 
-    # instant 0.1.13 -- unmaintained.
-    #
-    # Pulled in transitively: instant <- notify-types <- notify <-
-    # postrust-proxy. `notify` is a direct dependency of the proxy but is used
-    # for exactly one thing: the `ProxyError::Notify` variant. The config file
-    # watcher it was added for is not implemented -- `ConfigReloader` is
-    # scaffolding with an unread channel.
-    #
-    # The real fix is to drop `notify` until the watcher exists, which removes
-    # this and shrinks the dependency tree. That is an API change to
-    # `ProxyError`, so it waits for a deliberate pass rather than riding along
-    # with a lockfile update.
-    "RUSTSEC-2024-0384",
-
     # rustls-pemfile 2.2.0 -- unmaintained.
     #
     # Genuinely compiled and used, in `tls::server` and `tls::acme`, to parse

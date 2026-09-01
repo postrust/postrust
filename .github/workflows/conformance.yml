@@ -1,0 +1,186 @@
+name: Conformance
+
+# The suites that produce every figure on the website, on a schedule.
+#
+# They are not on the PR path, and that is deliberate. Each one starts
+# containers, replays hundreds of cases against two servers, and takes minutes;
+# gating every pull request on that would make the common case slow to punish an
+# uncommon regression. But left entirely manual, the published numbers drift
+# from the code silently -- which is the failure this exists to prevent.
+#
+# So: nightly for the transport suites, weekly for the dialect suites, and a
+# drift check that regenerates the website's data modules and fails if the
+# committed ones no longer match. A red run here means "a number changed";
+# the fix is to look at what moved and commit the regenerated file, not to
+# silence the job.
+
+on:
+  schedule:
+    # Nightly, transport. Off the hour, because everybody schedules on the hour
+    # and the runner queue shows it.
+    - cron: "17 3 * * *"
+    # Weekly, dialects. Heavier: PostGIS, PostgREST and Hasura images plus a
+    # release build.
+    - cron: "43 4 * * 0"
+  workflow_dispatch:
+    inputs:
+      suites:
+        description: Which suites to run
+        type: choice
+        default: transport
+        options: [transport, dialects, all]
+
+concurrency:
+  group: conformance-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  transport:
+    name: transport (h2spec, Autobahn, ACME)
+    # The nightly cron, or a dispatch that asked for it.
+    if: >-
+      github.event_name == 'schedule' && github.event.schedule == '17 3 * * *'
+      || github.event_name == 'workflow_dispatch'
+        && (inputs.suites == 'transport' || inputs.suites == 'all')
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust (stable)
+        uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: conformance-transport
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      # h2spec and Autobahn drive the proxy through its own binary, so it has
+      # to exist before they run. Debug is enough: these measure protocol
+      # behaviour, not speed.
+      - name: Build the proxy binary
+        run: cargo build -p postrust-proxy --bin postrust-proxy
+
+      - name: h2spec
+        run: scripts/h2spec/run.sh
+
+      # Baseline first. Autobahn scores the endpoint as much as the tunnel --
+      # postrust splices WebSocket streams rather than parsing frames -- so the
+      # figure that is about the proxy is the difference between a run through
+      # it and a run straight at the origin.
+      - name: Autobahn (baseline, no proxy)
+        run: BASELINE=1 scripts/autobahn/run.sh
+
+      - name: Autobahn (through the proxy)
+        run: scripts/autobahn/run.sh
+
+      # A real ACME order against Pebble, Let's Encrypt's test CA.
+      - name: ACME issuance
+        run: scripts/acme/run.sh
+
+      - name: Regenerate the transport figures
+        run: node scripts/gen-transport-conformance.mjs
+
+      - name: Fail if the published figures have drifted
+        run: |
+          if ! git diff --exit-code -- website/src/data/transport-conformance.ts; then
+            echo "::error::The transport conformance figures changed." \
+                 "Review the diff above and commit the regenerated file."
+            exit 1
+          fi
+          echo "The published figures still match this run."
+
+      - name: Upload the run artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: transport-conformance
+          if-no-files-found: warn
+          path: |
+            scripts/h2spec/.work/
+            scripts/autobahn/reports/
+            scripts/autobahn/reports-baseline/
+            scripts/acme/.work/
+            website/src/data/transport-conformance.ts
+
+  dialects:
+    name: dialects (PostgREST, Hasura)
+    if: >-
+      github.event_name == 'schedule' && github.event.schedule == '43 4 * * 0'
+      || github.event_name == 'workflow_dispatch'
+        && (inputs.suites == 'dialects' || inputs.suites == 'all')
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust (stable)
+        uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: conformance-dialects
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      # Both harnesses run `target/release/postrust`: a debug build is slow
+      # enough that cases time out against a reference server that is not.
+      - name: Build the server
+        run: cargo build --release -p postrust-server --features admin-ui
+
+      - name: PostgREST conformance
+        run: scripts/conformance/conformance.sh
+
+      - name: Regenerate the PostgREST figures
+        run: node scripts/gen-conformance.mjs scripts/conformance/.work/diff.json
+
+      - name: Hasura conformance
+        run: scripts/hasura-conformance/conformance.sh
+
+      - name: Regenerate the Hasura figures
+        run: >-
+          node scripts/gen-hasura-conformance.mjs
+          scripts/hasura-conformance/.work/diff.json
+
+      - name: Fail if the published figures have drifted
+        run: |
+          if ! git diff --exit-code -- \
+               website/src/data/conformance.ts \
+               website/src/data/hasura-conformance.ts; then
+            echo "::error::The dialect conformance figures changed." \
+                 "Review the diff above and commit the regenerated files."
+            exit 1
+          fi
+          echo "The published figures still match this run."
+
+      - name: Upload the run artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: dialect-conformance
+          if-no-files-found: warn
+          path: |
+            scripts/conformance/.work/
+            scripts/hasura-conformance/.work/
+            website/src/data/conformance.ts
+            website/src/data/hasura-conformance.ts
+
+# HTTP Garden is deliberately not here.
+#
+# It is a differential fuzzer, not a regression suite: it clones a GPL-3.0
+# repository and builds images for dozens of other HTTP servers, and its value
+# is in exploring inputs nobody thought of rather than in re-running a fixed
+# set. It found the hop-by-hop defect that way. Scheduling it would cost an
+# enormous amount of runner time to re-derive a result the transport suites
+# already cover, and its findings need a human to interpret.
+#
+# Run it by hand when the forwarding path changes: scripts/http-garden/setup.sh

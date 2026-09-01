@@ -5,39 +5,57 @@ use thiserror::Error;
 /// Vendored error type (adapted from rpxy error.rs).
 #[derive(Error, Debug)]
 pub enum ProxyError {
+    /// No backend is registered under this id.
     #[error("Backend not found: {0}")]
     BackendNotFound(String),
 
+    /// A route named an upstream that is not in the config.
     #[error("Upstream not found: {0}")]
     UpstreamNotFound(String),
 
+    /// The connection to the upstream could not be made or was lost.
     #[error("Connection error: {0}")]
     Connection(String),
 
+    /// The request could not be rebuilt for the upstream.
     #[error("Request error: {0}")]
     Request(String),
 
+    /// The upstream's response could not be read or relayed.
     #[error("Response error: {0}")]
     Response(String),
 
+    /// The upstream did not answer in time.
     #[error("Timeout")]
     Timeout,
 
+    /// From hyper, on either leg.
     #[error("Hyper error: {0}")]
     Hyper(#[from] hyper::Error),
 
+    /// A request or response that cannot be represented -- an invalid header
+    /// name, an unparseable URI.
     #[error("HTTP error: {0}")]
     Http(#[from] hyper::http::Error),
 
+    /// From the socket.
     #[error("IO error: {0}")]
     Io(#[from] std::io::Error),
 }
 
 /// Server name matching (adapted from rpxy name_exp.rs).
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
-pub struct ServerName(pub String);
+pub struct ServerName(
+    /// The name, already lowercased by [`ServerName::new`].
+    pub String,
+);
 
 impl ServerName {
+    /// Wrap a host name, lowercasing it.
+    ///
+    /// Host matching is case-insensitive per RFC 9110 section 4.2.3, and
+    /// normalising here means every comparison afterwards can be an equality
+    /// check.
     pub fn new(name: impl Into<String>) -> Self {
         Self(name.into().to_lowercase())
     }
@@ -87,9 +105,16 @@ impl From<String> for ServerName {
 
 /// Path name matching with longest-prefix support (adapted from rpxy name_exp.rs).
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
-pub struct PathName(pub String);
+pub struct PathName(
+    /// The path, guaranteed by [`PathName::new`] to start with `/`.
+    pub String,
+);
 
 impl PathName {
+    /// Wrap a path, adding a leading `/` if it is missing.
+    ///
+    /// Without that, a pattern written as `v1` would never match a request
+    /// path, which always starts with `/`.
     pub fn new(path: impl Into<String>) -> Self {
         let mut path = path.into();
         // Ensure path starts with /

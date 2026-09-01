@@ -159,7 +159,7 @@ export default component$(() => {
                   cases the tunnel made worse than no tunnel
                 </div>
                 <div class="text-sm text-neutral-500 mt-2">
-                  over {autobahn.cases} cases, {autobahn.ok} OK
+                  over {autobahn.cases} cases, {autobahn.ok} of {autobahn.settledCases} OK
                 </div>
               </div>
             </div>
@@ -185,7 +185,12 @@ export default component$(() => {
               echo when both arrive in one read, and any relay coalesces what a client chopped
               &mdash; measured directly, with no proxy involved, the same bytes sent octet-wise
               echo and sent as one write do not. Which member of the family trips varies between
-              runs; this one had {autobahn.intermittent.length}.
+              runs, so the {autobahn.segmentationSensitive} of them are left out of the OK count
+              above rather than making it move between runs. On this run{" "}
+              {autobahn.intermittentCount === 0
+                ? "none of them was worse than the baseline"
+                : `${autobahn.intermittentCount} of them was worse than the baseline`}
+              .
             </p>
           </section>
 

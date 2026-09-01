@@ -99,17 +99,3 @@ pub mod timer {
 
     impl std::error::Error for TimeoutError {}
 }
-
-/// Executor for spawning Hyper tasks.
-#[derive(Clone, Copy, Debug)]
-pub struct TokioExecutor;
-
-impl<F> hyper::rt::Executor<F> for TokioExecutor
-where
-    F: std::future::Future + Send + 'static,
-    F::Output: Send + 'static,
-{
-    fn execute(&self, fut: F) {
-        tokio::spawn(fut);
-    }
-}

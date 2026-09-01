@@ -11,6 +11,7 @@ Welcome to the Postrust documentation. Postrust is a high-performance, serverles
 - [Realtime Subscriptions](./realtime.md) - Table changes streamed over GraphQL subscriptions
 - [pgvector Integration](./pgvector.md) - Vector similarity search for AI applications
 - [Custom Routes](./custom-routes.md) - Add webhooks, health checks, and custom endpoints
+- [Reverse Proxy](./proxy.md) - Routing, TLS, HTTP/2 and WebSocket at the front door
 - [SaaS Domain Management](./saas-domains.md) - Multi-tenant custom domains with automatic SSL (Beta)
 - [Deployment](./deployment.md) - Deploy to various platforms
 - [Stability and Versioning](./stability.md) - What a version number promises, and which crates it covers

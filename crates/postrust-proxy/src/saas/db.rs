@@ -200,6 +200,140 @@ pub async fn get_domain_for_tenant(
     Ok(row.map(Domain::from))
 }
 
+/// Apply a partial update to a domain, scoped to a tenant.
+///
+/// Only the fields present in the request change. `COALESCE` on a bound
+/// `Option` is what makes that work in one statement: a `None` binds as NULL
+/// and the column keeps its value.
+///
+/// Moving a *verified* domain to `acme` also resets its SSL state to `pending`,
+/// which is the issuance worker's inbox -- otherwise switching the provider
+/// would leave the domain sitting in whatever state the old provider left, and
+/// nothing would ever pick it up.
+pub async fn update_domain(
+    pool: &PgPool,
+    id: Uuid,
+    tenant_id: Uuid,
+    verification_method: Option<&VerificationMethod>,
+    ssl_provider: Option<&SslProvider>,
+) -> ProxyResult<Option<Domain>> {
+    let queue_for_acme = matches!(ssl_provider, Some(SslProvider::Acme));
+
+    let row = sqlx::query_as::<_, DomainRow>(
+        "UPDATE proxy_domains SET \
+             verification_method = COALESCE($3, verification_method), \
+             ssl_provider = COALESCE($4, ssl_provider), \
+             ssl_status = CASE \
+                 WHEN $5 AND verification_status = 'verified' THEN 'pending' \
+                 ELSE ssl_status END, \
+             ssl_attempts = CASE \
+                 WHEN $5 AND verification_status = 'verified' THEN 0 \
+                 ELSE ssl_attempts END, \
+             ssl_error = CASE \
+                 WHEN $5 AND verification_status = 'verified' THEN NULL \
+                 ELSE ssl_error END, \
+             ssl_last_attempt_at = CASE \
+                 WHEN $5 AND verification_status = 'verified' THEN NULL \
+                 ELSE ssl_last_attempt_at END, \
+             updated_at = NOW() \
+         WHERE id = $1 AND tenant_id = $2 \
+         RETURNING *",
+    )
+    .bind(id)
+    .bind(tenant_id)
+    .bind(verification_method.map(verification_method_str))
+    .bind(ssl_provider.map(ssl_provider_str))
+    .bind(queue_for_acme)
+    .fetch_optional(pool)
+    .await?;
+
+    Ok(row.map(Domain::from))
+}
+
+/// Record an uploaded certificate against a domain, scoped to a tenant.
+///
+/// Sets the provider to `manual` and the status to `active`: an operator who has
+/// just supplied a certificate is not waiting for one. `auto_renew` is turned
+/// off on the certificate row, because nothing here can renew a certificate it
+/// did not obtain -- the renewal scan must not pick it up and mark it pending
+/// for an ACME worker that has no authorization for the domain.
+pub async fn record_uploaded_certificate(
+    pool: &PgPool,
+    id: Uuid,
+    tenant_id: Uuid,
+    expires_at: chrono::DateTime<chrono::Utc>,
+) -> ProxyResult<Option<Domain>> {
+    let mut tx = pool.begin().await?;
+
+    let row = sqlx::query_as::<_, DomainRow>(
+        "UPDATE proxy_domains SET \
+             ssl_provider = 'manual', \
+             ssl_status = 'active', \
+             ssl_expires_at = $3, \
+             ssl_error = NULL, \
+             ssl_attempts = 0, \
+             updated_at = NOW() \
+         WHERE id = $1 AND tenant_id = $2 \
+         RETURNING *",
+    )
+    .bind(id)
+    .bind(tenant_id)
+    .bind(expires_at)
+    .fetch_optional(&mut *tx)
+    .await?;
+
+    let Some(row) = row else {
+        tx.rollback().await?;
+        return Ok(None);
+    };
+
+    sqlx::query(
+        "UPDATE proxy_certificates SET \
+             provider = 'manual', auto_renew = false, \
+             tenant_id = $2, domain_id = $3, updated_at = NOW() \
+         WHERE domain = $1",
+    )
+    .bind(&row.domain)
+    .bind(tenant_id)
+    .bind(id)
+    .execute(&mut *tx)
+    .await?;
+
+    tx.commit().await?;
+    Ok(Some(Domain::from(row)))
+}
+
+/// Queue a verified ACME domain for issuance, scoped to a tenant.
+///
+/// Clears the attempt count, the error and the backoff so the worker picks it
+/// up on its next pass rather than waiting out a wait computed for a cause the
+/// caller has just fixed. Returns `None` when there is no such verified ACME
+/// domain for the tenant.
+pub async fn queue_for_issuance(
+    pool: &PgPool,
+    id: Uuid,
+    tenant_id: Uuid,
+) -> ProxyResult<Option<Domain>> {
+    let row = sqlx::query_as::<_, DomainRow>(
+        "UPDATE proxy_domains SET \
+             ssl_status = 'pending', \
+             ssl_attempts = 0, \
+             ssl_error = NULL, \
+             ssl_last_attempt_at = NULL, \
+             updated_at = NOW() \
+         WHERE id = $1 AND tenant_id = $2 \
+           AND ssl_provider = 'acme' \
+           AND verification_status = 'verified' \
+         RETURNING *",
+    )
+    .bind(id)
+    .bind(tenant_id)
+    .fetch_optional(pool)
+    .await?;
+
+    Ok(row.map(Domain::from))
+}
+
 /// List all domains for a tenant.
 pub async fn list_domains(pool: &PgPool, tenant_id: Uuid) -> ProxyResult<Vec<Domain>> {
     let rows = sqlx::query_as::<_, DomainRow>(

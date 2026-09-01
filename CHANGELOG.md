@@ -5,36 +5,124 @@ releases are described by their tags and the pull requests behind them.
 
 ## Unreleased
 
-### Security
+### Added
 
-**Twelve dependency advisories fixed** by updating the lockfile, including five
-in `aws-lc-sys` (X.509 name-constraint bypass via wildcard/Unicode CN, two
-PKCS7 signature and chain validation bypasses, a CRL distribution-point scope
-error, an AES-CCM timing side channel) and four in `rustls-webpki` (a reachable
-panic in CRL parsing, URI name constraints incorrectly accepted, and two more
-CRL and wildcard issues). All of these are in the path of a TLS-terminating
-proxy. Also `bytes`, `h2` (unbounded empty DATA frames), `time`, `anyhow`,
-`event-listener` and both `rand` majors.
+**Route matching honours the whole of `RouteMatch`.** `path_type`, `methods` and
+`match.headers` were all declarable and all ignored: the filter chain compared
+host and path prefix and nothing else. Each silent no-op *widened* a route past
+what its author wrote -- `path_type = "exact"` on `/health` also caught
+`/health-internal`, and a route restricted to `methods = ["GET"]` accepted
+`DELETE`. A host may now also be a single-label wildcard (`*.example.com`).
+A regex that does not compile matches nothing and logs why, rather than being
+treated as a prefix or a match-all.
 
-**`hickory-resolver` 0.24 to 0.26**, clearing an O(n²) name-compression CPU
-exhaustion in `hickory-proto`. The upgrade is a real API migration, and one
-part of it would have broken silently: 0.26 replaced the rdata iterator with
-`Lookup::answers()`, and `Record`'s `Display` renders the whole record line
-(`name ttl class type rdata`), so the previous `record.to_string()` would never
-have matched a bare challenge token again. Every DNS verification would have
-failed. The comparison now lives in a tested function, `txt_matches`, with a
-case asserting that a full record line does *not* match.
+Also removed `BackendManager::find_upstream`, a second route matcher that was
+never called and was worse: prefix only, no method, no headers, and it ignored
+`priority`.
 
-**A dependency audit now runs in CI.** `cargo audit --deny warnings`, with
-three documented ignores in `.cargo/audit.toml` -- one advisory with no
-reachable code path and no upstream fix (`rsa`, not in any build graph), and
-two unmaintained crates with the migration each needs written down. The job is
-verified green rather than added and hoped for.
+**Documentation for the proxy**, in [docs/proxy.md](docs/proxy.md) -- there was
+none, for a crate that had just gained TLS, HTTP/2, WebSocket and a binary. It
+includes a section naming the configuration that is declarable and does nothing
+yet (`timeout_secs`, `retry_count`, `watch_config_file`, `https_enabled`,
+`acme_directory`), because the alternative is that each one gets discovered.
 
-**`SECURITY.md`** added: how to report privately, what to expect, what is in
-scope, and the known-and-documented weaknesses that are not reports.
+**Three domain endpoints the documentation promised and the router never had.**
+`docs/saas-domains.md` listed `PUT /domains/{id}`,
+`POST /domains/{id}/ssl/provision` and `POST /domains/{id}/ssl/upload`; none was
+mounted. All three exist now.
+
+`PUT /domains/{id}` is a partial update of the verification method and the SSL
+provider. The domain name is deliberately not updatable: it is what the
+verification token proves control of, so a rename would carry a proof of
+ownership over to a name nobody has proved anything about.
+
+`ssl/upload` **checks the certificate before storing it** -- the key must match
+the chain, it must not be expired, and it must cover the domain, wildcards
+counting for exactly one label. Skipping any of those gives a listener that
+accepts the upload and then fails every handshake, with nothing pointing back at
+the cause.
+
+`ssl/provision` returns 202 and queues; the worker issues. It is also how to
+retry, so the `ssl/retry` endpoint that briefly existed in this branch is gone --
+one endpoint rather than two that overlap.
+
+**Automatic SSL via ACME, over HTTP-01.** `docs/saas-domains.md` advertised
+this as a feature and the schema tracked an `ssl_status`, but nothing in the
+crate had ever talked to a certificate authority.
+
+A verified domain with `ssl_provider = "acme"` is queued, and a background
+worker (`saas::ssl`) places the order, answers the challenge, stores the
+certificate, and renews it 30 days before expiry. Failures record `ssl_error`
+and retry with exponential backoff, capped at four hours, giving up after ten
+attempts; `POST /domains/{id}/ssl/retry` requeues one. There is deliberately no
+`provision` endpoint -- issuance is several round trips plus a challenge fetch
+the CA has to make back to us, which does not belong in a request.
+
+Three tables came with it, including **`proxy_certificates`, which
+`CertificateStore` had queried since it was written and which nothing ever
+created** -- so every certificate save had failed with "relation
+proxy_certificates does not exist".
+
+Tested end to end against [Pebble](https://github.com/letsencrypt/pebble),
+Let's Encrypt's deliberately-misbehaving test CA, through the shipped
+`/.well-known/acme-challenge/{token}` handler: `scripts/acme/run.sh`.
+
+**`rustls-acme` was replaced by `instant-acme`** rather than adding a second
+ACME client. The old wrapper took a fixed domain list, which cannot serve a
+tenant domain that arrives while the proxy is running, and was never
+constructed anywhere. Keeping both also resolved two copies of `rcgen`.
+
+**Database-backed proxy configuration actually reads and writes.**
+`config::load_from_database` was two `// TODO: Implement database query`
+comments returning `Ok(Vec::new())`, so a proxy pointed at a database started,
+logged nothing wrong, and answered every request with 503 -- the same failure
+that file-configured routing had before `1.0.0-alpha.2`. It now loads real
+routes and upstreams from three new tables
+(`migrations/20260901000001_proxy_config.sql`), and `postrust-proxy` merges
+them into a file-bootstrapped config when `DATABASE_URL` is set.
+
+**The admin API persists.** Its route, upstream and backend mutations replied
+`200`/`201` after changing only the in-memory config, behind eight
+`// TODO: Persist to database` comments, so every change vanished on restart
+while reporting success. They now write through before touching the running
+config, and report a failure to persist as a 500 rather than a success. With
+`server.database_config = false` -- an explicit "this proxy is configured from
+a file" -- edits stay in memory as before.
 
 ### Changed
+
+**The Autobahn figures published on the website are now run-stable.** The
+OK/NON-STRICT split is tallied over the cases *outside* the intermittent
+invalid-frame family, with the family's size reported separately. Members of
+that family move between OK and NON-STRICT from run to run with nothing about
+the proxy changing -- one run scored 501 OK and 12 NON-STRICT, the next 502 and
+11, from a single case. Publishing the raw split would have made the new drift
+check fail on the next run for a reason that is not a regression, and an
+intermittently red gate teaches everyone to ignore it. Verified stable over
+three consecutive runs.
+
+**The conformance suites run on a schedule.** `.github/workflows/conformance.yml`
+runs the transport suites nightly (h2spec, Autobahn baseline and proxied, and a
+real ACME order against Pebble) and the dialect suites weekly (PostgREST and
+Hasura, which need PostGIS and a release build). Each job then **regenerates the
+website's data module and fails if the committed one has drifted** -- which is
+the point: every figure the site publishes is generated from a run's artifacts,
+and nothing was re-running those, so the numbers could go stale silently.
+
+Not on the pull-request path: each suite starts containers and replays hundreds
+of cases against two servers. Gating every PR on that would make the common case
+slow to catch an uncommon regression.
+
+HTTP Garden is deliberately not scheduled. It is a differential fuzzer that
+clones a GPL-3.0 repository and builds images for dozens of other HTTP servers;
+its value is in exploring inputs nobody thought of -- which is how it found the
+hop-by-hop defect -- not in re-running a fixed set. The reasoning is recorded in
+the workflow.
+
+**h2spec and Autobahn now work on Linux.** Both reach the proxy through
+`host.docker.internal`, which resolves only on Docker Desktop. They pass
+`--add-host host.docker.internal:host-gateway`, so they work on a CI runner as
+well as on a developer's Mac.
 
 **The MSRV is declared and checked: Rust 1.88.** It was not declared anywhere,
 while the README claimed 1.78, `docs/getting-started.md` claimed 1.75 and
@@ -66,26 +154,34 @@ skips what is already on crates.io.
 New: [docs/stability.md](docs/stability.md), stating what a version number
 covers and what it does not.
 
-### Added
+### Removed
 
-**Database-backed proxy configuration actually reads and writes.**
-`config::load_from_database` was two `// TODO: Implement database query`
-comments returning `Ok(Vec::new())`, so a proxy pointed at a database started,
-logged nothing wrong, and answered every request with 503 -- the same failure
-that file-configured routing had before `1.0.0-alpha.2`. It now loads real
-routes and upstreams from three new tables
-(`migrations/20260901000001_proxy_config.sql`), and `postrust-proxy` merges
-them into a file-bootstrapped config when `DATABASE_URL` is set.
+**`POST /config/reload` answered "Configuration reload requested" and reloaded
+nothing.** It sent on a channel nobody read. That, `ConfigReloader`,
+`server.watch_config_file` and the `notify` dependency they existed for are all
+gone; configuration changes need a restart, which `docs/proxy.md` now says.
 
-**The admin API persists.** Its route, upstream and backend mutations replied
-`200`/`201` after changing only the in-memory config, behind eight
-`// TODO: Persist to database` comments, so every change vanished on restart
-while reporting success. They now write through before touching the running
-config, and report a failure to persist as a 500 rather than a success. With
-`server.database_config = false` -- an explicit "this proxy is configured from
-a file" -- edits stay in memory as before.
+Dropping `notify` also removed `instant` from the lockfile, so the
+`RUSTSEC-2024-0384` ignore in `.cargo/audit.toml` is gone -- two documented
+ignores left instead of three.
+
+Also removed: `hyper_ext::TokioExecutor`, a duplicate of the `hyper_util` one
+the code actually uses; `HealthChecker`'s `PgPool` field, held "for persisting
+health status" that was never implemented; and `ApiKeyRow::key_hash`, selected
+and never read.
 
 ### Fixed
+
+**Every parameterised route in the proxy would panic at construction.** 23
+routes across `admin_router` and `saas_router` used axum 0.7's `:param` syntax,
+which axum 0.8 -- what the workspace has depended on for some time -- rejects:
+
+```
+Path segments must not start with `:`. For capture groups, use `{capture}`.
+```
+
+Neither router is mounted anywhere, so nothing had ever called them and nothing
+noticed. Found by an ACME test that needed to serve the real router.
 
 **HTTP domain verification proved nothing.** The endpoint serving the
 challenge, `/.well-known/postrust-verification/{token}`, computed
@@ -111,6 +207,35 @@ has to be supplied manually.
 which are in the router, and omitted `enable` and `disable`, which are. It
 also advertised automatic ACME provisioning as a feature. Corrected against
 the router, and the SSL section now says plainly that no ACME client exists.
+
+### Security
+
+**Twelve dependency advisories fixed** by updating the lockfile, including five
+in `aws-lc-sys` (X.509 name-constraint bypass via wildcard/Unicode CN, two
+PKCS7 signature and chain validation bypasses, a CRL distribution-point scope
+error, an AES-CCM timing side channel) and four in `rustls-webpki` (a reachable
+panic in CRL parsing, URI name constraints incorrectly accepted, and two more
+CRL and wildcard issues). All of these are in the path of a TLS-terminating
+proxy. Also `bytes`, `h2` (unbounded empty DATA frames), `time`, `anyhow`,
+`event-listener` and both `rand` majors.
+
+**`hickory-resolver` 0.24 to 0.26**, clearing an O(n²) name-compression CPU
+exhaustion in `hickory-proto`. The upgrade is a real API migration, and one
+part of it would have broken silently: 0.26 replaced the rdata iterator with
+`Lookup::answers()`, and `Record`'s `Display` renders the whole record line
+(`name ttl class type rdata`), so the previous `record.to_string()` would never
+have matched a bare challenge token again. Every DNS verification would have
+failed. The comparison now lives in a tested function, `txt_matches`, with a
+case asserting that a full record line does *not* match.
+
+**A dependency audit now runs in CI.** `cargo audit --deny warnings`, with
+three documented ignores in `.cargo/audit.toml` -- one advisory with no
+reachable code path and no upstream fix (`rsa`, not in any build graph), and
+two unmaintained crates with the migration each needs written down. The job is
+verified green rather than added and hoped for.
+
+**`SECURITY.md`** added: how to report privately, what to expect, what is in
+scope, and the known-and-documented weaknesses that are not reports.
 
 ## 1.0.0-alpha.2
 

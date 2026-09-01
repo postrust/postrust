@@ -4,18 +4,14 @@
 
 Multi-tenant domain management API for SaaS applications. Allow your customers to bring their own custom domains, with domain verification and reverse proxy routing.
 
-> **Automatic SSL is not implemented.** The schema tracks an `ssl_status` and a
-> domain can be configured with `ssl_provider = "acme"`, but nothing in the
-> proxy has ever talked to a certificate authority: no ACME order is placed and
-> no certificate is issued or renewed. Serve TLS from a certificate on disk
-> (`tls.cert_file` / `tls.key_file`) until this lands. See
-> [Stability and Versioning](./stability.md) — `postrust-proxy` is on a `0.x`
-> line precisely because of gaps like this one.
+Automatic SSL is implemented over ACME HTTP-01: a verified domain with
+`ssl_provider = "acme"` is queued, and a background worker obtains and renews
+its certificate. See [SSL/TLS Certificates](#ssltls-certificates).
 
 ## Features
 
 - **Domain Verification**: DNS TXT and HTTP challenge methods
-- **SSL/TLS**: Not implemented — see the note above
+- **SSL/TLS**: Automatic via ACME HTTP-01 (Let's Encrypt), with renewal
 - **Authentication**: JWT + API Key dual authentication
 - **Multi-tenant**: Complete tenant isolation with quotas
 - **Dynamic Routing**: Per-domain routes without server restart
@@ -73,10 +69,13 @@ API keys are prefixed with `pk_` for identification and can have restricted scop
 | `GET` | `/api/v1/domains` | List domains |
 | `POST` | `/api/v1/domains` | Add domain |
 | `GET` | `/api/v1/domains/:id` | Get domain details |
+| `PUT` | `/api/v1/domains/:id` | Update verification method or SSL provider |
 | `DELETE` | `/api/v1/domains/:id` | Remove domain |
 | `POST` | `/api/v1/domains/:id/verify` | Trigger verification |
 | `POST` | `/api/v1/domains/:id/enable` | Enable a verified domain |
 | `POST` | `/api/v1/domains/:id/disable` | Disable a domain |
+| `POST` | `/api/v1/domains/:id/ssl/provision` | Queue (or requeue) ACME issuance |
+| `POST` | `/api/v1/domains/:id/ssl/upload` | Upload a certificate |
 
 ### Routes
 
@@ -105,6 +104,7 @@ API keys are prefixed with `pk_` for identification and can have restricted scop
 | Method | Endpoint | Description |
 |--------|----------|-------------|
 | `GET` | `/.well-known/postrust-verification/:token` | HTTP verification challenge |
+| `GET` | `/.well-known/acme-challenge/:token` | ACME HTTP-01 challenge |
 
 ## Domain Verification
 
@@ -188,20 +188,143 @@ by whoever holds the zone. It is the default (`verification_method` defaults to
 
 ## SSL/TLS Certificates
 
-### Automatic ACME Provisioning — not implemented
+### Automatic ACME provisioning
 
-There is no ACME client here. A domain with `ssl_provider = "acme"` that passes
-verification is left with `ssl_status = "pending"` and a warning in the log; it
-is not queued for issuance, because there is nothing to queue it with.
+A domain with `ssl_provider = "acme"` that passes verification is queued
+(`ssl_status = "pending"`). A background worker then places the order, answers
+the HTTP-01 challenge, and stores the certificate. Nothing else to call.
 
-Serve TLS from a certificate on disk instead — set `tls.cert_file` and
-`tls.key_file`, which also gives you ALPN, so HTTP/2 and `wss://` work.
+```bash
+# Verify. That is the whole trigger.
+curl -X POST http://localhost:8080/api/v1/domains/<id>/verify \
+  -H "Authorization: ApiKey pk_live_abc123..."
 
-`docker-compose.yml` carries a Pebble and challtestsrv pair behind the `acme`
-profile, ready for when an issuance flow is written against a CA that
-deliberately misbehaves.
+# Watch ssl_status go pending -> provisioning -> active
+curl http://localhost:8080/api/v1/domains/<id> \
+  -H "Authorization: ApiKey pk_live_abc123..."
+```
 
-### Manual Certificate Upload — not implemented
+Configure the CA in the proxy's TOML:
+
+```toml
+[tls]
+acme_enabled = true
+acme_email = "ops@example.com"
+acme_staging = true          # until the whole flow works; see below
+cert_dir = "/var/lib/postrust/certs"
+```
+
+**Use staging first.** Let's Encrypt's production rate limits are per-domain
+per-week and easy to exhaust while debugging. `acme_staging = true` issues
+untrusted certificates against far looser limits.
+
+The worker needs `DATABASE_URL`: the ACME account, the pending challenges and
+the certificates all live in the database, and the challenge is served from a
+table so that any instance can answer whichever one the CA happens to reach.
+Without a database the worker logs that it is not starting rather than failing
+later on the first order.
+
+**There is no `provision` endpoint**, and an older version of this document
+documented one that was never in the router. Issuance takes several round trips
+to the CA plus a challenge fetch, and retrying under a rate limit is the normal
+failure mode — none of which belongs in a request. Verification queues; the
+worker works.
+
+#### Provisioning explicitly
+
+Verification queues automatically, but there are cases where you need to ask:
+a domain whose provider you have just switched to `acme`, or one that failed and
+has been fixed.
+
+```bash
+curl -X POST http://localhost:8080/api/v1/domains/<id>/ssl/provision \
+  -H "Authorization: ApiKey pk_live_abc123..."
+```
+
+Returns **202 Accepted**. It sets state and returns; the worker does the work.
+It does not issue inline, and that is deliberate — see the note above. Poll
+`GET /domains/<id>` and watch `ssl_status`.
+
+The call is idempotent, and it is also how you retry: it clears the attempt
+count, the recorded error and the backoff, so the next pass picks the domain up
+immediately rather than waiting out a wait computed for a cause you have just
+fixed.
+
+It refuses (404) a domain that is not verified, or whose `ssl_provider` is not
+`acme`. Queueing either would have the worker place an order that cannot
+succeed, and spend a rate limit doing it.
+
+#### When it fails
+
+Failures record `ssl_error` on the domain and retry with exponential backoff
+from one minute, capped at four hours, giving up after ten attempts. The usual
+cause is that the domain's DNS was never pointed at the proxy, so the CA could
+not fetch the challenge; the error says so. Fix the cause, then call
+`ssl/provision`.
+
+#### Renewal
+
+Certificates within 30 days of expiry are requeued automatically. Let's Encrypt
+issues for 90, so there is a month to notice a problem.
+
+#### Why HTTP-01 and not DNS-01
+
+HTTP-01 needs only that the domain resolves to the proxy, which is already true
+for any domain it serves. DNS-01 would need write access to each tenant's zone,
+which a proxy has no way to obtain. The trade is that HTTP-01 cannot issue
+wildcards.
+
+#### Testing it
+
+`scripts/acme/run.sh` runs the whole flow against
+[Pebble](https://github.com/letsencrypt/pebble), Let's Encrypt's test CA, which
+deliberately misbehaves. See `scripts/acme/README.md`.
+
+### Manual certificate upload
+
+For a certificate that comes from somewhere else — an internal CA, or one issued
+by hand.
+
+```bash
+curl -X POST http://localhost:8080/api/v1/domains/<id>/ssl/upload \
+  -H "Authorization: ApiKey pk_live_abc123..." \
+  -H "Content-Type: application/json" \
+  -d '{"cert_pem": "-----BEGIN CERTIFICATE-----\n...", "key_pem": "-----BEGIN PRIVATE KEY-----\n..."}'
+```
+
+The certificate is **checked before it is stored**, and a rejection says which
+check failed:
+
+| Check | Why it is refused |
+| --- | --- |
+| The chain and key parse | Nothing usable otherwise |
+| **The key matches the chain** | The listener would accept the upload and then fail every TLS handshake, with nothing in the logs pointing at the upload |
+| Not expired | Same, immediately |
+| Covers this domain | A certificate for another name authorises nothing here. Wildcards count, for exactly one label — `*.example.com` covers `api.example.com`, not `example.com` and not `a.b.example.com` |
+
+On success the domain's `ssl_provider` becomes `manual` and its `ssl_status`
+becomes `active`. The stored certificate has `auto_renew` turned off: nothing
+here can renew a certificate it did not obtain, so the renewal scan must not
+queue it for an ACME worker that has no authorization for the domain. Upload a
+replacement before it expires, or switch the domain to `acme`.
+
+### Changing a domain
+
+```bash
+curl -X PUT http://localhost:8080/api/v1/domains/<id> \
+  -H "Authorization: ApiKey pk_live_abc123..." \
+  -H "Content-Type: application/json" \
+  -d '{"ssl_provider": "acme"}'
+```
+
+Partial — absent fields are left alone. Two fields can change:
+`verification_method` (which takes effect on the next verification attempt, and
+does not un-verify a verified domain) and `ssl_provider`. Moving a **verified**
+domain to `acme` queues it for issuance.
+
+**The domain name is not updatable.** It is the identity of the record and what
+the verification token proves control of, so a rename would carry a proof of
+ownership over to a name nobody has proved anything about. Delete and re-add.
 
 For custom certificates:
 

@@ -35,21 +35,11 @@
 //! ```
 
 #![warn(clippy::all)]
-// `postrust-proxy` is on its own 0.x version line, separate from the rest of the
-// workspace, and carries no stability promise. That is not a formality: turning
-// `missing_docs` and `dead_code` on here produces 306 and 4 warnings
-// respectively, and parts of the public surface answer successfully without
-// doing anything (see `config::database`, and the admin API's route and
-// upstream mutations). Freezing that under semver would be a promise the crate
-// cannot keep, so it does not go to 1.0.0 with the others. See docs/stability.md.
-//
-// The relaxed lints, and what each is waiting on:
-// - missing_docs / dead_code: public items and scaffolding not yet wired up.
-//   Tighten as the surface is documented and the stubs are resolved.
-// - result_large_err / large_enum_variant: rooted in the rich `ProxyError` enum.
-// - type_complexity: a few internal signatures pending refactor into type aliases.
-#![allow(missing_docs)]
-#![allow(dead_code)]
+#![warn(missing_docs)]
+// `result_large_err` and `large_enum_variant` are both rooted in the rich
+// `ProxyError` enum, which is deliberate: an error that says which upstream and
+// why is worth more than a small one. `type_complexity` covers a few internal
+// signatures waiting to become type aliases.
 #![allow(clippy::result_large_err)]
 #![allow(clippy::large_enum_variant)]
 #![allow(clippy::type_complexity)]
@@ -81,8 +71,6 @@ pub struct ProxyState {
     pub health_checker: std::sync::Arc<HealthChecker>,
     /// Rate limiter instance
     pub rate_limiter: std::sync::Arc<RateLimiter>,
-    /// Configuration reloader
-    pub config_reloader: std::sync::Arc<config::ConfigReloader>,
 }
 
 impl ProxyState {
@@ -90,16 +78,14 @@ impl ProxyState {
     pub async fn new(pool: sqlx::PgPool, config: ProxyConfig) -> ProxyResult<Self> {
         let rate_limit_defaults = config.rate_limit.clone();
         let config = std::sync::Arc::new(tokio::sync::RwLock::new(config));
-        let health_checker = std::sync::Arc::new(HealthChecker::new(pool.clone()));
+        let health_checker = std::sync::Arc::new(HealthChecker::new());
         let rate_limiter = std::sync::Arc::new(RateLimiter::new(rate_limit_defaults));
-        let config_reloader = std::sync::Arc::new(config::ConfigReloader::new(config.clone()));
 
         Ok(Self {
             pool,
             config,
             health_checker,
             rate_limiter,
-            config_reloader,
         })
     }
 }

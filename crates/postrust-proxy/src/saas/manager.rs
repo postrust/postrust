@@ -158,22 +158,19 @@ impl DomainManager {
                 db::update_verification_status(&self.pool, id, VerificationStatus::Verified)
                     .await?;
 
-                // A domain asking for ACME stays `pending`, not `provisioning`.
+                // A domain asking for ACME is queued, not marked
+                // `provisioning`.
                 //
-                // Nothing here has ever talked to a CA: no order is placed and
-                // `/.well-known/acme-challenge/{token}` has no authorization to
-                // serve. Writing `provisioning` claimed work was under way, so
-                // the API reported a domain as mid-issuance forever and an
-                // operator watching that field had no way to tell the
-                // difference between slow and never. `pending` is what is
-                // actually true -- verified, and waiting for a certificate
-                // somebody still has to supply.
+                // `pending` is the worker's inbox: `saas::ssl::run` claims
+                // these rows, flips them to `provisioning` itself, and records
+                // `active` or `failed` with a reason. Setting `provisioning`
+                // here would claim work was under way before anything had
+                // started, and would take the row out of the worker's own
+                // claim query -- so it would sit mid-issuance for ever.
                 if domain.ssl_provider == SslProvider::Acme {
-                    tracing::warn!(
+                    tracing::info!(
                         domain = %domain.domain,
-                        "domain verified with ssl_provider=acme, but automatic \
-                         provisioning is not implemented; certificate must be \
-                         supplied manually"
+                        "queued for ACME certificate issuance"
                     );
                     db::update_ssl_status(&self.pool, id, SslStatus::Pending, None).await?;
                 }
@@ -199,6 +196,93 @@ impl DomainManager {
         token: &str,
     ) -> ProxyResult<Option<db::HttpChallenge>> {
         db::find_live_http_challenge(&self.pool, token).await
+    }
+
+    /// Apply a partial update to a domain.
+    ///
+    /// The domain name cannot be changed -- see [`UpdateDomainRequest`] for
+    /// why -- so this only moves the verification method and the SSL provider.
+    pub async fn update_domain(
+        &self,
+        id: Uuid,
+        tenant_id: Uuid,
+        req: UpdateDomainRequest,
+    ) -> ProxyResult<Domain> {
+        db::update_domain(
+            &self.pool,
+            id,
+            tenant_id,
+            req.verification_method.as_ref(),
+            req.ssl_provider.as_ref(),
+        )
+        .await?
+        .ok_or_else(|| ProxyError::NotFound("Domain not found".into()))
+    }
+
+    /// Store a certificate an operator supplied, after checking it.
+    ///
+    /// The checks are the point. An unchecked upload gives a listener that
+    /// accepts the certificate now and fails every handshake later: the key may
+    /// not match the chain, the certificate may be expired, or it may be for
+    /// another domain entirely. All three are refused here, with a message
+    /// saying which.
+    pub async fn upload_certificate(
+        &self,
+        id: Uuid,
+        tenant_id: Uuid,
+        cert_store: &crate::tls::CertificateStore,
+        req: UploadCertificateRequest,
+    ) -> ProxyResult<Domain> {
+        let domain = db::get_domain_for_tenant(&self.pool, id, tenant_id)
+            .await?
+            .ok_or_else(|| ProxyError::NotFound("Domain not found".into()))?;
+
+        let facts = crate::tls::validate_for_domain(
+            &domain.domain,
+            req.cert_pem.as_bytes(),
+            req.key_pem.as_bytes(),
+        )?;
+
+        cert_store
+            .save(crate::tls::Certificate {
+                domain: domain.domain.clone(),
+                cert_pem: req.cert_pem.into_bytes(),
+                key_pem: req.key_pem.into_bytes(),
+                expires_at: Some(facts.expires_at),
+            })
+            .await?;
+
+        let updated = db::record_uploaded_certificate(&self.pool, id, tenant_id, facts.expires_at)
+            .await?
+            .ok_or_else(|| ProxyError::NotFound("Domain not found".into()))?;
+
+        tracing::info!(
+            domain = %updated.domain,
+            expires_at = %facts.expires_at,
+            "stored an uploaded certificate"
+        );
+        Ok(updated)
+    }
+
+    /// Queue a verified ACME domain for certificate issuance.
+    ///
+    /// Sets state and returns; the work is done by the issuance worker. That is
+    /// the whole endpoint, and deliberately so: an ACME order is several round
+    /// trips to the CA plus a challenge the CA has to fetch back from us, and
+    /// retrying under a rate limit is the normal failure mode. Doing it inline
+    /// would hold the request open and let a client timeout orphan an order the
+    /// CA had already started.
+    ///
+    /// Idempotent, and also the way to retry after a failure -- it clears the
+    /// attempt count and the backoff.
+    pub async fn queue_ssl_issuance(&self, id: Uuid, tenant_id: Uuid) -> ProxyResult<Domain> {
+        db::queue_for_issuance(&self.pool, id, tenant_id)
+            .await?
+            .ok_or_else(|| {
+                ProxyError::NotFound(
+                    "No verified domain with ssl_provider = acme for this tenant".into(),
+                )
+            })
     }
 
     /// Enable a verified domain.

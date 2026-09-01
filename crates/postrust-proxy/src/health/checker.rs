@@ -3,7 +3,6 @@
 use crate::config::HealthCheckConfig;
 use chrono::{DateTime, Utc};
 use dashmap::DashMap;
-use sqlx::PgPool;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio_util::sync::CancellationToken;
@@ -55,8 +54,6 @@ pub struct BackendInfo {
 
 /// Background health checker.
 pub struct HealthChecker {
-    /// Database pool for persisting health status
-    pool: PgPool,
     /// Backend health status
     health: DashMap<Uuid, BackendHealth>,
     /// Backend info
@@ -65,16 +62,26 @@ pub struct HealthChecker {
     client: reqwest::Client,
 }
 
+impl Default for HealthChecker {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl HealthChecker {
     /// Create a new health checker.
-    pub fn new(pool: PgPool) -> Self {
+    /// A checker with no backends registered yet.
+    ///
+    /// Took a `PgPool` until health status was going to be persisted; it never
+    /// was, and a parameter nobody uses is a parameter every caller has to
+    /// supply for nothing.
+    pub fn new() -> Self {
         let client = reqwest::Client::builder()
             .timeout(Duration::from_secs(10))
             .build()
             .expect("Failed to build HTTP client");
 
         Self {
-            pool,
             health: DashMap::new(),
             backends: DashMap::new(),
             client,
