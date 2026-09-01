@@ -58,10 +58,11 @@ the hop-by-hop defect. 7 of 7 probes correct.
 
 **h2spec** -- 146 tests, 145 passed, 1 skipped, 0 failed.
 
-**Autobahn** -- 517 cases, 502 OK, 0 failed, and no case worse than a baseline
-run that bypasses the proxy. The baseline matters: postrust splices WebSocket
-streams rather than parsing frames, so most of what Autobahn scores belongs to
-the origin behind it.
+**Autobahn** -- 517 cases, 501 OK, and no case worse than a baseline run that
+bypasses the proxy. One case fails, and fails identically with no proxy in the
+path. The baseline matters: postrust splices WebSocket streams rather than
+parsing frames, so most of what Autobahn scores belongs to the origin behind
+it.
 
 ## 1.0.0-alpha.1
 
