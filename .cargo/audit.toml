@@ -1,0 +1,42 @@
+# cargo-audit configuration.
+#
+# Every entry below is an advisory we have decided not to act on *yet*, with
+# the reason. The list is deliberately short and deliberately annotated: an
+# ignore list without reasons becomes a place advisories go to be forgotten.
+#
+# The bar for adding an entry is a reachability argument, not inconvenience.
+# `cargo audit` reports what is in Cargo.lock, which is not the same as what is
+# compiled -- an advisory against an optional dependency that no enabled
+# feature pulls in has no code path to reach. Check with:
+#
+#     cargo tree -i <crate>
+#
+# "nothing to print" means the crate is locked but never built. SECURITY.md
+# explains this at more length.
+
+[advisories]
+ignore = [
+    # rsa 0.9.9 -- Marvin attack, timing side channel in PKCS#1 v1.5
+    # decryption.
+    #
+    # Not in any build graph: `cargo tree -i rsa` prints nothing. It is an
+    # optional dependency of sqlx behind the MySQL feature, which this
+    # workspace does not enable -- postrust is PostgreSQL only. No RSA
+    # decryption code is compiled, let alone reachable.
+    #
+    # There is also no fixed version to move to; the advisory lists no patched
+    # release, because the fix requires an API change upstream has not made.
+    # Revisit if sqlx ever gains a mandatory RSA path.
+    "RUSTSEC-2023-0071",
+
+    # rustls-pemfile 2.2.0 -- unmaintained.
+    #
+    # Genuinely compiled and used, in `tls::server` and `tls::acme`, to parse
+    # PEM certificate chains and private keys. Unmaintained because rustls
+    # moved PEM parsing into `rustls-pki-types`, which is already in the tree.
+    #
+    # Migrating is the right fix and is not risky, but it touches the code path
+    # that loads the HTTPS listener's certificate, so it deserves its own
+    # change with its own testing rather than being bundled into an audit pass.
+    "RUSTSEC-2025-0134",
+]

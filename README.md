@@ -4,7 +4,7 @@
 
 **A PostgREST-inspired REST API for PostgreSQL, written in Rust**
 
-[![Rust](https://img.shields.io/badge/rust-1.78%2B-orange.svg)](https://www.rust-lang.org/)
+[![Rust](https://img.shields.io/badge/rust-1.88%2B-orange.svg)](https://www.rust-lang.org/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![Build Status](https://img.shields.io/github/actions/workflow/status/postrust/postrust/ci.yml?branch=main)](https://github.com/postrust/postrust/actions)
 
@@ -16,12 +16,12 @@
 
 ## What is Postrust?
 
-Postrust is a high-performance, serverless-first REST API server for PostgreSQL databases. Inspired by [PostgREST](https://postgrest.org), it automatically generates a RESTful API from your database schema, supporting filtering, pagination, embedding, and full CRUD operations.
+Postrust is a serverless-first REST API server for PostgreSQL databases. Inspired by [PostgREST](https://postgrest.org), it automatically generates a RESTful API from your database schema, supporting filtering, pagination, embedding, and full CRUD operations.
 
 **Why Postrust?**
 
 - **Serverless-first**: Native support for AWS Lambda and Cloudflare Workers
-- **Fast**: Written in Rust for maximum performance and minimal cold starts
+- **Measured**: Conformance against PostgREST's and Hasura's own test corpora, re-run on a schedule. Throughput figures are withdrawn until the harness can be trusted — see [Benchmarks](#benchmarks)
 - **Compatible**: Familiar PostgREST-style API; near drop-in with an opt-in [compatibility mode](#postgrest-compatibility) (see [Differences from PostgREST](#differences-from-postgrest))
 - **Type-safe**: Parameterized queries prevent SQL injection by design
 - **Lightweight**: Single binary with no runtime dependencies
@@ -66,7 +66,7 @@ Postrust is a high-performance, serverless-first REST API server for PostgreSQL 
 
 ### Prerequisites
 
-- Rust 1.78+ (`curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh`)
+- Rust 1.88+ (`curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh`)
 - PostgreSQL 12+ (or use Docker)
 
 ### Installation
@@ -472,7 +472,7 @@ Postrust crates at the same version work together. Browse them at
 | `postrust-graphql` | GraphQL API with dynamic schema generation | [crates.io](https://crates.io/crates/postrust-graphql) · [docs](https://docs.rs/postrust-graphql) |
 | `postrust-lambda` | AWS Lambda adapter | [crates.io](https://crates.io/crates/postrust-lambda) · [docs](https://docs.rs/postrust-lambda) |
 | `postrust-worker` | Cloudflare Workers adapter — **stub; `0.x`, no stability promise** | [crates.io](https://crates.io/crates/postrust-worker) · [docs](https://docs.rs/postrust-worker) |
-| `postrust-proxy` | Reverse proxy with load balancing and automatic TLS — **`0.x`, no stability promise** | [crates.io](https://crates.io/crates/postrust-proxy) · [docs](https://docs.rs/postrust-proxy) |
+| `postrust-proxy` | Reverse proxy with load balancing and automatic TLS — **`0.x`, no stability promise** | [guide](docs/proxy.md) · [crates.io](https://crates.io/crates/postrust-proxy) · [docs](https://docs.rs/postrust-proxy) |
 
 The first seven crates share one version and one semver promise. The last two
 are each on their own `0.x` line and carry none:

@@ -5,7 +5,7 @@ This guide will help you get Postrust up and running in minutes.
 ## Prerequisites
 
 - PostgreSQL 12 or later
-- Rust 1.75+ (for building from source) or Docker
+- Rust 1.88+ (for building from source) or Docker
 
 ## Installation
 

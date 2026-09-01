@@ -105,8 +105,11 @@ impl ApiKeyService {
 /// Result of API key validation.
 #[derive(Debug, Clone)]
 pub struct ValidatedApiKey {
+    /// Which key it was, for the audit log. Not the key itself.
     pub key_id: Uuid,
+    /// The tenant the key authenticates.
     pub tenant_id: Uuid,
+    /// What the key may do, as `resource:action` strings.
     pub scopes: Vec<String>,
 }
 

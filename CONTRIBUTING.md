@@ -21,7 +21,7 @@ This project adheres to a code of conduct. By participating, you are expected to
 
 ### Prerequisites
 
-- Rust 1.75 or later
+- Rust 1.88 or later (the declared MSRV, checked in CI)
 - Docker and Docker Compose (for running tests with PostgreSQL)
 - Git
 

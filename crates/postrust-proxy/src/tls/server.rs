@@ -24,7 +24,7 @@ pub const ALPN_PROTOCOLS: [&[u8]; 2] = [b"h2", b"http/1.1"];
 /// configured for the former, reqwest pulls the latter -- so rustls refuses to
 /// guess and panics on first use unless one is installed explicitly. Idempotent:
 /// a second call returns Err and is ignored.
-fn install_crypto_provider() {
+pub(crate) fn install_crypto_provider() {
     static ONCE: std::sync::Once = std::sync::Once::new();
     ONCE.call_once(|| {
         let _ = tokio_rustls::rustls::crypto::aws_lc_rs::default_provider().install_default();

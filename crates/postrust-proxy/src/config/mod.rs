@@ -1,11 +1,14 @@
 //! Configuration types and loaders for the proxy.
 //!
-//! Supports both file-based (TOML) and database-backed configuration,
-//! with hot-reload via file watching and PostgreSQL LISTEN/NOTIFY.
+//! Supports both file-based (TOML) and database-backed configuration.
+//!
+//! There is no hot reload. A `ConfigReloader` used to sit here with a channel
+//! nobody read, and `POST /config/reload` answered "Configuration reload
+//! requested" without reloading anything. Both are gone rather than left to be
+//! believed; changing the configuration needs a restart.
 
 mod database;
 mod file;
-mod reload;
 mod types;
 
 pub use database::{
@@ -13,5 +16,4 @@ pub use database::{
     save_upstream,
 };
 pub use file::load_from_file;
-pub use reload::ConfigReloader;
 pub use types::*;

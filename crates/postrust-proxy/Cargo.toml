@@ -9,14 +9,22 @@ keywords = ["proxy", "load-balancer", "tls", "acme", "http"]
 # promise a stability this crate cannot keep. See docs/stability.md.
 version = "0.5.0"
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 authors.workspace = true
 
 [features]
 default = ["acme"]
-acme = ["rustls-acme"]
+# ACME issuance over HTTP-01. instant-acme is not optional-only because the
+# issuer, the challenge endpoint and the worker are all behind this flag.
+acme = ["dep:instant-acme"]
 sticky-cookie = []
+# Enables tests/acme_issuance.rs, which needs a live certificate authority.
+# Not default: without the harness there is nothing for them to talk to, and a
+# test that quietly skips itself is a test that stops being noticed. Turned on
+# by scripts/acme/run.sh and by the conformance workflow.
+pebble-tests = ["acme"]
 
 [dependencies]
 # Async runtime
@@ -38,9 +46,11 @@ http.workspace = true
 tokio-rustls.workspace = true
 rustls.workspace = true
 rustls-pemfile.workspace = true
+instant-acme = { workspace = true, optional = true }
+x509-parser.workspace = true
+regex.workspace = true
 
 # ACME (optional)
-rustls-acme = { workspace = true, optional = true }
 
 # Database
 sqlx.workspace = true
@@ -65,7 +75,6 @@ uuid.workspace = true
 url.workspace = true
 
 # Hot-reload and concurrency
-notify.workspace = true
 dashmap.workspace = true
 parking_lot.workspace = true
 
@@ -82,7 +91,7 @@ pin-project-lite = "0.2"
 rand = "0.9"
 
 # DNS resolution for domain verification
-hickory-resolver = "0.24"
+hickory-resolver = "0.26"
 
 # Hashing for API keys
 sha2 = "0.10"
@@ -110,3 +119,4 @@ tokio = { workspace = true, features = ["test-util", "macros"] }
 # need these in their own right rather than through the library.
 sqlx.workspace = true
 uuid.workspace = true
+axum.workspace = true

@@ -37,6 +37,7 @@ scripts/hasura-conformance/.work-run*.log
 # HTTP Garden is cloned here by scripts/http-garden/setup.sh
 scripts/http-garden/garden/
 scripts/http-garden/images/postrust/src/
+scripts/acme/.work
 scripts/h2spec/.work
 scripts/autobahn/.work
 scripts/autobahn/reports

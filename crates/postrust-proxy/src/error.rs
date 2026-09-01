@@ -64,10 +64,6 @@ pub enum ProxyError {
     #[error("TOML parsing error: {0}")]
     Toml(#[from] toml::de::Error),
 
-    /// File watcher error
-    #[error("File watcher error: {0}")]
-    Notify(#[from] notify::Error),
-
     /// Internal error
     #[error("Internal error: {0}")]
     Internal(String),
@@ -124,7 +120,6 @@ impl ProxyError {
             ProxyError::NoHealthyBackends(_) => http::StatusCode::SERVICE_UNAVAILABLE,
             ProxyError::InvalidUrl(_) => http::StatusCode::BAD_REQUEST,
             ProxyError::Toml(_) => http::StatusCode::INTERNAL_SERVER_ERROR,
-            ProxyError::Notify(_) => http::StatusCode::INTERNAL_SERVER_ERROR,
             ProxyError::Internal(_) => http::StatusCode::INTERNAL_SERVER_ERROR,
             ProxyError::Verification(_) => http::StatusCode::BAD_REQUEST,
             ProxyError::Auth(_) => http::StatusCode::UNAUTHORIZED,

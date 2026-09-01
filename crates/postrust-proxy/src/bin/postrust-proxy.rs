@@ -68,6 +68,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .unwrap_or("postgres://postgres:postgres@127.0.0.1:5432/postgres"),
     )?;
 
+    let cancel = CancellationToken::new();
+    #[cfg(feature = "acme")]
+    let cancel_for_acme = cancel.clone();
+
     let mut config = config;
     if config.server.database_config && database_url.is_some() {
         let (routes, upstreams) = load_from_database(&pool).await?;
@@ -80,8 +84,32 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     let config = config;
 
+    // The ACME issuance worker, if the config asks for it.
+    //
+    // Needs a database: the account, the pending challenges and the
+    // certificates all live there, and the challenge the CA fetches is served
+    // out of a table so that any instance can answer it. Without DATABASE_URL
+    // there is nowhere to keep any of that, so the worker does not start and
+    // says so rather than failing later on the first order.
+    #[cfg(feature = "acme")]
+    let acme_worker = if config.tls.acme_enabled {
+        match &database_url {
+            Some(_) => {
+                Some(start_acme_worker(&config, pool.clone(), cancel_for_acme.clone()).await?)
+            }
+            None => {
+                tracing::warn!(
+                    "tls.acme_enabled is set but DATABASE_URL is not;                      the ACME worker needs a database for the account,                      challenges and certificates, so it will not start"
+                );
+                None
+            }
+        }
+    } else {
+        None
+    };
+
     let rate_limiter = Arc::new(RateLimiter::new(config.rate_limit.clone()));
-    let health_checker = Arc::new(HealthChecker::new(pool));
+    let health_checker = Arc::new(HealthChecker::new());
     let service = Arc::new(ProxyService::new(
         Arc::new(RwLock::new(config)),
         health_checker,
@@ -89,7 +117,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     ));
     service.load_config().await;
 
-    let cancel = CancellationToken::new();
     {
         let cancel = cancel.clone();
         tokio::spawn(async move {
@@ -147,7 +174,56 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         tls.await
             .map_err(|e| format!("https listener panicked: {e}"))??;
     }
+
+    #[cfg(feature = "acme")]
+    if let Some(worker) = acme_worker {
+        worker
+            .await
+            .map_err(|e| format!("ACME worker panicked: {e}"))?;
+    }
+
     Ok(())
+}
+
+/// Start the ACME issuance worker.
+///
+/// Split out to keep `main` readable, and because everything in it is behind
+/// the `acme` feature.
+#[cfg(feature = "acme")]
+async fn start_acme_worker(
+    config: &ProxyConfig,
+    pool: sqlx::PgPool,
+    cancel: CancellationToken,
+) -> Result<tokio::task::JoinHandle<()>, Box<dyn std::error::Error>> {
+    use postrust_proxy::tls::{
+        AcmeIssuer, CertificateStore, LETS_ENCRYPT_PRODUCTION, LETS_ENCRYPT_STAGING,
+    };
+
+    let directory = config.tls.acme_directory_url.clone().unwrap_or_else(|| {
+        if config.tls.acme_staging {
+            LETS_ENCRYPT_STAGING.to_string()
+        } else {
+            LETS_ENCRYPT_PRODUCTION.to_string()
+        }
+    });
+
+    let cert_store = Arc::new(CertificateStore::new(pool.clone(), &config.tls.cert_dir).await?);
+
+    let mut issuer = AcmeIssuer::new(
+        directory,
+        config.tls.acme_email.clone(),
+        pool.clone(),
+        cert_store,
+    );
+    if let Some(root) = &config.tls.acme_root_pem {
+        issuer = issuer.with_root_certificate(root);
+    }
+
+    Ok(tokio::spawn(postrust_proxy::saas::ssl::run(
+        pool,
+        Arc::new(issuer),
+        cancel,
+    )))
 }
 
 /// Add database-held routes and upstreams to a file-bootstrapped config.

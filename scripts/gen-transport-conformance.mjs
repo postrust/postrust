@@ -128,6 +128,25 @@ function readAutobahn() {
   const total = Object.values(counts).reduce((a, b) => a + b, 0);
   if (total === 0) die("the Autobahn report has no cases");
 
+  // Tally the OK/NON-STRICT split over cases *outside* the invalid-frame
+  // family, and report the family's size separately.
+  //
+  // Members of that family move between OK and NON-STRICT from run to run with
+  // nothing about the proxy changing -- one run scored 501 OK and 12
+  // NON-STRICT, the next 502 and 11, from 4.2.5 alone. Publishing the raw split
+  // means the committed figure disagrees with the next run, so the drift check
+  // that guards these numbers would fail for a reason that is not a
+  // regression. An intermittently red gate is worse than no gate: it teaches
+  // everyone to ignore it.
+  //
+  // `cases`, `failed` and `regressions` stay over the whole set, because those
+  // do not move.
+  const settled = Object.fromEntries(
+    Object.entries(proxied).filter(([name]) => !SEGMENTATION_SENSITIVE.has(name)),
+  );
+  const settledCounts = tally(settled);
+  const settledTotal = Object.values(settledCounts).reduce((a, b) => a + b, 0);
+
   // The two runs must cover the same cases. A run that stops early still writes
   // a valid-looking report -- one truncated mid-section-13 published 428 cases
   // against a 517-case baseline and read as a clean pass. Comparing the sets is
@@ -150,15 +169,22 @@ function readAutobahn() {
 
   return {
     cases: total,
-    ok: counts.OK ?? 0,
-    nonStrict: counts["NON-STRICT"] ?? 0,
-    informational: counts.INFORMATIONAL ?? 0,
-    unimplemented: counts.UNIMPLEMENTED ?? 0,
+    // Over the cases whose result is stable across runs. See above.
+    settledCases: settledTotal,
+    ok: settledCounts.OK ?? 0,
+    nonStrict: settledCounts["NON-STRICT"] ?? 0,
+    informational: settledCounts.INFORMATIONAL ?? 0,
+    unimplemented: settledCounts.UNIMPLEMENTED ?? 0,
     failed: counts.FAILED ?? 0,
+    // The invalid-frame family, excluded from the split above. A constant: it
+    // is the size of the set, not a result.
+    segmentationSensitive: SEGMENTATION_SENSITIVE.size,
     baselineCases: Object.keys(baseline).length,
     baselineFailed: tally(baseline).FAILED ?? 0,
     regressions: regressions.sort(),
-    intermittent: intermittent.sort(),
+    // How many of that family were worse than the baseline on this run. Kept
+    // out of the drift check by being reported rather than asserted.
+    intermittentCount: intermittent.length,
   };
 }
 
@@ -196,7 +222,8 @@ console.log(
   `  h2spec:   ${h2spec.passed}/${h2spec.tests} passed, ${h2spec.failed} failed`,
 );
 console.log(
-  `  autobahn: ${autobahn.ok}/${autobahn.cases} OK, ${autobahn.failed} failed, ` +
-    `${autobahn.regressions.length} worse than baseline, ` +
-    `${autobahn.intermittent.length} in the intermittent invalid-frame family`,
+  `  autobahn: ${autobahn.ok}/${autobahn.settledCases} OK of the settled cases, ` +
+    `${autobahn.failed} failed, ${autobahn.regressions.length} worse than baseline, ` +
+    `${autobahn.segmentationSensitive} in the invalid-frame family ` +
+    `(${autobahn.intermittentCount} of them worse than baseline this run)`,
 );

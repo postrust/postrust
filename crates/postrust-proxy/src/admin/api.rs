@@ -17,14 +17,19 @@ use uuid::Uuid;
 /// API response wrapper.
 #[derive(Serialize)]
 pub struct ApiResponse<T> {
+    /// Whether the request did what was asked. Read this, not the presence of
+    /// `data`.
     pub success: bool,
+    /// The payload, on success.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub data: Option<T>,
+    /// What went wrong, on failure.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
 }
 
 impl<T: Serialize> ApiResponse<T> {
+    /// A successful response carrying `data`.
     pub fn success(data: T) -> Self {
         Self {
             success: true,
@@ -33,6 +38,11 @@ impl<T: Serialize> ApiResponse<T> {
         }
     }
 
+    /// A failure response carrying `message` and no data.
+    ///
+    /// Returns `ApiResponse<()>` regardless of `T`: there is no payload to
+    /// type, and requiring the caller to name one at every error site would be
+    /// noise.
     pub fn error(message: impl Into<String>) -> ApiResponse<()> {
         ApiResponse {
             success: false,
@@ -68,32 +78,35 @@ async fn persists(state: &ProxyState) -> bool {
 }
 
 /// Create the admin API router.
+/// Build the admin API router.
+///
+/// **No authentication of its own.** Mount it behind something that
+/// authenticates, or on an address only operators can reach.
 pub fn admin_router() -> Router<Arc<ProxyState>> {
     Router::new()
         // Routes
         .route("/routes", get(list_routes))
         .route("/routes", post(create_route))
-        .route("/routes/:id", get(get_route))
-        .route("/routes/:id", put(update_route))
-        .route("/routes/:id", delete(delete_route))
+        .route("/routes/{id}", get(get_route))
+        .route("/routes/{id}", put(update_route))
+        .route("/routes/{id}", delete(delete_route))
         // Upstreams
         .route("/upstreams", get(list_upstreams))
         .route("/upstreams", post(create_upstream))
-        .route("/upstreams/:id", get(get_upstream))
-        .route("/upstreams/:id", put(update_upstream))
-        .route("/upstreams/:id", delete(delete_upstream))
+        .route("/upstreams/{id}", get(get_upstream))
+        .route("/upstreams/{id}", put(update_upstream))
+        .route("/upstreams/{id}", delete(delete_upstream))
         // Backends
-        .route("/upstreams/:id/backends", get(list_backends))
-        .route("/upstreams/:id/backends", post(add_backend))
+        .route("/upstreams/{id}/backends", get(list_backends))
+        .route("/upstreams/{id}/backends", post(add_backend))
         .route(
-            "/upstreams/:id/backends/:backend_id",
+            "/upstreams/{id}/backends/{backend_id}",
             delete(remove_backend),
         )
         // Health
         .route("/health", get(health_status))
-        .route("/health/:backend_id", get(backend_health))
+        .route("/health/{backend_id}", get(backend_health))
         // Config
-        .route("/config/reload", post(reload_config))
         // Stats
         .route("/stats", get(get_stats))
 }
@@ -121,15 +134,24 @@ async fn get_route(
     }
 }
 
+/// Body of `POST /routes` and `PUT /routes/{id}`.
 #[derive(Deserialize)]
 pub struct CreateRouteRequest {
+    /// Route name, unique in the config.
     pub name: String,
+    /// Host to match. Omit for any.
     pub host: Option<String>,
+    /// Path to match, as a prefix.
     pub path: Option<String>,
+    /// Name of the upstream to forward to.
     pub upstream: String,
+    /// Whether to remove the matched prefix. Defaults to false.
     pub strip_path: Option<bool>,
+    /// Higher is matched first. Defaults to 100.
     pub priority: Option<i32>,
+    /// Headers to add to the forwarded request.
     pub add_headers: Option<HashMap<String, String>>,
+    /// Headers to remove from the forwarded request.
     pub remove_headers: Option<Vec<String>>,
 }
 
@@ -295,17 +317,30 @@ async fn get_upstream(
     }
 }
 
+/// Body of `POST /upstreams` and `PUT /upstreams/{id}`.
 #[derive(Deserialize)]
 pub struct CreateUpstreamRequest {
+    /// Upstream name. Routes reference it.
     pub name: String,
+    /// How requests are spread across the backends. Defaults to round-robin.
     pub lb_strategy: Option<LoadBalanceStrategy>,
+    /// Backends to create with it.
+    ///
+    /// Only read on create. `update_upstream` ignores this field, because the
+    /// type cannot express a backend's id -- applying it would re-create every
+    /// backend under a fresh id, and an empty list sent by a caller that meant
+    /// only to rename would remove them all.
     pub backends: Vec<BackendRequest>,
 }
 
+/// A backend, inside an upstream request or `POST /upstreams/{id}/backends`.
 #[derive(Deserialize)]
 pub struct BackendRequest {
+    /// `host:port`.
     pub address: String,
+    /// Relative share of traffic under a weighted strategy.
     pub weight: Option<u32>,
+    /// `http` or `https`. Defaults to `http`.
     pub scheme: Option<String>,
 }
 
@@ -571,10 +606,16 @@ async fn remove_backend(
 
 // Health handlers
 
+/// Backend health across the whole running config.
 #[derive(Serialize)]
 pub struct HealthSummary {
+    /// Backends across every upstream.
     pub total_backends: usize,
+    /// How many are currently passing their health check.
     pub healthy_backends: usize,
+    /// How many are not. An unknown backend counts as healthy, so this is
+    /// backends known to be failing rather than backends not known to be
+    /// passing.
     pub unhealthy_backends: usize,
 }
 
@@ -616,19 +657,16 @@ async fn backend_health(
     }
 }
 
-// Config handlers
-
-async fn reload_config(State(state): State<Arc<ProxyState>>) -> impl IntoResponse {
-    state.config_reloader.request_reload().await;
-    Json(ApiResponse::success("Configuration reload requested"))
-}
-
 // Stats handlers
 
+/// How much configuration the proxy is currently holding.
 #[derive(Serialize)]
 pub struct ProxyStats {
+    /// Routes in the running config, enabled or not.
     pub routes_count: usize,
+    /// Upstreams in the running config.
     pub upstreams_count: usize,
+    /// Backends across all of them.
     pub backends_count: usize,
 }
 

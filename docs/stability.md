@@ -44,16 +44,18 @@ anything yet.
 
 Not caution for its own sake. Three specific things:
 
-**The public surface is largely undocumented.** Turning `missing_docs` on for
-`postrust-proxy` produces 306 warnings — 266 struct fields, 25 enum variants,
-8 associated functions, 5 structs, 2 methods. `dead_code` adds 4 more. A 1.0.0
-would freeze all of it as-is.
+**It has not been lived with.** The documentation gap is closed --
+`missing_docs` and `dead_code` are on and clean, where they used to be blanket
+`allow`s hiding 306 and 4 warnings -- but nobody outside this repository has
+depended on the API, and the surface is wide: routing, TLS, ACME, an admin API
+and a multi-tenant module. Freezing it now would be guessing at what people
+need.
 
-**Automatic SSL provisioning is not implemented.** A domain can be configured
-with `ssl_provider = "acme"` and the schema tracks an `ssl_status`, but nothing
-in the crate has ever talked to a certificate authority. A verified domain is
-left `pending` with a warning rather than claiming to be provisioning. See
-[SaaS Domain Management](./saas-domains.md).
+**There is no configuration reload.** Changing the config needs a restart. What
+was there -- a `ConfigReloader` whose channel nobody read, a
+`server.watch_config_file` that watched nothing, and a `POST /config/reload`
+that answered "Configuration reload requested" without reloading -- is removed
+rather than left to be believed.
 
 **It has only just grown its transport layer.** TLS, HTTP/2, WebSocket and
 RFC 8441 extended CONNECT all landed in `1.0.0-alpha.2`. They are measured, by
@@ -127,6 +129,6 @@ the next major.
 
 Bugs and questions: [GitHub Issues](https://github.com/postrust/postrust/issues).
 
-For anything with a security impact, please report it privately through
-[GitHub's security advisory form](https://github.com/postrust/postrust/security/advisories/new)
-rather than opening a public issue.
+For anything with a security impact, see
+[SECURITY.md](https://github.com/postrust/postrust/blob/main/SECURITY.md) --
+report it privately rather than opening a public issue.

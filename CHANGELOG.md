@@ -3,9 +3,122 @@
 Notable changes, newest first. This file starts at 1.0.0-alpha.1; earlier
 releases are described by their tags and the pull requests behind them.
 
-## Unreleased
+## 1.0.0-beta.1
+
+Everything on the checklist for a stable release is done except the one thing
+that cannot be done from inside the repository: exposure to somebody outside
+it. Hence beta rather than 1.0.0.
+
+**What the version numbers now mean.** Seven crates share `1.0.0-beta.1` and a
+semver promise once it lands. `postrust-proxy` and `postrust-worker` are on
+their own `0.x` lines and carry none -- the proxy because its surface is wide
+and nobody outside this repository has depended on it yet, the worker because
+it is a stub. Nothing in the stable line depends on either. See
+[docs/stability.md](docs/stability.md).
+
+**Throughput figures remain withdrawn**, and are not restored by attributing
+them to the release that produced them. `scripts/BENCH-FINDINGS.md` records why:
+the same server measured seconds apart differed by about a factor of two, and
+whatever ran first was the most understated, so run order determined the
+published ratios. Changing only the measurement window moved point lookup
+against PostgREST from 3.35x to 1.11x. The figures are a property of the
+harness, not of a version. The precondition for publishing again is in that
+file.
+
 
 ### Added
+
+**Host-based routing did not work over HTTP/2.** Route selection read only the
+`Host` header, and HTTP/2 has none -- RFC 9113 section 8.3.1 replaces it with
+`:authority`, which arrives on the URI. So `host` was empty for every h2 and
+h2c request and any route with a `match.host` matched nothing. Confirmed
+against a running proxy: the same host-matched route answered 200 over
+HTTP/1.1 and 404 over HTTP/2, and now answers 200 for both while still
+refusing a host that does not match.
+
+**A domain abandoned mid-issuance was never recovered.** Nothing moved a row
+out of `ssl_status = 'provisioning'` except the worker finishing with it, and
+both of those writes happen in-process after the order returns -- so a restart
+during an order, or a database error on the way to recording the result, left
+the domain there permanently with nothing retrying and nothing saying so. The
+worker now requeues rows stuck longer than 15 minutes, counting the interrupted
+attempt so a crash loop cannot spend the CA's rate limit without limit.
+
+**A certificate whose expiry could not be read was never renewed.** The renewal
+scan selects on `expires_at IS NOT NULL`, and issuance stored `None` when the
+chain would not parse -- so such a certificate was simply left to expire.
+Issuance now substitutes a deliberately short assumed lifetime and logs an
+error, and the Pebble test asserts the stored expiry is the chain's own rather
+than merely present.
+
+**The route regex was compiled on every request**, for every regex route a
+request was compared against. Now compiled once and cached by pattern, failures
+included, so a typo costs one compilation rather than one per request.
+
+**Route matching honours the whole of `RouteMatch`.** `path_type`, `methods` and
+`match.headers` were all declarable and all ignored: the filter chain compared
+host and path prefix and nothing else. Each silent no-op *widened* a route past
+what its author wrote -- `path_type = "exact"` on `/health` also caught
+`/health-internal`, and a route restricted to `methods = ["GET"]` accepted
+`DELETE`. A host may now also be a single-label wildcard (`*.example.com`).
+A regex that does not compile matches nothing and logs why, rather than being
+treated as a prefix or a match-all.
+
+Also removed `BackendManager::find_upstream`, a second route matcher that was
+never called and was worse: prefix only, no method, no headers, and it ignored
+`priority`.
+
+**Documentation for the proxy**, in [docs/proxy.md](docs/proxy.md) -- there was
+none, for a crate that had just gained TLS, HTTP/2, WebSocket and a binary. It
+includes a section naming the configuration that is declarable and does nothing
+yet (`timeout_secs`, `retry_count`, `watch_config_file`, `https_enabled`,
+`acme_directory`), because the alternative is that each one gets discovered.
+
+**Three domain endpoints the documentation promised and the router never had.**
+`docs/saas-domains.md` listed `PUT /domains/{id}`,
+`POST /domains/{id}/ssl/provision` and `POST /domains/{id}/ssl/upload`; none was
+mounted. All three exist now.
+
+`PUT /domains/{id}` is a partial update of the verification method and the SSL
+provider. The domain name is deliberately not updatable: it is what the
+verification token proves control of, so a rename would carry a proof of
+ownership over to a name nobody has proved anything about.
+
+`ssl/upload` **checks the certificate before storing it** -- the key must match
+the chain, it must not be expired, and it must cover the domain, wildcards
+counting for exactly one label. Skipping any of those gives a listener that
+accepts the upload and then fails every handshake, with nothing pointing back at
+the cause.
+
+`ssl/provision` returns 202 and queues; the worker issues. It is also how to
+retry, so the `ssl/retry` endpoint that briefly existed in this branch is gone --
+one endpoint rather than two that overlap.
+
+**Automatic SSL via ACME, over HTTP-01.** `docs/saas-domains.md` advertised
+this as a feature and the schema tracked an `ssl_status`, but nothing in the
+crate had ever talked to a certificate authority.
+
+A verified domain with `ssl_provider = "acme"` is queued, and a background
+worker (`saas::ssl`) places the order, answers the challenge, stores the
+certificate, and renews it 30 days before expiry. Failures record `ssl_error`
+and retry with exponential backoff, capped at four hours, giving up after ten
+attempts; `POST /domains/{id}/ssl/retry` requeues one. There is deliberately no
+`provision` endpoint -- issuance is several round trips plus a challenge fetch
+the CA has to make back to us, which does not belong in a request.
+
+Three tables came with it, including **`proxy_certificates`, which
+`CertificateStore` had queried since it was written and which nothing ever
+created** -- so every certificate save had failed with "relation
+proxy_certificates does not exist".
+
+Tested end to end against [Pebble](https://github.com/letsencrypt/pebble),
+Let's Encrypt's deliberately-misbehaving test CA, through the shipped
+`/.well-known/acme-challenge/{token}` handler: `scripts/acme/run.sh`.
+
+**`rustls-acme` was replaced by `instant-acme`** rather than adding a second
+ACME client. The old wrapper took a fixed domain list, which cannot serve a
+tenant domain that arrives while the proxy is running, and was never
+constructed anywhere. Keeping both also resolved two copies of `rcgen`.
 
 **Database-backed proxy configuration actually reads and writes.**
 `config::load_from_database` was two `// TODO: Implement database query`
@@ -24,7 +137,99 @@ config, and report a failure to persist as a 500 rather than a success. With
 `server.database_config = false` -- an explicit "this proxy is configured from
 a file" -- edits stay in memory as before.
 
+### Changed
+
+**The Autobahn figures published on the website are now run-stable.** The
+OK/NON-STRICT split is tallied over the cases *outside* the intermittent
+invalid-frame family, with the family's size reported separately. Members of
+that family move between OK and NON-STRICT from run to run with nothing about
+the proxy changing -- one run scored 501 OK and 12 NON-STRICT, the next 502 and
+11, from a single case. Publishing the raw split would have made the new drift
+check fail on the next run for a reason that is not a regression, and an
+intermittently red gate teaches everyone to ignore it. Verified stable over
+three consecutive runs.
+
+**The conformance suites run on a schedule.** `.github/workflows/conformance.yml`
+runs the transport suites nightly (h2spec, Autobahn baseline and proxied, and a
+real ACME order against Pebble) and the dialect suites weekly (PostgREST and
+Hasura, which need PostGIS and a release build). Each job then **regenerates the
+website's data module and fails if the committed one has drifted** -- which is
+the point: every figure the site publishes is generated from a run's artifacts,
+and nothing was re-running those, so the numbers could go stale silently.
+
+Not on the pull-request path: each suite starts containers and replays hundreds
+of cases against two servers. Gating every PR on that would make the common case
+slow to catch an uncommon regression.
+
+HTTP Garden is deliberately not scheduled. It is a differential fuzzer that
+clones a GPL-3.0 repository and builds images for dozens of other HTTP servers;
+its value is in exploring inputs nobody thought of -- which is how it found the
+hop-by-hop defect -- not in re-running a fixed set. The reasoning is recorded in
+the workflow.
+
+**h2spec and Autobahn now work on Linux.** Both reach the proxy through
+`host.docker.internal`, which resolves only on Docker Desktop. They pass
+`--add-host host.docker.internal:host-gateway`, so they work on a CI runner as
+well as on a developer's Mac.
+
+**The MSRV is declared and checked: Rust 1.88.** It was not declared anywhere,
+while the README claimed 1.78, `docs/getting-started.md` claimed 1.75 and
+`CONTRIBUTING.md` claimed 1.75 -- three different wrong numbers. The floor is
+now 1.88: `hickory-{net,proto,resolver}` 0.26 and `time` 0.3.55 all require it,
+and 1.87.0 is refused outright. Both arrived with the security updates above,
+so the floor moved from 1.86 to 1.88 as a direct cost of them, which is a trade
+worth making. Declared as `rust-version` in `[workspace.package]`, inherited by
+every crate, with a CI job that builds on 1.88 `--locked`.
+
+**`postrust-proxy` and `postrust-worker` each moved to their own `0.x` version
+line** and no longer share the workspace version. The rest of the workspace is
+heading for 1.0.0 and the semver promise that comes with it; neither of these
+is ready to make one.
+
+For the proxy: turning `missing_docs` on produces 306 warnings, and automatic
+SSL provisioning is still not implemented. (The config and admin-API stubs that
+were the other half of the reason are fixed in this release -- see Added.)
+For the worker: it is a stub that answers `{"status": "stub"}`.
+
+Nothing in the stable line depends on either, so no crate that makes a semver
+promise carries a dependency that cannot keep one. The worker is a `cdylib`,
+which cannot be a Rust library dependency at all.
+
+Both lines still release on the same git tags: the publish step reads each
+crate's own declared version rather than assuming one across the workspace, and
+skips what is already on crates.io.
+
+New: [docs/stability.md](docs/stability.md), stating what a version number
+covers and what it does not.
+
+### Removed
+
+**`POST /config/reload` answered "Configuration reload requested" and reloaded
+nothing.** It sent on a channel nobody read. That, `ConfigReloader`,
+`server.watch_config_file` and the `notify` dependency they existed for are all
+gone; configuration changes need a restart, which `docs/proxy.md` now says.
+
+Dropping `notify` also removed `instant` from the lockfile, so the
+`RUSTSEC-2024-0384` ignore in `.cargo/audit.toml` is gone -- two documented
+ignores left instead of three.
+
+Also removed: `hyper_ext::TokioExecutor`, a duplicate of the `hyper_util` one
+the code actually uses; `HealthChecker`'s `PgPool` field, held "for persisting
+health status" that was never implemented; and `ApiKeyRow::key_hash`, selected
+and never read.
+
 ### Fixed
+
+**Every parameterised route in the proxy would panic at construction.** 23
+routes across `admin_router` and `saas_router` used axum 0.7's `:param` syntax,
+which axum 0.8 -- what the workspace has depended on for some time -- rejects:
+
+```
+Path segments must not start with `:`. For capture groups, use `{capture}`.
+```
+
+Neither router is mounted anywhere, so nothing had ever called them and nothing
+noticed. Found by an ACME test that needed to serve the real router.
 
 **HTTP domain verification proved nothing.** The endpoint serving the
 challenge, `/.well-known/postrust-verification/{token}`, computed
@@ -51,29 +256,34 @@ which are in the router, and omitted `enable` and `disable`, which are. It
 also advertised automatic ACME provisioning as a feature. Corrected against
 the router, and the SSL section now says plainly that no ACME client exists.
 
-### Changed
+### Security
 
-**`postrust-worker` moved to its own `0.x` version line** as well, for a
-blunter reason: it is a stub. Its fetch handler answers `{"status": "stub"}`
-and does not parse requests, reach a database, or return data. It is built as
-a `cdylib`, so it cannot be a Rust library dependency at all.
+**Twelve dependency advisories fixed** by updating the lockfile, including five
+in `aws-lc-sys` (X.509 name-constraint bypass via wildcard/Unicode CN, two
+PKCS7 signature and chain validation bypasses, a CRL distribution-point scope
+error, an AES-CCM timing side channel) and four in `rustls-webpki` (a reachable
+panic in CRL parsing, URI name constraints incorrectly accepted, and two more
+CRL and wildcard issues). All of these are in the path of a TLS-terminating
+proxy. Also `bytes`, `h2` (unbounded empty DATA frames), `time`, `anyhow`,
+`event-listener` and both `rand` majors.
 
-**`postrust-proxy` moved to its own `0.x` version line** and no longer shares
-the workspace version. The rest of the workspace is heading for 1.0.0 and a
-semver promise; this crate is not ready to make one. Turning `missing_docs` on
-for it produces 306 warnings, and parts of its public surface answer
-successfully without doing anything -- `config::database` returns an empty
-route set instead of querying, and the admin API's route and upstream mutations
-change only the in-memory config while replying `200`/`201`. Nothing depends on
-`postrust-proxy`, so no crate that makes a semver promise carries a dependency
-that cannot keep one.
+**`hickory-resolver` 0.24 to 0.26**, clearing an O(n²) name-compression CPU
+exhaustion in `hickory-proto`. The upgrade is a real API migration, and one
+part of it would have broken silently: 0.26 replaced the rdata iterator with
+`Lookup::answers()`, and `Record`'s `Display` renders the whole record line
+(`name ttl class type rdata`), so the previous `record.to_string()` would never
+have matched a bare challenge token again. Every DNS verification would have
+failed. The comparison now lives in a tested function, `txt_matches`, with a
+case asserting that a full record line does *not* match.
 
-Both lines still release on the same git tags: the publish step now reads each
-crate's own declared version rather than assuming one across the workspace, and
-skips what is already on crates.io.
+**A dependency audit now runs in CI.** `cargo audit --deny warnings`, with
+three documented ignores in `.cargo/audit.toml` -- one advisory with no
+reachable code path and no upstream fix (`rsa`, not in any build graph), and
+two unmaintained crates with the migration each needs written down. The job is
+verified green rather than added and hoped for.
 
-New: [docs/stability.md](docs/stability.md), stating what a version number
-covers and what it does not.
+**`SECURITY.md`** added: how to report privately, what to expect, what is in
+scope, and the known-and-documented weaknesses that are not reports.
 
 ## 1.0.0-alpha.2
 

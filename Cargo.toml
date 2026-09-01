@@ -13,8 +13,15 @@ members = [
 ]
 
 [workspace.package]
-version = "1.0.0-alpha.2"
+version = "1.0.0-beta.1"
 edition = "2021"
+# Verified, not assumed: 1.88.0 builds the workspace clean and 1.87.0 is
+# refused outright -- hickory-{net,proto,resolver} 0.26 and time 0.3.55 all
+# declare 1.88. Both arrived with security updates, and the floor moved from
+# 1.86 to 1.88 as a result; the advisories were worth more than the two
+# releases. The README claimed 1.78, and the docs 1.75, before this was
+# declared anywhere at all.
+rust-version = "1.88"
 license = "MIT"
 repository = "https://github.com/postrust/postrust"
 homepage = "https://postrust.org/"
@@ -79,15 +86,27 @@ pretty_assertions = "1.4"
 tokio-rustls = "0.26"
 rustls = { version = "0.23", default-features = false, features = ["std", "aws_lc_rs"] }
 rustls-pemfile = "2"
-rustls-acme = { version = "0.11", default-features = false, features = ["aws-lc-rs"] }
 
 # HTTP client
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
+
+# ACME (Let's Encrypt). The `rcgen` feature makes `Order::finalize` build the
+# CSR and hand back the private key as PEM, so rcgen does not need to be a
+# direct dependency -- declaring it separately resolved a *second* rcgen
+# alongside instant-acme's own. `aws-lc-rs` keeps it on the crypto provider
+# already in the tree rather than adding a second backend.
+instant-acme = { version = "0.8", default-features = false, features = [
+    "aws-lc-rs",
+    "hyper-rustls",
+    "rcgen",
+] }
+# Reading `notAfter` out of an issued chain, so renewal can be scheduled.
+x509-parser = "0.18"
+
 hyper-util = { version = "0.1", features = ["full"] }
 http-body-util = "0.1"
 
 # Hot-reload
-notify = "7"
 
 # Concurrent data structures
 dashmap = "6"
@@ -96,12 +115,16 @@ parking_lot = "0.12"
 # Config
 toml = "0.8"
 
+# Route matching: `path_type = "regex"`. Already in the tree transitively, so
+# this adds no new compilation.
+regex = "1"
+
 # Internal crates
-postrust-core = { version = "1.0.0-alpha.2", path = "crates/postrust-core" }
-postrust-sql = { version = "1.0.0-alpha.2", path = "crates/postrust-sql" }
-postrust-auth = { version = "1.0.0-alpha.2", path = "crates/postrust-auth" }
-postrust-response = { version = "1.0.0-alpha.2", path = "crates/postrust-response" }
-postrust-graphql = { version = "1.0.0-alpha.2", path = "crates/postrust-graphql" }
+postrust-core = { version = "1.0.0-beta.1", path = "crates/postrust-core" }
+postrust-sql = { version = "1.0.0-beta.1", path = "crates/postrust-sql" }
+postrust-auth = { version = "1.0.0-beta.1", path = "crates/postrust-auth" }
+postrust-response = { version = "1.0.0-beta.1", path = "crates/postrust-response" }
+postrust-graphql = { version = "1.0.0-beta.1", path = "crates/postrust-graphql" }
 
 [profile.release]
 lto = true

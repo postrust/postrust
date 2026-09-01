@@ -7,6 +7,9 @@ use tokio::sync::RwLock;
 use tracing::{debug, info};
 
 /// Certificate and key pair.
+///
+/// `Debug` prints the domain and expiry but never the key or the chain: a
+/// private key that reaches a log is a private key that has to be rotated.
 #[derive(Clone)]
 pub struct Certificate {
     /// Domain name
@@ -17,6 +20,17 @@ pub struct Certificate {
     pub key_pem: Vec<u8>,
     /// Expiry timestamp
     pub expires_at: Option<chrono::DateTime<chrono::Utc>>,
+}
+
+impl std::fmt::Debug for Certificate {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Certificate")
+            .field("domain", &self.domain)
+            .field("expires_at", &self.expires_at)
+            .field("cert_pem", &format_args!("<{} bytes>", self.cert_pem.len()))
+            .field("key_pem", &format_args!("<redacted>"))
+            .finish()
+    }
 }
 
 /// Certificate store with database metadata and file caching.

@@ -67,3 +67,49 @@ pub async fn handle_verification_challenge(
 
     (StatusCode::OK, challenge.expected_value).into_response()
 }
+
+/// Serve an ACME HTTP-01 challenge.
+///
+/// Responds at `/.well-known/acme-challenge/{token}` with the key
+/// authorization the issuer recorded when it placed the order. The CA fetches
+/// this over plain HTTP -- it is how it decides the requester controls the
+/// domain -- so the route is public and unauthenticated by necessity.
+///
+/// Answering is safe because the value is not a secret we are being tricked
+/// into revealing: it is `{token}.{account_key_thumbprint}`, which we wrote
+/// ourselves, for a token the CA has just told us it will ask for. A token
+/// nobody stored gets a 404.
+///
+/// The lookup goes to `proxy_acme_challenges` rather than to memory on purpose:
+/// the CA resolves the domain and reaches whichever instance DNS sends it to,
+/// which is usually not the one that placed the order.
+///
+/// Unlike the domain-verification endpoint, this deliberately does **not**
+/// match on `Host`. RFC 8555 lets the CA validate from several vantage points
+/// and follow redirects, and the token already scopes the response to one
+/// order; requiring a `Host` match here would fail validation for a domain
+/// served under an alias, and buy nothing -- the value is not sensitive.
+///
+/// Requires the `acme` feature: without the issuer there is nothing to write a
+/// challenge, so the route is not mounted at all rather than answering 404 to
+/// every CA that asks.
+#[cfg(feature = "acme")]
+pub async fn handle_acme_challenge(
+    State(state): State<SaasState>,
+    Path(token): Path<String>,
+) -> impl IntoResponse {
+    match crate::tls::find_challenge(&state.pool, &token).await {
+        Ok(Some(challenge)) => {
+            tracing::debug!(
+                domain = %challenge.domain,
+                "served an ACME http-01 challenge"
+            );
+            (StatusCode::OK, challenge.key_authorization).into_response()
+        }
+        Ok(None) => NOT_FOUND.into_response(),
+        Err(error) => {
+            tracing::error!(%error, "ACME challenge lookup failed");
+            (StatusCode::INTERNAL_SERVER_ERROR, "lookup failed").into_response()
+        }
+    }
+}
