@@ -10,23 +10,35 @@ honestly describe both.
 
 | Line | Crates | Promise |
 | --- | --- | --- |
-| **Stable** | `postrust-core`, `postrust-sql`, `postrust-auth`, `postrust-response`, `postrust-graphql`, `postrust-server`, `postrust-lambda`, `postrust-worker` | Semver. A breaking change to the public Rust API needs a major bump. |
-| **Unstable** | `postrust-proxy` | None. On its own `0.x`, where a minor bump may break anything. |
+| **Stable** | `postrust-core`, `postrust-sql`, `postrust-auth`, `postrust-response`, `postrust-graphql`, `postrust-server`, `postrust-lambda` | Semver. A breaking change to the public Rust API needs a major bump. |
+| **Unstable** | `postrust-proxy`, `postrust-worker` | None. Each on its own `0.x`, where a minor bump may break anything. |
 
-Nothing in the stable line depends on `postrust-proxy`, so no crate that makes
-a semver promise carries a dependency that cannot keep one. The proxy depends
-on `postrust-core`, not the other way round.
+Nothing in the stable line depends on either unstable crate, so no crate that
+makes a semver promise carries a dependency that cannot keep one.
+`postrust-proxy` depends on `postrust-core`, not the other way round, and
+`postrust-worker` is built as a `cdylib`, which cannot be a Rust library
+dependency at all.
 
 Both lines release on the same git tags. A tag publishes whatever version each
 crate currently declares and skips what is already on crates.io, so the proxy
 is not dragged along to a version it has not earned.
 
-One wrinkle from the transition: `postrust-proxy` was published at
+One wrinkle from the transition: both unstable crates were published at
 `1.0.0-alpha.1` and `1.0.0-alpha.2` before the split, and that `1.0.0` line
-will never get a stable successor. Both are prereleases, so Cargo will not
-select either by default — `cargo add postrust-proxy` resolves to the newest
-`0.x`. Only an explicit request for one of those versions reaches code that
-predates the split.
+will never get a stable successor for either. Both are prereleases, so Cargo
+will not select them by default — `cargo add postrust-proxy` resolves to the
+newest `0.x`. Only an explicit request reaches code that predates the split.
+
+## Why the worker is held back
+
+`postrust-worker` is a stub, and says so in its own response body: the fetch
+handler answers `{"status": "stub"}` and nothing else. It does not parse
+requests, reach a database, or return data. Finishing it needs Cloudflare
+pieces that are not written yet -- Hyperdrive for database connections, KV or
+Durable Objects for the schema cache.
+
+A 1.0.0 on that would be a promise to keep an interface that does not do
+anything yet.
 
 ## Why the proxy is held back
 
@@ -68,7 +80,7 @@ Covered — a breaking change here requires a major bump:
 
 Not covered:
 
-- `postrust-proxy`, entirely.
+- `postrust-proxy` and `postrust-worker`, entirely.
 - Anything reachable only through a `#[doc(hidden)]` item or a private module.
 - The exact wording of error messages, and log output.
 - Behaviour under configurations the documentation calls unsupported.
