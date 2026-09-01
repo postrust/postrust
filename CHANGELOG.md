@@ -5,6 +5,25 @@ releases are described by their tags and the pull requests behind them.
 
 ## Unreleased
 
+### Added
+
+**Database-backed proxy configuration actually reads and writes.**
+`config::load_from_database` was two `// TODO: Implement database query`
+comments returning `Ok(Vec::new())`, so a proxy pointed at a database started,
+logged nothing wrong, and answered every request with 503 -- the same failure
+that file-configured routing had before `1.0.0-alpha.2`. It now loads real
+routes and upstreams from three new tables
+(`migrations/20260901000001_proxy_config.sql`), and `postrust-proxy` merges
+them into a file-bootstrapped config when `DATABASE_URL` is set.
+
+**The admin API persists.** Its route, upstream and backend mutations replied
+`200`/`201` after changing only the in-memory config, behind eight
+`// TODO: Persist to database` comments, so every change vanished on restart
+while reporting success. They now write through before touching the running
+config, and report a failure to persist as a 500 rather than a success. With
+`server.database_config = false` -- an explicit "this proxy is configured from
+a file" -- edits stay in memory as before.
+
 ### Fixed
 
 **HTTP domain verification proved nothing.** The endpoint serving the

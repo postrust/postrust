@@ -106,3 +106,7 @@ postrust-core.workspace = true
 [dev-dependencies]
 pretty_assertions.workspace = true
 tokio = { workspace = true, features = ["test-util", "macros"] }
+# The database-backed tests in tests/ connect and assert on raw rows, so they
+# need these in their own right rather than through the library.
+sqlx.workspace = true
+uuid.workspace = true

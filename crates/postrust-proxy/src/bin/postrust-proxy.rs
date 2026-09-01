@@ -15,11 +15,18 @@
 //! lazily-connected pool to a database that does not exist is fine for
 //! file-configured runs. `HealthChecker::is_healthy` treats an unknown backend
 //! as healthy, so backends are used as configured.
+//!
+//! When `DATABASE_URL` *is* set and `server.database_config` is left at its
+//! default of true, the routes and upstreams in the database are loaded and
+//! added to whatever the file declared. The trigger is the variable rather
+//! than the flag alone: `database_config` defaults to true, so keying off it
+//! by itself would make every file-configured proxy -- the conformance
+//! harnesses included -- try to reach a database that is not there.
 
 use std::net::SocketAddr;
 use std::sync::Arc;
 
-use postrust_proxy::config::{load_from_file, ProxyConfig};
+use postrust_proxy::config::{load_from_database, load_from_file, ProxyConfig};
 use postrust_proxy::health::HealthChecker;
 use postrust_proxy::ratelimit::RateLimiter;
 use postrust_proxy::vendored::ProxyService;
@@ -53,12 +60,25 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .map_err(|e| format!("bad listen address in {config_path}: {e}"))?;
 
     // Lazy: no connection is attempted here, and none is needed unless the
-    // health checker's background task runs.
-    let pool =
-        PgPoolOptions::new()
-            .connect_lazy(&std::env::var("DATABASE_URL").unwrap_or_else(|_| {
-                "postgres://postgres:postgres@127.0.0.1:5432/postgres".into()
-            }))?;
+    // health checker's background task runs or the database holds config.
+    let database_url = std::env::var("DATABASE_URL").ok();
+    let pool = PgPoolOptions::new().connect_lazy(
+        database_url
+            .as_deref()
+            .unwrap_or("postgres://postgres:postgres@127.0.0.1:5432/postgres"),
+    )?;
+
+    let mut config = config;
+    if config.server.database_config && database_url.is_some() {
+        let (routes, upstreams) = load_from_database(&pool).await?;
+        tracing::info!(
+            routes = routes.len(),
+            upstreams = upstreams.len(),
+            "loaded configuration from the database"
+        );
+        merge_from_database(&mut config, routes, upstreams)?;
+    }
+    let config = config;
 
     let rate_limiter = Arc::new(RateLimiter::new(config.rate_limit.clone()));
     let health_checker = Arc::new(HealthChecker::new(pool));
@@ -127,5 +147,38 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         tls.await
             .map_err(|e| format!("https listener panicked: {e}"))??;
     }
+    Ok(())
+}
+
+/// Add database-held routes and upstreams to a file-bootstrapped config.
+///
+/// Names have to stay unique across both sources. `Upstream::resolved_id`
+/// derives a UUID from the name when there is no id, and the routing tables are
+/// keyed by it -- so two upstreams sharing a name would collide there, and one
+/// would silently take the other's traffic. Refusing to start is the right
+/// answer to a configuration that cannot be represented.
+fn merge_from_database(
+    config: &mut ProxyConfig,
+    routes: Vec<postrust_proxy::config::Route>,
+    upstreams: Vec<postrust_proxy::config::Upstream>,
+) -> Result<(), String> {
+    for upstream in &upstreams {
+        if config.upstreams.iter().any(|u| u.name == upstream.name) {
+            return Err(format!(
+                "upstream {:?} is declared in both the config file and the database",
+                upstream.name
+            ));
+        }
+    }
+    for route in &routes {
+        if config.routes.iter().any(|r| r.name == route.name) {
+            return Err(format!(
+                "route {:?} is declared in both the config file and the database",
+                route.name
+            ));
+        }
+    }
+    config.upstreams.extend(upstreams);
+    config.routes.extend(routes);
     Ok(())
 }
