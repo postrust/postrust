@@ -151,8 +151,9 @@ Adding a criterion can only narrow a route, never widen it.
 - A `*.example.com` host covers exactly one label: `api.example.com`, but not
   `example.com` and not `a.b.example.com`.
 
-Two route fields are **declarable and not yet honoured**: `timeout_secs` and
-`retry_count`. Nothing in the forwarding path reads either.
+`timeout_secs` is honoured: an upstream that does not answer in time gets a
+**504**, distinct from the 502 an upstream that refuses gets, because an
+operator reads those differently. `retry_count` is still declarable and unread.
 
 Upstreams are matched by name:
 
@@ -275,19 +276,19 @@ Throughput is deliberately absent. See [Benchmarking](./benchmarking.md).
 
 Listed rather than left to be discovered:
 
-- **`timeout_secs` and `retry_count` on a route.** Declarable, and nothing in
-  the forwarding path reads either. An upstream that hangs will hang the
-  request.
-- **`server.watch_config_file`** watches nothing. `ConfigReloader` is
-  scaffolding: a channel nobody reads and fields nobody uses. Changing the file
-  needs a restart.
+- **`retry_count` on a route.** Declarable, and nothing reads it. Retrying needs
+  the request body to be replayable, which a streamed body is not, so this is a
+  design question rather than a missing line.
 - **`server.https_enabled`** is not read. The HTTPS listener starts when
   `tls.cert_file` and `tls.key_file` are both set, and not otherwise.
 - **`tls.acme_directory`** (the old field) is not read either; use
   `tls.acme_directory_url`, or `acme_staging` for Let's Encrypt staging.
 
-Also: much of the crate's public API is undocumented. Turning `missing_docs` on
-produces hundreds of warnings, and that is the main reason it is on `0.x`.
+**There is no configuration reload.** Changing the config needs a restart.
+`ConfigReloader`, `server.watch_config_file` and `POST /config/reload` used to
+suggest otherwise -- the endpoint answered "Configuration reload requested" and
+sent on a channel nobody read -- and all three are gone rather than left to be
+believed.
 
 ## Origins
 

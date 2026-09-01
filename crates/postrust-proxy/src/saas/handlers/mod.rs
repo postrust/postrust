@@ -24,8 +24,13 @@ use std::sync::Arc;
 /// Shared state for SaaS API handlers.
 #[derive(Clone)]
 pub struct SaasState {
+    /// Domains, their routes and their upstreams.
     pub domain_manager: Arc<DomainManager>,
+    /// Creating, listing and revoking API keys.
     pub api_key_service: Arc<ApiKeyService>,
+    /// The middleware that turns a credential into an [`AuthContext`].
+    ///
+    /// [`AuthContext`]: crate::saas::AuthContext
     pub auth_layer: Arc<SaasAuthLayer>,
     /// The pool, for handlers whose concern is not domain management.
     ///

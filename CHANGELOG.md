@@ -91,6 +91,16 @@ a file" -- edits stay in memory as before.
 
 ### Changed
 
+**The Autobahn figures published on the website are now run-stable.** The
+OK/NON-STRICT split is tallied over the cases *outside* the intermittent
+invalid-frame family, with the family's size reported separately. Members of
+that family move between OK and NON-STRICT from run to run with nothing about
+the proxy changing -- one run scored 501 OK and 12 NON-STRICT, the next 502 and
+11, from a single case. Publishing the raw split would have made the new drift
+check fail on the next run for a reason that is not a regression, and an
+intermittently red gate teaches everyone to ignore it. Verified stable over
+three consecutive runs.
+
 **The conformance suites run on a schedule.** `.github/workflows/conformance.yml`
 runs the transport suites nightly (h2spec, Autobahn baseline and proxied, and a
 real ACME order against Pebble) and the dialect suites weekly (PostgREST and
@@ -143,6 +153,22 @@ skips what is already on crates.io.
 
 New: [docs/stability.md](docs/stability.md), stating what a version number
 covers and what it does not.
+
+### Removed
+
+**`POST /config/reload` answered "Configuration reload requested" and reloaded
+nothing.** It sent on a channel nobody read. That, `ConfigReloader`,
+`server.watch_config_file` and the `notify` dependency they existed for are all
+gone; configuration changes need a restart, which `docs/proxy.md` now says.
+
+Dropping `notify` also removed `instant` from the lockfile, so the
+`RUSTSEC-2024-0384` ignore in `.cargo/audit.toml` is gone -- two documented
+ignores left instead of three.
+
+Also removed: `hyper_ext::TokioExecutor`, a duplicate of the `hyper_util` one
+the code actually uses; `HealthChecker`'s `PgPool` field, held "for persisting
+health status" that was never implemented; and `ApiKeyRow::key_hash`, selected
+and never read.
 
 ### Fixed
 

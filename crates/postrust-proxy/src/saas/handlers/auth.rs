@@ -61,8 +61,11 @@ pub async fn revoke_api_key(
 /// Current tenant info response.
 #[derive(Serialize)]
 pub struct CurrentTenantResponse {
+    /// The tenant the caller is acting as.
     pub tenant_id: Uuid,
+    /// How they authenticated -- `jwt` or `api_key`.
     pub auth_type: String,
+    /// What this credential may do.
     pub scopes: Vec<String>,
 }
 

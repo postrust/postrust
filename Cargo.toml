@@ -107,7 +107,6 @@ hyper-util = { version = "0.1", features = ["full"] }
 http-body-util = "0.1"
 
 # Hot-reload
-notify = "7"
 
 # Concurrent data structures
 dashmap = "6"

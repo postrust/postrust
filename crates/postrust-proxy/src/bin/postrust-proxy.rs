@@ -109,7 +109,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
 
     let rate_limiter = Arc::new(RateLimiter::new(config.rate_limit.clone()));
-    let health_checker = Arc::new(HealthChecker::new(pool.clone()));
+    let health_checker = Arc::new(HealthChecker::new());
     let service = Arc::new(ProxyService::new(
         Arc::new(RwLock::new(config)),
         health_checker,

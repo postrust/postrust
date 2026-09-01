@@ -32,7 +32,7 @@
 
 pub mod api_keys;
 pub mod auth;
-pub mod db;
+pub(crate) mod db;
 pub mod handlers;
 pub mod manager;
 #[cfg(feature = "acme")]

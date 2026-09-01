@@ -224,17 +224,31 @@ fn decode_jwt(token: &str, secret: &str) -> Result<JwtClaims, AuthError> {
 /// Authentication errors.
 #[derive(Debug)]
 pub enum AuthError {
+    /// No `Authorization` header at all.
     MissingHeader,
+    /// The header is present but not `Bearer <jwt>` or `ApiKey <key>`.
     InvalidFormat,
+    /// A JWT that does not verify, with the reason.
     InvalidToken(String),
+    /// A JWT whose `exp` has passed.
     TokenExpired,
+    /// A JWT missing a claim this proxy needs, named.
     MissingClaim(String),
+    /// An API key that matches no stored hash.
     InvalidApiKey,
+    /// A key that exists but has been revoked.
     ApiKeyDisabled,
+    /// A key past its `expires_at`.
     ApiKeyExpired,
+    /// The credential is good but its tenant may not act.
     TenantSuspended,
+    /// A JWT was presented and no signing secret is configured, so it cannot
+    /// be verified. Refused rather than trusted.
     JwtNotConfigured,
+    /// An `Authorization` scheme this proxy does not implement.
     UnsupportedAuthMethod,
+    /// The lookup itself failed. Ours, not the caller's -- reported as a 500
+    /// rather than a 401, so an outage does not read as a bad credential.
     Database(sqlx::Error),
 }
 
@@ -308,7 +322,10 @@ impl IntoResponse for AuthError {
 
 /// Extractor for AuthContext from request extensions.
 #[derive(Clone, Debug)]
-pub struct Auth(pub AuthContext);
+pub struct Auth(
+    /// The context the middleware put in the request's extensions.
+    pub AuthContext,
+);
 
 impl<S> axum::extract::FromRequestParts<S> for Auth
 where

@@ -68,10 +68,6 @@ pub struct ServerConfig {
 
     /// Config file path (for file-based bootstrap)
     pub config_file: Option<String>,
-
-    /// Enable file watcher for hot-reload
-    #[serde(default)]
-    pub watch_config_file: bool,
 }
 
 impl Default for ServerConfig {
@@ -85,7 +81,6 @@ impl Default for ServerConfig {
             https_enabled: false,
             database_config: true,
             config_file: None,
-            watch_config_file: false,
         }
     }
 }

@@ -75,7 +75,6 @@ uuid.workspace = true
 url.workspace = true
 
 # Hot-reload and concurrency
-notify.workspace = true
 dashmap.workspace = true
 parking_lot.workspace = true
 

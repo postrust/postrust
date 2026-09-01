@@ -42,6 +42,7 @@ pub struct LoadBalanceRoundRobin {
 }
 
 impl LoadBalanceRoundRobin {
+    /// A round-robin balancer over `num_upstreams` backends.
     pub fn new(num_upstreams: usize) -> Self {
         Self {
             ptr: Arc::new(AtomicUsize::new(0)),
@@ -69,6 +70,7 @@ pub struct LoadBalanceRandom {
 }
 
 impl LoadBalanceRandom {
+    /// A uniformly random balancer over `num_upstreams` backends.
     pub fn new(num_upstreams: usize) -> Self {
         Self { num_upstreams }
     }
@@ -178,13 +180,21 @@ impl LoadBalanceWithPointer for LoadBalanceWeighted {
 
 /// Load balancer enum (adapted from rpxy).
 pub enum LoadBalance {
+    /// Each backend in turn.
     RoundRobin(LoadBalanceRoundRobin),
+    /// Uniformly at random.
     Random(LoadBalanceRandom),
+    /// Whichever backend currently has the fewest connections.
     LeastConnections(LoadBalanceLeastConn),
+    /// In proportion to each backend's weight.
     Weighted(LoadBalanceWeighted),
 }
 
 impl LoadBalance {
+    /// Build the balancer a strategy names, sized to `backends`.
+    ///
+    /// Sticky falls back to round-robin: cookie affinity is behind the
+    /// `sticky-cookie` feature and there is nothing to be sticky on without it.
     pub fn from_strategy(strategy: &LoadBalanceStrategy, backends: &[Backend]) -> Self {
         let num = backends.len();
         match strategy {
@@ -206,6 +216,7 @@ impl LoadBalance {
         }
     }
 
+    /// Choose the next backend, as an index into the upstream's list.
     pub fn get_ptr(&self, ctx: Option<&LoadBalanceContext>) -> PointerToUpstream {
         match self {
             LoadBalance::RoundRobin(lb) => lb.get_ptr(ctx),
@@ -232,6 +243,7 @@ struct UpstreamEntry {
 }
 
 impl BackendAppManager {
+    /// An empty manager, with no health checking.
     pub fn new() -> Self {
         Self {
             upstreams: DashMap::new(),
@@ -240,6 +252,7 @@ impl BackendAppManager {
         }
     }
 
+    /// Attach a health checker, so unhealthy backends are skipped.
     pub fn with_health_checker(mut self, checker: Arc<HealthChecker>) -> Self {
         self.health_checker = Some(checker);
         self

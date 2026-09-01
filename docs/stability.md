@@ -44,15 +44,18 @@ anything yet.
 
 Not caution for its own sake. Three specific things:
 
-**The public surface is largely undocumented.** Turning `missing_docs` on for
-`postrust-proxy` produces hundreds of warnings, most of them struct fields. A
-1.0.0 would freeze all of it as it stands. `cargo clippy` with the crate-level
-`allow`s removed is the current count.
+**It has not been lived with.** The documentation gap is closed --
+`missing_docs` and `dead_code` are on and clean, where they used to be blanket
+`allow`s hiding 306 and 4 warnings -- but nobody outside this repository has
+depended on the API, and the surface is wide: routing, TLS, ACME, an admin API
+and a multi-tenant module. Freezing it now would be guessing at what people
+need.
 
-**The config reloader is scaffolding.** `ConfigReloader` has a channel nobody
-reads and fields nobody uses; `server.watch_config_file` is a setting that
-watches nothing. The `notify` dependency exists only for the error variant that
-watcher would have used.
+**There is no configuration reload.** Changing the config needs a restart. What
+was there -- a `ConfigReloader` whose channel nobody read, a
+`server.watch_config_file` that watched nothing, and a `POST /config/reload`
+that answered "Configuration reload requested" without reloading -- is removed
+rather than left to be believed.
 
 **It has only just grown its transport layer.** TLS, HTTP/2, WebSocket and
 RFC 8441 extended CONNECT all landed in `1.0.0-alpha.2`. They are measured, by

@@ -23,15 +23,15 @@ export const h2spec = {
 
 export const autobahn = {
   "cases": 517,
-  "ok": 501,
-  "nonStrict": 12,
+  "settledCases": 509,
+  "ok": 499,
+  "nonStrict": 6,
   "informational": 3,
   "unimplemented": 0,
   "failed": 1,
+  "segmentationSensitive": 8,
   "baselineCases": 517,
   "baselineFailed": 1,
   "regressions": [],
-  "intermittent": [
-    "4.2.5"
-  ]
+  "intermittentCount": 0
 } as const;
