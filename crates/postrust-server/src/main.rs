@@ -8,12 +8,18 @@
 #![allow(clippy::result_large_err)]
 
 use anyhow::Result;
-use axum::{http::Method, response::Json, routing::any, Router};
-use sqlx::postgres::PgPoolOptions;
+use axum::{
+    extract::DefaultBodyLimit,
+    http::{HeaderValue, Method},
+    response::Json,
+    routing::any,
+    Router,
+};
+use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
 use std::sync::Arc;
 use tokio::sync::RwLock;
-use tower_http::cors::{Any as CorsAny, CorsLayer};
-use tracing::info;
+use tower_http::cors::{AllowOrigin, Any as CorsAny, CorsLayer};
+use tracing::{error, info};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
 mod app;
@@ -39,23 +45,55 @@ static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    // Initialize tracing
+    // The log level is read here rather than from the loaded config, because
+    // the subscriber has to exist before `from_env` runs -- it warns about
+    // values it rejects, and a warning emitted before there is a subscriber
+    // goes nowhere. `from_env` parses the same variable again for anything
+    // else that wants it, and is the one that reports a bad value.
+    //
+    // `RUST_LOG` wins where both are set: it is the more specific instrument,
+    // able to name targets and spans, and somebody who exported it is asking
+    // for exactly what it says.
+    let filter = std::env::var("RUST_LOG").unwrap_or_else(|_| {
+        let level = std::env::var("PGRST_LOG_LEVEL")
+            .ok()
+            .and_then(|v| postrust_core::LogLevel::parse_config(&v))
+            .unwrap_or_else(|| postrust_core::AppConfig::default().log_level);
+        format!("postrust={}", level.to_tracing())
+    });
+
     tracing_subscriber::registry()
-        .with(tracing_subscriber::EnvFilter::new(
-            std::env::var("RUST_LOG").unwrap_or_else(|_| "postrust=info".into()),
-        ))
+        .with(tracing_subscriber::EnvFilter::new(filter))
         .with(tracing_subscriber::fmt::layer())
         .init();
 
-    // Load configuration
     let config = postrust_core::AppConfig::from_env();
+
     info!("Starting Postrust server");
     info!("Database: {}", mask_db_uri(&config.db_uri));
 
     // Create database pool
+    let connect_options: PgConnectOptions = config
+        .db_uri
+        .parse()
+        .map_err(|e| anyhow::anyhow!("invalid database URI: {e}"))?;
+
+    // Prepared statements are sqlx's default and stay on unless asked. Turning
+    // them off is for a connection pooler in transaction mode -- PgBouncer and
+    // the like -- where the server connection a statement was prepared on is
+    // not the one the next query lands on, and every reuse fails with
+    // "prepared statement does not exist".
+    let connect_options = if config.db_prepared_statements {
+        connect_options
+    } else {
+        info!("Prepared statements disabled");
+        connect_options.statement_cache_capacity(0)
+    };
+
     let pool = PgPoolOptions::new()
         .max_connections(config.db_pool_size)
-        .connect(&config.db_uri)
+        .acquire_timeout(std::time::Duration::from_secs(config.db_pool_timeout))
+        .connect_with(connect_options)
         .await?;
 
     info!("Connected to database");
@@ -81,7 +119,35 @@ async fn main() -> Result<()> {
             role_claim_key: config.jwt_role_claim_key.clone(),
             anon_role: config.db_anon_role.clone(),
         },
+        jwt_cache: postrust_auth::JwtCache::new(
+            config.jwt_cache_enabled,
+            config.jwt_cache_max_lifetime,
+        ),
     });
+
+    // `db_channel_enabled`: reload the schema cache when PostgreSQL says the
+    // schema changed, instead of on a restart. A migration ends with
+    // `NOTIFY pgrst, 'reload schema'` and the API picks the new shape up.
+    //
+    // This refreshes the REST schema cache. The GraphQL schema is built once
+    // from a snapshot taken at start-up and is not rebuilt here.
+    if config.db_channel_enabled {
+        spawn_schema_reloader(state.clone(), config.db_channel.clone());
+    }
+
+    // `admin_server_port`: liveness and readiness on a port of their own, so a
+    // probe does not have to be able to reach the API.
+    if let Some(admin_port) = config.admin_server_port {
+        let admin_addr = format!("{}:{}", config.server_host, admin_port);
+        let admin_listener = tokio::net::TcpListener::bind(&admin_addr).await?;
+        info!("Admin server listening on http://{}", admin_addr);
+        let admin_app = custom::admin_router().with_state(state.clone());
+        tokio::spawn(async move {
+            if let Err(e) = axum::serve(admin_listener, admin_app).await {
+                error!("Admin server stopped: {}", e);
+            }
+        });
+    }
 
     // Build REST API router (under /api prefix)
     let api_router: Router<Arc<AppState>> = Router::new()
@@ -644,11 +710,34 @@ async fn main() -> Result<()> {
         );
     }
 
+    // An empty list is "any origin", which is the default and what
+    // `PGRST_SERVER_CORS_ORIGINS="*"` asks for. Anything that is not a valid
+    // header value is dropped with a warning rather than quietly widening the
+    // policy back to `*` -- a typo in an origin should cost that origin, not
+    // the restriction.
+    let allow_origin = if config.server_cors_origins.is_empty() {
+        AllowOrigin::any()
+    } else {
+        let origins: Vec<HeaderValue> = config
+            .server_cors_origins
+            .iter()
+            .filter_map(|o| match HeaderValue::from_str(o) {
+                Ok(v) => Some(v),
+                Err(_) => {
+                    tracing::warn!("Ignoring CORS origin {:?}: not a valid header value", o);
+                    None
+                }
+            })
+            .collect();
+        info!("CORS restricted to {} origin(s)", origins.len());
+        AllowOrigin::list(origins)
+    };
+
     // Apply CORS and state
     let app = app
         .layer(
             CorsLayer::new()
-                .allow_origin(CorsAny)
+                .allow_origin(allow_origin)
                 .allow_methods([
                     Method::GET,
                     Method::POST,
@@ -661,6 +750,11 @@ async fn main() -> Result<()> {
                 .allow_headers(CorsAny)
                 .expose_headers(CorsAny),
         )
+        // For the routes whose handlers take a body *extractor* -- GraphQL,
+        // the admin surface -- which is what this layer reaches. The REST
+        // handler takes the whole `Request` and reads the body itself, so it
+        // applies `max_body_size` directly; see `app::process_request`.
+        .layer(DefaultBodyLimit::max(config.max_body_size))
         // Outermost, so it runs before the CORS layer -- which answers every
         // OPTIONS itself and never calls what it wraps, so nothing downstream
         // of it can say what a resource allows.
@@ -670,16 +764,133 @@ async fn main() -> Result<()> {
         ))
         .with_state(state);
 
-    // Start server
-    let addr = format!("{}:{}", config.server_host, config.server_port);
-    let listener = tokio::net::TcpListener::bind(&addr).await?;
-    info!("Listening on http://{}", addr);
-
-    // Wrapped so that a request target carrying a raw `>` or `"` reaches the
-    // router instead of being refused by the URI parser. See `lenient_uri`.
-    axum::serve(postrust_server::lenient_uri::LenientListener(listener), app).await?;
+    // Start server.
+    //
+    // Both listeners are wrapped so that a request target carrying a raw `>`
+    // or `"` reaches the router instead of being refused by the URI parser.
+    // See `lenient_uri`.
+    match &config.server_unix_socket {
+        Some(path) => serve_unix_socket(path, app).await?,
+        None => {
+            let addr = format!("{}:{}", config.server_host, config.server_port);
+            let listener = tokio::net::TcpListener::bind(&addr).await?;
+            info!("Listening on http://{}", addr);
+            axum::serve(postrust_server::lenient_uri::LenientListener(listener), app).await?;
+        }
+    }
 
     Ok(())
+}
+
+/// Serve on a Unix domain socket.
+///
+/// Unix only. `tokio::net::UnixListener` does not exist elsewhere, so the
+/// alternative to this split is a binary that does not compile off Unix at
+/// all -- and CI only builds Linux, so nothing would have caught that.
+#[cfg(unix)]
+async fn serve_unix_socket(path: &str, app: Router) -> Result<()> {
+    remove_stale_socket(path).await?;
+    let listener = tokio::net::UnixListener::bind(path)
+        .map_err(|e| anyhow::anyhow!("could not bind unix socket {path}: {e}"))?;
+    info!("Listening on unix:{}", path);
+    axum::serve(
+        postrust_server::lenient_uri::LenientUnixListener(listener),
+        app,
+    )
+    .await?;
+    Ok(())
+}
+
+/// Refuse the option rather than ignore it: silently falling back to the TCP
+/// port would bind an address the operator did not ask for.
+#[cfg(not(unix))]
+async fn serve_unix_socket(path: &str, _app: Router) -> Result<()> {
+    Err(anyhow::anyhow!(
+        "server_unix_socket ({path}) is not supported on this platform"
+    ))
+}
+
+/// Remove a leftover socket file so the bind does not fail with `EADDRINUSE`
+/// against a server that is not running.
+///
+/// Only a socket is removed. If the path holds a regular file or a directory,
+/// that is a configuration mistake and deleting it would be the wrong way to
+/// find out.
+#[cfg(unix)]
+async fn remove_stale_socket(path: &str) -> Result<()> {
+    use std::os::unix::fs::FileTypeExt;
+
+    let metadata = match tokio::fs::symlink_metadata(path).await {
+        Ok(m) => m,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(anyhow::anyhow!("could not stat {path}: {e}")),
+    };
+
+    if !metadata.file_type().is_socket() {
+        return Err(anyhow::anyhow!(
+            "{path} exists and is not a socket; refusing to remove it"
+        ));
+    }
+
+    tokio::fs::remove_file(path)
+        .await
+        .map_err(|e| anyhow::anyhow!("could not remove stale socket {path}: {e}"))?;
+    info!("Removed stale socket at {}", path);
+    Ok(())
+}
+
+/// Reload the REST schema cache on `NOTIFY <channel>`.
+///
+/// Reconnects on its own: a listening connection is dropped by a restart of
+/// the database or anything between, and a reloader that gives up on the first
+/// error is one that stops working silently partway through a deployment.
+fn spawn_schema_reloader(state: Arc<AppState>, channel: String) {
+    const RETRY: std::time::Duration = std::time::Duration::from_secs(5);
+
+    tokio::spawn(async move {
+        loop {
+            let mut listener = match sqlx::postgres::PgListener::connect_with(&state.pool).await {
+                Ok(listener) => listener,
+                Err(e) => {
+                    error!("Schema reloader could not connect: {}; retrying", e);
+                    tokio::time::sleep(RETRY).await;
+                    continue;
+                }
+            };
+
+            if let Err(e) = listener.listen(&channel).await {
+                error!("Schema reloader could not LISTEN on {}: {}", channel, e);
+                tokio::time::sleep(RETRY).await;
+                continue;
+            }
+            info!("Listening on channel {} for schema reloads", channel);
+
+            // Inner loop until the connection fails, then reconnect.
+            loop {
+                match listener.recv().await {
+                    Ok(notification) => {
+                        info!("Schema reload requested: {:?}", notification.payload());
+                        match state.reload_schema().await {
+                            Ok(()) => {
+                                info!(
+                                    "Schema cache reloaded: {}",
+                                    state.schema_cache().await.summary()
+                                )
+                            }
+                            // The old cache is kept. Serving the previous
+                            // schema is better than serving none, and the next
+                            // notification tries again.
+                            Err(e) => error!("Schema cache reload failed: {}", e),
+                        }
+                    }
+                    Err(e) => {
+                        error!("Schema reloader lost its connection: {}; reconnecting", e);
+                        break;
+                    }
+                }
+            }
+        }
+    });
 }
 
 /// Mask database URI for logging.

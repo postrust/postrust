@@ -50,7 +50,7 @@ pub use api_request::{
     Payload, PreferRepresentation, Preferences, QualifiedIdentifier, QueryParams, Range, Resource,
     SelectItem,
 };
-pub use config::{AppConfig, IsolationLevel, LogLevel};
+pub use config::{AppConfig, IsolationLevel, LogLevel, OpenApiMode};
 pub use embed::EmbedRendering;
 pub use error::{Error, Result};
 pub use plan::{create_action_plan, ActionPlan, CallPlan, DbActionPlan, MutatePlan, ReadPlan};
