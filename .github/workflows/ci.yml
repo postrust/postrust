@@ -144,3 +144,16 @@ jobs:
         # would otherwise also run doc examples marked `ignore`, which are
         # sketches that don't compile.
         run: cargo test --workspace --lib --bins --tests -- --ignored
+
+      # `compat-key-order` changes the response byte-for-byte, and had no
+      # coverage here at all -- which is how embedded rows came to be built as
+      # `jsonb`, whose keys PostgreSQL sorts by length and then bytes. The
+      # feature's own test said so and nothing ran it.
+      #
+      # Named explicitly rather than `--all-features`: that would also turn on
+      # `pebble-tests`, which needs a live certificate authority and is meant
+      # to be run by scripts/acme/run.sh.
+      - name: Integration tests (compat-key-order)
+        run: |
+          cargo test -p postrust-server --features compat-key-order \
+            --lib --bins --tests -- --ignored

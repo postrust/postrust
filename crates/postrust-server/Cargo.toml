@@ -40,7 +40,7 @@ admin-ui = ["utoipa", "postrust-graphql", "async-graphql", "async-graphql-axum"]
 # genuinely the faster one here.
 #
 # Turn it on when byte-level PostgREST compatibility matters more than that.
-compat-key-order = ["serde_json/preserve_order"]
+compat-key-order = ["serde_json/preserve_order", "postrust-core/compat-key-order"]
 
 [dependencies]
 # Async

@@ -318,6 +318,15 @@ pub async fn load_relationships(pool: &PgPool, schemas: &[String]) -> Result<Rel
         JOIN pg_namespace ns2 ON ns2.oid = t2.relnamespace
         WHERE c.contype = 'f'
           AND ns1.nspname = ANY($1)
+        -- Ordered, because the order reaches the client. Where two foreign
+        -- keys join the same pair of tables the embed is ambiguous, and the
+        -- PGRST201 that says so lists the candidates -- in this order, both in
+        -- `details` and in the `hint` that tells the caller what to write
+        -- instead. `pg_constraint` unordered is heap order, which differs
+        -- between two databases holding the same schema and can differ between
+        -- two reads of one database. That made the error message arbitrary and
+        -- the conformance cases covering it flip between runs.
+        ORDER BY ns1.nspname, t1.relname, c.conname
         "#,
     )
     .bind(schemas)

@@ -2,10 +2,12 @@
 //!
 //! Provides JWT token validation and role extraction for PostgreSQL RLS.
 
+mod cache;
 mod claims;
 pub mod hasura;
 mod jwt;
 
+pub use cache::JwtCache;
 pub use claims::Claims;
 pub use hasura::{HasuraAuthConfig, HasuraIdentity, SecretOutcome, TokenRole};
 pub use jwt::validate_token;

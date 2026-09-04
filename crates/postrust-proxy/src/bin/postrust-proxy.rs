@@ -84,6 +84,31 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     let config = config;
 
+    // Whether to serve HTTPS at all, decided before anything is built for it.
+    //
+    // Not "a database is configured": that would open 0.0.0.0:8443 on every
+    // proxy that merely keeps its routes in PostgreSQL, and serve nothing on
+    // it, because there would be no certificate to answer a handshake with.
+    let https = wants_https(&config);
+
+    // The certificate store, shared by whatever issues certificates and by the
+    // listener that serves them. Created here rather than inside the ACME
+    // worker because the two need the same one -- when they had one each, the
+    // worker wrote certificates the listener could not see. It does not depend
+    // on the `acme` feature: `POST /domains/{id}/ssl/upload` fills the same
+    // store by hand.
+    //
+    // Built only when something will use it. `CertificateStore::new` creates
+    // `tls.cert_dir` (`./certs` by default), which fails on a read-only root
+    // filesystem -- so building it unconditionally would stop a proxy that
+    // uses no TLS from starting at all.
+    let cert_store = match (&database_url, https.needs_store()) {
+        (Some(_), true) => Some(Arc::new(
+            postrust_proxy::tls::CertificateStore::new(pool.clone(), &config.tls.cert_dir).await?,
+        )),
+        _ => None,
+    };
+
     // The ACME issuance worker, if the config asks for it.
     //
     // Needs a database: the account, the pending challenges and the
@@ -93,10 +118,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // says so rather than failing later on the first order.
     #[cfg(feature = "acme")]
     let acme_worker = if config.tls.acme_enabled {
-        match &database_url {
-            Some(_) => {
-                Some(start_acme_worker(&config, pool.clone(), cancel_for_acme.clone()).await?)
-            }
+        match &cert_store {
+            Some(store) => Some(
+                start_acme_worker(
+                    &config,
+                    pool.clone(),
+                    store.clone(),
+                    cancel_for_acme.clone(),
+                )
+                .await?,
+            ),
             None => {
                 tracing::warn!(
                     "tls.acme_enabled is set but DATABASE_URL is not;                      the ACME worker needs a database for the account,                      challenges and certificates, so it will not start"
@@ -136,25 +167,54 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         None => None,
     };
 
-    // HTTPS, if a certificate was configured. ALPN is what makes HTTP/2 reachable
-    // as browsers actually use it; without this listener h2 is cleartext-only
-    // and WebSocket is ws:// only.
-    let tls = match (cert_file, key_file) {
+    // The statically configured pair, if there is one. It becomes the fallback
+    // for a handshake whose SNI names no stored certificate, and for a client
+    // that sends no SNI at all.
+    let static_key = match (&cert_file, &key_file) {
         (Some(cert), Some(key)) => {
-            let tls_config = postrust_proxy::tls::load_server_config(&cert, &key).await?;
-            let https_addr: SocketAddr = format!("{https_host}:{https_port}")
-                .parse()
-                .map_err(|e| format!("bad https listen address in {config_path}: {e}"))?;
-            let tls_service = service.clone();
-            let tls_cancel = cancel.clone();
-            Some(tokio::spawn(async move {
-                tls_service
-                    .serve_https(https_addr, tls_config, tls_cancel)
-                    .await
-            }))
+            let cert_pem = tokio::fs::read(cert)
+                .await
+                .map_err(|e| format!("could not read {cert}: {e}"))?;
+            let key_pem = tokio::fs::read(key)
+                .await
+                .map_err(|e| format!("could not read {key}: {e}"))?;
+            Some(postrust_proxy::tls::SniCertResolver::certified_key(
+                &cert_pem, &key_pem,
+            )?)
         }
         (None, None) => None,
         _ => return Err("tls.cert_file and tls.key_file must be set together".into()),
+    };
+
+    // HTTPS. ALPN is what makes HTTP/2 reachable as browsers actually use it;
+    // without this listener h2 is cleartext-only and WebSocket is ws:// only.
+    let tls = if https.enabled() {
+        let resolver = Arc::new(postrust_proxy::tls::SniCertResolver::new(static_key));
+
+        if let Some(store) = &cert_store {
+            match resolver.refresh(store).await {
+                Ok(0) => {
+                    tracing::info!("No stored certificates yet; serving the configured pair only")
+                }
+                Ok(_) => {}
+                Err(e) => tracing::warn!("Could not load stored certificates: {e}"),
+            }
+            spawn_certificate_refresh(resolver.clone(), store.clone(), cancel.clone());
+        }
+
+        let tls_config = postrust_proxy::tls::build_server_config_with_resolver(resolver);
+        let https_addr: SocketAddr = format!("{https_host}:{https_port}")
+            .parse()
+            .map_err(|e| format!("bad https listen address in {config_path}: {e}"))?;
+        let tls_service = service.clone();
+        let tls_cancel = cancel.clone();
+        Some(tokio::spawn(async move {
+            tls_service
+                .serve_https(https_addr, tls_config, tls_cancel)
+                .await
+        }))
+    } else {
+        None
     };
 
     match h2_addr {
@@ -193,11 +253,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 async fn start_acme_worker(
     config: &ProxyConfig,
     pool: sqlx::PgPool,
+    cert_store: Arc<postrust_proxy::tls::CertificateStore>,
     cancel: CancellationToken,
 ) -> Result<tokio::task::JoinHandle<()>, Box<dyn std::error::Error>> {
-    use postrust_proxy::tls::{
-        AcmeIssuer, CertificateStore, LETS_ENCRYPT_PRODUCTION, LETS_ENCRYPT_STAGING,
-    };
+    use postrust_proxy::tls::{AcmeIssuer, LETS_ENCRYPT_PRODUCTION, LETS_ENCRYPT_STAGING};
 
     let directory = config.tls.acme_directory_url.clone().unwrap_or_else(|| {
         if config.tls.acme_staging {
@@ -206,8 +265,6 @@ async fn start_acme_worker(
             LETS_ENCRYPT_PRODUCTION.to_string()
         }
     });
-
-    let cert_store = Arc::new(CertificateStore::new(pool.clone(), &config.tls.cert_dir).await?);
 
     let mut issuer = AcmeIssuer::new(
         directory,
@@ -224,6 +281,67 @@ async fn start_acme_worker(
         Arc::new(issuer),
         cancel,
     )))
+}
+
+/// What, if anything, the HTTPS listener is being asked to serve.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Https {
+    /// `tls.cert_file` and `tls.key_file` are set.
+    static_pair: bool,
+    /// Certificates are expected to arrive in the database: ACME issuance, or
+    /// an operator saying so with `server.https_enabled`.
+    stored: bool,
+}
+
+impl Https {
+    fn enabled(self) -> bool {
+        self.static_pair || self.stored
+    }
+
+    /// Whether to build a `CertificateStore`, which creates `tls.cert_dir`.
+    fn needs_store(self) -> bool {
+        self.stored
+    }
+}
+
+/// Decide whether to serve HTTPS, from what the configuration actually asks
+/// for rather than from whether a database happens to be reachable.
+///
+/// `server.https_enabled` is how a deployment says "serve tenant certificates
+/// from the store" without also configuring a static pair. It used to be
+/// declared and unread; this is what reads it.
+fn wants_https(config: &ProxyConfig) -> Https {
+    Https {
+        static_pair: config.tls.cert_file.is_some() && config.tls.key_file.is_some(),
+        stored: config.tls.acme_enabled || config.server.https_enabled,
+    }
+}
+
+/// Re-read the certificate store periodically, so a certificate issued or
+/// uploaded while the proxy is running starts being served.
+///
+/// Polling rather than LISTEN/NOTIFY: issuance is rare and a minute of delay
+/// on a new tenant domain costs nothing, where a listening connection is one
+/// more thing to reconnect and get wrong. `POST /domains/{id}/ssl/provision`
+/// takes several round trips to the CA anyway, so this is not the slow part.
+fn spawn_certificate_refresh(
+    resolver: Arc<postrust_proxy::tls::SniCertResolver>,
+    store: Arc<postrust_proxy::tls::CertificateStore>,
+    cancel: CancellationToken,
+) {
+    const EVERY: std::time::Duration = std::time::Duration::from_secs(60);
+
+    tokio::spawn(async move {
+        loop {
+            tokio::select! {
+                _ = cancel.cancelled() => return,
+                _ = tokio::time::sleep(EVERY) => {}
+            }
+            if let Err(e) = resolver.refresh(&store).await {
+                tracing::warn!("Certificate refresh failed: {e}");
+            }
+        }
+    });
 }
 
 /// Add database-held routes and upstreams to a file-bootstrapped config.
@@ -257,4 +375,71 @@ fn merge_from_database(
     config.upstreams.extend(upstreams);
     config.routes.extend(routes);
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn config() -> ProxyConfig {
+        ProxyConfig::default()
+    }
+
+    #[test]
+    fn a_plain_proxy_does_not_serve_https() {
+        // The regression this guards: HTTPS was gated on whether a certificate
+        // *store* could be built, and the store was built whenever
+        // DATABASE_URL was set. A proxy that merely keeps its routes in
+        // PostgreSQL then bound 0.0.0.0:8443 and failed every handshake on it,
+        // having no certificate to offer.
+        let https = wants_https(&config());
+        assert!(!https.enabled());
+        assert!(!https.needs_store());
+    }
+
+    #[test]
+    fn a_static_pair_serves_https_without_a_store() {
+        let mut config = config();
+        config.tls.cert_file = Some("/etc/postrust/fullchain.pem".into());
+        config.tls.key_file = Some("/etc/postrust/privkey.pem".into());
+
+        let https = wants_https(&config);
+        assert!(https.enabled());
+        // No store, so `tls.cert_dir` is not created -- which is what lets
+        // this run on a read-only root filesystem.
+        assert!(!https.needs_store());
+    }
+
+    #[test]
+    fn half_a_pair_is_not_a_pair() {
+        let mut config = config();
+        config.tls.cert_file = Some("/etc/postrust/fullchain.pem".into());
+        // main() rejects this combination outright; wants_https must not
+        // report it as usable in the meantime.
+        assert!(!wants_https(&config).static_pair);
+    }
+
+    #[test]
+    fn acme_serves_https_from_the_store_alone() {
+        let mut config = config();
+        config.tls.acme_enabled = true;
+
+        let https = wants_https(&config);
+        assert!(https.enabled());
+        assert!(https.needs_store());
+        // This is the multi-tenant case: no static pair configured at all.
+        assert!(!https.static_pair);
+    }
+
+    #[test]
+    fn https_enabled_is_read() {
+        // It was declared and ignored, and documented as doing nothing. It is
+        // how a deployment serves uploaded certificates without ACME.
+        let mut config = config();
+        config.server.https_enabled = true;
+
+        let https = wants_https(&config);
+        assert!(https.enabled());
+        assert!(https.needs_store());
+    }
 }

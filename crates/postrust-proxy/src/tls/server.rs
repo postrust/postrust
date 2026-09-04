@@ -57,6 +57,25 @@ pub fn build_server_config(cert_pem: &[u8], key_pem: &[u8]) -> ProxyResult<Arc<S
     Ok(Arc::new(config))
 }
 
+/// Build a `ServerConfig` that picks its certificate per handshake.
+///
+/// The single-certificate form above cannot serve a multi-tenant proxy: it
+/// answers every handshake with the same chain whatever name was asked for.
+/// See [`crate::tls::SniCertResolver`].
+pub fn build_server_config_with_resolver(
+    resolver: Arc<dyn tokio_rustls::rustls::server::ResolvesServerCert>,
+) -> Arc<ServerConfig> {
+    install_crypto_provider();
+
+    let mut config = ServerConfig::builder()
+        .with_no_client_auth()
+        .with_cert_resolver(resolver);
+
+    config.alpn_protocols = ALPN_PROTOCOLS.iter().map(|p| p.to_vec()).collect();
+
+    Arc::new(config)
+}
+
 /// Load a certificate and key from disk and build a `ServerConfig`.
 pub async fn load_server_config(cert_file: &str, key_file: &str) -> ProxyResult<Arc<ServerConfig>> {
     let cert_pem = tokio::fs::read(cert_file)

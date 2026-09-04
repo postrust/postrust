@@ -14,7 +14,8 @@
 
 use axum::{
     extract::State,
-    response::{Html, IntoResponse},
+    http::StatusCode,
+    response::{Html, IntoResponse, Response},
     routing::get,
     Json, Router,
 };
@@ -22,6 +23,7 @@ use std::sync::Arc;
 use utoipa::OpenApi;
 
 use crate::state::AppState;
+use postrust_core::OpenApiMode;
 
 /// OpenAPI specification for the Postrust REST API.
 #[derive(OpenApi)]
@@ -469,8 +471,112 @@ async fn dashboard_handler(State(state): State<Arc<AppState>>) -> impl IntoRespo
 }
 
 /// Handler for OpenAPI spec JSON.
-async fn openapi_json_handler() -> impl IntoResponse {
-    Json(ApiDoc::openapi())
+///
+/// The derived document describes the shape of the API; what is added here
+/// describes *this* database -- a path per exposed table, with the operations
+/// that table actually allows.
+async fn openapi_json_handler(State(state): State<Arc<AppState>>) -> Response {
+    // `disabled` means there is no specification to serve, not an empty one.
+    if state.config.openapi_mode == OpenApiMode::Disabled {
+        return (StatusCode::NOT_FOUND, "OpenAPI output is disabled").into_response();
+    }
+
+    let mut doc = ApiDoc::openapi();
+
+    // Behind a reverse proxy the server's own address is not the one clients
+    // use, and a "Try it" button that posts to the wrong host is worse than no
+    // button. `openapi_server_proxy_uri` is that outside address.
+    if let Some(proxy_uri) = &state.config.openapi_server_proxy_uri {
+        doc.servers = Some(vec![utoipa::openapi::ServerBuilder::new()
+            .url(proxy_uri.clone())
+            .description(Some("Configured by openapi_server_proxy_uri"))
+            .build()]);
+    }
+
+    add_table_paths(&mut doc, &state.schema_cache().await.tables, &state.config);
+    Json(doc).into_response()
+}
+
+/// Add one path per exposed table.
+///
+/// Under `follow-privileges` a table contributes only the operations it
+/// permits, which is what the schema cache already records from
+/// `information_schema.table_privileges`. Under `ignore-privileges` every
+/// table contributes all four, whether or not the request would be allowed --
+/// which is the point of that mode: it documents the API, not the caller.
+///
+/// Note the privileges are the connecting role's, read when the cache was
+/// loaded. They are not re-evaluated per request against the JWT's role.
+fn add_table_paths(
+    doc: &mut utoipa::openapi::OpenApi,
+    tables: &postrust_core::schema_cache::TablesMap,
+    config: &postrust_core::AppConfig,
+) {
+    use utoipa::openapi::path::{HttpMethod, OperationBuilder, PathItem};
+
+    let ignore_privileges = config.openapi_mode == OpenApiMode::IgnorePrivileges;
+    // In compatibility mode the REST surface is also at the root, which is the
+    // path a PostgREST client will use.
+    let prefix = if config.compat_mode { "" } else { "/api" };
+    let default_schema = config.default_schema();
+
+    // Sorted, and with the default schema first within a name.
+    //
+    // A URL carries no schema -- a table outside the default one is reached by
+    // asking for it with `Accept-Profile` -- so two exposed schemas holding the
+    // same table name produce the same path. Iterating a `HashMap` and
+    // inserting blindly meant one of them silently overwrote the other, and
+    // *which* one changed between runs. The default schema is the one served
+    // without a header, so it is the one the bare path describes.
+    let mut ordered: Vec<_> = tables.iter().collect();
+    ordered.sort_by_key(|(qualified, _)| {
+        (
+            qualified.name.clone(),
+            qualified.schema != default_schema,
+            qualified.schema.clone(),
+        )
+    });
+
+    for (qualified, table) in ordered {
+        let path = format!("{prefix}/{}", qualified.name);
+
+        // Already described by the default schema, or by an earlier one.
+        // Recorded on the entry that won rather than dropped in silence.
+        if let Some(existing) = doc.paths.paths.get_mut(&path) {
+            let note = format!(
+                "Also exposed by schema `{}`; select it with the \
+                 `Accept-Profile` header.",
+                qualified.schema
+            );
+            existing.description = Some(match existing.description.take() {
+                Some(previous) => format!("{previous} {note}"),
+                None => note,
+            });
+            continue;
+        }
+
+        let operation = |summary: &str| {
+            OperationBuilder::new()
+                .tag("tables")
+                .summary(Some(summary.to_string()))
+                .description(table.description.clone())
+                .build()
+        };
+
+        let mut item = PathItem::new(HttpMethod::Get, operation("Read rows"));
+        if ignore_privileges || table.insertable {
+            item.post = Some(operation("Insert rows"));
+        }
+        if ignore_privileges || table.updatable {
+            item.patch = Some(operation("Update rows"));
+        }
+        if ignore_privileges || table.deletable {
+            item.delete = Some(operation("Delete rows"));
+        }
+        item.summary = Some(format!("{}.{}", qualified.schema, qualified.name));
+
+        doc.paths.paths.insert(path, item);
+    }
 }
 
 /// Handler for GraphQL Playground.
@@ -565,6 +671,141 @@ pub fn admin_router() -> Router<Arc<AppState>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use postrust_core::schema_cache::{Table, TablesMap};
+
+    fn table(schema: &str, name: &str) -> Table {
+        Table {
+            schema: schema.into(),
+            name: name.into(),
+            description: None,
+            is_view: false,
+            is_partitioned: false,
+            insertable: true,
+            updatable: true,
+            deletable: true,
+            pk_cols: vec!["id".into()],
+            unique_constraints: Vec::new(),
+            columns: Default::default(),
+            computed_columns: Default::default(),
+        }
+    }
+
+    fn tables_map(entries: Vec<Table>) -> TablesMap {
+        entries
+            .into_iter()
+            .map(|t| (t.qualified_identifier(), t))
+            .collect()
+    }
+
+    fn paths_for(tables: TablesMap, config: &postrust_core::AppConfig) -> Vec<String> {
+        let mut doc = utoipa::openapi::OpenApiBuilder::new().build();
+        add_table_paths(&mut doc, &tables, config);
+        let mut paths: Vec<String> = doc.paths.paths.keys().cloned().collect();
+        paths.sort();
+        paths
+    }
+
+    #[test]
+    fn a_table_gets_a_path_under_the_api_prefix() {
+        let config = postrust_core::AppConfig::default();
+        let paths = paths_for(tables_map(vec![table("public", "users")]), &config);
+        assert_eq!(paths, vec!["/api/users".to_string()]);
+    }
+
+    #[test]
+    fn compat_mode_puts_tables_at_the_root() {
+        let config = postrust_core::AppConfig {
+            compat_mode: true,
+            ..Default::default()
+        };
+        let paths = paths_for(tables_map(vec![table("public", "users")]), &config);
+        assert_eq!(paths, vec!["/users".to_string()]);
+    }
+
+    #[test]
+    fn two_schemas_sharing_a_name_do_not_silently_lose_one() {
+        // A URL carries no schema, so both tables want `/api/orders`.
+        // Inserting blindly from a HashMap dropped one of them, and which one
+        // varied between runs. The default schema wins the path, and the other
+        // is recorded on it rather than vanishing.
+        let config = postrust_core::AppConfig {
+            db_schemas: vec!["public".into(), "api".into()],
+            ..Default::default()
+        };
+
+        let tables = tables_map(vec![table("api", "orders"), table("public", "orders")]);
+        let mut doc = utoipa::openapi::OpenApiBuilder::new().build();
+        add_table_paths(&mut doc, &tables, &config);
+
+        assert_eq!(doc.paths.paths.len(), 1);
+        let item = doc.paths.paths.get("/api/orders").expect("path present");
+        // `public` is the default schema, so it is what the bare path means.
+        assert_eq!(item.summary.as_deref(), Some("public.orders"));
+        let description = item.description.as_deref().unwrap_or_default();
+        assert!(
+            description.contains("`api`") && description.contains("Accept-Profile"),
+            "the other schema must be named: {description:?}"
+        );
+    }
+
+    #[test]
+    fn the_default_schema_wins_the_path_whichever_way_the_map_iterates() {
+        // Same inputs, built in both orders: the result must not depend on it.
+        let config = postrust_core::AppConfig {
+            db_schemas: vec!["public".into(), "api".into()],
+            ..Default::default()
+        };
+
+        for order in [
+            vec![table("api", "orders"), table("public", "orders")],
+            vec![table("public", "orders"), table("api", "orders")],
+        ] {
+            let mut doc = utoipa::openapi::OpenApiBuilder::new().build();
+            add_table_paths(&mut doc, &tables_map(order), &config);
+            assert_eq!(
+                doc.paths.paths["/api/orders"].summary.as_deref(),
+                Some("public.orders")
+            );
+        }
+    }
+
+    #[test]
+    fn follow_privileges_omits_what_a_table_does_not_allow() {
+        let config = postrust_core::AppConfig::default();
+        let mut read_only = table("public", "reports");
+        read_only.insertable = false;
+        read_only.updatable = false;
+        read_only.deletable = false;
+
+        let mut doc = utoipa::openapi::OpenApiBuilder::new().build();
+        add_table_paths(&mut doc, &tables_map(vec![read_only]), &config);
+
+        let item = &doc.paths.paths["/api/reports"];
+        assert!(item.get.is_some());
+        assert!(item.post.is_none());
+        assert!(item.patch.is_none());
+        assert!(item.delete.is_none());
+    }
+
+    #[test]
+    fn ignore_privileges_lists_every_operation() {
+        let config = postrust_core::AppConfig {
+            openapi_mode: OpenApiMode::IgnorePrivileges,
+            ..Default::default()
+        };
+        let mut read_only = table("public", "reports");
+        read_only.insertable = false;
+        read_only.updatable = false;
+        read_only.deletable = false;
+
+        let mut doc = utoipa::openapi::OpenApiBuilder::new().build();
+        add_table_paths(&mut doc, &tables_map(vec![read_only]), &config);
+
+        let item = &doc.paths.paths["/api/reports"];
+        assert!(item.post.is_some());
+        assert!(item.patch.is_some());
+        assert!(item.delete.is_some());
+    }
 
     #[test]
     fn test_openapi_spec_generation() {

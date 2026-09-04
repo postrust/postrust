@@ -11,11 +11,16 @@ its certificate. See [SSL/TLS Certificates](#ssltls-certificates).
 ## Features
 
 - **Domain Verification**: DNS TXT and HTTP challenge methods
-- **SSL/TLS**: Automatic via ACME HTTP-01 (Let's Encrypt), with renewal
+- **SSL/TLS**: certificates obtained and renewed automatically via ACME HTTP-01
+  (Let's Encrypt), and served per-domain by SNI — see
+  [Serving an issued certificate](#serving-an-issued-certificate)
 - **Authentication**: JWT + API Key dual authentication
 - **Multi-tenant**: Complete tenant isolation with quotas
-- **Dynamic Routing**: Per-domain routes without server restart
-- **Hot Reload**: PostgreSQL LISTEN/NOTIFY for instant config updates
+- **Database-backed routing**: per-domain routes stored in PostgreSQL rather
+  than a config file, and editable through the admin API
+
+Configuration is read at startup and there is no hot reload — see
+[Applying a configuration change](#applying-a-configuration-change).
 
 ## Authentication
 
@@ -496,16 +501,49 @@ sqlx migrate run
 | `PROXY_ACME_EMAIL` | Email for ACME registration | Required for auto-SSL |
 | `PROXY_ACME_DIRECTORY` | ACME directory URL | Let's Encrypt production |
 
-### Hot Reload
+### Applying a configuration change
 
-The proxy automatically reloads configuration when domains, routes, or upstreams change. This uses PostgreSQL LISTEN/NOTIFY:
+**The proxy needs a restart.** Routes, upstreams and domains are read from the
+database once, at startup, by `load_from_database`. Writing a row — through the
+admin API or directly — changes what the *next* start will load, and nothing
+about the process already running.
 
-```sql
--- Automatic triggers notify on changes
-LISTEN proxy_config_change;
-```
+There is no LISTEN/NOTIFY channel, no watcher and no reload endpoint. Earlier
+versions of this document described a `proxy_config_change` channel, and the
+crate carried a `ConfigReloader` whose channel nobody read alongside a
+`POST /config/reload` that answered "Configuration reload requested" without
+reloading. Both were removed rather than left to be believed; this section was
+the last place still describing them.
 
-No server restart required when adding or modifying domains.
+Certificates are the exception: those are re-read on a timer and do not need a
+restart. See [Serving an issued certificate](#serving-an-issued-certificate).
+
+### Serving an issued certificate
+
+A certificate in the store is served automatically, chosen per handshake by the
+name the client asked for (SNI).
+
+The HTTPS listener is built with an SNI resolver backed by `CertificateStore`
+rather than with a single fixed certificate, so each tenant domain is answered
+with its own. `tls.cert_file` and `tls.key_file`, where configured, become the
+fallback for a handshake whose SNI matches nothing stored and for a client that
+sends no SNI at all.
+
+Neither is required — a multi-tenant deployment can serve stored certificates
+alone — but the listener has to be asked for. `tls.acme_enabled` asks for it;
+so does `server.https_enabled`, which is the switch to use when certificates
+arrive by `ssl/upload` rather than from a CA. A `DATABASE_URL` on its own does
+not: keeping routes in PostgreSQL is not a request to terminate TLS. See
+[the proxy's TLS section](./proxy.md#tls).
+
+A wildcard covers exactly one label, as RFC 6125 requires — `*.example.com`
+answers for `a.example.com`, and not for `a.b.example.com` or the bare
+`example.com`.
+
+**Timing.** A certificate issued or uploaded while the proxy is running is
+picked up within a minute; the resolver re-reads the store on a timer. The read
+goes to the database rather than to any cache, so a renewal performed by another
+instance is picked up too.
 
 ## Error Responses
 

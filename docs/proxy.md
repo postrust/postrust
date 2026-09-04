@@ -112,11 +112,33 @@ https_host = "0.0.0.0"
 https_port = 8443
 ```
 
-Both must be set together. The listener offers ALPN `h2` and `http/1.1` and
-dispatches on what was negotiated — which is what makes HTTP/2 reachable as
-browsers actually use it, and WebSocket reachable as `wss://`. Without a
-certificate there is no HTTPS listener at all: `https_host` and `https_port`
-alone do nothing.
+`cert_file` and `key_file` must be set together, or neither. The listener offers
+ALPN `h2` and `http/1.1` and dispatches on what was negotiated — which is what
+makes HTTP/2 reachable as browsers actually use it, and WebSocket reachable as
+`wss://`.
+
+**The certificate is chosen per handshake, by SNI.** Certificates stored by ACME
+issuance or by `ssl/upload` are served for the domains they were issued for; the
+pair above, if set, is the fallback for a name that matches none of them and for
+a client that sends no SNI. A wildcard covers exactly one label, as RFC 6125
+requires.
+
+**HTTPS starts when the configuration asks for it**, which is any of:
+
+| | |
+| --- | --- |
+| `tls.cert_file` **and** `tls.key_file` | serve that pair, plus anything in the store |
+| `tls.acme_enabled` | serve issued certificates, no static pair needed |
+| `server.https_enabled` | serve stored certificates, for uploads without ACME |
+
+With none of them, `https_host` and `https_port` alone do nothing — and neither
+does a `DATABASE_URL`. Keeping routes in PostgreSQL is not a request to
+terminate TLS, and treating it as one opened `0.0.0.0:8443` on proxies that had
+no certificate to answer a handshake with.
+
+New certificates are picked up within a minute without a restart; the resolver
+re-reads the store on a timer, from the database rather than from a cache, so a
+renewal by another instance is seen too.
 
 ## Routing
 
@@ -279,8 +301,6 @@ Listed rather than left to be discovered:
 - **`retry_count` on a route.** Declarable, and nothing reads it. Retrying needs
   the request body to be replayable, which a streamed body is not, so this is a
   design question rather than a missing line.
-- **`server.https_enabled`** is not read. The HTTPS listener starts when
-  `tls.cert_file` and `tls.key_file` are both set, and not otherwise.
 - **`tls.acme_directory`** (the old field) is not read either; use
   `tls.acme_directory_url`, or `acme_staging` for Let's Encrypt staging.
 

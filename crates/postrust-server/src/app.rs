@@ -65,14 +65,28 @@ async fn process_request(
         .get("authorization")
         .and_then(|v| v.to_str().ok());
 
-    // Authenticate
-    let auth_result = authenticate(auth_header, &state.jwt_config).map_err(jwt_error)?;
+    // Authenticate, through the token cache where one is configured.
+    let auth_result = match &state.jwt_cache {
+        Some(cache) => cache.authenticate(auth_header, &state.jwt_config),
+        None => authenticate(auth_header, &state.jwt_config),
+    }
+    .map_err(jwt_error)?;
 
     debug!("Authenticated as role: {}", auth_result.role);
 
-    // Parse request
+    // Parse request.
+    //
+    // `max_body_size`, not a constant, and not `DefaultBodyLimit` either: that
+    // layer works by setting an extension the body *extractors* read, and this
+    // handler takes the whole `Request` and reads the body itself. The limit
+    // was hardcoded at 10 MiB here, so `PGRST_MAX_BODY_SIZE` was configuring
+    // nothing on this path however it was set.
     let (parts, body) = request.into_parts();
-    let body_bytes = axum::body::to_bytes(body, 10 * 1024 * 1024)
+    // Still `InvalidBody`, so still a 400: `to_bytes` reports a body that
+    // exceeded the limit and a connection that died mid-body as the same
+    // error, and answering 413 to a truncated upload would be a worse lie than
+    // the 400.
+    let body_bytes = axum::body::to_bytes(body, state.config.max_body_size)
         .await
         .map_err(|e| postrust_core::Error::InvalidBody(e.to_string()))?;
 
@@ -663,6 +677,16 @@ async fn execute_plan(
                 base: params.len(),
                 max_rows: api_request.max_rows,
                 alias_counter: 0,
+                // A schema-declared handler produces the whole body from
+                // these rows, so each column reaches the client as *text* --
+                // and that is the one place the cast is observable. Keyed on
+                // whether there is a handler at all, not on which row shape it
+                // wants: `{"id":1}` against PostgREST's `{"id": 1}` is the
+                // difference either way.
+                rendering: match &media_handler {
+                    Some(_) => postrust_core::EmbedRendering::Normalised,
+                    None => postrust_core::EmbedRendering::Verbatim,
+                },
             };
 
             // The single-query form cannot express a spread, whose columns have
@@ -948,6 +972,29 @@ async fn execute_plan(
                 .await
                 .map_err(|e| postrust_core::Error::ConnectionPool(e.to_string()))?;
 
+            // Isolation level. `SET TRANSACTION` is only accepted before the
+            // first statement of a transaction, so it goes here.
+            //
+            // A role's own setting wins over the server-wide
+            // `PGRST_DB_TX_ISOLATION`, and both are closed enums rendered by
+            // `to_sql` -- never caller text. Issued only when it differs from
+            // PostgreSQL's own default, so the common case costs no round trip.
+            let isolation = state
+                .config
+                .role_settings
+                .get(&auth.role)
+                .and_then(|r| r.isolation_level.as_ref())
+                .unwrap_or(&state.config.db_tx_isolation);
+            if *isolation != postrust_core::IsolationLevel::ReadCommitted {
+                sqlx::query(&format!(
+                    "SET TRANSACTION ISOLATION LEVEL {}",
+                    isolation.to_sql()
+                ))
+                .execute(&mut *tx)
+                .await
+                .map_err(map_sqlx_error)?;
+            }
+
             // A read request runs in a read-only transaction.
             //
             // Without this a GET can change data: `GET /rpc/some_volatile_fn`
@@ -997,7 +1044,18 @@ async fn execute_plan(
                     serde_json::Value::String(auth.role.clone()),
                 );
 
-                let mut settings: Vec<(String, String)> = vec![
+                let mut settings: Vec<(String, String)> = Vec::new();
+
+                // The settings a role carries come first, before the `role`
+                // that follows them -- see the note above on
+                // `GRANT SET ON PARAMETER`.
+                if let Some(role_settings) = state.config.role_settings.get(&auth.role) {
+                    if let Some(timeout) = role_settings.statement_timeout {
+                        settings.push(("statement_timeout".to_string(), timeout.to_string()));
+                    }
+                }
+
+                settings.extend([
                     ("search_path".to_string(), search_path),
                     ("role".to_string(), auth.role.clone()),
                     (
@@ -1014,7 +1072,14 @@ async fn execute_plan(
                         "request.cookies".to_string(),
                         json_object(&api_request.cookies),
                     ),
-                ];
+                ]);
+
+                // `app_settings`, exposed as PostgREST spells them: a function
+                // or policy reads one back with
+                // `current_setting('app.settings.<key>')`.
+                for (key, value) in &state.config.app_settings {
+                    settings.push((format!("app.settings.{key}"), value.clone()));
+                }
 
                 // `Prefer: timezone` is applied to the session, so every value
                 // the database renders -- and every `now()` a function calls --
@@ -1034,6 +1099,26 @@ async fn execute_plan(
                     query = query.bind(name).bind(value);
                 }
                 query.execute(&mut *tx).await.map_err(map_sqlx_error)?;
+            }
+
+            // `db_pre_request`: a function called before the request's own
+            // query, on the same transaction, so it sees every setting above
+            // and anything it raises aborts the request. PostgREST's use for
+            // it is a custom authorisation check that `RAISE`s to refuse.
+            //
+            // The name is an identifier from the configuration, not from the
+            // request, and is escaped as one -- a schema-qualified name stays
+            // two identifiers so `auth.check` does not become `"auth.check"`.
+            if let Some(pre_request) = &state.config.db_pre_request {
+                let qualified = pre_request
+                    .split('.')
+                    .map(postrust_sql::escape_ident)
+                    .collect::<Vec<_>>()
+                    .join(".");
+                sqlx::query(&format!("SELECT {qualified}()"))
+                    .execute(&mut *tx)
+                    .await
+                    .map_err(map_sqlx_error)?;
             }
 
             // Execute main query with bound parameters
@@ -2362,6 +2447,13 @@ struct EmbedFilters<'a> {
     max_rows: Option<i64>,
     /// Source of unique subquery aliases across the whole embed tree.
     alias_counter: usize,
+    /// How an embedded resource is rendered.
+    ///
+    /// `Verbatim` everywhere except under a media handler that stringifies the
+    /// whole row: there each column is rendered as *text*, and a `json` column
+    /// renders exactly as written where PostgREST's `jsonb` one renders
+    /// normalised. See [`postrust_core::EmbedRendering`].
+    rendering: postrust_core::EmbedRendering,
 }
 
 /// Renumber the placeholders in `sql` so they start after `offset`.
@@ -3138,6 +3230,7 @@ fn build_embed_expressions(
             // Positionally, with the parent row and nothing else: this surface
             // has no session to supply and no place to write an argument.
             None,
+            ctx.rendering,
         )?;
 
         if is_spread {

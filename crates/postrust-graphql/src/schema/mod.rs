@@ -315,6 +315,20 @@ pub struct FunctionField {
     pub description: Option<String>,
 }
 
+impl FunctionField {
+    /// The argument list, as PostgreSQL would write it -- `a integer, b text`.
+    ///
+    /// Two overloads differ only here, so this is what distinguishes them in a
+    /// warning and what orders them against each other.
+    pub fn argument_signature(&self) -> String {
+        self.arguments
+            .iter()
+            .map(|(name, sql_type, _)| format!("{name} {sql_type}"))
+            .collect::<Vec<_>>()
+            .join(", ")
+    }
+}
+
 /// What a computed relationship's function takes from the caller.
 ///
 /// Everything but the parent row, which is what makes it a relationship, and
@@ -1442,7 +1456,42 @@ pub fn build_schema(schema_cache: &SchemaCache, config: &SchemaConfig) -> Genera
             });
         }
     }
-    function_fields.sort_by(|a, b| a.name.cmp(&b.name));
+    // Sorted by name, and then by signature so that which overload survives
+    // the deduplication below does not depend on hash order.
+    function_fields.sort_by(|a, b| {
+        a.name.cmp(&b.name).then_with(|| {
+            a.arguments
+                .len()
+                .cmp(&b.arguments.len())
+                .then_with(|| a.argument_signature().cmp(&b.argument_signature()))
+        })
+    });
+
+    // PostgreSQL overloads functions; GraphQL does not overload fields. Two
+    // `SETOF` overloads of one name therefore want the same root field, and
+    // `dynamic::Object::field` *panics* on the second -- so this is not a
+    // cosmetic choice, it is the difference between starting and not. A schema
+    // with `f(a int)` and `f(a int, b text)` both returning `SETOF t` crashed
+    // the server at boot.
+    //
+    // The one taking fewest arguments is kept, being the one most callers can
+    // call, and every other is named in a warning: a function that is not
+    // exposed should say so rather than be discovered missing.
+    let mut seen: HashSet<String> = HashSet::new();
+    function_fields.retain(|function| {
+        if seen.insert(function.name.clone()) {
+            return true;
+        }
+        tracing::warn!(
+            "not exposing {}.{}({}) -- another overload of {} is already a root \
+             field, and GraphQL has no overloading",
+            function.schema_name,
+            function.function_name,
+            function.argument_signature(),
+            function.name,
+        );
+        false
+    });
 
     GeneratedSchema {
         object_types,
@@ -1550,6 +1599,84 @@ mod tests {
             media_handlers: HashMap::new(),
             pg_version: 150000,
             representations: Default::default(),
+        }
+    }
+
+    /// A `SETOF users` function, with the given argument names and types.
+    fn setof_users_routine(
+        name: &str,
+        args: &[(&str, &str)],
+    ) -> postrust_core::schema_cache::Routine {
+        use postrust_core::schema_cache::{FuncVolatility, RetType, Routine, RoutineParam};
+        Routine {
+            schema: "public".into(),
+            name: name.into(),
+            description: None,
+            params: args
+                .iter()
+                .map(|(pname, ptype)| RoutineParam {
+                    name: (*pname).into(),
+                    param_type: (*ptype).into(),
+                    type_max_length: (*ptype).into(),
+                    required: true,
+                    variadic: false,
+                })
+                .collect(),
+            return_type: RetType::SetOf("users".into()),
+            returns_composite: true,
+            volatility: FuncVolatility::Stable,
+            has_variadic: false,
+            isolation_level: None,
+            settings: Vec::new(),
+            is_procedure: false,
+            media_type: None,
+            media_base_type: None,
+            output_columns: Vec::new(),
+        }
+    }
+
+    /// Two `SETOF` overloads of one name want one root field, and
+    /// `dynamic::Object::field` panics on the second -- so this is the
+    /// difference between the server starting and not. Reproduced from
+    /// PostgREST's `overloaded_default` fixture, which crashed it at boot.
+    #[test]
+    fn overloads_of_one_function_become_a_single_root_field() {
+        let mut cache = create_test_schema_cache();
+        let one = setof_users_routine("overloaded", &[("a", "integer")]);
+        let two = setof_users_routine("overloaded", &[("a", "integer"), ("b", "text")]);
+        cache
+            .routines
+            .insert(one.qualified_identifier(), vec![two, one]);
+
+        let generated = build_schema(&cache, &SchemaConfig::default());
+        let named: Vec<&str> = generated
+            .function_fields
+            .iter()
+            .filter(|f| f.name == "overloaded")
+            .map(|f| f.name.as_str())
+            .collect();
+        assert_eq!(named.len(), 1, "exactly one root field per function name");
+    }
+
+    /// And which overload survives cannot depend on hash order, or the schema
+    /// differs between two runs of the same binary against one database.
+    #[test]
+    fn the_surviving_overload_is_the_one_taking_fewest_arguments() {
+        let long = setof_users_routine("overloaded", &[("a", "integer"), ("b", "text")]);
+        let short = setof_users_routine("overloaded", &[("a", "integer")]);
+
+        for order in [vec![long.clone(), short.clone()], vec![short, long]] {
+            let mut cache = create_test_schema_cache();
+            cache
+                .routines
+                .insert(order[0].qualified_identifier(), order);
+            let generated = build_schema(&cache, &SchemaConfig::default());
+            let kept = generated
+                .function_fields
+                .iter()
+                .find(|f| f.name == "overloaded")
+                .expect("the function is exposed");
+            assert_eq!(kept.argument_signature(), "a integer");
         }
     }
 
