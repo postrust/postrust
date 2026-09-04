@@ -1,0 +1,54 @@
+Subject: [PATCH] parser: an enum value may begin with true, false or null
+
+The GraphQL specification defines EnumValue as "Name but not `true` or
+`false` or `null`" -- the three *names*, not the three prefixes. The
+grammar excludes any name that merely starts with one:
+
+    enum_value = ${ !(boolean | null) ~ name }
+
+`!(boolean | null)` is a lookahead for the literal alone, so `boolean`
+matches the "true" inside "trueish" and the name is rejected. Anything
+called `nullPrefixTestTable_pkey`, `nullable`, `trueish` or `falsey` is
+then not lexable as an enum value, and a document naming one is answered
+with a parse error.
+
+That is reachable from ordinary schemas. A PostgreSQL constraint called
+`nullPrefixTestTable_pkey` is a legal identifier, and an upsert naming it
+is a legal request; Hasura's own test corpus has exactly that case
+(`graphql_mutation/insert/nullprefixcolumn`).
+
+The fix follows the idiom already used a few lines above for numbers,
+which have the same "literal must not run into a name" problem:
+
+    number = @{ (float | int) ~ !name_start }
+
+Reject the literal only where it is *not* followed by a name character,
+which is to say only where it is the whole name. `name_continue` is
+factored out of `name` so the two cannot drift apart.
+
+Verified against the rule directly, with the three literals and five
+names that begin with them:
+
+    true                     rejected    (was rejected)
+    false                    rejected    (was rejected)
+    null                     rejected    (was rejected)
+    nullPrefixTestTable_pkey accepted    (was rejected)
+    trueish                  accepted    (was rejected)
+    falsey                   accepted    (was rejected)
+    nullable                 accepted    (was rejected)
+    null_                    accepted    (was rejected)
+
+Unchanged for names that begin with none of them (`ACTIVE`, `_x`, `a1`).
+
+Present in 7.0.17 and unchanged in 7.2.1.
+
+---
+--- a/src/graphql.pest
++++ b/src/graphql.pest
+@@
+-name = @{ name_start ~ (ASCII_ALPHA | ASCII_DIGIT | "_")* }
++name_continue = @{ (ASCII_ALPHA | ASCII_DIGIT | "_") }
++name = @{ name_start ~ name_continue* }
+@@
+-enum_value = ${ !(boolean | null) ~ name }
++enum_value = ${ !((boolean | null) ~ !name_continue) ~ name }
