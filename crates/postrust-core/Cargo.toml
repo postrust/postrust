@@ -11,6 +11,18 @@ homepage.workspace = true
 readme = "README.md"
 keywords = ["postgres", "rest", "api", "query-planner", "postgrest"]
 
+[features]
+# Mirrors `postrust-server`'s feature of the same name, which turns it on here
+# too. Two things follow from it, and both have to agree or the feature only
+# half works:
+#
+#   * `serde_json/preserve_order`, so a decoded object keeps its key order;
+#   * embedded rows are built as `json` rather than `jsonb` -- see
+#     `Relationship::embed_expression`. `jsonb` sorts keys by length and then
+#     bytes, inside PostgreSQL, so no amount of care on the Rust side can
+#     recover the order the columns were selected in.
+compat-key-order = ["serde_json/preserve_order"]
+
 [dependencies]
 # Async
 async-trait.workspace = true

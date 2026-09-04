@@ -8525,6 +8525,10 @@ fn build_embed_expressions(
                     child_order.as_deref(),
                     call.as_deref(),
                     &child_distinct,
+                    // A GraphQL body is JSON throughout -- nothing here
+                    // renders a row as text -- and Hasura keeps the order the
+                    // fields were selected in.
+                    postrust_core::EmbedRendering::Verbatim,
                 )
                 .map_err(|e| async_graphql::Error::new(e.to_string()))?;
             expressions.push((field.name().to_string(), expression));
@@ -8664,6 +8668,7 @@ fn build_embed_expressions(
                 child_where.as_deref(),
                 child_order.as_deref(),
                 computed_call_arguments.as_deref(),
+                postrust_core::EmbedRendering::Verbatim,
             )
             .map_err(|e| async_graphql::Error::new(e.to_string()))?;
 

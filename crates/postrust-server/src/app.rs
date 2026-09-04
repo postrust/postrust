@@ -663,6 +663,16 @@ async fn execute_plan(
                 base: params.len(),
                 max_rows: api_request.max_rows,
                 alias_counter: 0,
+                // A schema-declared handler produces the whole body from
+                // these rows, so each column reaches the client as *text* --
+                // and that is the one place the cast is observable. Keyed on
+                // whether there is a handler at all, not on which row shape it
+                // wants: `{"id":1}` against PostgREST's `{"id": 1}` is the
+                // difference either way.
+                rendering: match &media_handler {
+                    Some(_) => postrust_core::EmbedRendering::Normalised,
+                    None => postrust_core::EmbedRendering::Verbatim,
+                },
             };
 
             // The single-query form cannot express a spread, whose columns have
@@ -2362,6 +2372,13 @@ struct EmbedFilters<'a> {
     max_rows: Option<i64>,
     /// Source of unique subquery aliases across the whole embed tree.
     alias_counter: usize,
+    /// How an embedded resource is rendered.
+    ///
+    /// `Verbatim` everywhere except under a media handler that stringifies the
+    /// whole row: there each column is rendered as *text*, and a `json` column
+    /// renders exactly as written where PostgREST's `jsonb` one renders
+    /// normalised. See [`postrust_core::EmbedRendering`].
+    rendering: postrust_core::EmbedRendering,
 }
 
 /// Renumber the placeholders in `sql` so they start after `offset`.
@@ -3138,6 +3155,7 @@ fn build_embed_expressions(
             // Positionally, with the parent row and nothing else: this surface
             // has no session to supply and no place to write an argument.
             None,
+            ctx.rendering,
         )?;
 
         if is_spread {
