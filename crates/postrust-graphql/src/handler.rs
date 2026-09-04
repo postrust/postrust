@@ -2634,8 +2634,37 @@ fn add_function_fields(
     relationships: Arc<HashMap<String, Vec<RelationshipField>>>,
     names: Arc<crate::names::NameOverrides>,
 ) -> Object {
+    // The names the root already carries, from the tables. A function may be
+    // named after one -- `create function t() returns setof t` is an ordinary
+    // way to write a parameterised view -- and `Object::field` *panics* on a
+    // duplicate, so an unguarded collision is a server that will not start.
+    let taken: HashSet<&str> = if volatile {
+        generated
+            .mutation_fields
+            .iter()
+            .map(|f| f.name.as_str())
+            .collect()
+    } else {
+        generated
+            .query_fields
+            .iter()
+            .map(|f| f.name.as_str())
+            .collect()
+    };
+
     for function in &generated.function_fields {
         if function.volatile != volatile {
+            continue;
+        }
+        if taken.contains(function.name.as_str()) {
+            tracing::warn!(
+                "not exposing {}.{}({}) -- a table already has a root field \
+                 called {}",
+                function.schema_name,
+                function.function_name,
+                function.argument_signature(),
+                function.name,
+            );
             continue;
         }
         let spec = Arc::new(QueryFieldSpec {
