@@ -12,11 +12,20 @@ Postrust is configured entirely through environment variables, making it easy to
 
 | Variable | Description | Default |
 |----------|-------------|---------|
+| `PGRST_DB_URI` | Connection URI. `DATABASE_URL` is accepted too and wins where both are set | `postgresql://localhost/postgres` |
 | `PGRST_DB_SCHEMAS` | Comma-separated list of schemas to expose | `public` |
 | `PGRST_DB_ANON_ROLE` | Role for unauthenticated requests | (none) |
-| `PGRST_DB_POOL_SIZE` | Connection pool size | `10` |
-| `PGRST_DB_POOL_TIMEOUT` | Pool timeout in seconds | `30` |
-| `PGRST_DB_TX_ISOLATION` | Transaction isolation level | `read committed` |
+| `PGRST_DB_POOL_SIZE` | Connection pool size. `PGRST_DB_POOL` is accepted as PostgREST spells it | `10` |
+| `PGRST_DB_POOL_TIMEOUT` | Seconds to wait for a pool connection before giving up | `10` |
+| `PGRST_DB_TX_ISOLATION` | Isolation level of the transaction every request runs in: `read committed`, `repeatable read` or `serializable` | `read committed` |
+| `PGRST_DB_EXTRA_SEARCH_PATH` | Comma-separated schemas appended to each request's `search_path`. Not exposed as endpoints — this is where a function or type that an exposed schema references is allowed to live | `public` |
+| `PGRST_DB_AGGREGATES_ENABLED` | Allow aggregate functions in `select`. Off by default, as in PostgREST: an aggregate over a large table costs far more than the request looks like it asks for | `false` |
+| `PGRST_DB_PREPARED_STATEMENTS` | Use prepared statements. Set `false` behind a connection pooler in transaction mode (PgBouncer), where the connection a statement was prepared on is not the one the next query lands on | `true` |
+| `PGRST_DB_PRE_REQUEST` | Function called on the request's transaction before its own query, after every setting is applied. Anything it raises aborts the request. Schema-qualify it as `auth.check` | (none) |
+| `PGRST_DB_CHANNEL` | LISTEN channel for schema cache reloads | `pgrst` |
+| `PGRST_DB_CHANNEL_ENABLED` | Reload the schema cache on `NOTIFY <channel>` instead of on a restart | `false` |
+
+`PGRST_DB_MAX_ROWS` is under [Request Limits](#request-limits).
 
 ### Database URL Format
 
@@ -60,6 +69,8 @@ curl http://localhost:3000/users \
 | `PGRST_JWT_SECRET_IS_BASE64` | Is secret base64 encoded? | `false` |
 | `PGRST_JWT_AUD` | Required audience claim | (none) |
 | `PGRST_JWT_ROLE_CLAIM_KEY` | Claim key containing role | `role` |
+| `PGRST_JWT_CACHE_ENABLED` | Cache validated tokens, so a repeated token is not verified again | `true` |
+| `PGRST_JWT_CACHE_MAX_LIFETIME` | How long a cached validation may be reused, in seconds. A token's own `exp` bounds this — the cache never answers with a token past its expiry. `0` turns the cache off | `3600` |
 
 ### JWT Secret
 
@@ -197,6 +208,8 @@ tried to be an administrator and failed is not then treated as a stranger.
 | `PGRST_SERVER_HOST` | Server bind address | `127.0.0.1` |
 | `PGRST_SERVER_PORT` | Server port | `3000` |
 | `PGRST_SERVER_CORS_ORIGINS` | Allowed CORS origins | `*` |
+| `PGRST_SERVER_UNIX_SOCKET` | Listen on a Unix domain socket instead of host and port. A stale socket file left by a previous run is removed; anything at the path that is not a socket is refused | (none) |
+| `PGRST_ADMIN_SERVER_PORT` | Serve `/live`, `/ready` and `/health` on a second port, so a probe does not need to reach the API | (none) |
 
 ### CORS Configuration
 
@@ -207,6 +220,12 @@ PGRST_SERVER_CORS_ORIGINS="https://example.com,https://app.example.com"
 # Allow all origins (development only)
 PGRST_SERVER_CORS_ORIGINS="*"
 ```
+
+An origin must be given as a scheme and host — `https://example.com`, not
+`example.com` — because that is what a browser puts in the `Origin` header and
+the comparison is exact. Naming any origin restricts the policy to that list:
+a request from anywhere else receives no `Access-Control-Allow-Origin` and the
+browser refuses it. The default, and `*`, allow every origin.
 
 ## Compatibility Settings
 
@@ -281,15 +300,20 @@ differences.
 | Variable | Description | Default |
 |----------|-------------|---------|
 | `PGRST_LOG_LEVEL` | Log level | `info` |
-| `RUST_LOG` | Detailed Rust logging | (none) |
+| `RUST_LOG` | Detailed Rust logging. Wins where both are set | (none) |
+| `PGRST_DEBUG` | Include the database's own error detail, hint and constraint name in error responses. Off in production: those strings describe the schema | `false` |
 
 ### Log Levels
 
+- `crit` - Errors only, as `error` (accepted for PostgREST parity)
 - `error` - Only errors
 - `warn` - Warnings and errors
 - `info` - General information (default)
 - `debug` - Detailed debugging
-- `trace` - Very verbose
+
+`RUST_LOG` takes a full [tracing filter](https://docs.rs/tracing-subscriber/latest/tracing_subscriber/filter/struct.EnvFilter.html)
+and can name targets and spans individually, so it overrides `PGRST_LOG_LEVEL`
+rather than combining with it.
 
 ```bash
 # Production
@@ -306,6 +330,68 @@ RUST_LOG="postrust=debug,sqlx=info"
 |----------|-------------|---------|
 | `PGRST_MAX_ROWS` | Maximum rows returned by a single request. Caps requests that specify no `limit`, and bounds larger ones. Alias: `PGRST_DB_MAX_ROWS` | unset (unlimited) |
 | `PGRST_MAX_BODY_SIZE` | Maximum request body (bytes) | `10485760` |
+
+## OpenAPI
+
+| Variable | Description | Default |
+|----------|-------------|---------|
+| `PGRST_OPENAPI_MODE` | `disabled`, `follow-privileges` or `ignore-privileges` | `follow-privileges` |
+| `PGRST_OPENAPI_SERVER_PROXY_URI` | Address to advertise in the specification's `servers`, for when the server sits behind a reverse proxy and its own address is not the one clients use | (none) |
+
+The specification is served at `/admin/openapi.json` and requires the
+`admin-ui` feature.
+
+`disabled` answers that path with 404 — there is no specification to serve, not
+an empty one. The other two both list a path per exposed table:
+`follow-privileges` gives each table only the operations it permits, which is
+what `information_schema.table_privileges` said when the schema cache was
+loaded; `ignore-privileges` lists all of them regardless, documenting the API
+rather than the caller.
+
+Those privileges are the connecting role's, read once at load. They are not
+re-evaluated per request against the role in a JWT.
+
+PostgREST also has a `security-definer` mode, where the specification comes from
+a user-supplied `SECURITY DEFINER` function. There is no configuration here for
+naming that function, so the value is rejected rather than accepted and quietly
+treated as one of the others.
+
+## Role Settings
+
+| Variable | Description | Default |
+|----------|-------------|---------|
+| `PGRST_ROLE_SETTINGS` | JSON object mapping a role to settings applied to its requests | `{}` |
+
+```bash
+PGRST_ROLE_SETTINGS='{"web_user":{"isolation_level":"serializable","statement_timeout":5000}}'
+```
+
+`isolation_level` takes the same spellings as `PGRST_DB_TX_ISOLATION` and
+overrides it for that role. `statement_timeout` is in milliseconds and is
+applied as a `SET LOCAL` on the request's transaction.
+
+JSON rather than one variable per role, because a PostgreSQL role name may hold
+characters an environment variable name cannot. A value that does not parse is
+rejected whole, with a warning, rather than half-applied.
+
+## App Settings
+
+| Variable | Description |
+|----------|-------------|
+| `PGRST_APP_SETTINGS_<NAME>` | Exposed to every request as `app.settings.<name>` |
+
+```bash
+PGRST_APP_SETTINGS_JWT_LIFETIME=3600
+```
+
+Read back in a function or a row-level policy:
+
+```sql
+current_setting('app.settings.jwt_lifetime', true)
+```
+
+The name is lower-cased, which is the form PostgREST uses and the one a policy
+expects.
 
 ## GraphQL Subscriptions
 
@@ -567,39 +653,42 @@ PGRST_LOG_LEVEL="info"
 PGRST_DB_POOL_SIZE="1"
 ```
 
-## Configuration File (Optional)
+## There is no configuration file, and no `.env`
 
-You can also use a `.env` file:
-
-```bash
-# .env
-DATABASE_URL=postgres://user:pass@localhost:5432/mydb
-PGRST_DB_ANON_ROLE=web_anon
-PGRST_JWT_SECRET=your-secret-key
-```
-
-Load it automatically:
-```bash
-# The server reads .env files by default
-./postrust
-```
-
-## Validation
-
-Postrust validates configuration on startup:
+Every setting above is read from the process environment, by
+`AppConfig::from_env`. Nothing reads a `.env` file — the server has no dotenv
+dependency — so a `.env` sitting next to the binary is not picked up. Use the
+shell, the unit file, or the container runtime:
 
 ```bash
-./postrust
+# systemd
+Environment=PGRST_DB_ANON_ROLE=web_anon
 
-# Output:
-# INFO postrust: Configuration validated
-# INFO postrust: Connected to database
-# INFO postrust: Server listening on 0.0.0.0:3000
+# docker compose
+environment:
+  PGRST_DB_ANON_ROLE: web_anon
+
+# a shell, for development, if you want a file
+set -a && . ./my.env && set +a && ./postrust
 ```
 
-Common validation errors:
+## What happens to a value it cannot use
 
-- `DATABASE_URL is required` - Set the database connection string
-- `Invalid DATABASE_URL format` - Check the URL syntax
-- `JWT_SECRET must be at least 32 characters` - Use a longer secret
-- `Unknown schema: xyz` - Schema doesn't exist in database
+There is no separate validation pass, and no "configuration validated" line.
+Two things happen instead.
+
+**A value that cannot be parsed is ignored, with a warning naming it**, and the
+default stands:
+
+```
+WARN postrust_core::config: Ignoring PGRST_DB_POOL_SIZE="lots": expected a positive integer
+```
+
+A rejected value and an unset one are different mistakes, and the operator can
+only fix the one they are told about. This is why the log subscriber is
+installed before the configuration is read.
+
+**Anything that has to be right to start at all fails the start**, and says so
+on the way out: a database URI that will not parse, a database that cannot be
+reached, a port already bound, a socket path occupied by something that is not a
+socket.

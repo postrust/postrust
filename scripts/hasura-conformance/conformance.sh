@@ -246,9 +246,15 @@ harness_stamp() {
         shasum -a 256 | cut -d' ' -f1
 }
 
+# `order_constraints.py` runs on the dump before it is ever restored.
+# PostgreSQL names whichever unique index it reaches first, and pg_dump emits
+# constraints alphabetically where the fixture declared the primary key first
+# -- so without this the two databases answer a duplicate row with different
+# constraint names while the servers behave identically. See the script.
 SNAPSHOT_CMD="docker exec -e PGPASSWORD=postgres $DB pg_dump -U postgres -d $DATA_DB \
     --no-owner --no-acl -N hdb_catalog -N hdb_views -N topology -N tiger -N tiger_data -N extensions \
-    -f /dump-{group}.sql && docker cp $DB:/dump-{group}.sql $WORK/dumps/{group}.sql"
+    -f /dump-{group}.sql && docker cp $DB:/dump-{group}.sql $WORK/dumps/{group}.sql \
+    && python3 $HERE/order_constraints.py $WORK/dumps/{group}.sql"
 
 # Between mutating files: the same dump with the schema left alone, so no DDL
 # runs, object OIDs never change and neither server has to be restarted to

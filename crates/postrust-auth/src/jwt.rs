@@ -68,11 +68,37 @@ pub fn validate_token(token: &str, config: &JwtConfig) -> Result<AuthResult, Jwt
 /// shape is read as a token that named no role at all and falls back the same
 /// way an absent claim does.
 fn role_of(claims: &HashMap<String, serde_json::Value>, config: &JwtConfig) -> Option<String> {
-    claims
-        .get(&config.role_claim_key)
+    lookup_claim(claims, &config.role_claim_key)
         .and_then(serde_json::Value::as_str)
         .map(str::to_string)
         .or_else(|| config.anon_role.clone())
+}
+
+/// Resolve a claim key, which may name a nested claim.
+///
+/// The literal key is tried first, and a dotted path only if that misses. The
+/// order matters: a top-level claim name is allowed to contain dots, and the
+/// ones that do are exactly the ones that must not be re-read as a path --
+/// Hasura mints `https://hasura.io/jwt/claims`, and splitting that would look
+/// for a claim named `https://hasura` instead.
+///
+/// Only objects are walked. A path that runs into a string or a number stops
+/// there and finds nothing, rather than pretending the rest of the path was
+/// satisfied.
+fn lookup_claim<'a>(
+    claims: &'a HashMap<String, serde_json::Value>,
+    key: &str,
+) -> Option<&'a serde_json::Value> {
+    if let Some(value) = claims.get(key) {
+        return Some(value);
+    }
+
+    let (first, rest) = key.split_once('.')?;
+    let mut current = claims.get(first)?;
+    for segment in rest.split('.') {
+        current = current.as_object()?.get(segment)?;
+    }
+    Some(current)
 }
 
 /// The registered claims, checked in the order the contract checks them.
@@ -192,6 +218,84 @@ mod tests {
             serde_json::Value::Object(map) => map.into_iter().collect(),
             _ => panic!("claims must be an object"),
         }
+    }
+
+    fn role_with(key: &str, json: serde_json::Value) -> Option<String> {
+        let config = JwtConfig {
+            role_claim_key: key.to_string(),
+            ..config()
+        };
+        role_of(&claims(json), &config)
+    }
+
+    #[test]
+    fn a_flat_role_claim_is_found() {
+        assert_eq!(
+            role_with("role", serde_json::json!({"role": "web_user"})),
+            Some("web_user".to_string())
+        );
+        assert_eq!(
+            role_with("my_role", serde_json::json!({"my_role": "web_user"})),
+            Some("web_user".to_string())
+        );
+    }
+
+    #[test]
+    fn a_dotted_key_reaches_a_nested_claim() {
+        // `PGRST_JWT_ROLE_CLAIM_KEY="user.role"` over
+        // `{"user": {"role": "..."}}` is the example the documentation gives.
+        // A flat `get` looks for a claim literally named `user.role`, finds
+        // nothing, and every such request silently became anonymous.
+        assert_eq!(
+            role_with(
+                "user.role",
+                serde_json::json!({"user": {"role": "web_user"}})
+            ),
+            Some("web_user".to_string())
+        );
+        assert_eq!(
+            role_with("a.b.c", serde_json::json!({"a": {"b": {"c": "web_user"}}})),
+            Some("web_user".to_string())
+        );
+    }
+
+    #[test]
+    fn a_literal_dotted_claim_wins_over_the_path_reading() {
+        // Hasura mints `https://hasura.io/jwt/claims`, and a namespaced claim
+        // name full of dots must not be split into a path.
+        assert_eq!(
+            role_with(
+                "https://hasura.io/jwt/claims",
+                serde_json::json!({"https://hasura.io/jwt/claims": "web_user"})
+            ),
+            Some("web_user".to_string())
+        );
+        // Both present: the literal key is the one that was asked for.
+        assert_eq!(
+            role_with(
+                "user.role",
+                serde_json::json!({"user.role": "literal", "user": {"role": "nested"}})
+            ),
+            Some("literal".to_string())
+        );
+    }
+
+    #[test]
+    fn a_path_that_runs_into_a_non_object_finds_nothing() {
+        // Falls back to the anonymous role rather than inventing one.
+        let anon = JwtConfig {
+            role_claim_key: "user.role".to_string(),
+            anon_role: Some("web_anon".to_string()),
+            ..config()
+        };
+        assert_eq!(
+            role_of(&claims(serde_json::json!({"user": "not-an-object"})), &anon),
+            Some("web_anon".to_string())
+        );
+        assert_eq!(
+            role_of(&claims(serde_json::json!({"user": {"other": 1}})), &anon),
+            Some("web_anon".to_string())
+        );
     }
 
     /// The token in PostgREST's own suite carries `"aud": [{...}, "test"]`,

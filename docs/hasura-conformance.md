@@ -131,6 +131,27 @@ which Hasura has neither of, and answers `__TypeKind`'s members in
 specification order where Hasura sorts them. Every large introspection case
 needs at least one of those.
 
+**This one stays even if the library opens up**, and it is worth being plain
+about why, because ten of the sixteen remaining cases are here and closing
+them would take the measured figure from 96.6% to about 99.4%.
+
+The response could be rewritten on the way out — there is one place every
+GraphQL answer passes through. But matching Hasura means *removing*
+`deprecated`, `specifiedBy` and `oneOf` from the directive list, and `ID` and
+`__DirectiveLocation` from the type list, when this server genuinely has them.
+Introspection is the contract a client or a code generator reads to learn what
+a server supports; a schema that omits `@deprecated` while `@deprecated` keeps
+working is a server misreporting itself. It runs the other way too: Hasura
+publishes a `cached` directive, and advertising that would claim a
+response-caching feature this server does not implement.
+
+Sorting types, arguments and enum members is harmless, and so is wording a
+description differently — order and prose carry no capability claim. Those are
+worth doing. The suppression is not, and since every large case needs at least
+one suppressed item, the cases stay open. A conformance percentage is a
+measurement, not a target to be reached by making the server describe itself
+falsely.
+
 **`_stream` subscriptions.** The cursor-based half of Hasura's subscription
 surface. The live queries beside it are done; this is a second shape with its
 own cursor types.
@@ -140,6 +161,14 @@ async-graphql's grammar excludes any name that *starts with* one of the three
 literals, where the specification excludes only the tokens themselves. So an
 upsert naming a constraint called `nullPrefixTestTable_pkey` is answered with a
 parse error.
+
+A fix is written and tested against the rule directly —
+[`patches/async-graphql-parser-enum-value.patch`](../patches/async-graphql-parser-enum-value.patch)
+— and belongs upstream rather than here. The local alternative is rewriting the
+document text and restoring every name in the parsed tree, machinery that could
+corrupt a document that was valid to begin with. This is a real defect beyond
+conformance: any schema with a constraint or enum member named `nullable_x` or
+`truestore` hits it.
 
 **Generated descriptions** are this server's wording rather than Hasura's, and
 arguments come back in declaration order where Hasura sorts them. Nothing

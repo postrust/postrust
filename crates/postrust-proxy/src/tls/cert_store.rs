@@ -161,6 +161,49 @@ impl CertificateStore {
         Ok(())
     }
 
+    /// Read every certificate from the database, ignoring both caches.
+    ///
+    /// [`get`](Self::get) answers from memory once a domain has been read
+    /// once, which is right for a handshake and wrong for a refresh: a
+    /// certificate renewed by *another* instance would never be noticed, and
+    /// this proxy would go on serving the old one until it was restarted. The
+    /// database is the authority, so a refresh asks it.
+    ///
+    /// The in-memory cache is replaced with what was read, so the two do not
+    /// then disagree.
+    pub async fn load_all(&self) -> ProxyResult<Vec<Certificate>> {
+        let rows: Vec<(
+            String,
+            Vec<u8>,
+            Vec<u8>,
+            Option<chrono::DateTime<chrono::Utc>>,
+        )> = sqlx::query_as("SELECT domain, cert_pem, key_pem, expires_at FROM proxy_certificates")
+            .fetch_all(&self.pool)
+            .await?;
+
+        let certificates: Vec<Certificate> = rows
+            .into_iter()
+            .map(|(domain, cert_pem, key_pem, expires_at)| Certificate {
+                domain,
+                cert_pem,
+                key_pem,
+                expires_at,
+            })
+            .collect();
+
+        let mut cache = self.cache.write().await;
+        *cache = certificates
+            .iter()
+            .map(|c| (c.domain.clone(), c.clone()))
+            .collect();
+
+        debug!(
+            "Loaded {} certificate(s) from the database",
+            certificates.len()
+        );
+        Ok(certificates)
+    }
+
     async fn load_from_database(&self, domain: &str) -> ProxyResult<Option<Certificate>> {
         let row: Option<(String, Vec<u8>, Vec<u8>, Option<chrono::DateTime<chrono::Utc>>)> =
             sqlx::query_as(

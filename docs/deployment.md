@@ -334,10 +334,11 @@ serverless deploy
 
 ### Lambda Best Practices
 
-1. **Connection Pooling**: Use a small pool size (1-2 connections)
-   ```bash
-   PGRST_DB_POOL_SIZE=1
-   ```
+1. **Connection Pooling**: fixed at one connection, and not configurable here.
+   A Lambda execution environment serves one request at a time, so a larger
+   pool buys nothing and multiplies connections by the concurrency limit
+   instead. `PGRST_DB_POOL_SIZE` is read by the server binary and ignored by
+   the Lambda adapter; setting it here has no effect.
 
 2. **VPC Configuration**: Place Lambda in the same VPC as RDS
 

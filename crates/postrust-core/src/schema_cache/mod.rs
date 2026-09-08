@@ -495,6 +495,32 @@ impl SchemaCache {
             matches.retain(|r| r.is_self_referential() || r.matches_hint(hint));
         }
 
+        // The order the candidates are reported in is part of the answer: it
+        // is what `details` lists and what the `hint` names as alternatives.
+        // Loading them in a fixed order makes it reproducible; this makes it
+        // PostgREST's.
+        //
+        // Inferred from every ambiguity its own suite covers, which agree on
+        // cardinality first and the relationship's own name to break a tie --
+        // `/agents?select=*,departments(*)` reports the one-to-many before the
+        // many-to-one, and `/sites?select=*,big_projects(*)` the many-to-one
+        // before the many-to-many. Where one-to-one sorts against the others
+        // no case says, and this is a guess: no ambiguity in the corpus mixes
+        // it with another cardinality.
+        matches.sort_by(|a, b| {
+            fn rank(name: &str) -> u8 {
+                match name {
+                    "one-to-many" => 0,
+                    "one-to-one" => 1,
+                    "many-to-one" => 2,
+                    _ => 3,
+                }
+            }
+            rank(a.cardinality_name())
+                .cmp(&rank(b.cardinality_name()))
+                .then_with(|| a.describe().cmp(&b.describe()))
+        });
+
         match matches.len() {
             0 => Ok(None),
             1 => Ok(Some(matches[0])),

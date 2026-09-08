@@ -389,6 +389,37 @@ impl axum::serve::Listener for LenientListener {
     }
 }
 
+/// The same leniency over a Unix domain socket, for `server_unix_socket`.
+///
+/// A request arriving over a socket goes through the same URI parser as one
+/// arriving over TCP, so it needs the same treatment; serving the socket with
+/// a plain `UnixListener` would make the two transports disagree about which
+/// request targets are acceptable.
+#[cfg(unix)]
+pub struct LenientUnixListener(pub tokio::net::UnixListener);
+
+#[cfg(unix)]
+impl axum::serve::Listener for LenientUnixListener {
+    type Io = LenientStream<tokio::net::UnixStream>;
+    type Addr = tokio::net::unix::SocketAddr;
+
+    async fn accept(&mut self) -> (Self::Io, Self::Addr) {
+        loop {
+            match self.0.accept().await {
+                Ok((stream, addr)) => return (LenientStream::new(stream), addr),
+                Err(e) => {
+                    tracing::debug!("accept failed: {e}");
+                    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                }
+            }
+        }
+    }
+
+    fn local_addr(&self) -> io::Result<Self::Addr> {
+        self.0.local_addr()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

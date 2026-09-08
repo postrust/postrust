@@ -2,13 +2,17 @@
 
 mod cert_store;
 pub(crate) mod server;
+mod sni;
 mod validate;
 
 #[cfg(feature = "acme")]
 mod acme;
 
 pub use cert_store::{Certificate, CertificateStore};
-pub use server::{build_server_config, load_server_config, ALPN_PROTOCOLS};
+pub use server::{
+    build_server_config, build_server_config_with_resolver, load_server_config, ALPN_PROTOCOLS,
+};
+pub use sni::SniCertResolver;
 pub use validate::{expiry_of, facts, validate_for_domain, CertificateFacts};
 
 #[cfg(feature = "acme")]

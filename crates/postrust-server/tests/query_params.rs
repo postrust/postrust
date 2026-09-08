@@ -41,7 +41,16 @@ async fn test_app_with_max_rows(max_rows: i64) -> Router {
     build_app(Some(max_rows)).await
 }
 
+/// Build the REST router with a request-body ceiling (`PGRST_MAX_BODY_SIZE`).
+async fn test_app_with_max_body(max_body_size: usize) -> Router {
+    build_app_with(None, Some(max_body_size)).await
+}
+
 async fn build_app(max_rows: Option<i64>) -> Router {
+    build_app_with(max_rows, None).await
+}
+
+async fn build_app_with(max_rows: Option<i64>, max_body_size: Option<usize>) -> Router {
     let db_uri = database_url();
 
     let pool = PgPoolOptions::new()
@@ -55,6 +64,7 @@ async fn build_app(max_rows: Option<i64>) -> Router {
         db_schemas: vec!["public".to_string()],
         db_anon_role: Some(ANON_ROLE.to_string()),
         db_max_rows: max_rows,
+        max_body_size: max_body_size.unwrap_or(AppConfig::default().max_body_size),
         ..AppConfig::default()
     };
 
@@ -75,6 +85,8 @@ async fn build_app(max_rows: Option<i64>) -> Router {
         schema_cache: RwLock::new(schema_cache),
         config,
         jwt_config,
+        // Uncached, so a test sees each request validated as it was written.
+        jwt_cache: None,
     });
 
     let api_router: Router<Arc<AppState>> = Router::new()
@@ -763,4 +775,105 @@ async fn embedded_key_order_matches_the_build() {
     } else {
         assert_eq!(keys, vec!["id", "title"]);
     }
+}
+
+// ===========================================================================
+// request body size
+// ===========================================================================
+
+#[tokio::test]
+#[ignore = "requires PostgreSQL"]
+async fn a_body_over_the_configured_maximum_is_refused() {
+    // The regression this guards: the limit was a 10 MiB constant inside the
+    // handler, so `PGRST_MAX_BODY_SIZE` configured nothing. `DefaultBodyLimit`
+    // does not reach this path either -- the handler takes the whole `Request`
+    // rather than a body extractor -- so only reading the config value here
+    // makes the option real.
+    let app = test_app_with_max_body(256).await;
+
+    let oversized = serde_json::to_vec(&serde_json::json!({
+        "name": "x".repeat(4096),
+        "price": 1,
+    }))
+    .unwrap();
+    assert!(oversized.len() > 256, "the body must exceed the limit");
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/products")
+                .header("content-type", "application/json")
+                .body(Body::from(oversized))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    let status = response.status();
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let text = String::from_utf8_lossy(&body).to_string();
+
+    // Asserting only on a 4xx is not enough: an oversized insert is refused
+    // for other reasons too, so such a test passes just as happily with the
+    // limit ignored. The body has to say it was the *size*.
+    assert!(
+        status.is_client_error(),
+        "an oversized body should be refused, got {status}"
+    );
+    assert!(
+        text.contains("length limit exceeded"),
+        "the refusal should be about the body size, got {status}: {text}"
+    );
+}
+
+#[tokio::test]
+#[ignore = "requires PostgreSQL"]
+async fn a_body_under_the_configured_maximum_is_read() {
+    // The limit must not be so eager that it refuses a body it should accept:
+    // a test that only checks the refusal passes just as well when everything
+    // is rejected.
+    let app = test_app_with_max_body(1024).await;
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/products")
+                .header("content-type", "application/json")
+                .header("prefer", "return=representation")
+                .body(Body::from(
+                    serde_json::to_vec(&serde_json::json!({
+                        "name": "small",
+                        "price": 1,
+                        "stock": 1,
+                        "category": "test",
+                        "is_active": true,
+                    }))
+                    .unwrap(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    // Whatever the database makes of it, the body itself was read rather than
+    // refused for its size.
+    assert_ne!(
+        response.status(),
+        StatusCode::PAYLOAD_TOO_LARGE,
+        "a body inside the limit must not be refused for its size"
+    );
+    assert!(
+        response.status() != StatusCode::BAD_REQUEST || {
+            let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            let text = String::from_utf8_lossy(&body);
+            !text.contains("length limit exceeded")
+        },
+        "a body inside the limit must not be refused for its size"
+    );
 }

@@ -19,6 +19,44 @@ use crate::error::{Error, Result};
 use crate::schema_cache::{Relationship, SchemaCache, Table};
 use std::collections::HashMap;
 
+/// How an embedded row or array is rendered.
+///
+/// **`jsonb` reorders keys.** It sorts them by length and then bytewise,
+/// inside PostgreSQL -- `SELECT row_to_json(t)::jsonb FROM (SELECT 1 AS aaa,
+/// 2 AS zz) t` gives `{"zz": 2, "aaa": 1}` -- so the order the columns were
+/// selected in is gone before the row reaches this process, and nothing on
+/// the Rust side can put it back. It also regularises the spacing that `json`
+/// keeps verbatim.
+///
+/// Both behaviours are wanted, in different places, which is why this is a
+/// choice made per query rather than a constant.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum EmbedRendering {
+    /// `json`. The row is written exactly as `row_to_json` produced it, so the
+    /// columns stay in the order they were selected. This is what an embedded
+    /// resource in a JSON body wants, and what PostgREST itself emits there.
+    Verbatim,
+    /// `jsonb`. PostgreSQL normalises the text.
+    ///
+    /// Only needed where the embedded value is rendered *as text* rather than
+    /// as part of a JSON body: a schema-declared media handler that
+    /// stringifies a whole row renders each column's text, and a `json` column
+    /// renders verbatim where PostgREST's `jsonb` one renders normalised --
+    /// `{"id":1}` against `{"id": 1}`. Measured: it is the only difference
+    /// between the two in PostgREST's whole corpus.
+    Normalised,
+}
+
+impl EmbedRendering {
+    /// The SQL cast this rendering needs.
+    fn cast(self) -> &'static str {
+        match self {
+            Self::Verbatim => "::json",
+            Self::Normalised => "::jsonb",
+        }
+    }
+}
+
 /// Everything needed to fetch one relationship's rows for a set of parents.
 #[derive(Clone, Debug)]
 pub struct EmbedPlan {
@@ -489,6 +527,7 @@ impl EmbedPlan {
         child_where: Option<&str>,
         order_by: Option<&str>,
         function_arguments: Option<&str>,
+        rendering: EmbedRendering,
     ) -> Result<String> {
         let inner = self.correlated_rows(
             parent_alias,
@@ -504,24 +543,21 @@ impl EmbedPlan {
 
         let alias = postrust_sql::escape_ident(&format!("{}_j", child_alias));
 
-        // Cast to `jsonb`, as PostgREST does -- `COALESCE(json_agg(..),'[]')::jsonb`.
-        // Only visible where an embedded row is rendered as text rather than
-        // as part of a JSON body: `jsonb` normalises what `json` keeps
-        // verbatim, so a schema-declared handler that stringifies the whole
-        // row wrote `{"id":1}` where PostgREST wrote `{"id": 1}`.
         Ok(if self.is_list {
             // An empty array rather than null, so the shape does not depend on
             // whether the parent happens to have children.
             format!(
-                "COALESCE((SELECT json_agg(row_to_json({alias})) FROM ({inner}) {alias}), '[]'::json)::jsonb",
+                "COALESCE((SELECT json_agg(row_to_json({alias})) FROM ({inner}) {alias}), '[]'::json){cast}",
                 alias = alias,
-                inner = inner
+                inner = inner,
+                cast = rendering.cast()
             )
         } else {
             format!(
-                "(SELECT row_to_json({alias}) FROM ({inner}) {alias})::jsonb",
+                "(SELECT row_to_json({alias}) FROM ({inner}) {alias}){cast}",
                 alias = alias,
-                inner = inner
+                inner = inner,
+                cast = rendering.cast()
             )
         })
     }
@@ -556,6 +592,7 @@ impl EmbedPlan {
         // being summarised rather than to the summary: counting the distinct
         // titles means counting the rows that survive it.
         distinct_on: &str,
+        rendering: EmbedRendering,
     ) -> Result<String> {
         let child = postrust_sql::escape_ident(child_alias);
         let rows = self.correlated_rows(
@@ -572,11 +609,12 @@ impl EmbedPlan {
         let alias = postrust_sql::escape_ident(&format!("{}_a", child_alias));
         Ok(format!(
             "(SELECT row_to_json({alias}) FROM \
-             (SELECT {select} FROM ({rows}) AS {child}) {alias})::jsonb",
+             (SELECT {select} FROM ({rows}) AS {child}) {alias}){cast}",
             alias = alias,
             select = aggregate_select,
             rows = rows,
-            child = child
+            child = child,
+            cast = rendering.cast()
         ))
     }
 
@@ -930,6 +968,7 @@ mod tests {
                 None,
                 None,
                 None,
+                EmbedRendering::Verbatim,
             )
             .unwrap();
 
@@ -950,7 +989,18 @@ mod tests {
     #[test]
     fn embed_expression_takes_one_row_for_a_to_one_relation() {
         let sql = plan(false)
-            .embed_expression("p", "\"p\"", "author", r#""id""#, None, 0, None, None, None)
+            .embed_expression(
+                "p",
+                "\"p\"",
+                "author",
+                r#""id""#,
+                None,
+                0,
+                None,
+                None,
+                None,
+                EmbedRendering::Verbatim,
+            )
             .unwrap();
 
         assert!(sql.contains("row_to_json"), "{}", sql);
@@ -975,6 +1025,7 @@ mod tests {
                 None,
                 None,
                 None,
+                EmbedRendering::Verbatim,
             )
             .unwrap();
         assert!(sql.contains("LIMIT 25"), "{}", sql);

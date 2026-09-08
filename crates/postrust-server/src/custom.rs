@@ -25,6 +25,21 @@ pub fn custom_router() -> Router<Arc<AppState>> {
     // .route("/email/send", post(send_email))
 }
 
+/// Build the router served on `admin_server_port`.
+///
+/// Liveness and readiness only. The point of a separate port is that it can be
+/// reachable from an orchestrator without the API being reachable from the same
+/// place, so nothing that reads or writes data belongs here.
+///
+/// `/live` and `/ready` are the names PostgREST's admin server uses; `/health`
+/// is the same answer as `/live` under the name the main API already serves.
+pub fn admin_router() -> Router<Arc<AppState>> {
+    Router::new()
+        .route("/live", get(health_check))
+        .route("/health", get(health_check))
+        .route("/ready", get(readiness_check))
+}
+
 // =============================================================================
 // Health & Readiness
 // =============================================================================
