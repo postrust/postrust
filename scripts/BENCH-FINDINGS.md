@@ -1,11 +1,214 @@
 # Benchmark findings
 
-What the comparison benchmark has been measuring, and why its numbers are not
-currently publishable. Newest first.
+What the comparison benchmark has been measuring, and what had to change before
+its numbers could be published. Newest first.
+
+## The drift does not reproduce on bare metal, and the gate now proves it
+
+**Status: resolved by changing the host. Numbers published.**
+
+The open item below -- throughput depending on when in a run it was sampled --
+does not occur on a dedicated bare-metal host with each component pinned to its
+own CCD. The same measurement, taken as the first and then as the last action
+of a full four-server run:
+
+| run | first | last | drift |
+|---|---|---|---|
+| debian 1 | 44163 rps | 44169 rps | 0.0% |
+| debian 2 | 44490 rps | 44559 rps | 0.2% |
+| debian 3 | 44186 rps | 44132 rps | 0.1% |
+| alpine | 43727 rps | 43179 rps | 1.3% |
+
+Those are within-run figures. The same measurement *across* the three debian
+runs read 44163, 44490 and 44186 -- a 0.7% spread between independent runs of
+the whole harness, against the 1.25x-1.39x run-to-run spread the previous host
+produced.
+
+That comparison is now a permanent part of the harness rather than something
+done by hand. `bench-compare.sh` repeats its first measurement at the end of
+the run and exits non-zero if the two disagree by more than
+`GATE_THRESHOLD_PCT` (default 3). The results file is still written, because it
+is needed to diagnose a failure, but a drifted run cannot be mistaken for a
+publishable one.
+
+This gate exists because `REPEATS` could never have caught the original
+problem. `measure_median` runs its repeats back to back, so all of them sit in
+the same state and agree with each other while being equally wrong -- the
+failure mode the note further down describes as "a systematic bias reproduces
+perfectly and reads as precision".
+
+Throughput on the new host is roughly four times what the virtualised host
+reported (44163 rps against 6212-13000 for the same scenario). That is not a
+change in the software. Nothing in this repository was made faster; the
+instrument stopped losing most of the signal.
+
+The clock was sampled for the length of the run rather than checked before it.
+Across 843 `turbostat` samples taken while the machine was loaded, `Bzy_MHz`
+spanned 4294-4329 -- a 0.82% spread. A ramping clock, which is the leading
+hypothesis for the old drift, would have shown as a trend across those samples.
+
+### What actually changed
+
+- Dedicated bare metal (AMD EPYC 9255, 24 cores, single socket), confirmed with
+  `systemd-detect-virt` returning `none`, rather than Docker Desktop on WSL2.
+- SMT off, so two components pinned to "different CPUs" cannot share a core.
+- One CCD per component -- database on 0-5, server under test on 6-11, load
+  generator on 12-17, everything else on 18-23 -- so no two of them share a
+  32 MB L3 slice. Every target gets the identical `CPUSET_SERVER`.
+- `docker-proxy` disabled, removing an unpinned userspace process from the
+  request path.
+
+## The alpine variant moves the other tools, and it should not
+
+**Status: open. One run each. No alpine throughput figure is published.**
+
+`VARIANT=alpine` is meant to answer "how big is the alpine image, and does the
+musl build cost anything". It changes more than that: the PostgreSQL image
+(`postgres:16` to `postgres:16.11-alpine`) and the PostGraphile base
+(`node:22` to `node:22-alpine`) as well as the Postrust image. PostgREST and
+Hasura run **byte-identical images in both variants** -- their image tags are
+not variant-dependent.
+
+Yet, alpine against debian:
+
+| target | image changed? | change |
+|---|---|---|
+| postrust | yes (musl) | +2% to +33% |
+| hasura | **no** | +1.4% to +2.2% |
+| postgraphile | yes (musl node) | -15% to -17% |
+| postgrest | **no** | **-27% to -38%** |
+
+postrust improving and PostGraphile losing ~15% are both readable -- a musl
+build is a real change. PostgREST is not. Its container is identical, so the
+only thing that moved underneath it is the database image, and Hasura saw that
+same database move and stayed flat.
+
+Candidate explanations, none established:
+
+- PostgREST noise. Its measured run-to-run spread is already 19.6% (below), the
+  widest of the four. -37% is more than that, but not a different universe.
+- The alpine PostgreSQL penalising PostgREST's query shapes specifically.
+  Hasura's flatness argues against a general database slowdown, but the two
+  tools are measured on different surfaces with different queries.
+
+Separating those needs a second alpine run, which has not been done. Until it
+is, alpine is used **only** for image size and memory, which is what it was
+added for. `gen-measured.mjs` takes request figures from the first results file
+only, so no alpine throughput number reaches the website; the guard is
+structural rather than a matter of remembering.
+
+## PostgREST's own run-to-run spread is an order of magnitude wider than the others'
+
+**Status: measured across two full runs. A caveat on the PostgREST ratios, not
+a fault in the harness.**
+
+Three complete debian runs, same host, same pinning, same configuration. Spread
+between the highest and lowest reading of each scenario:
+
+| target | worst scenario | mean |
+|---|---|---|
+| postrust | 0.8% | 0.5% |
+| postgraphile | 3.0% | 1.8% |
+| hasura | 3.6% | 2.6% |
+| **postgrest** | **19.6%** | **6.8%** |
+
+Two PostgREST scenarios account for it. Point lookup read 9136, 10747, 10931 --
+the first run is the outlier and the second and third agree to 1.7%, so that one
+looks like a single bad sample rather than continuing instability. Range filter
+read 6526, 7140, 6890: 9.4% with no outlier to blame. The remaining three
+scenarios are inside 3%.
+
+This is the tool, not the machine. postrust was measured seconds either side of
+those same PostgREST samples and held to 0.7%, and the self-consistency gate
+passed on both runs. A machine that drifted would have moved everything.
+
+Two consequences, both stated wherever PostgREST figures appear:
+
+- A single run establishes the PostgREST ratios to roughly +/-10%, where
+  postrust reaches 1% and the two GraphQL servers 3%. The *direction* of the
+  differences is far outside that margin -- postrust leads PostgREST by 3x to
+  9x depending on scenario -- but the precise multiples are not, and are not
+  quoted to more precision than they carry.
+- **The gate does not cover this.** It repeats the first measurement of the run,
+  which is one scenario on one target, and so it answers "did the machine hold
+  still" -- not "is each target individually reproducible". Extending it to
+  re-measure every target at the end would turn this into something the harness
+  reports on every run rather than something noticed by comparing two of them.
+  That change is not made here, because it has not been exercised.
+
+## The platform firmware ignores every OS frequency request
+
+**Status: understood, worked around by measuring rather than assuming.**
+
+The plan was to pin the CPU to its base clock, on the reasoning that base is
+the only clock a vendor guarantees and therefore the only one that reproduces
+elsewhere. On this host that is not possible: the BIOS owns P-states and
+discards what the OS asks for.
+
+The kernel accepts the request and reports success. `scaling_max_freq` drops to
+`3200000` and `cpuinfo_max_freq` follows. The hardware carries on at 4317 MHz.
+
+Caught by timing a fixed quantity of work rather than by reading a sysfs file
+back:
+
+| cap requested | `scaling_max_freq` | wall time |
+|---|---|---|
+| none (boost on) | 4317461 | 1965 / 1904 / 1903 ms |
+| base, boost off | 3200000 | 1912 / 1912 / 1940 ms |
+| 2.0 GHz | 2000000 | 1938 / 1956 ms |
+
+Identical to within noise across a 2.2x range of requested caps, and
+`turbostat` -- which reads APERF/MPERF, the hardware's own account -- reports
+4317 MHz throughout.
+
+The consequence is benign but has to be stated: the clock **is** fixed, which is
+what the benchmark actually needs, but it is fixed at the firmware's chosen
+value and not at base. Absolute figures therefore carry this machine's BIOS
+profile with them and will not reproduce on different firmware. The ratios
+between the four servers do not depend on it.
+
+The general lesson is that writing a sysfs file is not evidence that anything
+changed. Every control in `docs/benchmarking.md` is now paired with a
+measurement that would fail if the control did not take.
+
+## Docker costs 8.6%, and almost all of it is the network path
+
+**Status: measured. Kept, because it is charged to every target equally.**
+
+Running every server in a container is deliberate -- it stops any one of them
+getting a native-vs-container advantage -- but the size of that charge had
+never been established. Same binary, same database, same fixtures, same
+cpusets, same generator, only the packaging changing:
+
+| | point lookup |
+|---|---|
+| A both containers on a bridge, via the published port | 44496 rps |
+| B the same containers with `--network host` | 48013 rps |
+| C the native binary, host-networked database | 48684 rps |
+
+- A -> B **7.3%**: veth, the bridge, NAT.
+- B -> C **1.4%**: seccomp, cgroups, overlayfs. Essentially nothing.
+- A -> C **8.6%** total.
+
+So the container is nearly free and the *network plumbing* is not. Ratios are
+unaffected; absolute figures are understated by about 8.6% against the same
+binary run natively, and that is now stated wherever they are published.
+
+Disabling `docker-proxy` (`"userland-proxy": false`) was part of this work and
+is a measurement-integrity fix rather than a tuning choice: it is a userspace
+relay, one process per published port, in the request path, and covered by no
+`--cpuset-cpus` -- so it lands wherever the scheduler puts it, including on the
+cores pinned to the database or the server under test. Removing it recovered
+3.2 points (43130 -> 44496 rps) and left B and C unchanged, which is the check
+that it touched only the path it was meant to.
 
 ## The measured throughput depends on when in a run it is taken
 
-**Status: reproduced, mechanism not identified. Numbers withheld.**
+**Status: superseded. Was: reproduced on the virtualised host, mechanism never
+identified. Does not reproduce on bare metal -- see the entry at the top. The
+mechanism is still unidentified; it was escaped rather than explained, and the
+gate is what stops it returning unnoticed. The investigation is kept because
+the things it ruled out are still ruled out.**
 
 The same server, in the same container, measured seconds apart, differs by
 about a factor of two:

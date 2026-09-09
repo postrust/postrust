@@ -2,6 +2,7 @@ import { component$ } from "@builder.io/qwik";
 import type { DocumentHead } from "@builder.io/qwik-city";
 import { HeroSection } from "~/components/sections/hero";
 import { FeaturesSection } from "~/components/sections/features";
+import { PerformanceSection } from "~/components/sections/performance";
 import { CodeExamplesSection } from "~/components/sections/code-examples";
 import { SaasStarterSection } from "~/components/sections/saas-starter";
 import { DeploymentSection } from "~/components/sections/deployment";
@@ -12,6 +13,7 @@ export default component$(() => {
     <>
       <HeroSection />
       <FeaturesSection />
+      <PerformanceSection />
       <CodeExamplesSection />
       <SaasStarterSection />
       <DeploymentSection />

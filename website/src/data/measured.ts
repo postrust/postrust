@@ -6,8 +6,12 @@
 //   node scripts/gen-measured.mjs <results.json> [...]
 //
 // Measured on:
-//   debian variant -- Darwin 25.2.0 arm64, postgres:16, 3000 requests at concurrency 50
-//   alpine variant -- Darwin 25.2.0 arm64, postgres:16.11-alpine, 3000 requests at concurrency 50
+//   debian variant -- AMD EPYC 9255 24-Core Processor, postgres:16, 30000 requests at concurrency 50
+//     governor=performance boost_sysfs=0 smt=off online=0-23
+//     self-consistency: pass (0.1% drift over the run)
+//   alpine variant -- AMD EPYC 9255 24-Core Processor, postgres:16.11-alpine, 30000 requests at concurrency 50
+//     governor=performance boost=0 smt=off online=0-23
+//     self-consistency: pass (1.3% drift over the run)
 
 export interface Point {
   rps: number;
@@ -24,14 +28,33 @@ export interface MeasuredRow {
 }
 
 export const benchMeta = {
-  host: "Darwin 25.2.0 arm64",
+  host: "Linux 7.0.0-30-generic x86_64",
   postgres: "postgres:16",
   dataset: "bench_items 100000 rows, bench_reviews 300000 rows",
-  requests: 3000,
+  requests: 30000,
   concurrency: 50,
-  repeats: 5,
+  repeats: 3,
   warmup: 500,
   variant: "debian",
+  /** The CPU, and the state it was held in. A throughput figure without these is not reproducible. */
+  cpu: "AMD EPYC 9255 24-Core Processor",
+  cpuState: "governor=performance boost_sysfs=0 smt=off online=0-23",
+  /** Which cores each component was confined to, so none of them shared an L3 slice. */
+  pinning: { db: "0-5", server: "6-11", load: "12-17" },
+  /**
+   * The first measurement of the run, repeated as its last action. A run whose
+   * two readings disagree did not hold still, and nothing measured in between
+   * is comparable across targets.
+   */
+  selfConsistency: {
+    scenario: "point lookup",
+    target: "postrust",
+    first_rps: 44186,
+    last_rps: 44132,
+    drift_pct: 0.1,
+    threshold_pct: 3,
+    status: "pass",
+  },
 } as const;
 
 export interface VariantImages {
@@ -61,31 +84,31 @@ export const variantImages: Record<string, VariantImages> = {
     images: {
       postrust: {
         image: "postrust:bench-debian",
-        onDisk: "168MB",
-        layerBytes: 36898663,
-        rssIdleKb: 1968,
-        rssAfterKb: 15155,
+        onDisk: "149MB",
+        layerBytes: 148824698,
+        rssIdleKb: 3476,
+        rssAfterKb: 17162,
       },
       postgrest: {
         image: "postgrest/postgrest:v16.1",
-        onDisk: "26.8MB",
-        layerBytes: 6433834,
-        rssIdleKb: 18729,
-        rssAfterKb: 59443,
+        onDisk: "27MB",
+        layerBytes: 27028137,
+        rssIdleKb: 5336,
+        rssAfterKb: 56678,
       },
       hasura: {
-        image: "hasura/graphql-engine:v2.44.0",
-        onDisk: "711MB",
-        layerBytes: 159655847,
-        rssIdleKb: 171930,
-        rssAfterKb: 203674,
+        image: "hasura/graphql-engine:v2.50.1",
+        onDisk: "602MB",
+        layerBytes: 601716825,
+        rssIdleKb: 172851,
+        rssAfterKb: 203469,
       },
       postgraphile: {
         image: "postgraphile:bench-debian",
-        onDisk: "2.27GB",
-        layerBytes: 540044768,
-        rssIdleKb: 112742,
-        rssAfterKb: 247910,
+        onDisk: "2.29GB",
+        layerBytes: 2285948897,
+        rssIdleKb: 55921,
+        rssAfterKb: 221798,
       },
     },
   },
@@ -94,31 +117,31 @@ export const variantImages: Record<string, VariantImages> = {
     images: {
       postrust: {
         image: "postrust:bench-alpine",
-        onDisk: "31.7MB",
-        layerBytes: 9791771,
-        rssIdleKb: 3844,
-        rssAfterKb: 28447,
+        onDisk: "34.9MB",
+        layerBytes: 34905595,
+        rssIdleKb: 2816,
+        rssAfterKb: 22159,
       },
       postgrest: {
         image: "postgrest/postgrest:v16.1",
-        onDisk: "26.8MB",
-        layerBytes: 6433834,
-        rssIdleKb: 18739,
-        rssAfterKb: 53709,
+        onDisk: "27MB",
+        layerBytes: 27028137,
+        rssIdleKb: 5484,
+        rssAfterKb: 54753,
       },
       hasura: {
-        image: "hasura/graphql-engine:v2.44.0",
-        onDisk: "711MB",
-        layerBytes: 159655847,
-        rssIdleKb: 170803,
-        rssAfterKb: 200602,
+        image: "hasura/graphql-engine:v2.50.1",
+        onDisk: "602MB",
+        layerBytes: 601716825,
+        rssIdleKb: 166400,
+        rssAfterKb: 208998,
       },
       postgraphile: {
         image: "postgraphile:bench-alpine",
-        onDisk: "886MB",
-        layerBytes: 198538661,
-        rssIdleKb: 116326,
-        rssAfterKb: 212582,
+        onDisk: "893MB",
+        layerBytes: 893407044,
+        rssIdleKb: 52972,
+        rssAfterKb: 104038,
       },
     },
   },
@@ -133,76 +156,76 @@ const measured: Record<
       {
         scenario: "point lookup",
         postrust: {
-          rps: 14479,
-          p50_ms: 3.2,
-          p95_ms: 4.7,
-          p99_ms: 7.6,
+          rps: 44186,
+          p50_ms: 1.1,
+          p95_ms: 1.1,
+          p99_ms: 1.2,
         },
         other: {
-          rps: 4323,
-          p50_ms: 8.8,
-          p95_ms: 31.1,
-          p99_ms: 46,
+          rps: 10931,
+          p50_ms: 2.9,
+          p95_ms: 11.3,
+          p99_ms: 25.6,
         },
       },
       {
         scenario: "25-row page",
         postrust: {
-          rps: 13800,
-          p50_ms: 3.5,
-          p95_ms: 4.4,
-          p99_ms: 5,
+          rps: 34541,
+          p50_ms: 1.4,
+          p95_ms: 1.5,
+          p99_ms: 1.6,
         },
         other: {
-          rps: 4152,
-          p50_ms: 8.7,
-          p95_ms: 34.2,
-          p99_ms: 57.3,
+          rps: 10726,
+          p50_ms: 3.5,
+          p95_ms: 10.7,
+          p99_ms: 14.9,
         },
       },
       {
         scenario: "filtered + ordered page",
         postrust: {
-          rps: 11292,
-          p50_ms: 4.3,
-          p95_ms: 5.2,
-          p99_ms: 6,
+          rps: 32671,
+          p50_ms: 1.5,
+          p95_ms: 1.6,
+          p99_ms: 1.6,
         },
         other: {
-          rps: 7392,
-          p50_ms: 6,
-          p95_ms: 10,
-          p99_ms: 14.7,
+          rps: 6208,
+          p50_ms: 6.9,
+          p95_ms: 16.7,
+          p99_ms: 22.9,
         },
       },
       {
         scenario: "range filter on numeric",
         postrust: {
-          rps: 10892,
-          p50_ms: 4.4,
-          p95_ms: 5.5,
-          p99_ms: 6.9,
+          rps: 30691,
+          p50_ms: 1.6,
+          p95_ms: 1.7,
+          p99_ms: 1.7,
         },
         other: {
-          rps: 7851,
-          p50_ms: 5.3,
-          p95_ms: 10.9,
-          p99_ms: 28.7,
+          rps: 6890,
+          p50_ms: 6.1,
+          p95_ms: 15.3,
+          p99_ms: 21.1,
         },
       },
       {
         scenario: "25-row page + embed",
         postrust: {
-          rps: 9488,
-          p50_ms: 5.1,
-          p95_ms: 5.9,
-          p99_ms: 6.8,
+          rps: 20100,
+          p50_ms: 2.4,
+          p95_ms: 2.7,
+          p99_ms: 2.7,
         },
         other: {
-          rps: 6005,
-          p50_ms: 7.5,
-          p95_ms: 12.2,
-          p99_ms: 18,
+          rps: 2151,
+          p50_ms: 16.9,
+          p95_ms: 64.1,
+          p99_ms: 100.9,
         },
       },
     ],
@@ -214,46 +237,46 @@ const measured: Record<
       {
         scenario: "single row by primary key",
         postrust: {
-          rps: 12440,
-          p50_ms: 3.8,
-          p95_ms: 5.1,
-          p99_ms: 6.1,
+          rps: 31997,
+          p50_ms: 1.5,
+          p95_ms: 1.6,
+          p99_ms: 1.7,
         },
         other: {
-          rps: 4535,
-          p50_ms: 9.2,
-          p95_ms: 44,
-          p99_ms: 59.9,
+          rps: 9618,
+          p50_ms: 5.1,
+          p95_ms: 6,
+          p99_ms: 8.6,
         },
       },
       {
         scenario: "25-row page",
         postrust: {
-          rps: 8477,
-          p50_ms: 5.7,
-          p95_ms: 7,
-          p99_ms: 7.9,
+          rps: 17422,
+          p50_ms: 2.8,
+          p95_ms: 3.1,
+          p99_ms: 3.2,
         },
         other: {
-          rps: 4907,
-          p50_ms: 10.7,
-          p95_ms: 17.4,
-          p99_ms: 26.7,
+          rps: 10552,
+          p50_ms: 4.6,
+          p95_ms: 5.4,
+          p99_ms: 7.9,
         },
       },
       {
         scenario: "25-row page + embed",
         postrust: {
-          rps: 5193,
-          p50_ms: 9.5,
-          p95_ms: 11.4,
-          p99_ms: 12.1,
+          rps: 10096,
+          p50_ms: 4.9,
+          p95_ms: 5.3,
+          p99_ms: 5.5,
         },
         other: {
-          rps: 3588,
-          p50_ms: 14.8,
-          p95_ms: 20,
-          p99_ms: 32.5,
+          rps: 8133,
+          p50_ms: 6.1,
+          p95_ms: 9,
+          p99_ms: 14,
         },
       },
     ],
@@ -264,46 +287,46 @@ const measured: Record<
       {
         scenario: "single row by primary key",
         postrust: {
-          rps: 12440,
-          p50_ms: 3.8,
-          p95_ms: 5.1,
-          p99_ms: 6.1,
+          rps: 31997,
+          p50_ms: 1.5,
+          p95_ms: 1.6,
+          p99_ms: 1.7,
         },
         other: {
-          rps: 10231,
-          p50_ms: 4.6,
-          p95_ms: 6.7,
-          p99_ms: 10.4,
+          rps: 14310,
+          p50_ms: 3.2,
+          p95_ms: 4,
+          p99_ms: 4.7,
         },
       },
       {
         scenario: "25-row page",
         postrust: {
-          rps: 8477,
-          p50_ms: 5.7,
-          p95_ms: 7,
-          p99_ms: 7.9,
+          rps: 17422,
+          p50_ms: 2.8,
+          p95_ms: 3.1,
+          p99_ms: 3.2,
         },
         other: {
-          rps: 6593,
-          p50_ms: 7.2,
-          p95_ms: 10.2,
-          p99_ms: 19.7,
+          rps: 9298,
+          p50_ms: 5.4,
+          p95_ms: 5.7,
+          p99_ms: 6.7,
         },
       },
       {
         scenario: "25-row page + embed",
         postrust: {
-          rps: 5193,
-          p50_ms: 9.5,
-          p95_ms: 11.4,
-          p99_ms: 12.1,
+          rps: 10096,
+          p50_ms: 4.9,
+          p95_ms: 5.3,
+          p99_ms: 5.5,
         },
         other: {
-          rps: 3495,
-          p50_ms: 14,
-          p95_ms: 16.5,
-          p99_ms: 31,
+          rps: 4613,
+          p50_ms: 10.7,
+          p95_ms: 11.2,
+          p99_ms: 12.5,
         },
       },
     ],
@@ -367,6 +390,6 @@ export function footprintFor(slug: string): FootprintRow[] {
 
 /** Every variant's Postrust image size, for the note under the table. */
 export const postrustImages: Record<string, string> = {
-  debian: "168MB",
-  alpine: "31.7MB",
+  debian: "149MB",
+  alpine: "34.9MB",
 };
