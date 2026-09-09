@@ -14,6 +14,11 @@ concurrency:
 env:
   REGISTRY: ghcr.io
   IMAGE_NAME: ${{ github.repository }}
+  # docs/deployment.md, charts/postrust/values.yaml and the website all tell
+  # people to run `postrust/postrust`, which is Docker Hub. Until this was
+  # added nothing published there, so every one of those instructions was
+  # wrong -- `helm install` could not pull its own default image.
+  DOCKERHUB_IMAGE: postrust/postrust
 
 jobs:
   crates:
@@ -79,11 +84,32 @@ jobs:
           done
 
   image:
-    name: Build & publish container image
+    name: Image (${{ matrix.variant }})
     runs-on: ubuntu-latest
     permissions:
-      contents: write # create the GitHub Release
-      packages: write # push to GHCR
+      contents: read
+      packages: write
+    env:
+      # Whether Docker Hub is configured, as a plain boolean. The `secrets`
+      # context is not dependably available in a step-level `if`, and the
+      # secret's *value* must never reach a `run:` command line even though
+      # Actions would mask it in the log.
+      HAS_DOCKERHUB: ${{ secrets.DOCKERHUB_TOKEN != '' }}
+    strategy:
+      # Publish whichever variant builds. One failing should not withhold the
+      # other from people who can use it.
+      fail-fast: false
+      matrix:
+        include:
+          - variant: debian
+            dockerfile: ./Dockerfile
+            flavor: ""
+          - variant: alpine
+            dockerfile: ./Dockerfile.alpine
+            # onlatest so the floating tag is `latest-alpine`, not `latest`.
+            # Without it both variants would race for `latest` and the winner
+            # would be whichever job finished second.
+            flavor: suffix=-alpine,onlatest=true
     steps:
       - uses: actions/checkout@v4
 
@@ -97,11 +123,26 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
+      # Optional, so a fork or a repository without the secrets still releases
+      # to GHCR instead of failing outright.
+      - name: Log in to Docker Hub
+        if: env.HAS_DOCKERHUB == 'true'
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
       - name: Derive image tags
         id: meta
         uses: docker/metadata-action@v5
         with:
-          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          # `enable=` drops the Docker Hub tags entirely when the secret is
+          # absent, so the same build pushes to one registry or two without a
+          # second build step.
+          images: |
+            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+            name=docker.io/${{ env.DOCKERHUB_IMAGE }},enable=${{ env.HAS_DOCKERHUB }}
+          flavor: ${{ matrix.flavor }}
           tags: |
             type=semver,pattern={{version}}
             type=semver,pattern={{major}}.{{minor}}
@@ -115,16 +156,75 @@ jobs:
         uses: docker/build-push-action@v6
         with:
           context: .
-          file: ./Dockerfile
+          file: ${{ matrix.dockerfile }}
           push: true
           platforms: linux/amd64
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+          cache-from: type=gha,scope=${{ matrix.variant }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.variant }}
 
+  # A push succeeding proves the workflow could write, not that anybody else
+  # can read. GHCR packages are private by default, which is a way for a
+  # release to go green while `docker pull` fails for every user. So the tags
+  # are pulled back with no credentials at all.
+  #
+  # Its own job, and not a gate on the release: by the time this runs the
+  # crates are already on crates.io, so withholding the GitHub Release would
+  # leave the worse mess. It fails loudly and separately instead.
+  verify:
+    name: Images are pullable by strangers
+    needs: image
+    if: github.ref_type == 'tag'
+    runs-on: ubuntu-latest
+    env:
+      HAS_DOCKERHUB: ${{ secrets.DOCKERHUB_TOKEN != '' }}
+    steps:
+      - name: Pull anonymously
+        run: |
+          set -uo pipefail
+          docker logout ghcr.io >/dev/null 2>&1 || true
+          docker logout >/dev/null 2>&1 || true
+
+          version="${GITHUB_REF_NAME#v}"
+          failed=0
+
+          check() {
+            local ref="$1"
+            if docker pull --quiet "$ref" >/dev/null 2>&1; then
+              echo "ok       $ref"
+            else
+              echo "::error::$ref is not pullable without credentials"
+              failed=1
+            fi
+          }
+
+          check "${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${version}"
+          check "${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${version}-alpine"
+
+          if [ "${HAS_DOCKERHUB}" = "true" ]; then
+            check "docker.io/${{ env.DOCKERHUB_IMAGE }}:${version}"
+            check "docker.io/${{ env.DOCKERHUB_IMAGE }}:${version}-alpine"
+          else
+            echo "::warning::DOCKERHUB_TOKEN is not set, so nothing was published to Docker Hub." \
+                 "docs/deployment.md and the Helm chart both default to postrust/postrust there."
+          fi
+
+          if [ "$failed" -ne 0 ]; then
+            echo "::error::Set the package visibility to Public: " \
+                 "https://github.com/orgs/postrust/packages/container/postrust/settings"
+            exit 1
+          fi
+
+  release:
+    name: GitHub Release
+    needs: image
+    if: github.ref_type == 'tag'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
       - name: Create GitHub Release
-        if: github.ref_type == 'tag'
         uses: softprops/action-gh-release@v2
         with:
           generate_release_notes: true
@@ -132,13 +232,25 @@ jobs:
           # these two, the release publishes as a normal one and GitHub shows it
           # as `Latest` -- so an alpha becomes what `releases/latest` returns and
           # what the repository front page offers. Both had to be corrected by
-          # hand after 1.0.0-alpha.1 shipped. Same test as the `latest` container
-          # tag below uses, and for the same reason.
+          # hand after 1.0.0-alpha.1 shipped. The `latest` container tag in the
+          # `image` job is gated on the same test, for the same reason.
           prerelease: ${{ contains(github.ref_name, '-') }}
           make_latest: ${{ !contains(github.ref_name, '-') }}
           body: |
-            Container image published to GHCR:
+            ## Container images
+
+            Two variants of the same build. The Alpine one is much smaller; the
+            Debian one is the default because it is the one the throughput
+            figures were measured on.
+
+            ```
+            docker pull ${{ env.DOCKERHUB_IMAGE }}:${{ github.ref_name }}
+            docker pull ${{ env.DOCKERHUB_IMAGE }}:${{ github.ref_name }}-alpine
+            ```
+
+            Or from GitHub Container Registry:
 
             ```
             docker pull ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ github.ref_name }}
+            docker pull ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ github.ref_name }}-alpine
             ```

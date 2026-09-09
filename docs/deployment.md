@@ -89,6 +89,23 @@ sudo systemctl status postrust
 
 ## Docker
 
+Two registries carry the same images, and two variants of each build:
+
+| | |
+|---|---|
+| `postrust/postrust:1.0.0` | Docker Hub, Debian base |
+| `postrust/postrust:1.0.0-alpine` | Docker Hub, Alpine base -- much smaller |
+| `ghcr.io/postrust/postrust:1.0.0` | GitHub Container Registry, Debian |
+| `ghcr.io/postrust/postrust:1.0.0-alpine` | GitHub Container Registry, Alpine |
+
+`latest` and `latest-alpine` track the newest stable release and never a
+prerelease. `1.0` follows the newest patch of that minor.
+
+Debian is the default because it is the variant the published throughput
+figures were measured on. The Alpine image is a musl build of the same source;
+prefer it where image size matters and test it before relying on it, since it
+is not the one the benchmark numbers describe.
+
 ### Using the Official Image
 
 ```bash
