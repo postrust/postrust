@@ -48,11 +48,15 @@ pub fn quote_literal(s: &str) -> String {
 /// Qualified identifier (schema.name).
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct QualifiedIdentifier {
+    /// The schema. Empty when the identifier is unqualified, in which case
+    /// resolution is left to the connection's `search_path`.
     pub schema: String,
+    /// The object's own name, unqualified and unquoted.
     pub name: String,
 }
 
 impl QualifiedIdentifier {
+    /// A `schema.name` identifier.
     pub fn new(schema: impl Into<String>, name: impl Into<String>) -> Self {
         Self {
             schema: schema.into(),
@@ -60,6 +64,10 @@ impl QualifiedIdentifier {
         }
     }
 
+    /// A bare `name`, to be resolved against the connection's `search_path`.
+    ///
+    /// Prefer [`new`](Self::new) wherever the schema is known: which object a
+    /// bare name reaches depends on session state rather than on the query.
     pub fn unqualified(name: impl Into<String>) -> Self {
         Self {
             schema: String::new(),

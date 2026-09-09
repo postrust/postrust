@@ -247,7 +247,10 @@ pub fn has_backend_only(names: &NameOverrides, role: &str) -> bool {
 /// unrestricted read: no permission document, or an administrator.
 #[derive(Clone, Copy)]
 pub struct Caller<'a> {
+    /// The role to narrow rows to. `None` is the unrestricted read.
     pub role: Option<&'a str>,
+    /// Session variables the permissions may refer to, such as
+    /// `x-hasura-user-id`.
     pub session: &'a std::collections::HashMap<String, String>,
 }
 
@@ -271,7 +274,12 @@ pub enum Fault {
     /// role's own schema, which has no such field -- so reaching it means
     /// something was built that should not have been, and the safe answer is
     /// to refuse rather than to read every row.
-    NoPermission { role: String, table: String },
+    NoPermission {
+        /// The role that was asking.
+        role: String,
+        /// The table it has no select permission on.
+        table: String,
+    },
     /// A permission names a session variable the caller does not carry.
     MissingSessionVariable(String),
 }
@@ -308,9 +316,13 @@ pub const CHECK_FAILED: &str = "check constraint of an insert/update permission 
 /// Which of the four grants is being asked about.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Verb {
+    /// Reading rows.
     Select,
+    /// Adding rows.
     Insert,
+    /// Changing existing rows.
     Update,
+    /// Removing rows.
     Delete,
 }
 

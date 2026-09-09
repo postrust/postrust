@@ -167,14 +167,22 @@ impl CoercibleFilter {
 pub enum CoercibleLogicTree {
     /// Boolean expression
     Expr {
+        /// Whether the whole node is negated (`not.and(...)`).
         negated: bool,
+        /// How the children combine.
         op: LogicOperator,
+        /// The operands.
         children: Vec<CoercibleLogicTree>,
     },
     /// Leaf filter
     Stmt(CoercibleFilter),
     /// NULL check for embedding
-    NullEmbed { negated: bool, field_name: String },
+    NullEmbed {
+        /// Whether the test is inverted: the embed must *not* be null.
+        negated: bool,
+        /// The embedded field being tested.
+        field_name: String,
+    },
 }
 
 impl CoercibleLogicTree {

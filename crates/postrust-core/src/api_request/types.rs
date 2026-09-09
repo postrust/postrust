@@ -14,11 +14,14 @@ use std::collections::{HashMap, HashSet};
 /// A fully qualified identifier with schema and name.
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct QualifiedIdentifier {
+    /// The schema. Empty when unqualified, leaving resolution to `search_path`.
     pub schema: String,
+    /// The relation or routine's own name.
     pub name: String,
 }
 
 impl QualifiedIdentifier {
+    /// A `schema.name` identifier.
     pub fn new(schema: impl Into<String>, name: impl Into<String>) -> Self {
         Self {
             schema: schema.into(),
@@ -45,11 +48,17 @@ impl std::fmt::Display for QualifiedIdentifier {
     }
 }
 
+/// A column name, as the request wrote it.
 pub type FieldName = String;
+/// A schema name.
 pub type Schema = String;
+/// The name a selected field is returned under, where the request renamed it.
 pub type Alias = String;
+/// A PostgreSQL type name a selected field is cast to, from `::type`.
 pub type Cast = String;
+/// The `!hint` naming which relationship or which function signature to use.
 pub type Hint = String;
+/// A text-search configuration name, from `fts(english)`.
 pub type Language = String;
 
 // ============================================================================
@@ -80,11 +89,14 @@ pub type JsonPath = Vec<JsonOperation>;
 /// A field reference, optionally with JSON path.
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct Field {
+    /// The column.
     pub name: FieldName,
+    /// Steps into the column's JSON, empty for an ordinary column.
     pub json_path: JsonPath,
 }
 
 impl Field {
+    /// A plain column reference, with no JSON path.
     pub fn simple(name: impl Into<String>) -> Self {
         Self {
             name: name.into(),
@@ -92,6 +104,7 @@ impl Field {
         }
     }
 
+    /// A column reference that reaches into the column's JSON.
     pub fn with_json_path(name: impl Into<String>, json_path: JsonPath) -> Self {
         Self {
             name: name.into(),
@@ -110,7 +123,10 @@ pub enum InvokeMethod {
     /// POST invocation (can have side effects)
     Inv,
     /// GET/HEAD invocation (read-only)
-    InvRead { headers_only: bool },
+    InvRead {
+        /// The request was HEAD, so the body is computed and discarded.
+        headers_only: bool,
+    },
 }
 
 /// Type of mutation operation.
@@ -142,21 +158,32 @@ pub enum Resource {
 pub enum DbAction {
     /// SELECT from a table/view
     RelationRead {
+        /// The relation being read.
         qi: QualifiedIdentifier,
+        /// The request was HEAD: headers are computed, the body discarded.
         headers_only: bool,
     },
     /// INSERT/UPDATE/DELETE on a table
     RelationMut {
+        /// The relation being written.
         qi: QualifiedIdentifier,
+        /// Which write.
         mutation: Mutation,
     },
     /// Call a stored function
     Routine {
+        /// The function being called.
         qi: QualifiedIdentifier,
+        /// How it was invoked, which decides whether it may write.
         invoke_method: InvokeMethod,
     },
     /// Read schema metadata
-    SchemaRead { schema: Schema, headers_only: bool },
+    SchemaRead {
+        /// The schema being described.
+        schema: Schema,
+        /// The request was HEAD.
+        headers_only: bool,
+    },
 }
 
 /// The action to perform, which may or may not require database access.
@@ -168,7 +195,9 @@ pub enum Action {
     RelationInfo(QualifiedIdentifier),
     /// OPTIONS on a function
     RoutineInfo {
+        /// The function being described.
         qi: QualifiedIdentifier,
+        /// How it would be invoked.
         invoke_method: InvokeMethod,
     },
     /// OPTIONS on root (returns OpenAPI spec)
@@ -296,14 +325,20 @@ impl FtsOperator {
 /// Value for IS comparisons.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum IsValue {
+    /// `is.null`
     Null,
+    /// `is.notnull`
     NotNull,
+    /// `is.true`
     True,
+    /// `is.false`
     False,
+    /// `is.unknown`
     Unknown,
 }
 
 impl IsValue {
+    /// The SQL keyword this compares against.
     pub fn to_sql(&self) -> &'static str {
         match self {
             Self::Null => "NULL",
@@ -319,11 +354,20 @@ impl IsValue {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub enum Operation {
     /// Simple binary operation: `col.neq.value`
-    Simple { op: SimpleOperator, value: String },
+    Simple {
+        /// The operator.
+        op: SimpleOperator,
+        /// Its right-hand operand, unparsed: the column's type decides how it
+        /// is read.
+        value: String,
+    },
     /// Quantified operation: `col.eq.value` or `col.eq(any).{arr}`
     Quant {
+        /// The operator.
         op: QuantOperator,
+        /// `any` or `all`, where the request supplied one.
         quantifier: Option<OpQuantifier>,
+        /// The operand, unparsed.
         value: String,
     },
     /// IN list: `col.in.(a,b,c)`
@@ -334,8 +378,11 @@ pub enum Operation {
     IsDistinctFrom(String),
     /// Full-text search: `col.fts(english).query`
     Fts {
+        /// Which of the text-search functions to build the query with.
         op: FtsOperator,
+        /// The text-search configuration, where the request named one.
         language: Option<Language>,
+        /// The search text.
         value: String,
     },
 }
@@ -350,6 +397,7 @@ pub struct OpExpr {
 }
 
 impl OpExpr {
+    /// The operation as written.
     pub fn new(operation: Operation) -> Self {
         Self {
             negated: false,
@@ -357,6 +405,7 @@ impl OpExpr {
         }
     }
 
+    /// The operation under `not.`.
     pub fn negated(operation: Operation) -> Self {
         Self {
             negated: true,
@@ -372,11 +421,14 @@ impl OpExpr {
 /// A single filter on a field.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Filter {
+    /// The column being filtered, with any JSON path into it.
     pub field: Field,
+    /// The comparison applied to it.
     pub op_expr: OpExpr,
 }
 
 impl Filter {
+    /// One column compared one way.
     pub fn new(field: Field, op_expr: OpExpr) -> Self {
         Self { field, op_expr }
     }
@@ -385,7 +437,9 @@ impl Filter {
 /// Boolean logic operator.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum LogicOperator {
+    /// Every child must hold.
     And,
+    /// At least one child must hold.
     Or,
 }
 
@@ -394,8 +448,11 @@ pub enum LogicOperator {
 pub enum LogicTree {
     /// A boolean expression combining children
     Expr {
+        /// Whether the whole node is negated, as in `not.and(...)`.
         negated: bool,
+        /// How the children combine.
         op: LogicOperator,
+        /// The operands.
         children: Vec<LogicTree>,
     },
     /// A leaf filter
@@ -438,6 +495,7 @@ impl LogicTree {
         }
     }
 
+    /// Combine children with `AND`, not negated.
     pub fn and(children: Vec<LogicTree>) -> Self {
         Self::Expr {
             negated: false,
@@ -446,6 +504,7 @@ impl LogicTree {
         }
     }
 
+    /// Combine children with `OR`, not negated.
     pub fn or(children: Vec<LogicTree>) -> Self {
         Self::Expr {
             negated: false,
@@ -454,6 +513,7 @@ impl LogicTree {
         }
     }
 
+    /// A tree of exactly one filter.
     pub fn filter(filter: Filter) -> Self {
         Self::Stmt(filter)
     }
@@ -466,14 +526,20 @@ impl LogicTree {
 /// Aggregate functions.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum AggregateFunction {
+    /// `sum()`
     Sum,
+    /// `avg()`
     Avg,
+    /// `max()`
     Max,
+    /// `min()`
     Min,
+    /// `count()`
     Count,
 }
 
 impl AggregateFunction {
+    /// The SQL function name.
     pub fn to_sql(&self) -> &'static str {
         match self {
             Self::Sum => "SUM",
@@ -500,17 +566,27 @@ pub enum JoinType {
 pub enum SelectItem {
     /// Select a column, possibly with aggregation
     Field {
+        /// The column, with any JSON path into it.
         field: Field,
+        /// An aggregate applied to it, from `col.sum()`.
         aggregate: Option<AggregateFunction>,
+        /// A cast applied to the aggregate's result, distinct from `cast`,
+        /// which applies to the column before aggregating.
         aggregate_cast: Option<Cast>,
+        /// A cast applied to the column, from `col::text`.
         cast: Option<Cast>,
+        /// The key this is returned under, where the request renamed it.
         alias: Option<Alias>,
     },
     /// Embed a related resource
     Relation {
+        /// The related resource, as the request named it.
         relation: FieldName,
+        /// The key the embed is returned under, where renamed.
         alias: Option<Alias>,
+        /// Which relationship to follow, where several connect the two.
         hint: Option<Hint>,
+        /// Whether a parent with no children is kept. Defaults to `Left`.
         join_type: Option<JoinType>,
         /// Columns and further embeds selected on the related resource.
         ///
@@ -523,8 +599,11 @@ pub enum SelectItem {
     /// than under a key of their own, so unlike [`Self::Relation`] there is no
     /// alias: nothing is being named.
     SpreadRelation {
+        /// The related resource, as the request named it.
         relation: FieldName,
+        /// Which relationship to follow, where several connect the two.
         hint: Option<Hint>,
+        /// Whether a parent with no children is kept. Defaults to `Left`.
         join_type: Option<JoinType>,
         /// Columns and further embeds selected on the related resource.
         ///
@@ -564,12 +643,15 @@ impl SelectItem {
 /// Sort direction.
 #[derive(Clone, Debug, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub enum OrderDirection {
+    /// Ascending, PostgreSQL's default.
     #[default]
     Asc,
+    /// Descending.
     Desc,
 }
 
 impl OrderDirection {
+    /// The `ORDER BY` keyword.
     pub fn to_sql(&self) -> &'static str {
         match self {
             Self::Asc => "ASC",
@@ -581,11 +663,14 @@ impl OrderDirection {
 /// NULL ordering.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum OrderNulls {
+    /// Nulls sort before non-nulls.
     First,
+    /// Nulls sort after non-nulls.
     Last,
 }
 
 impl OrderNulls {
+    /// The `NULLS FIRST` / `NULLS LAST` clause.
     pub fn to_sql(&self) -> &'static str {
         match self {
             Self::First => "NULLS FIRST",
@@ -599,20 +684,29 @@ impl OrderNulls {
 pub enum OrderTerm {
     /// Order by a field
     Field {
+        /// The column to sort on.
         field: Field,
+        /// Ascending or descending. Absent leaves PostgreSQL's default.
         direction: Option<OrderDirection>,
+        /// Where nulls sort. Absent leaves PostgreSQL's default, which depends
+        /// on the direction.
         nulls: Option<OrderNulls>,
     },
     /// Order by a field from an embedded relation
     Relation {
+        /// The embedded resource holding the column.
         relation: FieldName,
+        /// The column to sort on.
         field: Field,
+        /// Ascending or descending.
         direction: Option<OrderDirection>,
+        /// Where nulls sort.
         nulls: Option<OrderNulls>,
     },
 }
 
 impl OrderTerm {
+    /// Sort on a column, leaving direction and null placement to PostgreSQL.
     pub fn field(name: impl Into<String>) -> Self {
         Self::Field {
             field: Field::simple(name),
@@ -621,6 +715,7 @@ impl OrderTerm {
         }
     }
 
+    /// Sort on a column, descending.
     pub fn field_desc(name: impl Into<String>) -> Self {
         Self::Field {
             field: Field::simple(name),
@@ -637,7 +732,9 @@ impl OrderTerm {
 /// A range for pagination (offset and limit).
 #[derive(Clone, Debug, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct Range {
+    /// Rows to skip before the first returned.
     pub offset: i64,
+    /// How many rows at most. `None` is unbounded.
     pub limit: Option<i64>,
     /// Whether `offset` was asked for rather than defaulted to.
     ///
@@ -651,6 +748,7 @@ pub struct Range {
 }
 
 impl Range {
+    /// A range from an explicit offset and limit, as query parameters give.
     pub fn new(offset: i64, limit: Option<i64>) -> Self {
         Self {
             offset,
@@ -683,12 +781,17 @@ impl Range {
 pub enum Payload {
     /// Parsed JSON with extracted keys
     ProcessedJson {
+        /// The body as received, passed to PostgreSQL unaltered.
         raw: bytes::Bytes,
+        /// The union of the keys across every object in the body, which is
+        /// what decides the column list when `?columns=` was not given.
         keys: HashSet<String>,
     },
     /// URL-encoded form data
     ProcessedUrlEncoded {
+        /// The decoded pairs, in the order they were sent.
         data: Vec<(String, String)>,
+        /// The distinct keys among them.
         keys: HashSet<String>,
     },
     /// Raw JSON (used with &columns parameter)
@@ -727,6 +830,7 @@ pub enum MediaType {
     Other(String),
     /// Singular JSON object (vnd.pgrst.object)
     SingularJson {
+        /// `;nulls=null`: an empty result is `null` rather than a 406.
         nullable: bool,
         /// `;nulls=stripped`: omit keys whose value is null.
         strip_nulls: bool,
@@ -738,13 +842,18 @@ pub enum MediaType {
     },
     /// EXPLAIN plan output
     Plan {
+        /// The media type the plan is *for*: the plan describes the query that
+        /// would have produced this.
         base: Box<MediaType>,
+        /// How the plan itself is rendered.
         format: PlanFormat,
+        /// `EXPLAIN` options the request asked for.
         options: Vec<PlanOption>,
     },
 }
 
 impl MediaType {
+    /// The `Content-Type` this is answered with.
     pub fn content_type(&self) -> &str {
         match self {
             Self::ApplicationJson => "application/json",
@@ -818,17 +927,24 @@ impl MediaType {
 /// EXPLAIN plan format.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum PlanFormat {
+    /// `EXPLAIN (FORMAT JSON)`.
     Json,
+    /// `EXPLAIN (FORMAT TEXT)`, PostgreSQL's default rendering.
     Text,
 }
 
 /// EXPLAIN plan options.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum PlanOption {
+    /// Run the query and report actual timings, not just the plan.
     Analyze,
+    /// Include additional per-node detail.
     Verbose,
+    /// Report planner settings that differ from their defaults.
     Settings,
+    /// Report buffer usage. Requires `Analyze`.
     Buffers,
+    /// Report WAL usage. Requires `Analyze`.
     Wal,
 }
 
@@ -839,7 +955,9 @@ pub enum PlanOption {
 /// Resolution strategy for upsert conflicts.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum PreferResolution {
+    /// `resolution=merge-duplicates`: a conflicting row is updated.
     MergeDuplicates,
+    /// `resolution=ignore-duplicates`: a conflicting row is left alone.
     IgnoreDuplicates,
 }
 
@@ -869,8 +987,11 @@ pub enum PreferCount {
 /// Transaction handling.
 #[derive(Clone, Debug, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub enum PreferTransaction {
+    /// `tx=commit`, the default.
     #[default]
     Commit,
+    /// `tx=rollback`: the work is done, reported, and thrown away. Useful for
+    /// seeing what a mutation would do without doing it.
     Rollback,
 }
 
@@ -900,14 +1021,24 @@ pub enum PreferHandling {
 /// Parsed Prefer headers.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct Preferences {
+    /// How an upsert resolves a conflicting row.
     pub resolution: Option<PreferResolution>,
+    /// Whether a mutation returns the rows it touched.
     pub representation: PreferRepresentation,
+    /// Whether, and how exactly, to count the full result set.
     pub count: Option<PreferCount>,
+    /// Whether the transaction commits.
     pub transaction: PreferTransaction,
+    /// What an omitted column means on insert: its default, or null.
     pub missing: PreferMissing,
+    /// Whether an unrecognised preference is an error.
     pub handling: PreferHandling,
+    /// `timezone=`: the session time zone for this request.
     pub timezone: Option<String>,
+    /// `max-affected=`: refuse the write if it would touch more rows.
     pub max_affected: Option<i64>,
+    /// Preferences that were sent and not understood. Reported under
+    /// `handling=strict`, ignored otherwise.
     pub invalid: Vec<String>,
     /// Every preference the server understood, in the order it was sent.
     ///

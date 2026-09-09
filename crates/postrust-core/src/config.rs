@@ -583,12 +583,18 @@ pub struct RoleSettings {
 /// entry reads the same as the environment variable.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum IsolationLevel {
+    /// PostgreSQL's default. A statement sees rows committed before it began.
     ReadCommitted,
+    /// Every statement in the transaction sees the same snapshot.
     RepeatableRead,
+    /// As `RepeatableRead`, and concurrent transactions are additionally
+    /// guaranteed to be equivalent to some serial order. May abort with a
+    /// serialization failure, which the client is expected to retry.
     Serializable,
 }
 
 impl IsolationLevel {
+    /// The spelling PostgreSQL's `SET TRANSACTION ISOLATION LEVEL` expects.
     pub fn to_sql(&self) -> &'static str {
         match self {
             Self::ReadCommitted => "READ COMMITTED",
@@ -634,8 +640,12 @@ impl IsolationLevel {
 /// and behaving as one of the others.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum OpenApiMode {
+    /// No OpenAPI document is served.
     Disabled,
+    /// The document describes only what the requesting role may reach, so two
+    /// roles asking are answered differently.
     FollowPrivileges,
+    /// The document describes the whole exposed schema, whoever is asking.
     IgnorePrivileges,
 }
 
@@ -669,14 +679,24 @@ impl OpenApiMode {
 /// Log levels.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum LogLevel {
+    /// Only failures that stop the server. Mapped onto `ERROR`, which is the
+    /// least severe level `tracing` offers.
     Crit,
+    /// Requests that failed, and faults that did not stop the server.
     Error,
+    /// Configuration that was ignored, and conditions worth noticing.
     Warn,
+    /// Start-up, schema reloads, and one line per request.
     Info,
+    /// The generated SQL and the decisions behind it.
     Debug,
 }
 
 impl LogLevel {
+    /// The `tracing` level this maps onto.
+    ///
+    /// `Crit` and `Error` both become `ERROR`: PostgREST distinguishes them
+    /// and `tracing` has nothing more severe to map `Crit` onto.
     pub fn to_tracing(&self) -> tracing::Level {
         match self {
             Self::Crit | Self::Error => tracing::Level::ERROR,

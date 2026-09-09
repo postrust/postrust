@@ -97,6 +97,7 @@ pub struct LenientStream<T> {
 }
 
 impl<T> LenientStream<T> {
+    /// Wrap a stream, rewriting request targets as they pass through.
     pub fn new(inner: T) -> Self {
         Self {
             inner,
