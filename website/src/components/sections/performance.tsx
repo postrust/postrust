@@ -173,13 +173,16 @@ export const PerformanceSection = component$(() => {
             )}
           </p>
           <p class="mt-3 text-sm text-neutral-500">
-            Read these as ratios rather than as capacity. Everything shares one
-            host, so absolute throughput depends on that machine — and running
-            in a container costs about {measurementContext.dockerCostPct}%
-            against the same binary run natively, charged to every server
-            equally. PostgREST's own run-to-run spread is wider than the others'
-            at up to {measurementContext.spreadPct.postgrest}%, so its multiples
-            carry roughly ±{measurementContext.postgrestRatioTolerancePct}%.{" "}
+            Read these as ratios rather than as capacity, and as a comparison of
+            whole designs rather than of HTTP layers — much of the REST gap is
+            that Postrust renders JSON itself where PostgREST builds it inside
+            PostgreSQL on every request. Everything shares one host, so absolute
+            throughput depends on that machine — and running in a container
+            costs about {measurementContext.dockerCostPct}% against the same
+            binary run natively, charged to every server equally. PostgREST's
+            own run-to-run spread is wider than the others' at up to{" "}
+            {measurementContext.spreadPct.postgrest}%, so its multiples carry
+            roughly ±{measurementContext.postgrestRatioTolerancePct}%.{" "}
             <Link
               href="/docs/benchmarks"
               class="text-primary-600 hover:text-primary-700"
