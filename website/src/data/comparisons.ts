@@ -70,7 +70,8 @@ const mc = measurementContext;
 export const perfCaveats = [
   "Every server runs as a container on one docker network against the same PostgreSQL instance and the same dataset. No tool gets to skip container overhead.",
   "Each tool keeps its own default connection pool and worker settings. Tuning one and not the others measures the tuning, not the tool.",
-  "Requests are expressed in each tool's own dialect, because the dialects differ. The work asked of PostgreSQL is the same.",
+  "Requests are expressed in each tool's own dialect, because the dialects differ. Before any scenario is measured, every target is checked to have returned the same number of rows -- and for REST, the same columns -- so a throughput figure cannot compare unequal work.",
+  "The tools differ in where they build the response, and much of the gap is that rather than raw speed. Postrust sends a plain parameterised SELECT and renders JSON itself; PostgREST wraps the query in a CTE, computes a count and builds the JSON inside PostgreSQL on every request, whether or not one was asked for. Both designs are measured as they ship.",
   "Every target is warmed before any of them is measured, and the database cache is populated first, so no tool pays to warm the cache for the ones measured after it.",
   "Each figure is the median of several runs rather than the best of them, because a best-of-N reports whichever tool got the quietest moment on the machine.",
   `Measured on dedicated bare metal with SMT disabled and the CPU held at a fixed ${mc.clockMhz} MHz -- verified by sampling the clock across the run (${mc.clockSpreadPct}% spread), not by trusting the setting. Absolute figures carry that machine's firmware with them; the ratios do not.`,

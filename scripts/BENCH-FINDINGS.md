@@ -58,6 +58,107 @@ hypothesis for the old drift, would have shown as a trend across those samples.
 - `docker-proxy` disabled, removing an unpinned userspace process from the
   request path.
 
+## Where the 4x against PostgREST actually comes from
+
+**Status: investigated after the ratio was questioned. The number stands; the
+reading of it needed qualifying, and the harness needed a check it lacked.**
+
+A point lookup measures 44186 rps here against 10931 for PostgREST. That gap is
+large enough to deserve an explanation before it is published, so three ways it
+could have been an artefact were tested directly.
+
+**It is not a cache.** `pg_stat_statements` records exactly 3000 calls for 3000
+requests, for both servers. Every request reaches PostgreSQL.
+
+**It is not a connection pool difference.** postrust holds 10 client backends,
+PostgREST 11.
+
+**It is not unequal output.** Both return the same rows, both send
+`Content-Range: 0-0/*`, and the bodies are 176 and 177 bytes. postrust's is the
+*larger* of the two, because `arbitrary_precision` preserves what PostgreSQL
+sent (`0.1000`) where PostgREST trims it (`0.10`).
+
+What differs is the SQL. postrust sends:
+
+```sql
+SELECT "id", "name", "category", "price", "stock", "is_active", "metadata",
+       "created_at"
+FROM "public"."bench_items" WHERE "id" = $1::int4
+```
+
+PostgREST sends:
+
+```sql
+WITH pgrst_source AS (
+  SELECT "public"."bench_items".* FROM "public"."bench_items"
+  WHERE "public"."bench_items"."id" = $1
+)
+SELECT $2::bigint AS total_result_set,
+       pg_catalog.count(_postgrest_t) AS page_total,
+       coalesce(json_agg(_postgrest_t), $3) AS body,
+       nullif(current_setting($4, $5), $6) AS response_headers,
+       nullif(current_setting($7, $8), $9) AS response_status,
+       $10 AS response_inserted
+FROM (SELECT * FROM pgrst_source) _postgrest_t
+```
+
+PostgREST builds the JSON *inside PostgreSQL* with `json_agg`, computes a
+`count()`, and reads three GUCs -- on every request, whether or not the client
+asked for a count or the function set a response header. postrust sends a plain
+parameterised select and builds the JSON in Rust.
+
+So a large part of the difference is **where each design does the work**, and
+PostgREST paying per-request for generality this benchmark does not use. That
+is a real architectural difference with real consequences, and it is a fair
+thing to measure. What it is not is evidence that this server's HTTP layer is
+four times faster than PostgREST's, and the figure should not be read that way.
+
+Both components are pinned to six cores each, so the two designs load the two
+pinned halves differently. A machine where the database had more headroom than
+the server would narrow this gap; one where it had less would widen it.
+
+### The harness was not checking that the question was the same
+
+Until this, `rest_ok` checked for an HTTP 200 and `gql_ok` for a `data` key.
+Neither compared what came back. One server answering with one row while
+another returned twenty-five would have passed both and been measured as though
+the work were equal.
+
+`check_rest_equivalence` and `check_gql_equivalence` now run before any
+scenario is measured. Row counts must match -- a difference there is never a
+dialect difference, so it fails the run. REST column sets must match too. Bytes
+are deliberately not compared, because `0.1000` against `0.10` is a real
+difference that does not make the work unequal, and GraphQL field names are not
+compared because PostGraphile genuinely calls `id` `rowId`.
+
+The first thing the check did was fail on a difference that was not one.
+PostGraphile answers a lookup by key with a single *object*, where Postrust and
+Hasura answer with an array of one, and the extractor looked for the first
+array in the document -- so it read PostGraphile's response as no rows at all
+and called the run invalid. Both servers had returned exactly one row. The
+extractor now treats a lone object under `data`, or a lone top-level object, as
+one row, and is exercised against all seven shapes the three dialects produce.
+
+Worth stating plainly: a check that fails a good run is not obviously better
+than no check. This one earned its place only after it stopped doing that.
+
+### What a short window would have published instead
+
+A deliberately bad run -- 2,000 requests, one repeat -- was used to exercise the
+new check. It passed equivalence, and the self-consistency gate rejected the run
+at 11.4% drift, which is what it is for. The numbers it would have produced:
+
+| | 2,000-request window | 30,000-request window |
+|---|---|---|
+| postrust, point lookup | 35017 rps | 44186 rps |
+| postgrest, point lookup | 2667 rps | 10931 rps |
+| **ratio** | **13.1x** | **4.0x** |
+
+The short window understates both servers and understates the GHC-based one far
+more, exactly as the note further down describes. A 13x figure was available
+from this harness, from a run that looked healthy, and the gate is the only
+thing between it and a website.
+
 ## The alpine variant moves the other tools, and it should not
 
 **Status: open. One run each. No alpine throughput figure is published.**
