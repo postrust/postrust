@@ -3,6 +3,69 @@
 Notable changes, newest first. This file starts at 1.0.0-alpha.1; earlier
 releases are described by their tags and the pull requests behind them.
 
+## 1.0.0
+
+The seven crates on the stable line -- `postrust-core`, `postrust-sql`,
+`postrust-auth`, `postrust-response`, `postrust-graphql`, `postrust-server`
+and `postrust-lambda` -- are 1.0.0 and carry a semver promise from here:
+a breaking change to the public Rust API needs a major bump.
+`postrust-proxy` and `postrust-worker` stay on their own `0.x` lines and carry
+none, for the reasons in [docs/stability.md](docs/stability.md). Nothing in the
+stable line depends on either.
+
+No code changed between `1.0.0-beta.1` and this release. What changed is what
+can be said about it with evidence.
+
+**Throughput figures are restored.** The beta.1 entry said they remained
+withdrawn, and that is no longer true. `scripts/BENCH-FINDINGS.md` set a
+precondition for publishing again -- run the comparison on a machine with
+native Docker rather than a virtualised one, and confirm that a measurement
+repeated at the start and the end of a run agrees with itself. Both are now
+met, on a dedicated bare-metal host with each component pinned to its own CCD:
+
+| | first | last | drift |
+|---|---|---|---|
+| debian | 44186 rps | 44132 rps | 0.1% |
+| alpine | 43727 rps | 43179 rps | 1.3% |
+
+That check is no longer something done by hand. `bench-compare.sh` repeats its
+first measurement as the last action of the run and exits non-zero if the two
+disagree by more than 3%, so a drifted run cannot be mistaken for a publishable
+one. Three independent runs of the whole harness agree to 0.7%, against the
+1.25x-1.39x spread the previous host produced.
+
+The published numbers move a long way -- point lookup goes from 6,065 rps to
+44,186 -- and none of that is a change to this software. The instrument was
+losing most of the signal.
+
+Two things measured alongside, and published with the figures rather than
+discovered later by someone else: a container costs about 8.6% against the same
+binary run natively, almost all of it Docker's network path, charged to every
+server equally; and PostgREST's run-to-run spread is 19.6% at worst against
+0.8% here, so multiples quoted against it carry roughly +/-10%.
+
+**Conformance, measured on merged main from a clean tree.**
+
+| suite | |
+|---|---|
+| PostgREST v16.1, full contract | 1424/1499 (95.0%) |
+| Hasura v2.50.1, full body | 454/468 (97.0%) |
+
+The PostgREST figure is one above the previously published 1423, and the whole
+of that +1 is in writes -- `Query/InsertSpec.hs`, 78/82 to 79/82. Hasura
+reproduces its recorded figure exactly on different hardware, a different
+kernel and a different Docker, which is the useful part: the number is a
+property of the code rather than of the machine that measured it.
+
+The Hasura introspection gap stays where it is, deliberately. Closing it would
+mean the server misreporting the schema it actually has, and a conformance
+point bought that way is not worth having. See
+[docs/hasura-conformance.md](docs/hasura-conformance.md).
+
+**Verified for this release:** `cargo fmt` clean, `cargo clippy --workspace
+--all-targets -D warnings` clean, the same with `--features admin-ui` clean,
+and 755 tests passing with 0 failures across 25 binaries on a clean checkout.
+
 ## 1.0.0-beta.1
 
 Everything on the checklist for a stable release is done except the one thing
