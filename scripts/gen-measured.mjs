@@ -12,6 +12,7 @@
 // rows for variants the earlier ones did not cover.
 
 import { readFileSync, writeFileSync } from "node:fs";
+import { spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { dirname, join, resolve } from "node:path";
 
@@ -96,8 +97,13 @@ const banner = `// GENERATED FILE -- do not edit by hand.
 ${runs
   .map(
     (r) =>
-      `//   ${r.data.variant ?? "unknown"} variant -- ${r.data.host}, ${r.data.postgres}, ` +
-      `${r.data.requests} requests at concurrency ${r.data.concurrency}`,
+      `//   ${r.data.variant ?? "unknown"} variant -- ${r.data.cpu ?? r.data.host}, ` +
+      `${r.data.postgres}, ${r.data.requests} requests at concurrency ${r.data.concurrency}\n` +
+      `//     ${r.data.cpu_state ?? "cpu state not recorded"}\n` +
+      `//     self-consistency: ${r.data.self_consistency?.status ?? "not run"}` +
+      (r.data.self_consistency?.drift_pct != null
+        ? ` (${r.data.self_consistency.drift_pct}% drift over the run)`
+        : ""),
   )
   .join("\n")}
 `;
@@ -126,6 +132,17 @@ export const benchMeta = {
   repeats: ${primary.repeats ?? 1},
   warmup: ${primary.warmup ?? 0},
   variant: ${JSON.stringify(primary.variant ?? "unknown")},
+  /** The CPU, and the state it was held in. A throughput figure without these is not reproducible. */
+  cpu: ${JSON.stringify(primary.cpu ?? "not recorded")},
+  cpuState: ${JSON.stringify(primary.cpu_state ?? "not recorded")},
+  /** Which cores each component was confined to, so none of them shared an L3 slice. */
+  pinning: ${JSON.stringify(primary.pinning ?? null)},
+  /**
+   * The first measurement of the run, repeated as its last action. A run whose
+   * two readings disagree did not hold still, and nothing measured in between
+   * is comparable across targets.
+   */
+  selfConsistency: ${JSON.stringify(primary.self_consistency ?? null)},
 } as const;
 
 export interface VariantImages {
@@ -224,6 +241,29 @@ export const postrustImages: Record<string, string> = ${JSON.stringify(
 `;
 
 writeFileSync(OUT, body);
+
+// Format it here rather than leaving it to whoever regenerates next.
+//
+// The object literals below are emitted with JSON.stringify, which quotes its
+// keys and does not wrap the way Prettier does, so raw output has never
+// satisfied `prettier --check`. That was survivable only because someone
+// remembered to run Prettier afterwards; when they did not, a formatting
+// failure appeared in CI attached to a data regeneration that was otherwise
+// correct. Doing it here means the generator's output is committable as-is.
+const website = join(here, "..", "website");
+const fmt = spawnSync("npx", ["prettier", "--write", OUT], {
+  cwd: website,
+  stdio: "ignore",
+  shell: process.platform === "win32",
+});
+if (fmt.status !== 0) {
+  console.warn(
+    `warning: could not run prettier on ${OUT} ` +
+      `(exit ${fmt.status ?? "n/a"}). Run \`npx prettier --write\` in website/ ` +
+      `before committing, or \`prettier --check\` will fail.`,
+  );
+}
+
 console.log(`wrote ${OUT}`);
 for (const [slug, v] of Object.entries(data)) {
   console.log(`  ${slug}: ${v.rest.length} rest, ${v.graphql.length} graphql`);

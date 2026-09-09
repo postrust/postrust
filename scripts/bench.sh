@@ -35,6 +35,13 @@ WARMUP="${WARMUP:-200}"
 KEEP="${KEEP:-0}"
 SKIP_BUILD="${SKIP_BUILD:-0}"
 
+# CPU pinning, matching scripts/bench-compare.sh. Unset means no pinning.
+# See docs/benchmarking.md for how to find the groups on a given machine.
+CPUSET_DB="${CPUSET_DB:-}"
+CPUSET_SERVER="${CPUSET_SERVER:-}"
+CPUSET_LOAD="${CPUSET_LOAD:-}"
+export CPUSET_LOAD
+
 # Feature set to build. Defaults to the set the published Docker image and
 # release binaries are built with, so the reported size matches what users get.
 # Set to an empty string to measure a minimal build.
@@ -123,8 +130,10 @@ fi
 
 log "starting PostgreSQL ($PG_IMAGE) on port $PG_PORT..."
 docker rm -f "$PG_CONTAINER" >/dev/null 2>&1 || true
+DB_PIN=(); [[ -n "$CPUSET_DB" ]] && DB_PIN=(--cpuset-cpus "$CPUSET_DB")
 docker run -d --rm \
     --name "$PG_CONTAINER" \
+    ${DB_PIN[@]+"${DB_PIN[@]}"} \
     -e POSTGRES_PASSWORD=postgres \
     -e POSTGRES_DB="$PG_DB" \
     -p "$PG_PORT:5432" \
@@ -147,12 +156,13 @@ docker exec -i "$PG_CONTAINER" \
 
 # --- Server ----------------------------------------------------------------
 
+SRV_PIN=(); [[ -n "$CPUSET_SERVER" ]] && SRV_PIN=(taskset -c "$CPUSET_SERVER")
 log "starting postrust on port $BENCH_PORT..."
 DATABASE_URL="postgres://postgres:postgres@127.0.0.1:$PG_PORT/$PG_DB" \
 PGRST_DB_ANON_ROLE=bench_anon \
 PGRST_SERVER_PORT="$BENCH_PORT" \
 PGRST_LOG_LEVEL=warn \
-    "$BINARY" > "$SERVER_LOG" 2>&1 &
+    ${SRV_PIN[@]+"${SRV_PIN[@]}"} "$BINARY" > "$SERVER_LOG" 2>&1 &
 SERVER_PID=$!
 
 if ! wait_until 45 curl -fsS -o /dev/null "$BASE_URL/_/health"; then
@@ -219,6 +229,9 @@ echo "==========================================================================
 echo " Postrust benchmark"
 echo "==========================================================================="
 printf ' host           : %s\n' "$(uname -srm)"
+printf ' cpu            : %s\n' "$(grep -m1 'model name' /proc/cpuinfo 2>/dev/null | cut -d: -f2- | sed 's/^ *//' || echo unknown)"
+printf ' pinning        : db=%s server=%s load=%s\n' \
+    "${CPUSET_DB:-none}" "${CPUSET_SERVER:-none}" "${CPUSET_LOAD:-none}"
 printf ' postgres       : %s\n' "$PG_IMAGE"
 printf ' load generator : %s (n=%s, c=%s)\n' "$LOAD_TOOL" "$REQUESTS" "$CONCURRENCY"
 printf ' dataset        : bench_items, 100000 rows\n'
@@ -244,7 +257,13 @@ while IFS=$'\t' read -r name measured rss; do
 done < "$RESULTS_FILE"
 
 echo
-echo " Numbers are from a single machine over loopback: PostgreSQL, the server"
-echo " and the load generator all compete for the same cores, so treat these as"
-echo " relative measurements, not absolute capacity."
+if [[ -n "$CPUSET_DB$CPUSET_SERVER$CPUSET_LOAD" ]]; then
+    echo " PostgreSQL, the server and the load generator each have their own cores,"
+    echo " so they are not competing for CPU -- but they still share one machine's"
+    echo " memory bandwidth and one kernel. Relative measurements, not capacity."
+else
+    echo " Numbers are from a single machine over loopback: PostgreSQL, the server"
+    echo " and the load generator all compete for the same cores, so treat these as"
+    echo " relative measurements, not absolute capacity."
+fi
 echo "==========================================================================="

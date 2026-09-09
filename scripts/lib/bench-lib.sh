@@ -41,8 +41,19 @@ wait_until() {
 }
 
 # Resident set size of a pid, in KB. Works on both macOS and Linux.
+#
+# The `|| echo 0` this used to end with never fired: the exit status of the
+# pipeline is `tr`'s, which succeeds on empty input, so a `ps` that did not
+# understand `-o rss=` produced an empty string that `human_kb` then rendered
+# as "0.0 MB". A memory column silently reading zero is worse than one that is
+# missing, so the value is checked rather than the exit status.
 rss_kb() {
-    ps -o rss= -p "$1" 2>/dev/null | tr -d ' ' || echo 0
+    local kb
+    kb="$(ps -o rss= -p "$1" 2>/dev/null | tr -d ' ')"
+    case "$kb" in
+        ''|*[!0-9]*) echo 0 ;;
+        *)           echo "$kb" ;;
+    esac
 }
 
 # Resident set size of a running container, in KB.
@@ -127,8 +138,14 @@ run_oha() {
         args+=(-m POST -H "Content-Type: application/json" -d "$body")
     fi
 
+    # The generator gets its own cores when CPUSET_LOAD says so, for the same
+    # reason the servers do: an unpinned generator competes with the server it
+    # is measuring, and the result reads as the server being slow.
+    local pin=()
+    [[ -n "${CPUSET_LOAD:-}" ]] && pin=(taskset -c "$CPUSET_LOAD")
+
     local output
-    if ! output="$(oha "${args[@]}" "$url" 2>&1)"; then
+    if ! output="$(${pin[@]+"${pin[@]}"} oha "${args[@]}" "$url" 2>&1)"; then
         echo "ERROR oha-failed"
         return 0
     fi

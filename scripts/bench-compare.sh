@@ -121,6 +121,31 @@ WARMUP="${WARMUP:-500}"
 # conclusion from.
 REPEATS="${REPEATS:-3}"
 
+# CPU pinning, one component per group of cores. Unset means no pinning, which
+# is the right default on a machine whose topology is unknown -- a wrong cpuset
+# is worse than none, because it silently starves whatever it names.
+#
+# On a multi-CCD AMD part, use one CCD each so no two components share an L3
+# slice; the groups are what this prints:
+#
+#     cat /sys/devices/system/cpu/cpu*/cache/index3/shared_cpu_list | sort -u
+#
+# Every server gets the SAME cpuset. Giving one target more cores than another
+# encodes the bias into the instrument, which is the failure a differential
+# benchmark exists to rule out.
+CPUSET_DB="${CPUSET_DB:-}"
+CPUSET_SERVER="${CPUSET_SERVER:-}"
+CPUSET_LOAD="${CPUSET_LOAD:-}"
+
+# Self-consistency gate. The first measurement of the run is repeated as the
+# very last action; if the two disagree by more than this, the machine drifted
+# under the harness and nothing measured in between is comparable.
+#
+# This exists because REPEATS cannot detect that drift: measure_median runs its
+# repeats back to back, so all of them sit in the same drift state and agree
+# with each other while being equally wrong.
+GATE_THRESHOLD_PCT="${GATE_THRESHOLD_PCT:-3}"
+
 KEEP="${KEEP:-0}"
 SKIP_BUILD="${SKIP_BUILD:-0}"
 ONLY="${ONLY:-postrust,postgrest,hasura,postgraphile}"
@@ -340,6 +365,30 @@ LOAD_TOOL="oha"
 
 docker info >/dev/null 2>&1 || die "docker daemon is not responding"
 
+# What the CPU was actually doing while this ran. A throughput figure without
+# these is not reproducible: the same box with boost left on, SMT on, or a
+# ramping governor is a different instrument.
+host_cpu_model() { grep -m1 'model name' /proc/cpuinfo 2>/dev/null | cut -d: -f2- | sed 's/^ *//' || echo unknown; }
+host_cpu_cond() {
+    local gov boost smt
+    gov="$(cat /sys/devices/system/cpu/cpu0/cpufreq/scaling_governor 2>/dev/null || echo n/a)"
+    boost="$(cat /sys/devices/system/cpu/cpufreq/boost 2>/dev/null || echo n/a)"
+    smt="$(cat /sys/devices/system/cpu/smt/control 2>/dev/null || echo n/a)"
+    # boost_sysfs, not boost: this is what the file reads, which is not the
+    # same as what the hardware does. Some platform firmware owns P-states
+    # and discards the request. See docs/benchmarking.md.
+    printf 'governor=%s boost_sysfs=%s smt=%s online=%s' "$gov" "$boost" "$smt" \
+        "$(cat /sys/devices/system/cpu/online 2>/dev/null || echo n/a)"
+}
+
+# Built as arrays so an unset cpuset adds no argument at all.
+DB_PIN=();  [[ -n "$CPUSET_DB"     ]] && DB_PIN=(--cpuset-cpus "$CPUSET_DB")
+SRV_PIN=(); [[ -n "$CPUSET_SERVER" ]] && SRV_PIN=(--cpuset-cpus "$CPUSET_SERVER")
+export CPUSET_LOAD
+if [[ -n "$CPUSET_LOAD" ]] && ! command -v taskset >/dev/null 2>&1; then
+    die "CPUSET_LOAD is set but taskset is not installed"
+fi
+
 # A process already holding one of these ports produces a confusing failure:
 # docker cannot publish the port, the health check reaches whatever is already
 # listening, and the target is reported unhealthy after a 90s wait. Checking up
@@ -402,6 +451,7 @@ docker network create "$NETWORK" >/dev/null
 
 log "starting postgres ($PG_IMAGE)..."
 docker run -d --name "$PG_CONTAINER" --network "$NETWORK" \
+        ${DB_PIN[@]+"${DB_PIN[@]}"} \
     -e POSTGRES_PASSWORD=postgres -e POSTGRES_DB="$PG_DB" \
     "$PG_IMAGE" >/dev/null
 
@@ -442,6 +492,7 @@ fi
 start_postrust() {
     log "starting postrust..."
     docker run -d --name postrust-cmp-postrust --network "$NETWORK" \
+        ${SRV_PIN[@]+"${SRV_PIN[@]}"} \
         -p "$PORT_POSTRUST:3000" \
         -e DATABASE_URL="$PG_INTERNAL_URI" \
         -e PGRST_DB_ANON_ROLE=bench_anon \
@@ -457,6 +508,7 @@ start_postrust() {
 start_postgrest() {
     log "starting postgrest..."
     docker run -d --name postrust-cmp-postgrest --network "$NETWORK" \
+        ${SRV_PIN[@]+"${SRV_PIN[@]}"} \
         -p "$PORT_POSTGREST:3000" \
         -e PGRST_DB_URI="$PG_INTERNAL_URI" \
         -e PGRST_DB_SCHEMAS=public \
@@ -472,6 +524,7 @@ start_postgrest() {
 start_hasura() {
     log "starting hasura..."
     docker run -d --name postrust-cmp-hasura --network "$NETWORK" \
+        ${SRV_PIN[@]+"${SRV_PIN[@]}"} \
         -p "$PORT_HASURA:8080" \
         -e HASURA_GRAPHQL_DATABASE_URL="$PG_INTERNAL_URI" \
         -e HASURA_GRAPHQL_METADATA_DATABASE_URL="postgres://postgres:postgres@$PG_CONTAINER:5432/$PG_META_DB" \
@@ -537,6 +590,7 @@ start_postgraphile() {
     # --simple-inflection is deliberately NOT used: the default inflection is
     # what a default install serves, and the point is to measure defaults.
     docker run -d --name postrust-cmp-postgraphile --network "$NETWORK" \
+        ${SRV_PIN[@]+"${SRV_PIN[@]}"} \
         -p "$PORT_POSTGRAPHILE:5000" \
         "$POSTGRAPHILE_IMAGE" \
         sh -c "postgraphile --preset postgraphile/presets/amber -c '$PG_INTERNAL_URI' -n 0.0.0.0 -p 5000 --schema public" >/dev/null
@@ -570,6 +624,53 @@ done
 # surface|scenario|target|rps|p50|p95|p99|status
 record() {
     printf '%s\t%s\t%s\t%s\t%s\n' "$1" "$2" "$3" "$4" "$5" >> "$RESULTS_TSV"
+}
+
+# --- Self-consistency gate -------------------------------------------------
+#
+# The first thing measured is remembered here and measured again as the last
+# action of the run. Everything else happens in between, so if the machine
+# drifted the two disagree.
+
+GATE_SURFACE=""; GATE_NAME=""; GATE_TARGET=""; GATE_URL=""; GATE_BODY=""
+GATE_FIRST_RPS=""; GATE_LAST_RPS=""; GATE_DRIFT=""; GATE_STATUS="not run"
+
+# Remember the first real measurement of the run, and only the first.
+gate_capture() {
+    local surface="$1" name="$2" target="$3" url="$4" body="$5" measured="$6"
+    [[ -n "$GATE_TARGET" ]] && return 0
+    case "$measured" in ERROR*|UNSUPPORTED*) return 0 ;; esac
+    local rps="${measured%% *}"
+    case "$rps" in ''|*[!0-9]*) return 0 ;; esac
+    GATE_SURFACE="$surface"; GATE_NAME="$name"; GATE_TARGET="$target"
+    GATE_URL="$url"; GATE_BODY="$body"; GATE_FIRST_RPS="$rps"
+}
+
+# Repeat that measurement, identically, at the end.
+gate_run() {
+    if [[ -z "$GATE_TARGET" ]]; then
+        GATE_STATUS="not run (nothing was measured)"
+        return 0
+    fi
+
+    log "self-consistency: re-measuring '$GATE_NAME' on $GATE_TARGET"
+    isolate "$GATE_TARGET"
+    warm_target "$GATE_URL" "" "$GATE_BODY"
+    local measured; measured="$(measure_median "$GATE_URL" "" "$GATE_BODY")"
+    unisolate
+
+    case "$measured" in
+        ERROR*|UNSUPPORTED*) GATE_STATUS="inconclusive ($measured)"; return 0 ;;
+    esac
+    GATE_LAST_RPS="${measured%% *}"
+    GATE_DRIFT="$(awk -v a="$GATE_FIRST_RPS" -v b="$GATE_LAST_RPS" \
+        'BEGIN { d = (b - a) / a * 100; printf "%.1f", (d < 0 ? -d : d) }')"
+
+    if awk -v d="$GATE_DRIFT" -v t="$GATE_THRESHOLD_PCT" 'BEGIN { exit !(d <= t) }'; then
+        GATE_STATUS="pass"
+    else
+        GATE_STATUS="FAIL"
+    fi
 }
 
 # Run one measurement REPEATS times and print the median by throughput.
@@ -641,6 +742,7 @@ bench_rest() {
             isolate "$target"
             measured="$(measure_median "$url" "")"
             record rest "$name" "$target" "$measured" ok
+            gate_capture rest "$name" "$target" "$url" "" "$measured"
         done
         unisolate
     done
@@ -683,6 +785,7 @@ bench_gql() {
             isolate "$target"
             measured="$(measure_median "$url" "" "$body")"
             record graphql "$label" "$target" "$measured" ok
+            gate_capture graphql "$label" "$target" "$url" "$body" "$measured"
         done
         unisolate
     done
@@ -691,10 +794,16 @@ bench_gql() {
 bench_rest
 bench_gql
 
+# Memory is read before the gate runs, not after. The gate re-measures a single
+# target, and charging that one target for ~90k requests the others never
+# served would make the memory column a record of who happened to be measured
+# first.
 RSS_FINAL=()
 for i in "${!TARGETS[@]}"; do
     RSS_FINAL[$i]="$(container_rss_kb "$(container_of "${TARGETS[$i]}")")"
 done
+
+gate_run
 
 # ---------------------------------------------------------------------------
 # Report
@@ -705,6 +814,10 @@ echo "==========================================================================
 echo " Postrust vs PostgREST, Hasura, PostGraphile"
 echo "==========================================================================="
 printf ' host           : %s\n' "$(uname -srm)"
+printf ' cpu            : %s\n' "$(host_cpu_model)"
+printf ' cpu state      : %s\n' "$(host_cpu_cond)"
+printf ' pinning        : db=%s server=%s load=%s\n' \
+    "${CPUSET_DB:-none}" "${CPUSET_SERVER:-none}" "${CPUSET_LOAD:-none}"
 printf ' variant        : %s\n' "$VARIANT"
 printf ' postgres       : %s\n' "$PG_IMAGE"
 printf ' load generator : %s (n=%s, c=%s)\n' "$LOAD_TOOL" "$REQUESTS" "$CONCURRENCY"
@@ -734,6 +847,13 @@ print_matrix() {
     echo
 }
 
+echo "Self-consistency"
+printf ' the first measurement (%s / %s) repeated as the last action of the run\n' \
+    "${GATE_NAME:-n/a}" "${GATE_TARGET:-n/a}"
+printf ' first %s rps, last %s rps -- drift %s%% against a %s%% threshold: %s\n\n' \
+    "${GATE_FIRST_RPS:-n/a}" "${GATE_LAST_RPS:-n/a}" "${GATE_DRIFT:-n/a}" \
+    "$GATE_THRESHOLD_PCT" "$GATE_STATUS"
+
 print_matrix rest    "REST"
 print_matrix graphql "GraphQL"
 
@@ -755,6 +875,18 @@ echo
 {
     printf '{\n'
     printf '  "host": %s,\n' "$(jq -Rn --arg v "$(uname -srm)" '$v')"
+    printf '  "cpu": %s,\n' "$(jq -Rn --arg v "$(host_cpu_model)" '$v')"
+    printf '  "cpu_state": %s,\n' "$(jq -Rn --arg v "$(host_cpu_cond)" '$v')"
+    printf '  "pinning": {"db": %s, "server": %s, "load": %s},\n' \
+        "$(jq -Rn --arg v "${CPUSET_DB:-}" '$v')" \
+        "$(jq -Rn --arg v "${CPUSET_SERVER:-}" '$v')" \
+        "$(jq -Rn --arg v "${CPUSET_LOAD:-}" '$v')"
+    printf '  "self_consistency": {"scenario": %s, "target": %s, "first_rps": %s, "last_rps": %s, "drift_pct": %s, "threshold_pct": %s, "status": %s},\n' \
+        "$(jq -Rn --arg v "${GATE_NAME:-}" '$v')" \
+        "$(jq -Rn --arg v "${GATE_TARGET:-}" '$v')" \
+        "${GATE_FIRST_RPS:-null}" "${GATE_LAST_RPS:-null}" \
+        "${GATE_DRIFT:-null}" "$GATE_THRESHOLD_PCT" \
+        "$(jq -Rn --arg v "$GATE_STATUS" '$v')"
     printf '  "variant": %s,\n' "$(jq -Rn --arg v "$VARIANT" '$v')"
     printf '  "postgres": %s,\n' "$(jq -Rn --arg v "$PG_IMAGE" '$v')"
     printf '  "requests": %s,\n' "$REQUESTS"
@@ -799,3 +931,11 @@ jq -e . "$RESULTS_JSON" >/dev/null || die "results.json is not valid JSON"
 
 log "wrote $RESULTS_JSON"
 echo "Numbers published on the website are copied from this file."
+
+# Results are still written -- they are needed to diagnose the drift -- but the
+# run exits non-zero so nothing downstream treats them as publishable.
+if [[ "$GATE_STATUS" == FAIL* ]]; then
+    warn "self-consistency FAILED: ${GATE_DRIFT}% drift over the run (threshold ${GATE_THRESHOLD_PCT}%)"
+    warn "the machine did not hold still; these numbers are not comparable across targets"
+    exit 1
+fi
