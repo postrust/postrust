@@ -232,11 +232,18 @@ export const ComparisonPage = component$<Props>(({ comparison: c }) => {
                   ))}
                 </ul>
                 <p class="mt-4 text-sm text-neutral-500">
-                  {benchMeta.host} · PostgreSQL {benchMeta.postgres} ·{" "}
-                  {benchMeta.dataset} · {benchMeta.requests} requests at
-                  concurrency {benchMeta.concurrency}, median of{" "}
-                  {benchMeta.repeats} runs after {benchMeta.warmup} warm-up
-                  requests.{" "}
+                  {benchMeta.cpu} · {benchMeta.cpuState} · PostgreSQL{" "}
+                  {benchMeta.postgres} · {benchMeta.dataset} ·{" "}
+                  {benchMeta.requests} requests at concurrency{" "}
+                  {benchMeta.concurrency}, median of {benchMeta.repeats} runs
+                  after {benchMeta.warmup} warm-up requests.
+                  {benchMeta.selfConsistency?.drift_pct != null && (
+                    <>
+                      {" "}
+                      The first measurement, repeated at the end of the run,
+                      differed by {benchMeta.selfConsistency.drift_pct}%.
+                    </>
+                  )}{" "}
                   <Link
                     href="/docs/benchmarks"
                     class="text-primary-600 hover:text-primary-700"

@@ -50,7 +50,11 @@ export const perfCaveats = [
   "Requests are expressed in each tool's own dialect, because the dialects differ. The work asked of PostgreSQL is the same.",
   "Every target is warmed before any of them is measured, and the database cache is populated first, so no tool pays to warm the cache for the ones measured after it.",
   "Each figure is the median of several runs rather than the best of them, because a best-of-N reports whichever tool got the quietest moment on the machine.",
-  "These are single-machine numbers from a laptop. They are useful for comparing the tools against each other, not for capacity planning.",
+  "Measured on dedicated bare metal with SMT disabled and the CPU held at a fixed 4317 MHz -- verified by sampling the clock across the run (0.82% spread), not by trusting the setting. Absolute figures carry that machine's firmware with them; the ratios do not.",
+  "Each component is confined to its own group of CPU cores -- database, server under test, and load generator -- so no two of them share an L3 cache slice. Every server gets the identical allocation.",
+  "The first measurement of a run is repeated as its last action. If the two disagree by more than 3%, the machine drifted under the harness and the run is rejected rather than published.",
+  "Every server runs in a container, which costs about 8.6% against the same binary run natively -- almost all of it Docker's network path rather than the container itself. It is charged to every tool equally.",
+  "These are single-machine numbers: the database, the server and the load generator share one host. They are useful for comparing the tools against each other, not for capacity planning.",
 ];
 
 export const comparisons: Comparison[] = [
