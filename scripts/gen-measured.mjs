@@ -143,6 +143,13 @@ export const benchMeta = {
    * is comparable across targets.
    */
   selfConsistency: ${JSON.stringify(primary.self_consistency ?? null)},
+  /**
+   * Whether the targets were verified to have answered each scenario with the
+   * same number of rows, and the REST targets with the same columns, before
+   * any of them was measured. A throughput figure over unequal work is not a
+   * comparison.
+   */
+  equivalence: ${JSON.stringify(primary.equivalence ?? null)},
 } as const;
 
 export interface VariantImages {

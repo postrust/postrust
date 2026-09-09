@@ -626,6 +626,99 @@ record() {
     printf '%s\t%s\t%s\t%s\t%s\n' "$1" "$2" "$3" "$4" "$5" >> "$RESULTS_TSV"
 }
 
+# --- Equivalence -----------------------------------------------------------
+#
+# Are the targets being asked the same question?
+#
+# Until this existed the harness checked an HTTP 200 for REST and a `data` key
+# for GraphQL, and nothing else. One server answering with a single row while
+# another returned twenty-five would have passed both, and the throughput
+# figures would have compared unequal work while looking perfectly healthy.
+#
+# What is compared, and why not more: the number of rows, always; and for REST,
+# the set of keys in the first row. Bytes cannot be compared, because the two
+# render `numeric` differently -- 0.1000 against 0.10 -- which is a real
+# difference and not one that makes the work unequal. GraphQL key sets are not
+# compared either: PostGraphile's dialect genuinely names fields differently
+# (`rowId` for `id`), so a mismatch there is expected rather than wrong.
+
+EQUIV_MISMATCHES=()
+EQUIV_FATAL=0
+
+# How many rows came back, and what columns the first one has.
+#
+# The shapes differ by dialect and all of them mean "rows": a REST body is a
+# bare array, Hasura puts one under `data.<table>`, PostGraphile under
+# `data.all<Table>.nodes` -- and for a lookup by key PostGraphile returns a
+# single *object* rather than an array of one. Treating that last case as "no
+# rows" was the first thing this check got wrong, and it read as the two
+# servers disagreeing when they did not.
+#
+# So: any array in the document is the row set; otherwise a lone object under
+# `data`, or a lone top-level object, is one row.
+shape_of() {
+    local payload="$1"
+    jq -r '
+        ([.. | arrays] | first) as $arr
+        | (if $arr != null then $arr
+           elif (type == "object" and has("data") and (.data | type) == "object")
+             then [(.data | to_entries | .[0].value // empty)]
+           elif type == "object" then [.]
+           else null end) as $rows
+        | if $rows == null then "n/a n/a"
+          else "\($rows | length) " +
+               (if ($rows | first | type) == "object"
+                then ($rows | first | keys | join(","))
+                else "scalar" end)
+          end
+    ' <<<"$payload" 2>/dev/null || echo "n/a n/a"
+}
+
+# Record a difference. Row counts differing is never legitimate -- it means the
+# two servers were asked for different amounts of work -- so it fails the run.
+# A key-set difference at the same row count is reported and does not.
+# `fatal` means the row counts differed, which is never a dialect difference.
+equiv_note() {
+    local severity="$1" message="$2"
+    EQUIV_MISMATCHES+=("$severity|$message")
+    [[ "$severity" == fatal ]] && EQUIV_FATAL=$((EQUIV_FATAL + 1))
+    warn "equivalence ($severity): $message"
+    return 0
+}
+
+check_rest_equivalence() {
+    local name="$1"; shift
+    local entry target url first_target="" first_rows="" first_keys=""
+    for entry in "$@"; do
+        target="${entry%%|*}"; url="${entry#*|}"
+        read -r rows keys <<<"$(shape_of "$(curl -s "$url")")"
+        if [[ -z "$first_target" ]]; then
+            first_target="$target"; first_rows="$rows"; first_keys="$keys"
+            continue
+        fi
+        if [[ "$rows" != "$first_rows" ]]; then
+            equiv_note fatal "$name: $first_target returned $first_rows rows, $target returned $rows -- not the same work"
+        elif [[ "$keys" != "$first_keys" ]]; then
+            equiv_note warn "$name: $first_target and $target agree on $rows rows but not on columns ($first_keys / $keys)"
+        fi
+    done
+}
+
+check_gql_equivalence() {
+    local name="$1"; shift
+    local entry target url body first_target="" first_rows=""
+    for entry in "$@"; do
+        IFS='|' read -r target url body <<<"$entry"
+        read -r rows _ <<<"$(shape_of "$(curl -s -H 'Content-Type: application/json' -d "$body" "$url")")"
+        if [[ -z "$first_target" ]]; then
+            first_target="$target"; first_rows="$rows"; continue
+        fi
+        if [[ "$rows" != "$first_rows" ]]; then
+            equiv_note fatal "$name: $first_target returned $first_rows rows, $target returned $rows -- not the same work"
+        fi
+    done
+}
+
 # --- Self-consistency gate -------------------------------------------------
 #
 # The first thing measured is remembered here and measured again as the last
@@ -728,6 +821,9 @@ bench_rest() {
             urls+=("$target|$url")
         done
 
+        # Before anything is measured: are they answering the same question?
+        check_rest_equivalence "$name" ${urls[@]+"${urls[@]}"}
+
         # Warm every target for this scenario before measuring any of them.
         # Measuring one tool while the cache is still cold and the next once it
         # is warm compares the cache, not the tools.
@@ -773,6 +869,8 @@ bench_gql() {
             # The body differs per target, so it travels with the endpoint.
             posts+=("$target|$url|$body")
         done
+
+        check_gql_equivalence "$label" ${posts[@]+"${posts[@]}"}
 
         for entry in "${posts[@]}"; do
             IFS='|' read -r _t _u _b <<<"$entry"
@@ -847,6 +945,18 @@ print_matrix() {
     echo
 }
 
+echo "Equivalence"
+if [[ ${#EQUIV_MISMATCHES[@]} -eq 0 ]]; then
+    printf ' every target answered each scenario with the same number of rows,\n'
+    printf ' and the REST targets with the same columns.\n\n'
+else
+    printf ' %s difference(s) between what the targets returned:\n' "${#EQUIV_MISMATCHES[@]}"
+    for m in "${EQUIV_MISMATCHES[@]}"; do
+        printf '   [%s] %s\n' "${m%%|*}" "${m#*|}"
+    done
+    echo
+fi
+
 echo "Self-consistency"
 printf ' the first measurement (%s / %s) repeated as the last action of the run\n' \
     "${GATE_NAME:-n/a}" "${GATE_TARGET:-n/a}"
@@ -881,6 +991,15 @@ echo
         "$(jq -Rn --arg v "${CPUSET_DB:-}" '$v')" \
         "$(jq -Rn --arg v "${CPUSET_SERVER:-}" '$v')" \
         "$(jq -Rn --arg v "${CPUSET_LOAD:-}" '$v')"
+    printf '  "equivalence": {"mismatches": ['
+    first=1
+    for m in ${EQUIV_MISMATCHES[@]+"${EQUIV_MISMATCHES[@]}"}; do
+        [[ $first -eq 0 ]] && printf ', '
+        first=0
+        printf '{"severity": %s, "detail": %s}' \
+            "$(jq -Rn --arg v "${m%%|*}" '$v')" "$(jq -Rn --arg v "${m#*|}" '$v')"
+    done
+    printf '], "fatal": %s},\n' "$EQUIV_FATAL"
     printf '  "self_consistency": {"scenario": %s, "target": %s, "first_rps": %s, "last_rps": %s, "drift_pct": %s, "threshold_pct": %s, "status": %s},\n' \
         "$(jq -Rn --arg v "${GATE_NAME:-}" '$v')" \
         "$(jq -Rn --arg v "${GATE_TARGET:-}" '$v')" \
@@ -934,6 +1053,12 @@ echo "Numbers published on the website are copied from this file."
 
 # Results are still written -- they are needed to diagnose the drift -- but the
 # run exits non-zero so nothing downstream treats them as publishable.
+if [[ "$EQUIV_FATAL" -gt 0 ]]; then
+    warn "$EQUIV_FATAL scenario(s) returned different numbers of rows from different targets"
+    warn "the servers were not asked the same question; these figures compare unequal work"
+    exit 1
+fi
+
 if [[ "$GATE_STATUS" == FAIL* ]]; then
     warn "self-consistency FAILED: ${GATE_DRIFT}% drift over the run (threshold ${GATE_THRESHOLD_PCT}%)"
     warn "the machine did not hold still; these numbers are not comparable across targets"

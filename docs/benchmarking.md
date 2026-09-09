@@ -209,6 +209,48 @@ A passing gate is a necessary condition, not a sufficient one. It proves the
 machine ended the run where it started, which is what the earlier virtualised
 runs could not do.
 
+## Are the targets answering the same question?
+
+Checked before anything is measured, because for a long time it was not.
+`rest_ok` looked for an HTTP 200 and `gql_ok` for a `data` key; neither compared
+what came back, so one server answering with a single row while another returned
+twenty-five would have passed and been measured as though the work were equal.
+
+`CPUSET`-pinned throughput of unequal work is still unequal work.
+
+So each scenario is fetched from every target first, and:
+
+- **Row counts must match.** A difference there is never a dialect difference,
+  so it fails the run.
+- **REST column sets must match.** A difference at the same row count is
+  reported and does not fail, since it can be a legitimate spelling difference.
+- **Bytes are deliberately not compared.** The two render `numeric` differently
+  -- `0.1000` against `0.10`, because `arbitrary_precision` preserves what
+  PostgreSQL sent -- which is a real difference that does not make the work
+  unequal. GraphQL field names are not compared either: PostGraphile genuinely
+  calls `id` `rowId`.
+
+## Why the REST gap is as large as it is
+
+Worth understanding before quoting the ratio. A point lookup measures about
+44,000 rps here against about 11,000 for PostgREST, and none of that gap is a
+cache, a pool size, or a difference in what comes back -- all three were
+measured and ruled out (see
+[`scripts/BENCH-FINDINGS.md`](../scripts/BENCH-FINDINGS.md)). Both servers issue
+exactly one query per request.
+
+The difference is the SQL. This server sends a plain parameterised `SELECT` and
+builds the JSON in Rust. PostgREST wraps the query in a CTE, computes a
+`count()`, builds the JSON inside PostgreSQL with `json_agg`, and reads three
+GUCs -- on every request, whether or not the client asked for a count or the
+function set a response header.
+
+So a large part of the ratio is **where each design does the work**, and
+PostgREST paying per-request for generality these scenarios do not use. That is
+a real architectural difference and a fair thing to measure. It is not evidence
+that this server's HTTP layer is four times faster, and the figure should not be
+read that way.
+
 ## What Docker costs
 
 Every server runs in a container so that none of them gets a native-vs-container
