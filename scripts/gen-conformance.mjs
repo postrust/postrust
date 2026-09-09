@@ -14,6 +14,7 @@
 // build features produces a number that looks exactly like a good one.
 
 import { readFileSync, writeFileSync } from "node:fs";
+import { spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
 
@@ -178,6 +179,21 @@ export const worstSpecs = ${JSON.stringify(worstSpecs, null, 2)};
 `;
 
 writeFileSync(OUT, body);
+
+// Format it here rather than leaving it to whoever regenerates next. The data
+// below is emitted with JSON.stringify, which quotes its keys and does not wrap
+// the way Prettier does, so raw output has never satisfied `prettier --check`.
+const fmt = spawnSync("npx", ["prettier", "--write", OUT], {
+  cwd: join(here, "..", "website"),
+  stdio: "ignore",
+  shell: process.platform === "win32",
+});
+if (fmt.status !== 0) {
+  console.warn(
+    `warning: could not run prettier on ${OUT} (exit ${fmt.status ?? "n/a"}). ` +
+      `Run \`npx prettier --write\` in website/ before committing.`,
+  );
+}
 console.log(`wrote ${OUT}`);
 console.log(
   `  ${meta.cases} cases: ${groups.all.statusAndBody.pct}% status+body, ` +
