@@ -28,87 +28,87 @@ export interface Group {
 }
 
 export const hasuraConformanceMeta = {
-  "hasura": "v2.50.1",
-  "features": "admin-ui,compat-key-order",
-  "referenceReused": false,
-  "commit": "ddc5291893ff847711a50f991d1e8517b6d4f52e",
-  "measured": "2026-08-29",
-  "cases": 468,
-  "groups": 59
+  hasura: "v2.50.1",
+  features: "admin-ui,compat-key-order",
+  referenceReused: false,
+  commit: "c0dbe0045aa9ba4203ac400dae36cd432b522670",
+  measured: "2026-09-09",
+  cases: 468,
+  groups: 59,
 } as const;
 
 export const hasuraConformance: Record<"all" | "reads" | "writes", Group> = {
-  "all": {
-    "cases": 468,
-    "status": {
-      "passed": 468,
-      "pct": 100
+  all: {
+    cases: 468,
+    status: {
+      passed: 468,
+      pct: 100,
     },
-    "sameOutcome": {
-      "passed": 466,
-      "pct": 99.6
+    sameOutcome: {
+      passed: 466,
+      pct: 99.6,
     },
-    "sameData": {
-      "passed": 456,
-      "pct": 97.4
+    sameData: {
+      passed: 456,
+      pct: 97.4,
     },
-    "fullBody": {
-      "passed": 452,
-      "pct": 96.6
-    }
+    fullBody: {
+      passed: 454,
+      pct: 97,
+    },
   },
-  "reads": {
-    "cases": 271,
-    "status": {
-      "passed": 271,
-      "pct": 100
+  reads: {
+    cases: 271,
+    status: {
+      passed: 271,
+      pct: 100,
     },
-    "sameOutcome": {
-      "passed": 270,
-      "pct": 99.6
+    sameOutcome: {
+      passed: 270,
+      pct: 99.6,
     },
-    "sameData": {
-      "passed": 260,
-      "pct": 95.9
+    sameData: {
+      passed: 260,
+      pct: 95.9,
     },
-    "fullBody": {
-      "passed": 259,
-      "pct": 95.6
-    }
+    fullBody: {
+      passed: 259,
+      pct: 95.6,
+    },
   },
-  "writes": {
-    "cases": 197,
-    "status": {
-      "passed": 197,
-      "pct": 100
+  writes: {
+    cases: 197,
+    status: {
+      passed: 197,
+      pct: 100,
     },
-    "sameOutcome": {
-      "passed": 196,
-      "pct": 99.5
+    sameOutcome: {
+      passed: 196,
+      pct: 99.5,
     },
-    "sameData": {
-      "passed": 196,
-      "pct": 99.5
+    sameData: {
+      passed: 196,
+      pct: 99.5,
     },
-    "fullBody": {
-      "passed": 193,
-      "pct": 98
-    }
-  }
+    fullBody: {
+      passed: 195,
+      pct: 99,
+    },
+  },
 };
 
 /** How the "same data" level divides: agreeing rows, and mutual refusals. */
 export const hasuraAgreement = {
-  "sameData": 325,
-  "bothRefuse": 131
+  sameData: 325,
+  bothRefuse: 131,
 };
 
 /** Where the remaining disagreement lives, worst first. */
 export const worstGroups = [
   {
-    "group": "graphql_query/computed_fields",
-    "total": 11,
-    "passed": 10,
-    "pct": 90.9
-  }
+    group: "graphql_query/computed_fields",
+    total: 11,
+    passed: 10,
+    pct: 90.9,
+  },
 ];

@@ -41,122 +41,122 @@ export const comparedHeaders = [
 ] as const;
 
 export const conformanceMeta = {
-  "postgrest": "v16.1",
-  "features": "admin-ui,compat-key-order",
-  "compatMode": true,
-  "commit": "c3026ad955b8ddcbfe5054431dae30a187ae8d1c",
-  "measured": "2026-08-29",
-  "cases": 1499
+  postgrest: "v16.1",
+  features: "admin-ui,compat-key-order",
+  compatMode: true,
+  commit: "c0dbe0045aa9ba4203ac400dae36cd432b522670",
+  measured: "2026-09-09",
+  cases: 1499,
 } as const;
 
 export const conformance: Record<"all" | "reads" | "writes", Group> = {
-  "all": {
-    "cases": 1499,
-    "status": {
-      "passed": 1478,
-      "pct": 98.6
+  all: {
+    cases: 1499,
+    status: {
+      passed: 1479,
+      pct: 98.7,
     },
-    "statusAndBody": {
-      "passed": 1450,
-      "pct": 96.7
+    statusAndBody: {
+      passed: 1451,
+      pct: 96.8,
     },
-    "exceptContentRange": {
-      "passed": 1427,
-      "pct": 95.2
+    exceptContentRange: {
+      passed: 1428,
+      pct: 95.3,
     },
-    "fullContract": {
-      "passed": 1423,
-      "pct": 94.9
-    }
+    fullContract: {
+      passed: 1424,
+      pct: 95,
+    },
   },
-  "reads": {
-    "cases": 1068,
-    "status": {
-      "passed": 1052,
-      "pct": 98.5
+  reads: {
+    cases: 1068,
+    status: {
+      passed: 1052,
+      pct: 98.5,
     },
-    "statusAndBody": {
-      "passed": 1028,
-      "pct": 96.3
+    statusAndBody: {
+      passed: 1028,
+      pct: 96.3,
     },
-    "exceptContentRange": {
-      "passed": 1010,
-      "pct": 94.6
+    exceptContentRange: {
+      passed: 1010,
+      pct: 94.6,
     },
-    "fullContract": {
-      "passed": 1009,
-      "pct": 94.5
-    }
+    fullContract: {
+      passed: 1009,
+      pct: 94.5,
+    },
   },
-  "writes": {
-    "cases": 431,
-    "status": {
-      "passed": 426,
-      "pct": 98.8
+  writes: {
+    cases: 431,
+    status: {
+      passed: 427,
+      pct: 99.1,
     },
-    "statusAndBody": {
-      "passed": 422,
-      "pct": 97.9
+    statusAndBody: {
+      passed: 423,
+      pct: 98.1,
     },
-    "exceptContentRange": {
-      "passed": 417,
-      "pct": 96.8
+    exceptContentRange: {
+      passed: 418,
+      pct: 97,
     },
-    "fullContract": {
-      "passed": 414,
-      "pct": 96.1
-    }
-  }
+    fullContract: {
+      passed: 415,
+      pct: 96.3,
+    },
+  },
 };
 
 /** Where the remaining disagreement lives, worst first. */
 export const worstSpecs = [
   {
-    "spec": "Query/RelatedQueriesSpec.hs",
-    "total": 36,
-    "passed": 33,
-    "pct": 91.7
+    spec: "Query/RelatedQueriesSpec.hs",
+    total: 36,
+    passed: 33,
+    pct: 91.7,
   },
   {
-    "spec": "Query/Preferences/MaxAffectedSpec.hs",
-    "total": 13,
-    "passed": 12,
-    "pct": 92.3
+    spec: "Query/Preferences/MaxAffectedSpec.hs",
+    total: 13,
+    passed: 12,
+    pct: 92.3,
   },
   {
-    "spec": "Query/SpreadQueriesSpec.hs",
-    "total": 56,
-    "passed": 52,
-    "pct": 92.9
+    spec: "Query/SpreadQueriesSpec.hs",
+    total: 56,
+    passed: 52,
+    pct: 92.9,
   },
   {
-    "spec": "Query/EmbedDisambiguationSpec.hs",
-    "total": 58,
-    "passed": 54,
-    "pct": 93.1
+    spec: "Query/EmbedDisambiguationSpec.hs",
+    total: 58,
+    passed: 54,
+    pct: 93.1,
   },
   {
-    "spec": "Query/EmbedInnerJoinSpec.hs",
-    "total": 57,
-    "passed": 54,
-    "pct": 94.7
+    spec: "Query/EmbedInnerJoinSpec.hs",
+    total: 57,
+    passed: 54,
+    pct: 94.7,
   },
   {
-    "spec": "Query/QuerySpec.hs",
-    "total": 301,
-    "passed": 286,
-    "pct": 95
+    spec: "Query/QuerySpec.hs",
+    total: 302,
+    passed: 287,
+    pct: 95,
   },
   {
-    "spec": "Query/UpsertSpec.hs",
-    "total": 60,
-    "passed": 57,
-    "pct": 95
+    spec: "Query/UpsertSpec.hs",
+    total: 60,
+    passed: 57,
+    pct: 95,
   },
   {
-    "spec": "Query/InsertSpec.hs",
-    "total": 82,
-    "passed": 78,
-    "pct": 95.1
-  }
+    spec: "Query/JsonOperatorSpec.hs",
+    total: 64,
+    passed: 61,
+    pct: 95.3,
+  },
 ];
