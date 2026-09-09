@@ -43,6 +43,29 @@ export interface Comparison {
   faq: FaqEntry[];
 }
 
+/**
+ * Figures that come from measurements the harness does not write into
+ * results.json -- the container-cost A/B/C, the dispersion across repeated
+ * runs, and the sampled clock. Recorded once, here, and read by every place
+ * that states them, so the homepage and the comparison pages cannot drift
+ * apart or quietly disagree with scripts/BENCH-FINDINGS.md.
+ */
+export const measurementContext = {
+  /** Container against the same binary run natively, on the point lookup. */
+  dockerCostPct: 8.6,
+  /** Of which this much is Docker's network path rather than the container. */
+  dockerNetworkPct: 7.3,
+  /** Clock sampled across a whole run, and the spread of those samples. */
+  clockMhz: 4317,
+  clockSpreadPct: 0.82,
+  /** Worst run-to-run spread, across three complete runs. */
+  spreadPct: { postrust: 0.8, hasura: 3.6, postgraphile: 3.0, postgrest: 19.6 },
+  /** What PostgREST's spread means for the multiples quoted against it. */
+  postgrestRatioTolerancePct: 10,
+} as const;
+
+const mc = measurementContext;
+
 /** Shared caveats shown under every performance table. */
 export const perfCaveats = [
   "Every server runs as a container on one docker network against the same PostgreSQL instance and the same dataset. No tool gets to skip container overhead.",
@@ -50,10 +73,11 @@ export const perfCaveats = [
   "Requests are expressed in each tool's own dialect, because the dialects differ. The work asked of PostgreSQL is the same.",
   "Every target is warmed before any of them is measured, and the database cache is populated first, so no tool pays to warm the cache for the ones measured after it.",
   "Each figure is the median of several runs rather than the best of them, because a best-of-N reports whichever tool got the quietest moment on the machine.",
-  "Measured on dedicated bare metal with SMT disabled and the CPU held at a fixed 4317 MHz -- verified by sampling the clock across the run (0.82% spread), not by trusting the setting. Absolute figures carry that machine's firmware with them; the ratios do not.",
+  `Measured on dedicated bare metal with SMT disabled and the CPU held at a fixed ${mc.clockMhz} MHz -- verified by sampling the clock across the run (${mc.clockSpreadPct}% spread), not by trusting the setting. Absolute figures carry that machine's firmware with them; the ratios do not.`,
   "Each component is confined to its own group of CPU cores -- database, server under test, and load generator -- so no two of them share an L3 cache slice. Every server gets the identical allocation.",
   "The first measurement of a run is repeated as its last action. If the two disagree by more than 3%, the machine drifted under the harness and the run is rejected rather than published.",
-  "Every server runs in a container, which costs about 8.6% against the same binary run natively -- almost all of it Docker's network path rather than the container itself. It is charged to every tool equally.",
+  `Every server runs in a container, which costs about ${mc.dockerCostPct}% against the same binary run natively -- ${mc.dockerNetworkPct} of those points are Docker's network path rather than the container itself. It is charged to every tool equally.`,
+  `Repeated whole runs agree to ${mc.spreadPct.postrust}% for Postrust and ${mc.spreadPct.hasura}% for the GraphQL servers, but only ${mc.spreadPct.postgrest}% for PostgREST. Multiples quoted against PostgREST carry roughly +/-${mc.postgrestRatioTolerancePct}%.`,
   "These are single-machine numbers: the database, the server and the load generator share one host. They are useful for comparing the tools against each other, not for capacity planning.",
 ];
 
@@ -188,7 +212,8 @@ export const comparisons: Comparison[] = [
       },
       {
         feature: "Permissions",
-        postrust: "Hasura's model from a JSON document, or PostgreSQL roles and RLS",
+        postrust:
+          "Hasura's model from a JSON document, or PostgreSQL roles and RLS",
         other: "Metadata, per role and per field",
       },
       {
