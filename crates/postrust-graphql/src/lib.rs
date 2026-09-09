@@ -3,6 +3,8 @@
 //! This crate provides GraphQL API generation from PostgreSQL schema,
 //! including queries, mutations, and subscriptions.
 
+#![warn(missing_docs)]
+
 pub mod error;
 pub mod scalar;
 pub mod types;

@@ -34,12 +34,17 @@ pub enum DbActionPlan {
     Read(ReadPlanTree),
     /// Mutation operation (INSERT/UPDATE/DELETE)
     MutateRead {
+        /// The write to perform.
         mutate: MutatePlan,
+        /// What to read back afterwards. `None` when the client asked for no
+        /// representation, in which case nothing is selected.
         read: Option<ReadPlanTree>,
     },
     /// RPC call
     Call {
+        /// The function call.
         call: CallPlan,
+        /// How to shape what the function returned, when it returns rows.
         read: Option<ReadPlanTree>,
     },
 }

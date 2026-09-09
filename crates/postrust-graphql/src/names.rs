@@ -180,12 +180,16 @@ impl RolePermissions {
 /// without restriction.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 pub struct RolePermissions {
+    /// Which rows the role may read. Absent means it may read none.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub select: Option<SelectPermission>,
+    /// What the role may insert. Absent means it may insert nothing.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub insert: Option<InsertPermission>,
+    /// Which rows the role may change. Absent means it may change none.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub update: Option<UpdatePermission>,
+    /// Which rows the role may delete. Absent means it may delete none.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub delete: Option<DeletePermission>,
 }
@@ -258,6 +262,7 @@ pub struct InsertPermission {
 /// has to satisfy.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 pub struct UpdatePermission {
+    /// The columns the role may write.
     #[serde(default)]
     pub columns: ColumnSet,
 
@@ -271,6 +276,8 @@ pub struct UpdatePermission {
     #[serde(default, skip_serializing_if = "serde_json::Value::is_null")]
     pub check: serde_json::Value,
 
+    /// Columns forced to a fixed value on every update, whatever the request
+    /// asked for. Hasura's `set`, used for things like an updated-at stamp.
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub set: HashMap<String, serde_json::Value>,
 }
@@ -278,6 +285,7 @@ pub struct UpdatePermission {
 /// Which rows a role may delete.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 pub struct DeletePermission {
+    /// Which rows may be deleted. Null means every row the role can see.
     #[serde(default, skip_serializing_if = "serde_json::Value::is_null")]
     pub filter: serde_json::Value,
 }

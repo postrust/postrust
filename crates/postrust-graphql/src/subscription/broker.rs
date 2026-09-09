@@ -304,12 +304,16 @@ impl NotifyBroker {
 /// Errors that can occur in the broker.
 #[derive(Debug, thiserror::Error)]
 pub enum BrokerError {
+    /// The listening connection failed, or could not be established.
     #[error("Database error: {0}")]
     Database(#[from] sqlx::Error),
 
+    /// A channel was addressed that the broker is not listening on.
     #[error("Channel not found: {0}")]
     ChannelNotFound(String),
 
+    /// `run` was called on a broker that is already running. Two listeners on
+    /// one broker would each deliver every notification.
     #[error("Broker is already running")]
     AlreadyRunning,
 }

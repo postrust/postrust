@@ -28,6 +28,7 @@
 //! let (sql, params) = build_query(&plan)?;
 //! ```
 
+#![warn(missing_docs)]
 // The `Error` enum carries a rich `DatabaseError` payload (PostgREST-style error
 // bodies), which makes it larger than clippy's `Result`/enum size thresholds.
 // Boxing it would ripple through every construction site for little benefit, so

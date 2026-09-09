@@ -14,6 +14,7 @@ pub enum Error {
     // ========================================================================
     // Request Parsing Errors (4xx)
     // ========================================================================
+    /// The request path does not name a resource this API serves.
     #[error("Invalid path: {0}")]
     InvalidPath(String),
 
@@ -25,6 +26,8 @@ pub enum Error {
     #[error("Use of aggregate functions is not allowed")]
     AggregatesNotAllowed,
 
+    /// A query parameter this API does not accept, or one whose value is not
+    /// valid for it.
     #[error("Invalid query parameter: {0}")]
     InvalidQueryParam(String),
 
@@ -47,12 +50,16 @@ pub enum Error {
         expected: String,
     },
 
+    /// A request header whose value this server cannot read. Names the header
+    /// only; the value may carry credentials.
     #[error("Invalid header: {0}")]
     InvalidHeader(&'static str),
 
+    /// The body did not parse, or does not fit the resource it was sent to.
     #[error("{0}")]
     InvalidBody(String),
 
+    /// An HTTP method this API does not implement for any resource.
     #[error("Unsupported HTTP method: {0}")]
     UnsupportedMethod(String),
 
@@ -70,10 +77,13 @@ pub enum Error {
     /// to correct the request and they are part of the API's own contract.
     #[error("Invalid schema: {requested}")]
     UnacceptableSchema {
+        /// The schema the profile header named.
         requested: String,
+        /// The schemas that are exposed, so the client can correct itself.
         exposed: Vec<String>,
     },
 
+    /// A column the request named that the relation does not have.
     #[error("Could not find the '{column}' column of '{relation}' in the schema cache")]
     UnknownColumn {
         /// The column the request named.
@@ -82,26 +92,36 @@ pub enum Error {
         relation: String,
     },
 
+    /// A `Range` header or `limit`/`offset` pair that cannot be satisfied.
     #[error("Requested range not satisfiable")]
     InvalidRange(String),
 
+    /// Content negotiation found nothing both sides accept.
     #[error("None of these media types are available: {0}")]
     InvalidMediaType(String),
 
+    /// A function argument the signature requires and the call omitted.
     #[error("Missing required parameter: {0}")]
     MissingParameter(String),
 
+    /// The request admits more than one reading and the server will not guess.
     #[error("Ambiguous request: {0}")]
     AmbiguousRequest(String),
 
     /// Several signatures of a function fit the arguments equally well.
     #[error("Could not choose the best candidate function between: {}", .candidates.join(", "))]
-    AmbiguousFunction { candidates: Vec<String> },
+    AmbiguousFunction {
+        /// The signatures that fit, as the client would have to distinguish
+        /// them.
+        candidates: Vec<String>,
+    },
 
     /// Several relationships connect the two resources and none was named.
     #[error("Could not embed because more than one relationship was found for '{origin}' and '{target}'")]
     AmbiguousRelationship {
+        /// The resource being embedded from.
         origin: String,
+        /// The resource being embedded.
         target: String,
         /// Each candidate as `(cardinality, description)`.
         candidates: Vec<(String, String)>,
@@ -136,18 +156,22 @@ pub enum Error {
     #[error("{0}")]
     JwtClaim(String),
 
+    /// Nothing said who is asking, and no anonymous role is configured to be.
     #[error("Anonymous access is disabled")]
     MissingAuth,
 
+    /// The caller is known and the role it resolved to may not do this.
     #[error("Insufficient permissions: {0}")]
     InsufficientPermissions(String),
 
     // ========================================================================
     // Resource Errors (404)
     // ========================================================================
+    /// Nothing at this path, where no more specific variant applies.
     #[error("Resource not found: {0}")]
     NotFound(String),
 
+    /// No table, view or foreign table of this name in the exposed schema.
     #[error("Table not found: {name}")]
     TableNotFound {
         /// The name the request asked for, schema-qualified.
@@ -196,9 +220,12 @@ pub enum Error {
     #[error("geometry column is missing")]
     MissingGeometryColumn,
 
+    /// A column named in the request that the relation does not have. Prefer
+    /// [`Error::UnknownColumn`], which also says which relation was searched.
     #[error("Column not found: {0}")]
     ColumnNotFound(String),
 
+    /// Nothing connects the two resources, so the embed cannot be planned.
     #[error("Could not find a relationship between '{origin}' and '{target}' in the schema cache")]
     RelationshipNotFound {
         /// The table the embedding started from.
@@ -289,36 +316,49 @@ pub enum Error {
     // ========================================================================
     // Schema Cache Errors
     // ========================================================================
+    /// A request arrived before the schema had been read. Transient at
+    /// start-up; persistent means the initial load failed.
     #[error("Schema cache not loaded")]
     SchemaCacheNotLoaded,
 
+    /// Reading the schema from PostgreSQL failed. Usually a missing privilege
+    /// on the catalogue rather than a fault in the schema itself.
     #[error("Schema cache load failed: {0}")]
     SchemaCacheLoadFailed(String),
 
     // ========================================================================
     // Database Errors (500/4xx depending on type)
     // ========================================================================
+    /// PostgreSQL refused the statement. The SQLSTATE decides the HTTP status,
+    /// so this is not always a 500.
     #[error("Database error: {0}")]
     Database(#[from] DatabaseError),
 
+    /// No connection could be obtained: the pool is exhausted, or the database
+    /// is unreachable.
     #[error("Connection pool error: {0}")]
     ConnectionPool(String),
 
     // ========================================================================
     // Internal Errors (500)
     // ========================================================================
+    /// A fault in this server. Always a bug; the message is for its log rather
+    /// than for the client to act on.
     #[error("Internal error: {0}")]
     Internal(String),
 
+    /// The server was started with a setting it cannot act on.
     #[error("Configuration error: {0}")]
     Config(String),
 
     // ========================================================================
     // Plan Errors
     // ========================================================================
+    /// The request parsed and no execution plan could be built from it.
     #[error("Invalid plan: {0}")]
     InvalidPlan(String),
 
+    /// An embed that cannot be planned, where no more specific variant fits.
     #[error("Embedding error: {0}")]
     EmbeddingError(String),
 }
@@ -629,10 +669,6 @@ impl Error {
     }
 }
 
-/// How a function's argument list reads in an error message.
-///
-/// PostgREST words the no-argument case differently rather than printing an
-/// empty list, and the messages are matched verbatim by clients.
 /// How the message spells the type of a single unnamed JSON parameter.
 ///
 /// It is the one media type that can also carry named arguments, so it reads
@@ -647,6 +683,10 @@ pub fn names_only_one_param(single_param: Option<&str>) -> bool {
     matches!(single_param, Some(other) if other != JSON_PARAM)
 }
 
+/// How a function's argument list reads in an error message.
+///
+/// PostgREST words the no-argument case differently rather than printing an
+/// empty list, and the messages are matched verbatim by clients.
 pub fn function_signature(name: &str, params: &[String]) -> String {
     match params.is_empty() {
         true => format!("{} without parameters", name),
@@ -666,12 +706,20 @@ fn describe_params(params: &[String]) -> String {
 #[derive(Error, Debug)]
 #[error("Database error [{code}]: {message}")]
 pub struct DatabaseError {
+    /// The five-character SQLSTATE. This decides the HTTP status, so it is the
+    /// field that matters most.
     pub code: String,
+    /// PostgreSQL's primary message.
     pub message: String,
+    /// PostgreSQL's detail field, where it sent one.
     pub details: Option<String>,
+    /// PostgreSQL's hint field, where it sent one.
     pub hint: Option<String>,
+    /// The constraint that was violated, for the integrity SQLSTATEs.
     pub constraint: Option<String>,
+    /// The table the failure concerns, where PostgreSQL identified one.
     pub table: Option<String>,
+    /// The column the failure concerns, where PostgreSQL identified one.
     pub column: Option<String>,
 }
 

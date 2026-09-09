@@ -304,17 +304,23 @@ impl Relationship {
 pub enum Cardinality {
     /// One-to-Many: parent has many children
     O2M {
+        /// The foreign key constraint this was read from.
         constraint: String,
+        /// `(parent column, child column)` for each column in the key.
         columns: Vec<(String, String)>,
     },
     /// Many-to-One: child has one parent
     M2O {
+        /// The foreign key constraint this was read from.
         constraint: String,
+        /// `(child column, parent column)` for each column in the key.
         columns: Vec<(String, String)>,
     },
     /// One-to-One
     O2O {
+        /// The foreign key constraint this was read from.
         constraint: String,
+        /// `(this table's column, other table's column)` for each column.
         columns: Vec<(String, String)>,
         /// Whether this table is the parent in the relationship
         is_parent: bool,

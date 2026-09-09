@@ -3,6 +3,8 @@
 //! Provides a safe way to construct SQL queries without string concatenation,
 //! using parameterized queries to prevent SQL injection.
 
+#![warn(missing_docs)]
+
 mod builder;
 mod delete;
 mod expr;

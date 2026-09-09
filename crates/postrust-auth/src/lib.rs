@@ -2,6 +2,8 @@
 //!
 //! Provides JWT token validation and role extraction for PostgreSQL RLS.
 
+#![warn(missing_docs)]
+
 mod cache;
 mod claims;
 pub mod hasura;
@@ -80,18 +82,24 @@ impl Default for JwtConfig {
 /// is wrong".
 #[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
 pub enum ClaimFault {
+    /// `exp` is in the past.
     #[error("JWT expired")]
     Expired,
 
+    /// `nbf` is in the future: the token is valid, but not yet.
     #[error("JWT not yet valid")]
     NotYetValid,
 
+    /// `iat` is in the future, which usually means the two clocks disagree
+    /// rather than that the token is forged.
     #[error("JWT issued at future")]
     IssuedInFuture,
 
+    /// `aud` is present and does not list the audience this server accepts.
     #[error("JWT not in audience")]
     NotInAudience,
 
+    /// The payload decoded but is not a JSON object of claims.
     #[error("Parsing claims failed")]
     Unparsable,
 
@@ -99,6 +107,7 @@ pub enum ClaimFault {
     #[error("The JWT '{0}' claim must be a number")]
     NotANumber(&'static str),
 
+    /// `aud` is present and is neither a string nor an array of strings.
     #[error("The JWT 'aud' claim must be a string or an array of strings")]
     AudienceNotStrings,
 }
@@ -110,12 +119,15 @@ pub enum JwtError {
     #[error("Anonymous access is disabled")]
     NoIdentity,
 
+    /// The `Authorization` header is not a bearer token this server can read.
     #[error("Unsupported token type")]
     InvalidHeaderFormat,
 
+    /// A token was presented and no secret is configured to verify it with.
     #[error("Server lacks JWT secret")]
     SecretMissing,
 
+    /// The signature did not verify under the key that was selected.
     #[error("JWT cryptographic operation failed")]
     InvalidSignature,
 

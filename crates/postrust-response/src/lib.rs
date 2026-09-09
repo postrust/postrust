@@ -2,6 +2,8 @@
 //!
 //! Handles content negotiation and response formatting for JSON, CSV, and other formats.
 
+#![warn(missing_docs)]
+
 mod headers;
 pub use headers::parse_guc_headers;
 mod json;
@@ -65,6 +67,11 @@ impl Response {
         }
     }
 
+    /// Set a header, replacing any already present under that name.
+    ///
+    /// A name or value that is not valid as an HTTP header is dropped rather
+    /// than reported: these are built from database output, and one bad GUC
+    /// should not fail an otherwise good response.
     pub fn set_header(&mut self, name: &str, value: &str) {
         if let Ok(v) = HeaderValue::from_str(value) {
             self.headers.insert(
@@ -419,17 +426,23 @@ pub struct QueryResult {
 /// Response formatting error.
 #[derive(Debug, thiserror::Error)]
 pub enum FormatError {
+    /// The rows could not be serialised. Reported as 500: the request was
+    /// answerable and this server failed to render the answer.
     #[error("JSON serialization error: {0}")]
     Json(#[from] serde_json::Error),
 
+    /// A singular response was asked for and no row matched.
     #[error("Resource not found")]
     NotFound,
 
+    /// A singular response was asked for and more than one row matched, which
+    /// is 406 rather than 500: the rows are fine, the requested shape is not.
     #[error("Multiple rows returned for singular response")]
     MultipleRows,
 }
 
 impl FormatError {
+    /// The HTTP status this failure is answered with.
     pub fn status_code(&self) -> StatusCode {
         match self {
             Self::Json(_) => StatusCode::INTERNAL_SERVER_ERROR,

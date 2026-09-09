@@ -113,6 +113,10 @@ impl TableObjectType {
         }
     }
 
+    /// Build the field for a table, under a name chosen by the caller.
+    ///
+    /// Separate from the unnamed constructor because a custom table name has
+    /// to reach the field before its type name is derived from it.
     pub fn from_table_named(
         table: &Table,
         base_name: &str,

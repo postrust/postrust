@@ -152,6 +152,11 @@ pub enum FuncVolatility {
 }
 
 impl FuncVolatility {
+    /// Read from `pg_proc.provolatile`, which is `i`, `s` or `v`.
+    ///
+    /// Anything else is treated as volatile: that is the assumption which
+    /// forbids the most, so an unrecognised value cannot make a function look
+    /// safer to call than it is.
     pub fn from_char(c: char) -> Self {
         match c {
             'i' => Self::Immutable,

@@ -98,7 +98,9 @@ pub struct EmbedPlan {
 /// The table a many-to-many relationship is joined through.
 #[derive(Clone, Debug)]
 pub struct EmbedJunction {
+    /// Schema holding the junction table.
     pub schema: String,
+    /// The junction table's name.
     pub table: String,
     /// `(parent column, junction column)` for each column the parent joins on.
     ///
@@ -802,6 +804,11 @@ pub fn group_from_aggregated(
     grouped
 }
 
+/// Group child rows by the value of one of their columns.
+///
+/// The join is done in SQL and the rows come back flat; this puts each child
+/// under the parent it belongs to. Keyed by the rendered value, so a parent
+/// with no children gets no entry rather than an empty one.
 pub fn group_by_key(
     children: Vec<serde_json::Value>,
     foreign_column: &str,
