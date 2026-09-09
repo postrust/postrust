@@ -9,7 +9,7 @@ import {
   hasuraAgreement,
 } from "~/data/hasura-conformance";
 
-const VERSION = "1.0.0-beta.1";
+const VERSION = "1.0.0";
 
 const added = [
   {
@@ -52,7 +52,8 @@ const fixed = [
     body: "Path-match type, methods and header criteria were all declarable and all ignored, and each silent omission widened a route past what its author wrote: an exact match on /health also caught /health-internal, and a route restricted to GET accepted DELETE.",
   },
   {
-    title: "Twelve dependency advisories, five of them in certificate validation",
+    title:
+      "Twelve dependency advisories, five of them in certificate validation",
     body: "An X.509 name-constraint bypass, two PKCS7 validation bypasses, a CRL scope error and a timing side channel — all in the path of a proxy that terminates TLS — plus four in the certificate-chain verifier and unbounded empty frames in the HTTP/2 library.",
   },
 ];
@@ -63,20 +64,25 @@ export default component$(() => {
 
   return (
     <div class="min-h-screen bg-white">
-      <div class="bg-gradient-to-b from-neutral-50 to-white border-b border-neutral-200">
+      <div class="border-b border-neutral-200 bg-gradient-to-b from-neutral-50 to-white">
         <div class="container-wide py-12">
-          <div class="flex items-center gap-3 mb-4">
-            <span class="px-2 py-0.5 text-xs font-semibold rounded bg-amber-100 text-amber-800 border border-amber-200">
+          <div class="mb-4 flex items-center gap-3">
+            <span class="rounded border border-amber-200 bg-amber-100 px-2 py-0.5 text-xs font-semibold text-amber-800">
               PRERELEASE
             </span>
-            <span class="text-sm text-neutral-500">{hasuraConformanceMeta.measured}</span>
+            <span class="text-sm text-neutral-500">
+              {hasuraConformanceMeta.measured}
+            </span>
           </div>
-          <h1 class="text-4xl font-bold text-neutral-900 mb-4">Postrust {VERSION}</h1>
-          <p class="text-lg text-neutral-600 max-w-2xl">
-            A release about the front door. The HTTP proxy was a library with no entry point and,
-            it turned out, had never routed a request from a file config. Making it runnable made
-            it testable, and testing it found the rest &mdash; a smuggling vector, a framing
-            ambiguity, and three transports that were missing rather than broken.
+          <h1 class="mb-4 text-4xl font-bold text-neutral-900">
+            Postrust {VERSION}
+          </h1>
+          <p class="max-w-2xl text-lg text-neutral-600">
+            A release about the front door. The HTTP proxy was a library with no
+            entry point and, it turned out, had never routed a request from a
+            file config. Making it runnable made it testable, and testing it
+            found the rest &mdash; a smuggling vector, a framing ambiguity, and
+            three transports that were missing rather than broken.
           </p>
         </div>
       </div>
@@ -85,116 +91,132 @@ export default component$(() => {
         <div class="max-w-3xl">
           {/* The numbers */}
           <section class="mb-12">
-            <h2 class="text-2xl font-bold text-neutral-900 mb-4">Measured, not asserted</h2>
-            <div class="grid sm:grid-cols-2 gap-4 mb-4">
+            <h2 class="mb-4 text-2xl font-bold text-neutral-900">
+              Measured, not asserted
+            </h2>
+            <div class="mb-4 grid gap-4 sm:grid-cols-2">
               <Link
                 href="/docs/conformance/postgrest"
-                class="block p-5 rounded-lg border border-neutral-200 hover:border-primary-400 transition-colors"
+                class="hover:border-primary-400 block rounded-lg border border-neutral-200 p-5 transition-colors"
               >
-                <div class="text-sm text-neutral-500 mb-1">
+                <div class="mb-1 text-sm text-neutral-500">
                   vs PostgREST {conformanceMeta.postgrest}
                 </div>
-                <div class="text-3xl font-bold text-neutral-900 font-mono">
+                <div class="font-mono text-3xl font-bold text-neutral-900">
                   {pg.statusAndBody.pct}%
                 </div>
-                <div class="text-sm text-neutral-600 mt-1">
+                <div class="mt-1 text-sm text-neutral-600">
                   status and body, over {pg.cases} replayed cases
                 </div>
-                <div class="text-sm text-neutral-500 mt-2">
+                <div class="mt-2 text-sm text-neutral-500">
                   {pg.fullContract.pct}% on the full contract, headers included
                 </div>
               </Link>
               <Link
                 href="/docs/conformance/hasura"
-                class="block p-5 rounded-lg border border-neutral-200 hover:border-primary-400 transition-colors"
+                class="hover:border-primary-400 block rounded-lg border border-neutral-200 p-5 transition-colors"
               >
-                <div class="text-sm text-neutral-500 mb-1">
+                <div class="mb-1 text-sm text-neutral-500">
                   vs Hasura {hasuraConformanceMeta.hasura}
                 </div>
-                <div class="text-3xl font-bold text-neutral-900 font-mono">
+                <div class="font-mono text-3xl font-bold text-neutral-900">
                   {hg.sameData.pct}%
                 </div>
-                <div class="text-sm text-neutral-600 mt-1">
-                  same data, over {hg.cases} cases in {hasuraConformanceMeta.groups} groups
+                <div class="mt-1 text-sm text-neutral-600">
+                  same data, over {hg.cases} cases in{" "}
+                  {hasuraConformanceMeta.groups} groups
                 </div>
-                <div class="text-sm text-neutral-500 mt-2">
-                  {hg.status.pct}% agree on status; {hg.fullBody.pct}% on the whole body
+                <div class="mt-2 text-sm text-neutral-500">
+                  {hg.status.pct}% agree on status; {hg.fullBody.pct}% on the
+                  whole body
                 </div>
               </Link>
             </div>
-            <p class="text-neutral-600 mb-4">
-              Neither harness interprets a test expectation. The reference implementation&rsquo;s
-              live response is the oracle, so a mistake in the extractor shows up as a case both
-              servers answer the same way rather than as a false failure. Of the{" "}
-              {hasuraAgreement.sameData + hasuraAgreement.bothRefuse} Hasura cases counted at that
-              level, {hasuraAgreement.sameData} agree about data and {hasuraAgreement.bothRefuse}{" "}
-              agree because both servers refuse — a distinction worth keeping, since counting only
-              the first would score a case where Hasura itself raises an error as a failure to
-              match it.
+            <p class="mb-4 text-neutral-600">
+              Neither harness interprets a test expectation. The reference
+              implementation&rsquo;s live response is the oracle, so a mistake
+              in the extractor shows up as a case both servers answer the same
+              way rather than as a false failure. Of the{" "}
+              {hasuraAgreement.sameData + hasuraAgreement.bothRefuse} Hasura
+              cases counted at that level, {hasuraAgreement.sameData} agree
+              about data and {hasuraAgreement.bothRefuse} agree because both
+              servers refuse — a distinction worth keeping, since counting only
+              the first would score a case where Hasura itself raises an error
+              as a failure to match it.
             </p>
             <p class="text-neutral-600">
-              Both numbers carry their provenance. Each harness builds its own candidate, because
-              which features it was built with is part of what is measured and cannot be read off
-              the binary, and records the reference version, the features, the commit and whether
-              the reference was replayed or a recording reused. The generators that put these
-              figures on this page read that record and refuse a run that cannot account for
-              itself. Nothing here is typed by hand.
+              Both numbers carry their provenance. Each harness builds its own
+              candidate, because which features it was built with is part of
+              what is measured and cannot be read off the binary, and records
+              the reference version, the features, the commit and whether the
+              reference was replayed or a recording reused. The generators that
+              put these figures on this page read that record and refuse a run
+              that cannot account for itself. Nothing here is typed by hand.
             </p>
           </section>
 
           {/* Transports */}
           <section class="mb-12">
-            <h2 class="text-2xl font-bold text-neutral-900 mb-4">The front door, measured</h2>
-            <div class="grid sm:grid-cols-2 gap-4 mb-4">
-              <div class="p-5 rounded-lg border border-neutral-200">
-                <div class="text-sm text-neutral-500 mb-1">h2spec</div>
-                <div class="text-3xl font-bold text-neutral-900 font-mono">
+            <h2 class="mb-4 text-2xl font-bold text-neutral-900">
+              The front door, measured
+            </h2>
+            <div class="mb-4 grid gap-4 sm:grid-cols-2">
+              <div class="rounded-lg border border-neutral-200 p-5">
+                <div class="mb-1 text-sm text-neutral-500">h2spec</div>
+                <div class="font-mono text-3xl font-bold text-neutral-900">
                   {h2spec.passed}/{h2spec.tests}
                 </div>
-                <div class="text-sm text-neutral-600 mt-1">
+                <div class="mt-1 text-sm text-neutral-600">
                   passed, {h2spec.failed} failed
                 </div>
-                <div class="text-sm text-neutral-500 mt-2">
+                <div class="mt-2 text-sm text-neutral-500">
                   {h2spec.skipped} skipped, against the HTTP/2-only listener
                 </div>
               </div>
-              <div class="p-5 rounded-lg border border-neutral-200">
-                <div class="text-sm text-neutral-500 mb-1">Autobahn</div>
-                <div class="text-3xl font-bold text-neutral-900 font-mono">
+              <div class="rounded-lg border border-neutral-200 p-5">
+                <div class="mb-1 text-sm text-neutral-500">Autobahn</div>
+                <div class="font-mono text-3xl font-bold text-neutral-900">
                   {autobahn.regressions.length}
                 </div>
-                <div class="text-sm text-neutral-600 mt-1">
+                <div class="mt-1 text-sm text-neutral-600">
                   cases the tunnel made worse than no tunnel
                 </div>
-                <div class="text-sm text-neutral-500 mt-2">
-                  over {autobahn.cases} cases, {autobahn.ok} of {autobahn.settledCases} OK
+                <div class="mt-2 text-sm text-neutral-500">
+                  over {autobahn.cases} cases, {autobahn.ok} of{" "}
+                  {autobahn.settledCases} OK
                 </div>
               </div>
             </div>
-            <p class="text-neutral-600 mb-4">
-              Three suites, none of them ours. <strong>HTTP Garden</strong>, a differential fuzzer
-              that sends a payload through a proxy and shows how a set of origin servers parsed
-              what came out, is what found the hop-by-hop defect. <strong>h2spec</strong> speaks
-              HTTP/2 at the listener. <strong>Autobahn</strong> is the reference WebSocket suite.
+            <p class="mb-4 text-neutral-600">
+              Three suites, none of them ours. <strong>HTTP Garden</strong>, a
+              differential fuzzer that sends a payload through a proxy and shows
+              how a set of origin servers parsed what came out, is what found
+              the hop-by-hop defect. <strong>h2spec</strong> speaks HTTP/2 at
+              the listener. <strong>Autobahn</strong> is the reference WebSocket
+              suite.
             </p>
-            <p class="text-neutral-600 mb-4">
-              The Autobahn figure needs its method stated, because the obvious number would be
-              misleading. Postrust splices two upgraded byte streams and never parses a WebSocket
-              frame, so most of what the suite scores belongs to the origin behind it, not to the
-              proxy. Every run therefore has a twin that bypasses the proxy entirely, and the
-              figure above is the difference: cases that are worse through the tunnel than without
-              it. Of {autobahn.cases} cases, {autobahn.failed} fails &mdash; and fails identically
-              with no proxy in the path, so it is the origin&rsquo;s.
+            <p class="mb-4 text-neutral-600">
+              The Autobahn figure needs its method stated, because the obvious
+              number would be misleading. Postrust splices two upgraded byte
+              streams and never parses a WebSocket frame, so most of what the
+              suite scores belongs to the origin behind it, not to the proxy.
+              Every run therefore has a twin that bypasses the proxy entirely,
+              and the figure above is the difference: cases that are worse
+              through the tunnel than without it. Of {autobahn.cases} cases,{" "}
+              {autobahn.failed} fails &mdash; and fails identically with no
+              proxy in the path, so it is the origin&rsquo;s.
             </p>
             <p class="text-neutral-600">
-              One family of cases is excluded from that comparison and named on every run rather
-              than dropped quietly: those that send a valid message, then an invalid frame, and
-              expect the echo of the first. The origin fails the connection without flushing that
-              echo when both arrive in one read, and any relay coalesces what a client chopped
-              &mdash; measured directly, with no proxy involved, the same bytes sent octet-wise
-              echo and sent as one write do not. Which member of the family trips varies between
-              runs, so the {autobahn.segmentationSensitive} of them are left out of the OK count
-              above rather than making it move between runs. On this run{" "}
+              One family of cases is excluded from that comparison and named on
+              every run rather than dropped quietly: those that send a valid
+              message, then an invalid frame, and expect the echo of the first.
+              The origin fails the connection without flushing that echo when
+              both arrive in one read, and any relay coalesces what a client
+              chopped &mdash; measured directly, with no proxy involved, the
+              same bytes sent octet-wise echo and sent as one write do not.
+              Which member of the family trips varies between runs, so the{" "}
+              {autobahn.segmentationSensitive} of them are left out of the OK
+              count above rather than making it move between runs. On this run{" "}
               {autobahn.intermittentCount === 0
                 ? "none of them was worse than the baseline"
                 : `${autobahn.intermittentCount} of them was worse than the baseline`}
@@ -204,36 +226,44 @@ export default component$(() => {
 
           {/* Alpha */}
           <section class="mb-12">
-            <div class="p-5 rounded-lg bg-amber-50 border border-amber-200">
-              <h2 class="text-lg font-bold text-neutral-900 mb-2">What the beta means</h2>
-              <p class="text-neutral-700 mb-2">
-                Everything on the checklist for a stable release is done except the one thing that
-                cannot be done from inside the repository: being used by somebody outside it. That
-                is what this beta is for.
+            <div class="rounded-lg border border-amber-200 bg-amber-50 p-5">
+              <h2 class="mb-2 text-lg font-bold text-neutral-900">
+                What 1.0.0 means
+              </h2>
+              <p class="mb-2 text-neutral-700">
+                No code changed between{" "}
+                <code class="text-sm">1.0.0-beta.1</code> and this release. What
+                changed is what can be said about it with evidence: the
+                throughput figures the beta withdrew are restored, measured on
+                dedicated bare metal behind a gate that rejects a run the
+                machine drifted under, and both conformance suites were re-run
+                against this commit from a clean tree.
               </p>
-              <p class="text-neutral-700 mb-2">
-                Seven crates share this version and will carry a semver promise at 1.0.0.{" "}
-                <code class="text-sm">postrust-proxy</code> and{" "}
-                <code class="text-sm">postrust-worker</code> are on their own 0.x lines and carry
-                none — the proxy because its surface is wide and nobody outside this repository has
-                depended on it yet, the worker because it is a stub. Nothing in the stable line
-                depends on either.
+              <p class="mb-2 text-neutral-700">
+                Seven crates share this version and carry a semver promise from
+                here — a breaking change to the public Rust API needs a major
+                bump. <code class="text-sm">postrust-proxy</code> and{" "}
+                <code class="text-sm">postrust-worker</code> are on their own
+                0.x lines and carry none — the proxy because its surface is wide
+                and nobody outside this repository has depended on it yet, the
+                worker because it is a stub. Nothing in the stable line depends
+                on either.
               </p>
               <p class="text-neutral-700">
-                The HTTP and GraphQL surfaces are the part meant to be stable. If you are pointing
-                a PostgREST or Hasura client at this, that is the contract the conformance reports
-                describe.
+                The HTTP and GraphQL surfaces are the part meant to be stable.
+                If you are pointing a PostgREST or Hasura client at this, that
+                is the contract the conformance reports describe.
               </p>
             </div>
           </section>
 
           {/* Added */}
           <section class="mb-12">
-            <h2 class="text-2xl font-bold text-neutral-900 mb-4">Added</h2>
+            <h2 class="mb-4 text-2xl font-bold text-neutral-900">Added</h2>
             <div class="space-y-4">
               {added.map((a) => (
-                <div key={a.title} class="p-4 bg-neutral-50 rounded-lg">
-                  <h3 class="font-semibold text-neutral-900 mb-1">{a.title}</h3>
+                <div key={a.title} class="rounded-lg bg-neutral-50 p-4">
+                  <h3 class="mb-1 font-semibold text-neutral-900">{a.title}</h3>
                   <p class="text-sm text-neutral-600">{a.body}</p>
                 </div>
               ))}
@@ -242,15 +272,16 @@ export default component$(() => {
 
           {/* Fixed */}
           <section class="mb-12">
-            <h2 class="text-2xl font-bold text-neutral-900 mb-4">Fixed</h2>
-            <p class="text-neutral-600 mb-4">
-              Every one of these was found by measurement rather than by a report, and each had
-              the same shape: the request succeeded, so nothing looked wrong.
+            <h2 class="mb-4 text-2xl font-bold text-neutral-900">Fixed</h2>
+            <p class="mb-4 text-neutral-600">
+              Every one of these was found by measurement rather than by a
+              report, and each had the same shape: the request succeeded, so
+              nothing looked wrong.
             </p>
             <div class="space-y-4">
               {fixed.map((f) => (
-                <div key={f.title} class="p-4 bg-neutral-50 rounded-lg">
-                  <h3 class="font-semibold text-neutral-900 mb-1">{f.title}</h3>
+                <div key={f.title} class="rounded-lg bg-neutral-50 p-4">
+                  <h3 class="mb-1 font-semibold text-neutral-900">{f.title}</h3>
                   <p class="text-sm text-neutral-600">{f.body}</p>
                 </div>
               ))}
@@ -259,107 +290,146 @@ export default component$(() => {
 
           {/* Breaking */}
           <section class="mb-12">
-            <h2 class="text-2xl font-bold text-neutral-900 mb-4">Breaking changes</h2>
-            <p class="text-neutral-600 mb-4">
-              These affect Rust code that depends on the crates. The HTTP and GraphQL surfaces are
-              unaffected, and a proxy configuration that worked before still works &mdash; every
-              new field has a default.
+            <h2 class="mb-4 text-2xl font-bold text-neutral-900">
+              Breaking changes
+            </h2>
+            <p class="mb-4 text-neutral-600">
+              These affect Rust code that depends on the crates. The HTTP and
+              GraphQL surfaces are unaffected, and a proxy configuration that
+              worked before still works &mdash; every new field has a default.
             </p>
             <ul class="space-y-2 text-neutral-600">
               <li>
-                <strong>The minimum Rust version is 1.88.</strong> It was previously undeclared,
-                and the README claimed 1.78. The floor moved as a direct cost of the security
-                updates below, which was a trade worth making.
+                <strong>The minimum Rust version is 1.88.</strong> It was
+                previously undeclared, and the README claimed 1.78. The floor
+                moved as a direct cost of the security updates below, which was
+                a trade worth making.
               </li>
               <li>
                 <strong>
                   <code class="font-mono text-sm">postrust-proxy</code> and{" "}
-                  <code class="font-mono text-sm">postrust-worker</code> left the shared version.
+                  <code class="font-mono text-sm">postrust-worker</code> left
+                  the shared version.
                 </strong>{" "}
-                They are on their own 0.x lines. Both still release on the same tags; nothing in
-                the stable line depends on either.
+                They are on their own 0.x lines. Both still release on the same
+                tags; nothing in the stable line depends on either.
               </li>
               <li>
-                <code class="font-mono text-sm">POST /config/reload</code> is gone. It answered
-                &ldquo;Configuration reload requested&rdquo; and reloaded nothing, sending on a
-                channel nobody read. Changing configuration needs a restart, which is now what the
+                <code class="font-mono text-sm">POST /config/reload</code> is
+                gone. It answered &ldquo;Configuration reload requested&rdquo;
+                and reloaded nothing, sending on a channel nobody read. Changing
+                configuration needs a restart, which is now what the
                 documentation says.
               </li>
               <li>
-                A route declaring a path-match type, methods or header criteria now has them
-                enforced. They were previously ignored, so such a route matched{" "}
-                <em>more</em> traffic than it asked for &mdash; narrowing it is the fix, but it is
-                a behaviour change.
+                A route declaring a path-match type, methods or header criteria
+                now has them enforced. They were previously ignored, so such a
+                route matched <em>more</em> traffic than it asked for &mdash;
+                narrowing it is the fix, but it is a behaviour change.
               </li>
               <li>
-                The proxy&rsquo;s database-access layer and its row types are no longer public.
-                They mirror the schema, and publishing them would have frozen it.
+                The proxy&rsquo;s database-access layer and its row types are no
+                longer public. They mirror the schema, and publishing them would
+                have frozen it.
               </li>
             </ul>
           </section>
 
           {/* Gaps */}
           <section class="mb-12">
-            <h2 class="text-2xl font-bold text-neutral-900 mb-4">Known gaps</h2>
-            <p class="text-neutral-600 mb-4">
-              In the proxy: <strong>HTTP/3</strong> is not implemented, and neither is upstream
-              HTTP/2 over TLS &mdash; a backend can be told to speak h2c in cleartext, but there
-              is no ALPN on the upstream leg. There is no response cache and no retry or
-              circuit-breaking. One h2spec case, an invalid connection preface answered without
-              GOAWAY, fails on the shared HTTP/1.1-and-h2c port and passes on the HTTP/2-only one:
-              a port that sniffs its protocol cannot tell a corrupted preface from a malformed
-              HTTP/1 request. That is why the dedicated port exists, and why it is optional rather
-              than the default.
+            <h2 class="mb-4 text-2xl font-bold text-neutral-900">Known gaps</h2>
+            <p class="mb-4 text-neutral-600">
+              In the proxy: <strong>HTTP/3</strong> is not implemented, and
+              neither is upstream HTTP/2 over TLS &mdash; a backend can be told
+              to speak h2c in cleartext, but there is no ALPN on the upstream
+              leg. There is no response cache and no retry or circuit-breaking.
+              One h2spec case, an invalid connection preface answered without
+              GOAWAY, fails on the shared HTTP/1.1-and-h2c port and passes on
+              the HTTP/2-only one: a port that sniffs its protocol cannot tell a
+              corrupted preface from a malformed HTTP/1 request. That is why the
+              dedicated port exists, and why it is optional rather than the
+              default.
             </p>
-            <p class="text-neutral-600 mb-4">
-              Also in the proxy: <code class="font-mono text-sm">retry_count</code> on a route is
-              declarable and unread, and there is no configuration reload. Manual certificate
-              upload works; automatic issuance is HTTP-01 only, so no wildcards.
+            <p class="mb-4 text-neutral-600">
+              Also in the proxy:{" "}
+              <code class="font-mono text-sm">retry_count</code> on a route is
+              declarable and unread, and there is no configuration reload.
+              Manual certificate upload works; automatic issuance is HTTP-01
+              only, so no wildcards.
             </p>
-            <p class="text-neutral-600 mb-4">
-              In the dialects, unchanged from the previous alpha: the largest gap is{" "}
-              <strong>introspection</strong>, and it is not reachable from here &mdash;
-              async-graphql builds its own registry and keeps it private, so the directives it
-              installs and the order it lists types in cannot be changed from outside the library.
-              Eight of the sixteen remaining Hasura divergences are that one thing.
+            <p class="mb-4 text-neutral-600">
+              In the dialects, unchanged from the previous alpha: the largest
+              gap is <strong>introspection</strong>, and it is not reachable
+              from here &mdash; async-graphql builds its own registry and keeps
+              it private, so the directives it installs and the order it lists
+              types in cannot be changed from outside the library. Eight of the
+              sixteen remaining Hasura divergences are that one thing.
             </p>
             <p class="text-neutral-600">
-              Beside it: <code class="font-mono text-sm">_stream</code> subscriptions, the
-              cursor-based half of Hasura&rsquo;s subscription surface; and the OpenAPI document
-              PostgREST serves at <code class="font-mono text-sm">/</code>. Actions and Apollo
+              Beside it: <code class="font-mono text-sm">_stream</code>{" "}
+              subscriptions, the cursor-based half of Hasura&rsquo;s
+              subscription surface; and the OpenAPI document PostgREST serves at{" "}
+              <code class="font-mono text-sm">/</code>. Actions and Apollo
               federation are subsystems rather than gaps. The{" "}
-              <code class="font-mono text-sm">FINDINGS.md</code> files record the rest.
+              <code class="font-mono text-sm">FINDINGS.md</code> files record
+              the rest.
             </p>
           </section>
 
           {/* Install */}
           <section class="mb-12">
-            <h2 class="text-2xl font-bold text-neutral-900 mb-4">Try it</h2>
-            <div class="bg-neutral-900 rounded-xl overflow-hidden">
-              <div class="px-4 py-2 bg-neutral-800 border-b border-neutral-700">
+            <h2 class="mb-4 text-2xl font-bold text-neutral-900">Try it</h2>
+            <div class="overflow-hidden rounded-xl bg-neutral-900">
+              <div class="border-b border-neutral-700 bg-neutral-800 px-4 py-2">
                 <span class="text-sm text-neutral-400">bash</span>
               </div>
-              <pre class="p-4 text-sm overflow-x-auto">
+              <pre class="overflow-x-auto p-4 text-sm">
                 <code class="text-neutral-100">{`docker pull ghcr.io/postrust/postrust:v${VERSION}`}</code>
               </pre>
             </div>
-            <p class="text-sm text-neutral-500 mt-3">
-              A prerelease is not tagged <code class="font-mono">latest</code>, so it has to be
-              asked for by name.
+            <p class="mt-3 text-sm text-neutral-500">
+              A prerelease is not tagged <code class="font-mono">latest</code>,
+              so it has to be asked for by name.
             </p>
           </section>
 
-          <div class="flex items-center justify-between pt-8 border-t border-neutral-200">
-            <Link href="/docs/getting-started" class="flex items-center gap-2 text-neutral-600 hover:text-primary-600">
-              <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15 19l-7-7 7-7"/>
+          <div class="flex items-center justify-between border-t border-neutral-200 pt-8">
+            <Link
+              href="/docs/getting-started"
+              class="hover:text-primary-600 flex items-center gap-2 text-neutral-600"
+            >
+              <svg
+                class="h-4 w-4"
+                fill="none"
+                stroke="currentColor"
+                viewBox="0 0 24 24"
+              >
+                <path
+                  stroke-linecap="round"
+                  stroke-linejoin="round"
+                  stroke-width="2"
+                  d="M15 19l-7-7 7-7"
+                />
               </svg>
               Getting Started
             </Link>
-            <Link href="/docs/conformance" class="flex items-center gap-2 text-neutral-600 hover:text-primary-600">
+            <Link
+              href="/docs/conformance"
+              class="hover:text-primary-600 flex items-center gap-2 text-neutral-600"
+            >
               Conformance
-              <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 5l7 7-7 7"/>
+              <svg
+                class="h-4 w-4"
+                fill="none"
+                stroke="currentColor"
+                viewBox="0 0 24 24"
+              >
+                <path
+                  stroke-linecap="round"
+                  stroke-linejoin="round"
+                  stroke-width="2"
+                  d="M9 5l7 7-7 7"
+                />
               </svg>
             </Link>
           </div>
@@ -376,7 +446,7 @@ export const head: DocumentHead = {
     {
       name: "description",
       content:
-        "Postrust 1.0.0-beta.1: ACME certificate issuance tested against a real CA, database-backed proxy configuration, a declared and enforced MSRV, and twelve dependency advisories closed.",
+        "Postrust 1.0.0: seven crates with a semver promise, PostgREST conformance at 1424/1499 and Hasura at 454/468, and throughput figures restored on a measurement host that can prove it held still.",
     },
   ],
 };
