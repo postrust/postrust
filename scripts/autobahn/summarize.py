@@ -2,6 +2,7 @@
 """Summarise an Autobahn fuzzingclient report and decide whether to fail.
 
     summarize.py REPORT [BASELINE_REPORT]
+    summarize.py REPORT --recording-baseline
 
 The gate is deliberately narrow, because postrust is a transparent tunnel: it
 splices two upgraded byte streams and never parses a WebSocket frame. Most of
@@ -19,6 +20,14 @@ So:
                       of what this origin does; we measure the change.
   without a baseline: any FAILED fails, conservatively, since there is nothing
                       to attribute it against.
+  --recording-baseline: this report *is* the baseline, so there is nothing to
+                      attribute it against and nothing to attribute. It defines
+                      what the origin does, including what the origin fails.
+                      Failures are printed and do not gate. Judging the origin
+                      here would be backwards: a baseline run that goes red
+                      because the origin is imperfect never produces the
+                      reference the proxied run needs, and takes the whole
+                      suite down with it.
   UNIMPLEMENTED       reported as coverage, never a failure on its own. It means
                       the capability was not there to exercise, which for a
                       tunnel is a statement about the endpoint behind it.
@@ -97,8 +106,15 @@ def main(argv):
         print(__doc__)
         return 2
 
-    cases = load(argv[1])
-    baseline = load(argv[2]) if len(argv) > 2 else None
+    args = argv[1:]
+    recording_baseline = "--recording-baseline" in args
+    args = [a for a in args if a != "--recording-baseline"]
+
+    cases = load(args[0])
+    baseline = load(args[1]) if len(args) > 1 else None
+    if recording_baseline and baseline is not None:
+        print("error: --recording-baseline takes one report, not two.")
+        return 2
 
     counts = Counter(result.get("behavior", "?") for result in cases.values())
     total = sum(counts.values())
@@ -138,7 +154,11 @@ def main(argv):
             print(f"  {case}{note}")
         print()
 
-    if baseline is None:
+    if recording_baseline:
+        print("recording the baseline -- these define what the origin does.")
+        print("  the proxied run is measured against them, and fails only on")
+        print("  cases it makes worse.")
+    elif baseline is None:
         print("no baseline given -- every FAILED counts.")
         print("  run BASELINE=1 scripts/autobahn/run.sh to attribute them.")
         problems += len(failed)

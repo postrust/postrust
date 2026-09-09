@@ -170,7 +170,13 @@ BASELINE_REPORT="$HERE/reports-baseline/index.json"
 if [ -f "$REPORTS/index.json" ]; then
     # Pass the baseline when one exists: it turns on the regression check, which
     # is the only rule that really speaks to the tunnel.
-    if [ "$BASELINE" != "1" ] && [ -f "$BASELINE_REPORT" ]; then
+    if [ "$BASELINE" = "1" ]; then
+        # This run *is* the reference. What the origin fails is the thing being
+        # recorded, not a verdict on it, so the summary reports and does not
+        # gate -- otherwise an imperfect origin fails the baseline step and the
+        # proxied run never gets the baseline it needs.
+        python3 "$HERE/summarize.py" "$REPORTS/index.json" --recording-baseline
+    elif [ -f "$BASELINE_REPORT" ]; then
         python3 "$HERE/summarize.py" "$REPORTS/index.json" "$BASELINE_REPORT"
     else
         python3 "$HERE/summarize.py" "$REPORTS/index.json"
