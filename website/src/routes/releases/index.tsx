@@ -384,7 +384,7 @@ export default component$(() => {
                 <span class="text-sm text-neutral-400">bash</span>
               </div>
               <pre class="overflow-x-auto p-4 text-sm">
-                <code class="text-neutral-100">{`docker pull ghcr.io/postrust/postrust:v${VERSION}`}</code>
+                <code class="text-neutral-100">{`docker pull postrust/postrust:${VERSION}`}</code>
               </pre>
             </div>
             <p class="mt-3 text-sm text-neutral-500">

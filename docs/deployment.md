@@ -89,14 +89,12 @@ sudo systemctl status postrust
 
 ## Docker
 
-Two registries carry the same images, and two variants of each build:
+Images are published to Docker Hub, in two variants of each build:
 
 | | |
 |---|---|
-| `postrust/postrust:1.0.0` | Docker Hub, Debian base |
-| `postrust/postrust:1.0.0-alpine` | Docker Hub, Alpine base -- much smaller |
-| `ghcr.io/postrust/postrust:1.0.0` | GitHub Container Registry, Debian |
-| `ghcr.io/postrust/postrust:1.0.0-alpine` | GitHub Container Registry, Alpine |
+| `postrust/postrust:1.0.0` | Debian base |
+| `postrust/postrust:1.0.0-alpine` | Alpine base -- much smaller |
 
 `latest` and `latest-alpine` track the newest stable release and never a
 prerelease. `1.0` follows the newest patch of that minor.
