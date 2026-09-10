@@ -27,19 +27,13 @@ export const Footer = component$(() => {
       { href: "https://x.com/postrustorg", label: "Twitter / X", external: true },
       { href: "/community", label: "Contributing" },
     ],
-    company: [
-      { href: "/blog", label: "Blog" },
-      { href: "/about", label: "About" },
-      { href: "/privacy", label: "Privacy Policy" },
-      { href: "/terms", label: "Terms of Service" },
-    ],
   };
 
   return (
     <footer class="bg-neutral-950 text-neutral-300">
       <div class="container-wide section-padding">
         {/* Main Footer */}
-        <div class="grid grid-cols-2 md:grid-cols-5 gap-8 lg:gap-12">
+        <div class="grid grid-cols-2 md:grid-cols-4 gap-8 lg:gap-12">
           {/* Brand */}
           <div class="col-span-2 md:col-span-1">
             <Link href="/" class="flex items-center gap-2 mb-4">
@@ -154,21 +148,6 @@ export const Footer = component$(() => {
             </ul>
           </div>
 
-          <div>
-            <h4 class="text-sm font-semibold text-white mb-4">Company</h4>
-            <ul class="space-y-3">
-              {footerLinks.company.map((link) => (
-                <li key={link.href}>
-                  <Link
-                    href={link.href}
-                    class="text-sm text-neutral-400 hover:text-white transition-colors"
-                  >
-                    {link.label}
-                  </Link>
-                </li>
-              ))}
-            </ul>
-          </div>
         </div>
 
         {/* Bottom Bar */}

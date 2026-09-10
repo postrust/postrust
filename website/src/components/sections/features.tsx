@@ -3,13 +3,13 @@ import { component$ } from "@builder.io/qwik";
 const features = [
   {
     icon: "bolt",
-    title: "Blazing Fast",
-    description: "Written in Rust for maximum performance. Sub-millisecond response times and minimal memory footprint.",
+    title: "Fast, and Measured",
+    description: "44,324 requests/second on a point lookup at 1.1 ms median, on a host held still and gated for self-consistency. The method and the caveats are published with the figures.",
   },
   {
     icon: "cloud",
-    title: "Serverless-First",
-    description: "Native support for AWS Lambda. Single binary with ~50ms cold starts. No container overhead.",
+    title: "Runs on Lambda",
+    description: "A native AWS Lambda adapter with connection pooling, from the same binary that runs standalone. Cloudflare Workers is a stub pending Hyperdrive.",
   },
   {
     icon: "graphql",
@@ -39,7 +39,7 @@ const features = [
   {
     icon: "code",
     title: "PostgREST Compatible",
-    description: "Same query syntax and filtering operators. An opt-in compatibility mode serves canonical PostgREST paths and response shapes for drop-in migrations.",
+    description: "Same query syntax and filtering operators. An opt-in compatibility mode serves canonical PostgREST paths and response shapes, and matches on 1,424 of PostgREST's own 1,499 test cases.",
   },
   {
     icon: "api",
@@ -49,7 +49,7 @@ const features = [
   {
     icon: "package",
     title: "Single Binary",
-    description: "~5MB binary with no runtime dependencies. Deploy anywhere - Docker, Lambda, bare metal.",
+    description: "4.98 MiB with the admin UI, 2.93 MiB without, and no runtime dependencies. Deploy anywhere - Docker, Lambda, bare metal.",
   },
 ];
 

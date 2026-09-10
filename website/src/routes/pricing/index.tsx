@@ -52,11 +52,15 @@ const faqs = [
   },
   {
     question: "Can I use Postrust in production?",
-    answer: "Absolutely. Postrust is designed for production workloads with features like connection pooling, health checks, and comprehensive logging. Many teams run it in production today.",
+    answer: "1.0 is released and the API is stable, with connection pooling, health checks and structured logging. Be aware of what is and is not measured: 95% of PostgREST's own test suite and 97% of Hasura's pass, the remaining cases are listed on the conformance page, and only compatibility mode is covered by the PostgREST suite. Read those before you migrate something that matters.",
+  },
+  {
+    question: "Will the license change?",
+    answer: "No. The server stays MIT, there is no contributor licence agreement, and the enterprise tier is support and consulting rather than features held back from the open source build.",
   },
   {
     question: "How does Postrust compare to managed services?",
-    answer: "Postrust gives you full control over your infrastructure while being significantly more cost-effective. You can run it on your own servers, AWS Lambda, or any cloud provider without per-request pricing.",
+    answer: "You run it yourself, on your own servers, AWS Lambda or any cloud provider, with no per-request pricing and no vendor account in the request path. That is a trade: you also carry the upgrades, the monitoring and the on-call.",
   },
   {
     question: "Do you offer consulting services?",
