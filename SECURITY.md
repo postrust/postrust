@@ -12,7 +12,7 @@ starts the clock for everyone running the software, including people who cannot
 upgrade the same day.
 
 If the advisory form does not work for you, email
-[technology@bimaplan.co](mailto:technology@bimaplan.co) with `SECURITY` in the
+[founder@postrust.org](mailto:founder@postrust.org) with `SECURITY` in the
 subject.
 
 What helps most, in rough order:

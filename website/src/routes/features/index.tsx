@@ -96,8 +96,8 @@ const featureCategories = [
         description: "Automatic reconnection and subscription recovery",
       },
       {
-        name: "Low Latency",
-        description: "Sub-millisecond notification delivery",
+        name: "Push, Not Poll",
+        description: "Delivered on PostgreSQL's LISTEN/NOTIFY, not a polling loop",
       },
     ],
   },

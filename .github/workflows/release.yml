@@ -12,12 +12,10 @@ concurrency:
   cancel-in-progress: false
 
 env:
-  REGISTRY: ghcr.io
-  IMAGE_NAME: ${{ github.repository }}
+  # Docker Hub is the only registry images are published to.
   # docs/deployment.md, charts/postrust/values.yaml and the website all tell
-  # people to run `postrust/postrust`, which is Docker Hub. Until this was
-  # added nothing published there, so every one of those instructions was
-  # wrong -- `helm install` could not pull its own default image.
+  # people to run `postrust/postrust`, which is here, so this is the one that
+  # has to work -- `helm install` cannot pull its own default image otherwise.
   DOCKERHUB_IMAGE: postrust/postrust
 
 jobs:
@@ -88,7 +86,6 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: read
-      packages: write
     env:
       # Whether Docker Hub is configured, as a plain boolean. The `secrets`
       # context is not dependably available in a step-level `if`, and the
@@ -116,17 +113,19 @@ jobs:
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
-      - name: Log in to GHCR
-        uses: docker/login-action@v3
-        with:
-          registry: ${{ env.REGISTRY }}
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
+      # Docker Hub is the only registry now, so a missing secret means the
+      # release would publish nothing at all. Say so here rather than let the
+      # push fail further down with an authorization error that reads like a
+      # bad password.
+      - name: Require Docker Hub credentials
+        run: |
+          if [ "${HAS_DOCKERHUB}" != "true" ]; then
+            echo "::error::DOCKERHUB_TOKEN is not set, so this release would publish no images." \
+                 "Set DOCKERHUB_USERNAME and DOCKERHUB_TOKEN, with a token scoped Read & Write."
+            exit 1
+          fi
 
-      # Optional, so a fork or a repository without the secrets still releases
-      # to GHCR instead of failing outright.
       - name: Log in to Docker Hub
-        if: env.HAS_DOCKERHUB == 'true'
         uses: docker/login-action@v3
         with:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
@@ -136,12 +135,7 @@ jobs:
         id: meta
         uses: docker/metadata-action@v5
         with:
-          # `enable=` drops the Docker Hub tags entirely when the secret is
-          # absent, so the same build pushes to one registry or two without a
-          # second build step.
-          images: |
-            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
-            name=docker.io/${{ env.DOCKERHUB_IMAGE }},enable=${{ env.HAS_DOCKERHUB }}
+          images: docker.io/${{ env.DOCKERHUB_IMAGE }}
           flavor: ${{ matrix.flavor }}
           tags: |
             type=semver,pattern={{version}}
@@ -165,9 +159,9 @@ jobs:
           cache-to: type=gha,mode=max,scope=${{ matrix.variant }}
 
   # A push succeeding proves the workflow could write, not that anybody else
-  # can read. GHCR packages are private by default, which is a way for a
-  # release to go green while `docker pull` fails for every user. So the tags
-  # are pulled back with no credentials at all.
+  # can read -- a private repository is a way for a release to go green while
+  # `docker pull` fails for every user. So the tags are pulled back with no
+  # credentials at all.
   #
   # Its own job, and not a gate on the release: by the time this runs the
   # crates are already on crates.io, so withholding the GitHub Release would
@@ -177,13 +171,10 @@ jobs:
     needs: image
     if: github.ref_type == 'tag'
     runs-on: ubuntu-latest
-    env:
-      HAS_DOCKERHUB: ${{ secrets.DOCKERHUB_TOKEN != '' }}
     steps:
       - name: Pull anonymously
         run: |
           set -uo pipefail
-          docker logout ghcr.io >/dev/null 2>&1 || true
           docker logout >/dev/null 2>&1 || true
 
           version="${GITHUB_REF_NAME#v}"
@@ -199,20 +190,12 @@ jobs:
             fi
           }
 
-          check "${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${version}"
-          check "${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${version}-alpine"
-
-          if [ "${HAS_DOCKERHUB}" = "true" ]; then
-            check "docker.io/${{ env.DOCKERHUB_IMAGE }}:${version}"
-            check "docker.io/${{ env.DOCKERHUB_IMAGE }}:${version}-alpine"
-          else
-            echo "::warning::DOCKERHUB_TOKEN is not set, so nothing was published to Docker Hub." \
-                 "docs/deployment.md and the Helm chart both default to postrust/postrust there."
-          fi
+          check "docker.io/${{ env.DOCKERHUB_IMAGE }}:${version}"
+          check "docker.io/${{ env.DOCKERHUB_IMAGE }}:${version}-alpine"
 
           if [ "$failed" -ne 0 ]; then
-            echo "::error::Set the package visibility to Public: " \
-                 "https://github.com/orgs/postrust/packages/container/postrust/settings"
+            echo "::error::The repository at https://hub.docker.com/r/${{ env.DOCKERHUB_IMAGE }}" \
+                 "has to be public, and the push has to have actually happened."
             exit 1
           fi
 
@@ -246,11 +229,4 @@ jobs:
             ```
             docker pull ${{ env.DOCKERHUB_IMAGE }}:${{ github.ref_name }}
             docker pull ${{ env.DOCKERHUB_IMAGE }}:${{ github.ref_name }}-alpine
-            ```
-
-            Or from GitHub Container Registry:
-
-            ```
-            docker pull ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ github.ref_name }}
-            docker pull ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ github.ref_name }}-alpine
             ```

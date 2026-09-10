@@ -1,4 +1,4 @@
-import { component$, useSignal } from "@builder.io/qwik";
+import { component$ } from "@builder.io/qwik";
 import type { DocumentHead } from "@builder.io/qwik-city";
 
 const enterpriseFeatures = [
@@ -44,8 +44,6 @@ const iconPaths: Record<string, string> = {
 };
 
 export default component$(() => {
-  const formSubmitted = useSignal(false);
-
   return (
     <div class="min-h-screen bg-white">
       {/* Hero */}
@@ -108,144 +106,73 @@ export default component$(() => {
           <div class="max-w-2xl mx-auto">
             <div class="text-center mb-12">
               <h2 class="text-3xl font-bold text-neutral-900 mb-4">
-                Contact Sales
+                Talk to us
               </h2>
               <p class="text-lg text-neutral-600">
-                Tell us about your needs and we'll get back to you within one business day.
+                Support and consulting for teams running Postrust in
+                production.
               </p>
             </div>
 
-            {formSubmitted.value ? (
-              <div class="bg-green-50 border border-green-200 rounded-xl p-8 text-center">
-                <div class="w-16 h-16 bg-green-100 rounded-full flex items-center justify-center mx-auto mb-4">
-                  <svg class="w-8 h-8 text-green-600" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M5 13l4 4L19 7"/>
-                  </svg>
-                </div>
-                <h3 class="text-xl font-semibold text-neutral-900 mb-2">
-                  Thank you for reaching out!
-                </h3>
-                <p class="text-neutral-600">
-                  We've received your message and will get back to you within one business day.
-                </p>
-              </div>
-            ) : (
-              <form
-                class="bg-white rounded-2xl p-8 border border-neutral-200 shadow-sm"
-                preventdefault:submit
-                onSubmit$={() => {
-                  formSubmitted.value = true;
-                }}
+            <div class="bg-white rounded-2xl border border-neutral-200 shadow-sm p-8">
+              <p class="text-neutral-700 mb-6">
+                Enterprise support is handled by email, by the people who
+                maintain the server. There is no form and no sales team in
+                between.
+              </p>
+
+              <a
+                href="mailto:founder@postrust.org?subject=Postrust%20enterprise%20support"
+                class="inline-flex items-center gap-2 px-6 py-3 text-base font-semibold text-white bg-neutral-900 hover:bg-neutral-800 rounded-lg transition-colors"
               >
-                <div class="grid md:grid-cols-2 gap-6 mb-6">
-                  <div>
-                    <label class="block text-sm font-medium text-neutral-700 mb-2">
-                      First Name *
-                    </label>
-                    <input
-                      type="text"
-                      required
-                      class="w-full px-4 py-3 border border-neutral-300 rounded-lg focus:ring-2 focus:ring-primary-500 focus:border-primary-500 outline-none transition-colors"
-                      placeholder="John"
-                    />
-                  </div>
-                  <div>
-                    <label class="block text-sm font-medium text-neutral-700 mb-2">
-                      Last Name *
-                    </label>
-                    <input
-                      type="text"
-                      required
-                      class="w-full px-4 py-3 border border-neutral-300 rounded-lg focus:ring-2 focus:ring-primary-500 focus:border-primary-500 outline-none transition-colors"
-                      placeholder="Doe"
-                    />
-                  </div>
-                </div>
+                <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                  <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M3 8l7.89 5.26a2 2 0 002.22 0L21 8M5 19h14a2 2 0 002-2V7a2 2 0 00-2-2H5a2 2 0 00-2 2v10a2 2 0 002 2z"/>
+                </svg>
+                founder@postrust.org
+              </a>
 
-                <div class="mb-6">
-                  <label class="block text-sm font-medium text-neutral-700 mb-2">
-                    Work Email *
-                  </label>
-                  <input
-                    type="email"
-                    required
-                    class="w-full px-4 py-3 border border-neutral-300 rounded-lg focus:ring-2 focus:ring-primary-500 focus:border-primary-500 outline-none transition-colors"
-                    placeholder="john@company.com"
-                  />
-                </div>
-
-                <div class="mb-6">
-                  <label class="block text-sm font-medium text-neutral-700 mb-2">
-                    Company *
-                  </label>
-                  <input
-                    type="text"
-                    required
-                    class="w-full px-4 py-3 border border-neutral-300 rounded-lg focus:ring-2 focus:ring-primary-500 focus:border-primary-500 outline-none transition-colors"
-                    placeholder="Company Inc."
-                  />
-                </div>
-
-                <div class="mb-6">
-                  <label class="block text-sm font-medium text-neutral-700 mb-2">
-                    Team Size
-                  </label>
-                  <select class="w-full px-4 py-3 border border-neutral-300 rounded-lg focus:ring-2 focus:ring-primary-500 focus:border-primary-500 outline-none transition-colors">
-                    <option value="">Select team size</option>
-                    <option value="1-10">1-10 employees</option>
-                    <option value="11-50">11-50 employees</option>
-                    <option value="51-200">51-200 employees</option>
-                    <option value="201-1000">201-1000 employees</option>
-                    <option value="1000+">1000+ employees</option>
-                  </select>
-                </div>
-
-                <div class="mb-8">
-                  <label class="block text-sm font-medium text-neutral-700 mb-2">
-                    How can we help? *
-                  </label>
-                  <textarea
-                    required
-                    rows={4}
-                    class="w-full px-4 py-3 border border-neutral-300 rounded-lg focus:ring-2 focus:ring-primary-500 focus:border-primary-500 outline-none transition-colors resize-none"
-                    placeholder="Tell us about your project and requirements..."
-                  ></textarea>
-                </div>
-
-                <button
-                  type="submit"
-                  class="w-full py-4 px-6 text-base font-semibold text-white bg-neutral-900 hover:bg-neutral-800 rounded-lg transition-colors"
+              <p class="mt-6 text-sm text-neutral-500">
+                It helps to include your team size, what you are running today,
+                and what you need from a support agreement. Bug reports and
+                feature requests are better off in{" "}
+                <a
+                  href="https://github.com/postrust/postrust/issues"
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  class="text-primary-600 hover:text-primary-700"
                 >
-                  Submit Request
-                </button>
-
-                <p class="mt-4 text-center text-sm text-neutral-500">
-                  By submitting this form, you agree to our{" "}
-                  <a href="/privacy" class="text-primary-600 hover:text-primary-700">
-                    Privacy Policy
-                  </a>
-                  .
-                </p>
-              </form>
-            )}
+                  GitHub Issues
+                </a>
+                , where everyone can see them.
+              </p>
+            </div>
           </div>
         </div>
       </section>
 
-      {/* Trust */}
+      {/* Trust -- disabled until there are real logos to show.
+          Re-enable only when named companies have agreed to be listed:
+          five grey placeholders under "Trusted by teams at companies of
+          all sizes" claims social proof the project does not have yet,
+          and reads as an unfinished template.
+
+          Note: the inner `Placeholder logos` comment was dropped, since a
+          nested block comment would close this one early.
+
       <section class="section-padding">
         <div class="container-wide text-center">
           <p class="text-neutral-500 mb-8">
             Trusted by teams at companies of all sizes
           </p>
           <div class="flex flex-wrap items-center justify-center gap-12 opacity-50">
-            {/* Placeholder logos */}
             {[1, 2, 3, 4, 5].map((i) => (
               <div key={i} class="w-32 h-8 bg-neutral-200 rounded"></div>
             ))}
           </div>
         </div>
       </section>
+
+      */}
     </div>
   );
 });

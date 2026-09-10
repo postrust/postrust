@@ -30,22 +30,23 @@ export const HeroSection = component$(() => {
 
           {/* Subheadline */}
           <p class="text-lg md:text-xl text-neutral-600 max-w-2xl mx-auto mb-10">
-            High-performance REST & GraphQL API server for PostgreSQL,
-            written in Rust. Native AWS Lambda support with ~50ms cold starts.{" "}
+            One Rust binary that serves a PostgreSQL schema over REST and
+            GraphQL, with a native AWS Lambda adapter. It answers{" "}
             <Link
               href="/docs/conformance"
               class="underline decoration-neutral-300 underline-offset-4 hover:decoration-primary-600 hover:text-primary-700"
             >
-              Drop-in PostgREST replacement
-            </Link>
-            , and it speaks{" "}
+              PostgREST&rsquo;s dialect
+            </Link>{" "}
+            and{" "}
             <Link
               href="/docs/conformance/hasura"
               class="underline decoration-neutral-300 underline-offset-4 hover:decoration-primary-600 hover:text-primary-700"
             >
-              Hasura&rsquo;s GraphQL dialect
+              Hasura&rsquo;s
             </Link>
-            . Both measured against the servers they replace.
+            , and how closely is not a matter of opinion: each is measured by
+            replaying that server&rsquo;s own test suite against both.
           </p>
 
           {/* CTAs */}
@@ -88,19 +89,18 @@ export const HeroSection = component$(() => {
               <div class="p-6 text-left">
                 <pre class="text-sm md:text-base font-mono">
                   <code>
-                    <span class="text-neutral-500"># Start in seconds with Docker</span>
+                    <span class="text-neutral-500"># Postgres and the server, from a clone</span>
                     {"\n"}
                     <span class="text-green-400">$</span>
-                    <span class="text-neutral-100"> docker run -p 3000:3000 \</span>
+                    <span class="text-neutral-100"> git clone https://github.com/postrust/postrust</span>
                     {"\n"}
-                    <span class="text-neutral-100">    -e DATABASE_URL="postgres://..." \</span>
-                    {"\n"}
-                    <span class="text-neutral-100">    postrust/postrust</span>
+                    <span class="text-green-400">$</span>
+                    <span class="text-neutral-100"> cd postrust && docker compose up -d</span>
                     {"\n\n"}
                     <span class="text-neutral-500"># Your API is ready!</span>
                     {"\n"}
                     <span class="text-green-400">$</span>
-                    <span class="text-neutral-100"> curl localhost:3000/users</span>
+                    <span class="text-neutral-100"> curl localhost:3000/api/users</span>
                     {"\n"}
                     <span class="text-accent-400">[{`{"id":1,"name":"Alice"},{"id":2,"name":"Bob"}`}]</span>
                   </code>
@@ -121,7 +121,7 @@ export const HeroSection = component$(() => {
               <svg class="w-5 h-5 text-primary-500" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                 <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M13 10V3L4 14h7v7l9-11h-7z"/>
               </svg>
-              <span>~50ms Lambda Cold Start</span>
+              <span>95% of PostgREST&rsquo;s test suite</span>
             </div>
             <div class="flex items-center gap-2">
               <svg class="w-5 h-5 text-accent-500" fill="none" stroke="currentColor" viewBox="0 0 24 24">

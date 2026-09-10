@@ -38,7 +38,7 @@ discussions — and whenever someone is representing the project in public.
 ## Reporting
 
 Report abusive, harassing, or otherwise unacceptable behaviour to
-[technology@bimaplan.co](mailto:technology@bimaplan.co).
+[founder@postrust.org](mailto:founder@postrust.org).
 
 Every report will be reviewed and investigated promptly and fairly. Your
 privacy and safety as a reporter will be respected: we will not share your

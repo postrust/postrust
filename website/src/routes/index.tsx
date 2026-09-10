@@ -28,7 +28,7 @@ export const head: DocumentHead = {
     {
       name: "description",
       content:
-        "High-performance PostgreSQL REST & GraphQL API server written in Rust. Native AWS Lambda support with ~50ms cold starts. Drop-in PostgREST replacement that also speaks Hasura's GraphQL dialect.",
+        "One Rust binary serving a PostgreSQL schema over REST and GraphQL, with a native AWS Lambda adapter. It answers PostgREST's dialect and Hasura's, each measured by replaying that server's own test suite.",
     },
     {
       name: "keywords",
@@ -42,7 +42,7 @@ export const head: DocumentHead = {
     {
       property: "og:description",
       content:
-        "High-performance PostgreSQL REST & GraphQL API server written in Rust. Native AWS Lambda support with ~50ms cold starts.",
+        "One Rust binary serving a PostgreSQL schema over REST and GraphQL, with a native AWS Lambda adapter. Measured against PostgREST's and Hasura's own test suites.",
     },
     {
       property: "og:type",
@@ -63,7 +63,7 @@ export const head: DocumentHead = {
     {
       name: "twitter:description",
       content:
-        "High-performance PostgreSQL REST & GraphQL API server written in Rust. Native AWS Lambda support with ~50ms cold starts.",
+        "One Rust binary serving a PostgreSQL schema over REST and GraphQL, with a native AWS Lambda adapter. Measured against PostgREST's and Hasura's own test suites.",
     },
   ],
 };

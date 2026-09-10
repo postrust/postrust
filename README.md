@@ -20,8 +20,8 @@ Postrust is a serverless-first REST API server for PostgreSQL databases. Inspire
 
 **Why Postrust?**
 
-- **Serverless-first**: Native support for AWS Lambda and Cloudflare Workers
-- **Measured**: Conformance against PostgREST's and Hasura's own test corpora, re-run on a schedule. Throughput figures are withdrawn until the harness can be trusted — see [Benchmarks](#benchmarks)
+- **Serverless-first**: A native AWS Lambda adapter with connection pooling (Cloudflare Workers is a stub, pending Hyperdrive)
+- **Measured**: Conformance against PostgREST's and Hasura's own test corpora, re-run on a schedule, and throughput measured on a pinned bare-metal host behind a self-consistency gate — see [Benchmarks](#benchmarks)
 - **Compatible**: Familiar PostgREST-style API; near drop-in with an opt-in [compatibility mode](#postgrest-compatibility) (see [Differences from PostgREST](#differences-from-postgrest))
 - **Type-safe**: Parameterized queries prevent SQL injection by design
 - **Lightweight**: Single binary with no runtime dependencies
@@ -88,9 +88,13 @@ cargo build --release
 # Start PostgreSQL and Postrust
 docker-compose up -d
 
-# API is available at http://localhost:3000
-curl http://localhost:3000/users
+# API is available at http://localhost:3000, mounted under /api by default
+curl http://localhost:3000/api/users
 ```
+
+The REST surface is served under `/api` unless
+[compatibility mode](#postgrest-compatibility) is enabled, which moves it to
+the root. The examples further down use root-level paths and assume that mode.
 
 ### Configuration
 
@@ -550,38 +554,88 @@ postrust/
 
 ## Benchmarks
 
-**Throughput figures are withdrawn pending re-measurement.**
+AMD EPYC 9255, `governor=performance smt=off`, PostgreSQL 16, 30,000 requests
+at concurrency 50, median of 3 runs. The database, the server under test and
+the load generator each get their own CCD, and every target gets the identical
+core allocation. Figures are the harness's own output, via
+[`website/src/data/measured.ts`](website/src/data/measured.ts).
 
-The comparison benchmark was found to report the order of a run as much as the
-speed of a server: the same server, in the same container, measured seconds
-apart differed by about a factor of two, and scenarios measured earlier in a
-run read lower than ones measured later. The mechanism is not identified.
-Thermal throttling, measurement order, host load, a cold database, the bulk
-load, checkpointing, server and PostgreSQL start-up, container pausing and
-Docker's port forwarding are each ruled out by direct test.
+REST, against PostgREST v16.1 (requests/second, and median latency):
 
-[`scripts/BENCH-FINDINGS.md`](scripts/BENCH-FINDINGS.md) records the
-investigation. Numbers will return once they reproduce on a host without a
-virtualised Docker network, and once a measurement repeated at the start and
-the end of a run agrees with itself.
+| Scenario | Postrust | PostgREST | Ratio |
+|----------|---------:|----------:|------:|
+| point lookup | 44,324 (1.1 ms) | 10,958 (2.8 ms) | 4.0x |
+| 25-row page | 34,633 (1.4 ms) | 10,488 (4.0 ms) | 3.3x |
+| filtered + ordered page | 32,701 (1.5 ms) | 6,306 (6.6 ms) | 5.2x |
+| range filter on numeric | 30,837 (1.6 ms) | 7,099 (6.1 ms) | 4.3x |
+| 25-row page + embed | 20,093 (2.4 ms) | 2,152 (16.8 ms) | 9.3x |
 
-Size is not affected by any of this, and is deterministic:
+GraphQL, against Hasura v2.50.1 and PostGraphile, sent the same query text byte
+for byte:
+
+| Scenario | Postrust | Hasura | PostGraphile |
+|----------|---------:|-------:|-------------:|
+| single row by primary key | 32,146 | 9,650 (3.3x) | 14,127 (2.3x) |
+| 25-row page | 17,411 | 10,379 (1.7x) | 9,003 (1.9x) |
+| 25-row page + embed | 10,092 | 8,024 (1.3x) | 4,498 (2.2x) |
+
+### What these numbers are worth
+
+Read them as ratios rather than as capacity, and as a comparison of whole
+designs rather than of HTTP layers.
+
+- **Much of the REST gap is where each design does the work.** PostgREST wraps
+  every query in a CTE, computes a `count()`, builds the JSON inside PostgreSQL
+  and reads three GUCs via `current_setting` — on every request, whether or not
+  any of it was asked for. Postrust renders JSON itself. That is a real
+  difference and a real cost users pay, but it is *not* evidence that this
+  server's HTTP layer is four times faster.
+- **PostgREST's run-to-run spread is up to 19.6%**, against 0.8% for Postrust,
+  so multiples quoted against it carry roughly ±10%.
+- **A container costs about 8.6%** against the same binary run natively,
+  charged to every target equally.
+- **Absolutes carry this machine's BIOS.** The firmware ignores the OS
+  frequency request, so the clock is fixed but at the firmware's value.
+
+### The gate
+
+The first measurement of a run is repeated as the run's **last** action, and a
+disagreement beyond 3% fails the run. On the run above the two readings agreed
+to **0.1%**. Every target is also fetched and compared before anything is
+timed: mismatched row counts fail the run, because unequal work measured
+precisely is still unequal work.
+
+This matters more than the figures. A deliberately short 2,000-request window
+makes the same REST comparison read **13.1x instead of 4.0x**, from a run that
+looks perfectly healthy. The gate is what stands between a number like that and
+this table. An earlier set of figures was withdrawn for exactly that reason;
+[`scripts/BENCH-FINDINGS.md`](scripts/BENCH-FINDINGS.md) keeps that
+investigation, including the eight causes ruled out and the mechanism that was
+never identified.
+
+### Size and memory
+
+Deterministic, and unaffected by any of the above:
 
 | Resource | Measured |
 |----------|----------|
 | Binary size (`--features admin-ui`, as shipped) | 5,220,864 bytes (4.98 MiB) |
 | Binary size (default features) | 3,070,080 bytes (2.93 MiB) |
+| Image size (Alpine) | 34.9 MB |
+| RSS, idle / after the run (Alpine) | 2.8 MB / 21.6 MB |
 
-The method is unchanged and documented in
-[Benchmarking](docs/benchmarking.md), and the harness still runs:
+For comparison on the same host, PostgREST holds 53.5 MB RSS after the run,
+Hasura 204 MB and PostGraphile 102 MB.
+
+The method is documented in [Benchmarking](docs/benchmarking.md), and the
+harness runs:
 
 ```bash
 ./scripts/bench.sh
 ```
 
-What it measures against other servers is trustworthy in shape but not yet in
-number. Conformance is a separate matter and is unaffected: it measures whether
-two servers give the same answer, not how fast.
+Conformance is a separate matter: it measures whether two servers give the same
+answer, not how fast.
 
 ## Comparison with PostgREST
 
