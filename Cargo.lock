@@ -2334,7 +2334,7 @@ checksum = "05c8b63e8d9609db387f0324918f81d68fe27748f084ef092fb35954d0539a85"
 
 [[package]]
 name = "postrust-auth"
-version = "1.0.0"
+version = "1.0.1"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
@@ -2350,7 +2350,7 @@ dependencies = [
 
 [[package]]
 name = "postrust-core"
-version = "1.0.0"
+version = "1.0.1"
 dependencies = [
  "async-trait",
  "bytes",
@@ -2374,7 +2374,7 @@ dependencies = [
 
 [[package]]
 name = "postrust-graphql"
-version = "1.0.0"
+version = "1.0.1"
 dependencies = [
  "async-graphql",
  "async-graphql-axum",
@@ -2400,7 +2400,7 @@ dependencies = [
 
 [[package]]
 name = "postrust-lambda"
-version = "1.0.0"
+version = "1.0.1"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -2424,7 +2424,7 @@ dependencies = [
 
 [[package]]
 name = "postrust-proxy"
-version = "0.5.0"
+version = "0.5.1"
 dependencies = [
  "ahash",
  "anyhow",
@@ -2474,7 +2474,7 @@ dependencies = [
 
 [[package]]
 name = "postrust-response"
-version = "1.0.0"
+version = "1.0.1"
 dependencies = [
  "bytes",
  "http",
@@ -2489,7 +2489,7 @@ dependencies = [
 
 [[package]]
 name = "postrust-server"
-version = "1.0.0"
+version = "1.0.1"
 dependencies = [
  "anyhow",
  "async-graphql",
@@ -2512,6 +2512,7 @@ dependencies = [
  "sqlx",
  "thiserror 2.0.17",
  "tokio",
+ "toml",
  "tower 0.5.2",
  "tower-http",
  "tracing",
@@ -2521,7 +2522,7 @@ dependencies = [
 
 [[package]]
 name = "postrust-sql"
-version = "1.0.0"
+version = "1.0.1"
 dependencies = [
  "bytes",
  "chrono",
@@ -2534,7 +2535,7 @@ dependencies = [
 
 [[package]]
 name = "postrust-worker"
-version = "0.5.0"
+version = "0.5.1"
 dependencies = [
  "async-trait",
  "futures",
@@ -2963,9 +2964,9 @@ dependencies = [
 
 [[package]]
 name = "rustls"
-version = "0.23.35"
+version = "0.23.45"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "533f54bc6a7d4f647e46ad909549eda97bf5afc1585190ef692b4286b198bd8f"
+checksum = "0d41d731c7d2f962d1ccc364cec258de3c0e93b38c2fb3ba97ac74513048d634"
 dependencies = [
  "aws-lc-rs",
  "log",
@@ -3398,6 +3399,8 @@ dependencies = [
  "memchr",
  "once_cell",
  "percent-encoding",
+ "rustls",
+ "rustls-native-certs",
  "serde",
  "serde_json",
  "sha2",

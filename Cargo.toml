@@ -13,7 +13,7 @@ members = [
 ]
 
 [workspace.package]
-version = "1.0.0"
+version = "1.0.1"
 edition = "2021"
 # Verified, not assumed: 1.88.0 builds the workspace clean and 1.87.0 is
 # refused outright -- hickory-{net,proto,resolver} 0.26 and time 0.3.55 all
@@ -40,7 +40,27 @@ tower-http = { version = "0.6", features = ["cors", "trace", "compression-gzip"]
 hyper = { version = "1.5", features = ["full"] }
 
 # Database
-sqlx = { version = "0.8", features = ["runtime-tokio", "postgres", "json", "chrono", "uuid", "bigdecimal"] }
+#
+# `tls-rustls-ring-native-roots` and not an aws-lc-rs variant, which would
+# otherwise match the provider the rest of the tree is pinned to. The choice is
+# forced: sqlx 0.8 wires the system trust store only to the ring feature
+# (`_tls-rustls-ring-native-roots` -> `certs_from_native_store()`), while
+# `tls-rustls-aws-lc-rs` gets webpki's bundled roots and nothing else. Native
+# roots is the one that works for a database behind a private or
+# organisation-issued CA, and both runtime images already ship
+# `ca-certificates` (see ./Dockerfile and ./Dockerfile.alpine).
+#
+# This costs nothing and risks nothing. `ring` was already compiled in --
+# reqwest pulls it, so rustls has had both features on for as long as the proxy
+# has existed (see the comment on `install_crypto_provider` in
+# crates/postrust-proxy/src/tls/server.rs). And sqlx selects its provider
+# explicitly via `ClientConfig::builder_with_provider`, so it cannot collide
+# with the aws-lc-rs provider that crate installs process-wide.
+#
+# Without a TLS feature sqlx does not merely lack the option: `sslmode=require`
+# fails outright with "SQLx was built without TLS support enabled", and the
+# default `sslmode=prefer` silently connects in cleartext.
+sqlx = { version = "0.8", features = ["runtime-tokio", "tls-rustls-ring-native-roots", "postgres", "json", "chrono", "uuid", "bigdecimal"] }
 deadpool-postgres = "0.14"
 tokio-postgres = "0.7"
 
@@ -120,11 +140,11 @@ toml = "0.8"
 regex = "1"
 
 # Internal crates
-postrust-core = { version = "1.0.0", path = "crates/postrust-core" }
-postrust-sql = { version = "1.0.0", path = "crates/postrust-sql" }
-postrust-auth = { version = "1.0.0", path = "crates/postrust-auth" }
-postrust-response = { version = "1.0.0", path = "crates/postrust-response" }
-postrust-graphql = { version = "1.0.0", path = "crates/postrust-graphql" }
+postrust-core = { version = "1.0.1", path = "crates/postrust-core" }
+postrust-sql = { version = "1.0.1", path = "crates/postrust-sql" }
+postrust-auth = { version = "1.0.1", path = "crates/postrust-auth" }
+postrust-response = { version = "1.0.1", path = "crates/postrust-response" }
+postrust-graphql = { version = "1.0.1", path = "crates/postrust-graphql" }
 
 [profile.release]
 lto = true

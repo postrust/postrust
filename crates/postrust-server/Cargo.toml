@@ -85,3 +85,5 @@ async-graphql-axum = { version = "7", optional = true }
 
 [dev-dependencies]
 pretty_assertions.workspace = true
+# Parses the workspace manifest in tests/sqlx_tls_feature.rs.
+toml.workspace = true

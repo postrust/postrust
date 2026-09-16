@@ -2,7 +2,7 @@
 name = "postrust-worker"
 # Deliberately NOT `version.workspace = true`. This adapter is a stub, and the
 # rest of the workspace is heading for 1.0.0. See docs/stability.md.
-version = "0.5.0"
+version = "0.5.1"
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
