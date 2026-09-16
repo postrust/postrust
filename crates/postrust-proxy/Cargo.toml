@@ -7,7 +7,7 @@ keywords = ["proxy", "load-balancer", "tls", "acme", "http"]
 # Deliberately NOT `version.workspace = true`. The rest of the workspace is
 # heading for 1.0.0; this crate is not, and a shared version number would
 # promise a stability this crate cannot keep. See docs/stability.md.
-version = "0.5.0"
+version = "0.5.1"
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true

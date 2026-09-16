@@ -21,10 +21,13 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install Rust (stable)
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          components: rustfmt, clippy
+      # No channel named here: rust-toolchain.toml is the single place the
+      # version lives, so this job and a contributor run the same clippy.
+      # With `-D warnings` a version difference is a failure only one of them
+      # can see. rustup installs the pinned toolchain, and the components that
+      # file declares, on first use.
+      - name: Install Rust (from rust-toolchain.toml)
+        run: rustup show active-toolchain
 
       - uses: Swatinem/rust-cache@v2
 
@@ -68,8 +71,8 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install Rust (stable)
-        uses: dtolnay/rust-toolchain@stable
+      - name: Install Rust (from rust-toolchain.toml)
+        run: rustup show active-toolchain
 
       - uses: Swatinem/rust-cache@v2
         with:
@@ -116,8 +119,8 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install Rust (stable)
-        uses: dtolnay/rust-toolchain@stable
+      - name: Install Rust (from rust-toolchain.toml)
+        run: rustup show active-toolchain
 
       - uses: Swatinem/rust-cache@v2
 

@@ -3,6 +3,44 @@
 Notable changes, newest first. This file starts at 1.0.0-alpha.1; earlier
 releases are described by their tags and the pull requests behind them.
 
+## 1.0.1
+
+**The server could not talk to a hosted database over TLS, and did not say so.**
+`sqlx` was built without any TLS feature. Two consequences, neither of them
+visible from the logs:
+
+- `sslmode=require` failed outright, with "SQLx was built without TLS support
+  enabled". `docs/configuration.md` has carried that exact URL as an example
+  since before 1.0.0, so a documented configuration did not work.
+- The default `sslmode=prefer` does not fail when TLS is unavailable. It
+  connects in cleartext. Every 1.0.0 deployment against a hosted database --
+  RDS, Cloud SQL, Neon, Supabase -- was unencrypted on the wire unless it had
+  been given `sslmode=require` and had noticed the error.
+
+Fixed by enabling `tls-rustls-ring-native-roots`, which verifies against the
+host trust store rather than a bundled root list, so a database behind a
+private or organisation-issued CA works without rebuilding. `ca-certificates`
+was already installed in both published images. The reason that feature and not
+an aws-lc-rs one -- the choice is forced by sqlx, and costs nothing, because
+`ring` was already compiled in -- is recorded against the dependency in
+`Cargo.toml`.
+
+Thanks to @CBeardSafire, who found this and sent the fix in
+[#38](https://github.com/postrust/postrust/pull/38).
+
+`docs/configuration.md` now documents what each `sslmode` actually does,
+including that the default downgrades silently, and the production example asks
+for `verify-full` rather than `require` -- `require` encrypts but verifies
+nothing, which stops a passive listener and not an active one.
+
+A test asserts the feature stays enabled. It reads the parsed workspace
+manifest, because Cargo does not expose a dependency's feature selection to a
+dependent's `cfg`, and it accepts any of sqlx's TLS features so that revisiting
+which one is chosen does not fail the build.
+
+No API changed. `postrust-proxy` and `postrust-worker` go to 0.5.1 for the same
+fix, which reaches them through the workspace.
+
 ## 1.0.0
 
 The seven crates on the stable line -- `postrust-core`, `postrust-sql`,

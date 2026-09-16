@@ -1,0 +1,24 @@
+# The toolchain contributors and CI both build with. Not the MSRV.
+#
+# Two different numbers live in this repo and they answer different questions.
+# `[workspace.package] rust-version` in Cargo.toml is 1.88: the floor a crates.io
+# consumer must clear, verified by the `msrv` job in .github/workflows/ci.yml.
+# This file is what the workspace is *developed* on, and it tracks stable.
+#
+# Pinned because CI lints with `-D warnings`, which turns any difference in
+# clippy version into a hard failure. A contributor on a different toolchain
+# sees lints CI does not have, or misses lints CI will fail on, and neither can
+# reproduce the other. PR #38 hit exactly this: it reported
+# `manual_range_contains` firing on crates/postrust-graphql/src/hasura.rs from
+# clippy 1.95, which stable does not emit -- the lint stopped applying to
+# floats, and rightly so, since for NaN the suggested rewrite inverts the
+# branch.
+#
+# An exact version rather than "stable" so a new release cannot turn CI red
+# without a commit. The cost is bumping this deliberately; that is the point.
+#
+# `cargo +1.88 ...` still overrides this, which is why the msrv job keeps
+# working. Verified, not assumed.
+[toolchain]
+channel = "1.98.1"
+components = ["rustfmt", "clippy"]
