@@ -665,6 +665,15 @@ fn build_dynamic_schema(
     );
     if generated.enable_federation {
         builder = builder.enable_federation();
+        let entity_state = Arc::new(EntityResolverState::new(
+            generated,
+            Arc::clone(&relationships),
+            Arc::clone(&names),
+        ));
+        builder = builder.entity_resolver(move |ctx| {
+            let state = Arc::clone(&entity_state);
+            FieldFuture::new(async move { resolve_entities(&ctx, state.as_ref()).await })
+        });
     }
 
     // Register all object types
@@ -2656,6 +2665,276 @@ struct QueryFieldSpec {
     /// Set where the rows come from a function rather than from the table
     /// itself. Everything else about reading them is the same.
     call: Option<Arc<FunctionCall>>,
+}
+
+/// Everything `_entities` needs to resolve a representation to a table row.
+#[derive(Clone)]
+struct EntityLookup {
+    schema_name: String,
+    table_name: String,
+    type_name: String,
+    key_columns: Vec<EntityKeyColumn>,
+    row_column_types: HashMap<String, String>,
+}
+
+#[derive(Clone)]
+struct EntityKeyColumn {
+    field_name: String,
+    column_name: String,
+    pg_type: String,
+}
+
+/// The federation entity resolver's immutable schema view.
+struct EntityResolverState {
+    entities: HashMap<String, EntityLookup>,
+    relationships: Arc<HashMap<String, Vec<RelationshipField>>>,
+    names: Arc<crate::names::NameOverrides>,
+}
+
+impl EntityResolverState {
+    fn new(
+        generated: &GeneratedSchema,
+        relationships: Arc<HashMap<String, Vec<RelationshipField>>>,
+        names: Arc<crate::names::NameOverrides>,
+    ) -> Self {
+        let mut entities = HashMap::new();
+        for (type_name, entity) in &generated.federation_entities {
+            let Some(object) = generated.object_types.get(type_name) else {
+                continue;
+            };
+            let mut key_columns = Vec::with_capacity(entity.key_fields.len());
+            for field_name in &entity.key_fields {
+                let column_name = names
+                    .column_source(&object.table.schema, &object.table.name, field_name)
+                    .unwrap_or(field_name);
+                let Some(column) = object.table.get_column(column_name) else {
+                    continue;
+                };
+                key_columns.push(EntityKeyColumn {
+                    field_name: field_name.clone(),
+                    column_name: column.name.clone(),
+                    pg_type: column.nominal_type.clone(),
+                });
+            }
+            if key_columns.len() != entity.key_fields.len() {
+                continue;
+            }
+            entities.insert(
+                type_name.clone(),
+                EntityLookup {
+                    schema_name: object.table.schema.clone(),
+                    table_name: object.table.name.clone(),
+                    type_name: type_name.clone(),
+                    key_columns,
+                    row_column_types: exposed_column_types(&object.table, names.as_ref()),
+                },
+            );
+        }
+        Self {
+            entities,
+            relationships,
+            names,
+        }
+    }
+}
+
+struct EntityRepresentation {
+    index: usize,
+    type_name: String,
+    values: serde_json::Map<String, serde_json::Value>,
+}
+
+async fn resolve_entities<'a>(
+    ctx: &ResolverContext<'a>,
+    state: &EntityResolverState,
+) -> Result<Option<FieldValue<'a>>, async_graphql::Error> {
+    let representations = ctx.args.try_get("representations")?.list()?;
+    let mut grouped: HashMap<String, Vec<EntityRepresentation>> = HashMap::new();
+    let mut count = 0;
+    for (index, representation) in representations.iter().enumerate() {
+        count += 1;
+        let value = accessor_to_json(&representation);
+        let serde_json::Value::Object(values) = value else {
+            return Err(async_graphql::Error::new(
+                "entity representation must be an object",
+            ));
+        };
+        let type_name = values
+            .get("__typename")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| {
+                async_graphql::Error::new("entity representation is missing __typename")
+            })?
+            .to_string();
+        grouped
+            .entry(type_name.clone())
+            .or_default()
+            .push(EntityRepresentation {
+                index,
+                type_name,
+                values,
+            });
+    }
+
+    let mut resolved: Vec<Option<FieldValue<'a>>> =
+        std::iter::repeat_with(|| None).take(count).collect();
+    for (type_name, representations) in grouped {
+        let lookup = state.entities.get(&type_name).ok_or_else(|| {
+            async_graphql::Error::new(format!("unknown federation entity \"{}\"", type_name))
+        })?;
+        let rows = resolve_entity_group(ctx, lookup, &representations, state).await?;
+        for representation in representations {
+            let key = entity_key(&representation.values, &lookup.key_columns)?;
+            resolved[representation.index] = match rows.get(&key) {
+                Some(row) => Some(
+                    FieldValue::value(json_to_value(row.clone()))
+                        .with_type(representation.type_name),
+                ),
+                None => Some(FieldValue::value(Value::Null)),
+            };
+        }
+    }
+
+    Ok(Some(FieldValue::list(resolved.into_iter().map(|value| {
+        value.unwrap_or_else(|| FieldValue::value(Value::Null))
+    }))))
+}
+
+async fn resolve_entity_group(
+    ctx: &ResolverContext<'_>,
+    lookup: &EntityLookup,
+    representations: &[EntityRepresentation],
+    state: &EntityResolverState,
+) -> Result<HashMap<String, serde_json::Value>, async_graphql::Error> {
+    if representations.is_empty() {
+        return Ok(HashMap::new());
+    }
+
+    let pool = ctx.data::<PgPool>()?;
+    let gql_ctx = ctx.data::<GraphQLContext>()?;
+    let mut bound_values = Vec::new();
+    let mut disjuncts = Vec::with_capacity(representations.len());
+    for representation in representations {
+        let mut conjuncts = Vec::with_capacity(lookup.key_columns.len());
+        for key_column in &lookup.key_columns {
+            let value = representation
+                .values
+                .get(&key_column.field_name)
+                .ok_or_else(|| {
+                    async_graphql::Error::new(format!(
+                        "entity representation for \"{}\" is missing key field \"{}\"",
+                        lookup.type_name, key_column.field_name
+                    ))
+                })?;
+            conjuncts.push(format!(
+                "{}.{} = ${}::{}",
+                postrust_sql::escape_ident(READ_ROW),
+                postrust_sql::escape_ident(&key_column.column_name),
+                bound_values.len() + 1,
+                key_column.pg_type
+            ));
+            bound_values.push(value.clone());
+        }
+        disjuncts.push(format!("({})", conjuncts.join(" AND ")));
+    }
+    let mut where_sql = format!(" WHERE ({})", disjuncts.join(" OR "));
+
+    let permission = permission_predicate(
+        &gql_ctx.caller(),
+        state.names.as_ref(),
+        &lookup.schema_name,
+        &lookup.table_name,
+    )?;
+    if let Some(predicate) = permission {
+        let guard = gql_ctx
+            .schema_cache
+            .get()
+            .await
+            .map_err(|e| async_graphql::Error::new(e.to_string()))?;
+        let cache = guard
+            .as_ref()
+            .ok_or_else(|| async_graphql::Error::new("schema cache is not loaded"))?;
+        let scope = WhereScope::table(
+            &lookup.schema_name,
+            &lookup.table_name,
+            &lookup.type_name,
+            state.names.as_ref(),
+        )
+        .under_alias(READ_ROW)
+        .with_resolution(cache, state.relationships.as_ref())
+        .for_caller(gql_ctx.caller());
+        let (filter_sql, filter_values) =
+            build_where_clause(Some(&predicate), bound_values.len() + 1, &scope)?;
+        if !filter_sql.is_empty() {
+            where_sql = format!(
+                "{} AND ({})",
+                where_sql,
+                filter_sql.trim_start_matches("WHERE ")
+            );
+            bound_values.extend(filter_values);
+        }
+    }
+
+    let source = format!(
+        "{}.{} AS {}",
+        postrust_sql::escape_ident(&lookup.schema_name),
+        postrust_sql::escape_ident(&lookup.table_name),
+        postrust_sql::escape_ident(READ_ROW)
+    );
+    let renamed = {
+        let guard = gql_ctx
+            .schema_cache
+            .get()
+            .await
+            .map_err(|e| async_graphql::Error::new(e.to_string()))?;
+        guard
+            .as_ref()
+            .and_then(|cache| {
+                cache.get_table(&postrust_core::api_request::QualifiedIdentifier::new(
+                    &lookup.schema_name,
+                    &lookup.table_name,
+                ))
+            })
+            .and_then(|table| rename_projection(table, READ_ROW, state.names.as_ref()))
+            .unwrap_or_else(|| format!("{}.*", postrust_sql::escape_ident(READ_ROW)))
+    };
+    let sql = format!(
+        "SELECT {} FROM (SELECT {} FROM {}{}) AS t",
+        row_json("t", &lookup.row_column_types),
+        renamed,
+        source,
+        where_sql,
+    );
+    let mut tx = begin_with_session(pool, gql_ctx.role(), &gql_ctx.session_settings()).await?;
+    let rows = execute_query_on(&mut tx, &sql, &bound_values).await?;
+    tx.commit().await?;
+
+    let mut by_key = HashMap::new();
+    for row in rows {
+        let serde_json::Value::Object(values) = &row else {
+            continue;
+        };
+        by_key.insert(entity_key(values, &lookup.key_columns)?, row);
+    }
+    Ok(by_key)
+}
+
+fn entity_key(
+    values: &serde_json::Map<String, serde_json::Value>,
+    key_columns: &[EntityKeyColumn],
+) -> Result<String, async_graphql::Error> {
+    let mut key = Vec::with_capacity(key_columns.len());
+    for key_column in key_columns {
+        let value = values.get(&key_column.field_name).ok_or_else(|| {
+            async_graphql::Error::new(format!(
+                "entity row is missing key field \"{}\"",
+                key_column.field_name
+            ))
+        })?;
+        key.push(value.clone());
+    }
+    serde_json::to_string(&key)
+        .map_err(|e| async_graphql::Error::new(format!("entity key could not be encoded: {e}")))
 }
 
 /// Add the root fields for functions that answer with rows of a table.

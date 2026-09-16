@@ -133,6 +133,31 @@ async fn build_state(
     )
 }
 
+/// Build GraphQL state with federation enabled and a metadata document.
+async fn build_federated_state_with_names(
+    pool: &PgPool,
+    schema: &str,
+    names: &str,
+) -> Arc<GraphQLState> {
+    let schemas = vec![schema.to_string()];
+    let cache = SchemaCache::load(pool, &schemas)
+        .await
+        .expect("failed to load schema cache");
+
+    let config = SchemaConfig {
+        exposed_schemas: schemas.clone(),
+        enable_mutations: true,
+        enable_federation: true,
+        names: postrust_graphql::names::NameOverrides::parse(names).expect("the names parse"),
+        ..SchemaConfig::default()
+    };
+
+    Arc::new(
+        GraphQLState::new(pool.clone(), Arc::new(cache), config)
+            .expect("failed to build GraphQL schema"),
+    )
+}
+
 /// Execute a GraphQL document and return the whole response.
 async fn execute(
     state: &Arc<GraphQLState>,
@@ -306,6 +331,64 @@ async fn by_pk_query_returns_null_for_a_missing_key() {
         data.get("widgets_by_pk"),
         Some(&serde_json::Value::Null),
         "a key that matches nothing must resolve to null"
+    );
+
+    drop_schema(&pool, &schema).await;
+}
+
+#[tokio::test]
+#[ignore = "requires PostgreSQL"]
+async fn federation_entities_resolve_shared_rows_by_key() {
+    let pool = connect().await;
+    let schema = unique_schema_name("fedentity");
+    create_widgets_schema(&pool, &schema).await;
+
+    let names =
+        format!(r#"{{"tables": {{"{schema}.widgets": {{"federation": {{"shared": true}}}}}}}}"#);
+    let state = build_federated_state_with_names(&pool, &schema, &names).await;
+    let data = execute_ok(
+        &state,
+        &pool,
+        &schema,
+        r#"
+        {
+          _entities(representations: [
+            {__typename: "widgets", id: 3},
+            {__typename: "widgets", id: 1}
+          ]) {
+            __typename
+            ... on widgets {
+              id
+              name
+            }
+          }
+        }
+        "#,
+    )
+    .await;
+
+    let rows = data
+        .get("_entities")
+        .and_then(|value| value.as_array())
+        .expect("entities list");
+    assert_eq!(rows.len(), 2);
+    assert_eq!(
+        rows[0].get("__typename").and_then(|value| value.as_str()),
+        Some("widgets")
+    );
+    assert_eq!(rows[0].get("id").and_then(|value| value.as_i64()), Some(3));
+    assert_eq!(
+        rows[0].get("name").and_then(|value| value.as_str()),
+        Some("charlie")
+    );
+    assert_eq!(
+        rows[1].get("__typename").and_then(|value| value.as_str()),
+        Some("widgets")
+    );
+    assert_eq!(rows[1].get("id").and_then(|value| value.as_i64()), Some(1));
+    assert_eq!(
+        rows[1].get("name").and_then(|value| value.as_str()),
+        Some("alpha")
     );
 
     drop_schema(&pool, &schema).await;
