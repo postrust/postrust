@@ -3,9 +3,7 @@
 //! Mirrors PostgREST's configuration options.
 
 use serde::{Deserialize, Serialize};
-use std::collections::{HashMap, HashSet};
-
-use crate::api_request::QualifiedIdentifier;
+use std::collections::HashMap;
 
 /// Main application configuration.
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -200,10 +198,6 @@ pub struct AppConfig {
     #[serde(default)]
     pub graphql_type_prefix: Option<String>,
 
-    /// Tables that retain an unprefixed identity across federated subgraphs.
-    #[serde(default)]
-    pub graphql_shared_entities: Vec<QualifiedIdentifier>,
-
     // ========================================================================
     // Compatibility Settings
     // ========================================================================
@@ -256,7 +250,6 @@ impl Default for AppConfig {
             app_settings: HashMap::new(),
             graphql_federation: false,
             graphql_type_prefix: None,
-            graphql_shared_entities: Vec::new(),
             compat_mode: false,
         }
     }
@@ -302,36 +295,6 @@ fn parse_graphql_type_prefix(value: &str) -> Result<Option<String>, &'static str
     }
 
     Ok(Some(value.to_string()))
-}
-
-/// Parse a comma-separated list of schema-qualified table names.
-fn parse_graphql_shared_entities(value: &str) -> Result<Vec<QualifiedIdentifier>, String> {
-    if value.trim().is_empty() {
-        return Ok(Vec::new());
-    }
-
-    let mut entities = Vec::new();
-    let mut seen = HashSet::new();
-    for written in value.split(',') {
-        let written = written.trim();
-        let Some((schema, table)) = written.split_once('.') else {
-            return Err(format!(
-                "comma-separated schema.table names; {written:?} is not schema-qualified"
-            ));
-        };
-        if schema.is_empty() || table.is_empty() || table.contains('.') {
-            return Err(format!(
-                "comma-separated schema.table names; {written:?} is malformed"
-            ));
-        }
-
-        let entity = QualifiedIdentifier::new(schema, table);
-        if seen.insert(entity.clone()) {
-            entities.push(entity);
-        }
-    }
-
-    Ok(entities)
 }
 
 impl AppConfig {
@@ -566,12 +529,6 @@ impl AppConfig {
             match parse_graphql_type_prefix(&value) {
                 Ok(prefix) => config.graphql_type_prefix = prefix,
                 Err(expected) => warn_ignored("PGRST_GRAPHQL_TYPE_PREFIX", &value, expected),
-            }
-        }
-        if let Ok(value) = std::env::var("PGRST_GRAPHQL_SHARED_ENTITIES") {
-            match parse_graphql_shared_entities(&value) {
-                Ok(entities) => config.graphql_shared_entities = entities,
-                Err(expected) => warn_ignored("PGRST_GRAPHQL_SHARED_ENTITIES", &value, &expected),
             }
         }
 
@@ -903,7 +860,6 @@ mod tests {
         assert!(config.db_prepared_statements);
         assert!(!config.graphql_federation);
         assert_eq!(config.graphql_type_prefix, None);
-        assert!(config.graphql_shared_entities.is_empty());
     }
 
     #[test]
@@ -983,21 +939,10 @@ mod tests {
         let config = with_env(&[
             ("PGRST_GRAPHQL_FEDERATION", "true"),
             ("PGRST_GRAPHQL_TYPE_PREFIX", " test "),
-            (
-                "PGRST_GRAPHQL_SHARED_ENTITIES",
-                " public.users, audit.events, public.users ",
-            ),
         ]);
 
         assert!(config.graphql_federation);
         assert_eq!(config.graphql_type_prefix.as_deref(), Some("test"));
-        assert_eq!(
-            config.graphql_shared_entities,
-            vec![
-                QualifiedIdentifier::new("public", "users"),
-                QualifiedIdentifier::new("audit", "events"),
-            ]
-        );
     }
 
     #[test]
@@ -1010,23 +955,17 @@ mod tests {
         let config = with_env(&[
             ("PGRST_GRAPHQL_FEDERATION", "sometimes"),
             ("PGRST_GRAPHQL_TYPE_PREFIX", "not-valid"),
-            ("PGRST_GRAPHQL_SHARED_ENTITIES", "public.users,unqualified"),
         ]);
 
         assert!(!config.graphql_federation);
         assert_eq!(config.graphql_type_prefix, None);
-        assert!(config.graphql_shared_entities.is_empty());
     }
 
     #[test]
-    fn an_empty_graphql_prefix_and_shared_entity_list_mean_unset() {
-        let config = with_env(&[
-            ("PGRST_GRAPHQL_TYPE_PREFIX", "   "),
-            ("PGRST_GRAPHQL_SHARED_ENTITIES", "   "),
-        ]);
+    fn an_empty_graphql_prefix_means_unset() {
+        let config = with_env(&[("PGRST_GRAPHQL_TYPE_PREFIX", "   ")]);
 
         assert_eq!(config.graphql_type_prefix, None);
-        assert!(config.graphql_shared_entities.is_empty());
     }
 
     // `from_env` reads process-global state, so these run one at a time.

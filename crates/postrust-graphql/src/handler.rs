@@ -9361,7 +9361,10 @@ mod tests {
         let config = SchemaConfig {
             enable_federation: true,
             type_prefix: Some("test".into()),
-            shared_entities: vec![postrust_core::QualifiedIdentifier::new("public", "users")],
+            names: crate::names::NameOverrides::parse(
+                r#"{"tables": {"public.users": {"federation": {"shared": true}}}}"#,
+            )
+            .expect("metadata"),
             ..SchemaConfig::default()
         };
         let generated = build_schema(&cache, &config);

@@ -146,6 +146,10 @@ pub struct TableNames {
     #[serde(default, rename = "enum")]
     pub is_enum: bool,
 
+    /// Apollo Federation settings for this table.
+    #[serde(default)]
+    pub federation: FederationConfig,
+
     /// What each role may do with this table, keyed by role.
     ///
     /// A role absent from this map has no permission on the table at all,
@@ -160,6 +164,14 @@ pub struct TableNames {
     /// second layer above them.
     #[serde(default)]
     pub permissions: HashMap<String, RolePermissions>,
+}
+
+/// Apollo Federation settings for one table.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct FederationConfig {
+    /// Whether this table keeps its unprefixed entity identity across subgraphs.
+    #[serde(default)]
+    pub shared: bool,
 }
 
 impl RolePermissions {
@@ -679,6 +691,13 @@ impl NameOverrides {
             .unwrap_or(false)
     }
 
+    /// Whether metadata marks this table as a shared Apollo Federation entity.
+    pub fn federation_shared(&self, schema: &str, table: &str) -> bool {
+        self.table(schema, table)
+            .map(|t| t.federation.shared)
+            .unwrap_or(false)
+    }
+
     /// Every table marked as one, as `(schema, table)`.
     pub fn enum_tables(&self) -> Vec<(String, String)> {
         self.tables
@@ -899,6 +918,17 @@ mod tests {
             names.enum_tables(),
             vec![("public".to_string(), "colors".to_string())]
         );
+    }
+
+    #[test]
+    fn a_table_can_be_marked_as_a_shared_federation_entity() {
+        let names = NameOverrides::parse(
+            r#"{"tables": {"public.users": {"federation": {"shared": true}}}}"#,
+        )
+        .unwrap();
+
+        assert!(names.federation_shared("public", "users"));
+        assert!(!names.federation_shared("public", "posts"));
     }
 
     /// A declaration is the whole list, and it may describe a join.

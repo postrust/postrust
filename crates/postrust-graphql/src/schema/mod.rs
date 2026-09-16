@@ -57,8 +57,6 @@ pub struct SchemaConfig {
     pub enable_federation: bool,
     /// Namespace applied to generated table types and root fields.
     pub type_prefix: Option<String>,
-    /// Tables that retain an unprefixed identity across federated subgraphs.
-    pub shared_entities: Vec<QualifiedIdentifier>,
 
     /// Whose schema this is.
     ///
@@ -81,7 +79,6 @@ impl Default for SchemaConfig {
             max_rows: None,
             enable_federation: false,
             type_prefix: None,
-            shared_entities: Vec::new(),
             role: None,
         }
     }
@@ -113,7 +110,7 @@ impl SchemaConfig {
 
     /// Whether a table keeps its unprefixed type identity across subgraphs.
     pub fn is_shared_entity(&self, table: &QualifiedIdentifier) -> bool {
-        self.shared_entities.contains(table)
+        self.names.federation_shared(&table.schema, &table.name)
     }
 
     /// Name a table type, applying the configured namespace unless it is shared.
@@ -2128,7 +2125,10 @@ mod tests {
         );
         let config = SchemaConfig {
             type_prefix: Some("test".into()),
-            shared_entities: vec![QualifiedIdentifier::new("public", "users")],
+            names: crate::names::NameOverrides::parse(
+                r#"{"tables": {"public.users": {"federation": {"shared": true}}}}"#,
+            )
+            .expect("metadata"),
             ..SchemaConfig::default()
         };
 
@@ -2163,7 +2163,10 @@ mod tests {
             &SchemaConfig {
                 enable_federation: true,
                 type_prefix: Some("test".into()),
-                shared_entities: vec![QualifiedIdentifier::new("public", "users")],
+                names: crate::names::NameOverrides::parse(
+                    r#"{"tables": {"public.users": {"federation": {"shared": true}}}}"#,
+                )
+                .expect("metadata"),
                 ..SchemaConfig::default()
             },
         );
