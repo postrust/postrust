@@ -86,19 +86,20 @@ pub fn build_inputs(
     let mut enums = vec![direction_enum()];
 
     for (type_name, object) in object_types {
+        let local_type_name = object.local_name.as_str();
         // A table with no columns would produce an enum with no members, which
         // no GraphQL schema may contain.
         if object.fields.is_empty() {
             continue;
         }
 
-        let mut input = InputObject::new(order_by_type_name(type_name)).description(format!(
+        let mut input = InputObject::new(order_by_type_name(local_type_name)).description(format!(
             "Order rows of {} by a column, by a related row's column, or by an \
              aggregate of its children.",
-            type_name
+            local_type_name
         ));
-        let mut columns = Enum::new(select_column_type_name(type_name))
-            .description(format!("A column of {}.", type_name));
+        let mut columns = Enum::new(select_column_type_name(local_type_name))
+            .description(format!("A column of {}.", local_type_name));
 
         let mut taken: HashSet<String> = HashSet::new();
         for field in &object.fields {
@@ -120,13 +121,15 @@ pub fn build_inputs(
                 if taken.insert(field.clone()) {
                     input = input.field(InputValue::new(
                         &field,
-                        TypeRef::named(aggregate_order_by_type_name(&relationship.target_type)),
+                        TypeRef::named(aggregate_order_by_type_name(
+                            &relationship.target_local_name,
+                        )),
                     ));
                 }
             } else if taken.insert(relationship.name.clone()) {
                 input = input.field(InputValue::new(
                     &relationship.name,
-                    TypeRef::named(order_by_type_name(&relationship.target_type)),
+                    TypeRef::named(order_by_type_name(&relationship.target_local_name)),
                 ));
             }
         }
@@ -135,15 +138,18 @@ pub fn build_inputs(
         enums.push(columns);
 
         // What a parent may order its children by.
-        let mut aggregate = InputObject::new(aggregate_order_by_type_name(type_name))
-            .description(format!("Order by an aggregate of {} rows.", type_name))
+        let mut aggregate = InputObject::new(aggregate_order_by_type_name(local_type_name))
+            .description(format!(
+                "Order by an aggregate of {} rows.",
+                local_type_name
+            ))
             .field(InputValue::new("count", TypeRef::named(DIRECTION_ENUM)));
 
         for (function, _, columns) in crate::schema::aggregate::functions_for(object) {
-            let function_type = function_order_by_type_name(type_name, function);
+            let function_type = function_order_by_type_name(local_type_name, function);
             let mut per_column = InputObject::new(&function_type).description(format!(
                 "Order by the `{}` of a {} column.",
-                function, type_name
+                function, local_type_name
             ));
             for column in &columns {
                 per_column =

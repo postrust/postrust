@@ -19,6 +19,8 @@ pub struct RelationshipField {
     pub name: String,
     /// Target GraphQL type name.
     pub target_type: String,
+    /// Target base name for generated helper types.
+    pub target_local_name: String,
     /// Whether this returns a list (O2M, M2M) or single object (M2O, O2O).
     pub is_list: bool,
     /// The original relationship.
@@ -51,6 +53,24 @@ impl RelationshipField {
         target_base_name: &str,
         given_name: Option<&str>,
     ) -> Self {
+        Self::from_relationship_typed(
+            rel,
+            target_base_name,
+            target_base_name,
+            target_base_name,
+            given_name,
+        )
+    }
+
+    /// Create a GraphQL field with independent naming for the target object
+    /// type and its generated helper types.
+    pub fn from_relationship_typed(
+        rel: &Relationship,
+        target_base_name: &str,
+        target_type: &str,
+        target_local_name: &str,
+        given_name: Option<&str>,
+    ) -> Self {
         let is_list = !rel.is_to_one();
 
         // A computed relationship is named by its function, not by the table
@@ -70,8 +90,6 @@ impl RelationshipField {
             },
         };
 
-        let target_type = target_base_name.to_string();
-
         let description = Some(format!(
             "Related {} via {}",
             if is_list { "records" } else { "record" },
@@ -80,7 +98,8 @@ impl RelationshipField {
 
         Self {
             name,
-            target_type,
+            target_type: target_type.to_string(),
+            target_local_name: target_local_name.to_string(),
             is_list,
             relationship: rel.clone(),
             description,

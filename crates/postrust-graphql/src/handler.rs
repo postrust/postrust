@@ -18,7 +18,7 @@ use axum::extract::State;
 use axum::response::IntoResponse;
 use postrust_core::schema_cache::SchemaCache;
 use sqlx::PgPool;
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
 use tokio::sync::RwLock;
 use tracing::{debug, info, trace};
@@ -546,7 +546,7 @@ fn build_dynamic_schema(
         if obj.fields.is_empty() && !countable.contains(type_name.as_str()) {
             continue;
         }
-        for aggregate_type in create_aggregate_types(type_name, obj) {
+        for aggregate_type in create_aggregate_types(&obj.local_name, obj) {
             object_types.insert(aggregate_type.type_name().to_string(), aggregate_type);
         }
     }
@@ -554,10 +554,10 @@ fn build_dynamic_schema(
     // One mutation response per table that has any mutation, and only those:
     // an unreferenced type is still a type, and a read-only view would
     // otherwise contribute a response nothing can return.
-    let mutable: HashSet<&str> = generated
+    let mutable: HashMap<String, String> = generated
         .mutation_fields
         .iter()
-        .map(|f| {
+        .filter_map(|f| {
             // The table's own name. A bulk write already answers with the
             // response type, and trimming the suffix here is what keeps
             // `<t>_mutation_response_mutation_response` from being built: the
@@ -565,22 +565,24 @@ fn build_dynamic_schema(
             // naming the bare type, so a table with only bulk writes -- which
             // is what a role that cannot read one has -- registered the wrong
             // name and left the right one missing.
-            f.return_type
+            let response = f
+                .return_type
                 .trim_matches(|c| c == '[' || c == ']' || c == '!')
-                .trim_end_matches("_mutation_response")
+                .strip_suffix("_mutation_response")?;
+            Some((response.to_string(), f.type_name.clone()))
         })
         .collect();
-    for base_name in mutable {
+    for (base_name, row_type_name) in mutable {
         // Whether it has rows to give back. A write to a table this role
         // cannot read answers with `affected_rows` and nothing else -- there
         // is no row type for `returning` to be a list of.
         let returning = generated
             .object_types
-            .get(base_name)
+            .get(&row_type_name)
             .is_some_and(|object| !object.fields.is_empty());
         object_types.insert(
-            mutation_response_type_name(base_name),
-            create_mutation_response_type(base_name, returning),
+            mutation_response_type_name(&base_name),
+            create_mutation_response_type(&base_name, &row_type_name, returning),
         );
     }
 
@@ -768,10 +770,7 @@ fn build_dynamic_schema(
         if field.mutation_type != MutationType::UpdateByPk || field.pk_columns.is_empty() {
             continue;
         }
-        let base_name = field
-            .return_type
-            .trim_matches(|c| c == '[' || c == ']' || c == '!')
-            .trim_end_matches("_mutation_response");
+        let base_name = field.local_type_name.as_str();
         let type_name = format!("{}_pk_columns_input", base_name);
         let mut input = InputObject::new(&type_name)
             .description(format!("The primary key of one {} row.", base_name));
@@ -817,6 +816,7 @@ fn build_dynamic_schema(
         .collect();
 
     for (type_name, object) in &generated.object_types {
+        let local_type_name = object.local_name.as_str();
         let table = &object.table;
         // Which columns a write may name, which is the write permission's
         // answer and not the read permission's. A role granted `columns:
@@ -850,12 +850,12 @@ fn build_dynamic_schema(
             .unwrap_or(&[]);
         let conflict_type = match table.unique_constraints.is_empty() {
             true => None,
-            false => Some(format!("{}_on_conflict", type_name)),
+            false => Some(format!("{}_on_conflict", local_type_name)),
         };
 
         if crate::input::mutation::is_insertable(table) {
-            let mut insert = InputObject::new(format!("{}_insert_input", type_name))
-                .description(format!("The columns of a new {} row.", type_name));
+            let mut insert = InputObject::new(format!("{}_insert_input", local_type_name))
+                .description(format!("The columns of a new {} row.", local_type_name));
             let mut taken: HashSet<&str> = HashSet::new();
             for field in &insert_fields {
                 // Every column optional: which ones the database insists on is
@@ -883,7 +883,7 @@ fn build_dynamic_schema(
                 };
                 insert = insert.field(InputValue::new(
                     &relationship.name,
-                    TypeRef::named(format!("{}_{}", relationship.target_type, suffix)),
+                    TypeRef::named(format!("{}_{}", relationship.target_local_name, suffix)),
                 ));
             }
             builder = builder.register(insert);
@@ -891,16 +891,24 @@ fn build_dynamic_schema(
             // How this table is written as somebody else's nested row. Both
             // shapes carry an `on_conflict`, which is what makes a nested
             // upsert expressible.
-            let data_type = format!("{}_insert_input", type_name);
-            let mut object_rel = InputObject::new(format!("{}_obj_rel_insert_input", type_name))
-                .description(format!("One {} row written beside its parent.", type_name))
-                .field(InputValue::new("data", TypeRef::named_nn(&data_type)));
-            let mut array_rel = InputObject::new(format!("{}_arr_rel_insert_input", type_name))
-                .description(format!("{} rows written beside their parent.", type_name))
-                .field(InputValue::new(
-                    "data",
-                    TypeRef::named_nn_list_nn(&data_type),
-                ));
+            let data_type = format!("{}_insert_input", local_type_name);
+            let mut object_rel =
+                InputObject::new(format!("{}_obj_rel_insert_input", local_type_name))
+                    .description(format!(
+                        "One {} row written beside its parent.",
+                        local_type_name
+                    ))
+                    .field(InputValue::new("data", TypeRef::named_nn(&data_type)));
+            let mut array_rel =
+                InputObject::new(format!("{}_arr_rel_insert_input", local_type_name))
+                    .description(format!(
+                        "{} rows written beside their parent.",
+                        local_type_name
+                    ))
+                    .field(InputValue::new(
+                        "data",
+                        TypeRef::named_nn_list_nn(&data_type),
+                    ));
             if let Some(conflict) = &conflict_type {
                 object_rel =
                     object_rel.field(InputValue::new("on_conflict", TypeRef::named(conflict)));
@@ -911,10 +919,10 @@ fn build_dynamic_schema(
         }
 
         if crate::input::mutation::is_updatable(table) {
-            let mut set = InputObject::new(format!("{}_set_input", type_name))
-                .description(format!("Columns of {} to replace.", type_name));
-            let mut numeric = InputObject::new(format!("{}_inc_input", type_name))
-                .description(format!("Columns of {} to add to.", type_name));
+            let mut set = InputObject::new(format!("{}_set_input", local_type_name))
+                .description(format!("Columns of {} to replace.", local_type_name));
+            let mut numeric = InputObject::new(format!("{}_inc_input", local_type_name))
+                .description(format!("Columns of {} to add to.", local_type_name));
             let mut any_numeric = false;
             let mut any_jsonb = false;
             for field in &update_fields {
@@ -945,23 +953,23 @@ fn build_dynamic_schema(
             // where it matches. The whole list runs in one transaction, in the
             // order it was given, which is what makes it different from
             // sending the updates one at a time.
-            let mut updates = InputObject::new(format!("{}_updates", type_name))
+            let mut updates = InputObject::new(format!("{}_updates", local_type_name))
                 .description(format!(
                     "One update to {}: which rows, and what to write.",
-                    type_name
+                    local_type_name
                 ))
                 .field(InputValue::new(
                     "where",
-                    TypeRef::named_nn(crate::input::bool_exp::bool_exp_type_name(type_name)),
+                    TypeRef::named_nn(crate::input::bool_exp::bool_exp_type_name(local_type_name)),
                 ))
                 .field(InputValue::new(
                     "_set",
-                    TypeRef::named(format!("{}_set_input", type_name)),
+                    TypeRef::named(format!("{}_set_input", local_type_name)),
                 ));
             if any_numeric {
                 updates = updates.field(InputValue::new(
                     "_inc",
-                    TypeRef::named(format!("{}_inc_input", type_name)),
+                    TypeRef::named(format!("{}_inc_input", local_type_name)),
                 ));
             }
             // What a document column may be told to do, one input per
@@ -976,16 +984,18 @@ fn build_dynamic_schema(
                 }
                 updates = updates.field(InputValue::new(
                     *operator,
-                    TypeRef::named(jsonb_operator_input(type_name, operator)),
+                    TypeRef::named(jsonb_operator_input(local_type_name, operator)),
                 ));
             }
             builder = builder.register(updates);
             if any_jsonb {
                 for (operator, item) in JSONB_OPERATORS {
                     let mut input =
-                        InputObject::new(jsonb_operator_input(type_name, operator)).description(
-                            format!("Columns of {} to apply `{}` to.", type_name, operator),
-                        );
+                        InputObject::new(jsonb_operator_input(local_type_name, operator))
+                            .description(format!(
+                                "Columns of {} to apply `{}` to.",
+                                local_type_name, operator
+                            ));
                     for field in &update_fields {
                         if !matches!(&field.graphql_type, crate::types::GraphQLType::Json) {
                             continue;
@@ -1025,15 +1035,21 @@ fn build_dynamic_schema(
     // type and the field, since two tables may reach the same function and one
     // table may reach two.
     for (type_name, relationships) in &generated.relationship_fields {
+        let local_type_name = generated
+            .object_types
+            .get(type_name)
+            .map(|object| object.local_name.as_str())
+            .unwrap_or(type_name);
         for relationship in relationships {
             if relationship.arguments.is_empty() {
                 continue;
             }
-            let mut args = InputObject::new(computed_args_type_name(type_name, &relationship.name))
-                .description(format!(
-                    "Arguments to {}, beside the row it is asked of.",
-                    relationship.name
-                ));
+            let mut args =
+                InputObject::new(computed_args_type_name(local_type_name, &relationship.name))
+                    .description(format!(
+                        "Arguments to {}, beside the row it is asked of.",
+                        relationship.name
+                    ));
             for (name, pg_type, _) in &relationship.arguments {
                 let scalar = crate::types::pg_type_to_graphql(pg_type).to_string();
                 // Nullable, for the reason the function arguments above are.
@@ -1047,12 +1063,13 @@ fn build_dynamic_schema(
     // arguments where the field is asked for. `locations { distance(args: {
     // from: ... }) }` -- the field is a function of the row and of what the
     // caller wants measured against it.
-    for (type_name, object) in &generated.object_types {
+    for object in generated.object_types.values() {
+        let local_type_name = object.local_name.as_str();
         for field in &object.fields {
             if field.arguments.is_empty() {
                 continue;
             }
-            let mut args = InputObject::new(computed_args_type_name(type_name, &field.name))
+            let mut args = InputObject::new(computed_args_type_name(local_type_name, &field.name))
                 .description(format!(
                     "Arguments to {}, beside the row it is asked of.",
                     field.name
@@ -1071,16 +1088,19 @@ fn build_dynamic_schema(
     // only place the field naming them exists.
     {
         use crate::input::bool_exp as be;
-        let mut targets: BTreeSet<&str> = BTreeSet::new();
+        let mut targets: BTreeMap<&str, &str> = BTreeMap::new();
         for relationships in generated.relationship_fields.values() {
             for relationship in relationships {
                 if relationship.is_list {
-                    targets.insert(relationship.target_type.as_str());
+                    targets.insert(
+                        relationship.target_local_name.as_str(),
+                        relationship.target_type.as_str(),
+                    );
                 }
             }
         }
-        for target in targets {
-            let Some(object) = generated.object_types.get(target) else {
+        for (target, target_type) in targets {
+            let Some(object) = generated.object_types.get(target_type) else {
                 continue;
             };
             // A boolean column is what `bool_and` and `bool_or` fold, and a
@@ -1158,7 +1178,8 @@ fn build_dynamic_schema(
     // Upserts. A table with no unique constraint has no conflict to resolve,
     // and a GraphQL enum may not be empty, so it gets none of these types
     // rather than an unusable set of them.
-    for (type_name, object) in &generated.object_types {
+    for object in generated.object_types.values() {
+        let local_type_name = object.local_name.as_str();
         // What an upsert may write, which is the update permission's answer
         // and not the read permission's: `update_columns` names columns to
         // overwrite, so a role that may set a column without seeing it may
@@ -1169,17 +1190,19 @@ fn build_dynamic_schema(
             continue;
         }
 
-        let mut constraints = Enum::new(format!("{}_constraint", type_name)).description(format!(
-            "A uniqueness of {} that an insert may conflict with.",
-            type_name
-        ));
+        let mut constraints =
+            Enum::new(format!("{}_constraint", local_type_name)).description(format!(
+                "A uniqueness of {} that an insert may conflict with.",
+                local_type_name
+            ));
         for (name, columns) in &object.table.unique_constraints {
             constraints = constraints
                 .item(EnumItem::new(name).description(format!("unique ({})", columns.join(", "))));
         }
 
-        let mut updatable = Enum::new(format!("{}_update_column", type_name))
-            .description(format!("A column of {} an upsert may write.", type_name));
+        let mut updatable = Enum::new(format!("{}_update_column", local_type_name)).description(
+            format!("A column of {} an upsert may write.", local_type_name),
+        );
         for field in &updatable_columns {
             updatable = updatable.item(EnumItem::new(&field.name));
         }
@@ -1198,14 +1221,14 @@ fn build_dynamic_schema(
             );
         }
 
-        let on_conflict = InputObject::new(format!("{}_on_conflict", type_name))
+        let on_conflict = InputObject::new(format!("{}_on_conflict", local_type_name))
             .description(format!(
                 "What to do when an insert into {} conflicts.",
-                type_name
+                local_type_name
             ))
             .field(InputValue::new(
                 "constraint",
-                TypeRef::named_nn(format!("{}_constraint", type_name)),
+                TypeRef::named_nn(format!("{}_constraint", local_type_name)),
             ))
             // An empty list is `DO NOTHING`, which is how Hasura spells "leave
             // the row that is already there alone" -- and is the default, so
@@ -1214,13 +1237,13 @@ fn build_dynamic_schema(
             .field(
                 InputValue::new(
                     "update_columns",
-                    TypeRef::named_nn_list_nn(format!("{}_update_column", type_name)),
+                    TypeRef::named_nn_list_nn(format!("{}_update_column", local_type_name)),
                 )
                 .default_value(Value::List(Vec::new())),
             )
             .field(InputValue::new(
                 "where",
-                TypeRef::named(crate::input::bool_exp::bool_exp_type_name(type_name)),
+                TypeRef::named(crate::input::bool_exp::bool_exp_type_name(local_type_name)),
             ));
 
         builder = builder
@@ -1280,9 +1303,8 @@ pub fn mutation_response_type_name(base_name: &str) -> String {
 /// `affected_rows` is the count PostgreSQL reports, which is not the length of
 /// `returning`: a client may ask for no rows back at all and still need to know
 /// how many were touched, and that is the usual case for a delete.
-fn create_mutation_response_type(base_name: &str, returning: bool) -> Object {
+fn create_mutation_response_type(base_name: &str, row_type: &str, returning: bool) -> Object {
     let response_name = mutation_response_type_name(base_name);
-    let row_type = base_name.to_string();
 
     let response = Object::new(&response_name)
         .description(format!("The rows {} changed, and how many.", base_name))
@@ -1308,7 +1330,7 @@ fn create_mutation_response_type(base_name: &str, returning: bool) -> Object {
     }
     response.field(Field::new(
         "returning",
-        TypeRef::named_nn_list_nn(row_type),
+        TypeRef::named_nn_list_nn(row_type.to_string()),
         |ctx| {
             FieldFuture::new(async move {
                 let rows = match ctx.parent_value.as_value() {
@@ -1357,7 +1379,7 @@ fn create_aggregate_types(base_name: &str, object: &TableObjectType) -> Vec<Obje
     if has_rows {
         over = over.field(Field::new(
             "nodes",
-            TypeRef::named_nn_list_nn(base_name.to_string()),
+            TypeRef::named_nn_list_nn(object.name.clone()),
             |ctx| {
                 FieldFuture::new(async move {
                     let rows = match child_value(&ctx, "nodes") {
@@ -1660,7 +1682,7 @@ fn create_object_type(
             true => gql_field,
             false => gql_field.argument(InputValue::new(
                 "args",
-                TypeRef::named_nn(computed_args_type_name(&obj.name, &field.name)),
+                TypeRef::named_nn(computed_args_type_name(&obj.local_name, &field.name)),
             )),
         };
 
@@ -1734,7 +1756,7 @@ fn create_object_type(
         if !rel.arguments.is_empty() {
             gql_field = gql_field.argument(InputValue::new(
                 "args",
-                TypeRef::named_nn(computed_args_type_name(&obj.name, &rel.name)),
+                TypeRef::named_nn(computed_args_type_name(&obj.local_name, &rel.name)),
             ));
         }
         if rel.is_list {
@@ -1742,17 +1764,19 @@ fn create_object_type(
                 .argument(InputValue::new(
                     "distinct_on",
                     TypeRef::named_nn_list(crate::input::order_by::select_column_type_name(
-                        &rel.target_type,
+                        &rel.target_local_name,
                     )),
                 ))
                 .argument(InputValue::new(
                     "where",
-                    TypeRef::named(crate::input::bool_exp::bool_exp_type_name(&rel.target_type)),
+                    TypeRef::named(crate::input::bool_exp::bool_exp_type_name(
+                        &rel.target_local_name,
+                    )),
                 ))
                 .argument(InputValue::new(
                     "order_by",
                     TypeRef::named_nn_list(crate::input::order_by::order_by_type_name(
-                        &rel.target_type,
+                        &rel.target_local_name,
                     )),
                 ))
                 .argument(InputValue::new("limit", TypeRef::named("Int")))
@@ -1780,7 +1804,7 @@ fn create_object_type(
                     Field::new(
                         &aggregate_field,
                         TypeRef::named_nn(crate::schema::aggregate::aggregate_type_name(
-                            &rel.target_type,
+                            &rel.target_local_name,
                         )),
                         move |ctx| {
                             let key = key.clone();
@@ -1801,19 +1825,19 @@ fn create_object_type(
                     .argument(InputValue::new(
                         "distinct_on",
                         TypeRef::named_nn_list(crate::input::order_by::select_column_type_name(
-                            &rel.target_type,
+                            &rel.target_local_name,
                         )),
                     ))
                     .argument(InputValue::new(
                         "where",
                         TypeRef::named(crate::input::bool_exp::bool_exp_type_name(
-                            &rel.target_type,
+                            &rel.target_local_name,
                         )),
                     ))
                     .argument(InputValue::new(
                         "order_by",
                         TypeRef::named_nn_list(crate::input::order_by::order_by_type_name(
-                            &rel.target_type,
+                            &rel.target_local_name,
                         )),
                     ))
                     .argument(InputValue::new("limit", TypeRef::named("Int")))
@@ -1829,7 +1853,7 @@ fn create_object_type(
                         name,
                         field.argument(InputValue::new(
                             "args",
-                            TypeRef::named_nn(computed_args_type_name(&obj.name, &rel.name)),
+                            TypeRef::named_nn(computed_args_type_name(&obj.local_name, &rel.name)),
                         )),
                     ));
                 }
@@ -1941,11 +1965,12 @@ fn create_query_type(
         let table_name = field.table_name.clone();
         let schema_name = field.schema_name.clone();
         let type_name = field.type_name.clone();
+        let local_type_name = field.local_type_name.clone();
         let is_by_pk = field.is_by_pk;
         let pk_columns = field.pk_columns.clone();
         let return_type = graphql_type_ref(&field.return_type);
 
-        let spec_type_name = type_name.clone();
+        let spec_type_name = local_type_name.clone();
         let spec = Arc::new(QueryFieldSpec {
             schema_name,
             table_name,
@@ -2004,15 +2029,14 @@ fn create_query_type(
                 names: Arc::clone(&names),
                 call: None,
             });
-            let aggregate_field_name = field
-                .aggregate_name
-                .clone()
-                .unwrap_or_else(|| crate::schema::aggregate::aggregate_type_name(&field.type_name));
+            let aggregate_field_name = field.aggregate_name.clone().unwrap_or_else(|| {
+                crate::schema::aggregate::aggregate_type_name(&field.local_type_name)
+            });
             let aggregate_field_name_for_sorting = aggregate_field_name.clone();
             let mut agg_field = Field::new(
                 aggregate_field_name,
                 TypeRef::named_nn(crate::schema::aggregate::aggregate_type_name(
-                    &field.type_name,
+                    &field.local_type_name,
                 )),
                 move |ctx| {
                     let agg_spec = Arc::clone(&agg_spec);
@@ -2187,13 +2211,13 @@ fn create_mutation_type(
     // drift, and drifting means an argument naming a type that is not there.
     let mut has_numeric_column: HashSet<String> = HashSet::new();
     let mut has_jsonb_column: HashSet<String> = HashSet::new();
-    for (type_name, object) in &generated.object_types {
+    for object in generated.object_types.values() {
         let (numeric, jsonb) = update_inputs(object, &names, role);
         if numeric {
-            has_numeric_column.insert(type_name.clone());
+            has_numeric_column.insert(object.local_name.clone());
         }
         if jsonb {
-            has_jsonb_column.insert(type_name.clone());
+            has_jsonb_column.insert(object.local_name.clone());
         }
     }
 
@@ -2201,7 +2225,7 @@ fn create_mutation_type(
         .object_types
         .iter()
         .filter(|(_, object)| !object.table.unique_constraints.is_empty())
-        .map(|(type_name, _)| type_name.clone())
+        .map(|(_, object)| object.local_name.clone())
         .collect();
 
     for field in &generated.mutation_fields {
@@ -2214,11 +2238,7 @@ fn create_mutation_type(
         // The table's own type name, which is what its boolean expression is
         // named after. A bulk mutation returns `[author!]!` and a by-key one
         // returns `author`; both name the same table.
-        let where_type = field
-            .return_type
-            .trim_matches(|c| c == '[' || c == ']' || c == '!')
-            .trim_end_matches("_mutation_response")
-            .to_string();
+        let where_type = field.local_type_name.clone();
 
         let resolver_pk_columns = pk_columns.clone();
         let field_relationships = Arc::clone(&relationships);
@@ -2367,7 +2387,7 @@ fn create_subscription_type(
     let mut roots: Vec<(String, SubscriptionField)> = Vec::new();
 
     for field in &generated.query_fields {
-        let spec_type_name = field.type_name.clone();
+        let spec_type_name = field.local_type_name.clone();
         let pk_columns = field.pk_columns.clone();
         let is_by_pk = field.is_by_pk;
         let return_type = graphql_type_ref(&field.return_type);
@@ -2435,14 +2455,13 @@ fn create_subscription_type(
             &field.schema_name,
             &field.table_name,
         )];
-        let agg_name = field
-            .aggregate_name
-            .clone()
-            .unwrap_or_else(|| crate::schema::aggregate::aggregate_type_name(&field.type_name));
+        let agg_name = field.aggregate_name.clone().unwrap_or_else(|| {
+            crate::schema::aggregate::aggregate_type_name(&field.local_type_name)
+        });
         let mut agg_field = SubscriptionField::new(
             agg_name.clone(),
             TypeRef::named_nn(crate::schema::aggregate::aggregate_type_name(
-                &field.type_name,
+                &field.local_type_name,
             )),
             move |ctx| {
                 let agg_spec = Arc::clone(&agg_spec);
@@ -2721,19 +2740,19 @@ fn add_function_fields(
             .argument(InputValue::new(
                 "where",
                 TypeRef::named(crate::input::bool_exp::bool_exp_type_name(
-                    &function.returns,
+                    &function.local_returns,
                 )),
             ))
             .argument(InputValue::new(
                 "order_by",
                 TypeRef::named_nn_list(crate::input::order_by::order_by_type_name(
-                    &function.returns,
+                    &function.local_returns,
                 )),
             ))
             .argument(InputValue::new(
                 "distinct_on",
                 TypeRef::named_nn_list(crate::input::order_by::select_column_type_name(
-                    &function.returns,
+                    &function.local_returns,
                 )),
             ))
             .argument(InputValue::new("limit", TypeRef::named("Int")))
@@ -2764,7 +2783,7 @@ fn add_function_fields(
         let mut aggregate = Field::new(
             format!("{}_aggregate", function.name),
             TypeRef::named_nn(crate::schema::aggregate::aggregate_type_name(
-                &function.returns,
+                &function.local_returns,
             )),
             move |ctx| {
                 let agg_spec = Arc::clone(&agg_spec);
@@ -2777,7 +2796,7 @@ fn add_function_fields(
                 TypeRef::named_nn(format!("{}_args", function.name)),
             ));
         }
-        aggregate = with_row_arguments(aggregate, &function.returns).description(format!(
+        aggregate = with_row_arguments(aggregate, &function.local_returns).description(format!(
             "fetch aggregated fields from the table: \"{}\"",
             function.returns_table.1
         ));
@@ -6182,15 +6201,18 @@ impl<'a> WhereScope<'a> {
             if let Some(entry) = declared.iter().find(|entry| entry.name == name) {
                 // Reached by a mapping, which the catalogue has never heard
                 // of.
+                let target = entry
+                    .target(&table.schema)
+                    .map(|(_, target)| target)
+                    .unwrap_or_default();
                 if let Some(field) = crate::schema::mapped_relationship_field(
                     entry,
                     table,
                     resolution.cache,
                     &table.schema,
-                    &entry
-                        .target(&table.schema)
-                        .map(|(_, target)| target)
-                        .unwrap_or_default(),
+                    &target,
+                    &target,
+                    &target,
                 ) {
                     return Some(std::borrow::Cow::Owned(field));
                 }
@@ -9391,6 +9413,34 @@ mod tests {
         assert!(
             federation_sdl.contains("@shareable"),
             "shared field directive:\n{federation_sdl}"
+        );
+        assert!(sdl.contains("type users "), "shared object type:\n{sdl}");
+        assert!(
+            !sdl.contains("type test_users "),
+            "prefixed shared object type:\n{sdl}"
+        );
+        assert!(sdl.contains("test_users("), "query root:\n{sdl}");
+        assert!(sdl.contains("test_users_by_pk("), "by-PK root:\n{sdl}");
+        assert!(sdl.contains("test_users_bool_exp"), "derived input:\n{sdl}");
+        assert!(
+            !sdl.contains("input users_bool_exp "),
+            "unprefixed derived input:\n{sdl}"
+        );
+        assert!(
+            sdl.contains("test_users_aggregate"),
+            "aggregate type:\n{sdl}"
+        );
+        assert!(
+            !sdl.contains("type users_aggregate "),
+            "unprefixed aggregate type:\n{sdl}"
+        );
+        assert!(
+            sdl.contains("test_users_mutation_response"),
+            "mutation response type:\n{sdl}"
+        );
+        assert!(
+            !sdl.contains("type users_mutation_response "),
+            "unprefixed mutation response type:\n{sdl}"
         );
 
         let response = schema.execute("{ _service { sdl } }").await;

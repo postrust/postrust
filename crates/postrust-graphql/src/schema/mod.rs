@@ -352,6 +352,8 @@ pub struct FunctionField {
     pub function_name: String,
     /// The GraphQL type of the rows it returns.
     pub returns: String,
+    /// Base name for helper types owned by the returned rows.
+    pub local_returns: String,
     /// The table those rows belong to, as `(schema, table)`.
     pub returns_table: (String, String),
     /// Its arguments, as `(name, PostgreSQL type, required)`. The session
@@ -398,6 +400,7 @@ fn reflected_fields(
     config: &SchemaConfig,
     base_names: &HashMap<(String, String), String>,
     type_names: &HashMap<(String, String), String>,
+    local_type_names: &HashMap<(String, String), String>,
 ) -> Vec<RelationshipField> {
     schema_cache
         .get_relationships(&table.qualified_identifier(), &table.schema)
@@ -411,14 +414,16 @@ fn reflected_fields(
                     let target_key = (foreign.schema.clone(), foreign.name.clone());
                     let target_base = base_names.get(&target_key)?;
                     let target_type = type_names.get(&target_key)?;
-                    let mut field = RelationshipField::from_relationship_named(
+                    let target_local_type = local_type_names.get(&target_key)?;
+                    let mut field = RelationshipField::from_relationship_typed(
                         rel,
                         target_base,
+                        target_type,
+                        target_local_type,
                         relationship_keys(rel).iter().find_map(|key| {
                             config.names.relationship(&table.schema, &table.name, key)
                         }),
                     );
-                    field.target_type = target_type.clone();
                     field.arguments = caller_arguments(rel, schema_cache);
                     Some(field)
                 })
@@ -446,6 +451,7 @@ fn declared_fields(
     config: &SchemaConfig,
     base_names: &HashMap<(String, String), String>,
     type_names: &HashMap<(String, String), String>,
+    local_type_names: &HashMap<(String, String), String>,
 ) -> Vec<RelationshipField> {
     use postrust_core::schema_cache::Relationship;
 
@@ -474,14 +480,20 @@ fn declared_fields(
             };
             let foreign = rel.foreign_table();
             let target_key = (foreign.schema.clone(), foreign.name.clone());
-            let (Some(target_base), Some(target_type)) =
-                (base_names.get(&target_key), type_names.get(&target_key))
-            else {
+            let (Some(target_base), Some(target_type), Some(target_local_type)) = (
+                base_names.get(&target_key),
+                type_names.get(&target_key),
+                local_type_names.get(&target_key),
+            ) else {
                 continue;
             };
-            let mut field =
-                RelationshipField::from_relationship_named(rel, target_base, Some(&entry.name));
-            field.target_type = target_type.clone();
+            let mut field = RelationshipField::from_relationship_typed(
+                rel,
+                target_base,
+                target_type,
+                target_local_type,
+                Some(&entry.name),
+            );
             field.arguments = caller_arguments(rel, schema_cache);
             fields.push(field);
             continue;
@@ -499,9 +511,11 @@ fn declared_fields(
             continue;
         };
         let target_key = (schema, name);
-        let (Some(target_base), Some(target_type)) =
-            (base_names.get(&target_key), type_names.get(&target_key))
-        else {
+        let (Some(target_base), Some(target_type), Some(target_local_type)) = (
+            base_names.get(&target_key),
+            type_names.get(&target_key),
+            local_type_names.get(&target_key),
+        ) else {
             continue;
         };
         match mapped_relationship_field(
@@ -510,11 +524,10 @@ fn declared_fields(
             schema_cache,
             config.default_schema(),
             target_base,
+            target_type,
+            target_local_type,
         ) {
-            Some(mut field) => {
-                field.target_type = target_type.clone();
-                fields.push(field);
-            }
+            Some(field) => fields.push(field),
             None => tracing::warn!(
                 "GraphQL: {}.{} declares the relationship \"{}\" with no columns to \
                  join on; it is left out",
@@ -537,19 +550,22 @@ fn declared_fields(
     {
         let foreign = rel.foreign_table();
         let target_key = (foreign.schema.clone(), foreign.name.clone());
-        let (Some(target_base), Some(target_type)) =
-            (base_names.get(&target_key), type_names.get(&target_key))
-        else {
+        let (Some(target_base), Some(target_type), Some(target_local_type)) = (
+            base_names.get(&target_key),
+            type_names.get(&target_key),
+            local_type_names.get(&target_key),
+        ) else {
             continue;
         };
-        let mut field = RelationshipField::from_relationship_named(
+        let mut field = RelationshipField::from_relationship_typed(
             rel,
             target_base,
+            target_type,
+            target_local_type,
             relationship_keys(rel)
                 .iter()
                 .find_map(|key| config.names.relationship(&table.schema, &table.name, key)),
         );
-        field.target_type = target_type.clone();
         if already.contains(&field.name) {
             continue;
         }
@@ -571,6 +587,8 @@ pub(crate) fn mapped_relationship_field(
     schema_cache: &SchemaCache,
     default_schema: &str,
     target_base: &str,
+    target_type: &str,
+    target_local_type: &str,
 ) -> Option<RelationshipField> {
     use postrust_core::schema_cache::{Cardinality, Relationship};
 
@@ -617,9 +635,11 @@ pub(crate) fn mapped_relationship_field(
         table_is_view: table.is_view,
         constraint_name: constraint,
     };
-    Some(RelationshipField::from_relationship_named(
+    Some(RelationshipField::from_relationship_typed(
         &rel,
         target_base,
+        target_type,
+        target_local_type,
         Some(&entry.name),
     ))
 }
@@ -755,6 +775,8 @@ pub struct QueryField {
     pub schema_name: String,
     /// GraphQL object type name (e.g., "Users")
     pub type_name: String,
+    /// Base name for helper types owned by this table.
+    pub local_type_name: String,
     /// GraphQL return type
     pub return_type: String,
     /// Whether this returns a list
@@ -806,14 +828,24 @@ impl QueryField {
 
     /// Create a list query field using an explicit base name.
     pub fn list_named(table: &Table, base_name: &str) -> Self {
-        let type_name = base_name.to_string();
-        let name = base_name.to_string();
+        Self::list_typed(table, base_name, base_name, base_name)
+    }
+
+    /// Create a list query field with separate root, row type and helper names.
+    pub fn list_typed(
+        table: &Table,
+        root_base_name: &str,
+        type_name: &str,
+        local_type_name: &str,
+    ) -> Self {
+        let name = root_base_name.to_string();
 
         Self {
             name,
             table_name: table.name.clone(),
             schema_name: table.schema.clone(),
-            type_name: type_name.clone(),
+            type_name: type_name.to_string(),
+            local_type_name: local_type_name.to_string(),
             return_type: format!("[{}!]!", type_name),
             is_list: true,
             is_by_pk: false,
@@ -833,12 +865,21 @@ impl QueryField {
 
     /// Create a by-PK query field using an explicit base name.
     pub fn by_pk_named(table: &Table, base_name: &str) -> Option<Self> {
+        Self::by_pk_typed(table, base_name, base_name, base_name)
+    }
+
+    /// Create a by-PK query field with separate root, row type and helper names.
+    pub fn by_pk_typed(
+        table: &Table,
+        root_base_name: &str,
+        type_name: &str,
+        local_type_name: &str,
+    ) -> Option<Self> {
         if !has_whole_key(table) {
             return None;
         }
 
-        let type_name = base_name.to_string();
-        let field_name = format!("{}_by_pk", base_name);
+        let field_name = format!("{}_by_pk", root_base_name);
 
         // Carry the key columns and their types so the resolver can filter on
         // the real primary key.
@@ -848,8 +889,9 @@ impl QueryField {
             name: field_name,
             table_name: table.name.clone(),
             schema_name: table.schema.clone(),
-            type_name: type_name.clone(),
-            return_type: type_name,
+            type_name: type_name.to_string(),
+            local_type_name: local_type_name.to_string(),
+            return_type: type_name.to_string(),
             is_list: false,
             is_by_pk: true,
             pk_columns,
@@ -883,6 +925,10 @@ pub struct MutationField {
     pub pk_columns: Vec<(String, String)>,
     /// GraphQL return type
     pub return_type: String,
+    /// GraphQL row object type name.
+    pub type_name: String,
+    /// Base name for helper types owned by this table.
+    pub local_type_name: String,
     /// Field description
     pub description: Option<String>,
 }
@@ -915,35 +961,42 @@ impl MutationField {
     /// As [`Self::insert_fields`], with an explicit base name for the generated
     /// field and type names.
     pub fn insert_fields_named(table: &Table, base_name: &str) -> Vec<Self> {
+        Self::insert_fields_typed(table, base_name, base_name)
+    }
+
+    /// Create insert mutation fields using separate helper and row type names.
+    pub fn insert_fields_typed(table: &Table, local_type_name: &str, type_name: &str) -> Vec<Self> {
         if !is_insertable(table) {
             return vec![];
         }
 
-        let type_name = base_name.to_string();
-
         let mut fields = vec![];
 
         // insert_users (batch insert)
-        let name = format!("insert_{}", base_name);
+        let name = format!("insert_{}", local_type_name);
         fields.push(Self {
             name,
             table_name: table.name.clone(),
             schema_name: table.schema.clone(),
             mutation_type: MutationType::Insert,
             pk_columns: Vec::new(),
-            return_type: format!("{}_mutation_response", type_name),
+            return_type: format!("{}_mutation_response", local_type_name),
+            type_name: type_name.to_string(),
+            local_type_name: local_type_name.to_string(),
             description: Some(format!("insert data into the table: \"{}\"", table.name)),
         });
 
         // insert_user_one (single insert)
-        let name = format!("insert_{}_one", base_name);
+        let name = format!("insert_{}_one", local_type_name);
         fields.push(Self {
             name,
             table_name: table.name.clone(),
             schema_name: table.schema.clone(),
             mutation_type: MutationType::InsertOne,
             pk_columns: Vec::new(),
-            return_type: type_name.clone(),
+            return_type: type_name.to_string(),
+            type_name: type_name.to_string(),
+            local_type_name: local_type_name.to_string(),
             description: Some(format!(
                 "insert a single row into the table: \"{}\"",
                 table.name
@@ -961,35 +1014,42 @@ impl MutationField {
     /// As [`Self::update_fields`], with an explicit base name for the generated
     /// field and type names.
     pub fn update_fields_named(table: &Table, base_name: &str) -> Vec<Self> {
+        Self::update_fields_typed(table, base_name, base_name)
+    }
+
+    /// Create update mutation fields using separate helper and row type names.
+    pub fn update_fields_typed(table: &Table, local_type_name: &str, type_name: &str) -> Vec<Self> {
         if !is_updatable(table) {
             return vec![];
         }
 
-        let type_name = base_name.to_string();
-
         let mut fields = vec![];
 
         // update_users (batch update)
-        let name = format!("update_{}", base_name);
+        let name = format!("update_{}", local_type_name);
         fields.push(Self {
             name,
             table_name: table.name.clone(),
             schema_name: table.schema.clone(),
             mutation_type: MutationType::Update,
             pk_columns: Vec::new(),
-            return_type: format!("{}_mutation_response", type_name),
+            return_type: format!("{}_mutation_response", local_type_name),
+            type_name: type_name.to_string(),
+            local_type_name: local_type_name.to_string(),
             description: Some(format!("update data of the table: \"{}\"", table.name)),
         });
 
         // update_users_many (several filters, each with its own values)
-        let name = format!("update_{}_many", base_name);
+        let name = format!("update_{}_many", local_type_name);
         fields.push(Self {
             name,
             table_name: table.name.clone(),
             schema_name: table.schema.clone(),
             mutation_type: MutationType::UpdateMany,
             pk_columns: Vec::new(),
-            return_type: format!("[{}_mutation_response]", type_name),
+            return_type: format!("[{}_mutation_response]", local_type_name),
+            type_name: type_name.to_string(),
+            local_type_name: local_type_name.to_string(),
             description: Some(format!(
                 "update multiples rows of table: \"{}\"",
                 table.name
@@ -998,14 +1058,16 @@ impl MutationField {
 
         // update_user_by_pk (single update by PK)
         if has_whole_key(table) {
-            let name = format!("update_{}_by_pk", base_name);
+            let name = format!("update_{}_by_pk", local_type_name);
             fields.push(Self {
                 name,
                 table_name: table.name.clone(),
                 schema_name: table.schema.clone(),
                 mutation_type: MutationType::UpdateByPk,
                 pk_columns: pk_columns_of(table),
-                return_type: type_name,
+                return_type: type_name.to_string(),
+                type_name: type_name.to_string(),
+                local_type_name: local_type_name.to_string(),
                 description: Some(format!(
                     "update single row of the table: \"{}\"",
                     table.name
@@ -1024,36 +1086,43 @@ impl MutationField {
     /// As [`Self::delete_fields`], with an explicit base name for the generated
     /// field and type names.
     pub fn delete_fields_named(table: &Table, base_name: &str) -> Vec<Self> {
+        Self::delete_fields_typed(table, base_name, base_name)
+    }
+
+    /// Create delete mutation fields using separate helper and row type names.
+    pub fn delete_fields_typed(table: &Table, local_type_name: &str, type_name: &str) -> Vec<Self> {
         if !is_deletable(table) {
             return vec![];
         }
 
-        let type_name = base_name.to_string();
-
         let mut fields = vec![];
 
         // delete_users (batch delete)
-        let name = format!("delete_{}", base_name);
+        let name = format!("delete_{}", local_type_name);
         fields.push(Self {
             name,
             table_name: table.name.clone(),
             schema_name: table.schema.clone(),
             mutation_type: MutationType::Delete,
             pk_columns: Vec::new(),
-            return_type: format!("{}_mutation_response", type_name),
+            return_type: format!("{}_mutation_response", local_type_name),
+            type_name: type_name.to_string(),
+            local_type_name: local_type_name.to_string(),
             description: Some(format!("delete data from the table: \"{}\"", table.name)),
         });
 
         // delete_user_by_pk (single delete by PK)
         if has_whole_key(table) {
-            let name = format!("delete_{}_by_pk", base_name);
+            let name = format!("delete_{}_by_pk", local_type_name);
             fields.push(Self {
                 name,
                 table_name: table.name.clone(),
                 schema_name: table.schema.clone(),
                 mutation_type: MutationType::DeleteByPk,
                 pk_columns: pk_columns_of(table),
-                return_type: type_name,
+                return_type: type_name.to_string(),
+                type_name: type_name.to_string(),
+                local_type_name: local_type_name.to_string(),
                 description: Some(format!(
                     "delete single row from the table: \"{}\"",
                     table.name
@@ -1123,6 +1192,7 @@ pub fn build_schema(schema_cache: &SchemaCache, config: &SchemaConfig) -> Genera
     // keep their type identity while their root fields remain namespaced.
     let mut used_type_names: HashMap<String, u32> = HashMap::new();
     let mut type_names: HashMap<(String, String), String> = HashMap::new();
+    let mut local_type_names: HashMap<(String, String), String> = HashMap::new();
     for table in &tables {
         let key = (table.schema.clone(), table.name.clone());
         let base_name = base_names
@@ -1147,6 +1217,8 @@ pub fn build_schema(schema_cache: &SchemaCache, config: &SchemaConfig) -> Genera
                 disambiguated
             }
         };
+        let local_type_name = config.root_field_name(base_name);
+        local_type_names.insert(key.clone(), local_type_name);
         type_names.insert(key, type_name);
     }
 
@@ -1163,9 +1235,14 @@ pub fn build_schema(schema_cache: &SchemaCache, config: &SchemaConfig) -> Genera
             .get(&(table.schema.clone(), table.name.clone()))
             .expect("every visited table has a resolved type name")
             .clone();
+        let local_type_name = local_type_names
+            .get(&(table.schema.clone(), table.name.clone()))
+            .expect("every visited table has a resolved local type name")
+            .clone();
 
         // Create object type
         let mut obj_type = TableObjectType::from_table_named(table, &type_name, &config.names);
+        obj_type.local_name = local_type_name.clone();
         // Whether this role can read the table at all. A table it may only
         // write has no GraphQL type -- a type with no fields is not a legal
         // one -- so nothing that would return that type is generated: no query
@@ -1213,7 +1290,7 @@ pub fn build_schema(schema_cache: &SchemaCache, config: &SchemaConfig) -> Genera
                 field.description = Some(comment.to_string()).filter(|c| !c.is_empty());
             }
         };
-        let mut list = QueryField::list_named(table, &type_name);
+        let mut list = QueryField::list_typed(table, &base_name, &type_name, &local_type_name);
         list.name = base_name.clone();
         rename(&mut list, "select");
         list.name = config.root_field_name(&list.name);
@@ -1247,7 +1324,9 @@ pub fn build_schema(schema_cache: &SchemaCache, config: &SchemaConfig) -> Genera
             query_fields.push(list);
         }
         if readable {
-            if let Some(mut by_pk) = QueryField::by_pk_named(table, &type_name) {
+            if let Some(mut by_pk) =
+                QueryField::by_pk_typed(table, &base_name, &type_name, &local_type_name)
+            {
                 by_pk.name = format!("{}_by_pk", base_name);
                 rename(&mut by_pk, "select_by_pk");
                 by_pk.name = config.root_field_name(&by_pk.name);
@@ -1258,9 +1337,21 @@ pub fn build_schema(schema_cache: &SchemaCache, config: &SchemaConfig) -> Genera
         // Add mutation fields if enabled
         if config.enable_mutations {
             let mut fields: Vec<MutationField> = Vec::new();
-            fields.extend(MutationField::insert_fields_named(table, &type_name));
-            fields.extend(MutationField::update_fields_named(table, &type_name));
-            fields.extend(MutationField::delete_fields_named(table, &type_name));
+            fields.extend(MutationField::insert_fields_typed(
+                table,
+                &local_type_name,
+                &type_name,
+            ));
+            fields.extend(MutationField::update_fields_typed(
+                table,
+                &local_type_name,
+                &type_name,
+            ));
+            fields.extend(MutationField::delete_fields_typed(
+                table,
+                &local_type_name,
+                &type_name,
+            ));
             // The three that answer with a row rather than with a count.
             if !readable {
                 fields.retain(|field| {
@@ -1317,8 +1408,16 @@ pub fn build_schema(schema_cache: &SchemaCache, config: &SchemaConfig) -> Genera
                 config,
                 &base_names,
                 &type_names,
+                &local_type_names,
             ),
-            None => reflected_fields(table, schema_cache, config, &base_names, &type_names),
+            None => reflected_fields(
+                table,
+                schema_cache,
+                config,
+                &base_names,
+                &type_names,
+                &local_type_names,
+            ),
         };
 
         if !rels.is_empty() {
@@ -1567,6 +1666,11 @@ pub fn build_schema(schema_cache: &SchemaCache, config: &SchemaConfig) -> Genera
             else {
                 continue;
             };
+            let Some(local_return_type) =
+                local_type_names.get(&(target_schema.clone(), target_table.clone()))
+            else {
+                continue;
+            };
             let returns_table = (target_schema.clone(), target_table.clone());
 
             // Placed by what PostgreSQL says it does, unless metadata said
@@ -1604,6 +1708,7 @@ pub fn build_schema(schema_cache: &SchemaCache, config: &SchemaConfig) -> Genera
                 schema_name: routine.schema.clone(),
                 function_name: routine.name.clone(),
                 returns: return_type.clone(),
+                local_returns: local_return_type.clone(),
                 returns_table,
                 arguments: routine
                     .params
@@ -2134,8 +2239,10 @@ mod tests {
 
         let schema = build_schema(&cache, &config);
 
-        assert!(schema.get_object_type("users").is_some());
-        assert!(schema.get_object_type("test_posts").is_some());
+        let users_object = schema.get_object_type("users").expect("users object");
+        assert_eq!(users_object.local_name, "test_users");
+        let posts_object = schema.get_object_type("test_posts").expect("posts object");
+        assert_eq!(posts_object.local_name, "test_posts");
         let users = schema
             .query_fields
             .iter()
@@ -2143,11 +2250,13 @@ mod tests {
             .expect("users list field");
         assert_eq!(users.name, "test_users");
         assert_eq!(users.type_name, "users");
+        assert_eq!(users.local_type_name, "test_users");
         let posts_relationships = schema
             .get_relationship_fields("test_posts")
             .expect("posts relationships");
         assert_eq!(posts_relationships[0].name, "user");
         assert_eq!(posts_relationships[0].target_type, "users");
+        assert_eq!(posts_relationships[0].target_local_name, "test_users");
     }
 
     #[test]

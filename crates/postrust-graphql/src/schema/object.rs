@@ -56,6 +56,8 @@ pub struct TableObjectType {
     pub table: Table,
     /// GraphQL type name (PascalCase).
     pub name: String,
+    /// Base name for generated helper types owned by this table.
+    pub local_name: String,
     /// Fields derived from columns: the ones a read may name.
     ///
     /// Empty where the role may write this table and not read it, which is a
@@ -179,6 +181,7 @@ impl TableObjectType {
 
         Self {
             table: table.clone(),
+            local_name: name.clone(),
             name,
             // Nothing has narrowed the read yet, so the two lists start equal.
             // A role's schema splits them where its object type is built.
