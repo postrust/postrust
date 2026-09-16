@@ -45,6 +45,34 @@ DATABASE_URL="postgres://user:pass@host:5432/db?sslmode=require"
 DATABASE_URL="postgres://user:pass@mydb.xxx.us-east-1.rds.amazonaws.com:5432/mydb"
 ```
 
+#### TLS
+
+`sslmode` is honoured. Where the mode asks for verification, the chain is
+checked against the host's trust store -- the same roots `curl` uses, which is
+why both published images install `ca-certificates`. A database behind a
+private or organisation-issued CA works as long as that CA is installed in the
+image; point `sslrootcert` at a PEM file to trust one without installing it
+system-wide.
+
+| `sslmode` | |
+|---|---|
+| `disable` | never encrypts |
+| `prefer` | encrypts if the server offers it, silently connects in cleartext if not. **The default** |
+| `require` | encrypts, but does not verify the certificate |
+| `verify-ca` | encrypts and verifies the chain |
+| `verify-full` | encrypts, verifies the chain, and checks the hostname |
+
+The default is worth reading twice: `prefer` downgrades without saying so, so a
+misconfigured server is indistinguishable from a working one. Set
+`verify-full` for anything reachable over a network you do not control --
+`require` on its own stops a passive listener but not someone who can answer in
+the server's place.
+
+Before 1.0.1 the server was built without TLS support at all: `sslmode=require`
+failed with "SQLx was built without TLS support enabled", and the default
+`prefer` always connected in cleartext. If you are on 1.0.0 and talking to a
+hosted database, you are not encrypted.
+
 ### Schema Configuration
 
 Expose multiple schemas:
@@ -631,7 +659,7 @@ PGRST_SERVER_HOST="0.0.0.0"
 ### Production
 
 ```bash
-DATABASE_URL="postgres://user:pass@prod-db:5432/app?sslmode=require"
+DATABASE_URL="postgres://user:pass@prod-db:5432/app?sslmode=verify-full"
 PGRST_DB_SCHEMAS="api"
 PGRST_DB_ANON_ROLE="web_anon"
 PGRST_DB_POOL_SIZE="20"
