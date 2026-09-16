@@ -9284,6 +9284,37 @@ mod tests {
         assert!(result.is_ok(), "Schema build failed: {:?}", result.err());
     }
 
+    #[test]
+    fn a_type_prefix_names_the_complete_dynamic_schema() {
+        let cache = create_test_schema_cache();
+        let config = SchemaConfig {
+            type_prefix: Some("test".into()),
+            ..SchemaConfig::default()
+        };
+        let generated = build_schema(&cache, &config);
+        let schema = build_dynamic_schema(
+            &generated,
+            &cache,
+            None,
+            None,
+            Arc::new(Default::default()),
+            std::time::Duration::from_secs(30),
+            None,
+        )
+        .expect("a prefixed schema should build");
+        let sdl = schema.sdl();
+
+        assert!(sdl.contains("type test_users "), "object type:\n{sdl}");
+        assert!(sdl.contains("test_users("), "query root:\n{sdl}");
+        assert!(sdl.contains("test_users_by_pk("), "by-PK root:\n{sdl}");
+        assert!(sdl.contains("test_users_bool_exp"), "derived input:\n{sdl}");
+        assert!(
+            sdl.contains("test_users_aggregate"),
+            "aggregate type:\n{sdl}"
+        );
+        assert!(sdl.contains("test_insert_users("), "mutation root:\n{sdl}");
+    }
+
     /// `_exists` becomes a subselect over the table it names, correlated with
     /// nothing -- which is the difference between it and a relationship.
     #[test]

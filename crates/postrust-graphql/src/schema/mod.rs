@@ -111,6 +111,29 @@ impl SchemaConfig {
         self
     }
 
+    /// Whether a table keeps its unprefixed type identity across subgraphs.
+    pub fn is_shared_entity(&self, table: &QualifiedIdentifier) -> bool {
+        self.shared_entities.contains(table)
+    }
+
+    /// Name a table type, applying the configured namespace unless it is shared.
+    pub fn table_type_name(&self, table: &QualifiedIdentifier, base_name: &str) -> String {
+        match self.type_prefix.as_deref() {
+            Some(prefix) if !prefix.is_empty() && !self.is_shared_entity(table) => {
+                format!("{prefix}_{base_name}")
+            }
+            _ => base_name.to_string(),
+        }
+    }
+
+    /// Namespace a root field so independently generated subgraphs do not collide.
+    pub fn root_field_name(&self, base_name: &str) -> String {
+        match self.type_prefix.as_deref() {
+            Some(prefix) if !prefix.is_empty() => format!("{prefix}_{base_name}"),
+            _ => base_name.to_string(),
+        }
+    }
+
     /// How often a live query re-reads itself when nothing has notified it.
     pub fn subscription_refresh(&self) -> std::time::Duration {
         match self.subscription_refresh_seconds {
@@ -353,6 +376,7 @@ fn reflected_fields(
     schema_cache: &SchemaCache,
     config: &SchemaConfig,
     base_names: &HashMap<(String, String), String>,
+    type_names: &HashMap<(String, String), String>,
 ) -> Vec<RelationshipField> {
     schema_cache
         .get_relationships(&table.qualified_identifier(), &table.schema)
@@ -363,8 +387,9 @@ fn reflected_fields(
                     // A relationship whose target is not exposed would
                     // reference a GraphQL type that was never registered.
                     let foreign = rel.foreign_table();
-                    let target_base =
-                        base_names.get(&(foreign.schema.clone(), foreign.name.clone()))?;
+                    let target_key = (foreign.schema.clone(), foreign.name.clone());
+                    let target_base = base_names.get(&target_key)?;
+                    let target_type = type_names.get(&target_key)?;
                     let mut field = RelationshipField::from_relationship_named(
                         rel,
                         target_base,
@@ -372,6 +397,7 @@ fn reflected_fields(
                             config.names.relationship(&table.schema, &table.name, key)
                         }),
                     );
+                    field.target_type = target_type.clone();
                     field.arguments = caller_arguments(rel, schema_cache);
                     Some(field)
                 })
@@ -398,6 +424,7 @@ fn declared_fields(
     schema_cache: &SchemaCache,
     config: &SchemaConfig,
     base_names: &HashMap<(String, String), String>,
+    type_names: &HashMap<(String, String), String>,
 ) -> Vec<RelationshipField> {
     use postrust_core::schema_cache::Relationship;
 
@@ -425,12 +452,15 @@ fn declared_fields(
                 continue;
             };
             let foreign = rel.foreign_table();
-            let Some(target_base) = base_names.get(&(foreign.schema.clone(), foreign.name.clone()))
+            let target_key = (foreign.schema.clone(), foreign.name.clone());
+            let (Some(target_base), Some(target_type)) =
+                (base_names.get(&target_key), type_names.get(&target_key))
             else {
                 continue;
             };
             let mut field =
                 RelationshipField::from_relationship_named(rel, target_base, Some(&entry.name));
+            field.target_type = target_type.clone();
             field.arguments = caller_arguments(rel, schema_cache);
             fields.push(field);
             continue;
@@ -447,7 +477,10 @@ fn declared_fields(
             );
             continue;
         };
-        let Some(target_base) = base_names.get(&(schema, name)) else {
+        let target_key = (schema, name);
+        let (Some(target_base), Some(target_type)) =
+            (base_names.get(&target_key), type_names.get(&target_key))
+        else {
             continue;
         };
         match mapped_relationship_field(
@@ -457,7 +490,10 @@ fn declared_fields(
             config.default_schema(),
             target_base,
         ) {
-            Some(field) => fields.push(field),
+            Some(mut field) => {
+                field.target_type = target_type.clone();
+                fields.push(field);
+            }
             None => tracing::warn!(
                 "GraphQL: {}.{} declares the relationship \"{}\" with no columns to \
                  join on; it is left out",
@@ -479,7 +515,9 @@ fn declared_fields(
         .filter(|rel| matches!(rel, Relationship::Computed { .. }))
     {
         let foreign = rel.foreign_table();
-        let Some(target_base) = base_names.get(&(foreign.schema.clone(), foreign.name.clone()))
+        let target_key = (foreign.schema.clone(), foreign.name.clone());
+        let (Some(target_base), Some(target_type)) =
+            (base_names.get(&target_key), type_names.get(&target_key))
         else {
             continue;
         };
@@ -490,6 +528,7 @@ fn declared_fields(
                 .iter()
                 .find_map(|key| config.names.relationship(&table.schema, &table.name, key)),
         );
+        field.target_type = target_type.clone();
         if already.contains(&field.name) {
             continue;
         }
@@ -1052,18 +1091,54 @@ pub fn build_schema(schema_cache: &SchemaCache, config: &SchemaConfig) -> Genera
         );
     }
 
-    // The tables this role may read, by base name. Needed after the loop, by
+    // Object and derived input types share one GraphQL namespace. Resolve the
+    // prefixed names independently from field bases because shared entities
+    // keep their type identity while their root fields remain namespaced.
+    let mut used_type_names: HashMap<String, u32> = HashMap::new();
+    let mut type_names: HashMap<(String, String), String> = HashMap::new();
+    for table in &tables {
+        let key = (table.schema.clone(), table.name.clone());
+        let base_name = base_names
+            .get(&key)
+            .expect("every visited table has a resolved base name");
+        let preferred = config.table_type_name(&table.qualified_identifier(), base_name);
+        let type_name = match used_type_names.get_mut(&preferred) {
+            None => {
+                used_type_names.insert(preferred.clone(), 1);
+                preferred
+            }
+            Some(count) => {
+                *count += 1;
+                let disambiguated = format!("{}_{}", preferred, count);
+                tracing::warn!(
+                    "GraphQL type name collision: {}.{} would generate the same type as \
+                     an earlier table; exposing it as \"{}\" instead",
+                    table.schema,
+                    table.name,
+                    disambiguated
+                );
+                disambiguated
+            }
+        };
+        type_names.insert(key, type_name);
+    }
+
+    // The tables this role may read. Needed after the loop, by
     // anything that would answer with a row of one.
-    let mut readable_bases: HashSet<String> = HashSet::new();
+    let mut readable_tables: HashSet<QualifiedIdentifier> = HashSet::new();
 
     for table in &tables {
         let base_name = base_names
             .get(&(table.schema.clone(), table.name.clone()))
             .expect("every visited table has a resolved base name")
             .clone();
+        let type_name = type_names
+            .get(&(table.schema.clone(), table.name.clone()))
+            .expect("every visited table has a resolved type name")
+            .clone();
 
         // Create object type
-        let mut obj_type = TableObjectType::from_table_named(table, &base_name, &config.names);
+        let mut obj_type = TableObjectType::from_table_named(table, &type_name, &config.names);
         // Whether this role can read the table at all. A table it may only
         // write has no GraphQL type -- a type with no fields is not a legal
         // one -- so nothing that would return that type is generated: no query
@@ -1080,7 +1155,7 @@ pub fn build_schema(schema_cache: &SchemaCache, config: &SchemaConfig) -> Genera
                 .is_none_or(|granted| crate::role::reads_anything(granted, table))
         });
         if readable {
-            readable_bases.insert(base_name.clone());
+            readable_tables.insert(table.qualified_identifier());
         }
         // What each computed field takes from the caller. Read from the
         // routine, for the reason `caller_arguments` gives.
@@ -1097,8 +1172,6 @@ pub fn build_schema(schema_cache: &SchemaCache, config: &SchemaConfig) -> Genera
             };
             field.arguments = computed_caller_arguments(computed, schema_cache);
         }
-        let type_name = obj_type.name.clone();
-
         // Add query fields. Each root may be named separately -- Hasura names
         // them one at a time, and a set that does not agree on a base name has
         // nowhere else to be written down.
@@ -1113,15 +1186,19 @@ pub fn build_schema(schema_cache: &SchemaCache, config: &SchemaConfig) -> Genera
                 field.description = Some(comment.to_string()).filter(|c| !c.is_empty());
             }
         };
-        let mut list = QueryField::list_named(table, &base_name);
+        let mut list = QueryField::list_named(table, &type_name);
+        list.name = base_name.clone();
         rename(&mut list, "select");
+        list.name = config.root_field_name(&list.name);
         // The aggregate root is generated from the type name rather than being
         // a `QueryField` of its own, so its name travels with the list field
         // that spawns it.
-        list.aggregate_name = config
+        let aggregate_name = config
             .names
             .root(&table.schema, &table.name, "select_aggregate")
-            .map(str::to_string);
+            .map(str::to_string)
+            .unwrap_or_else(|| format!("{}_aggregate", base_name));
+        list.aggregate_name = Some(config.root_field_name(&aggregate_name));
         list.aggregate_description = config
             .names
             .root_comment(&table.schema, &table.name, "select_aggregate")
@@ -1143,8 +1220,10 @@ pub fn build_schema(schema_cache: &SchemaCache, config: &SchemaConfig) -> Genera
             query_fields.push(list);
         }
         if readable {
-            if let Some(mut by_pk) = QueryField::by_pk_named(table, &base_name) {
+            if let Some(mut by_pk) = QueryField::by_pk_named(table, &type_name) {
+                by_pk.name = format!("{}_by_pk", base_name);
                 rename(&mut by_pk, "select_by_pk");
+                by_pk.name = config.root_field_name(&by_pk.name);
                 query_fields.push(by_pk);
             }
         }
@@ -1152,9 +1231,9 @@ pub fn build_schema(schema_cache: &SchemaCache, config: &SchemaConfig) -> Genera
         // Add mutation fields if enabled
         if config.enable_mutations {
             let mut fields: Vec<MutationField> = Vec::new();
-            fields.extend(MutationField::insert_fields_named(table, &base_name));
-            fields.extend(MutationField::update_fields_named(table, &base_name));
-            fields.extend(MutationField::delete_fields_named(table, &base_name));
+            fields.extend(MutationField::insert_fields_named(table, &type_name));
+            fields.extend(MutationField::update_fields_named(table, &type_name));
+            fields.extend(MutationField::delete_fields_named(table, &type_name));
             // The three that answer with a row rather than with a count.
             if !readable {
                 fields.retain(|field| {
@@ -1176,9 +1255,19 @@ pub fn build_schema(schema_cache: &SchemaCache, config: &SchemaConfig) -> Genera
                     MutationType::Delete => "delete",
                     MutationType::DeleteByPk => "delete_by_pk",
                 };
+                field.name = match field.mutation_type {
+                    MutationType::Insert => format!("insert_{base_name}"),
+                    MutationType::InsertOne => format!("insert_{base_name}_one"),
+                    MutationType::Update => format!("update_{base_name}"),
+                    MutationType::UpdateByPk => format!("update_{base_name}_by_pk"),
+                    MutationType::UpdateMany => format!("update_{base_name}_many"),
+                    MutationType::Delete => format!("delete_{base_name}"),
+                    MutationType::DeleteByPk => format!("delete_{base_name}_by_pk"),
+                };
                 if let Some(given) = config.names.root(&table.schema, &table.name, kind) {
                     field.name = given.to_string();
                 }
+                field.name = config.root_field_name(&field.name);
                 if let Some(comment) = config.names.root_comment(&table.schema, &table.name, kind) {
                     field.description = Some(comment.to_string()).filter(|c| !c.is_empty());
                 }
@@ -1194,8 +1283,15 @@ pub fn build_schema(schema_cache: &SchemaCache, config: &SchemaConfig) -> Genera
             .names
             .declared_relationships(&table.schema, &table.name)
         {
-            Some(declared) => declared_fields(declared, table, schema_cache, config, &base_names),
-            None => reflected_fields(table, schema_cache, config, &base_names),
+            Some(declared) => declared_fields(
+                declared,
+                table,
+                schema_cache,
+                config,
+                &base_names,
+                &type_names,
+            ),
+            None => reflected_fields(table, schema_cache, config, &base_names, &type_names),
         };
 
         if !rels.is_empty() {
@@ -1219,16 +1315,23 @@ pub fn build_schema(schema_cache: &SchemaCache, config: &SchemaConfig) -> Genera
         // the query `where: {favorite_color: {_eq: red}}` is one it answers.
         // So the name is derived rather than looked up, since a table the
         // role cannot read has no entry to look up.
-        let base = match base_names.get(&(schema_name.clone(), table_name.clone())) {
+        let table_key = (schema_name.clone(), table_name.clone());
+        let base = match type_names.get(&table_key) {
             Some(found) => found.clone(),
-            None => config
-                .names
-                .base_name(&schema_name, &table_name)
-                .map(str::to_string)
-                .unwrap_or_else(|| match schema_name == config.default_schema() {
-                    true => table_name.clone(),
-                    false => format!("{}_{}", schema_name, table_name),
-                }),
+            None => {
+                let unprefixed = config
+                    .names
+                    .base_name(&schema_name, &table_name)
+                    .map(str::to_string)
+                    .unwrap_or_else(|| match schema_name == config.default_schema() {
+                        true => table_name.clone(),
+                        false => format!("{}_{}", schema_name, table_name),
+                    });
+                config.table_type_name(
+                    &QualifiedIdentifier::new(&schema_name, &table_name),
+                    &unprefixed,
+                )
+            }
         };
         let key = format!("{}.{}", schema_name, table_name);
         let members: Vec<(String, Option<String>)> = config
@@ -1271,7 +1374,7 @@ pub fn build_schema(schema_cache: &SchemaCache, config: &SchemaConfig) -> Genera
     // type with them.
     if !enum_type_of.is_empty() {
         for table in &tables {
-            let Some(type_name) = base_names.get(&(table.schema.clone(), table.name.clone()))
+            let Some(type_name) = type_names.get(&(table.schema.clone(), table.name.clone()))
             else {
                 continue;
             };
@@ -1403,16 +1506,21 @@ pub fn build_schema(schema_cache: &SchemaCache, config: &SchemaConfig) -> Genera
                         .iter()
                         .find(|((_, table), _)| table == &returned_table)
                 });
-            let Some(((target_schema, target_table), base)) = found else {
+            let Some(((target_schema, target_table), _)) = found else {
                 continue;
             };
+            let target = QualifiedIdentifier::new(target_schema, target_table);
             // A function returning rows of a table this role cannot read has
             // nowhere to put them: that table has no GraphQL type, and naming
             // one that was never registered is a schema that will not build.
-            if !readable_bases.contains(base) {
+            if !readable_tables.contains(&target) {
                 continue;
             }
-            let target = (target_schema.clone(), target_table.clone());
+            let Some(return_type) = type_names.get(&(target_schema.clone(), target_table.clone()))
+            else {
+                continue;
+            };
+            let returns_table = (target_schema.clone(), target_table.clone());
 
             // Placed by what PostgreSQL says it does, unless metadata said
             // otherwise: `track_function` with `configuration: {exposed_as:
@@ -1445,11 +1553,11 @@ pub fn build_schema(schema_cache: &SchemaCache, config: &SchemaConfig) -> Genera
             }
 
             function_fields.push(FunctionField {
-                name: routine.name.clone(),
+                name: config.root_field_name(&routine.name),
                 schema_name: routine.schema.clone(),
                 function_name: routine.name.clone(),
-                returns: base.clone(),
-                returns_table: target,
+                returns: return_type.clone(),
+                returns_table,
                 arguments: routine
                     .params
                     .iter()
@@ -1904,6 +2012,90 @@ mod tests {
         assert!(names.contains(&"users"));
         assert!(names.contains(&"posts"));
         assert!(names.contains(&"comments"));
+    }
+
+    #[test]
+    fn type_prefix_namespaces_generated_types_and_roots() {
+        let mut cache = create_test_schema_cache();
+        let routine = setof_users_routine("search_users", &[("name", "text")]);
+        cache
+            .routines
+            .insert(routine.qualified_identifier(), vec![routine]);
+        let config = SchemaConfig {
+            type_prefix: Some("test".into()),
+            ..SchemaConfig::default()
+        };
+
+        let schema = build_schema(&cache, &config);
+
+        assert!(schema.get_object_type("test_users").is_some());
+        let users = schema
+            .query_fields
+            .iter()
+            .find(|field| field.table_name == "users" && field.is_list)
+            .expect("users list field");
+        assert_eq!(users.name, "test_users");
+        assert_eq!(users.type_name, "test_users");
+        assert_eq!(
+            users.aggregate_name.as_deref(),
+            Some("test_users_aggregate")
+        );
+        assert!(schema
+            .mutation_fields
+            .iter()
+            .any(|field| field.name == "test_insert_users"));
+        let function = schema
+            .function_fields
+            .iter()
+            .find(|field| field.function_name == "search_users")
+            .expect("set-returning function field");
+        assert_eq!(function.name, "test_search_users");
+        assert_eq!(function.returns, "test_users");
+    }
+
+    #[test]
+    fn shared_entities_keep_their_type_name_but_not_their_root_names() {
+        use postrust_core::schema_cache::{Cardinality, Relationship};
+
+        let mut cache = create_test_schema_cache();
+        let posts = QualifiedIdentifier::new("public", "posts");
+        cache.relationships.insert(
+            (posts.clone(), "public".into()),
+            vec![Relationship::ForeignKey {
+                table: posts,
+                foreign_table: QualifiedIdentifier::new("public", "users"),
+                is_self: false,
+                cardinality: Cardinality::M2O {
+                    constraint: "posts_user_id_fkey".into(),
+                    columns: vec![("id".into(), "id".into())],
+                },
+                table_is_view: false,
+                foreign_table_is_view: false,
+                constraint_name: "posts_user_id_fkey".into(),
+            }],
+        );
+        let config = SchemaConfig {
+            type_prefix: Some("test".into()),
+            shared_entities: vec![QualifiedIdentifier::new("public", "users")],
+            ..SchemaConfig::default()
+        };
+
+        let schema = build_schema(&cache, &config);
+
+        assert!(schema.get_object_type("users").is_some());
+        assert!(schema.get_object_type("test_posts").is_some());
+        let users = schema
+            .query_fields
+            .iter()
+            .find(|field| field.table_name == "users" && field.is_list)
+            .expect("users list field");
+        assert_eq!(users.name, "test_users");
+        assert_eq!(users.type_name, "users");
+        let posts_relationships = schema
+            .get_relationship_fields("test_posts")
+            .expect("posts relationships");
+        assert_eq!(posts_relationships[0].name, "user");
+        assert_eq!(posts_relationships[0].target_type, "users");
     }
 
     #[test]
