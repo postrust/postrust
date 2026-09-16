@@ -669,6 +669,7 @@ fn build_dynamic_schema(
             generated,
             Arc::clone(&relationships),
             Arc::clone(&names),
+            max_rows,
         ));
         builder = builder.entity_resolver(move |ctx| {
             let state = Arc::clone(&entity_state);
@@ -2689,6 +2690,7 @@ struct EntityResolverState {
     entities: HashMap<String, EntityLookup>,
     relationships: Arc<HashMap<String, Vec<RelationshipField>>>,
     names: Arc<crate::names::NameOverrides>,
+    max_rows: Option<i64>,
 }
 
 impl EntityResolverState {
@@ -2696,6 +2698,7 @@ impl EntityResolverState {
         generated: &GeneratedSchema,
         relationships: Arc<HashMap<String, Vec<RelationshipField>>>,
         names: Arc<crate::names::NameOverrides>,
+        max_rows: Option<i64>,
     ) -> Self {
         let mut entities = HashMap::new();
         for (type_name, entity) in &generated.federation_entities {
@@ -2734,6 +2737,7 @@ impl EntityResolverState {
             entities,
             relationships,
             names,
+            max_rows,
         }
     }
 }
@@ -2785,18 +2789,20 @@ async fn resolve_entities<'a>(
         let rows = resolve_entity_group(ctx, lookup, &representations, state).await?;
         for representation in representations {
             let key = entity_key(&representation.values, &lookup.key_columns)?;
-            resolved[representation.index] = match rows.get(&key) {
-                Some(row) => Some(
-                    FieldValue::value(json_to_value(row.clone()))
-                        .with_type(representation.type_name),
-                ),
-                None => Some(FieldValue::value(Value::Null)),
-            };
+            let row = rows.get(&key).ok_or_else(|| {
+                async_graphql::Error::new(format!(
+                    "entity \"{}\" could not be resolved from its key",
+                    representation.type_name
+                ))
+            })?;
+            resolved[representation.index] = Some(
+                FieldValue::value(json_to_value(row.clone())).with_type(representation.type_name),
+            );
         }
     }
 
     Ok(Some(FieldValue::list(resolved.into_iter().map(|value| {
-        value.unwrap_or_else(|| FieldValue::value(Value::Null))
+        value.expect("every representation was resolved or errored")
     }))))
 }
 
@@ -2881,7 +2887,13 @@ async fn resolve_entity_group(
         postrust_sql::escape_ident(&lookup.table_name),
         postrust_sql::escape_ident(READ_ROW)
     );
-    let renamed = {
+    let source_rows = format!(
+        "SELECT {}.* FROM {}{}",
+        postrust_sql::escape_ident(READ_ROW),
+        source,
+        where_sql
+    );
+    let mut projection = {
         let guard = gql_ctx
             .schema_cache
             .get()
@@ -2895,15 +2907,64 @@ async fn resolve_entity_group(
                     &lookup.table_name,
                 ))
             })
-            .and_then(|table| rename_projection(table, READ_ROW, state.names.as_ref()))
-            .unwrap_or_else(|| format!("{}.*", postrust_sql::escape_ident(READ_ROW)))
+            .and_then(|table| rename_projection(table, "src", state.names.as_ref()))
+            .unwrap_or_else(|| "src.*".to_string())
+    };
+    let projected_rows = {
+        let guard = gql_ctx
+            .schema_cache
+            .get()
+            .await
+            .map_err(|e| async_graphql::Error::new(e.to_string()))?;
+        let cache = guard
+            .as_ref()
+            .ok_or_else(|| async_graphql::Error::new("schema cache is not loaded"))?;
+        let table = cache.get_table(&postrust_core::api_request::QualifiedIdentifier::new(
+            &lookup.schema_name,
+            &lookup.table_name,
+        ));
+        let mut param_idx = bound_values.len() + 1;
+        let computed = match table {
+            Some(table) => computed_projections(
+                table,
+                ctx.field(),
+                "src",
+                state.names.as_ref(),
+                cache,
+                &mut param_idx,
+                &mut bound_values,
+            )?,
+            None => Vec::new(),
+        };
+        let embeds = build_embed_expressions(
+            &gql_ctx.caller(),
+            cache,
+            state.relationships.as_ref(),
+            &lookup.type_name,
+            "src",
+            ctx.field(),
+            state.max_rows,
+            &mut 0,
+            &mut param_idx,
+            &mut bound_values,
+            state.names.as_ref(),
+        )?;
+        for expression in &computed {
+            projection.push_str(", ");
+            projection.push_str(expression);
+        }
+        for (field_name, expression) in &embeds {
+            projection.push_str(", ");
+            projection.push_str(expression);
+            projection.push_str(" AS ");
+            projection.push_str(&postrust_sql::escape_ident(field_name));
+        }
+        format!("SELECT {} FROM ({}) AS src", projection, source_rows)
     };
     let sql = format!(
-        "SELECT {} FROM (SELECT {} FROM {}{}) AS t",
+        "SELECT {} FROM ({}) AS t",
         row_json("t", &lookup.row_column_types),
-        renamed,
-        source,
-        where_sql,
+        projected_rows,
     );
     let mut tx = begin_with_session(pool, gql_ctx.role(), &gql_ctx.session_settings()).await?;
     let rows = execute_query_on(&mut tx, &sql, &bound_values).await?;
