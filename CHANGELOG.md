@@ -38,6 +38,21 @@ manifest, because Cargo does not expose a dependency's feature selection to a
 dependent's `cfg`, and it accepts any of sqlx's TLS features so that revisiting
 which one is chosen does not fail the build.
 
+**rustls moves to 0.23.45 for RUSTSEC-2026-0285**, a medium-severity advisory
+against TLS 1.3 handshake messages being accepted across encryption level
+boundaries. 0.23.35 was already in the lockfile before this release, so the
+advisory is not a regression -- it was published on 2026-09-14 and would have
+turned the audit red on its own. What this release changes is whether it is
+reachable. rustls was previously pulled only by `postrust-proxy`, through ACME
+and reqwest, on a 0.x line that carries no stability promise; enabling TLS in
+sqlx puts it under `postrust-core` and therefore under every crate on the
+stable line. By the test SECURITY.md already sets -- check `cargo tree -i`
+before treating an advisory as an exposure -- that moves it from worth fixing
+to worth fixing now, and a release whose subject is that TLS works should not
+ship a known TLS advisory. The bump is within 0.23 and costs no compatibility:
+rustls 0.23.45 declares Rust 1.71, well under the 1.88 floor, checked against
+the locked dependency set rather than assumed.
+
 No API changed. `postrust-proxy` and `postrust-worker` go to 0.5.1 for the same
 fix, which reaches them through the workspace.
 
