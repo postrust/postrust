@@ -11,6 +11,7 @@ use crate::input::mutation::{is_deletable, is_insertable, is_updatable};
 use crate::schema::object::TableObjectType;
 use crate::schema::relationship::RelationshipField;
 use postrust_core::schema_cache::{SchemaCache, Table};
+use postrust_core::QualifiedIdentifier;
 use std::collections::{HashMap, HashSet};
 
 /// Configuration for schema generation.
@@ -52,6 +53,13 @@ pub struct SchemaConfig {
     /// bound when it supplies a larger one. `None` leaves queries unbounded.
     pub max_rows: Option<i64>,
 
+    /// Whether this schema is emitted as an Apollo Federation subgraph.
+    pub enable_federation: bool,
+    /// Namespace applied to generated table types and root fields.
+    pub type_prefix: Option<String>,
+    /// Tables that retain an unprefixed identity across federated subgraphs.
+    pub shared_entities: Vec<QualifiedIdentifier>,
+
     /// Whose schema this is.
     ///
     /// `None` is the unrestricted one: what an administrator sees, and what
@@ -71,6 +79,9 @@ impl Default for SchemaConfig {
             enable_subscriptions: false,
             subscription_refresh_seconds: 30,
             max_rows: None,
+            enable_federation: false,
+            type_prefix: None,
+            shared_entities: Vec::new(),
             role: None,
         }
     }
