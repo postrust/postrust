@@ -49,13 +49,15 @@ curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
 # Build the project
 cargo build
 
-# Run tests
+# Run the tests that need nothing but a compiler
 cargo test
 
-# Run with Docker (includes PostgreSQL)
-docker-compose up -d postgres
-docker-compose run test
+# Run everything, including the tests that need PostgreSQL
+./scripts/test.sh
 ```
+
+`cargo test` on its own is expected to report a long list of ignored tests.
+See [Testing](#testing).
 
 ### Running the Server Locally
 
@@ -200,8 +202,19 @@ frag.push(&format!("'{}'", user_input));
 
 ### Running Tests
 
+Around 121 tests are `#[ignore]`d because they need a live PostgreSQL, so a
+plain `cargo test` reports them as ignored and passes without touching a
+database. That is expected, and it is not the whole suite.
+
+`scripts/test.sh` runs the whole thing: it starts the Compose PostgreSQL, waits
+for it, loads `scripts/init-db.sql` and `scripts/test-fixtures.sql`, and then
+runs both the ordinary and the ignored passes.
+
 ```bash
-# All tests
+# Everything, database included
+./scripts/test.sh
+
+# Just the tests that need no database
 cargo test --all
 
 # Specific crate
@@ -248,11 +261,31 @@ Integration tests requiring a database should:
 - Use the `scripts/init-db.sql` schema
 - Clean up after themselves
 
+Two things are easy to miss here, and `scripts/test.sh` exists so you do not
+have to remember either. A database-backed test is `#[ignore]`d, so it does not
+run without `-- --ignored`; and it reads fixtures, so an empty database is not
+enough.
+
 ```bash
-# Run integration tests
+# Or just: ./scripts/test.sh
+
 docker-compose up -d postgres
-DATABASE_URL="postgres://postgres:postgres@localhost:5432/postrust_test" cargo test
+
+# Schema and fixtures -- without these the ignored tests fail on missing data
+export PGPASSWORD=postgres
+for f in scripts/init-db.sql scripts/test-fixtures.sql; do
+  docker-compose exec -T postgres psql -q -v ON_ERROR_STOP=1 \
+    -U postgres -d postrust_test < "$f"
+done
+
+export DATABASE_URL="postgres://postgres:postgres@localhost:5432/postrust_test"
+
+cargo test --workspace                                  # ordinary tests
+cargo test --workspace --lib --bins --tests -- --ignored  # database-backed
 ```
+
+Two tests need an ACME test CA rather than a database and stay ignored even
+then; `scripts/acme/run.sh` runs those.
 
 ## Documentation
 
