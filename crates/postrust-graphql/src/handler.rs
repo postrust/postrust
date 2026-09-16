@@ -7,7 +7,7 @@ use crate::context::GraphQLContext;
 use crate::error::GraphQLError;
 use crate::schema::object::TableObjectType;
 use crate::schema::relationship::RelationshipField;
-use crate::schema::{build_schema, GeneratedSchema, MutationType, SchemaConfig};
+use crate::schema::{build_schema, FederationEntity, GeneratedSchema, MutationType, SchemaConfig};
 use crate::subscription::{
     generate_subscription_fields, NotifyBroker, SubscriptionField as SubField,
 };
@@ -523,7 +523,11 @@ fn build_dynamic_schema(
             .get(type_name)
             .map(|r| r.as_slice())
             .unwrap_or(&[]);
-        let table_obj = create_object_type(obj, relationships);
+        let table_obj = create_object_type(
+            obj,
+            relationships,
+            generated.federation_entities.get(type_name),
+        );
         object_types.insert(type_name.clone(), table_obj);
     }
 
@@ -657,6 +661,9 @@ fn build_dynamic_schema(
         mutation.as_ref().map(|_| "mutation_root"),
         subscription.as_ref().map(|_| "subscription_root"),
     );
+    if generated.enable_federation {
+        builder = builder.enable_federation();
+    }
 
     // Register all object types
     for (_, obj) in object_types {
@@ -1543,8 +1550,15 @@ fn at_path(mut error: async_graphql::Error, path: &str) -> async_graphql::Error 
     error
 }
 
-fn create_object_type(obj: &TableObjectType, relationships: &[RelationshipField]) -> Object {
+fn create_object_type(
+    obj: &TableObjectType,
+    relationships: &[RelationshipField],
+    federation_entity: Option<&FederationEntity>,
+) -> Object {
     let mut object = Object::new(&obj.name);
+    if let Some(entity) = federation_entity {
+        object = object.key(entity.key_fields_sdl());
+    }
 
     // A table with no comment still gets a description, because Hasura gives
     // one and a client generating documentation from the schema would
@@ -1652,6 +1666,11 @@ fn create_object_type(obj: &TableObjectType, relationships: &[RelationshipField]
 
         let gql_field = if let Some(desc) = &field.description {
             gql_field.description(desc)
+        } else {
+            gql_field
+        };
+        let gql_field = if federation_entity.is_some_and(|entity| entity.shared && !field.is_pk) {
+            gql_field.shareable()
         } else {
             gql_field
         };
@@ -9315,6 +9334,80 @@ mod tests {
         assert!(sdl.contains("test_insert_users("), "mutation root:\n{sdl}");
     }
 
+    #[test]
+    fn federation_is_absent_by_default() {
+        let cache = create_test_schema_cache();
+        let generated = build_schema(&cache, &SchemaConfig::default());
+        let schema = build_dynamic_schema(
+            &generated,
+            &cache,
+            None,
+            None,
+            Arc::new(Default::default()),
+            std::time::Duration::from_secs(30),
+            None,
+        )
+        .expect("a non-federated schema should build");
+        let sdl = schema.sdl();
+
+        assert!(!sdl.contains("_Service"), "service type:\n{sdl}");
+        assert!(!sdl.contains("_service"), "service field:\n{sdl}");
+        assert!(!sdl.contains("@key"), "federation key:\n{sdl}");
+    }
+
+    #[tokio::test]
+    async fn federation_exposes_service_sdl_and_entity_keys() {
+        let cache = create_test_schema_cache();
+        let config = SchemaConfig {
+            enable_federation: true,
+            type_prefix: Some("test".into()),
+            shared_entities: vec![postrust_core::QualifiedIdentifier::new("public", "users")],
+            ..SchemaConfig::default()
+        };
+        let generated = build_schema(&cache, &config);
+        let schema = build_dynamic_schema(
+            &generated,
+            &cache,
+            None,
+            None,
+            Arc::new(Default::default()),
+            std::time::Duration::from_secs(30),
+            None,
+        )
+        .expect("a federated schema should build");
+        let sdl = schema.sdl();
+        let federation_sdl =
+            schema.sdl_with_options(async_graphql::SDLExportOptions::new().federation());
+
+        assert!(sdl.contains("_Service"), "service type:\n{sdl}");
+        assert!(sdl.contains("_service"), "service field:\n{sdl}");
+        assert!(
+            federation_sdl.contains("type users @key(fields: \"id\")"),
+            "users key:\n{federation_sdl}"
+        );
+        assert!(
+            federation_sdl.contains("@shareable"),
+            "shared field directive:\n{federation_sdl}"
+        );
+
+        let response = schema.execute("{ _service { sdl } }").await;
+        assert!(
+            response.errors.is_empty(),
+            "service query errors: {:?}",
+            response.errors
+        );
+        let service = response.data.into_json().expect("service response JSON");
+        let service_sdl = service
+            .get("_service")
+            .and_then(|value| value.get("sdl"))
+            .and_then(serde_json::Value::as_str)
+            .expect("service SDL string");
+        assert!(
+            service_sdl.contains("type users @key(fields: \"id\")"),
+            "{service_sdl}"
+        );
+    }
+
     /// `_exists` becomes a subselect over the table it names, correlated with
     /// nothing -- which is the difference between it and a relationship.
     #[test]
@@ -9733,7 +9826,7 @@ mod tests {
     fn test_create_object_type() {
         let table = create_test_table("users");
         let obj = TableObjectType::from_table(&table);
-        let _gql_obj = create_object_type(&obj, &[]);
+        let _gql_obj = create_object_type(&obj, &[], None);
     }
 
     #[test]

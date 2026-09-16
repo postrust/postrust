@@ -308,6 +308,30 @@ pub struct GeneratedSchema {
     pub enum_types: HashMap<String, Vec<(String, Option<String>)>>,
     /// Database functions exposed as root fields.
     pub function_fields: Vec<FunctionField>,
+    /// Apollo Federation entities keyed by GraphQL type name.
+    pub federation_entities: HashMap<String, FederationEntity>,
+    /// Whether Apollo Federation system fields should be exposed.
+    pub enable_federation: bool,
+}
+
+/// A table exposed as an Apollo Federation entity.
+#[derive(Debug, Clone)]
+pub struct FederationEntity {
+    /// GraphQL type name of the entity.
+    pub type_name: String,
+    /// Table this entity resolves to.
+    pub table: QualifiedIdentifier,
+    /// Primary key field names as exposed in GraphQL.
+    pub key_fields: Vec<String>,
+    /// Whether the type is configured as shared across subgraphs.
+    pub shared: bool,
+}
+
+impl FederationEntity {
+    /// The `fields` argument used by Apollo Federation's `@key` directive.
+    pub fn key_fields_sdl(&self) -> String {
+        self.key_fields.join(" ")
+    }
 }
 
 /// A database function returning rows of a table, exposed as a root field.
@@ -704,6 +728,11 @@ impl GeneratedSchema {
         self.relationship_fields.get(type_name)
     }
 
+    /// Get federation entity metadata for a type.
+    pub fn get_federation_entity(&self, type_name: &str) -> Option<&FederationEntity> {
+        self.federation_entities.get(type_name)
+    }
+
     /// Get all table names.
     pub fn table_names(&self) -> Vec<&str> {
         self.object_types
@@ -1045,6 +1074,7 @@ pub fn build_schema(schema_cache: &SchemaCache, config: &SchemaConfig) -> Genera
     let mut query_fields = Vec::new();
     let mut mutation_fields = Vec::new();
     let mut relationship_fields = HashMap::new();
+    let mut federation_entities = HashMap::new();
 
     // Tables are visited in a stable order: the cache is a hash map, and any
     // name disambiguation below must not shift between restarts.
@@ -1296,6 +1326,26 @@ pub fn build_schema(schema_cache: &SchemaCache, config: &SchemaConfig) -> Genera
 
         if !rels.is_empty() {
             relationship_fields.insert(type_name.clone(), rels);
+        }
+
+        if config.enable_federation && readable && has_whole_key(table) {
+            let key_fields: Vec<String> = obj_type
+                .fields
+                .iter()
+                .filter(|field| field.is_pk)
+                .map(|field| field.name.clone())
+                .collect();
+            if key_fields.len() == table.pk_cols.len() {
+                federation_entities.insert(
+                    type_name.clone(),
+                    FederationEntity {
+                        type_name: type_name.clone(),
+                        table: table.qualified_identifier(),
+                        key_fields,
+                        shared: config.is_shared_entity(&table.qualified_identifier()),
+                    },
+                );
+            }
         }
 
         object_types.insert(type_name, obj_type);
@@ -1619,6 +1669,8 @@ pub fn build_schema(schema_cache: &SchemaCache, config: &SchemaConfig) -> Genera
         relationship_fields,
         enum_types,
         function_fields,
+        federation_entities,
+        enable_federation: config.enable_federation,
     }
 }
 
@@ -2096,6 +2148,41 @@ mod tests {
             .expect("posts relationships");
         assert_eq!(posts_relationships[0].name, "user");
         assert_eq!(posts_relationships[0].target_type, "users");
+    }
+
+    #[test]
+    fn federation_entities_are_generated_only_when_enabled() {
+        let cache = create_test_schema_cache();
+
+        let disabled = build_schema(&cache, &SchemaConfig::default());
+        assert!(!disabled.enable_federation);
+        assert!(disabled.federation_entities.is_empty());
+
+        let enabled = build_schema(
+            &cache,
+            &SchemaConfig {
+                enable_federation: true,
+                type_prefix: Some("test".into()),
+                shared_entities: vec![QualifiedIdentifier::new("public", "users")],
+                ..SchemaConfig::default()
+            },
+        );
+
+        assert!(enabled.enable_federation);
+        let users = enabled
+            .get_federation_entity("users")
+            .expect("shared users entity");
+        assert_eq!(users.type_name, "users");
+        assert_eq!(users.table, QualifiedIdentifier::new("public", "users"));
+        assert_eq!(users.key_fields_sdl(), "id");
+        assert!(users.shared);
+
+        let posts = enabled
+            .get_federation_entity("test_posts")
+            .expect("prefixed posts entity");
+        assert_eq!(posts.type_name, "test_posts");
+        assert_eq!(posts.key_fields_sdl(), "id");
+        assert!(!posts.shared);
     }
 
     #[test]
