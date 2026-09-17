@@ -2229,6 +2229,7 @@ mod tests {
             }],
         );
         let config = SchemaConfig {
+            enable_federation: true,
             type_prefix: Some("test".into()),
             names: crate::names::NameOverrides::parse(
                 r#"{"tables": {"public.users": {"federation": {"shared": true}}}}"#,
