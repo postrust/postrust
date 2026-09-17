@@ -110,7 +110,7 @@ impl SchemaConfig {
 
     /// Whether a table keeps its unprefixed type identity across subgraphs.
     pub fn is_shared_entity(&self, table: &QualifiedIdentifier) -> bool {
-        self.names.federation_shared(&table.schema, &table.name)
+        self.enable_federation && self.names.federation_shared(&table.schema, &table.name)
     }
 
     /// Name a table type, applying the configured namespace unless it is shared.

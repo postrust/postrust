@@ -9740,6 +9740,53 @@ mod tests {
         assert!(!sdl.contains("@key"), "federation key:\n{sdl}");
     }
 
+    #[test]
+    fn federation_metadata_is_byte_for_byte_inert_when_disabled() {
+        let cache = create_test_schema_cache();
+        let sdl_for = |config: SchemaConfig| {
+            let generated = build_schema(&cache, &config);
+            build_dynamic_schema(
+                &generated,
+                &cache,
+                None,
+                None,
+                Arc::new(config.names.clone()),
+                std::time::Duration::from_secs(30),
+                None,
+            )
+            .expect("schema should build")
+            .sdl()
+        };
+
+        let baseline = sdl_for(SchemaConfig {
+            type_prefix: Some("test".into()),
+            ..SchemaConfig::default()
+        });
+        let with_disabled_federation_metadata = sdl_for(SchemaConfig {
+            enable_federation: false,
+            type_prefix: Some("test".into()),
+            names: crate::names::NameOverrides::parse(
+                r#"{"tables": {"public.users": {"federation": {"shared": true}}}}"#,
+            )
+            .expect("metadata"),
+            ..SchemaConfig::default()
+        });
+
+        assert_eq!(with_disabled_federation_metadata, baseline);
+        assert!(
+            with_disabled_federation_metadata.contains("type test_users "),
+            "prefixed object type remains when federation is disabled:\n{with_disabled_federation_metadata}"
+        );
+        assert!(
+            !with_disabled_federation_metadata.contains("_Service"),
+            "service type:\n{with_disabled_federation_metadata}"
+        );
+        assert!(
+            !with_disabled_federation_metadata.contains("@key"),
+            "federation key:\n{with_disabled_federation_metadata}"
+        );
+    }
+
     #[tokio::test]
     async fn federation_exposes_service_sdl_and_entity_keys() {
         let cache = create_test_schema_cache();
