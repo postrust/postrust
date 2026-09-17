@@ -500,11 +500,12 @@ For a table `author`, with a to-many relationship `articles`:
 | `delete_author(where:)` | `affected_rows` and `returning { … }` |
 | `delete_author_by_pk(id: 1)` | the row removed |
 
-The root types are named `query_root`, `mutation_root` and `subscription_root`.
-The subscription root mirrors the query root — `author`, `author_by_pk` and
-`author_aggregate`, with the same arguments — and each of its fields is a live
-query: the answer now, and the answer again whenever it changes. See
-[Realtime](./realtime.md).
+The root types are named `query_root`, `mutation_root` and `subscription_root`
+unless Apollo Federation is enabled, where the root types are `Query`,
+`Mutation` and `Subscription`. The subscription root mirrors the query root —
+`author`, `author_by_pk` and `author_aggregate`, with the same arguments — and
+each of its fields is a live query: the answer now, and the answer again
+whenever it changes. See [Realtime](./realtime.md).
 
 ### Queries
 
@@ -951,6 +952,11 @@ query {
   }
 }
 ```
+
+With `PGRST_GRAPHQL_FEDERATION=true`, the service also exposes Apollo
+Federation's `_service { sdl }` and `_entities(representations:)` fields. The
+SDL returned from `_service` is the subgraph SDL used by an Apollo router or
+gateway.
 
 ### GraphQL vs REST Comparison
 
