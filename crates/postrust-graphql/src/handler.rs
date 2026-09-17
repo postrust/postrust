@@ -9557,6 +9557,11 @@ mod tests {
         }
     }
 
+    fn add_test_table(cache: &mut SchemaCache, name: &str) {
+        let table = create_test_table(name);
+        cache.tables.insert(table.qualified_identifier(), table);
+    }
+
     // ============================================================================
     // Type Reference Tests
     // ============================================================================
@@ -9789,7 +9794,8 @@ mod tests {
 
     #[tokio::test]
     async fn federation_exposes_service_sdl_and_entity_keys() {
-        let cache = create_test_schema_cache();
+        let mut cache = create_test_schema_cache();
+        add_test_table(&mut cache, "posts");
         let config = SchemaConfig {
             enable_federation: true,
             type_prefix: Some("test".into()),
@@ -9852,6 +9858,19 @@ mod tests {
             !sdl.contains("type users_mutation_response "),
             "unprefixed mutation response type:\n{sdl}"
         );
+        assert!(
+            sdl.contains("type test_posts {"),
+            "non-shared object type remains prefixed:\n{sdl}"
+        );
+        assert!(
+            !sdl.contains("type posts {"),
+            "non-shared object type must not become unprefixed:\n{sdl}"
+        );
+        assert!(sdl.contains("test_posts("), "prefixed posts root:\n{sdl}");
+        assert!(
+            sdl.contains("test_posts_bool_exp"),
+            "prefixed posts bool_exp:\n{sdl}"
+        );
 
         let response = schema.execute("{ _service { sdl } }").await;
         assert!(
@@ -9874,11 +9893,19 @@ mod tests {
             "query fields are on the federation root:\n{service_sdl}"
         );
         assert!(
+            service_sdl.contains("test_posts("),
+            "non-shared query fields are on the federation root:\n{service_sdl}"
+        );
+        assert!(
             !service_sdl.contains("type query_root"),
             "Apollo composition treats query_root as an ordinary object without a schema definition:\n{service_sdl}"
         );
         assert!(
             service_sdl.contains("type users @key(fields: \"id\")"),
+            "{service_sdl}"
+        );
+        assert!(
+            service_sdl.contains("type test_posts @key(fields: \"id\")"),
             "{service_sdl}"
         );
     }
