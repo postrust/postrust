@@ -586,6 +586,26 @@ fn build_dynamic_schema(
         );
     }
 
+    // Non-federated Hasura-compatible schemas use `query_root`, not `Query`.
+    // Federation SDL from async-graphql does not include an operation-root
+    // schema definition, so Apollo composition treats only the conventional
+    // root names as root types.
+    let query_root = if generated.enable_federation {
+        "Query"
+    } else {
+        "query_root"
+    };
+    let mutation_root = if generated.enable_federation {
+        "Mutation"
+    } else {
+        "mutation_root"
+    };
+    let subscription_root = if generated.enable_federation {
+        "Subscription"
+    } else {
+        "subscription_root"
+    };
+
     // Create query type. Resolvers need the relationship map to embed related
     // rows, so it is shared into each closure.
     let relationships = Arc::new(generated.relationship_fields.clone());
@@ -609,6 +629,7 @@ fn build_dynamic_schema(
     let query = add_function_fields(
         create_query_type(
             generated,
+            query_root,
             max_rows,
             Arc::clone(&relationships),
             Arc::clone(&names),
@@ -627,6 +648,7 @@ fn build_dynamic_schema(
         Some(add_function_fields(
             create_mutation_type(
                 generated,
+                mutation_root,
                 Arc::clone(&relationships),
                 Arc::clone(&type_names),
                 Arc::clone(&names),
@@ -647,6 +669,7 @@ fn build_dynamic_schema(
     let subscription = subscription_fields.map(|_| {
         create_subscription_type(
             generated,
+            subscription_root,
             max_rows,
             Arc::clone(&relationships),
             Arc::clone(&names),
@@ -655,13 +678,10 @@ fn build_dynamic_schema(
     });
 
     // Build schema
-    // `query_root`, not `Query`. The root type's name is not private to the
-    // server: a fragment is declared `on query_root`, and a client that writes
-    // one names the type it was generated against.
     let mut builder = Schema::build(
-        "query_root",
-        mutation.as_ref().map(|_| "mutation_root"),
-        subscription.as_ref().map(|_| "subscription_root"),
+        query_root,
+        mutation.as_ref().map(|_| mutation_root),
+        subscription.as_ref().map(|_| subscription_root),
     );
     if generated.enable_federation {
         builder = builder.enable_federation();
@@ -1961,6 +1981,7 @@ fn with_key_arguments<F: RootField>(
 /// Create the Query type with all table query fields.
 fn create_query_type(
     generated: &GeneratedSchema,
+    root_name: &str,
     max_rows: Option<i64>,
     relationships: Arc<HashMap<String, Vec<RelationshipField>>>,
     names: Arc<crate::names::NameOverrides>,
@@ -2067,7 +2088,7 @@ fn create_query_type(
     }
 
     roots.sort_by(|(a, _), (b, _)| a.cmp(b));
-    let mut query = Object::new("query_root");
+    let mut query = Object::new(root_name);
     // A GraphQL object may not have no fields, so a schema that exposes no
     // table needs something on its query root. Hasura puts a placeholder there
     // and calls it this; a client that reaches it has nothing to read.
@@ -2203,13 +2224,14 @@ fn update_inputs(
 
 fn create_mutation_type(
     generated: &GeneratedSchema,
+    root_name: &str,
     relationships: Arc<HashMap<String, Vec<RelationshipField>>>,
     type_names: Arc<HashMap<(String, String), String>>,
     names: Arc<crate::names::NameOverrides>,
     max_rows: Option<i64>,
     role: Option<&str>,
 ) -> Object {
-    let mut mutation = Object::new("mutation_root");
+    let mut mutation = Object::new(root_name);
     // In name order, for the reason the query root is: see there.
     let mut roots: Vec<(String, Field)> = Vec::new();
 
@@ -2389,6 +2411,7 @@ fn create_mutation_type(
 /// for every subscriber every tick whether or not anything happened.
 fn create_subscription_type(
     generated: &GeneratedSchema,
+    root_name: &str,
     max_rows: Option<i64>,
     relationships: Arc<HashMap<String, Vec<RelationshipField>>>,
     names: Arc<crate::names::NameOverrides>,
@@ -2495,7 +2518,7 @@ fn create_subscription_type(
     }
 
     roots.sort_by(|(a, _), (b, _)| a.cmp(b));
-    let mut subscription = Subscription::new("subscription_root");
+    let mut subscription = Subscription::new(root_name);
     // A GraphQL object may not have no fields, and a schema that exposes no
     // table still has a subscription root if subscriptions are on.
     if roots.is_empty() {
@@ -9796,6 +9819,18 @@ mod tests {
             .and_then(serde_json::Value::as_str)
             .expect("service SDL string");
         assert!(
+            service_sdl.contains("type Query"),
+            "federation root type:\n{service_sdl}"
+        );
+        assert!(
+            service_sdl.contains("test_users("),
+            "query fields are on the federation root:\n{service_sdl}"
+        );
+        assert!(
+            !service_sdl.contains("type query_root"),
+            "Apollo composition treats query_root as an ordinary object without a schema definition:\n{service_sdl}"
+        );
+        assert!(
             service_sdl.contains("type users @key(fields: \"id\")"),
             "{service_sdl}"
         );
@@ -10230,6 +10265,7 @@ mod tests {
 
         let _query = create_query_type(
             &generated,
+            "query_root",
             None,
             Arc::new(HashMap::new()),
             Arc::new(Default::default()),
@@ -10244,6 +10280,7 @@ mod tests {
 
         let _mutation = create_mutation_type(
             &generated,
+            "mutation_root",
             Arc::new(HashMap::new()),
             Arc::new(HashMap::new()),
             Arc::new(Default::default()),
@@ -10397,6 +10434,7 @@ mod tests {
         // query root, which is the whole contract.
         let _subscription = create_subscription_type(
             &generated,
+            "subscription_root",
             None,
             Arc::new(Default::default()),
             Arc::new(Default::default()),
