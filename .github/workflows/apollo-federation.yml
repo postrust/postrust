@@ -1,0 +1,74 @@
+name: Apollo Federation compatibility
+
+on:
+  pull_request:
+    paths:
+      - ".github/workflows/apollo-federation.yml"
+      - "Cargo.lock"
+      - "Cargo.toml"
+      - "crates/postrust-core/**"
+      - "crates/postrust-graphql/**"
+      - "crates/postrust-server/**"
+      - "scripts/apollo-federation/**"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: apollo-federation-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  compatibility:
+    name: Apollo subgraph suite (baseline)
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      # v2.1.1. Keep the full SHA: this action builds and executes containers
+      # supplied by another repository.
+      - name: Run Apollo's subgraph compatibility suite
+        uses: apollographql/federation-subgraph-compatibility@b6981fd83d24450a7cbd2d7727196e0ba57614e0
+        env:
+          POSTRUST_BUILD_CONTEXT: .
+          POSTRUST_FIXTURE_DIR: scripts/apollo-federation
+        with:
+          compose: scripts/apollo-federation/compose.yaml
+          schema: scripts/apollo-federation/products.graphql
+          path: /v1/graphql
+          port: 4001
+          debug: true
+          # Establish the measured baseline before making any category a gate.
+          failOnRequired: false
+          failOnWarning: false
+
+      - name: Capture Postrust fixture logs
+        if: always()
+        env:
+          POSTRUST_BUILD_CONTEXT: .
+          POSTRUST_FIXTURE_DIR: scripts/apollo-federation
+        run: >-
+          docker compose -f scripts/apollo-federation/compose.yaml logs
+          --no-color > apollo-federation-docker.log
+
+      - name: Upload compatibility artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: apollo-federation-compatibility
+          if-no-files-found: ignore
+          path: |
+            results.md
+            scripts/apollo-federation/results.md
+            apollo-federation-docker.log
+
+      - name: Stop the fixture
+        if: always()
+        env:
+          POSTRUST_BUILD_CONTEXT: .
+          POSTRUST_FIXTURE_DIR: scripts/apollo-federation
+        run: >-
+          docker compose -f scripts/apollo-federation/compose.yaml down
+          --volumes --remove-orphans

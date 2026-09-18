@@ -42,3 +42,8 @@ scripts/h2spec/.work
 scripts/autobahn/.work
 scripts/autobahn/reports
 scripts/autobahn/reports-baseline
+
+# Apollo Federation Testing
+supergraph-compose.yaml
+supergraph-config.yaml
+supergraph.graphql

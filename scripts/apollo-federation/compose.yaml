@@ -1,0 +1,46 @@
+name: postrust-apollo-federation
+
+services:
+  database:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: federation
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d federation"]
+      interval: 2s
+      timeout: 5s
+      retries: 30
+    volumes:
+      - ./${POSTRUST_FIXTURE_DIR:-.}/schema.sql:/docker-entrypoint-initdb.d/01-schema.sql:ro
+
+  products:
+    build:
+      # Standalone Compose resolves paths from this file, so ../.. is the
+      # repository root. Apollo prepends a generated Compose file in the
+      # repository root, which changes the base directory; its callers set
+      # POSTRUST_BUILD_CONTEXT=. to compensate.
+      context: ${POSTRUST_BUILD_CONTEXT:-../..}
+      dockerfile: scripts/apollo-federation/Dockerfile
+    depends_on:
+      database:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgres://postgres:postgres@database:5432/federation
+      PGRST_DB_SCHEMAS: public
+      PGRST_DB_ANON_ROLE: postgres
+      PGRST_GRAPHQL_FEDERATION: "true"
+      PGRST_GRAPHQL_METADATA: /config/graphql-metadata.json
+      PGRST_SERVER_HOST: 0.0.0.0
+      PGRST_SERVER_PORT: 4001
+      PGRST_LOG_LEVEL: info
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "http://localhost:4001/_/health"]
+      interval: 2s
+      timeout: 5s
+      retries: 30
+    ports:
+      - "4001:4001"
+    volumes:
+      - ./${POSTRUST_FIXTURE_DIR:-.}/graphql-metadata.json:/config/graphql-metadata.json:ro
