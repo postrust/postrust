@@ -175,7 +175,9 @@ arguments come back in declaration order where Hasura sorts them. Nothing
 breaks on it — a description is documentation — but it is one reason no large
 introspection case reaches agreement.
 
-**Actions and Apollo federation** are subsystems rather than gaps.
+**Actions** are a subsystem rather than a gap. **Apollo Federation** is an
+opt-in subgraph mode; enabling it intentionally changes the SDL by adding
+Federation fields and directives.
 
 ## Related
 

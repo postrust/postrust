@@ -313,6 +313,8 @@ async fn main() -> Result<()> {
             enable_subscriptions: true,
             subscription_refresh_seconds,
             max_rows: config.db_max_rows,
+            enable_federation: config.graphql_federation,
+            type_prefix: config.graphql_type_prefix.clone(),
             // The GraphQL schema was built for `public` whatever the server
             // was told to expose, so a table in any other schema of
             // `PGRST_DB_SCHEMAS` was reachable over REST and invisible over

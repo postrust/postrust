@@ -439,7 +439,9 @@ nothing depends on time. See [Realtime](./realtime.md).
 
 | Variable | Description | Default |
 |----------|-------------|---------|
-| `PGRST_GRAPHQL_METADATA` | Names for tables, columns, root fields, relationships and computed fields that the schema cannot supply; which root a function is exposed on; and what each role may do with each table. A JSON document, or a path to a file holding one. Also read as `PGRST_GRAPHQL_NAMES`, which is what it was called when names were all it carried. | unset (every name derived, no permission layer) |
+| `PGRST_GRAPHQL_METADATA` | Names for tables, columns, root fields, relationships and computed fields that the schema cannot supply; which root a function is exposed on; what each role may do with each table; and Apollo Federation table metadata. A JSON document, or a path to a file holding one. Also read as `PGRST_GRAPHQL_NAMES`, which is what it was called when names were all it carried. | unset (every name derived, no permission layer) |
+| `PGRST_GRAPHQL_FEDERATION` | Expose this GraphQL API as an Apollo Federation subgraph, adding `_service`, `_entities` and Federation SDL. | `false` |
+| `PGRST_GRAPHQL_TYPE_PREFIX` | Prefix generated table types and root fields, useful when several Postrust subgraphs are composed together. Shared Federation entities keep their unprefixed object type. | unset |
 
 Almost everything in the generated GraphQL API is derived: a table's name gives
 its root fields, a foreign key gives a relationship, a function gives a
@@ -453,6 +455,7 @@ down. This is where those names go when a schema is migrated from one.
     "name": "Authors",
     "roots": { "select_by_pk": "Author", "select_aggregate": "AuthorAgg" },
     "columns": { "id": "AuthorId" },
+    "column_types": { "id": "ID" },
     "relationships": {
       "article_author_id_fkey": "posts",
       "fetch_articles_plain": "get_articles"
@@ -477,10 +480,15 @@ down. This is where those names go when a schema is migrated from one.
   that come back, in `where`, in `order_by`, in `distinct_on`, in the key
   arguments, in `_set` and `objects`, in `on_conflict.update_columns` and
   inside every embed and aggregate. The database keeps its own name throughout.
-- **`relationships`** is keyed by *constraint* name, or by *function* name for a
-  computed relationship, because a constraint names exactly one relationship
-  even where two of them point at the same table. The name being replaced would
-  not: that is what this is for.
+- **`column_types`** exposes a column using a GraphQL scalar that cannot be
+  inferred from PostgreSQL. Currently `ID` is supported. The database column
+  retains its PostgreSQL type for reading, binding and casting; the override
+  applies to GraphQL fields, comparisons, write inputs and key arguments.
+- **`relationships`** is keyed by *constraint* name, by *junction-table* name
+  for a many-to-many relationship, or by *function* name for a computed
+  relationship. These source names distinguish relationships even where two
+  of them point at the same table. The name being replaced would not: that is
+  what this is for.
 - **`computed_fields`** is keyed by the function behind the field.
 - **`comments`** carries the descriptions Hasura keeps in metadata rather than
   in the database, under `table`, `columns`, `roots` and `computed_fields`. A
@@ -504,6 +512,39 @@ down. This is where those names go when a schema is migrated from one.
 
 Keys are `schema.table`, so a table in the default schema is still
 `public.author`. A table absent from the document is exposed exactly as before.
+
+### Apollo Federation
+
+Federation is opt-in. With `PGRST_GRAPHQL_FEDERATION=false`, Federation metadata
+is inert and the generated SDL is unchanged.
+
+When enabled, the GraphQL service is an Apollo Federation v2 subgraph. It adds
+`_service`, `_entities` and Federation directives, and uses the conventional
+root type names `Query`, `Mutation` and `Subscription`.
+
+Use `PGRST_GRAPHQL_TYPE_PREFIX` to keep independently generated subgraphs from
+colliding:
+
+```bash
+PGRST_GRAPHQL_FEDERATION=true
+PGRST_GRAPHQL_TYPE_PREFIX=billing
+```
+
+Mark a table as shared when another subgraph also owns the same entity:
+
+```json
+{
+  "tables": {
+    "public.users": {
+      "federation": { "shared": true }
+    }
+  }
+}
+```
+
+A shared table keeps its unprefixed object type, for example `users @key(...)`.
+Its root fields and helper types still use the prefix, for example
+`billing_users`, `billing_users_bool_exp` and `billing_users_aggregate`.
 
 ### What each role may do
 

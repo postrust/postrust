@@ -188,6 +188,17 @@ pub struct AppConfig {
     pub app_settings: HashMap<String, String>,
 
     // ========================================================================
+    // GraphQL Settings
+    // ========================================================================
+    /// Expose the GraphQL API as an Apollo Federation subgraph.
+    #[serde(default)]
+    pub graphql_federation: bool,
+
+    /// Namespace applied to generated GraphQL table types and root fields.
+    #[serde(default)]
+    pub graphql_type_prefix: Option<String>,
+
+    // ========================================================================
     // Compatibility Settings
     // ========================================================================
     /// PostgREST compatibility mode.
@@ -237,6 +248,8 @@ impl Default for AppConfig {
             log_level: default_log_level(),
             role_settings: HashMap::new(),
             app_settings: HashMap::new(),
+            graphql_federation: false,
+            graphql_type_prefix: None,
             compat_mode: false,
         }
     }
@@ -255,6 +268,33 @@ fn env_bool(value: &str) -> bool {
         value.trim().to_ascii_lowercase().as_str(),
         "true" | "1" | "yes" | "on"
     )
+}
+
+/// Parse the explicit boolean values accepted by GraphQL federation configuration.
+fn parse_graphql_federation(value: &str) -> Option<bool> {
+    match value.trim() {
+        "true" => Some(true),
+        "false" => Some(false),
+        _ => None,
+    }
+}
+
+/// Validate a namespace before it becomes part of generated GraphQL names.
+fn parse_graphql_type_prefix(value: &str) -> Result<Option<String>, &'static str> {
+    let value = value.trim();
+    if value.is_empty() {
+        return Ok(None);
+    }
+
+    let mut chars = value.chars();
+    let valid_first = chars
+        .next()
+        .is_some_and(|c| c == '_' || c.is_ascii_alphabetic());
+    if !valid_first || !chars.all(|c| c == '_' || c.is_ascii_alphanumeric()) {
+        return Err("a GraphQL identifier beginning with a letter or underscore");
+    }
+
+    Ok(Some(value.to_string()))
 }
 
 impl AppConfig {
@@ -476,6 +516,19 @@ impl AppConfig {
                     &raw,
                     &format!("a JSON object of role to settings ({e})"),
                 ),
+            }
+        }
+
+        if let Ok(value) = std::env::var("PGRST_GRAPHQL_FEDERATION") {
+            match parse_graphql_federation(&value) {
+                Some(enabled) => config.graphql_federation = enabled,
+                None => warn_ignored("PGRST_GRAPHQL_FEDERATION", &value, "one of: true, false"),
+            }
+        }
+        if let Ok(value) = std::env::var("PGRST_GRAPHQL_TYPE_PREFIX") {
+            match parse_graphql_type_prefix(&value) {
+                Ok(prefix) => config.graphql_type_prefix = prefix,
+                Err(expected) => warn_ignored("PGRST_GRAPHQL_TYPE_PREFIX", &value, expected),
             }
         }
 
@@ -805,6 +858,8 @@ mod tests {
         assert_eq!(config.server_port, 3000);
         assert_eq!(config.db_pool_size, 10);
         assert!(config.db_prepared_statements);
+        assert!(!config.graphql_federation);
+        assert_eq!(config.graphql_type_prefix, None);
     }
 
     #[test]
@@ -877,6 +932,40 @@ mod tests {
         for s in ["false", "0", "no", "off", "", "maybe"] {
             assert!(!env_bool(s), "{s:?}");
         }
+    }
+
+    #[test]
+    fn graphql_federation_configuration_is_read() {
+        let config = with_env(&[
+            ("PGRST_GRAPHQL_FEDERATION", "true"),
+            ("PGRST_GRAPHQL_TYPE_PREFIX", " test "),
+        ]);
+
+        assert!(config.graphql_federation);
+        assert_eq!(config.graphql_type_prefix.as_deref(), Some("test"));
+    }
+
+    #[test]
+    fn graphql_federation_accepts_an_explicit_false() {
+        assert!(!with_env(&[("PGRST_GRAPHQL_FEDERATION", "false")]).graphql_federation);
+    }
+
+    #[test]
+    fn malformed_graphql_federation_configuration_is_ignored() {
+        let config = with_env(&[
+            ("PGRST_GRAPHQL_FEDERATION", "sometimes"),
+            ("PGRST_GRAPHQL_TYPE_PREFIX", "not-valid"),
+        ]);
+
+        assert!(!config.graphql_federation);
+        assert_eq!(config.graphql_type_prefix, None);
+    }
+
+    #[test]
+    fn an_empty_graphql_prefix_means_unset() {
+        let config = with_env(&[("PGRST_GRAPHQL_TYPE_PREFIX", "   ")]);
+
+        assert_eq!(config.graphql_type_prefix, None);
     }
 
     // `from_env` reads process-global state, so these run one at a time.

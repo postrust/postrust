@@ -347,10 +347,11 @@ pub fn build_inputs(
     let mut inputs = Vec::new();
 
     for (type_name, object) in object_types {
-        let bool_exp = bool_exp_type_name(type_name);
+        let local_type_name = object.local_name.as_str();
+        let bool_exp = bool_exp_type_name(local_type_name);
         let mut input = InputObject::new(&bool_exp).description(format!(
             "Filter rows of {}. Fields are combined with AND unless _or says otherwise.",
-            type_name
+            local_type_name
         ));
 
         input = input
@@ -403,7 +404,7 @@ pub fn build_inputs(
             }
             input = input.field(InputValue::new(
                 &relationship.name,
-                TypeRef::named(bool_exp_type_name(&relationship.target_type)),
+                TypeRef::named(bool_exp_type_name(&relationship.target_local_name)),
             ));
         }
 
@@ -425,7 +426,9 @@ pub fn build_inputs(
             }
             input = input.field(InputValue::new(
                 &name,
-                TypeRef::named(aggregate_bool_exp_type_name(&relationship.target_type)),
+                TypeRef::named(aggregate_bool_exp_type_name(
+                    &relationship.target_local_name,
+                )),
             ));
             // `count`'s predicate is an `Int` comparison whether or not any
             // column is one, and a type the schema names and never registers
