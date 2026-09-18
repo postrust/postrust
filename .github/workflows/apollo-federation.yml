@@ -21,7 +21,7 @@ concurrency:
 
 jobs:
   compatibility:
-    name: Apollo subgraph suite (baseline)
+    name: Apollo subgraph compatibility
     runs-on: ubuntu-latest
     timeout-minutes: 60
     steps:
@@ -40,8 +40,9 @@ jobs:
           path: /v1/graphql
           port: 4001
           debug: true
-          # Establish the measured baseline before making any category a gate.
-          failOnRequired: false
+          # Required compatibility is enforced; optional capabilities remain
+          # visible in the report without blocking changes.
+          failOnRequired: true
           failOnWarning: false
 
       - name: Capture Postrust fixture logs

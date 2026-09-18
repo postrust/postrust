@@ -75,25 +75,23 @@ npx --yes @apollo/federation-subgraph-compatibility@2.2.2 docker \
 The report is written to `results.json` in the current directory. Omit
 `--format json` to write `results.md` instead.
 
-## Expected initial gaps
+## Optional compatibility gaps
 
 The database and metadata reproduce as much of the canonical model as Postrust
 can currently express. The target schema intentionally retains features that
-are not yet supported, including multiple and nested keys, extended/external
+are not yet supported, including repeatable and nested keys, extended/external
 fields, `@requires`, `@provides`, `@override`, `@tag`, `@inaccessible`,
 `@composeDirective`, and `@interfaceObject`.
 
-The next step is to run Apollo's action with `failOnRequired: false` and record
-the baseline before changing the implementation.
+Apollo's required compatibility checks are enforced in CI. Optional capability
+failures remain visible in the report without failing the workflow.
 
-## GitHub Actions baseline
+## GitHub Actions
 
 `.github/workflows/apollo-federation.yml` runs Apollo's official compatibility
 action on pull requests that change the GraphQL/Federation implementation or
 this fixture. It can also be started manually with `workflow_dispatch`.
 
 The action is pinned to the commit behind Apollo action release `v2.1.1`.
-Initially, required and optional failures are both non-blocking: the purpose of
-the first run is to establish the baseline. The workflow uploads any suite
-results and the fixture's Docker logs as an artifact. Once the required tests
-pass reliably, change `failOnRequired` to `true`.
+Required failures block the workflow; optional failures remain non-blocking.
+The workflow uploads the suite results and fixture Docker logs as an artifact.
