@@ -204,13 +204,26 @@ fn pk_columns_of(table: &Table) -> Vec<(String, String)> {
 /// relationship to many. All of them are accepted, so a converted document
 /// needs no database to turn a column into the constraint that carries it.
 pub(crate) fn relationship_keys(rel: &postrust_core::schema_cache::Relationship) -> Vec<String> {
-    use postrust_core::schema_cache::Relationship;
+    use postrust_core::schema_cache::{Cardinality, Relationship};
 
     if let Relationship::Computed { function, .. } = rel {
         return vec![function.name.clone()];
     }
 
     let mut keys = Vec::new();
+    // A many-to-many has no single constraint of its own: it is inferred from
+    // the two constraints on its junction table. The junction is the stable,
+    // unambiguous name clients already use as a PostgREST relationship hint,
+    // and either constituent constraint is useful to hand-written metadata.
+    if let Relationship::ForeignKey {
+        cardinality: Cardinality::M2M(junction),
+        ..
+    } = rel
+    {
+        keys.push(junction.table.name.clone());
+        keys.push(junction.constraint1.clone());
+        keys.push(junction.constraint2.clone());
+    }
     match rel.constraint_name() {
         "" => {}
         constraint => keys.push(constraint.to_string()),
@@ -1873,6 +1886,69 @@ mod tests {
             pg_version: 150000,
             representations: Default::default(),
         }
+    }
+
+    #[test]
+    fn a_many_to_many_relationship_can_be_named_by_its_junction() {
+        use postrust_core::schema_cache::{Cardinality, Junction, Relationship};
+
+        let relationship = Relationship::ForeignKey {
+            table: QualifiedIdentifier::new("public", "products"),
+            foreign_table: QualifiedIdentifier::new("public", "product_research"),
+            is_self: false,
+            cardinality: Cardinality::M2M(Junction {
+                table: QualifiedIdentifier::new("public", "product_research_links"),
+                constraint1: "product_research_links_product_id_fkey".into(),
+                constraint2: "product_research_links_research_id_fkey".into(),
+                source_columns: vec![("id".into(), "product_id".into())],
+                target_columns: vec![("research_id".into(), "id".into())],
+            }),
+            table_is_view: false,
+            foreign_table_is_view: false,
+            constraint_name: String::new(),
+        };
+
+        assert_eq!(
+            relationship_keys(&relationship),
+            vec![
+                "product_research_links",
+                "product_research_links_product_id_fkey",
+                "product_research_links_research_id_fkey"
+            ]
+        );
+
+        let mut cache = create_test_schema_cache();
+        let products = create_test_table("products", true, true, true);
+        let product_research = create_test_table("product_research", true, true, true);
+        let products_key = products.qualified_identifier();
+        cache.tables.insert(products_key.clone(), products);
+        cache
+            .tables
+            .insert(product_research.qualified_identifier(), product_research);
+        cache
+            .relationships
+            .insert((products_key, "public".into()), vec![relationship]);
+
+        let names = crate::names::NameOverrides::parse(
+            r#"{"tables": {"public.products": {
+                "relationships": {"product_research_links": "research"}
+            }}}"#,
+        )
+        .unwrap();
+        let schema = build_schema(
+            &cache,
+            &SchemaConfig {
+                names,
+                ..SchemaConfig::default()
+            },
+        );
+        let field = schema
+            .get_relationship_fields("products")
+            .and_then(|fields| fields.iter().find(|field| field.name == "research"))
+            .expect("junction metadata renames the inferred relationship");
+
+        assert_eq!(field.target_type, "product_research");
+        assert!(field.is_list);
     }
 
     /// A `SETOF users` function, with the given argument names and types.

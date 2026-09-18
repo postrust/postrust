@@ -809,7 +809,13 @@ fn build_dynamic_schema(
                 names
                     .column(&field.schema_name, &field.table_name, column)
                     .unwrap_or(column),
-                TypeRef::named_nn(pk_argument_type(pg_type)),
+                TypeRef::named_nn(exposed_pk_argument_type(
+                    names.as_ref(),
+                    &field.schema_name,
+                    &field.table_name,
+                    column,
+                    pg_type,
+                )),
             ));
         }
         key_inputs.insert(type_name, input);
@@ -1972,7 +1978,13 @@ fn with_key_arguments<F: RootField>(
             names
                 .column(schema_name, table_name, column)
                 .unwrap_or(column),
-            TypeRef::named_nn(pk_argument_type(pg_type)),
+            TypeRef::named_nn(exposed_pk_argument_type(
+                names,
+                schema_name,
+                table_name,
+                column,
+                pg_type,
+            )),
         ));
     }
     field
@@ -2360,7 +2372,13 @@ fn create_mutation_type(
                         names
                             .column(&field.schema_name, &field.table_name, col_name)
                             .unwrap_or(col_name),
-                        TypeRef::named_nn(pk_argument_type(pg_type)),
+                        TypeRef::named_nn(exposed_pk_argument_type(
+                            names.as_ref(),
+                            &field.schema_name,
+                            &field.table_name,
+                            col_name,
+                            pg_type,
+                        )),
                     ));
                 }
             }
@@ -9298,6 +9316,23 @@ fn pk_argument_type(pg_type: &str) -> String {
     }
 }
 
+/// The public GraphQL type of a primary-key argument.
+///
+/// SQL execution still carries the PostgreSQL type beside the key and uses it
+/// for casts and binding. This is only the schema-facing type.
+fn exposed_pk_argument_type(
+    names: &crate::names::NameOverrides,
+    schema: &str,
+    table: &str,
+    column: &str,
+    pg_type: &str,
+) -> String {
+    names
+        .column_type(schema, table, column)
+        .map(|given| given.to_string())
+        .unwrap_or_else(|| pk_argument_type(pg_type))
+}
+
 /// Convert a GraphQL type string to a TypeRef.
 fn graphql_type_ref(type_str: &str) -> TypeRef {
     // Parse type string like "[Users!]!" or "String" or "Int!"
@@ -9691,6 +9726,60 @@ mod tests {
             eprintln!("Schema build error: {:?}", e);
         }
         assert!(result.is_ok(), "Schema build failed: {:?}", result.err());
+    }
+
+    #[test]
+    fn a_column_type_override_reaches_fields_and_key_arguments() {
+        let cache = create_test_schema_cache();
+        let names = crate::names::NameOverrides::parse(
+            r#"{"tables": {"public.users": {"column_types": {"id": "ID"}}}}"#,
+        )
+        .unwrap();
+        let config = SchemaConfig {
+            names: names.clone(),
+            ..SchemaConfig::default()
+        };
+        let generated = build_schema(&cache, &config);
+        let schema = build_dynamic_schema(
+            &generated,
+            &cache,
+            None,
+            None,
+            Arc::new(names),
+            std::time::Duration::from_secs(30),
+            None,
+        )
+        .expect("schema with an ID override should build");
+        let sdl = schema.sdl();
+
+        let input_body = |name: &str| {
+            sdl.split_once(&format!("input {name} {{"))
+                .and_then(|(_, rest)| rest.split_once('}'))
+                .map(|(body, _)| body.to_string())
+                .unwrap_or_else(|| panic!("missing input {name}:\n{sdl}"))
+        };
+
+        assert!(sdl.contains("id: ID!"), "object and input fields:\n{sdl}");
+        assert!(
+            sdl.contains("users_by_pk(id: ID!): users"),
+            "query key argument:\n{sdl}"
+        );
+        assert!(
+            sdl.contains("delete_users_by_pk(id: ID!): users"),
+            "delete key argument:\n{sdl}"
+        );
+        assert!(
+            input_body("users_pk_columns_input").contains("id: ID!"),
+            "update key input:\n{sdl}"
+        );
+        assert!(
+            input_body("users_bool_exp").contains("id: ID_comparison_exp"),
+            "comparison input:\n{sdl}"
+        );
+        assert!(
+            input_body("users_insert_input").contains("id: ID"),
+            "write input:\n{sdl}"
+        );
     }
 
     #[test]

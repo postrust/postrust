@@ -131,6 +131,15 @@ pub struct TableNames {
     #[serde(default)]
     pub columns: HashMap<String, String>,
 
+    /// GraphQL scalar overrides for columns, keyed by the database column.
+    ///
+    /// PostgreSQL has no `ID` type: identifiers are commonly stored as text,
+    /// integers or UUIDs. This lets the public GraphQL contract mark a column
+    /// as an opaque identifier without changing the type used to read, bind or
+    /// cast that column in PostgreSQL.
+    #[serde(default)]
+    pub column_types: HashMap<String, ColumnTypeOverride>,
+
     /// Whether this table is a set of allowed values rather than a set of
     /// rows.
     ///
@@ -172,6 +181,27 @@ pub struct FederationConfig {
     /// Whether this table keeps its unprefixed entity identity across subgraphs.
     #[serde(default)]
     pub shared: bool,
+}
+
+/// A GraphQL scalar a database column may be exposed as.
+///
+/// Only `ID` is supported for now. Unlike the other built-in scalars, `ID`
+/// has no PostgreSQL type from which it can be inferred, and strings returned
+/// by PostgreSQL are already valid `ID` values.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub enum ColumnTypeOverride {
+    /// GraphQL's opaque identifier scalar.
+    #[serde(rename = "ID")]
+    Id,
+}
+
+impl ColumnTypeOverride {
+    /// The schema type represented by this override.
+    pub fn graphql_type(self) -> crate::types::GraphQLType {
+        match self {
+            Self::Id => crate::types::GraphQLType::Id,
+        }
+    }
 }
 
 impl RolePermissions {
@@ -750,6 +780,20 @@ impl NameOverrides {
             .map(String::as_str)
     }
 
+    /// The GraphQL scalar a column is exposed as, if metadata overrides it.
+    pub fn column_type(
+        &self,
+        schema: &str,
+        table: &str,
+        column: &str,
+    ) -> Option<crate::types::GraphQLType> {
+        self.table(schema, table)?
+            .column_types
+            .get(column)
+            .copied()
+            .map(ColumnTypeOverride::graphql_type)
+    }
+
     /// The column behind a field name, if that name is a rename.
     ///
     /// The other direction, which is the one every resolver needs: it is
@@ -929,6 +973,30 @@ mod tests {
 
         assert!(names.federation_shared("public", "users"));
         assert!(!names.federation_shared("public", "posts"));
+    }
+
+    #[test]
+    fn a_column_can_be_exposed_as_an_id() {
+        let names = NameOverrides::parse(
+            r#"{"tables": {"public.users": {"column_types": {"email": "ID"}}}}"#,
+        )
+        .unwrap();
+
+        assert_eq!(
+            names.column_type("public", "users", "email"),
+            Some(crate::types::GraphQLType::Id)
+        );
+        assert_eq!(names.column_type("public", "users", "name"), None);
+    }
+
+    #[test]
+    fn an_unknown_column_type_override_is_rejected() {
+        let error = NameOverrides::parse(
+            r#"{"tables": {"public.users": {"column_types": {"email": "String"}}}}"#,
+        )
+        .expect_err("only supported overrides parse");
+
+        assert!(error.contains("unknown variant `String`"), "{error}");
     }
 
     /// A declaration is the whole list, and it may describe a join.

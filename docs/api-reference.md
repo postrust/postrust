@@ -915,6 +915,20 @@ and a client that declares one is naming this.
 | a type this server knows nothing about | a scalar of that name |
 | `_type` (arrays) | `[InnerType]` |
 
+PostgreSQL has no `ID` type. A text-, integer- or UUID-backed identifier can
+be exposed as GraphQL `ID` without changing its database type by adding a
+`column_types` entry to `PGRST_GRAPHQL_METADATA`:
+
+```json
+{
+  "tables": {
+    "public.author": {
+      "column_types": { "id": "ID" }
+    }
+  }
+}
+```
+
 A table marked as an enumeration in `PGRST_GRAPHQL_NAMES` becomes a GraphQL
 enum built from its rows, and every column with a foreign key to it is typed as
 that enum.

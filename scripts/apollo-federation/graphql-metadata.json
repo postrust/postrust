@@ -2,13 +2,17 @@
   "tables": {
     "public.products": {
       "name": "Product",
+      "column_types": {
+        "id": "ID"
+      },
       "roots": {
         "select_by_pk": "product"
       },
       "relationships": {
         "products_variation_id_fkey": "variation",
         "products_dimension_id_fkey": "dimensions",
-        "products_created_by_email_fkey": "createdBy"
+        "products_created_by_email_fkey": "createdBy",
+        "product_research_links": "research"
       }
     },
     "public.deprecated_products": {
@@ -21,7 +25,10 @@
       }
     },
     "public.product_variations": {
-      "name": "ProductVariation"
+      "name": "ProductVariation",
+      "column_types": {
+        "id": "ID"
+      }
     },
     "public.product_dimensions": {
       "name": "ProductDimension",
@@ -31,6 +38,9 @@
     },
     "public.users": {
       "name": "User",
+      "column_types": {
+        "email": "ID"
+      },
       "columns": {
         "total_products_created": "totalProductsCreated",
         "years_of_employment": "yearsOfEmployment"
@@ -47,6 +57,9 @@
     },
     "public.case_studies": {
       "name": "CaseStudy",
+      "column_types": {
+        "case_number": "ID"
+      },
       "columns": {
         "case_number": "caseNumber"
       }

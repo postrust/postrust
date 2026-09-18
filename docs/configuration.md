@@ -455,6 +455,7 @@ down. This is where those names go when a schema is migrated from one.
     "name": "Authors",
     "roots": { "select_by_pk": "Author", "select_aggregate": "AuthorAgg" },
     "columns": { "id": "AuthorId" },
+    "column_types": { "id": "ID" },
     "relationships": {
       "article_author_id_fkey": "posts",
       "fetch_articles_plain": "get_articles"
@@ -479,10 +480,15 @@ down. This is where those names go when a schema is migrated from one.
   that come back, in `where`, in `order_by`, in `distinct_on`, in the key
   arguments, in `_set` and `objects`, in `on_conflict.update_columns` and
   inside every embed and aggregate. The database keeps its own name throughout.
-- **`relationships`** is keyed by *constraint* name, or by *function* name for a
-  computed relationship, because a constraint names exactly one relationship
-  even where two of them point at the same table. The name being replaced would
-  not: that is what this is for.
+- **`column_types`** exposes a column using a GraphQL scalar that cannot be
+  inferred from PostgreSQL. Currently `ID` is supported. The database column
+  retains its PostgreSQL type for reading, binding and casting; the override
+  applies to GraphQL fields, comparisons, write inputs and key arguments.
+- **`relationships`** is keyed by *constraint* name, by *junction-table* name
+  for a many-to-many relationship, or by *function* name for a computed
+  relationship. These source names distinguish relationships even where two
+  of them point at the same table. The name being replaced would not: that is
+  what this is for.
 - **`computed_fields`** is keyed by the function behind the field.
 - **`comments`** carries the descriptions Hasura keeps in metadata rather than
   in the database, under `table`, `columns`, `roots` and `computed_fields`. A

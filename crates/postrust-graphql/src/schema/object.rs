@@ -139,6 +139,12 @@ impl TableObjectType {
             .values()
             .map(|column| {
                 let mut field = GraphQLField::from_column(column);
+                // The database type remains the source of truth for SQL. A
+                // metadata override changes only the scalar in the public
+                // GraphQL contract.
+                if let Some(given) = names.column_type(&table.schema, &table.name, &column.name) {
+                    field.graphql_type = given;
+                }
                 // A column may be exposed under another name. This is the one
                 // place the schema decides that; every resolver reads it back
                 // the other way, from the field to the column.
@@ -363,6 +369,21 @@ mod tests {
 
         let metadata_field = obj.get_field("metadata").unwrap();
         assert_eq!(metadata_field.graphql_type, GraphQLType::Json);
+    }
+
+    #[test]
+    fn metadata_can_expose_a_database_column_as_graphql_id() {
+        let table = create_test_table();
+        let names = crate::names::NameOverrides::parse(
+            r#"{"tables": {"public.users": {"column_types": {"id": "ID"}}}}"#,
+        )
+        .unwrap();
+        let obj = TableObjectType::from_table_named(&table, "users", &names);
+
+        let id_field = obj.get_field("id").unwrap();
+        assert_eq!(id_field.graphql_type, GraphQLType::Id);
+        assert_eq!(id_field.type_string(), "ID!");
+        assert_eq!(obj.table.get_column("id").unwrap().nominal_type, "int4");
     }
 
     #[test]
