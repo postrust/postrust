@@ -3252,7 +3252,14 @@ fn normalize_entity_key_value(
     }
 
     let pg_type = key_column.pg_type.trim().to_ascii_lowercase();
-    let normalized = if integer_bounds(&pg_type).is_some() {
+    let normalized = if matches!(pg_type.as_str(), "int8" | "bigint") {
+        match value {
+            serde_json::Value::Number(number) => number.as_i64(),
+            serde_json::Value::String(text) => text.parse::<i64>().ok(),
+            _ => None,
+        }
+        .map(serde_json::Value::from)
+    } else if integer_bounds(&pg_type).is_some() {
         value.as_i64().and_then(|integer| {
             let (min, max) = integer_bounds(&pg_type)?;
             (min..=max)
@@ -3268,9 +3275,15 @@ fn normalize_entity_key_value(
             .and_then(serde_json::Number::from_f64)
             .map(serde_json::Value::Number)
     } else if matches!(pg_type.as_str(), "numeric" | "decimal") {
-        value
-            .as_number()
-            .map(|number| serde_json::Value::String(number.to_string()))
+        match value {
+            serde_json::Value::Number(number) => {
+                Some(serde_json::Value::String(number.to_string()))
+            }
+            serde_json::Value::String(text) if text.parse::<sqlx::types::BigDecimal>().is_ok() => {
+                Some(serde_json::Value::String(text.clone()))
+            }
+            _ => None,
+        }
     } else if matches!(pg_type.as_str(), "bool" | "boolean") {
         value.as_bool().map(serde_json::Value::Bool)
     } else if matches!(pg_type.as_str(), "json" | "jsonb") {
@@ -9858,6 +9871,51 @@ mod tests {
         assert_eq!(
             error.message,
             "entity representation for \"users\" has invalid key field \"id\": expected a value compatible with PostgreSQL type \"int4\", found a string"
+        );
+    }
+
+    #[test]
+    fn federation_bigint_keys_accept_exact_decimal_strings() {
+        let column = entity_key_column("int8", false);
+
+        assert_eq!(
+            normalize_entity_key_value("users", &column, &serde_json::json!(7)).unwrap(),
+            serde_json::json!(7)
+        );
+        assert_eq!(
+            normalize_entity_key_value("users", &column, &serde_json::json!("9007199254740993"))
+                .unwrap(),
+            serde_json::json!(9_007_199_254_740_993_i64)
+        );
+        assert!(normalize_entity_key_value(
+            "users",
+            &column,
+            &serde_json::json!("9223372036854775808")
+        )
+        .is_err());
+        assert!(normalize_entity_key_value("users", &column, &serde_json::json!("7.5")).is_err());
+    }
+
+    #[test]
+    fn federation_numeric_keys_accept_exact_decimal_strings() {
+        let column = entity_key_column("numeric", false);
+
+        assert_eq!(
+            normalize_entity_key_value("users", &column, &serde_json::json!(7.5)).unwrap(),
+            serde_json::json!("7.5")
+        );
+        assert_eq!(
+            normalize_entity_key_value(
+                "users",
+                &column,
+                &serde_json::json!("9007199254740993.123456789")
+            )
+            .unwrap(),
+            serde_json::json!("9007199254740993.123456789")
+        );
+        assert!(
+            normalize_entity_key_value("users", &column, &serde_json::json!("not-a-number"))
+                .is_err()
         );
     }
 

@@ -190,6 +190,37 @@ async fn create_equivalent_entity_keys_schema(pool: &PgPool, schema: &str) {
     .expect("create equivalent entity key fixture failed");
 }
 
+async fn create_decimal_entity_keys_schema(pool: &PgPool, schema: &str) {
+    pool.execute(format!("DROP SCHEMA IF EXISTS {schema} CASCADE").as_str())
+        .await
+        .expect("drop schema failed");
+    pool.execute(format!("CREATE SCHEMA {schema}").as_str())
+        .await
+        .expect("create schema failed");
+    pool.execute(
+        format!(
+            r#"
+            CREATE TABLE {schema}.bigint_entities (
+                id BIGINT PRIMARY KEY,
+                label TEXT NOT NULL
+            );
+            CREATE TABLE {schema}.numeric_entities (
+                id NUMERIC PRIMARY KEY,
+                label TEXT NOT NULL
+            );
+            INSERT INTO {schema}.bigint_entities VALUES
+                (7, 'seven'),
+                (9007199254740993, 'past JavaScript integer precision');
+            INSERT INTO {schema}.numeric_entities VALUES
+                (9007199254740993.123456789, 'exact decimal')
+            "#
+        )
+        .as_str(),
+    )
+    .await
+    .expect("create decimal entity key fixture failed");
+}
+
 async fn create_mixed_entity_schema(pool: &PgPool, schema: &str) {
     pool.execute(format!("DROP SCHEMA IF EXISTS {} CASCADE", schema).as_str())
         .await
@@ -581,6 +612,53 @@ async fn federation_entities_use_postgres_key_equality() {
     assert_eq!(rows[1]["label"], "uuid row");
     assert_eq!(rows[2]["label"], "citext row");
     assert_eq!(rows[3]["label"], "timestamptz row");
+
+    drop_schema(&pool, &schema).await;
+}
+
+#[tokio::test]
+#[ignore = "requires PostgreSQL"]
+async fn federation_entities_accept_string_bigint_and_numeric_keys() {
+    let pool = connect().await;
+    let schema = unique_schema_name("feddecimalkeys");
+    create_decimal_entity_keys_schema(&pool, &schema).await;
+
+    let names = format!(
+        r#"{{"tables": {{
+            "{schema}.bigint_entities": {{"federation": {{"shared": true}}}},
+            "{schema}.numeric_entities": {{"federation": {{"shared": true}}}}
+        }}}}"#
+    );
+    let state = build_federated_state_with_names(&pool, &schema, &names).await;
+    let data = execute_ok(
+        &state,
+        &pool,
+        &schema,
+        r#"
+        {
+          _entities(representations: [
+            {__typename: "bigint_entities", id: "7"},
+            {__typename: "bigint_entities", id: 7},
+            {__typename: "bigint_entities", id: "9007199254740993"},
+            {__typename: "numeric_entities", id: "9007199254740993.123456789"}
+          ]) {
+            ... on bigint_entities { label }
+            ... on numeric_entities { label }
+          }
+        }
+        "#,
+    )
+    .await;
+
+    let rows = data
+        .get("_entities")
+        .and_then(serde_json::Value::as_array)
+        .expect("entities list");
+    assert_eq!(rows.len(), 4);
+    assert_eq!(rows[0]["label"], "seven");
+    assert_eq!(rows[1]["label"], "seven");
+    assert_eq!(rows[2]["label"], "past JavaScript integer precision");
+    assert_eq!(rows[3]["label"], "exact decimal");
 
     drop_schema(&pool, &schema).await;
 }
