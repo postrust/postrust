@@ -2967,13 +2967,8 @@ async fn resolve_entities<'a>(
             async_graphql::Error::new(format!("unknown federation entity \"{}\"", type_name))
         })?;
         let rows = resolve_entity_group(ctx, lookup, &representations, state).await?;
-        for representation in representations {
-            let (key, _) = normalized_entity_key(
-                &representation.values,
-                &lookup.key_columns,
-                &lookup.type_name,
-            )?;
-            resolved[representation.index] = Some(match rows.get(&key) {
+        for (ordinality, representation) in representations.into_iter().enumerate() {
+            resolved[representation.index] = Some(match &rows[ordinality] {
                 Some(row) => FieldValue::value(json_to_value(row.clone()))
                     .with_type(representation.type_name),
                 None => FieldValue::NULL,
@@ -2991,35 +2986,66 @@ async fn resolve_entity_group(
     lookup: &EntityLookup,
     representations: &[EntityRepresentation],
     state: &EntityResolverState,
-) -> Result<HashMap<String, serde_json::Value>, async_graphql::Error> {
+) -> Result<Vec<Option<serde_json::Value>>, async_graphql::Error> {
     if representations.is_empty() {
-        return Ok(HashMap::new());
+        return Ok(Vec::new());
     }
 
     let pool = ctx.data::<PgPool>()?;
     let gql_ctx = ctx.data::<GraphQLContext>()?;
     let mut bound_values = Vec::new();
-    let mut disjuncts = Vec::with_capacity(representations.len());
-    for representation in representations {
-        let (_, normalized_values) = normalized_entity_key(
+    let mut value_rows = Vec::with_capacity(representations.len());
+    for (ordinality, representation) in representations.iter().enumerate() {
+        let normalized_values = normalized_entity_key_values(
             &representation.values,
             &lookup.key_columns,
             &lookup.type_name,
         )?;
-        let mut conjuncts = Vec::with_capacity(lookup.key_columns.len());
+        let mut values = Vec::with_capacity(lookup.key_columns.len() + 1);
         for (key_column, value) in lookup.key_columns.iter().zip(normalized_values) {
-            conjuncts.push(format!(
-                "{}.{} = ${}::{}",
-                postrust_sql::escape_ident(READ_ROW),
-                postrust_sql::escape_ident(&key_column.column_name),
+            values.push(format!(
+                "${}::{}",
                 bound_values.len() + 1,
                 key_column.pg_type
             ));
             bound_values.push(value);
         }
-        disjuncts.push(format!("({})", conjuncts.join(" AND ")));
+        values.push(ordinality.to_string());
+        value_rows.push(format!("({})", values.join(", ")));
     }
-    let mut where_sql = format!(" WHERE ({})", disjuncts.join(" OR "));
+
+    let representation_alias = "pgrst_entity_representation";
+    let ordinality_column = "pgrst_entity_ordinality";
+    let key_aliases: Vec<String> = (0..lookup.key_columns.len())
+        .map(|index| format!("pgrst_entity_key_{index}"))
+        .collect();
+    let mut representation_columns: Vec<String> = key_aliases
+        .iter()
+        .map(|column| postrust_sql::escape_ident(column))
+        .collect();
+    representation_columns.push(postrust_sql::escape_ident(ordinality_column));
+    let representations_sql = format!(
+        "(VALUES {}) AS {} ({})",
+        value_rows.join(", "),
+        postrust_sql::escape_ident(representation_alias),
+        representation_columns.join(", ")
+    );
+    let key_predicate = lookup
+        .key_columns
+        .iter()
+        .zip(&key_aliases)
+        .map(|(key_column, key_alias)| {
+            format!(
+                "{}.{} = {}.{}",
+                postrust_sql::escape_ident(READ_ROW),
+                postrust_sql::escape_ident(&key_column.column_name),
+                postrust_sql::escape_ident(representation_alias),
+                postrust_sql::escape_ident(key_alias)
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(" AND ");
+    let mut where_sql = format!(" WHERE ({key_predicate})");
 
     let permission = permission_predicate(
         &gql_ctx.caller(),
@@ -3138,34 +3164,56 @@ async fn resolve_entity_group(
         }
         format!("SELECT {} FROM ({}) AS src", projection, source_rows)
     };
+    // PostgreSQL decides whether an entity key matches. Carry the input's
+    // ordinal through that same query instead of reconstructing a key from
+    // row JSON: PostgreSQL-equivalent spellings (UUID case, citext case and
+    // timestamptz offsets, for example) need to resolve to the row it found.
     let sql = format!(
-        "SELECT {} FROM ({}) AS t",
+        "SELECT json_build_array({}.{}, {}) FROM {} CROSS JOIN LATERAL ({}) AS t",
+        postrust_sql::escape_ident(representation_alias),
+        postrust_sql::escape_ident(ordinality_column),
         row_json("t", &lookup.row_column_types),
+        representations_sql,
         projected_rows,
     );
     let mut tx = begin_with_session(pool, gql_ctx.role(), &gql_ctx.session_settings()).await?;
     let rows = execute_query_on(&mut tx, &sql, &bound_values).await?;
     tx.commit().await?;
 
-    let mut by_key = HashMap::new();
-    for row in rows {
-        let serde_json::Value::Object(values) = &row else {
-            continue;
+    let mut by_ordinal = std::iter::repeat_with(|| None)
+        .take(representations.len())
+        .collect::<Vec<_>>();
+    for result in rows {
+        let serde_json::Value::Array(mut pair) = result else {
+            return Err(async_graphql::Error::new(
+                "entity query returned an invalid result",
+            ));
         };
-        let (key, _) = normalized_entity_key(values, &lookup.key_columns, &lookup.type_name)?;
-        by_key.insert(key, row);
+        if pair.len() != 2 {
+            return Err(async_graphql::Error::new(
+                "entity query returned an invalid result",
+            ));
+        }
+        let row = pair.pop().expect("the result pair has two values");
+        let ordinality = pair
+            .pop()
+            .and_then(|value| value.as_u64())
+            .and_then(|value| usize::try_from(value).ok())
+            .filter(|value| *value < by_ordinal.len())
+            .ok_or_else(|| async_graphql::Error::new("entity query returned an invalid ordinal"))?;
+        by_ordinal[ordinality] = Some(row);
     }
-    Ok(by_key)
+    Ok(by_ordinal)
 }
 
 /// Validate an entity key and normalize explicit GraphQL `ID` overrides to
 /// their integer, text or UUID storage type. `_Any` deliberately skips the
 /// field-level checks ordinary GraphQL arguments receive.
-fn normalized_entity_key(
+fn normalized_entity_key_values(
     values: &serde_json::Map<String, serde_json::Value>,
     key_columns: &[EntityKeyColumn],
     type_name: &str,
-) -> Result<(String, Vec<serde_json::Value>), async_graphql::Error> {
+) -> Result<Vec<serde_json::Value>, async_graphql::Error> {
     let mut key = Vec::with_capacity(key_columns.len());
     for key_column in key_columns {
         let value = values.get(&key_column.field_name).ok_or_else(|| {
@@ -3176,9 +3224,7 @@ fn normalized_entity_key(
         })?;
         key.push(normalize_entity_key_value(type_name, key_column, value)?);
     }
-    let encoded = serde_json::to_string(&key)
-        .map_err(|e| async_graphql::Error::new(format!("entity key could not be encoded: {e}")))?;
-    Ok((encoded, key))
+    Ok(key)
 }
 
 fn normalize_entity_key_value(

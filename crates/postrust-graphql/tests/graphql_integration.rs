@@ -151,6 +151,45 @@ async fn create_composite_key_schema(pool: &PgPool, schema: &str) {
     .expect("create composite key fixture failed");
 }
 
+async fn create_equivalent_entity_keys_schema(pool: &PgPool, schema: &str) {
+    pool.execute("CREATE EXTENSION IF NOT EXISTS citext")
+        .await
+        .expect("create citext extension failed");
+    pool.execute(format!("DROP SCHEMA IF EXISTS {schema} CASCADE").as_str())
+        .await
+        .expect("drop schema failed");
+    pool.execute(format!("CREATE SCHEMA {schema}").as_str())
+        .await
+        .expect("create schema failed");
+
+    pool.execute(
+        format!(
+            r#"
+            CREATE TABLE {schema}.uuid_entities (
+                id UUID PRIMARY KEY,
+                label TEXT NOT NULL
+            );
+            CREATE TABLE {schema}.citext_entities (
+                id CITEXT PRIMARY KEY,
+                label TEXT NOT NULL
+            );
+            CREATE TABLE {schema}.timestamptz_entities (
+                id TIMESTAMPTZ PRIMARY KEY,
+                label TEXT NOT NULL
+            );
+            INSERT INTO {schema}.uuid_entities VALUES
+                ('550e8400-e29b-41d4-a716-446655440000', 'uuid row');
+            INSERT INTO {schema}.citext_entities VALUES ('alice', 'citext row');
+            INSERT INTO {schema}.timestamptz_entities VALUES
+                ('2024-01-01T00:00:00+00:00', 'timestamptz row')
+            "#
+        )
+        .as_str(),
+    )
+    .await
+    .expect("create equivalent entity key fixture failed");
+}
+
 async fn create_mixed_entity_schema(pool: &PgPool, schema: &str) {
     pool.execute(format!("DROP SCHEMA IF EXISTS {} CASCADE", schema).as_str())
         .await
@@ -493,6 +532,55 @@ async fn federation_entities_resolve_shared_rows_by_key() {
         rows[1].get("name").and_then(|value| value.as_str()),
         Some("alpha")
     );
+
+    drop_schema(&pool, &schema).await;
+}
+
+#[tokio::test]
+#[ignore = "requires PostgreSQL"]
+async fn federation_entities_use_postgres_key_equality() {
+    let pool = connect().await;
+    let schema = unique_schema_name("fedequality");
+    create_equivalent_entity_keys_schema(&pool, &schema).await;
+
+    let names = format!(
+        r#"{{"tables": {{
+            "{schema}.uuid_entities": {{"federation": {{"shared": true}}}},
+            "{schema}.citext_entities": {{"federation": {{"shared": true}}}},
+            "{schema}.timestamptz_entities": {{"federation": {{"shared": true}}}}
+        }}}}"#
+    );
+    let state = build_federated_state_with_names(&pool, &schema, &names).await;
+    let data = execute_ok(
+        &state,
+        &pool,
+        &schema,
+        r#"
+        {
+          _entities(representations: [
+            {__typename: "uuid_entities", id: "550E8400-E29B-41D4-A716-446655440000"},
+            {__typename: "uuid_entities", id: "550e8400-e29b-41d4-a716-446655440000"},
+            {__typename: "citext_entities", id: "ALICE"},
+            {__typename: "timestamptz_entities", id: "2024-01-01T00:00:00Z"}
+          ]) {
+            ... on uuid_entities { label }
+            ... on citext_entities { label }
+            ... on timestamptz_entities { label }
+          }
+        }
+        "#,
+    )
+    .await;
+
+    let rows = data
+        .get("_entities")
+        .and_then(serde_json::Value::as_array)
+        .expect("entities list");
+    assert_eq!(rows.len(), 4);
+    assert_eq!(rows[0]["label"], "uuid row");
+    assert_eq!(rows[1]["label"], "uuid row");
+    assert_eq!(rows[2]["label"], "citext row");
+    assert_eq!(rows[3]["label"], "timestamptz row");
 
     drop_schema(&pool, &schema).await;
 }
