@@ -98,12 +98,22 @@ impl Extension for NullableFederationEntity {
         info: ResolveInfo<'_>,
         next: NextResolve<'_>,
     ) -> ServerResult<Option<Value>> {
-        let is_entity_member = info.parent_type == "[_Entity]" && info.return_type == "_Entity";
+        // IMPORTANT: async-graphql 7.0.17 invokes this hook for every field and
+        // every list member, not only `_entities`. That leaves one boxed
+        // extension future per call, so do not copy this pattern for other
+        // field-specific behaviour. Its dynamic API cannot represent a bare
+        // nullable union member: an untyped null is rejected and a typed null
+        // is resolved as an object. Until that changes upstream, keep the
+        // successful path to the one required `next.run`; in particular,
+        // defer all string comparisons until the union error has occurred.
+        let parent_type = info.parent_type;
+        let return_type = info.return_type;
         match next.run(ctx, info).await {
             Err(error)
-                if is_entity_member
-                    && error.message
-                        == "internal: invalid value for union \"_Entity\", expected \"FieldValue::WithType\"" =>
+                if error.message
+                    == "internal: invalid value for union \"_Entity\", expected \"FieldValue::WithType\""
+                    && parent_type == "[_Entity]"
+                    && return_type == "_Entity" =>
             {
                 Ok(Some(Value::Null))
             }
