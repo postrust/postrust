@@ -274,13 +274,11 @@ async fn build_state(
         .await
         .expect("failed to load schema cache");
 
-    let config = SchemaConfig {
-        exposed_schemas: schemas.clone(),
-        enable_mutations: true,
-        enable_subscriptions: subscriptions,
-        max_rows,
-        ..SchemaConfig::default()
-    };
+    let mut config = SchemaConfig::default();
+    config.exposed_schemas = schemas.clone();
+    config.enable_mutations = true;
+    config.enable_subscriptions = subscriptions;
+    config.max_rows = max_rows;
 
     Arc::new(
         GraphQLState::new(pool.clone(), Arc::new(cache), config)
@@ -299,13 +297,11 @@ async fn build_federated_state_with_names(
         .await
         .expect("failed to load schema cache");
 
-    let config = SchemaConfig {
-        exposed_schemas: schemas.clone(),
-        enable_mutations: true,
-        enable_federation: true,
-        names: postrust_graphql::names::NameOverrides::parse(names).expect("the names parse"),
-        ..SchemaConfig::default()
-    };
+    let mut config = SchemaConfig::default();
+    config.exposed_schemas = schemas.clone();
+    config.enable_mutations = true;
+    config.enable_federation = true;
+    config.names = postrust_graphql::names::NameOverrides::parse(names).expect("the names parse");
 
     Arc::new(
         GraphQLState::new(pool.clone(), Arc::new(cache), config)
@@ -1761,12 +1757,10 @@ async fn same_table_name_in_two_schemas_gets_distinct_fields() {
     let cache = SchemaCache::load(&pool, &schemas)
         .await
         .expect("failed to load schema cache");
-    let config = SchemaConfig {
-        exposed_schemas: schemas.clone(),
-        enable_mutations: true,
-        max_rows: None,
-        ..SchemaConfig::default()
-    };
+    let mut config = SchemaConfig::default();
+    config.exposed_schemas = schemas.clone();
+    config.enable_mutations = true;
+    config.max_rows = None;
     let state = Arc::new(
         GraphQLState::new(pool.clone(), Arc::new(cache), config)
             .expect("failed to build GraphQL schema"),
@@ -2481,19 +2475,14 @@ async fn a_subscription_is_a_live_query() {
     let cache = SchemaCache::load(&pool, &schemas)
         .await
         .expect("failed to load schema cache");
+    let mut config = SchemaConfig::default();
+    config.exposed_schemas = schemas.clone();
+    config.enable_mutations = true;
+    config.enable_subscriptions = true;
+    config.subscription_refresh_seconds = 1;
     let state = Arc::new(
-        GraphQLState::new(
-            pool.clone(),
-            Arc::new(cache),
-            SchemaConfig {
-                exposed_schemas: schemas.clone(),
-                enable_mutations: true,
-                enable_subscriptions: true,
-                subscription_refresh_seconds: 1,
-                ..SchemaConfig::default()
-            },
-        )
-        .expect("failed to build GraphQL schema"),
+        GraphQLState::new(pool.clone(), Arc::new(cache), config)
+            .expect("failed to build GraphQL schema"),
     );
 
     let cache = SchemaCache::load(&pool, &schemas)
@@ -2707,12 +2696,10 @@ async fn build_state_with_names(pool: &PgPool, schema: &str, names: &str) -> Arc
     let cache = SchemaCache::load(pool, &schemas)
         .await
         .expect("failed to load schema cache");
-    let config = SchemaConfig {
-        exposed_schemas: schemas.clone(),
-        enable_mutations: true,
-        names: postrust_graphql::names::NameOverrides::parse(names).expect("the names parse"),
-        ..SchemaConfig::default()
-    };
+    let mut config = SchemaConfig::default();
+    config.exposed_schemas = schemas.clone();
+    config.enable_mutations = true;
+    config.names = postrust_graphql::names::NameOverrides::parse(names).expect("the names parse");
     Arc::new(
         GraphQLState::new(pool.clone(), Arc::new(cache), config)
             .expect("failed to build GraphQL schema"),

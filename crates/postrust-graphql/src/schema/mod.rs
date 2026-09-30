@@ -16,6 +16,7 @@ use std::collections::{HashMap, HashSet};
 
 /// Configuration for schema generation.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct SchemaConfig {
     /// Schemas to expose in GraphQL (e.g., ["public"])
     pub exposed_schemas: Vec<String>,
@@ -304,6 +305,7 @@ fn base_name_for(table: &Table, config: &SchemaConfig) -> String {
 
 /// Represents a generated GraphQL schema.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct GeneratedSchema {
     /// Object types for each table
     pub object_types: HashMap<String, TableObjectType>,
@@ -326,6 +328,7 @@ pub struct GeneratedSchema {
 
 /// A table exposed as an Apollo Federation entity.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct FederationEntity {
     /// GraphQL type name of the entity.
     pub type_name: String,
@@ -356,6 +359,7 @@ impl FederationEntity {
 /// IMMUTABLE may not, so it is a query. Nothing else is a safe place to draw
 /// that line -- the alternative is trusting a name.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct FunctionField {
     /// The field's name, which is the function's.
     pub name: String,
@@ -779,6 +783,7 @@ impl GeneratedSchema {
 
 /// A query field for a table (e.g., users, userByPk).
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct QueryField {
     /// Field name (e.g., "users")
     pub name: String,
@@ -922,6 +927,7 @@ impl QueryField {
 
 /// A mutation field for a table.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct MutationField {
     /// Field name (e.g., "insertUsers")
     pub name: String,

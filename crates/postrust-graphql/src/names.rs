@@ -61,6 +61,7 @@ use std::collections::HashMap;
 
 /// The names given to one table.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+#[non_exhaustive]
 pub struct TableNames {
     /// The base name for this table's root fields and types.
     ///
@@ -177,6 +178,7 @@ pub struct TableNames {
 
 /// Apollo Federation settings for one table.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+#[non_exhaustive]
 pub struct FederationConfig {
     /// Whether this table keeps its unprefixed entity identity across subgraphs.
     #[serde(default)]
@@ -189,6 +191,7 @@ pub struct FederationConfig {
 /// has no PostgreSQL type from which it can be inferred, and strings returned
 /// by PostgreSQL are already valid `ID` values.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum ColumnTypeOverride {
     /// GraphQL's opaque identifier scalar.
     #[serde(rename = "ID")]
@@ -221,6 +224,7 @@ impl RolePermissions {
 /// means the table cannot be read by this role, not that it can be read
 /// without restriction.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+#[non_exhaustive]
 pub struct RolePermissions {
     /// Which rows the role may read. Absent means it may read none.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -238,6 +242,7 @@ pub struct RolePermissions {
 
 /// Which rows a role may read, and which of their columns.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+#[non_exhaustive]
 pub struct SelectPermission {
     /// The columns this role can see. Every other column of the table is not
     /// merely unreadable but absent from the type, which is what makes a
@@ -276,6 +281,7 @@ pub struct SelectPermission {
 
 /// What a role may write, and what the result has to satisfy.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+#[non_exhaustive]
 pub struct InsertPermission {
     /// The columns a request may supply.
     #[serde(default)]
@@ -303,6 +309,7 @@ pub struct InsertPermission {
 /// Which rows a role may change, which columns of them, and what the result
 /// has to satisfy.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+#[non_exhaustive]
 pub struct UpdatePermission {
     /// The columns the role may write.
     #[serde(default)]
@@ -326,6 +333,7 @@ pub struct UpdatePermission {
 
 /// Which rows a role may delete.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+#[non_exhaustive]
 pub struct DeletePermission {
     /// Which rows may be deleted. Null means every row the role can see.
     #[serde(default, skip_serializing_if = "serde_json::Value::is_null")]
@@ -398,6 +406,7 @@ impl<'de> Deserialize<'de> for ColumnSet {
 /// Every value is a description as written: an empty string means the field
 /// has none, which is a different answer from having said nothing.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+#[non_exhaustive]
 pub struct Comments {
     /// The description of the table's own type.
     #[serde(default)]
@@ -415,6 +424,7 @@ pub struct Comments {
 
 /// Every name given, keyed by `schema.table`.
 #[derive(Debug, Clone, Default, PartialEq)]
+#[non_exhaustive]
 pub struct NameOverrides {
     tables: HashMap<String, TableNames>,
     functions: HashMap<String, FunctionNames>,
@@ -443,6 +453,7 @@ struct Sections {
 /// the column, the same spellings [`TableNames::relationships`] accepts -- or
 /// by a column mapping, which is a join no key describes.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+#[non_exhaustive]
 pub struct DeclaredRelationship {
     /// The field name this relationship is exposed under.
     pub name: String,
@@ -493,6 +504,7 @@ impl DeclaredRelationship {
 
 /// What metadata says about one function, beyond what the catalogue knows.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+#[non_exhaustive]
 pub struct FunctionNames {
     /// The root this function is exposed on: `query` or `mutation`.
     #[serde(default)]

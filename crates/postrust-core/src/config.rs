@@ -18,6 +18,7 @@ pub struct ConfigError {
 
 /// Main application configuration.
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct AppConfig {
     // ========================================================================
     // Database Settings
@@ -644,7 +645,8 @@ impl<'de> Deserialize<'de> for LogLevel {
 }
 
 /// Per-role settings.
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct RoleSettings {
     /// Isolation level for this role
     pub isolation_level: Option<IsolationLevel>,

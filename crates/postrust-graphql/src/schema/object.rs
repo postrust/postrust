@@ -5,6 +5,7 @@ use postrust_core::schema_cache::{Column, Table};
 
 /// Represents a GraphQL field derived from a database column.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct GraphQLField {
     /// Field name (same as column name).
     pub name: String,
@@ -51,6 +52,7 @@ impl GraphQLField {
 
 /// Represents a GraphQL ObjectType derived from a database table.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct TableObjectType {
     /// The original table.
     pub table: Table,

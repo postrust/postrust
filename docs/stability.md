@@ -77,6 +77,14 @@ Covered — a breaking change here requires a major bump:
 - Configuration keys and their meanings.
 - The minimum supported Rust version.
 
+Configuration, schema and metadata types that grow with features --
+`AppConfig`, `SchemaConfig`, `TableNames` and their neighbours -- are
+`#[non_exhaustive]`. A new field or variant on one of those is a minor
+release, not a major one; the price is that another crate cannot build one with
+a struct literal, and starts from `Default::default()` and assigns the fields it
+needs instead. This is what 2.0.0 changed, so that a feature adding a setting
+does not need 3.0.0.
+
 Not covered:
 
 - `postrust-proxy` and `postrust-worker`, entirely.

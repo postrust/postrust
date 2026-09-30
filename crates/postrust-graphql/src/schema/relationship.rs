@@ -14,6 +14,7 @@ fn get_constraint_name(rel: &Relationship) -> &str {
 
 /// Represents a GraphQL field derived from a database relationship.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct RelationshipField {
     /// Field name (derived from foreign table name).
     pub name: String,
