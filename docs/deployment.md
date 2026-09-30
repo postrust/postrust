@@ -93,8 +93,8 @@ Images are published to Docker Hub, in two variants of each build:
 
 | | |
 |---|---|
-| `postrust/postrust:1.0.0` | Debian base |
-| `postrust/postrust:1.0.0-alpine` | Alpine base -- much smaller |
+| `postrust/postrust:2.0.0` | Debian base |
+| `postrust/postrust:2.0.0-alpine` | Alpine base -- much smaller |
 
 `latest` and `latest-alpine` track the newest stable release and never a
 prerelease. `1.0` follows the newest patch of that minor.

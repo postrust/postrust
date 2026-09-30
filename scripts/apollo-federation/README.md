@@ -81,7 +81,12 @@ The database and metadata reproduce as much of the canonical model as Postrust
 can currently express. The target schema intentionally retains features that
 are not yet supported, including repeatable and nested keys, extended/external
 fields, `@requires`, `@provides`, `@override`, `@tag`, `@inaccessible`,
-`@composeDirective`, and `@interfaceObject`.
+`@composeDirective`, `@interfaceObject`, and federated tracing (`ftv1`).
+
+The suite's `@shareable` check also fails, for a narrower reason: it looks for
+the type-level form, `type ProductDimension @shareable`, and Postrust marks each
+non-key field of a shared entity `@shareable` instead. The two compose the same
+way; the check reads the SDL rather than composing it.
 
 Apollo's required compatibility checks are enforced in CI. Optional capability
 failures remain visible in the report without failing the workflow.

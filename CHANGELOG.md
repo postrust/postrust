@@ -3,6 +3,113 @@
 Notable changes, newest first. This file starts at 1.0.0-alpha.1; earlier
 releases are described by their tags and the pull requests behind them.
 
+## 2.0.0
+
+**Postrust can be an Apollo Federation v2 subgraph.** Set
+`PGRST_GRAPHQL_FEDERATION=true` and the GraphQL API adds `_service { sdl }`,
+`_entities(representations:)` and the Federation directives, so an Apollo
+router or gateway can compose it with other services. It is opt-in: with the
+variable unset, Federation metadata is inert and adds nothing to the SDL, and a
+test holds it there. Apollo's own subgraph compatibility suite runs on every
+pull request that touches the GraphQL path, and a required-capability failure
+fails the build.
+
+- A table's primary key is its `@key`. A table marked
+  `"federation": {"shared": true}` in `PGRST_GRAPHQL_METADATA` keeps its
+  unprefixed type name, so two subgraphs can both contribute to it, and its
+  non-key columns, computed fields and relationships are marked `@shareable`.
+- `PGRST_GRAPHQL_TYPE_PREFIX` prefixes generated types and root fields, so
+  several Postrust subgraphs over different databases do not collide when
+  composed.
+- With Federation on, the root types are `Query`, `Mutation` and
+  `Subscription`, the names a router expects, rather than Hasura's
+  `query_root` family.
+- `_entities` resolves each type's representations in one query and lets
+  PostgreSQL decide what matches. A key that PostgreSQL considers equal but
+  spells differently -- an uppercase UUID, a `citext` value in another case, a
+  `timestamptz` with a different offset -- finds its row, and a key that
+  matches nothing is a `null` in its position rather than an error for the
+  whole list. Select permissions apply to `_entities` exactly as to any other
+  read.
+
+**A column can be exposed as GraphQL `ID`.** PostgreSQL has no `ID` type, so a
+key that a router or client expects as `ID` could not be one. A
+`column_types` entry in `PGRST_GRAPHQL_METADATA` -- `{"id": "ID"}` -- changes
+the GraphQL type of a text, integer or UUID column without changing how it is
+read, bound or cast.
+
+**A boolean setting that is not a boolean now stops the server.** Every
+`PGRST_*` true/false variable used to read anything other than an exact
+lowercase `true` as false, so `PGRST_DB_AGGREGATES_ENABLED=TRUE` or `=yes` or a
+typo silently disabled the feature. They now accept `true/false`, `1/0`,
+`yes/no` and `on/off` in any case, and anything else fails startup with the
+variable's name. **A deployment that was relying on a malformed value reading
+as false will not start after upgrading**; the error says which variable to
+fix. `AppConfig::try_from_env` returns the error; `AppConfig::from_env` panics
+with it.
+
+**Why this is 2.0.0.** The features are additive for anyone running the
+server. The major bump is for the Rust API: Federation added public fields to
+`AppConfig`, `SchemaConfig`, `TableNames`, `GeneratedSchema` and eight other
+public structs in `postrust-core` and `postrust-graphql`, and adding a field
+breaks any code that builds one of them with an exhaustive struct literal.
+[docs/stability.md](docs/stability.md) covers public struct fields, and
+`cargo semver-checks` against 1.0.1 agrees.
+
+So that the next feature is not another major release, those structs and the
+related configuration, schema and metadata types are now `#[non_exhaustive]`.
+From another crate, build one from its default and assign the fields you need:
+
+```rust
+let mut config = SchemaConfig::default();
+config.exposed_schemas = vec!["public".into()];
+config.enable_mutations = true;
+```
+
+A struct literal -- including one ending in `..Default::default()` -- no
+longer compiles for these types, and an exhaustive `match` on
+`ColumnTypeOverride` needs a wildcard arm. The affected types are
+`AppConfig` and `RoleSettings` in `postrust-core`; `SchemaConfig`,
+`GeneratedSchema`, `FederationEntity`, `FunctionField`, `QueryField`,
+`MutationField`, `GraphQLField`, `TableObjectType` and `RelationshipField` in
+`postrust_graphql::schema`; and `TableNames`, `FederationConfig`,
+`ColumnTypeOverride`, `RolePermissions`, the four `*Permission` structs,
+`Comments`, `NameOverrides`, `DeclaredRelationship` and `FunctionNames` in
+`postrust_graphql::names`. Nothing else in the public API changed.
+
+`postrust-proxy` and `postrust-worker` go to 0.6.0: they depend on
+`postrust-core`, which is now 2.0.0.
+
+Thanks to @CBeardSafire, who asked for Federation in
+[#40](https://github.com/postrust/postrust/issues/40) and built it in
+[#42](https://github.com/postrust/postrust/pull/42).
+
+**Conformance, measured on this release.**
+
+| suite | |
+|---|---|
+| PostgREST v16.1, full contract | 1424/1499 (95.0%) |
+| Hasura v2.50.1, full body | 454/468 (97.0%) |
+
+Both reproduce the 1.0.0 figures exactly, case for case, so the published data
+files are unchanged: Federation is off by default and did not move either
+dialect. The Hasura corpus has its own `apollo_federation` group, and all three
+of its cases agree.
+
+Apollo's subgraph compatibility suite passes every required check: `_service`,
+`@key` (single and multiple) and `@link`, plus introspection. The optional
+capabilities listed in
+[scripts/apollo-federation/README.md](scripts/apollo-federation/README.md) are
+reported as not supported, which is accurate. The one exception is
+`@shareable`: the suite looks for the directive on the type, and Postrust puts
+it on each non-key field of a shared entity instead. The two compose the same
+way. The local run and the CI run on the same commit agree check for check.
+
+**Verified for this release:** `cargo fmt` clean, `cargo clippy --workspace
+--all-targets --all-features -D warnings` clean, 782 unit tests and 134
+database tests passing with 0 failures, and `cargo semver-checks` against 1.0.1
+reporting exactly the breaks described above.
+
 ## 1.0.1
 
 **The server could not talk to a hosted database over TLS, and did not say so.**
