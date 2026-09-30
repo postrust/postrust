@@ -221,7 +221,9 @@ node scripts/gen-hasura-conformance.mjs scripts/hasura-conformance/.work/diff.js
               Beside it: <code class="font-mono">_stream</code> subscriptions, the cursor-based
               half of the subscription surface; a function returning a single row as a root field;
               and generated descriptions, which are this server&rsquo;s wording rather than
-              Hasura&rsquo;s. Actions and Apollo federation are subsystems rather than gaps.
+              Hasura&rsquo;s. Actions are a subsystem rather than a gap. Apollo Federation is
+              outside what this corpus replays; it is measured instead by Apollo&rsquo;s subgraph
+              compatibility suite in CI.
             </p>
             <p class="text-neutral-600">
               The run history — including the runs whose numbers are not publishable, and why — is

@@ -101,6 +101,161 @@ async fn create_widgets_schema(pool: &PgPool, schema: &str) {
     .expect("seed failed");
 }
 
+async fn create_widgets_schema_with_computed_field(pool: &PgPool, schema: &str) {
+    create_widgets_schema(pool, schema).await;
+    pool.execute(
+        format!(
+            r#"
+            CREATE FUNCTION {schema}.widget_label(widget_row {schema}.widgets)
+            RETURNS TEXT
+            LANGUAGE SQL
+            STABLE
+            AS $$
+                SELECT widget_row.name || ':' || widget_row.category
+            $$
+            "#
+        )
+        .as_str(),
+    )
+    .await
+    .expect("create computed field failed");
+}
+
+async fn create_composite_key_schema(pool: &PgPool, schema: &str) {
+    pool.execute(format!("DROP SCHEMA IF EXISTS {} CASCADE", schema).as_str())
+        .await
+        .expect("drop schema failed");
+    pool.execute(format!("CREATE SCHEMA {}", schema).as_str())
+        .await
+        .expect("create schema failed");
+
+    pool.execute(
+        format!(
+            r#"
+            CREATE TABLE {}.inventory (
+                warehouse_id INTEGER NOT NULL,
+                sku TEXT NOT NULL,
+                quantity INTEGER NOT NULL,
+                PRIMARY KEY (warehouse_id, sku)
+            );
+            INSERT INTO {}.inventory (warehouse_id, sku, quantity) VALUES
+                (1, 'alpha', 5),
+                (1, 'bravo', 10),
+                (2, 'alpha', 15)
+            "#,
+            schema, schema
+        )
+        .as_str(),
+    )
+    .await
+    .expect("create composite key fixture failed");
+}
+
+async fn create_equivalent_entity_keys_schema(pool: &PgPool, schema: &str) {
+    pool.execute("CREATE EXTENSION IF NOT EXISTS citext")
+        .await
+        .expect("create citext extension failed");
+    pool.execute(format!("DROP SCHEMA IF EXISTS {schema} CASCADE").as_str())
+        .await
+        .expect("drop schema failed");
+    pool.execute(format!("CREATE SCHEMA {schema}").as_str())
+        .await
+        .expect("create schema failed");
+
+    pool.execute(
+        format!(
+            r#"
+            CREATE TABLE {schema}.uuid_entities (
+                id UUID PRIMARY KEY,
+                label TEXT NOT NULL
+            );
+            CREATE TABLE {schema}.citext_entities (
+                id CITEXT PRIMARY KEY,
+                label TEXT NOT NULL
+            );
+            CREATE TABLE {schema}.timestamptz_entities (
+                id TIMESTAMPTZ PRIMARY KEY,
+                label TEXT NOT NULL
+            );
+            INSERT INTO {schema}.uuid_entities VALUES
+                ('550e8400-e29b-41d4-a716-446655440000', 'uuid row');
+            INSERT INTO {schema}.citext_entities VALUES ('alice', 'citext row');
+            INSERT INTO {schema}.timestamptz_entities VALUES
+                ('2024-01-01T00:00:00+00:00', 'timestamptz row')
+            "#
+        )
+        .as_str(),
+    )
+    .await
+    .expect("create equivalent entity key fixture failed");
+}
+
+async fn create_decimal_entity_keys_schema(pool: &PgPool, schema: &str) {
+    pool.execute(format!("DROP SCHEMA IF EXISTS {schema} CASCADE").as_str())
+        .await
+        .expect("drop schema failed");
+    pool.execute(format!("CREATE SCHEMA {schema}").as_str())
+        .await
+        .expect("create schema failed");
+    pool.execute(
+        format!(
+            r#"
+            CREATE TABLE {schema}.bigint_entities (
+                id BIGINT PRIMARY KEY,
+                label TEXT NOT NULL
+            );
+            CREATE TABLE {schema}.numeric_entities (
+                id NUMERIC PRIMARY KEY,
+                label TEXT NOT NULL
+            );
+            INSERT INTO {schema}.bigint_entities VALUES
+                (7, 'seven'),
+                (9007199254740993, 'past JavaScript integer precision');
+            INSERT INTO {schema}.numeric_entities VALUES
+                (9007199254740993.123456789, 'exact decimal')
+            "#
+        )
+        .as_str(),
+    )
+    .await
+    .expect("create decimal entity key fixture failed");
+}
+
+async fn create_mixed_entity_schema(pool: &PgPool, schema: &str) {
+    pool.execute(format!("DROP SCHEMA IF EXISTS {} CASCADE", schema).as_str())
+        .await
+        .expect("drop schema failed");
+    pool.execute(format!("CREATE SCHEMA {}", schema).as_str())
+        .await
+        .expect("create schema failed");
+
+    for statement in [
+        format!("CREATE TABLE {schema}.authors (id SERIAL PRIMARY KEY, name TEXT NOT NULL)"),
+        format!(
+            "CREATE TABLE {schema}.author_items (id SERIAL PRIMARY KEY, title TEXT NOT NULL, \
+             author_id INTEGER NOT NULL REFERENCES {schema}.authors(id))"
+        ),
+        format!("CREATE TABLE {schema}.shops (id SERIAL PRIMARY KEY, code TEXT NOT NULL)"),
+        format!(
+            "CREATE TABLE {schema}.shop_items (id SERIAL PRIMARY KEY, sku TEXT NOT NULL, \
+             shop_id INTEGER NOT NULL REFERENCES {schema}.shops(id))"
+        ),
+        format!(
+            "CREATE FUNCTION {schema}.code(author_row {schema}.authors, prefix TEXT) \
+             RETURNS TEXT LANGUAGE SQL STABLE AS \
+             'SELECT prefix || author_row.name'"
+        ),
+        format!("INSERT INTO {schema}.authors (name) VALUES ('ada')"),
+        format!("INSERT INTO {schema}.author_items (title, author_id) VALUES ('paper', 1)"),
+        format!("INSERT INTO {schema}.shops (code) VALUES ('shop-code')"),
+        format!("INSERT INTO {schema}.shop_items (sku, shop_id) VALUES ('sku-1', 1)"),
+    ] {
+        pool.execute(statement.as_str())
+            .await
+            .expect("create mixed entity fixture failed");
+    }
+}
+
 async fn drop_schema(pool: &PgPool, schema: &str) {
     let _ = pool
         .execute(format!("DROP SCHEMA IF EXISTS {} CASCADE", schema).as_str())
@@ -119,17 +274,57 @@ async fn build_state(
         .await
         .expect("failed to load schema cache");
 
-    let config = SchemaConfig {
-        exposed_schemas: schemas.clone(),
-        enable_mutations: true,
-        enable_subscriptions: subscriptions,
-        max_rows,
-        ..SchemaConfig::default()
-    };
+    let mut config = SchemaConfig::default();
+    config.exposed_schemas = schemas.clone();
+    config.enable_mutations = true;
+    config.enable_subscriptions = subscriptions;
+    config.max_rows = max_rows;
 
     Arc::new(
         GraphQLState::new(pool.clone(), Arc::new(cache), config)
             .expect("failed to build GraphQL schema"),
+    )
+}
+
+/// Build GraphQL state with federation enabled and a metadata document.
+async fn build_federated_state_with_names(
+    pool: &PgPool,
+    schema: &str,
+    names: &str,
+) -> Arc<GraphQLState> {
+    let schemas = vec![schema.to_string()];
+    let cache = SchemaCache::load(pool, &schemas)
+        .await
+        .expect("failed to load schema cache");
+
+    let mut config = SchemaConfig::default();
+    config.exposed_schemas = schemas.clone();
+    config.enable_mutations = true;
+    config.enable_federation = true;
+    config.names = postrust_graphql::names::NameOverrides::parse(names).expect("the names parse");
+
+    Arc::new(
+        GraphQLState::new(pool.clone(), Arc::new(cache), config)
+            .expect("failed to build GraphQL schema"),
+    )
+}
+
+fn shared_table_names(schema: &str, table: &str) -> String {
+    format!(r#"{{"tables": {{"{schema}.{table}": {{"federation": {{"shared": true}}}}}}}}"#)
+}
+
+fn mixed_entity_names(schema: &str) -> String {
+    format!(
+        r#"{{"tables": {{
+            "{schema}.authors": {{
+                "federation": {{"shared": true}},
+                "relationships": {{"author_items_author_id_fkey": "items"}}
+            }},
+            "{schema}.shops": {{
+                "federation": {{"shared": true}},
+                "relationships": {{"shop_items_shop_id_fkey": "items"}}
+            }}
+        }}}}"#
     )
 }
 
@@ -307,6 +502,706 @@ async fn by_pk_query_returns_null_for_a_missing_key() {
         Some(&serde_json::Value::Null),
         "a key that matches nothing must resolve to null"
     );
+
+    drop_schema(&pool, &schema).await;
+}
+
+#[tokio::test]
+#[ignore = "requires PostgreSQL"]
+async fn federation_entities_resolve_shared_rows_by_key() {
+    let pool = connect().await;
+    let schema = unique_schema_name("fedentity");
+    create_widgets_schema(&pool, &schema).await;
+
+    let names = shared_table_names(&schema, "widgets");
+    let state = build_federated_state_with_names(&pool, &schema, &names).await;
+    let data = execute_ok(
+        &state,
+        &pool,
+        &schema,
+        r#"
+        {
+          _entities(representations: [
+            {__typename: "widgets", id: 3},
+            {__typename: "widgets", id: 1}
+          ]) {
+            __typename
+            ... on widgets {
+              id
+              name
+            }
+          }
+        }
+        "#,
+    )
+    .await;
+
+    let rows = data
+        .get("_entities")
+        .and_then(|value| value.as_array())
+        .expect("entities list");
+    assert_eq!(rows.len(), 2);
+    assert_eq!(
+        rows[0].get("__typename").and_then(|value| value.as_str()),
+        Some("widgets")
+    );
+    assert_eq!(rows[0].get("id").and_then(|value| value.as_i64()), Some(3));
+    assert_eq!(
+        rows[0].get("name").and_then(|value| value.as_str()),
+        Some("charlie")
+    );
+    assert_eq!(
+        rows[1].get("__typename").and_then(|value| value.as_str()),
+        Some("widgets")
+    );
+    assert_eq!(rows[1].get("id").and_then(|value| value.as_i64()), Some(1));
+    assert_eq!(
+        rows[1].get("name").and_then(|value| value.as_str()),
+        Some("alpha")
+    );
+
+    drop_schema(&pool, &schema).await;
+}
+
+#[tokio::test]
+#[ignore = "requires PostgreSQL"]
+async fn federation_entities_use_postgres_key_equality() {
+    let pool = connect().await;
+    let schema = unique_schema_name("fedequality");
+    create_equivalent_entity_keys_schema(&pool, &schema).await;
+
+    let names = format!(
+        r#"{{"tables": {{
+            "{schema}.uuid_entities": {{"federation": {{"shared": true}}}},
+            "{schema}.citext_entities": {{"federation": {{"shared": true}}}},
+            "{schema}.timestamptz_entities": {{"federation": {{"shared": true}}}}
+        }}}}"#
+    );
+    let state = build_federated_state_with_names(&pool, &schema, &names).await;
+    let data = execute_ok(
+        &state,
+        &pool,
+        &schema,
+        r#"
+        {
+          _entities(representations: [
+            {__typename: "uuid_entities", id: "550E8400-E29B-41D4-A716-446655440000"},
+            {__typename: "uuid_entities", id: "550e8400-e29b-41d4-a716-446655440000"},
+            {__typename: "citext_entities", id: "ALICE"},
+            {__typename: "timestamptz_entities", id: "2024-01-01T00:00:00Z"}
+          ]) {
+            ... on uuid_entities { label }
+            ... on citext_entities { label }
+            ... on timestamptz_entities { label }
+          }
+        }
+        "#,
+    )
+    .await;
+
+    let rows = data
+        .get("_entities")
+        .and_then(serde_json::Value::as_array)
+        .expect("entities list");
+    assert_eq!(rows.len(), 4);
+    assert_eq!(rows[0]["label"], "uuid row");
+    assert_eq!(rows[1]["label"], "uuid row");
+    assert_eq!(rows[2]["label"], "citext row");
+    assert_eq!(rows[3]["label"], "timestamptz row");
+
+    drop_schema(&pool, &schema).await;
+}
+
+#[tokio::test]
+#[ignore = "requires PostgreSQL"]
+async fn federation_entities_accept_string_bigint_and_numeric_keys() {
+    let pool = connect().await;
+    let schema = unique_schema_name("feddecimalkeys");
+    create_decimal_entity_keys_schema(&pool, &schema).await;
+
+    let names = format!(
+        r#"{{"tables": {{
+            "{schema}.bigint_entities": {{"federation": {{"shared": true}}}},
+            "{schema}.numeric_entities": {{"federation": {{"shared": true}}}}
+        }}}}"#
+    );
+    let state = build_federated_state_with_names(&pool, &schema, &names).await;
+    let data = execute_ok(
+        &state,
+        &pool,
+        &schema,
+        r#"
+        {
+          _entities(representations: [
+            {__typename: "bigint_entities", id: "7"},
+            {__typename: "bigint_entities", id: 7},
+            {__typename: "bigint_entities", id: "9007199254740993"},
+            {__typename: "numeric_entities", id: "9007199254740993.123456789"}
+          ]) {
+            ... on bigint_entities { label }
+            ... on numeric_entities { label }
+          }
+        }
+        "#,
+    )
+    .await;
+
+    let rows = data
+        .get("_entities")
+        .and_then(serde_json::Value::as_array)
+        .expect("entities list");
+    assert_eq!(rows.len(), 4);
+    assert_eq!(rows[0]["label"], "seven");
+    assert_eq!(rows[1]["label"], "seven");
+    assert_eq!(rows[2]["label"], "past JavaScript integer precision");
+    assert_eq!(rows[3]["label"], "exact decimal");
+
+    drop_schema(&pool, &schema).await;
+}
+
+#[tokio::test]
+#[ignore = "requires PostgreSQL"]
+async fn federation_integer_keys_reject_string_representations_before_querying() {
+    let pool = connect().await;
+    let schema = unique_schema_name("fedkeytype");
+    create_widgets_schema(&pool, &schema).await;
+
+    let names = shared_table_names(&schema, "widgets");
+    let state = build_federated_state_with_names(&pool, &schema, &names).await;
+    let errors = execute_err(
+        &state,
+        &pool,
+        &schema,
+        r#"
+        {
+          _entities(representations: [{__typename: "widgets", id: "2"}]) {
+            ... on widgets { id name }
+          }
+        }
+        "#,
+    )
+    .await;
+
+    assert!(
+        errors.contains(
+            "invalid key field \"id\": expected a value compatible with PostgreSQL type \"int4\", found a string"
+        ),
+        "unexpected error: {}",
+        errors
+    );
+
+    drop_schema(&pool, &schema).await;
+}
+
+#[tokio::test]
+#[ignore = "requires PostgreSQL"]
+async fn federation_integer_backed_ids_reuse_prepared_statements_across_both_input_forms() {
+    let pool = PgPoolOptions::new()
+        .max_connections(1)
+        .connect(&database_url())
+        .await
+        .expect("failed to connect to test database");
+    let schema = unique_schema_name("fedidnormalize");
+    create_widgets_schema(&pool, &schema).await;
+
+    let names = format!(
+        r#"{{"tables": {{"{schema}.widgets": {{
+            "column_types": {{"id": "ID"}},
+            "federation": {{"shared": true}}
+        }}}}}}"#
+    );
+    let state = build_federated_state_with_names(&pool, &schema, &names).await;
+
+    for id in ["2", "\"2\"", "2"] {
+        let query = format!(
+            r#"{{
+              _entities(representations: [{{__typename: "widgets", id: {id}}}]) {{
+                ... on widgets {{ id name }}
+              }}
+            }}"#
+        );
+        let data = execute_ok(&state, &pool, &schema, &query).await;
+        let entity = data
+            .get("_entities")
+            .and_then(|value| value.as_array())
+            .and_then(|values| values.first())
+            .expect("resolved entity");
+        assert_eq!(
+            entity.get("name").and_then(|value| value.as_str()),
+            Some("bravo")
+        );
+    }
+
+    // A different projection produces a fresh prepared statement. Start this
+    // one with the string spelling so the opposite cache order is covered.
+    for id in ["\"3\"", "3"] {
+        let query = format!(
+            r#"{{
+              _entities(representations: [{{__typename: "widgets", id: {id}}}]) {{
+                ... on widgets {{ id category }}
+              }}
+            }}"#
+        );
+        let data = execute_ok(&state, &pool, &schema, &query).await;
+        let entity = data
+            .get("_entities")
+            .and_then(|value| value.as_array())
+            .and_then(|values| values.first())
+            .expect("resolved entity");
+        assert_eq!(
+            entity.get("category").and_then(|value| value.as_str()),
+            Some("books")
+        );
+    }
+
+    drop_schema(&pool, &schema).await;
+}
+
+#[tokio::test]
+#[ignore = "requires PostgreSQL"]
+async fn federation_entities_return_null_for_missing_rows() {
+    let pool = connect().await;
+    let schema = unique_schema_name("fedmissing");
+    create_widgets_schema(&pool, &schema).await;
+
+    let names = shared_table_names(&schema, "widgets");
+    let state = build_federated_state_with_names(&pool, &schema, &names).await;
+    let data = execute_ok(
+        &state,
+        &pool,
+        &schema,
+        r#"
+        {
+          _entities(representations: [
+            {__typename: "widgets", id: 9999},
+            {__typename: "widgets", id: 2}
+          ]) {
+            __typename
+            ... on widgets {
+              id
+              name
+            }
+          }
+        }
+        "#,
+    )
+    .await;
+
+    let rows = data
+        .get("_entities")
+        .and_then(|value| value.as_array())
+        .expect("entity results");
+    assert_eq!(rows.len(), 2);
+    assert!(rows[0].is_null());
+    assert_eq!(rows[1].get("id").and_then(|value| value.as_i64()), Some(2));
+    assert_eq!(
+        rows[1].get("name").and_then(|value| value.as_str()),
+        Some("bravo")
+    );
+
+    drop_schema(&pool, &schema).await;
+}
+
+#[tokio::test]
+#[ignore = "requires PostgreSQL"]
+async fn federation_entities_reject_unknown_typenames() {
+    let pool = connect().await;
+    let schema = unique_schema_name("fedunknown");
+    create_widgets_schema(&pool, &schema).await;
+
+    let names = shared_table_names(&schema, "widgets");
+    let state = build_federated_state_with_names(&pool, &schema, &names).await;
+    let errors = execute_err(
+        &state,
+        &pool,
+        &schema,
+        r#"
+        {
+          _entities(representations: [{__typename: "not_widgets", id: 1}]) {
+            __typename
+          }
+        }
+        "#,
+    )
+    .await;
+
+    assert!(
+        errors.contains("unknown federation entity \"not_widgets\""),
+        "unexpected error: {}",
+        errors
+    );
+
+    drop_schema(&pool, &schema).await;
+}
+
+#[tokio::test]
+#[ignore = "requires PostgreSQL"]
+async fn federation_entities_reject_missing_key_fields() {
+    let pool = connect().await;
+    let schema = unique_schema_name("fednokey");
+    create_widgets_schema(&pool, &schema).await;
+
+    let names = shared_table_names(&schema, "widgets");
+    let state = build_federated_state_with_names(&pool, &schema, &names).await;
+    let errors = execute_err(
+        &state,
+        &pool,
+        &schema,
+        r#"
+        {
+          _entities(representations: [{__typename: "widgets"}]) {
+            __typename
+            ... on widgets {
+              id
+            }
+          }
+        }
+        "#,
+    )
+    .await;
+
+    assert!(
+        errors.contains("missing key field \"id\""),
+        "unexpected error: {}",
+        errors
+    );
+
+    drop_schema(&pool, &schema).await;
+}
+
+#[tokio::test]
+#[ignore = "requires PostgreSQL"]
+async fn federation_entities_use_renamed_key_fields() {
+    let pool = connect().await;
+    let schema = unique_schema_name("fedrename");
+    create_widgets_schema(&pool, &schema).await;
+
+    let names = format!(
+        r#"{{"tables": {{"{schema}.widgets": {{
+            "columns": {{"id": "widget_id"}},
+            "federation": {{"shared": true}}
+        }}}}}}"#
+    );
+    let state = build_federated_state_with_names(&pool, &schema, &names).await;
+    let data = execute_ok(
+        &state,
+        &pool,
+        &schema,
+        r#"
+        {
+          _entities(representations: [{__typename: "widgets", widget_id: 4}]) {
+            __typename
+            ... on widgets {
+              widget_id
+              name
+            }
+          }
+        }
+        "#,
+    )
+    .await;
+
+    let rows = data
+        .get("_entities")
+        .and_then(|value| value.as_array())
+        .expect("entities list");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(
+        rows[0].get("widget_id").and_then(|value| value.as_i64()),
+        Some(4)
+    );
+    assert_eq!(
+        rows[0].get("name").and_then(|value| value.as_str()),
+        Some("delta")
+    );
+
+    drop_schema(&pool, &schema).await;
+}
+
+#[tokio::test]
+#[ignore = "requires PostgreSQL"]
+async fn federation_entities_resolve_composite_primary_keys() {
+    let pool = connect().await;
+    let schema = unique_schema_name("fedcomposite");
+    create_composite_key_schema(&pool, &schema).await;
+
+    let names = shared_table_names(&schema, "inventory");
+    let state = build_federated_state_with_names(&pool, &schema, &names).await;
+    let data = execute_ok(
+        &state,
+        &pool,
+        &schema,
+        r#"
+        {
+          _entities(representations: [
+            {__typename: "inventory", warehouse_id: 2, sku: "alpha"},
+            {__typename: "inventory", warehouse_id: 1, sku: "bravo"}
+          ]) {
+            __typename
+            ... on inventory {
+              warehouse_id
+              sku
+              quantity
+            }
+          }
+        }
+        "#,
+    )
+    .await;
+
+    let rows = data
+        .get("_entities")
+        .and_then(|value| value.as_array())
+        .expect("entities list");
+    assert_eq!(rows.len(), 2);
+    assert_eq!(
+        rows[0].get("warehouse_id").and_then(|value| value.as_i64()),
+        Some(2)
+    );
+    assert_eq!(
+        rows[0].get("sku").and_then(|value| value.as_str()),
+        Some("alpha")
+    );
+    assert_eq!(
+        rows[0].get("quantity").and_then(|value| value.as_i64()),
+        Some(15)
+    );
+    assert_eq!(
+        rows[1].get("warehouse_id").and_then(|value| value.as_i64()),
+        Some(1)
+    );
+    assert_eq!(
+        rows[1].get("sku").and_then(|value| value.as_str()),
+        Some("bravo")
+    );
+    assert_eq!(
+        rows[1].get("quantity").and_then(|value| value.as_i64()),
+        Some(10)
+    );
+
+    drop_schema(&pool, &schema).await;
+}
+
+#[tokio::test]
+#[ignore = "requires PostgreSQL"]
+async fn federation_entities_do_not_bypass_select_permissions() {
+    let pool = connect().await;
+    let schema = unique_schema_name("fedperm");
+    create_widgets_schema(&pool, &schema).await;
+
+    let names = format!(
+        r#"{{"tables": {{"{schema}.widgets": {{
+            "federation": {{"shared": true}},
+            "permissions": {{"listener": {{"select": {{
+                "columns": "*",
+                "filter": {{"category": {{"_eq": "books"}}}}
+            }}}}}}
+        }}}}}}"#
+    );
+    let state = build_federated_state_with_names(&pool, &schema, &names).await;
+    let data = execute_as(
+        &state,
+        &pool,
+        &schema,
+        r#"
+        {
+          _entities(representations: [
+            {__typename: "widgets", id: 2},
+            {__typename: "widgets", id: 3}
+          ]) {
+            __typename
+            ... on widgets {
+              id
+              name
+            }
+          }
+        }
+        "#,
+    )
+    .await;
+
+    let rows = data
+        .get("_entities")
+        .and_then(|value| value.as_array())
+        .expect("entity results");
+    assert_eq!(rows.len(), 2);
+    assert!(rows[0].is_null());
+    assert_eq!(rows[1].get("id").and_then(|value| value.as_i64()), Some(3));
+    assert_eq!(
+        rows[1].get("name").and_then(|value| value.as_str()),
+        Some("charlie")
+    );
+
+    drop_schema(&pool, &schema).await;
+}
+
+#[tokio::test]
+#[ignore = "requires PostgreSQL"]
+async fn federation_entities_can_select_relationships() {
+    let pool = connect().await;
+    let schema = unique_schema_name("fedrel");
+    create_related_schema(&pool, &schema).await;
+
+    let names = shared_table_names(&schema, "authors");
+    let state = build_federated_state_with_names(&pool, &schema, &names).await;
+    let data = execute_ok(
+        &state,
+        &pool,
+        &schema,
+        r#"
+        {
+          _entities(representations: [{__typename: "authors", id: 1}]) {
+            __typename
+            ... on authors {
+              id
+              name
+              books(order_by: [{id: asc}]) {
+                id
+                title
+              }
+            }
+          }
+        }
+        "#,
+    )
+    .await;
+
+    let row = data
+        .get("_entities")
+        .and_then(|value| value.as_array())
+        .and_then(|rows| rows.first())
+        .expect("first entity");
+    assert_eq!(
+        row.get("name").and_then(|value| value.as_str()),
+        Some("ada")
+    );
+    let books = row
+        .get("books")
+        .and_then(|value| value.as_array())
+        .expect("books list");
+    assert_eq!(books.len(), 2);
+    assert_eq!(
+        books[0].get("title").and_then(|value| value.as_str()),
+        Some("a-one")
+    );
+    assert_eq!(
+        books[1].get("title").and_then(|value| value.as_str()),
+        Some("a-two")
+    );
+
+    drop_schema(&pool, &schema).await;
+}
+
+#[tokio::test]
+#[ignore = "requires PostgreSQL"]
+async fn federation_entities_can_select_computed_fields() {
+    let pool = connect().await;
+    let schema = unique_schema_name("fedcomputed");
+    create_widgets_schema_with_computed_field(&pool, &schema).await;
+
+    let names = shared_table_names(&schema, "widgets");
+    let state = build_federated_state_with_names(&pool, &schema, &names).await;
+    let data = execute_ok(
+        &state,
+        &pool,
+        &schema,
+        r#"
+        {
+          _entities(representations: [{__typename: "widgets", id: 1}]) {
+            __typename
+            ... on widgets {
+              id
+              widget_label
+            }
+          }
+        }
+        "#,
+    )
+    .await;
+
+    let row = data
+        .get("_entities")
+        .and_then(|value| value.as_array())
+        .and_then(|rows| rows.first())
+        .expect("first entity");
+    assert_eq!(
+        row.get("widget_label").and_then(|value| value.as_str()),
+        Some("alpha:books")
+    );
+
+    drop_schema(&pool, &schema).await;
+}
+
+#[tokio::test]
+#[ignore = "requires PostgreSQL"]
+async fn federation_entity_relationships_respect_fragment_type_conditions() {
+    let pool = connect().await;
+    let schema = unique_schema_name("fedrelfragments");
+    create_mixed_entity_schema(&pool, &schema).await;
+
+    let names = mixed_entity_names(&schema);
+    let state = build_federated_state_with_names(&pool, &schema, &names).await;
+    let data = execute_ok(
+        &state,
+        &pool,
+        &schema,
+        r#"
+        {
+          _entities(representations: [
+            {__typename: "authors", id: 1},
+            {__typename: "shops", id: 1}
+          ]) {
+            ... on authors {
+              id
+              items { title }
+            }
+            ... on shops {
+              id
+              items { sku }
+            }
+          }
+        }
+        "#,
+    )
+    .await;
+
+    let rows = data["_entities"].as_array().expect("entities list");
+    assert_eq!(rows[0]["items"][0]["title"], "paper");
+    assert_eq!(rows[1]["items"][0]["sku"], "sku-1");
+
+    drop_schema(&pool, &schema).await;
+}
+
+#[tokio::test]
+#[ignore = "requires PostgreSQL"]
+async fn federation_entity_computed_fields_respect_fragment_type_conditions() {
+    let pool = connect().await;
+    let schema = unique_schema_name("fedcomputedfragments");
+    create_mixed_entity_schema(&pool, &schema).await;
+
+    let names = mixed_entity_names(&schema);
+    let state = build_federated_state_with_names(&pool, &schema, &names).await;
+    let data = execute_ok(
+        &state,
+        &pool,
+        &schema,
+        r#"
+        {
+          _entities(representations: [
+            {__typename: "authors", id: 1},
+            {__typename: "shops", id: 1}
+          ]) {
+            ... on authors { id }
+            ... on shops { id code }
+          }
+        }
+        "#,
+    )
+    .await;
+
+    let rows = data["_entities"].as_array().expect("entities list");
+    assert_eq!(rows[0]["id"], 1);
+    assert_eq!(rows[1]["code"], "shop-code");
 
     drop_schema(&pool, &schema).await;
 }
@@ -862,12 +1757,10 @@ async fn same_table_name_in_two_schemas_gets_distinct_fields() {
     let cache = SchemaCache::load(&pool, &schemas)
         .await
         .expect("failed to load schema cache");
-    let config = SchemaConfig {
-        exposed_schemas: schemas.clone(),
-        enable_mutations: true,
-        max_rows: None,
-        ..SchemaConfig::default()
-    };
+    let mut config = SchemaConfig::default();
+    config.exposed_schemas = schemas.clone();
+    config.enable_mutations = true;
+    config.max_rows = None;
     let state = Arc::new(
         GraphQLState::new(pool.clone(), Arc::new(cache), config)
             .expect("failed to build GraphQL schema"),
@@ -1582,19 +2475,14 @@ async fn a_subscription_is_a_live_query() {
     let cache = SchemaCache::load(&pool, &schemas)
         .await
         .expect("failed to load schema cache");
+    let mut config = SchemaConfig::default();
+    config.exposed_schemas = schemas.clone();
+    config.enable_mutations = true;
+    config.enable_subscriptions = true;
+    config.subscription_refresh_seconds = 1;
     let state = Arc::new(
-        GraphQLState::new(
-            pool.clone(),
-            Arc::new(cache),
-            SchemaConfig {
-                exposed_schemas: schemas.clone(),
-                enable_mutations: true,
-                enable_subscriptions: true,
-                subscription_refresh_seconds: 1,
-                ..SchemaConfig::default()
-            },
-        )
-        .expect("failed to build GraphQL schema"),
+        GraphQLState::new(pool.clone(), Arc::new(cache), config)
+            .expect("failed to build GraphQL schema"),
     );
 
     let cache = SchemaCache::load(&pool, &schemas)
@@ -1808,12 +2696,10 @@ async fn build_state_with_names(pool: &PgPool, schema: &str, names: &str) -> Arc
     let cache = SchemaCache::load(pool, &schemas)
         .await
         .expect("failed to load schema cache");
-    let config = SchemaConfig {
-        exposed_schemas: schemas.clone(),
-        enable_mutations: true,
-        names: postrust_graphql::names::NameOverrides::parse(names).expect("the names parse"),
-        ..SchemaConfig::default()
-    };
+    let mut config = SchemaConfig::default();
+    config.exposed_schemas = schemas.clone();
+    config.enable_mutations = true;
+    config.names = postrust_graphql::names::NameOverrides::parse(names).expect("the names parse");
     Arc::new(
         GraphQLState::new(pool.clone(), Arc::new(cache), config)
             .expect("failed to build GraphQL schema"),

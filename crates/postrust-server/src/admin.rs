@@ -714,10 +714,8 @@ mod tests {
 
     #[test]
     fn compat_mode_puts_tables_at_the_root() {
-        let config = postrust_core::AppConfig {
-            compat_mode: true,
-            ..Default::default()
-        };
+        let mut config = postrust_core::AppConfig::default();
+        config.compat_mode = true;
         let paths = paths_for(tables_map(vec![table("public", "users")]), &config);
         assert_eq!(paths, vec!["/users".to_string()]);
     }
@@ -728,10 +726,8 @@ mod tests {
         // Inserting blindly from a HashMap dropped one of them, and which one
         // varied between runs. The default schema wins the path, and the other
         // is recorded on it rather than vanishing.
-        let config = postrust_core::AppConfig {
-            db_schemas: vec!["public".into(), "api".into()],
-            ..Default::default()
-        };
+        let mut config = postrust_core::AppConfig::default();
+        config.db_schemas = vec!["public".into(), "api".into()];
 
         let tables = tables_map(vec![table("api", "orders"), table("public", "orders")]);
         let mut doc = utoipa::openapi::OpenApiBuilder::new().build();
@@ -751,10 +747,8 @@ mod tests {
     #[test]
     fn the_default_schema_wins_the_path_whichever_way_the_map_iterates() {
         // Same inputs, built in both orders: the result must not depend on it.
-        let config = postrust_core::AppConfig {
-            db_schemas: vec!["public".into(), "api".into()],
-            ..Default::default()
-        };
+        let mut config = postrust_core::AppConfig::default();
+        config.db_schemas = vec!["public".into(), "api".into()];
 
         for order in [
             vec![table("api", "orders"), table("public", "orders")],
@@ -789,10 +783,8 @@ mod tests {
 
     #[test]
     fn ignore_privileges_lists_every_operation() {
-        let config = postrust_core::AppConfig {
-            openapi_mode: OpenApiMode::IgnorePrivileges,
-            ..Default::default()
-        };
+        let mut config = postrust_core::AppConfig::default();
+        config.openapi_mode = OpenApiMode::IgnorePrivileges;
         let mut read_only = table("public", "reports");
         read_only.insertable = false;
         read_only.updatable = false;

@@ -14,7 +14,7 @@ const features = [
   {
     icon: "graphql",
     title: "GraphQL Built-in",
-    description: "Full GraphQL API alongside REST. Queries, mutations, filtering, and nested relationships out of the box.",
+    description: "Full GraphQL API alongside REST. Queries, mutations, filtering, and nested relationships out of the box, and an opt-in Apollo Federation v2 subgraph mode.",
   },
   {
     icon: "realtime",

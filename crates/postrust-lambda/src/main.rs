@@ -32,7 +32,7 @@ async fn main() -> Result<(), Error> {
 }
 
 async fn handler(event: Request) -> Result<Response<Body>, Error> {
-    let config = postrust_core::AppConfig::from_env();
+    let config = postrust_core::AppConfig::try_from_env()?;
 
     // Get or create pool
     let pool = POOL

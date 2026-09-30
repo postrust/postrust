@@ -67,7 +67,7 @@ async fn main() -> Result<()> {
         .with(tracing_subscriber::fmt::layer())
         .init();
 
-    let config = postrust_core::AppConfig::from_env();
+    let config = postrust_core::AppConfig::try_from_env()?;
 
     info!("Starting Postrust server");
     info!("Database: {}", mask_db_uri(&config.db_uri));
@@ -309,19 +309,19 @@ async fn main() -> Result<()> {
             .and_then(|value| value.trim().parse::<u64>().ok())
             .unwrap_or(30);
 
-        let graphql_config = SchemaConfig {
-            enable_subscriptions: true,
-            subscription_refresh_seconds,
-            max_rows: config.db_max_rows,
-            // The GraphQL schema was built for `public` whatever the server
-            // was told to expose, so a table in any other schema of
-            // `PGRST_DB_SCHEMAS` was reachable over REST and invisible over
-            // GraphQL.
-            exposed_schemas: config.db_schemas.clone(),
-            enum_values: graphql_enum_values,
-            names: graphql_names,
-            ..SchemaConfig::default()
-        };
+        let mut graphql_config = SchemaConfig::default();
+        graphql_config.enable_subscriptions = true;
+        graphql_config.subscription_refresh_seconds = subscription_refresh_seconds;
+        graphql_config.max_rows = config.db_max_rows;
+        graphql_config.enable_federation = config.graphql_federation;
+        graphql_config.type_prefix = config.graphql_type_prefix.clone();
+        // The GraphQL schema was built for `public` whatever the server
+        // was told to expose, so a table in any other schema of
+        // `PGRST_DB_SCHEMAS` was reachable over REST and invisible over
+        // GraphQL.
+        graphql_config.exposed_schemas = config.db_schemas.clone();
+        graphql_config.enum_values = graphql_enum_values;
+        graphql_config.names = graphql_names;
         // A schema that cannot be built is a reason to serve without GraphQL,
         // not a reason to exit. The REST surface, the admin UI and the health
         // endpoint do not depend on it, and taking the process down with it

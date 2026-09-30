@@ -7,18 +7,22 @@ use crate::context::GraphQLContext;
 use crate::error::GraphQLError;
 use crate::schema::object::TableObjectType;
 use crate::schema::relationship::RelationshipField;
-use crate::schema::{build_schema, GeneratedSchema, MutationType, SchemaConfig};
+use crate::schema::{build_schema, FederationEntity, GeneratedSchema, MutationType, SchemaConfig};
 use crate::subscription::{
     generate_subscription_fields, NotifyBroker, SubscriptionField as SubField,
 };
 use async_graphql::dynamic::*;
-use async_graphql::Value;
+use async_graphql::extensions::{
+    Extension, ExtensionContext, ExtensionFactory, NextResolve, ResolveInfo,
+};
+use async_graphql::parser::types::{FragmentDefinition, Selection, SelectionSet, TypeCondition};
+use async_graphql::{Name, Positioned, SelectionField, ServerResult, Value};
 use async_graphql_axum::{GraphQLRequest, GraphQLResponse};
 use axum::extract::State;
 use axum::response::IntoResponse;
 use postrust_core::schema_cache::SchemaCache;
 use sqlx::PgPool;
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
 use tokio::sync::RwLock;
 use tracing::{debug, info, trace};
@@ -71,6 +75,51 @@ pub struct GraphQLState {
     pub subscription_fields: Vec<SubField>,
     /// Notification broker for subscriptions
     pub broker: Arc<RwLock<Option<NotifyBroker>>>,
+}
+
+/// async-graphql's dynamic resolver requires every union value to carry a
+/// concrete type, including `null`. A typed null is then treated as an object,
+/// though, so its non-null fields fail. Convert only the library's error for a
+/// bare null `_Entity` list member back into the nullable member the schema
+/// declares.
+struct NullableFederationEntity;
+
+impl ExtensionFactory for NullableFederationEntity {
+    fn create(&self) -> Arc<dyn Extension> {
+        Arc::new(Self)
+    }
+}
+
+#[async_graphql::async_trait::async_trait]
+impl Extension for NullableFederationEntity {
+    async fn resolve(
+        &self,
+        ctx: &ExtensionContext<'_>,
+        info: ResolveInfo<'_>,
+        next: NextResolve<'_>,
+    ) -> ServerResult<Option<Value>> {
+        // IMPORTANT: async-graphql 7.0.17 invokes this hook for every field and
+        // every list member, not only `_entities`. That leaves one boxed
+        // extension future per call, so do not copy this pattern for other
+        // field-specific behaviour. Its dynamic API cannot represent a bare
+        // nullable union member: an untyped null is rejected and a typed null
+        // is resolved as an object. Until that changes upstream, keep the
+        // successful path to the one required `next.run`; in particular,
+        // defer all string comparisons until the union error has occurred.
+        let parent_type = info.parent_type;
+        let return_type = info.return_type;
+        match next.run(ctx, info).await {
+            Err(error)
+                if error.message
+                    == "internal: invalid value for union \"_Entity\", expected \"FieldValue::WithType\""
+                    && parent_type == "[_Entity]"
+                    && return_type == "_Entity" =>
+            {
+                Ok(Some(Value::Null))
+            }
+            result => result,
+        }
+    }
 }
 
 /// Build one schema for each role the permission document names.
@@ -523,7 +572,11 @@ fn build_dynamic_schema(
             .get(type_name)
             .map(|r| r.as_slice())
             .unwrap_or(&[]);
-        let table_obj = create_object_type(obj, relationships);
+        let table_obj = create_object_type(
+            obj,
+            relationships,
+            generated.federation_entities.get(type_name),
+        );
         object_types.insert(type_name.clone(), table_obj);
     }
 
@@ -542,7 +595,7 @@ fn build_dynamic_schema(
         if obj.fields.is_empty() && !countable.contains(type_name.as_str()) {
             continue;
         }
-        for aggregate_type in create_aggregate_types(type_name, obj) {
+        for aggregate_type in create_aggregate_types(&obj.local_name, obj) {
             object_types.insert(aggregate_type.type_name().to_string(), aggregate_type);
         }
     }
@@ -550,10 +603,10 @@ fn build_dynamic_schema(
     // One mutation response per table that has any mutation, and only those:
     // an unreferenced type is still a type, and a read-only view would
     // otherwise contribute a response nothing can return.
-    let mutable: HashSet<&str> = generated
+    let mutable: HashMap<String, String> = generated
         .mutation_fields
         .iter()
-        .map(|f| {
+        .filter_map(|f| {
             // The table's own name. A bulk write already answers with the
             // response type, and trimming the suffix here is what keeps
             // `<t>_mutation_response_mutation_response` from being built: the
@@ -561,24 +614,46 @@ fn build_dynamic_schema(
             // naming the bare type, so a table with only bulk writes -- which
             // is what a role that cannot read one has -- registered the wrong
             // name and left the right one missing.
-            f.return_type
+            let response = f
+                .return_type
                 .trim_matches(|c| c == '[' || c == ']' || c == '!')
-                .trim_end_matches("_mutation_response")
+                .strip_suffix("_mutation_response")?;
+            Some((response.to_string(), f.type_name.clone()))
         })
         .collect();
-    for base_name in mutable {
+    for (base_name, row_type_name) in mutable {
         // Whether it has rows to give back. A write to a table this role
         // cannot read answers with `affected_rows` and nothing else -- there
         // is no row type for `returning` to be a list of.
         let returning = generated
             .object_types
-            .get(base_name)
+            .get(&row_type_name)
             .is_some_and(|object| !object.fields.is_empty());
         object_types.insert(
-            mutation_response_type_name(base_name),
-            create_mutation_response_type(base_name, returning),
+            mutation_response_type_name(&base_name),
+            create_mutation_response_type(&base_name, &row_type_name, returning),
         );
     }
+
+    // Non-federated Hasura-compatible schemas use `query_root`, not `Query`.
+    // Federation SDL from async-graphql does not include an operation-root
+    // schema definition, so Apollo composition treats only the conventional
+    // root names as root types.
+    let query_root = if generated.enable_federation {
+        "Query"
+    } else {
+        "query_root"
+    };
+    let mutation_root = if generated.enable_federation {
+        "Mutation"
+    } else {
+        "mutation_root"
+    };
+    let subscription_root = if generated.enable_federation {
+        "Subscription"
+    } else {
+        "subscription_root"
+    };
 
     // Create query type. Resolvers need the relationship map to embed related
     // rows, so it is shared into each closure.
@@ -603,6 +678,7 @@ fn build_dynamic_schema(
     let query = add_function_fields(
         create_query_type(
             generated,
+            query_root,
             max_rows,
             Arc::clone(&relationships),
             Arc::clone(&names),
@@ -621,6 +697,7 @@ fn build_dynamic_schema(
         Some(add_function_fields(
             create_mutation_type(
                 generated,
+                mutation_root,
                 Arc::clone(&relationships),
                 Arc::clone(&type_names),
                 Arc::clone(&names),
@@ -641,6 +718,7 @@ fn build_dynamic_schema(
     let subscription = subscription_fields.map(|_| {
         create_subscription_type(
             generated,
+            subscription_root,
             max_rows,
             Arc::clone(&relationships),
             Arc::clone(&names),
@@ -649,14 +727,26 @@ fn build_dynamic_schema(
     });
 
     // Build schema
-    // `query_root`, not `Query`. The root type's name is not private to the
-    // server: a fragment is declared `on query_root`, and a client that writes
-    // one names the type it was generated against.
     let mut builder = Schema::build(
-        "query_root",
-        mutation.as_ref().map(|_| "mutation_root"),
-        subscription.as_ref().map(|_| "subscription_root"),
+        query_root,
+        mutation.as_ref().map(|_| mutation_root),
+        subscription.as_ref().map(|_| subscription_root),
     );
+    if generated.enable_federation {
+        builder = builder
+            .enable_federation()
+            .extension(NullableFederationEntity);
+        let entity_state = Arc::new(EntityResolverState::new(
+            generated,
+            Arc::clone(&relationships),
+            Arc::clone(&names),
+            max_rows,
+        ));
+        builder = builder.entity_resolver(move |ctx| {
+            let state = Arc::clone(&entity_state);
+            FieldFuture::new(async move { resolve_entities(&ctx, state.as_ref()).await })
+        });
+    }
 
     // Register all object types
     for (_, obj) in object_types {
@@ -761,10 +851,7 @@ fn build_dynamic_schema(
         if field.mutation_type != MutationType::UpdateByPk || field.pk_columns.is_empty() {
             continue;
         }
-        let base_name = field
-            .return_type
-            .trim_matches(|c| c == '[' || c == ']' || c == '!')
-            .trim_end_matches("_mutation_response");
+        let base_name = field.local_type_name.as_str();
         let type_name = format!("{}_pk_columns_input", base_name);
         let mut input = InputObject::new(&type_name)
             .description(format!("The primary key of one {} row.", base_name));
@@ -773,7 +860,13 @@ fn build_dynamic_schema(
                 names
                     .column(&field.schema_name, &field.table_name, column)
                     .unwrap_or(column),
-                TypeRef::named_nn(pk_argument_type(pg_type)),
+                TypeRef::named_nn(exposed_pk_argument_type(
+                    names.as_ref(),
+                    &field.schema_name,
+                    &field.table_name,
+                    column,
+                    pg_type,
+                )),
             ));
         }
         key_inputs.insert(type_name, input);
@@ -810,6 +903,7 @@ fn build_dynamic_schema(
         .collect();
 
     for (type_name, object) in &generated.object_types {
+        let local_type_name = object.local_name.as_str();
         let table = &object.table;
         // Which columns a write may name, which is the write permission's
         // answer and not the read permission's. A role granted `columns:
@@ -843,12 +937,12 @@ fn build_dynamic_schema(
             .unwrap_or(&[]);
         let conflict_type = match table.unique_constraints.is_empty() {
             true => None,
-            false => Some(format!("{}_on_conflict", type_name)),
+            false => Some(format!("{}_on_conflict", local_type_name)),
         };
 
         if crate::input::mutation::is_insertable(table) {
-            let mut insert = InputObject::new(format!("{}_insert_input", type_name))
-                .description(format!("The columns of a new {} row.", type_name));
+            let mut insert = InputObject::new(format!("{}_insert_input", local_type_name))
+                .description(format!("The columns of a new {} row.", local_type_name));
             let mut taken: HashSet<&str> = HashSet::new();
             for field in &insert_fields {
                 // Every column optional: which ones the database insists on is
@@ -876,7 +970,7 @@ fn build_dynamic_schema(
                 };
                 insert = insert.field(InputValue::new(
                     &relationship.name,
-                    TypeRef::named(format!("{}_{}", relationship.target_type, suffix)),
+                    TypeRef::named(format!("{}_{}", relationship.target_local_name, suffix)),
                 ));
             }
             builder = builder.register(insert);
@@ -884,16 +978,24 @@ fn build_dynamic_schema(
             // How this table is written as somebody else's nested row. Both
             // shapes carry an `on_conflict`, which is what makes a nested
             // upsert expressible.
-            let data_type = format!("{}_insert_input", type_name);
-            let mut object_rel = InputObject::new(format!("{}_obj_rel_insert_input", type_name))
-                .description(format!("One {} row written beside its parent.", type_name))
-                .field(InputValue::new("data", TypeRef::named_nn(&data_type)));
-            let mut array_rel = InputObject::new(format!("{}_arr_rel_insert_input", type_name))
-                .description(format!("{} rows written beside their parent.", type_name))
-                .field(InputValue::new(
-                    "data",
-                    TypeRef::named_nn_list_nn(&data_type),
-                ));
+            let data_type = format!("{}_insert_input", local_type_name);
+            let mut object_rel =
+                InputObject::new(format!("{}_obj_rel_insert_input", local_type_name))
+                    .description(format!(
+                        "One {} row written beside its parent.",
+                        local_type_name
+                    ))
+                    .field(InputValue::new("data", TypeRef::named_nn(&data_type)));
+            let mut array_rel =
+                InputObject::new(format!("{}_arr_rel_insert_input", local_type_name))
+                    .description(format!(
+                        "{} rows written beside their parent.",
+                        local_type_name
+                    ))
+                    .field(InputValue::new(
+                        "data",
+                        TypeRef::named_nn_list_nn(&data_type),
+                    ));
             if let Some(conflict) = &conflict_type {
                 object_rel =
                     object_rel.field(InputValue::new("on_conflict", TypeRef::named(conflict)));
@@ -904,10 +1006,10 @@ fn build_dynamic_schema(
         }
 
         if crate::input::mutation::is_updatable(table) {
-            let mut set = InputObject::new(format!("{}_set_input", type_name))
-                .description(format!("Columns of {} to replace.", type_name));
-            let mut numeric = InputObject::new(format!("{}_inc_input", type_name))
-                .description(format!("Columns of {} to add to.", type_name));
+            let mut set = InputObject::new(format!("{}_set_input", local_type_name))
+                .description(format!("Columns of {} to replace.", local_type_name));
+            let mut numeric = InputObject::new(format!("{}_inc_input", local_type_name))
+                .description(format!("Columns of {} to add to.", local_type_name));
             let mut any_numeric = false;
             let mut any_jsonb = false;
             for field in &update_fields {
@@ -938,23 +1040,23 @@ fn build_dynamic_schema(
             // where it matches. The whole list runs in one transaction, in the
             // order it was given, which is what makes it different from
             // sending the updates one at a time.
-            let mut updates = InputObject::new(format!("{}_updates", type_name))
+            let mut updates = InputObject::new(format!("{}_updates", local_type_name))
                 .description(format!(
                     "One update to {}: which rows, and what to write.",
-                    type_name
+                    local_type_name
                 ))
                 .field(InputValue::new(
                     "where",
-                    TypeRef::named_nn(crate::input::bool_exp::bool_exp_type_name(type_name)),
+                    TypeRef::named_nn(crate::input::bool_exp::bool_exp_type_name(local_type_name)),
                 ))
                 .field(InputValue::new(
                     "_set",
-                    TypeRef::named(format!("{}_set_input", type_name)),
+                    TypeRef::named(format!("{}_set_input", local_type_name)),
                 ));
             if any_numeric {
                 updates = updates.field(InputValue::new(
                     "_inc",
-                    TypeRef::named(format!("{}_inc_input", type_name)),
+                    TypeRef::named(format!("{}_inc_input", local_type_name)),
                 ));
             }
             // What a document column may be told to do, one input per
@@ -969,16 +1071,18 @@ fn build_dynamic_schema(
                 }
                 updates = updates.field(InputValue::new(
                     *operator,
-                    TypeRef::named(jsonb_operator_input(type_name, operator)),
+                    TypeRef::named(jsonb_operator_input(local_type_name, operator)),
                 ));
             }
             builder = builder.register(updates);
             if any_jsonb {
                 for (operator, item) in JSONB_OPERATORS {
                     let mut input =
-                        InputObject::new(jsonb_operator_input(type_name, operator)).description(
-                            format!("Columns of {} to apply `{}` to.", type_name, operator),
-                        );
+                        InputObject::new(jsonb_operator_input(local_type_name, operator))
+                            .description(format!(
+                                "Columns of {} to apply `{}` to.",
+                                local_type_name, operator
+                            ));
                     for field in &update_fields {
                         if !matches!(&field.graphql_type, crate::types::GraphQLType::Json) {
                             continue;
@@ -1018,15 +1122,21 @@ fn build_dynamic_schema(
     // type and the field, since two tables may reach the same function and one
     // table may reach two.
     for (type_name, relationships) in &generated.relationship_fields {
+        let local_type_name = generated
+            .object_types
+            .get(type_name)
+            .map(|object| object.local_name.as_str())
+            .unwrap_or(type_name);
         for relationship in relationships {
             if relationship.arguments.is_empty() {
                 continue;
             }
-            let mut args = InputObject::new(computed_args_type_name(type_name, &relationship.name))
-                .description(format!(
-                    "Arguments to {}, beside the row it is asked of.",
-                    relationship.name
-                ));
+            let mut args =
+                InputObject::new(computed_args_type_name(local_type_name, &relationship.name))
+                    .description(format!(
+                        "Arguments to {}, beside the row it is asked of.",
+                        relationship.name
+                    ));
             for (name, pg_type, _) in &relationship.arguments {
                 let scalar = crate::types::pg_type_to_graphql(pg_type).to_string();
                 // Nullable, for the reason the function arguments above are.
@@ -1040,12 +1150,13 @@ fn build_dynamic_schema(
     // arguments where the field is asked for. `locations { distance(args: {
     // from: ... }) }` -- the field is a function of the row and of what the
     // caller wants measured against it.
-    for (type_name, object) in &generated.object_types {
+    for object in generated.object_types.values() {
+        let local_type_name = object.local_name.as_str();
         for field in &object.fields {
             if field.arguments.is_empty() {
                 continue;
             }
-            let mut args = InputObject::new(computed_args_type_name(type_name, &field.name))
+            let mut args = InputObject::new(computed_args_type_name(local_type_name, &field.name))
                 .description(format!(
                     "Arguments to {}, beside the row it is asked of.",
                     field.name
@@ -1064,16 +1175,19 @@ fn build_dynamic_schema(
     // only place the field naming them exists.
     {
         use crate::input::bool_exp as be;
-        let mut targets: BTreeSet<&str> = BTreeSet::new();
+        let mut targets: BTreeMap<&str, &str> = BTreeMap::new();
         for relationships in generated.relationship_fields.values() {
             for relationship in relationships {
                 if relationship.is_list {
-                    targets.insert(relationship.target_type.as_str());
+                    targets.insert(
+                        relationship.target_local_name.as_str(),
+                        relationship.target_type.as_str(),
+                    );
                 }
             }
         }
-        for target in targets {
-            let Some(object) = generated.object_types.get(target) else {
+        for (target, target_type) in targets {
+            let Some(object) = generated.object_types.get(target_type) else {
                 continue;
             };
             // A boolean column is what `bool_and` and `bool_or` fold, and a
@@ -1151,7 +1265,8 @@ fn build_dynamic_schema(
     // Upserts. A table with no unique constraint has no conflict to resolve,
     // and a GraphQL enum may not be empty, so it gets none of these types
     // rather than an unusable set of them.
-    for (type_name, object) in &generated.object_types {
+    for object in generated.object_types.values() {
+        let local_type_name = object.local_name.as_str();
         // What an upsert may write, which is the update permission's answer
         // and not the read permission's: `update_columns` names columns to
         // overwrite, so a role that may set a column without seeing it may
@@ -1162,17 +1277,19 @@ fn build_dynamic_schema(
             continue;
         }
 
-        let mut constraints = Enum::new(format!("{}_constraint", type_name)).description(format!(
-            "A uniqueness of {} that an insert may conflict with.",
-            type_name
-        ));
+        let mut constraints =
+            Enum::new(format!("{}_constraint", local_type_name)).description(format!(
+                "A uniqueness of {} that an insert may conflict with.",
+                local_type_name
+            ));
         for (name, columns) in &object.table.unique_constraints {
             constraints = constraints
                 .item(EnumItem::new(name).description(format!("unique ({})", columns.join(", "))));
         }
 
-        let mut updatable = Enum::new(format!("{}_update_column", type_name))
-            .description(format!("A column of {} an upsert may write.", type_name));
+        let mut updatable = Enum::new(format!("{}_update_column", local_type_name)).description(
+            format!("A column of {} an upsert may write.", local_type_name),
+        );
         for field in &updatable_columns {
             updatable = updatable.item(EnumItem::new(&field.name));
         }
@@ -1191,14 +1308,14 @@ fn build_dynamic_schema(
             );
         }
 
-        let on_conflict = InputObject::new(format!("{}_on_conflict", type_name))
+        let on_conflict = InputObject::new(format!("{}_on_conflict", local_type_name))
             .description(format!(
                 "What to do when an insert into {} conflicts.",
-                type_name
+                local_type_name
             ))
             .field(InputValue::new(
                 "constraint",
-                TypeRef::named_nn(format!("{}_constraint", type_name)),
+                TypeRef::named_nn(format!("{}_constraint", local_type_name)),
             ))
             // An empty list is `DO NOTHING`, which is how Hasura spells "leave
             // the row that is already there alone" -- and is the default, so
@@ -1207,13 +1324,13 @@ fn build_dynamic_schema(
             .field(
                 InputValue::new(
                     "update_columns",
-                    TypeRef::named_nn_list_nn(format!("{}_update_column", type_name)),
+                    TypeRef::named_nn_list_nn(format!("{}_update_column", local_type_name)),
                 )
                 .default_value(Value::List(Vec::new())),
             )
             .field(InputValue::new(
                 "where",
-                TypeRef::named(crate::input::bool_exp::bool_exp_type_name(type_name)),
+                TypeRef::named(crate::input::bool_exp::bool_exp_type_name(local_type_name)),
             ));
 
         builder = builder
@@ -1273,9 +1390,8 @@ pub fn mutation_response_type_name(base_name: &str) -> String {
 /// `affected_rows` is the count PostgreSQL reports, which is not the length of
 /// `returning`: a client may ask for no rows back at all and still need to know
 /// how many were touched, and that is the usual case for a delete.
-fn create_mutation_response_type(base_name: &str, returning: bool) -> Object {
+fn create_mutation_response_type(base_name: &str, row_type: &str, returning: bool) -> Object {
     let response_name = mutation_response_type_name(base_name);
-    let row_type = base_name.to_string();
 
     let response = Object::new(&response_name)
         .description(format!("The rows {} changed, and how many.", base_name))
@@ -1301,7 +1417,7 @@ fn create_mutation_response_type(base_name: &str, returning: bool) -> Object {
     }
     response.field(Field::new(
         "returning",
-        TypeRef::named_nn_list_nn(row_type),
+        TypeRef::named_nn_list_nn(row_type.to_string()),
         |ctx| {
             FieldFuture::new(async move {
                 let rows = match ctx.parent_value.as_value() {
@@ -1350,7 +1466,7 @@ fn create_aggregate_types(base_name: &str, object: &TableObjectType) -> Vec<Obje
     if has_rows {
         over = over.field(Field::new(
             "nodes",
-            TypeRef::named_nn_list_nn(base_name.to_string()),
+            TypeRef::named_nn_list_nn(object.name.clone()),
             |ctx| {
                 FieldFuture::new(async move {
                     let rows = match child_value(&ctx, "nodes") {
@@ -1543,8 +1659,16 @@ fn at_path(mut error: async_graphql::Error, path: &str) -> async_graphql::Error 
     error
 }
 
-fn create_object_type(obj: &TableObjectType, relationships: &[RelationshipField]) -> Object {
+fn create_object_type(
+    obj: &TableObjectType,
+    relationships: &[RelationshipField],
+    federation_entity: Option<&FederationEntity>,
+) -> Object {
     let mut object = Object::new(&obj.name);
+    let entity_is_shared = federation_entity.is_some_and(|entity| entity.shared);
+    if let Some(entity) = federation_entity {
+        object = object.key(entity.key_fields_sdl());
+    }
 
     // A table with no comment still gets a description, because Hasura gives
     // one and a client generating documentation from the schema would
@@ -1646,12 +1770,17 @@ fn create_object_type(obj: &TableObjectType, relationships: &[RelationshipField]
             true => gql_field,
             false => gql_field.argument(InputValue::new(
                 "args",
-                TypeRef::named_nn(computed_args_type_name(&obj.name, &field.name)),
+                TypeRef::named_nn(computed_args_type_name(&obj.local_name, &field.name)),
             )),
         };
 
         let gql_field = if let Some(desc) = &field.description {
             gql_field.description(desc)
+        } else {
+            gql_field
+        };
+        let gql_field = if entity_is_shared && !field.is_pk {
+            gql_field.shareable()
         } else {
             gql_field
         };
@@ -1715,7 +1844,7 @@ fn create_object_type(obj: &TableObjectType, relationships: &[RelationshipField]
         if !rel.arguments.is_empty() {
             gql_field = gql_field.argument(InputValue::new(
                 "args",
-                TypeRef::named_nn(computed_args_type_name(&obj.name, &rel.name)),
+                TypeRef::named_nn(computed_args_type_name(&obj.local_name, &rel.name)),
             ));
         }
         if rel.is_list {
@@ -1723,17 +1852,19 @@ fn create_object_type(obj: &TableObjectType, relationships: &[RelationshipField]
                 .argument(InputValue::new(
                     "distinct_on",
                     TypeRef::named_nn_list(crate::input::order_by::select_column_type_name(
-                        &rel.target_type,
+                        &rel.target_local_name,
                     )),
                 ))
                 .argument(InputValue::new(
                     "where",
-                    TypeRef::named(crate::input::bool_exp::bool_exp_type_name(&rel.target_type)),
+                    TypeRef::named(crate::input::bool_exp::bool_exp_type_name(
+                        &rel.target_local_name,
+                    )),
                 ))
                 .argument(InputValue::new(
                     "order_by",
                     TypeRef::named_nn_list(crate::input::order_by::order_by_type_name(
-                        &rel.target_type,
+                        &rel.target_local_name,
                     )),
                 ))
                 .argument(InputValue::new("limit", TypeRef::named("Int")))
@@ -1742,6 +1873,11 @@ fn create_object_type(obj: &TableObjectType, relationships: &[RelationshipField]
 
         let gql_field = if let Some(desc) = &rel.description {
             gql_field.description(desc)
+        } else {
+            gql_field
+        };
+        let gql_field = if entity_is_shared {
+            gql_field.shareable()
         } else {
             gql_field
         };
@@ -1761,7 +1897,7 @@ fn create_object_type(obj: &TableObjectType, relationships: &[RelationshipField]
                     Field::new(
                         &aggregate_field,
                         TypeRef::named_nn(crate::schema::aggregate::aggregate_type_name(
-                            &rel.target_type,
+                            &rel.target_local_name,
                         )),
                         move |ctx| {
                             let key = key.clone();
@@ -1782,19 +1918,19 @@ fn create_object_type(obj: &TableObjectType, relationships: &[RelationshipField]
                     .argument(InputValue::new(
                         "distinct_on",
                         TypeRef::named_nn_list(crate::input::order_by::select_column_type_name(
-                            &rel.target_type,
+                            &rel.target_local_name,
                         )),
                     ))
                     .argument(InputValue::new(
                         "where",
                         TypeRef::named(crate::input::bool_exp::bool_exp_type_name(
-                            &rel.target_type,
+                            &rel.target_local_name,
                         )),
                     ))
                     .argument(InputValue::new(
                         "order_by",
                         TypeRef::named_nn_list(crate::input::order_by::order_by_type_name(
-                            &rel.target_type,
+                            &rel.target_local_name,
                         )),
                     ))
                     .argument(InputValue::new("limit", TypeRef::named("Int")))
@@ -1810,9 +1946,14 @@ fn create_object_type(obj: &TableObjectType, relationships: &[RelationshipField]
                         name,
                         field.argument(InputValue::new(
                             "args",
-                            TypeRef::named_nn(computed_args_type_name(&obj.name, &rel.name)),
+                            TypeRef::named_nn(computed_args_type_name(&obj.local_name, &rel.name)),
                         )),
                     ));
+                }
+                if entity_is_shared {
+                    let last = fields.len() - 1;
+                    let (name, field) = fields.remove(last);
+                    fields.push((name, field.shareable()));
                 }
             }
         }
@@ -1899,7 +2040,13 @@ fn with_key_arguments<F: RootField>(
             names
                 .column(schema_name, table_name, column)
                 .unwrap_or(column),
-            TypeRef::named_nn(pk_argument_type(pg_type)),
+            TypeRef::named_nn(exposed_pk_argument_type(
+                names,
+                schema_name,
+                table_name,
+                column,
+                pg_type,
+            )),
         ));
     }
     field
@@ -1908,6 +2055,7 @@ fn with_key_arguments<F: RootField>(
 /// Create the Query type with all table query fields.
 fn create_query_type(
     generated: &GeneratedSchema,
+    root_name: &str,
     max_rows: Option<i64>,
     relationships: Arc<HashMap<String, Vec<RelationshipField>>>,
     names: Arc<crate::names::NameOverrides>,
@@ -1922,11 +2070,12 @@ fn create_query_type(
         let table_name = field.table_name.clone();
         let schema_name = field.schema_name.clone();
         let type_name = field.type_name.clone();
+        let local_type_name = field.local_type_name.clone();
         let is_by_pk = field.is_by_pk;
         let pk_columns = field.pk_columns.clone();
         let return_type = graphql_type_ref(&field.return_type);
 
-        let spec_type_name = type_name.clone();
+        let spec_type_name = local_type_name.clone();
         let spec = Arc::new(QueryFieldSpec {
             schema_name,
             table_name,
@@ -1985,15 +2134,14 @@ fn create_query_type(
                 names: Arc::clone(&names),
                 call: None,
             });
-            let aggregate_field_name = field
-                .aggregate_name
-                .clone()
-                .unwrap_or_else(|| crate::schema::aggregate::aggregate_type_name(&field.type_name));
+            let aggregate_field_name = field.aggregate_name.clone().unwrap_or_else(|| {
+                crate::schema::aggregate::aggregate_type_name(&field.local_type_name)
+            });
             let aggregate_field_name_for_sorting = aggregate_field_name.clone();
             let mut agg_field = Field::new(
                 aggregate_field_name,
                 TypeRef::named_nn(crate::schema::aggregate::aggregate_type_name(
-                    &field.type_name,
+                    &field.local_type_name,
                 )),
                 move |ctx| {
                     let agg_spec = Arc::clone(&agg_spec);
@@ -2014,7 +2162,7 @@ fn create_query_type(
     }
 
     roots.sort_by(|(a, _), (b, _)| a.cmp(b));
-    let mut query = Object::new("query_root");
+    let mut query = Object::new(root_name);
     // A GraphQL object may not have no fields, so a schema that exposes no
     // table needs something on its query root. Hasura puts a placeholder there
     // and calls it this; a client that reaches it has nothing to read.
@@ -2150,13 +2298,14 @@ fn update_inputs(
 
 fn create_mutation_type(
     generated: &GeneratedSchema,
+    root_name: &str,
     relationships: Arc<HashMap<String, Vec<RelationshipField>>>,
     type_names: Arc<HashMap<(String, String), String>>,
     names: Arc<crate::names::NameOverrides>,
     max_rows: Option<i64>,
     role: Option<&str>,
 ) -> Object {
-    let mut mutation = Object::new("mutation_root");
+    let mut mutation = Object::new(root_name);
     // In name order, for the reason the query root is: see there.
     let mut roots: Vec<(String, Field)> = Vec::new();
 
@@ -2168,13 +2317,13 @@ fn create_mutation_type(
     // drift, and drifting means an argument naming a type that is not there.
     let mut has_numeric_column: HashSet<String> = HashSet::new();
     let mut has_jsonb_column: HashSet<String> = HashSet::new();
-    for (type_name, object) in &generated.object_types {
+    for object in generated.object_types.values() {
         let (numeric, jsonb) = update_inputs(object, &names, role);
         if numeric {
-            has_numeric_column.insert(type_name.clone());
+            has_numeric_column.insert(object.local_name.clone());
         }
         if jsonb {
-            has_jsonb_column.insert(type_name.clone());
+            has_jsonb_column.insert(object.local_name.clone());
         }
     }
 
@@ -2182,7 +2331,7 @@ fn create_mutation_type(
         .object_types
         .iter()
         .filter(|(_, object)| !object.table.unique_constraints.is_empty())
-        .map(|(type_name, _)| type_name.clone())
+        .map(|(_, object)| object.local_name.clone())
         .collect();
 
     for field in &generated.mutation_fields {
@@ -2195,11 +2344,7 @@ fn create_mutation_type(
         // The table's own type name, which is what its boolean expression is
         // named after. A bulk mutation returns `[author!]!` and a by-key one
         // returns `author`; both name the same table.
-        let where_type = field
-            .return_type
-            .trim_matches(|c| c == '[' || c == ']' || c == '!')
-            .trim_end_matches("_mutation_response")
-            .to_string();
+        let where_type = field.local_type_name.clone();
 
         let resolver_pk_columns = pk_columns.clone();
         let field_relationships = Arc::clone(&relationships);
@@ -2289,7 +2434,13 @@ fn create_mutation_type(
                         names
                             .column(&field.schema_name, &field.table_name, col_name)
                             .unwrap_or(col_name),
-                        TypeRef::named_nn(pk_argument_type(pg_type)),
+                        TypeRef::named_nn(exposed_pk_argument_type(
+                            names.as_ref(),
+                            &field.schema_name,
+                            &field.table_name,
+                            col_name,
+                            pg_type,
+                        )),
                     ));
                 }
             }
@@ -2340,6 +2491,7 @@ fn create_mutation_type(
 /// for every subscriber every tick whether or not anything happened.
 fn create_subscription_type(
     generated: &GeneratedSchema,
+    root_name: &str,
     max_rows: Option<i64>,
     relationships: Arc<HashMap<String, Vec<RelationshipField>>>,
     names: Arc<crate::names::NameOverrides>,
@@ -2348,7 +2500,7 @@ fn create_subscription_type(
     let mut roots: Vec<(String, SubscriptionField)> = Vec::new();
 
     for field in &generated.query_fields {
-        let spec_type_name = field.type_name.clone();
+        let spec_type_name = field.local_type_name.clone();
         let pk_columns = field.pk_columns.clone();
         let is_by_pk = field.is_by_pk;
         let return_type = graphql_type_ref(&field.return_type);
@@ -2416,14 +2568,13 @@ fn create_subscription_type(
             &field.schema_name,
             &field.table_name,
         )];
-        let agg_name = field
-            .aggregate_name
-            .clone()
-            .unwrap_or_else(|| crate::schema::aggregate::aggregate_type_name(&field.type_name));
+        let agg_name = field.aggregate_name.clone().unwrap_or_else(|| {
+            crate::schema::aggregate::aggregate_type_name(&field.local_type_name)
+        });
         let mut agg_field = SubscriptionField::new(
             agg_name.clone(),
             TypeRef::named_nn(crate::schema::aggregate::aggregate_type_name(
-                &field.type_name,
+                &field.local_type_name,
             )),
             move |ctx| {
                 let agg_spec = Arc::clone(&agg_spec);
@@ -2447,7 +2598,7 @@ fn create_subscription_type(
     }
 
     roots.sort_by(|(a, _), (b, _)| a.cmp(b));
-    let mut subscription = Subscription::new("subscription_root");
+    let mut subscription = Subscription::new(root_name);
     // A GraphQL object may not have no fields, and a schema that exposes no
     // table still has a subscription root if subscriptions are on.
     if roots.is_empty() {
@@ -2620,6 +2771,609 @@ struct QueryFieldSpec {
     call: Option<Arc<FunctionCall>>,
 }
 
+/// Everything `_entities` needs to resolve a representation to a table row.
+#[derive(Clone)]
+struct EntityLookup {
+    schema_name: String,
+    table_name: String,
+    type_name: String,
+    key_columns: Vec<EntityKeyColumn>,
+    row_column_types: HashMap<String, String>,
+}
+
+#[derive(Clone)]
+struct EntityKeyColumn {
+    field_name: String,
+    column_name: String,
+    pg_type: String,
+    explicit_id: bool,
+}
+
+/// The federation entity resolver's immutable schema view.
+struct EntityResolverState {
+    entities: HashMap<String, EntityLookup>,
+    relationships: Arc<HashMap<String, Vec<RelationshipField>>>,
+    names: Arc<crate::names::NameOverrides>,
+    max_rows: Option<i64>,
+}
+
+impl EntityResolverState {
+    fn new(
+        generated: &GeneratedSchema,
+        relationships: Arc<HashMap<String, Vec<RelationshipField>>>,
+        names: Arc<crate::names::NameOverrides>,
+        max_rows: Option<i64>,
+    ) -> Self {
+        let mut entities = HashMap::new();
+        for (type_name, entity) in &generated.federation_entities {
+            let Some(object) = generated.object_types.get(type_name) else {
+                continue;
+            };
+            let mut key_columns = Vec::with_capacity(entity.key_fields.len());
+            for field_name in &entity.key_fields {
+                let column_name = names
+                    .column_source(&object.table.schema, &object.table.name, field_name)
+                    .unwrap_or(field_name);
+                let Some(column) = object.table.get_column(column_name) else {
+                    continue;
+                };
+                key_columns.push(EntityKeyColumn {
+                    field_name: field_name.clone(),
+                    column_name: column.name.clone(),
+                    pg_type: column.nominal_type.clone(),
+                    explicit_id: matches!(
+                        names.column_type(&object.table.schema, &object.table.name, &column.name),
+                        Some(crate::types::GraphQLType::Id)
+                    ),
+                });
+            }
+            if key_columns.len() != entity.key_fields.len() {
+                continue;
+            }
+            entities.insert(
+                type_name.clone(),
+                EntityLookup {
+                    schema_name: object.table.schema.clone(),
+                    table_name: object.table.name.clone(),
+                    type_name: type_name.clone(),
+                    key_columns,
+                    row_column_types: exposed_column_types(&object.table, names.as_ref()),
+                },
+            );
+        }
+        Self {
+            entities,
+            relationships,
+            names,
+            max_rows,
+        }
+    }
+}
+
+struct EntityRepresentation {
+    index: usize,
+    type_name: String,
+    values: serde_json::Map<String, serde_json::Value>,
+}
+
+/// Fields selected for one concrete member of the federation `_Entity` union.
+///
+/// `SelectionField::selection_set()` expands every fragment but does not apply
+/// its type condition. Keep a parallel applicability list while walking the
+/// raw selection tree, then use it to retain only the fields meant for this
+/// entity type.
+fn entity_field_applicability(
+    selection_set: &SelectionSet,
+    fragments: &HashMap<Name, Positioned<FragmentDefinition>>,
+    type_name: &str,
+) -> Vec<bool> {
+    fn condition_matches(condition: Option<&Positioned<TypeCondition>>, type_name: &str) -> bool {
+        condition.is_none_or(|condition| {
+            let condition = condition.node.on.node.as_str();
+            condition == type_name || condition == "_Entity"
+        })
+    }
+
+    fn collect(
+        selection_set: &SelectionSet,
+        fragments: &HashMap<Name, Positioned<FragmentDefinition>>,
+        type_name: &str,
+        parent_matches: bool,
+        applicability: &mut Vec<bool>,
+    ) {
+        for selection in &selection_set.items {
+            match &selection.node {
+                Selection::Field(_) => applicability.push(parent_matches),
+                Selection::FragmentSpread(spread) => {
+                    let Some(fragment) = fragments.get(&spread.node.fragment_name.node) else {
+                        continue;
+                    };
+                    collect(
+                        &fragment.node.selection_set.node,
+                        fragments,
+                        type_name,
+                        parent_matches
+                            && condition_matches(Some(&fragment.node.type_condition), type_name),
+                        applicability,
+                    );
+                }
+                Selection::InlineFragment(fragment) => collect(
+                    &fragment.node.selection_set.node,
+                    fragments,
+                    type_name,
+                    parent_matches
+                        && condition_matches(fragment.node.type_condition.as_ref(), type_name),
+                    applicability,
+                ),
+            }
+        }
+    }
+
+    let mut applicability = Vec::new();
+    collect(
+        selection_set,
+        fragments,
+        type_name,
+        true,
+        &mut applicability,
+    );
+    applicability
+}
+
+fn entity_selection_fields<'ctx, 'a>(
+    ctx: &'ctx ResolverContext<'a>,
+    type_name: &str,
+) -> Vec<SelectionField<'ctx>> {
+    let applicability = entity_field_applicability(
+        &ctx.ctx.item.node.selection_set.node,
+        &ctx.ctx.query_env.fragments,
+        type_name,
+    );
+    let fields: Vec<_> = ctx.field().selection_set().collect();
+    debug_assert_eq!(fields.len(), applicability.len());
+    fields
+        .into_iter()
+        .zip(applicability)
+        .filter_map(|(field, applies)| applies.then_some(field))
+        .collect()
+}
+
+async fn resolve_entities<'a>(
+    ctx: &ResolverContext<'a>,
+    state: &EntityResolverState,
+) -> Result<Option<FieldValue<'a>>, async_graphql::Error> {
+    let representations = ctx.args.try_get("representations")?.list()?;
+    let mut grouped: HashMap<String, Vec<EntityRepresentation>> = HashMap::new();
+    let mut count = 0;
+    for (index, representation) in representations.iter().enumerate() {
+        count += 1;
+        let value = accessor_to_json(&representation);
+        let serde_json::Value::Object(values) = value else {
+            return Err(async_graphql::Error::new(
+                "entity representation must be an object",
+            ));
+        };
+        let type_name = values
+            .get("__typename")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| {
+                async_graphql::Error::new("entity representation is missing __typename")
+            })?
+            .to_string();
+        grouped
+            .entry(type_name.clone())
+            .or_default()
+            .push(EntityRepresentation {
+                index,
+                type_name,
+                values,
+            });
+    }
+
+    let mut resolved: Vec<Option<FieldValue<'a>>> =
+        std::iter::repeat_with(|| None).take(count).collect();
+    for (type_name, representations) in grouped {
+        let lookup = state.entities.get(&type_name).ok_or_else(|| {
+            async_graphql::Error::new(format!("unknown federation entity \"{}\"", type_name))
+        })?;
+        let rows = resolve_entity_group(ctx, lookup, &representations, state).await?;
+        for (ordinality, representation) in representations.into_iter().enumerate() {
+            resolved[representation.index] = Some(match &rows[ordinality] {
+                Some(row) => FieldValue::value(json_to_value(row.clone()))
+                    .with_type(representation.type_name),
+                None => FieldValue::NULL,
+            });
+        }
+    }
+
+    Ok(Some(FieldValue::list(resolved.into_iter().map(|value| {
+        value.expect("every representation was resolved or errored")
+    }))))
+}
+
+async fn resolve_entity_group(
+    ctx: &ResolverContext<'_>,
+    lookup: &EntityLookup,
+    representations: &[EntityRepresentation],
+    state: &EntityResolverState,
+) -> Result<Vec<Option<serde_json::Value>>, async_graphql::Error> {
+    if representations.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let pool = ctx.data::<PgPool>()?;
+    let gql_ctx = ctx.data::<GraphQLContext>()?;
+    let mut bound_values = Vec::new();
+    let mut value_rows = Vec::with_capacity(representations.len());
+    for (ordinality, representation) in representations.iter().enumerate() {
+        let normalized_values = normalized_entity_key_values(
+            &representation.values,
+            &lookup.key_columns,
+            &lookup.type_name,
+        )?;
+        let mut values = Vec::with_capacity(lookup.key_columns.len() + 1);
+        for (key_column, value) in lookup.key_columns.iter().zip(normalized_values) {
+            values.push(format!(
+                "${}::{}",
+                bound_values.len() + 1,
+                key_column.pg_type
+            ));
+            bound_values.push(value);
+        }
+        values.push(ordinality.to_string());
+        value_rows.push(format!("({})", values.join(", ")));
+    }
+
+    let representation_alias = "pgrst_entity_representation";
+    let ordinality_column = "pgrst_entity_ordinality";
+    let key_aliases: Vec<String> = (0..lookup.key_columns.len())
+        .map(|index| format!("pgrst_entity_key_{index}"))
+        .collect();
+    let mut representation_columns: Vec<String> = key_aliases
+        .iter()
+        .map(|column| postrust_sql::escape_ident(column))
+        .collect();
+    representation_columns.push(postrust_sql::escape_ident(ordinality_column));
+    let representations_sql = format!(
+        "(VALUES {}) AS {} ({})",
+        value_rows.join(", "),
+        postrust_sql::escape_ident(representation_alias),
+        representation_columns.join(", ")
+    );
+    let key_predicate = lookup
+        .key_columns
+        .iter()
+        .zip(&key_aliases)
+        .map(|(key_column, key_alias)| {
+            format!(
+                "{}.{} = {}.{}",
+                postrust_sql::escape_ident(READ_ROW),
+                postrust_sql::escape_ident(&key_column.column_name),
+                postrust_sql::escape_ident(representation_alias),
+                postrust_sql::escape_ident(key_alias)
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(" AND ");
+    let mut where_sql = format!(" WHERE ({key_predicate})");
+
+    let permission = permission_predicate(
+        &gql_ctx.caller(),
+        state.names.as_ref(),
+        &lookup.schema_name,
+        &lookup.table_name,
+    )?;
+    if let Some(predicate) = permission {
+        let guard = gql_ctx
+            .schema_cache
+            .get()
+            .await
+            .map_err(|e| async_graphql::Error::new(e.to_string()))?;
+        let cache = guard
+            .as_ref()
+            .ok_or_else(|| async_graphql::Error::new("schema cache is not loaded"))?;
+        let scope = WhereScope::table(
+            &lookup.schema_name,
+            &lookup.table_name,
+            &lookup.type_name,
+            state.names.as_ref(),
+        )
+        .under_alias(READ_ROW)
+        .with_resolution(cache, state.relationships.as_ref())
+        .for_caller(gql_ctx.caller());
+        let (filter_sql, filter_values) =
+            build_where_clause(Some(&predicate), bound_values.len() + 1, &scope)?;
+        if !filter_sql.is_empty() {
+            where_sql = format!(
+                "{} AND ({})",
+                where_sql,
+                filter_sql.trim_start_matches("WHERE ")
+            );
+            bound_values.extend(filter_values);
+        }
+    }
+
+    let source = format!(
+        "{}.{} AS {}",
+        postrust_sql::escape_ident(&lookup.schema_name),
+        postrust_sql::escape_ident(&lookup.table_name),
+        postrust_sql::escape_ident(READ_ROW)
+    );
+    let source_rows = format!(
+        "SELECT {}.* FROM {}{}",
+        postrust_sql::escape_ident(READ_ROW),
+        source,
+        where_sql
+    );
+    let mut projection = {
+        let guard = gql_ctx
+            .schema_cache
+            .get()
+            .await
+            .map_err(|e| async_graphql::Error::new(e.to_string()))?;
+        guard
+            .as_ref()
+            .and_then(|cache| {
+                cache.get_table(&postrust_core::api_request::QualifiedIdentifier::new(
+                    &lookup.schema_name,
+                    &lookup.table_name,
+                ))
+            })
+            .and_then(|table| rename_projection(table, "src", state.names.as_ref()))
+            .unwrap_or_else(|| "src.*".to_string())
+    };
+    let projected_rows = {
+        let guard = gql_ctx
+            .schema_cache
+            .get()
+            .await
+            .map_err(|e| async_graphql::Error::new(e.to_string()))?;
+        let cache = guard
+            .as_ref()
+            .ok_or_else(|| async_graphql::Error::new("schema cache is not loaded"))?;
+        let table = cache.get_table(&postrust_core::api_request::QualifiedIdentifier::new(
+            &lookup.schema_name,
+            &lookup.table_name,
+        ));
+        let selected_fields = entity_selection_fields(ctx, &lookup.type_name);
+        let mut param_idx = bound_values.len() + 1;
+        let computed = match table {
+            Some(table) => computed_projections(
+                table,
+                selected_fields.iter().copied(),
+                "src",
+                state.names.as_ref(),
+                cache,
+                &mut param_idx,
+                &mut bound_values,
+            )?,
+            None => Vec::new(),
+        };
+        let embeds = build_embed_expressions(
+            &gql_ctx.caller(),
+            cache,
+            state.relationships.as_ref(),
+            &lookup.type_name,
+            "src",
+            selected_fields,
+            state.max_rows,
+            &mut 0,
+            &mut param_idx,
+            &mut bound_values,
+            state.names.as_ref(),
+        )?;
+        for expression in &computed {
+            projection.push_str(", ");
+            projection.push_str(expression);
+        }
+        for (field_name, expression) in &embeds {
+            projection.push_str(", ");
+            projection.push_str(expression);
+            projection.push_str(" AS ");
+            projection.push_str(&postrust_sql::escape_ident(field_name));
+        }
+        format!("SELECT {} FROM ({}) AS src", projection, source_rows)
+    };
+    // PostgreSQL decides whether an entity key matches. Carry the input's
+    // ordinal through that same query instead of reconstructing a key from
+    // row JSON: PostgreSQL-equivalent spellings (UUID case, citext case and
+    // timestamptz offsets, for example) need to resolve to the row it found.
+    let sql = format!(
+        "SELECT json_build_array({}.{}, {}) FROM {} CROSS JOIN LATERAL ({}) AS t",
+        postrust_sql::escape_ident(representation_alias),
+        postrust_sql::escape_ident(ordinality_column),
+        row_json("t", &lookup.row_column_types),
+        representations_sql,
+        projected_rows,
+    );
+    let mut tx = begin_with_session(pool, gql_ctx.role(), &gql_ctx.session_settings()).await?;
+    let rows = execute_query_on(&mut tx, &sql, &bound_values).await?;
+    tx.commit().await?;
+
+    let mut by_ordinal = std::iter::repeat_with(|| None)
+        .take(representations.len())
+        .collect::<Vec<_>>();
+    for result in rows {
+        let serde_json::Value::Array(mut pair) = result else {
+            return Err(async_graphql::Error::new(
+                "entity query returned an invalid result",
+            ));
+        };
+        if pair.len() != 2 {
+            return Err(async_graphql::Error::new(
+                "entity query returned an invalid result",
+            ));
+        }
+        let row = pair.pop().expect("the result pair has two values");
+        let ordinality = pair
+            .pop()
+            .and_then(|value| value.as_u64())
+            .and_then(|value| usize::try_from(value).ok())
+            .filter(|value| *value < by_ordinal.len())
+            .ok_or_else(|| async_graphql::Error::new("entity query returned an invalid ordinal"))?;
+        by_ordinal[ordinality] = Some(row);
+    }
+    Ok(by_ordinal)
+}
+
+/// Validate an entity key and normalize explicit GraphQL `ID` overrides to
+/// their integer, text or UUID storage type. `_Any` deliberately skips the
+/// field-level checks ordinary GraphQL arguments receive.
+fn normalized_entity_key_values(
+    values: &serde_json::Map<String, serde_json::Value>,
+    key_columns: &[EntityKeyColumn],
+    type_name: &str,
+) -> Result<Vec<serde_json::Value>, async_graphql::Error> {
+    let mut key = Vec::with_capacity(key_columns.len());
+    for key_column in key_columns {
+        let value = values.get(&key_column.field_name).ok_or_else(|| {
+            async_graphql::Error::new(format!(
+                "entity representation for \"{}\" is missing key field \"{}\"",
+                type_name, key_column.field_name
+            ))
+        })?;
+        key.push(normalize_entity_key_value(type_name, key_column, value)?);
+    }
+    Ok(key)
+}
+
+fn normalize_entity_key_value(
+    type_name: &str,
+    key_column: &EntityKeyColumn,
+    value: &serde_json::Value,
+) -> Result<serde_json::Value, async_graphql::Error> {
+    let invalid = |expected: &str| {
+        async_graphql::Error::new(format!(
+            "entity representation for \"{}\" has invalid key field \"{}\": expected {}, found {}",
+            type_name,
+            key_column.field_name,
+            expected,
+            json_value_kind(value)
+        ))
+    };
+
+    if key_column.explicit_id {
+        return normalize_graphql_id(value, &key_column.pg_type).ok_or_else(|| {
+            invalid(&format!(
+                "an ID compatible with PostgreSQL type \"{}\"",
+                key_column.pg_type
+            ))
+        });
+    }
+
+    let pg_type = key_column.pg_type.trim().to_ascii_lowercase();
+    let normalized = if matches!(pg_type.as_str(), "int8" | "bigint") {
+        match value {
+            serde_json::Value::Number(number) => number.as_i64(),
+            serde_json::Value::String(text) => text.parse::<i64>().ok(),
+            _ => None,
+        }
+        .map(serde_json::Value::from)
+    } else if integer_bounds(&pg_type).is_some() {
+        value.as_i64().and_then(|integer| {
+            let (min, max) = integer_bounds(&pg_type)?;
+            (min..=max)
+                .contains(&integer)
+                .then(|| serde_json::Value::from(integer))
+        })
+    } else if matches!(
+        pg_type.as_str(),
+        "float4" | "float8" | "real" | "double precision"
+    ) {
+        value
+            .as_f64()
+            .and_then(serde_json::Number::from_f64)
+            .map(serde_json::Value::Number)
+    } else if matches!(pg_type.as_str(), "numeric" | "decimal") {
+        match value {
+            serde_json::Value::Number(number) => {
+                Some(serde_json::Value::String(number.to_string()))
+            }
+            serde_json::Value::String(text) if text.parse::<sqlx::types::BigDecimal>().is_ok() => {
+                Some(serde_json::Value::String(text.clone()))
+            }
+            _ => None,
+        }
+    } else if matches!(pg_type.as_str(), "bool" | "boolean") {
+        value.as_bool().map(serde_json::Value::Bool)
+    } else if matches!(pg_type.as_str(), "json" | "jsonb") {
+        Some(value.clone())
+    } else if is_array_type(&pg_type) {
+        value.is_array().then(|| value.clone())
+    } else {
+        value
+            .as_str()
+            .map(|text| serde_json::Value::String(text.to_string()))
+    };
+
+    normalized.ok_or_else(|| {
+        invalid(&format!(
+            "a value compatible with PostgreSQL type \"{}\"",
+            key_column.pg_type
+        ))
+    })
+}
+
+fn normalize_graphql_id(value: &serde_json::Value, pg_type: &str) -> Option<serde_json::Value> {
+    if integer_bounds(pg_type).is_some() {
+        let integer = match value {
+            serde_json::Value::Number(number) => number.as_i64(),
+            serde_json::Value::String(text) => text.parse::<i64>().ok(),
+            _ => None,
+        }?;
+        let (min, max) = integer_bounds(pg_type)?;
+        return (min..=max)
+            .contains(&integer)
+            .then(|| serde_json::Value::from(integer));
+    }
+    if pg_type.eq_ignore_ascii_case("uuid") {
+        return normalize_uuid(value).map(serde_json::Value::String);
+    }
+    if is_text_type(pg_type) {
+        return match value {
+            serde_json::Value::String(s) => Some(serde_json::Value::String(s.clone())),
+            serde_json::Value::Number(n) if n.is_i64() || n.is_u64() => {
+                Some(serde_json::Value::String(n.to_string()))
+            }
+            _ => None,
+        };
+    }
+    None
+}
+
+fn integer_bounds(pg_type: &str) -> Option<(i64, i64)> {
+    match pg_type.trim().to_ascii_lowercase().as_str() {
+        "int2" | "smallint" => Some((i16::MIN.into(), i16::MAX.into())),
+        "int4" | "int" | "integer" => Some((i32::MIN.into(), i32::MAX.into())),
+        "int8" | "bigint" => Some((i64::MIN, i64::MAX)),
+        _ => None,
+    }
+}
+
+fn is_text_type(pg_type: &str) -> bool {
+    matches!(
+        pg_type.trim().to_ascii_lowercase().as_str(),
+        "text" | "varchar" | "character varying" | "char" | "character" | "bpchar" | "citext"
+    )
+}
+
+fn normalize_uuid(value: &serde_json::Value) -> Option<String> {
+    sqlx::types::Uuid::parse_str(value.as_str()?)
+        .ok()
+        .map(|uuid| uuid.to_string())
+}
+
+fn json_value_kind(value: &serde_json::Value) -> &'static str {
+    match value {
+        serde_json::Value::Null => "null",
+        serde_json::Value::Bool(_) => "a boolean",
+        serde_json::Value::Number(_) => "a number",
+        serde_json::Value::String(_) => "a string",
+        serde_json::Value::Array(_) => "an array",
+        serde_json::Value::Object(_) => "an object",
+    }
+}
+
 /// Add the root fields for functions that answer with rows of a table.
 ///
 /// The same arguments a table's own root field takes, because the rows are the
@@ -2702,19 +3456,19 @@ fn add_function_fields(
             .argument(InputValue::new(
                 "where",
                 TypeRef::named(crate::input::bool_exp::bool_exp_type_name(
-                    &function.returns,
+                    &function.local_returns,
                 )),
             ))
             .argument(InputValue::new(
                 "order_by",
                 TypeRef::named_nn_list(crate::input::order_by::order_by_type_name(
-                    &function.returns,
+                    &function.local_returns,
                 )),
             ))
             .argument(InputValue::new(
                 "distinct_on",
                 TypeRef::named_nn_list(crate::input::order_by::select_column_type_name(
-                    &function.returns,
+                    &function.local_returns,
                 )),
             ))
             .argument(InputValue::new("limit", TypeRef::named("Int")))
@@ -2745,7 +3499,7 @@ fn add_function_fields(
         let mut aggregate = Field::new(
             format!("{}_aggregate", function.name),
             TypeRef::named_nn(crate::schema::aggregate::aggregate_type_name(
-                &function.returns,
+                &function.local_returns,
             )),
             move |ctx| {
                 let agg_spec = Arc::clone(&agg_spec);
@@ -2758,7 +3512,7 @@ fn add_function_fields(
                 TypeRef::named_nn(format!("{}_args", function.name)),
             ));
         }
-        aggregate = with_row_arguments(aggregate, &function.returns).description(format!(
+        aggregate = with_row_arguments(aggregate, &function.local_returns).description(format!(
             "fetch aggregated fields from the table: \"{}\"",
             function.returns_table.1
         ));
@@ -3162,7 +3916,7 @@ async fn aggregate_value(
             let computed = match table {
                 Some(table) => computed_projections(
                     table,
-                    nodes,
+                    nodes.selection_set(),
                     "src",
                     spec.names.as_ref(),
                     cache,
@@ -3177,7 +3931,7 @@ async fn aggregate_value(
                 spec.relationships.as_ref(),
                 &spec.type_name,
                 "src",
-                nodes,
+                nodes.selection_set(),
                 spec.max_rows,
                 &mut 0,
                 &mut param_idx,
@@ -3498,7 +4252,7 @@ async fn query_rows(
                         (
                             computed_projections(
                                 table,
-                                ctx.field(),
+                                ctx.field().selection_set(),
                                 "src",
                                 spec.names.as_ref(),
                                 cache,
@@ -3551,7 +4305,7 @@ async fn query_rows(
                     relationships,
                     type_name,
                     "src",
-                    ctx.field(),
+                    ctx.field().selection_set(),
                     max_rows,
                     &mut 0,
                     &mut param_idx,
@@ -5058,7 +5812,7 @@ async fn reread_returning(
         relationships,
         type_name,
         "src",
-        returning,
+        returning.selection_set(),
         max_rows,
         &mut alias_counter,
         &mut param_idx,
@@ -5067,7 +5821,7 @@ async fn reread_returning(
     )?;
     let computed = computed_projections(
         table,
-        returning,
+        returning.selection_set(),
         "src",
         names,
         cache,
@@ -5630,7 +6384,7 @@ async fn execute_delete(
             relationships,
             type_name,
             "src",
-            returning,
+            returning.selection_set(),
             max_rows,
             &mut alias_counter,
             &mut param_idx,
@@ -5640,7 +6394,7 @@ async fn execute_delete(
         let computed = match cache.get_table(&qi) {
             Some(table) => computed_projections(
                 table,
-                returning,
+                returning.selection_set(),
                 "src",
                 names,
                 cache,
@@ -6163,15 +6917,18 @@ impl<'a> WhereScope<'a> {
             if let Some(entry) = declared.iter().find(|entry| entry.name == name) {
                 // Reached by a mapping, which the catalogue has never heard
                 // of.
+                let target = entry
+                    .target(&table.schema)
+                    .map(|(_, target)| target)
+                    .unwrap_or_default();
                 if let Some(field) = crate::schema::mapped_relationship_field(
                     entry,
                     table,
                     resolution.cache,
                     &table.schema,
-                    &entry
-                        .target(&table.schema)
-                        .map(|(_, target)| target)
-                        .unwrap_or_default(),
+                    &target,
+                    &target,
+                    &target,
                 ) {
                     return Some(std::borrow::Cow::Owned(field));
                 }
@@ -7695,10 +8452,10 @@ async fn build_distinct_on(
 /// notation reads `upper_name(author.*)` and `author.upper_name` as the same
 /// call; the explicit form is written here because it says which function is
 /// being called.
-#[allow(clippy::too_many_arguments)] // the selection, its source, and the binding state
-fn computed_projections(
+#[allow(clippy::too_many_arguments)] // the fields, their source, and the binding state
+fn computed_projections<'a>(
     table: &postrust_core::schema_cache::Table,
-    selection: async_graphql::SelectionField<'_>,
+    fields: impl IntoIterator<Item = SelectionField<'a>>,
     row_reference: &str,
     names: &crate::names::NameOverrides,
     schema_cache: &SchemaCache,
@@ -7706,7 +8463,7 @@ fn computed_projections(
     values: &mut Vec<serde_json::Value>,
 ) -> Result<Vec<String>, async_graphql::Error> {
     let mut projections = Vec::new();
-    for field in selection.selection_set() {
+    for field in fields {
         let name = field.name();
         // A real column wins, and the projection already carries it -- under
         // this name, whether or not that is the column's own.
@@ -7982,7 +8739,7 @@ fn nested_aggregate_select(
                     relationships,
                     target_type,
                     child_alias,
-                    child,
+                    child.selection_set(),
                     max_rows,
                     alias_counter,
                     param_idx,
@@ -8431,13 +9188,13 @@ fn embed_narrowing(
 }
 
 #[allow(clippy::too_many_arguments)] // one parameter per SQL clause, plus the binding state
-fn build_embed_expressions(
+fn build_embed_expressions<'a>(
     caller: &crate::role::Caller<'_>,
     schema_cache: &SchemaCache,
     relationships: &HashMap<String, Vec<RelationshipField>>,
     type_name: &str,
     parent_alias: &str,
-    selection: async_graphql::SelectionField<'_>,
+    fields: impl IntoIterator<Item = SelectionField<'a>>,
     max_rows: Option<i64>,
     alias_counter: &mut usize,
     param_idx: &mut usize,
@@ -8450,7 +9207,7 @@ fn build_embed_expressions(
 
     let mut expressions = Vec::new();
 
-    for field in selection.selection_set() {
+    for field in fields {
         // `<relationship>_aggregate` is the same embed with an aggregate
         // select list, so it is resolved here rather than by a resolver of its
         // own -- the correlation is what makes it a per-parent answer.
@@ -8551,7 +9308,7 @@ fn build_embed_expressions(
             relationships,
             &rel.target_type,
             &child_alias,
-            field,
+            field.selection_set(),
             max_rows,
             alias_counter,
             param_idx,
@@ -8894,6 +9651,23 @@ fn pk_argument_type(pg_type: &str) -> String {
     }
 }
 
+/// The public GraphQL type of a primary-key argument.
+///
+/// SQL execution still carries the PostgreSQL type beside the key and uses it
+/// for casts and binding. This is only the schema-facing type.
+fn exposed_pk_argument_type(
+    names: &crate::names::NameOverrides,
+    schema: &str,
+    table: &str,
+    column: &str,
+    pg_type: &str,
+) -> String {
+    names
+        .column_type(schema, table, column)
+        .map(|given| given.to_string())
+        .unwrap_or_else(|| pk_argument_type(pg_type))
+}
+
 /// Convert a GraphQL type string to a TypeRef.
 fn graphql_type_ref(type_str: &str) -> TypeRef {
     // Parse type string like "[Users!]!" or "String" or "Int!"
@@ -9081,8 +9855,118 @@ fn json_to_value(json: serde_json::Value) -> Value {
 mod tests {
     use super::*;
     use indexmap::IndexMap;
-    use postrust_core::schema_cache::{Column, Table};
+    use postrust_core::schema_cache::{Cardinality, Column, Relationship, Table};
+    use postrust_core::QualifiedIdentifier;
     use std::collections::{HashMap, HashSet};
+
+    fn entity_key_column(pg_type: &str, explicit_id: bool) -> EntityKeyColumn {
+        EntityKeyColumn {
+            field_name: "id".to_string(),
+            column_name: "id".to_string(),
+            pg_type: pg_type.to_string(),
+            explicit_id,
+        }
+    }
+
+    #[test]
+    fn federation_integer_keys_reject_strings() {
+        let column = entity_key_column("int4", false);
+
+        assert_eq!(
+            normalize_entity_key_value("users", &column, &serde_json::json!(2)).unwrap(),
+            serde_json::json!(2)
+        );
+        let error = normalize_entity_key_value("users", &column, &serde_json::json!("2"))
+            .expect_err("a GraphQL Int cannot be a string");
+        assert_eq!(
+            error.message,
+            "entity representation for \"users\" has invalid key field \"id\": expected a value compatible with PostgreSQL type \"int4\", found a string"
+        );
+    }
+
+    #[test]
+    fn federation_bigint_keys_accept_exact_decimal_strings() {
+        let column = entity_key_column("int8", false);
+
+        assert_eq!(
+            normalize_entity_key_value("users", &column, &serde_json::json!(7)).unwrap(),
+            serde_json::json!(7)
+        );
+        assert_eq!(
+            normalize_entity_key_value("users", &column, &serde_json::json!("9007199254740993"))
+                .unwrap(),
+            serde_json::json!(9_007_199_254_740_993_i64)
+        );
+        assert!(normalize_entity_key_value(
+            "users",
+            &column,
+            &serde_json::json!("9223372036854775808")
+        )
+        .is_err());
+        assert!(normalize_entity_key_value("users", &column, &serde_json::json!("7.5")).is_err());
+    }
+
+    #[test]
+    fn federation_numeric_keys_accept_exact_decimal_strings() {
+        let column = entity_key_column("numeric", false);
+
+        assert_eq!(
+            normalize_entity_key_value("users", &column, &serde_json::json!(7.5)).unwrap(),
+            serde_json::json!("7.5")
+        );
+        assert_eq!(
+            normalize_entity_key_value(
+                "users",
+                &column,
+                &serde_json::json!("9007199254740993.123456789")
+            )
+            .unwrap(),
+            serde_json::json!("9007199254740993.123456789")
+        );
+        assert!(
+            normalize_entity_key_value("users", &column, &serde_json::json!("not-a-number"))
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn federation_integer_backed_ids_have_one_normal_form() {
+        let column = entity_key_column("int4", true);
+
+        let number = normalize_entity_key_value("users", &column, &serde_json::json!(2)).unwrap();
+        let string = normalize_entity_key_value("users", &column, &serde_json::json!("2")).unwrap();
+        assert_eq!(number, serde_json::json!(2));
+        assert_eq!(string, number);
+        assert!(normalize_entity_key_value("users", &column, &serde_json::json!("two")).is_err());
+    }
+
+    #[test]
+    fn federation_text_backed_ids_normalize_integer_input_to_text() {
+        let column = entity_key_column("text", true);
+
+        let number = normalize_entity_key_value("users", &column, &serde_json::json!(2)).unwrap();
+        let string = normalize_entity_key_value("users", &column, &serde_json::json!("2")).unwrap();
+        assert_eq!(number, serde_json::json!("2"));
+        assert_eq!(string, number);
+    }
+
+    #[test]
+    fn federation_uuid_backed_ids_are_validated_and_canonicalized() {
+        let column = entity_key_column("uuid", true);
+
+        assert_eq!(
+            normalize_entity_key_value(
+                "users",
+                &column,
+                &serde_json::json!("550E8400-E29B-41D4-A716-446655440000")
+            )
+            .unwrap(),
+            serde_json::json!("550e8400-e29b-41d4-a716-446655440000")
+        );
+        assert!(
+            normalize_entity_key_value("users", &column, &serde_json::json!("not-a-uuid")).is_err()
+        );
+    }
 
     fn create_test_table(name: &str) -> Table {
         let mut columns = IndexMap::new();
@@ -9151,6 +10035,30 @@ mod tests {
             pg_version: 150000,
             representations: Default::default(),
         }
+    }
+
+    fn add_test_table(cache: &mut SchemaCache, name: &str) {
+        let table = create_test_table(name);
+        cache.tables.insert(table.qualified_identifier(), table);
+    }
+
+    fn add_test_posts_relationship(cache: &mut SchemaCache) {
+        let users = QualifiedIdentifier::new("public", "users");
+        cache.relationships.insert(
+            (users.clone(), "public".into()),
+            vec![Relationship::ForeignKey {
+                table: users,
+                foreign_table: QualifiedIdentifier::new("public", "posts"),
+                is_self: false,
+                cardinality: Cardinality::O2M {
+                    constraint: "posts_user_id_fkey".into(),
+                    columns: vec![("id".into(), "user_id".into())],
+                },
+                table_is_view: false,
+                foreign_table_is_view: false,
+                constraint_name: "posts_user_id_fkey".into(),
+            }],
+        );
     }
 
     // ============================================================================
@@ -9282,6 +10190,418 @@ mod tests {
             eprintln!("Schema build error: {:?}", e);
         }
         assert!(result.is_ok(), "Schema build failed: {:?}", result.err());
+    }
+
+    #[test]
+    fn a_column_type_override_reaches_fields_and_key_arguments() {
+        let cache = create_test_schema_cache();
+        let names = crate::names::NameOverrides::parse(
+            r#"{"tables": {"public.users": {"column_types": {"id": "ID"}}}}"#,
+        )
+        .unwrap();
+        let config = SchemaConfig {
+            names: names.clone(),
+            ..SchemaConfig::default()
+        };
+        let generated = build_schema(&cache, &config);
+        let schema = build_dynamic_schema(
+            &generated,
+            &cache,
+            None,
+            None,
+            Arc::new(names),
+            std::time::Duration::from_secs(30),
+            None,
+        )
+        .expect("schema with an ID override should build");
+        let sdl = schema.sdl();
+
+        let input_body = |name: &str| {
+            sdl.split_once(&format!("input {name} {{"))
+                .and_then(|(_, rest)| rest.split_once('}'))
+                .map(|(body, _)| body.to_string())
+                .unwrap_or_else(|| panic!("missing input {name}:\n{sdl}"))
+        };
+
+        assert!(sdl.contains("id: ID!"), "object and input fields:\n{sdl}");
+        assert!(
+            sdl.contains("users_by_pk(id: ID!): users"),
+            "query key argument:\n{sdl}"
+        );
+        assert!(
+            sdl.contains("delete_users_by_pk(id: ID!): users"),
+            "delete key argument:\n{sdl}"
+        );
+        assert!(
+            input_body("users_pk_columns_input").contains("id: ID!"),
+            "update key input:\n{sdl}"
+        );
+        assert!(
+            input_body("users_bool_exp").contains("id: ID_comparison_exp"),
+            "comparison input:\n{sdl}"
+        );
+        assert!(
+            input_body("users_insert_input").contains("id: ID"),
+            "write input:\n{sdl}"
+        );
+    }
+
+    #[test]
+    fn a_type_prefix_names_the_complete_dynamic_schema() {
+        let cache = create_test_schema_cache();
+        let config = SchemaConfig {
+            type_prefix: Some("test".into()),
+            ..SchemaConfig::default()
+        };
+        let generated = build_schema(&cache, &config);
+        let schema = build_dynamic_schema(
+            &generated,
+            &cache,
+            None,
+            None,
+            Arc::new(Default::default()),
+            std::time::Duration::from_secs(30),
+            None,
+        )
+        .expect("a prefixed schema should build");
+        let sdl = schema.sdl();
+
+        assert!(sdl.contains("type test_users "), "object type:\n{sdl}");
+        assert!(sdl.contains("test_users("), "query root:\n{sdl}");
+        assert!(sdl.contains("test_users_by_pk("), "by-PK root:\n{sdl}");
+        assert!(sdl.contains("test_users_bool_exp"), "derived input:\n{sdl}");
+        assert!(
+            sdl.contains("test_users_aggregate"),
+            "aggregate type:\n{sdl}"
+        );
+        assert!(sdl.contains("test_insert_users("), "mutation root:\n{sdl}");
+    }
+
+    #[test]
+    fn federation_is_absent_by_default() {
+        let cache = create_test_schema_cache();
+        let generated = build_schema(&cache, &SchemaConfig::default());
+        let schema = build_dynamic_schema(
+            &generated,
+            &cache,
+            None,
+            None,
+            Arc::new(Default::default()),
+            std::time::Duration::from_secs(30),
+            None,
+        )
+        .expect("a non-federated schema should build");
+        let sdl = schema.sdl();
+
+        assert!(!sdl.contains("_Service"), "service type:\n{sdl}");
+        assert!(!sdl.contains("_service"), "service field:\n{sdl}");
+        assert!(!sdl.contains("@key"), "federation key:\n{sdl}");
+    }
+
+    #[test]
+    fn federation_entity_selections_respect_fragment_type_conditions() {
+        let document = async_graphql::parser::parse_query(
+            r#"
+            query {
+              _entities(representations: []) {
+                __typename
+                ... on authors { id items { title } }
+                ...ShopFields
+                ... { common }
+                ...EntityName
+              }
+            }
+            fragment ShopFields on shops { id items { sku } }
+            fragment EntityName on _Entity { __typename }
+            "#,
+        )
+        .expect("query parses");
+        let (_, operation) = document.operations.iter().next().expect("one operation");
+        let entity = operation
+            .node
+            .selection_set
+            .node
+            .items
+            .iter()
+            .find_map(|selection| match &selection.node {
+                Selection::Field(field) if field.node.name.node == "_entities" => Some(&field.node),
+                _ => None,
+            })
+            .expect("_entities field");
+
+        assert_eq!(
+            entity_field_applicability(&entity.selection_set.node, &document.fragments, "authors"),
+            vec![true, true, true, false, false, true, true]
+        );
+        assert_eq!(
+            entity_field_applicability(&entity.selection_set.node, &document.fragments, "shops"),
+            vec![true, false, false, true, true, true, true]
+        );
+    }
+
+    #[tokio::test]
+    async fn federation_entity_lists_allow_null_members() {
+        let entity =
+            Object::new("widgets").field(Field::new("id", TypeRef::named_nn(TypeRef::INT), |_| {
+                FieldFuture::new(async { Ok(Some(Value::from(2))) })
+            }));
+        let union = Union::new("_Entity").possible_type("widgets");
+        let query = Object::new("Query").field(Field::new(
+            "_entities",
+            TypeRef::named_list_nn("_Entity"),
+            |_| {
+                FieldFuture::new(async {
+                    Ok(Some(FieldValue::list([
+                        FieldValue::NULL,
+                        FieldValue::NULL.with_type("widgets"),
+                    ])))
+                })
+            },
+        ));
+        let schema = Schema::build("Query", None, None)
+            .extension(NullableFederationEntity)
+            .register(entity)
+            .register(union)
+            .register(query)
+            .finish()
+            .expect("schema builds");
+
+        let response = schema
+            .execute("{ _entities { ... on widgets { id } } }")
+            .await;
+
+        assert!(response.errors.is_empty(), "{:?}", response.errors);
+        assert_eq!(
+            response.data,
+            async_graphql::value!({ "_entities": [null, { "id": 2 }] })
+        );
+    }
+
+    #[test]
+    fn federation_metadata_is_byte_for_byte_inert_when_disabled() {
+        let cache = create_test_schema_cache();
+        let sdl_for = |config: SchemaConfig| {
+            let generated = build_schema(&cache, &config);
+            build_dynamic_schema(
+                &generated,
+                &cache,
+                None,
+                None,
+                Arc::new(config.names.clone()),
+                std::time::Duration::from_secs(30),
+                None,
+            )
+            .expect("schema should build")
+            .sdl()
+        };
+
+        let baseline = sdl_for(SchemaConfig {
+            type_prefix: Some("test".into()),
+            ..SchemaConfig::default()
+        });
+        let with_disabled_federation_metadata = sdl_for(SchemaConfig {
+            enable_federation: false,
+            type_prefix: Some("test".into()),
+            names: crate::names::NameOverrides::parse(
+                r#"{"tables": {"public.users": {"federation": {"shared": true}}}}"#,
+            )
+            .expect("metadata"),
+            ..SchemaConfig::default()
+        });
+
+        assert_eq!(with_disabled_federation_metadata, baseline);
+        assert!(
+            with_disabled_federation_metadata.contains("type test_users "),
+            "prefixed object type remains when federation is disabled:\n{with_disabled_federation_metadata}"
+        );
+        assert!(
+            !with_disabled_federation_metadata.contains("_Service"),
+            "service type:\n{with_disabled_federation_metadata}"
+        );
+        assert!(
+            !with_disabled_federation_metadata.contains("@key"),
+            "federation key:\n{with_disabled_federation_metadata}"
+        );
+    }
+
+    #[test]
+    fn shared_entities_make_relationship_fields_shareable() {
+        let federation_sdl = |shared: bool| {
+            let mut cache = create_test_schema_cache();
+            add_test_table(&mut cache, "posts");
+            add_test_posts_relationship(&mut cache);
+            let names = match shared {
+                true => crate::names::NameOverrides::parse(
+                    r#"{"tables": {"public.users": {"federation": {"shared": true}}}}"#,
+                )
+                .expect("metadata"),
+                false => crate::names::NameOverrides::default(),
+            };
+            let config = SchemaConfig {
+                enable_federation: true,
+                type_prefix: Some("test".into()),
+                names: names.clone(),
+                ..SchemaConfig::default()
+            };
+            let generated = build_schema(&cache, &config);
+            build_dynamic_schema(
+                &generated,
+                &cache,
+                None,
+                None,
+                Arc::new(names),
+                std::time::Duration::from_secs(30),
+                None,
+            )
+            .expect("federated schema should build")
+            .sdl_with_options(async_graphql::SDLExportOptions::new().federation())
+        };
+
+        let shared = federation_sdl(true);
+        assert!(
+            shared.contains("): [test_posts!]! @shareable"),
+            "shared relationship field:\n{shared}"
+        );
+        assert!(
+            shared.contains("): test_posts_aggregate! @shareable"),
+            "shared relationship aggregate field:\n{shared}"
+        );
+
+        let not_shared = federation_sdl(false);
+        assert!(
+            not_shared.contains("): [test_posts!]!"),
+            "non-shared relationship field:\n{not_shared}"
+        );
+        assert!(
+            !not_shared.contains("): [test_posts!]! @shareable"),
+            "non-shared relationship field must not be shareable:\n{not_shared}"
+        );
+        assert!(
+            not_shared.contains("): test_posts_aggregate!"),
+            "non-shared relationship aggregate field:\n{not_shared}"
+        );
+        assert!(
+            !not_shared.contains("): test_posts_aggregate! @shareable"),
+            "non-shared relationship aggregate must not be shareable:\n{not_shared}"
+        );
+    }
+
+    #[tokio::test]
+    async fn federation_exposes_service_sdl_and_entity_keys() {
+        let mut cache = create_test_schema_cache();
+        add_test_table(&mut cache, "posts");
+        let config = SchemaConfig {
+            enable_federation: true,
+            type_prefix: Some("test".into()),
+            names: crate::names::NameOverrides::parse(
+                r#"{"tables": {"public.users": {"federation": {"shared": true}}}}"#,
+            )
+            .expect("metadata"),
+            ..SchemaConfig::default()
+        };
+        let generated = build_schema(&cache, &config);
+        let schema = build_dynamic_schema(
+            &generated,
+            &cache,
+            None,
+            None,
+            Arc::new(Default::default()),
+            std::time::Duration::from_secs(30),
+            None,
+        )
+        .expect("a federated schema should build");
+        let sdl = schema.sdl();
+        let federation_sdl =
+            schema.sdl_with_options(async_graphql::SDLExportOptions::new().federation());
+
+        assert!(sdl.contains("_Service"), "service type:\n{sdl}");
+        assert!(sdl.contains("_service"), "service field:\n{sdl}");
+        assert!(
+            federation_sdl.contains("type users @key(fields: \"id\")"),
+            "users key:\n{federation_sdl}"
+        );
+        assert!(
+            federation_sdl.contains("@shareable"),
+            "shared field directive:\n{federation_sdl}"
+        );
+        assert!(sdl.contains("type users "), "shared object type:\n{sdl}");
+        assert!(
+            !sdl.contains("type test_users "),
+            "prefixed shared object type:\n{sdl}"
+        );
+        assert!(sdl.contains("test_users("), "query root:\n{sdl}");
+        assert!(sdl.contains("test_users_by_pk("), "by-PK root:\n{sdl}");
+        assert!(sdl.contains("test_users_bool_exp"), "derived input:\n{sdl}");
+        assert!(
+            !sdl.contains("input users_bool_exp "),
+            "unprefixed derived input:\n{sdl}"
+        );
+        assert!(
+            sdl.contains("test_users_aggregate"),
+            "aggregate type:\n{sdl}"
+        );
+        assert!(
+            !sdl.contains("type users_aggregate "),
+            "unprefixed aggregate type:\n{sdl}"
+        );
+        assert!(
+            sdl.contains("test_users_mutation_response"),
+            "mutation response type:\n{sdl}"
+        );
+        assert!(
+            !sdl.contains("type users_mutation_response "),
+            "unprefixed mutation response type:\n{sdl}"
+        );
+        assert!(
+            sdl.contains("type test_posts {"),
+            "non-shared object type remains prefixed:\n{sdl}"
+        );
+        assert!(
+            !sdl.contains("type posts {"),
+            "non-shared object type must not become unprefixed:\n{sdl}"
+        );
+        assert!(sdl.contains("test_posts("), "prefixed posts root:\n{sdl}");
+        assert!(
+            sdl.contains("test_posts_bool_exp"),
+            "prefixed posts bool_exp:\n{sdl}"
+        );
+
+        let response = schema.execute("{ _service { sdl } }").await;
+        assert!(
+            response.errors.is_empty(),
+            "service query errors: {:?}",
+            response.errors
+        );
+        let service = response.data.into_json().expect("service response JSON");
+        let service_sdl = service
+            .get("_service")
+            .and_then(|value| value.get("sdl"))
+            .and_then(serde_json::Value::as_str)
+            .expect("service SDL string");
+        assert!(
+            service_sdl.contains("type Query"),
+            "federation root type:\n{service_sdl}"
+        );
+        assert!(
+            service_sdl.contains("test_users("),
+            "query fields are on the federation root:\n{service_sdl}"
+        );
+        assert!(
+            service_sdl.contains("test_posts("),
+            "non-shared query fields are on the federation root:\n{service_sdl}"
+        );
+        assert!(
+            !service_sdl.contains("type query_root"),
+            "Apollo composition treats query_root as an ordinary object without a schema definition:\n{service_sdl}"
+        );
+        assert!(
+            service_sdl.contains("type users @key(fields: \"id\")"),
+            "{service_sdl}"
+        );
+        assert!(
+            service_sdl.contains("type test_posts @key(fields: \"id\")"),
+            "{service_sdl}"
+        );
     }
 
     /// `_exists` becomes a subselect over the table it names, correlated with
@@ -9702,7 +11022,7 @@ mod tests {
     fn test_create_object_type() {
         let table = create_test_table("users");
         let obj = TableObjectType::from_table(&table);
-        let _gql_obj = create_object_type(&obj, &[]);
+        let _gql_obj = create_object_type(&obj, &[], None);
     }
 
     #[test]
@@ -9713,6 +11033,7 @@ mod tests {
 
         let _query = create_query_type(
             &generated,
+            "query_root",
             None,
             Arc::new(HashMap::new()),
             Arc::new(Default::default()),
@@ -9727,6 +11048,7 @@ mod tests {
 
         let _mutation = create_mutation_type(
             &generated,
+            "mutation_root",
             Arc::new(HashMap::new()),
             Arc::new(HashMap::new()),
             Arc::new(Default::default()),
@@ -9880,6 +11202,7 @@ mod tests {
         // query root, which is the whole contract.
         let _subscription = create_subscription_type(
             &generated,
+            "subscription_root",
             None,
             Arc::new(Default::default()),
             Arc::new(Default::default()),

@@ -61,6 +61,7 @@ use std::collections::HashMap;
 
 /// The names given to one table.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+#[non_exhaustive]
 pub struct TableNames {
     /// The base name for this table's root fields and types.
     ///
@@ -131,6 +132,15 @@ pub struct TableNames {
     #[serde(default)]
     pub columns: HashMap<String, String>,
 
+    /// GraphQL scalar overrides for columns, keyed by the database column.
+    ///
+    /// PostgreSQL has no `ID` type: identifiers are commonly stored as text,
+    /// integers or UUIDs. This lets the public GraphQL contract mark a column
+    /// as an opaque identifier without changing the type used to read, bind or
+    /// cast that column in PostgreSQL.
+    #[serde(default)]
+    pub column_types: HashMap<String, ColumnTypeOverride>,
+
     /// Whether this table is a set of allowed values rather than a set of
     /// rows.
     ///
@@ -146,6 +156,10 @@ pub struct TableNames {
     #[serde(default, rename = "enum")]
     pub is_enum: bool,
 
+    /// Apollo Federation settings for this table.
+    #[serde(default)]
+    pub federation: FederationConfig,
+
     /// What each role may do with this table, keyed by role.
     ///
     /// A role absent from this map has no permission on the table at all,
@@ -160,6 +174,37 @@ pub struct TableNames {
     /// second layer above them.
     #[serde(default)]
     pub permissions: HashMap<String, RolePermissions>,
+}
+
+/// Apollo Federation settings for one table.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+#[non_exhaustive]
+pub struct FederationConfig {
+    /// Whether this table keeps its unprefixed entity identity across subgraphs.
+    #[serde(default)]
+    pub shared: bool,
+}
+
+/// A GraphQL scalar a database column may be exposed as.
+///
+/// Only `ID` is supported for now. Unlike the other built-in scalars, `ID`
+/// has no PostgreSQL type from which it can be inferred, and strings returned
+/// by PostgreSQL are already valid `ID` values.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum ColumnTypeOverride {
+    /// GraphQL's opaque identifier scalar.
+    #[serde(rename = "ID")]
+    Id,
+}
+
+impl ColumnTypeOverride {
+    /// The schema type represented by this override.
+    pub fn graphql_type(self) -> crate::types::GraphQLType {
+        match self {
+            Self::Id => crate::types::GraphQLType::Id,
+        }
+    }
 }
 
 impl RolePermissions {
@@ -179,6 +224,7 @@ impl RolePermissions {
 /// means the table cannot be read by this role, not that it can be read
 /// without restriction.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+#[non_exhaustive]
 pub struct RolePermissions {
     /// Which rows the role may read. Absent means it may read none.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -196,6 +242,7 @@ pub struct RolePermissions {
 
 /// Which rows a role may read, and which of their columns.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+#[non_exhaustive]
 pub struct SelectPermission {
     /// The columns this role can see. Every other column of the table is not
     /// merely unreadable but absent from the type, which is what makes a
@@ -234,6 +281,7 @@ pub struct SelectPermission {
 
 /// What a role may write, and what the result has to satisfy.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+#[non_exhaustive]
 pub struct InsertPermission {
     /// The columns a request may supply.
     #[serde(default)]
@@ -261,6 +309,7 @@ pub struct InsertPermission {
 /// Which rows a role may change, which columns of them, and what the result
 /// has to satisfy.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+#[non_exhaustive]
 pub struct UpdatePermission {
     /// The columns the role may write.
     #[serde(default)]
@@ -284,6 +333,7 @@ pub struct UpdatePermission {
 
 /// Which rows a role may delete.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+#[non_exhaustive]
 pub struct DeletePermission {
     /// Which rows may be deleted. Null means every row the role can see.
     #[serde(default, skip_serializing_if = "serde_json::Value::is_null")]
@@ -356,6 +406,7 @@ impl<'de> Deserialize<'de> for ColumnSet {
 /// Every value is a description as written: an empty string means the field
 /// has none, which is a different answer from having said nothing.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+#[non_exhaustive]
 pub struct Comments {
     /// The description of the table's own type.
     #[serde(default)]
@@ -373,6 +424,7 @@ pub struct Comments {
 
 /// Every name given, keyed by `schema.table`.
 #[derive(Debug, Clone, Default, PartialEq)]
+#[non_exhaustive]
 pub struct NameOverrides {
     tables: HashMap<String, TableNames>,
     functions: HashMap<String, FunctionNames>,
@@ -401,6 +453,7 @@ struct Sections {
 /// the column, the same spellings [`TableNames::relationships`] accepts -- or
 /// by a column mapping, which is a join no key describes.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+#[non_exhaustive]
 pub struct DeclaredRelationship {
     /// The field name this relationship is exposed under.
     pub name: String,
@@ -451,6 +504,7 @@ impl DeclaredRelationship {
 
 /// What metadata says about one function, beyond what the catalogue knows.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+#[non_exhaustive]
 pub struct FunctionNames {
     /// The root this function is exposed on: `query` or `mutation`.
     #[serde(default)]
@@ -679,6 +733,13 @@ impl NameOverrides {
             .unwrap_or(false)
     }
 
+    /// Whether metadata marks this table as a shared Apollo Federation entity.
+    pub fn federation_shared(&self, schema: &str, table: &str) -> bool {
+        self.table(schema, table)
+            .map(|t| t.federation.shared)
+            .unwrap_or(false)
+    }
+
     /// Every table marked as one, as `(schema, table)`.
     pub fn enum_tables(&self) -> Vec<(String, String)> {
         self.tables
@@ -729,6 +790,20 @@ impl NameOverrides {
             .columns
             .get(column)
             .map(String::as_str)
+    }
+
+    /// The GraphQL scalar a column is exposed as, if metadata overrides it.
+    pub fn column_type(
+        &self,
+        schema: &str,
+        table: &str,
+        column: &str,
+    ) -> Option<crate::types::GraphQLType> {
+        self.table(schema, table)?
+            .column_types
+            .get(column)
+            .copied()
+            .map(ColumnTypeOverride::graphql_type)
     }
 
     /// The column behind a field name, if that name is a rename.
@@ -899,6 +974,41 @@ mod tests {
             names.enum_tables(),
             vec![("public".to_string(), "colors".to_string())]
         );
+    }
+
+    #[test]
+    fn a_table_can_be_marked_as_a_shared_federation_entity() {
+        let names = NameOverrides::parse(
+            r#"{"tables": {"public.users": {"federation": {"shared": true}}}}"#,
+        )
+        .unwrap();
+
+        assert!(names.federation_shared("public", "users"));
+        assert!(!names.federation_shared("public", "posts"));
+    }
+
+    #[test]
+    fn a_column_can_be_exposed_as_an_id() {
+        let names = NameOverrides::parse(
+            r#"{"tables": {"public.users": {"column_types": {"email": "ID"}}}}"#,
+        )
+        .unwrap();
+
+        assert_eq!(
+            names.column_type("public", "users", "email"),
+            Some(crate::types::GraphQLType::Id)
+        );
+        assert_eq!(names.column_type("public", "users", "name"), None);
+    }
+
+    #[test]
+    fn an_unknown_column_type_override_is_rejected() {
+        let error = NameOverrides::parse(
+            r#"{"tables": {"public.users": {"column_types": {"email": "String"}}}}"#,
+        )
+        .expect_err("only supported overrides parse");
+
+        assert!(error.contains("unknown variant `String`"), "{error}");
     }
 
     /// A declaration is the whole list, and it may describe a join.

@@ -500,11 +500,12 @@ For a table `author`, with a to-many relationship `articles`:
 | `delete_author(where:)` | `affected_rows` and `returning { … }` |
 | `delete_author_by_pk(id: 1)` | the row removed |
 
-The root types are named `query_root`, `mutation_root` and `subscription_root`.
-The subscription root mirrors the query root — `author`, `author_by_pk` and
-`author_aggregate`, with the same arguments — and each of its fields is a live
-query: the answer now, and the answer again whenever it changes. See
-[Realtime](./realtime.md).
+The root types are named `query_root`, `mutation_root` and `subscription_root`
+unless Apollo Federation is enabled, where the root types are `Query`,
+`Mutation` and `Subscription`. The subscription root mirrors the query root —
+`author`, `author_by_pk` and `author_aggregate`, with the same arguments — and
+each of its fields is a live query: the answer now, and the answer again
+whenever it changes. See [Realtime](./realtime.md).
 
 ### Queries
 
@@ -914,6 +915,20 @@ and a client that declares one is naming this.
 | a type this server knows nothing about | a scalar of that name |
 | `_type` (arrays) | `[InnerType]` |
 
+PostgreSQL has no `ID` type. A text-, integer- or UUID-backed identifier can
+be exposed as GraphQL `ID` without changing its database type by adding a
+`column_types` entry to `PGRST_GRAPHQL_METADATA`:
+
+```json
+{
+  "tables": {
+    "public.author": {
+      "column_types": { "id": "ID" }
+    }
+  }
+}
+```
+
 A table marked as an enumeration in `PGRST_GRAPHQL_NAMES` becomes a GraphQL
 enum built from its rows, and every column with a foreign key to it is typed as
 that enum.
@@ -951,6 +966,11 @@ query {
   }
 }
 ```
+
+With `PGRST_GRAPHQL_FEDERATION=true`, the service also exposes Apollo
+Federation's `_service { sdl }` and `_entities(representations:)` fields. The
+SDL returned from `_service` is the subgraph SDL used by an Apollo router or
+gateway.
 
 ### GraphQL vs REST Comparison
 

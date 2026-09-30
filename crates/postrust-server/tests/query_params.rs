@@ -59,14 +59,14 @@ async fn build_app_with(max_rows: Option<i64>, max_body_size: Option<usize>) -> 
         .await
         .expect("failed to connect to test database");
 
-    let config = AppConfig {
-        db_uri,
-        db_schemas: vec!["public".to_string()],
-        db_anon_role: Some(ANON_ROLE.to_string()),
-        db_max_rows: max_rows,
-        max_body_size: max_body_size.unwrap_or(AppConfig::default().max_body_size),
-        ..AppConfig::default()
-    };
+    let mut config = AppConfig::default();
+    config.db_uri = db_uri;
+    config.db_schemas = vec!["public".to_string()];
+    config.db_anon_role = Some(ANON_ROLE.to_string());
+    config.db_max_rows = max_rows;
+    if let Some(max_body_size) = max_body_size {
+        config.max_body_size = max_body_size;
+    }
 
     let schema_cache = SchemaCache::load(&pool, &config.db_schemas)
         .await

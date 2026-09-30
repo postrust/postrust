@@ -1,0 +1,77 @@
+{
+  "tables": {
+    "public.products": {
+      "name": "Product",
+      "column_types": {
+        "id": "ID"
+      },
+      "roots": {
+        "select_by_pk": "product"
+      },
+      "relationships": {
+        "products_variation_id_fkey": "variation",
+        "products_dimension_id_fkey": "dimensions",
+        "products_created_by_email_fkey": "createdBy",
+        "product_research_links": "research"
+      }
+    },
+    "public.deprecated_products": {
+      "name": "DeprecatedProduct",
+      "roots": {
+        "select_by_pk": "deprecatedProduct"
+      },
+      "relationships": {
+        "deprecated_products_created_by_email_fkey": "createdBy"
+      }
+    },
+    "public.product_variations": {
+      "name": "ProductVariation",
+      "column_types": {
+        "id": "ID"
+      }
+    },
+    "public.product_dimensions": {
+      "name": "ProductDimension",
+      "federation": {
+        "shared": true
+      }
+    },
+    "public.users": {
+      "name": "User",
+      "column_types": {
+        "email": "ID"
+      },
+      "columns": {
+        "total_products_created": "totalProductsCreated",
+        "years_of_employment": "yearsOfEmployment"
+      },
+      "computed_fields": {
+        "user_average_products_created_per_year": "averageProductsCreatedPerYear"
+      }
+    },
+    "public.product_research": {
+      "name": "ProductResearch",
+      "relationships": {
+        "product_research_study_case_number_fkey": "study"
+      }
+    },
+    "public.case_studies": {
+      "name": "CaseStudy",
+      "column_types": {
+        "case_number": "ID"
+      },
+      "columns": {
+        "case_number": "caseNumber"
+      }
+    },
+    "public.inventories": {
+      "name": "Inventory"
+    },
+    "public.product_research_links": {
+      "name": "ProductResearchLink"
+    },
+    "public.inventory_deprecated_products": {
+      "name": "InventoryDeprecatedProduct"
+    }
+  }
+}

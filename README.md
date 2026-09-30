@@ -229,6 +229,9 @@ curl "http://localhost:3000/rpc/get_user_count"
 Postrust serves a GraphQL API alongside the REST one, in the dialect Hasura
 speaks — so a client generated against Hasura points at it unchanged:
 
+Apollo Federation v2 subgraph mode is available with
+`PGRST_GRAPHQL_FEDERATION`; see [Configuration](docs/configuration.md#apollo-federation).
+
 ```bash
 # Query users
 curl -X POST http://localhost:3000/v1/graphql \
