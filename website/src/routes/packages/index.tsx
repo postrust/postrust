@@ -128,7 +128,7 @@ export default component$(() => {
           <p class="text-lg text-neutral-600 max-w-2xl">
             Postrust is published to crates.io as a set of crates, so you can run the
             whole server or depend on only the piece you need. All of them are released
-            together and share a version.
+            together; the seven stable crates share a version.
           </p>
           <div class="mt-6 flex flex-wrap gap-3">
             <a
@@ -280,11 +280,17 @@ export default component$(() => {
         <div class="max-w-4xl mt-12 p-6 bg-neutral-50 rounded-xl border border-neutral-200">
           <h2 class="text-lg font-bold text-neutral-900 mb-2">Versioning</h2>
           <p class="text-neutral-600 text-sm">
-            All crates share the workspace version and are published together from a
-            single <code class="px-1 py-0.5 bg-white border border-neutral-200 rounded">v*</code>{" "}
-            tag, so any two Postrust crates at the same version are known to work
-            together. Pin them to the same version in your{" "}
-            <code class="px-1 py-0.5 bg-white border border-neutral-200 rounded">Cargo.toml</code>.
+            The seven stable crates share the workspace version, currently 2.0.0, and carry a
+            semver promise: a breaking change to the public Rust API needs a major bump. Any two
+            of them at the same version are known to work together, so pin them to the same
+            version in your{" "}
+            <code class="px-1 py-0.5 bg-white border border-neutral-200 rounded">Cargo.toml</code>.{" "}
+            <code class="px-1 py-0.5 bg-white border border-neutral-200 rounded">postrust-proxy</code>{" "}
+            and{" "}
+            <code class="px-1 py-0.5 bg-white border border-neutral-200 rounded">postrust-worker</code>{" "}
+            are on their own 0.x line, currently 0.6.0, with no stability promise. Both lines are
+            published together from the same{" "}
+            <code class="px-1 py-0.5 bg-white border border-neutral-200 rounded">v*</code> tags.
           </p>
         </div>
       </div>

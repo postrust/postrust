@@ -146,9 +146,30 @@ export default component$(() => {
             <p class="text-neutral-600 mt-4">
               The root types are named <code class="font-mono">query_root</code>,{" "}
               <code class="font-mono">mutation_root</code> and{" "}
-              <code class="font-mono">subscription_root</code>. The subscription root mirrors the
-              query root, and each of its fields is a live query.
+              <code class="font-mono">subscription_root</code>, unless{" "}
+              <a href="#federation" class="text-primary-600 hover:underline">Apollo Federation</a>{" "}
+              is enabled, where they are <code class="font-mono">Query</code>,{" "}
+              <code class="font-mono">Mutation</code> and <code class="font-mono">Subscription</code>.
+              The subscription root mirrors the query root, and each of its fields is a live query.
             </p>
+            <p class="text-neutral-600 mt-4">
+              Column types follow the PostgreSQL type. PostgreSQL has no <code class="font-mono">ID</code>,
+              so a text-, integer- or UUID-backed identifier that a client expects as{" "}
+              <code class="font-mono">ID</code> is declared with a{" "}
+              <code class="font-mono">column_types</code> entry in{" "}
+              <code class="font-mono">PGRST_GRAPHQL_METADATA</code>. It changes the GraphQL type
+              &mdash; fields, comparisons, write inputs and key arguments &mdash; and not how the
+              column is read, bound or cast:
+            </p>
+            <div class="mt-4">
+              <Code label="JSON" code={`{
+  "tables": {
+    "public.author": {
+      "column_types": { "id": "ID" }
+    }
+  }
+}`} />
+            </div>
           </section>
 
           {/* Queries */}
@@ -266,6 +287,168 @@ export default component$(() => {
             </p>
           </section>
 
+          {/* Federation */}
+          <section id="federation" class="mb-12 scroll-mt-24">
+            <h2 class="text-2xl font-bold text-neutral-900 mb-4">Apollo Federation</h2>
+            <p class="text-neutral-600 mb-4">
+              The GraphQL API can be an Apollo Federation v2 subgraph, so an Apollo router or
+              gateway can compose it with other services. It is opt-in: with{" "}
+              <code class="font-mono">PGRST_GRAPHQL_FEDERATION</code> unset or false, Federation
+              metadata is inert and the generated SDL is unchanged.
+            </p>
+            <Code label="bash" code={`PGRST_GRAPHQL_FEDERATION=true
+PGRST_GRAPHQL_TYPE_PREFIX=billing   # optional`} />
+            <p class="text-neutral-600 mt-4 mb-4">With it on, the schema gains:</p>
+            <ul class="list-disc pl-6 space-y-2 text-neutral-600 mb-4">
+              <li>
+                <code class="font-mono">_service {"{ sdl }"}</code>, the subgraph SDL a router
+                composes from, and{" "}
+                <code class="font-mono">_entities(representations:)</code>, which resolves
+                entities by key.
+              </li>
+              <li>
+                The Federation v2 directives. A table&rsquo;s primary key is its{" "}
+                <code class="font-mono">@key</code>.
+              </li>
+              <li>
+                The root type names a router expects &mdash; <code class="font-mono">Query</code>,{" "}
+                <code class="font-mono">Mutation</code> and{" "}
+                <code class="font-mono">Subscription</code> &mdash; instead of Hasura&rsquo;s{" "}
+                <code class="font-mono">query_root</code> family.
+              </li>
+            </ul>
+
+            <h3 class="text-lg font-semibold text-neutral-900 mt-6 mb-2">Shared entities</h3>
+            <p class="text-neutral-600 mb-4">
+              When another subgraph owns the same entity, mark the table as shared in{" "}
+              <code class="font-mono">PGRST_GRAPHQL_METADATA</code>:
+            </p>
+            <Code label="JSON" code={`{
+  "tables": {
+    "public.users": {
+      "federation": { "shared": true }
+    }
+  }
+}`} />
+            <p class="text-neutral-600 mt-4">
+              A shared table keeps its unprefixed object type, so two subgraphs can both contribute
+              to it. Its non-key columns, computed fields, relationships and relationship
+              aggregates are marked <code class="font-mono">@shareable</code>, so another subgraph
+              may resolve the same fields; key columns are shareable through{" "}
+              <code class="font-mono">@key</code> already.
+            </p>
+
+            <h3 class="text-lg font-semibold text-neutral-900 mt-6 mb-2">Type prefix</h3>
+            <p class="text-neutral-600 mb-4">
+              <code class="font-mono">PGRST_GRAPHQL_TYPE_PREFIX</code> prefixes generated types and
+              root fields, so several Postrust subgraphs over different databases do not collide
+              when composed. A shared entity is the exception for its object type only: with the
+              prefix <code class="font-mono">billing</code>, the table above is still{" "}
+              <code class="font-mono">users @key(...)</code>, while its root fields and helper types
+              are <code class="font-mono">billing_users</code>,{" "}
+              <code class="font-mono">billing_users_bool_exp</code> and{" "}
+              <code class="font-mono">billing_users_aggregate</code>.
+            </p>
+
+            <h3 class="text-lg font-semibold text-neutral-900 mt-6 mb-2">Keys as ID</h3>
+            <p class="text-neutral-600 mb-4">
+              When the other subgraphs, or the router&rsquo;s clients, expect a key as{" "}
+              <code class="font-mono">ID</code>, declare it with{" "}
+              <code class="font-mono">column_types</code> as described under the shape of the
+              schema above: <code class="font-mono">{`"column_types": { "id": "ID" }`}</code>. A key
+              exposed as <code class="font-mono">ID</code> accepts GraphQL&rsquo;s string or integer
+              spelling in a representation and is normalised to the column&rsquo;s integer, text or
+              UUID type.
+            </p>
+
+            <h3 class="text-lg font-semibold text-neutral-900 mt-6 mb-2">How _entities matches</h3>
+            <p class="text-neutral-600 mb-4">
+              Representations are checked against each key field&rsquo;s GraphQL type before any
+              query runs: a field exposed as <code class="font-mono">Int</code> requires a JSON
+              integer, a field exposed as <code class="font-mono">ID</code> accepts either the
+              string or the integer spelling, and a <code class="font-mono">bigint</code> or{" "}
+              <code class="font-mono">numeric</code> key accepts a number or the exact decimal
+              string its scalar serialises to. An invalid key is a GraphQL error, without a trip to
+              the database.
+            </p>
+            <p class="text-neutral-600 mb-4">
+              Each type&rsquo;s representations are then resolved in one query, and PostgreSQL
+              decides what matches. A key that PostgreSQL considers equal but spells differently
+              &mdash; an uppercase UUID, a <code class="font-mono">citext</code> value in another
+              case, a <code class="font-mono">timestamptz</code> with a different offset &mdash;
+              finds its row. A key that matches nothing is a <code class="font-mono">null</code> in
+              its position rather than an error for the whole list. Select permissions apply to{" "}
+              <code class="font-mono">_entities</code> exactly as to any other read.
+            </p>
+
+            <h3 class="text-lg font-semibold text-neutral-900 mt-6 mb-2">A working subgraph</h3>
+            <p class="text-neutral-600 mb-4">
+              <a
+                href="https://github.com/postrust/postrust/tree/main/scripts/apollo-federation"
+                target="_blank"
+                rel="noopener noreferrer"
+                class="text-primary-600 hover:underline"
+              >
+                scripts/apollo-federation
+              </a>{" "}
+              runs Postrust as the Products subgraph from Apollo&rsquo;s subgraph compatibility
+              suite, over a PostgreSQL loaded with that suite&rsquo;s data. The part that matters is
+              the environment:
+            </p>
+            <Code label="compose.yaml (excerpt)" code={`products:
+  environment:
+    DATABASE_URL: postgres://postgres:postgres@database:5432/federation
+    PGRST_DB_SCHEMAS: public
+    PGRST_DB_ANON_ROLE: postgres
+    PGRST_GRAPHQL_FEDERATION: "true"
+    PGRST_GRAPHQL_METADATA: /config/graphql-metadata.json
+    PGRST_SERVER_PORT: 4001`} />
+            <p class="text-neutral-600 mt-4 mb-4">
+              and the metadata, which names the types the way the target schema does and exposes
+              the keys as <code class="font-mono">ID</code>:
+            </p>
+            <Code label="graphql-metadata.json (excerpt)" code={`{
+  "tables": {
+    "public.products": {
+      "name": "Product",
+      "column_types": { "id": "ID" },
+      "roots": { "select_by_pk": "product" }
+    },
+    "public.product_dimensions": {
+      "name": "ProductDimension",
+      "federation": { "shared": true }
+    }
+  }
+}`} />
+            <p class="text-neutral-600 mt-4 mb-4">
+              Start it with{" "}
+              <code class="font-mono">docker compose -f scripts/apollo-federation/compose.yaml up --build --wait</code>{" "}
+              from the repository root, then resolve a product as an entity, the way a router
+              would:
+            </p>
+            <Code label="bash" code={`curl http://localhost:4001/v1/graphql \\
+  -H 'content-type: application/json' \\
+  --data '{"query":"query { _entities(representations: [{__typename: \\"Product\\", id: \\"apollo-federation\\"}]) { ... on Product { id sku } } }"}'`} />
+            <p class="text-neutral-600 mt-4 mb-4">
+              A router is given the subgraph at <code class="font-mono">/v1/graphql</code> and
+              reads its SDL from <code class="font-mono">_service</code>. The fixture&rsquo;s README
+              also shows how to run Apollo&rsquo;s suite against it locally; the same suite runs in
+              CI, and a required-capability failure fails the build.
+            </p>
+            <p class="text-neutral-600">
+              Not supported yet: keys other than the primary key (so no repeatable or nested
+              keys), extended and external fields, <code class="font-mono">@requires</code>,{" "}
+              <code class="font-mono">@provides</code>, <code class="font-mono">@override</code>,{" "}
+              <code class="font-mono">@tag</code>, <code class="font-mono">@inaccessible</code>,{" "}
+              <code class="font-mono">@composeDirective</code>,{" "}
+              <code class="font-mono">@interfaceObject</code> and federated tracing. The fixture
+              keeps them in its target schema on purpose, so they show in the suite&rsquo;s report
+              as optional failures. The suite&rsquo;s <code class="font-mono">@shareable</code>{" "}
+              check fails too, because it looks for <code class="font-mono">@shareable</code> on
+              the type and Postrust puts it on each non-key field; the two compose the same way.
+            </p>
+          </section>
+
           {/* Auth */}
           <section class="mb-12">
             <h2 class="text-2xl font-bold text-neutral-900 mb-4">Authentication</h2>
@@ -351,7 +534,7 @@ export const head: DocumentHead = {
     {
       name: "description",
       content:
-        "A GraphQL API generated from your PostgreSQL schema, in the dialect Hasura speaks: queries, mutations, live subscriptions, filtering, and Hasura's error envelope.",
+        "A GraphQL API generated from your PostgreSQL schema, in the dialect Hasura speaks: queries, mutations, live subscriptions, filtering, Hasura's error envelope, and opt-in Apollo Federation v2 subgraph support.",
     },
   ],
 };

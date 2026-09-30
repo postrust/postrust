@@ -9,52 +9,51 @@ import {
   hasuraAgreement,
 } from "~/data/hasura-conformance";
 
-const VERSION = "1.0.0";
+const VERSION = "2.0.0";
 
 const added = [
   {
-    title: "Automatic SSL, actually implemented",
-    body: "A verified domain asking for ACME is queued, and a background worker places the order, answers the HTTP-01 challenge and renews the certificate 30 days before it expires. The documentation had advertised this as a feature and the schema had tracked an ssl_status the whole time, while nothing in the crate had ever spoken to a certificate authority. Tested end to end against Pebble — Let's Encrypt's test CA, which deliberately misbehaves — through the challenge endpoint that ships.",
+    title: "Postrust can be an Apollo Federation v2 subgraph",
+    body: "Set PGRST_GRAPHQL_FEDERATION=true and the GraphQL API adds _service { sdl }, _entities(representations:) and the Federation directives, so an Apollo router or gateway can compose it with other services. It is opt-in: with the variable unset, Federation metadata is inert and adds nothing to the SDL, and a test holds it there.",
   },
   {
-    title: "The endpoints the documentation promised",
-    body: "Updating a domain, uploading your own certificate, and asking for issuance were all documented and none was in the router. An uploaded certificate is checked before it is stored: the key must match the chain, it must not be expired, and it must cover the domain, wildcards counting for exactly one label. Skipping any of those gives a listener that accepts the upload and then fails every handshake.",
+    title: "A table's primary key is its @key, and a table can be shared",
+    body: 'A table marked "federation": {"shared": true} in PGRST_GRAPHQL_METADATA keeps its unprefixed type name, so two subgraphs can both contribute to it, and its non-key columns, computed fields and relationships are marked @shareable. Key columns are shareable through @key already.',
   },
   {
-    title: "Database-backed configuration that reads and writes",
-    body: "Loading routes from the database returned an empty set behind a TODO, so a proxy pointed at one started, logged nothing wrong and answered every request with 503. The admin API replied 201 and persisted nothing. Both are real now, over three new tables — one of which the certificate store had been querying since it was written and which nothing had ever created.",
+    title: "A prefix, so several Postrust subgraphs can be composed",
+    body: "PGRST_GRAPHQL_TYPE_PREFIX prefixes generated types and root fields, so subgraphs over different databases do not collide when composed. A shared entity's object type stays unprefixed; its root fields and helper types still take the prefix.",
   },
   {
-    title: "A declared and enforced minimum Rust version",
-    body: "It was declared nowhere, while the README said 1.78 and the docs said 1.75. The floor is 1.88, established by building on it and by 1.87 being refused, and a CI job now checks it against the locked dependency set.",
+    title: "Root types a router expects",
+    body: "With Federation on, the root types are Query, Mutation and Subscription rather than Hasura's query_root family. With it off, nothing about the names changes.",
   },
   {
-    title: "Conformance on a schedule, and a security policy",
-    body: "The suites that produce every figure on this site run nightly and weekly, and each regenerates the published data and fails if it has drifted. Nothing had been re-running them. SECURITY.md says how to report privately and what is in scope, and cargo audit runs on every pull request.",
+    title: "_entities lets PostgreSQL decide what matches",
+    body: "Each type's representations are resolved in one query. A key that PostgreSQL considers equal but spells differently — an uppercase UUID, a citext value in another case, a timestamptz with a different offset — finds its row, and a key that matches nothing is a null in its position rather than an error for the whole list. Select permissions apply to _entities exactly as to any other read.",
+  },
+  {
+    title: "A column can be exposed as GraphQL ID",
+    body: 'PostgreSQL has no ID type, so a key that a router or client expects as ID could not be one. A column_types entry in PGRST_GRAPHQL_METADATA — {"id": "ID"} — changes the GraphQL type of a text, integer or UUID column without changing how it is read, bound or cast.',
+  },
+  {
+    title: "Apollo's own compatibility suite, in CI",
+    body: "Apollo's subgraph compatibility suite runs on every pull request that touches the GraphQL path, against a fixture pinned to Apollo's schema and data. A required-capability failure fails the build; an optional one is reported without failing it.",
   },
 ];
 
-const fixed = [
+const changed = [
   {
-    title: "HTTP domain verification proved nothing",
-    body: "The endpoint serving the ownership challenge computed the expected content from whatever token was in the path and returned it, with no database lookup and no host check — so every token verified, for every domain whose DNS pointed at the proxy. It now answers only for a challenge that exists, is unexpired, is unresolved, and whose domain matches the request.",
+    title: "A boolean setting that is not a boolean now stops the server",
+    body: "Every PGRST_* true/false variable used to read anything other than an exact lowercase true as false, so PGRST_DB_AGGREGATES_ENABLED=TRUE, or =yes, or a typo silently disabled the feature. They now accept true/false, 1/0, yes/no and on/off in any case, and anything else fails startup with the variable's name.",
   },
   {
-    title: "Host-based routing did not work over HTTP/2",
-    body: "Route selection read only the Host header, and HTTP/2 has none — the authority arrives on the URI instead. The same host-matched route answered 200 over HTTP/1.1 and 404 over HTTP/2. Found by running it, not by reading it.",
+    title: "Configuration and schema structs are #[non_exhaustive]",
+    body: "Federation added public fields to AppConfig, SchemaConfig, TableNames, GeneratedSchema and eight other public structs, and adding a field breaks any code that builds one with an exhaustive struct literal. So that the next feature is not another major release, those structs and the related configuration, schema and metadata types are now #[non_exhaustive].",
   },
   {
-    title: "Every parameterised route would panic when first used",
-    body: "Twenty-three routes across the admin and multi-tenant APIs used a path syntax the web framework had stopped accepting. Neither router is mounted anywhere, so none had ever been called and nothing had noticed.",
-  },
-  {
-    title: "Route matching honoured half of what you could declare",
-    body: "Path-match type, methods and header criteria were all declarable and all ignored, and each silent omission widened a route past what its author wrote: an exact match on /health also caught /health-internal, and a route restricted to GET accepted DELETE.",
-  },
-  {
-    title:
-      "Twelve dependency advisories, five of them in certificate validation",
-    body: "An X.509 name-constraint bypass, two PKCS7 validation bypasses, a CRL scope error and a timing side channel — all in the path of a proxy that terminates TLS — plus four in the certificate-chain verifier and unbounded empty frames in the HTTP/2 library.",
+    title: "postrust-proxy and postrust-worker go to 0.6.0",
+    body: "They depend on postrust-core, which is now 2.0.0. Neither changed otherwise.",
   },
 ];
 
@@ -67,22 +66,23 @@ export default component$(() => {
       <div class="border-b border-neutral-200 bg-gradient-to-b from-neutral-50 to-white">
         <div class="container-wide py-12">
           <div class="mb-4 flex items-center gap-3">
-            <span class="rounded border border-amber-200 bg-amber-100 px-2 py-0.5 text-xs font-semibold text-amber-800">
-              PRERELEASE
+            <span class="rounded border border-neutral-200 bg-neutral-100 px-2 py-0.5 text-xs font-semibold text-neutral-800">
+              MAJOR
             </span>
             <span class="text-sm text-neutral-500">
-              {hasuraConformanceMeta.measured}
+              A major version for the Rust API; additive for the server
             </span>
           </div>
           <h1 class="mb-4 text-4xl font-bold text-neutral-900">
             Postrust {VERSION}
           </h1>
           <p class="max-w-2xl text-lg text-neutral-600">
-            A release about the front door. The HTTP proxy was a library with no
-            entry point and, it turned out, had never routed a request from a
-            file config. Making it runnable made it testable, and testing it
-            found the rest &mdash; a smuggling vector, a framing ambiguity, and
-            three transports that were missing rather than broken.
+            Postrust can now be an Apollo Federation v2 subgraph, so a router
+            can compose its GraphQL API with other services. It is opt-in, and
+            with it off the generated schema is what it was. The version is
+            2.0.0 because of the Rust API, not the server: if you run the binary
+            or the image, the one change you can notice is that a malformed
+            boolean setting now stops startup instead of reading as false.
           </p>
         </div>
       </div>
@@ -133,6 +133,21 @@ export default component$(() => {
               </Link>
             </div>
             <p class="mb-4 text-neutral-600">
+              These are the figures from the most recent recorded runs:
+              PostgREST on {conformanceMeta.measured} at commit{" "}
+              <code class="font-mono text-sm">
+                {conformanceMeta.commit.slice(0, 7)}
+              </code>
+              , Hasura on {hasuraConformanceMeta.measured} at commit{" "}
+              <code class="font-mono text-sm">
+                {hasuraConformanceMeta.commit.slice(0, 7)}
+              </code>
+              . This page reads them from the run&rsquo;s own record, so they
+              move when the suites are re-run and not otherwise. With Federation
+              off, this release adds nothing to the GraphQL schema the Hasura
+              suite measures.
+            </p>
+            <p class="mb-4 text-neutral-600">
               Neither harness interprets a test expectation. The reference
               implementation&rsquo;s live response is the oracle, so a mistake
               in the extractor shows up as a case both servers answer the same
@@ -145,13 +160,12 @@ export default component$(() => {
               as a failure to match it.
             </p>
             <p class="text-neutral-600">
-              Both numbers carry their provenance. Each harness builds its own
-              candidate, because which features it was built with is part of
-              what is measured and cannot be read off the binary, and records
-              the reference version, the features, the commit and whether the
-              reference was replayed or a recording reused. The generators that
-              put these figures on this page read that record and refuse a run
-              that cannot account for itself. Nothing here is typed by hand.
+              Federation is measured by a third suite that is not ours:
+              Apollo&rsquo;s subgraph compatibility suite, run against a fixture
+              pinned to Apollo&rsquo;s own schema and data. Its required
+              capabilities gate the build. The optional ones Postrust does not
+              yet support are listed under Known gaps below rather than left for
+              someone else to find.
             </p>
           </section>
 
@@ -224,35 +238,30 @@ export default component$(() => {
             </p>
           </section>
 
-          {/* Alpha */}
+          {/* What the version means */}
           <section class="mb-12">
             <div class="rounded-lg border border-amber-200 bg-amber-50 p-5">
               <h2 class="mb-2 text-lg font-bold text-neutral-900">
-                What 1.0.0 means
+                What 2.0.0 means
               </h2>
               <p class="mb-2 text-neutral-700">
-                No code changed between{" "}
-                <code class="text-sm">1.0.0-beta.1</code> and this release. What
-                changed is what can be said about it with evidence: the
-                throughput figures the beta withdrew are restored, measured on
-                dedicated bare metal behind a gate that rejects a run the
-                machine drifted under, and both conformance suites were re-run
-                against this commit from a clean tree.
-              </p>
-              <p class="mb-2 text-neutral-700">
-                Seven crates share this version and carry a semver promise from
-                here — a breaking change to the public Rust API needs a major
-                bump. <code class="text-sm">postrust-proxy</code> and{" "}
-                <code class="text-sm">postrust-worker</code> are on their own
-                0.x lines and carry none — the proxy because its surface is wide
-                and nobody outside this repository has depended on it yet, the
-                worker because it is a stub. Nothing in the stable line depends
-                on either.
+                The features are additive for anyone running the server. The
+                major bump is for the Rust API: Federation added public fields
+                to <code class="text-sm">AppConfig</code>,{" "}
+                <code class="text-sm">SchemaConfig</code>,{" "}
+                <code class="text-sm">TableNames</code>,{" "}
+                <code class="text-sm">GeneratedSchema</code> and eight other
+                public structs, and adding a field breaks code that builds one
+                with an exhaustive struct literal. The stability policy covers
+                public struct fields, and{" "}
+                <code class="text-sm">cargo semver-checks</code> against 1.0.1
+                agrees.
               </p>
               <p class="text-neutral-700">
-                The HTTP and GraphQL surfaces are the part meant to be stable.
-                If you are pointing a PostgREST or Hasura client at this, that
-                is the contract the conformance reports describe.
+                Those structs are now{" "}
+                <code class="text-sm">#[non_exhaustive]</code>, so a new field
+                or variant on one of them is a minor release from here, and a
+                feature that adds a setting does not need 3.0.0.
               </p>
             </div>
           </section>
@@ -268,111 +277,207 @@ export default component$(() => {
                 </div>
               ))}
             </div>
+            <p class="mt-4 text-neutral-600">
+              Thanks to @CBeardSafire, who asked for Federation in{" "}
+              <a
+                href="https://github.com/postrust/postrust/issues/40"
+                class="text-primary-600 hover:underline"
+              >
+                #40
+              </a>{" "}
+              and built it in{" "}
+              <a
+                href="https://github.com/postrust/postrust/pull/42"
+                class="text-primary-600 hover:underline"
+              >
+                #42
+              </a>
+              . How to set it up is in{" "}
+              <Link
+                href="/docs/graphql"
+                class="text-primary-600 hover:underline"
+              >
+                the GraphQL docs
+              </Link>
+              .
+            </p>
           </section>
 
-          {/* Fixed */}
+          {/* Changed */}
           <section class="mb-12">
-            <h2 class="mb-4 text-2xl font-bold text-neutral-900">Fixed</h2>
-            <p class="mb-4 text-neutral-600">
-              Every one of these was found by measurement rather than by a
-              report, and each had the same shape: the request succeeded, so
-              nothing looked wrong.
-            </p>
+            <h2 class="mb-4 text-2xl font-bold text-neutral-900">Changed</h2>
             <div class="space-y-4">
-              {fixed.map((f) => (
-                <div key={f.title} class="rounded-lg bg-neutral-50 p-4">
-                  <h3 class="mb-1 font-semibold text-neutral-900">{f.title}</h3>
-                  <p class="text-sm text-neutral-600">{f.body}</p>
+              {changed.map((c) => (
+                <div key={c.title} class="rounded-lg bg-neutral-50 p-4">
+                  <h3 class="mb-1 font-semibold text-neutral-900">{c.title}</h3>
+                  <p class="text-sm text-neutral-600">{c.body}</p>
                 </div>
               ))}
             </div>
           </section>
 
-          {/* Breaking */}
+          {/* Upgrading */}
           <section class="mb-12">
-            <h2 class="mb-4 text-2xl font-bold text-neutral-900">
-              Breaking changes
-            </h2>
+            <h2 class="mb-4 text-2xl font-bold text-neutral-900">Upgrading</h2>
             <p class="mb-4 text-neutral-600">
-              These affect Rust code that depends on the crates. The HTTP and
-              GraphQL surfaces are unaffected, and a proxy configuration that
-              worked before still works &mdash; every new field has a default.
+              <strong>If you run the server</strong>, check your boolean
+              settings. A deployment that was relying on a malformed value
+              reading as false will not start after upgrading. That is the point
+              &mdash; the value never meant what it looked like it meant &mdash;
+              and the error names the variable to fix. Nothing else changes: the
+              HTTP and GraphQL surfaces are the same, and Federation stays off
+              until you turn it on.
             </p>
-            <ul class="space-y-2 text-neutral-600">
-              <li>
-                <strong>The minimum Rust version is 1.88.</strong> It was
-                previously undeclared, and the README claimed 1.78. The floor
-                moved as a direct cost of the security updates below, which was
-                a trade worth making.
-              </li>
-              <li>
-                <strong>
-                  <code class="font-mono text-sm">postrust-proxy</code> and{" "}
-                  <code class="font-mono text-sm">postrust-worker</code> left
-                  the shared version.
-                </strong>{" "}
-                They are on their own 0.x lines. Both still release on the same
-                tags; nothing in the stable line depends on either.
-              </li>
-              <li>
-                <code class="font-mono text-sm">POST /config/reload</code> is
-                gone. It answered &ldquo;Configuration reload requested&rdquo;
-                and reloaded nothing, sending on a channel nobody read. Changing
-                configuration needs a restart, which is now what the
-                documentation says.
-              </li>
-              <li>
-                A route declaring a path-match type, methods or header criteria
-                now has them enforced. They were previously ignored, so such a
-                route matched <em>more</em> traffic than it asked for &mdash;
-                narrowing it is the fix, but it is a behaviour change.
-              </li>
-              <li>
-                The proxy&rsquo;s database-access layer and its row types are no
-                longer public. They mirror the schema, and publishing them would
-                have frozen it.
-              </li>
-            </ul>
+            <p class="mb-4 text-neutral-600">
+              <strong>If you depend on the crates</strong>, build the affected
+              types from their default and assign the fields you need. A struct
+              literal &mdash; including one ending in{" "}
+              <code class="font-mono text-sm">..Default::default()</code>{" "}
+              &mdash; no longer compiles for them from another crate:
+            </p>
+            <div class="mb-4 overflow-hidden rounded-xl bg-neutral-900">
+              <div class="border-b border-neutral-700 bg-neutral-800 px-4 py-2">
+                <span class="text-sm text-neutral-400">rust</span>
+              </div>
+              <pre class="overflow-x-auto p-4 text-sm">
+                <code class="text-neutral-100">{`let mut config = SchemaConfig::default();
+config.exposed_schemas = vec!["public".into()];
+config.enable_mutations = true;`}</code>
+              </pre>
+            </div>
+            <p class="mb-4 text-neutral-600">
+              An exhaustive <code class="font-mono text-sm">match</code> on{" "}
+              <code class="font-mono text-sm">ColumnTypeOverride</code> needs a
+              wildcard arm. The affected types are{" "}
+              <code class="font-mono text-sm">AppConfig</code> and{" "}
+              <code class="font-mono text-sm">RoleSettings</code> in{" "}
+              <code class="font-mono text-sm">postrust-core</code>; the schema
+              and field types in{" "}
+              <code class="font-mono text-sm">postrust_graphql::schema</code>;
+              and the metadata types in{" "}
+              <code class="font-mono text-sm">postrust_graphql::names</code>.
+              The changelog lists every one. Nothing else in the public API
+              changed.
+            </p>
+            <p class="text-neutral-600">
+              <code class="font-mono text-sm">AppConfig::try_from_env</code>{" "}
+              returns the boolean error;{" "}
+              <code class="font-mono text-sm">AppConfig::from_env</code> panics
+              with it.
+            </p>
           </section>
 
           {/* Gaps */}
           <section class="mb-12">
             <h2 class="mb-4 text-2xl font-bold text-neutral-900">Known gaps</h2>
             <p class="mb-4 text-neutral-600">
-              In the proxy: <strong>HTTP/3</strong> is not implemented, and
-              neither is upstream HTTP/2 over TLS &mdash; a backend can be told
-              to speak h2c in cleartext, but there is no ALPN on the upstream
-              leg. There is no response cache and no retry or circuit-breaking.
-              One h2spec case, an invalid connection preface answered without
-              GOAWAY, fails on the shared HTTP/1.1-and-h2c port and passes on
-              the HTTP/2-only one: a port that sniffs its protocol cannot tell a
-              corrupted preface from a malformed HTTP/1 request. That is why the
-              dedicated port exists, and why it is optional rather than the
-              default.
+              In Federation: the primary key is the only{" "}
+              <code class="font-mono text-sm">@key</code>, so repeatable keys
+              and nested keys are not expressible, and neither are extended or
+              external fields, <code class="font-mono text-sm">@requires</code>,{" "}
+              <code class="font-mono text-sm">@provides</code>,{" "}
+              <code class="font-mono text-sm">@override</code>,{" "}
+              <code class="font-mono text-sm">@tag</code>,{" "}
+              <code class="font-mono text-sm">@inaccessible</code>,{" "}
+              <code class="font-mono text-sm">@composeDirective</code>,{" "}
+              <code class="font-mono text-sm">@interfaceObject</code> or federated
+              tracing. Apollo counts these as optional capabilities; the
+              compatibility fixture keeps them in its target schema on purpose,
+              so they show in every report rather than being dropped from it.
+              The suite&rsquo;s <code class="font-mono text-sm">@shareable</code>{" "}
+              check also reports a failure: it looks for the directive on the
+              type, and Postrust puts it on each non-key field, which composes
+              the same way.
             </p>
             <p class="mb-4 text-neutral-600">
-              Also in the proxy:{" "}
-              <code class="font-mono text-sm">retry_count</code> on a route is
-              declarable and unread, and there is no configuration reload.
-              Manual certificate upload works; automatic issuance is HTTP-01
-              only, so no wildcards.
-            </p>
-            <p class="mb-4 text-neutral-600">
-              In the dialects, unchanged from the previous alpha: the largest
-              gap is <strong>introspection</strong>, and it is not reachable
-              from here &mdash; async-graphql builds its own registry and keeps
-              it private, so the directives it installs and the order it lists
-              types in cannot be changed from outside the library. Eight of the
-              sixteen remaining Hasura divergences are that one thing.
+              In the dialects, unchanged from 1.0: the largest gap is{" "}
+              <strong>introspection</strong>, and it is not reachable from here
+              &mdash; async-graphql builds its own registry and keeps it
+              private, so the directives it installs and the order it lists
+              types in cannot be changed from outside the library. Beside it:{" "}
+              <code class="font-mono text-sm">_stream</code> subscriptions, the
+              cursor-based half of Hasura&rsquo;s subscription surface; and the
+              OpenAPI document PostgREST serves at{" "}
+              <code class="font-mono text-sm">/</code>.
             </p>
             <p class="text-neutral-600">
-              Beside it: <code class="font-mono text-sm">_stream</code>{" "}
-              subscriptions, the cursor-based half of Hasura&rsquo;s
-              subscription surface; and the OpenAPI document PostgREST serves at{" "}
-              <code class="font-mono text-sm">/</code>. Actions and Apollo
-              federation are subsystems rather than gaps. The{" "}
+              In the proxy, also unchanged: no HTTP/3, no upstream HTTP/2 over
+              TLS, no response cache, no retry or circuit-breaking, no
+              configuration reload, and automatic certificates are HTTP-01 only,
+              so no wildcards. The{" "}
               <code class="font-mono text-sm">FINDINGS.md</code> files record
               the rest.
+            </p>
+          </section>
+
+          {/* Previous releases */}
+          <section class="mb-12">
+            <h2 class="mb-4 text-2xl font-bold text-neutral-900">
+              Previous releases
+            </h2>
+            <div class="space-y-4">
+              <div class="rounded-lg bg-neutral-50 p-4">
+                <h3 class="mb-1 font-semibold text-neutral-900">1.0.1</h3>
+                <p class="mb-2 text-sm text-neutral-600">
+                  <strong>
+                    The server could not talk to a hosted database over TLS, and
+                    did not say so.
+                  </strong>{" "}
+                  <code class="font-mono">sqlx</code> was built without any TLS
+                  feature, so <code class="font-mono">sslmode=require</code>{" "}
+                  failed outright, and the default{" "}
+                  <code class="font-mono">sslmode=prefer</code> silently fell
+                  back to cleartext &mdash; every 1.0.0 deployment against a
+                  hosted database was unencrypted on the wire unless it had
+                  asked for <code class="font-mono">require</code> and noticed
+                  the error. Fixed with rustls verifying against the host trust
+                  store, so a private CA works without rebuilding, and a test
+                  keeps the feature enabled.
+                </p>
+                <p class="text-sm text-neutral-600">
+                  rustls moved to 0.23.45 for RUSTSEC-2026-0285, which enabling
+                  TLS in sqlx had made reachable from the stable line. Thanks to
+                  @CBeardSafire, who found the TLS problem and sent the fix in{" "}
+                  <a
+                    href="https://github.com/postrust/postrust/pull/38"
+                    class="text-primary-600 hover:underline"
+                  >
+                    #38
+                  </a>
+                  .
+                </p>
+              </div>
+              <div class="rounded-lg bg-neutral-50 p-4">
+                <h3 class="mb-1 font-semibold text-neutral-900">1.0.0</h3>
+                <p class="mb-2 text-sm text-neutral-600">
+                  Seven crates took a semver promise: a breaking change to the
+                  public Rust API needs a major bump, which is why this release
+                  is 2.0.0. <code class="font-mono">postrust-proxy</code> and{" "}
+                  <code class="font-mono">postrust-worker</code> moved to their
+                  own 0.x lines, and nothing in the stable line depends on
+                  either.
+                </p>
+                <p class="text-sm text-neutral-600">
+                  No code changed from the beta. The throughput figures were
+                  restored, measured on dedicated bare metal behind a gate that
+                  rejects a run the machine drifted under, and both conformance
+                  suites were re-run from a clean tree. The work before it made
+                  the HTTP proxy runnable and testable &mdash; automatic
+                  certificates, host routing over HTTP/2, domain verification
+                  that proves something, and a declared minimum Rust version of
+                  1.88.
+                </p>
+              </div>
+            </div>
+            <p class="mt-4 text-sm text-neutral-500">
+              The full history is in{" "}
+              <a
+                href="https://github.com/postrust/postrust/blob/main/CHANGELOG.md"
+                class="text-primary-600 hover:underline"
+              >
+                CHANGELOG.md
+              </a>
+              .
             </p>
           </section>
 
@@ -388,8 +493,17 @@ export default component$(() => {
               </pre>
             </div>
             <p class="mt-3 text-sm text-neutral-500">
-              A prerelease is not tagged <code class="font-mono">latest</code>,
-              so it has to be asked for by name.
+              Federation is off until{" "}
+              <code class="font-mono">PGRST_GRAPHQL_FEDERATION=true</code>. A
+              working subgraph fixture, and how to run Apollo&rsquo;s suite
+              against it, is in{" "}
+              <a
+                href="https://github.com/postrust/postrust/tree/main/scripts/apollo-federation"
+                class="text-primary-600 hover:underline"
+              >
+                scripts/apollo-federation
+              </a>
+              .
             </p>
           </section>
 
@@ -440,13 +554,12 @@ export default component$(() => {
 });
 
 export const head: DocumentHead = {
-  title: `Postrust ${VERSION} — measured, and honest about the rest`,
+  title: `Postrust ${VERSION} — an Apollo Federation subgraph, opt-in`,
   links: [{ rel: "canonical", href: "https://postrust.org/releases" }],
   meta: [
     {
       name: "description",
-      content:
-        "Postrust 1.0.0: seven crates with a semver promise, PostgREST conformance at 1424/1499 and Hasura at 454/468, and throughput figures restored on a measurement host that can prove it held still.",
+      content: `Postrust ${VERSION}: opt-in Apollo Federation v2 subgraph support, columns exposed as GraphQL ID, and boolean settings that fail startup when malformed. A major version for Rust API changes only; nothing else changes for the server.`,
     },
   ],
 };

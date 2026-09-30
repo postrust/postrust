@@ -223,6 +223,11 @@ export const comparisons: Comparison[] = [
         other: "Tables must be tracked and permissions declared",
       },
       {
+        feature: "Apollo Federation",
+        postrust: "Opt-in v2 subgraph; @key is the primary key",
+        other: "Yes, per table via apollo_federation_config",
+      },
+      {
         feature: "Multiple data sources",
         postrust: "PostgreSQL only",
         other: "Yes, plus remote schemas and joins",

@@ -58,6 +58,10 @@ const featureCategories = [
         description: "Live queries over WebSocket, mirroring the query root",
       },
       {
+        name: "Apollo Federation",
+        description: "Opt-in Federation v2 subgraph: _service, _entities and @key from the primary key, checked by Apollo's compatibility suite in CI",
+      },
+      {
         name: "Introspection",
         description: "Full schema introspection for tooling support",
       },

@@ -130,13 +130,25 @@ const configVars = [
     ],
   },
   {
-    category: "GraphQL Names and Permissions",
+    category: "GraphQL Names, Permissions and Federation",
     vars: [
       {
         name: "PGRST_GRAPHQL_METADATA",
         required: false,
         default: "-",
-        desc: "Names for tables, columns, root fields, relationships and computed fields that the schema cannot supply; which root a function is exposed on; and what each role may do with each table. A JSON document, or a path to a file holding one. Unset means every name is derived and there is no permission layer. Also read as PGRST_GRAPHQL_NAMES, which is what it was called when names were all it carried.",
+        desc: "Names for tables, columns, root fields, relationships and computed fields that the schema cannot supply; which root a function is exposed on; what each role may do with each table; column_types, which exposes a text, integer or UUID column as GraphQL ID without changing its database type; and Apollo Federation table metadata, such as \"federation\": {\"shared\": true}. A JSON document, or a path to a file holding one. Unset means every name is derived and there is no permission layer. Also read as PGRST_GRAPHQL_NAMES, which is what it was called when names were all it carried.",
+      },
+      {
+        name: "PGRST_GRAPHQL_FEDERATION",
+        required: false,
+        default: "false",
+        desc: "Expose the GraphQL API as an Apollo Federation v2 subgraph, adding _service, _entities and the Federation directives, and naming the root types Query, Mutation and Subscription. Off, Federation metadata is inert and the SDL is unchanged. See the GraphQL docs.",
+      },
+      {
+        name: "PGRST_GRAPHQL_TYPE_PREFIX",
+        required: false,
+        default: "-",
+        desc: "Prefix generated table types and root fields, so several Postrust subgraphs can be composed without colliding. A shared Federation entity keeps its unprefixed object type; its root fields and helper types still take the prefix.",
       },
     ],
   },
@@ -194,6 +206,26 @@ export default component$(() => {
 
       <div class="container-wide py-12">
         <div class="max-w-4xl">
+          <div class="mb-12 rounded-lg border border-neutral-200 bg-neutral-50 p-5">
+            <h2 class="mb-2 text-lg font-bold text-neutral-900">
+              Boolean settings
+            </h2>
+            <p class="text-neutral-600">
+              A true/false variable accepts{" "}
+              <code class="font-mono text-sm">true</code>,{" "}
+              <code class="font-mono text-sm">1</code>,{" "}
+              <code class="font-mono text-sm">yes</code> and{" "}
+              <code class="font-mono text-sm">on</code>, or{" "}
+              <code class="font-mono text-sm">false</code>,{" "}
+              <code class="font-mono text-sm">0</code>,{" "}
+              <code class="font-mono text-sm">no</code> and{" "}
+              <code class="font-mono text-sm">off</code>, in any case. Anything
+              else fails startup, naming the variable &mdash; a typo read as
+              false could silently reverse a default or disable a feature you
+              asked for. Before 2.0.0, anything other than a lowercase{" "}
+              <code class="font-mono text-sm">true</code> read as false.
+            </p>
+          </div>
           {configVars.map((category) => (
             <section key={category.category} class="mb-12">
               <h2 class="mb-6 text-2xl font-bold text-neutral-900">
@@ -386,6 +418,10 @@ PGRST_JWT_SECRET=your-secret-key-at-least-32-characters
 # Hasura-dialect GraphQL at /v1/graphql
 PGRST_HASURA_ADMIN_SECRET=shh
 PGRST_HASURA_UNAUTHORIZED_ROLE=anonymous
+
+# Apollo Federation subgraph (optional)
+# PGRST_GRAPHQL_FEDERATION=true
+# PGRST_GRAPHQL_TYPE_PREFIX=billing
 
 # Server
 PGRST_SERVER_HOST=0.0.0.0
