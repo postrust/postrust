@@ -1,0 +1,71 @@
+[package]
+name = "postrust-ai"
+description = "On-demand AI model serving for Postrust: lazy model loading, priority job queues with pausable jobs, workflows and session-locked routing"
+homepage.workspace = true
+readme = "README.md"
+keywords = ["ai", "inference", "queue", "postgres", "scheduler"]
+# Deliberately NOT `version.workspace = true`, for the same reason as
+# postrust-proxy: this crate is new, and a shared version number would promise
+# a stability it cannot keep yet. See docs/stability.md.
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[[bin]]
+name = "postrust-ai"
+path = "src/bin/postrust-ai.rs"
+
+[dependencies]
+# Async runtime
+tokio.workspace = true
+# CancellationToken, for pause and shutdown signals.
+tokio-util = "0.7"
+async-trait.workspace = true
+futures.workspace = true
+
+# Web/HTTP
+axum.workspace = true
+http.workspace = true
+# `stream` forwards request and response bodies without buffering them, which
+# matters for audio and video. `multipart` is how whisper.cpp takes a file.
+reqwest = { workspace = true, features = ["stream", "multipart"] }
+
+# Database
+sqlx.workspace = true
+
+# Auth
+postrust-auth.workspace = true
+
+# Serialization
+serde.workspace = true
+serde_json.workspace = true
+toml.workspace = true
+
+# Error handling
+thiserror.workspace = true
+anyhow.workspace = true
+
+# Utilities
+bytes.workspace = true
+chrono.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+uuid.workspace = true
+url.workspace = true
+parking_lot.workspace = true
+
+# Content addressing for the model file cache and the result cache.
+base64.workspace = true
+sha2 = "0.10"
+hex = "0.4"
+
+[target.'cfg(unix)'.dependencies]
+# SIGTERM for a graceful model server shutdown; tokio only offers SIGKILL.
+libc = "0.2"
+
+[dev-dependencies]
+pretty_assertions.workspace = true
+tokio = { workspace = true, features = ["test-util", "macros"] }
