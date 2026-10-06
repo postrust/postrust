@@ -59,6 +59,60 @@ services:
     working_dir: /app
     command: cargo test --all
 
+  # --- AI node (profile: ai) ----------------------------------------------
+  # postrust-ai, on the compose Postgres. Not started by default:
+  #
+  #   docker compose --profile ai up ai
+  #
+  # The config declares no models, so it is healthy with nothing else running.
+  # The image has no model servers in it; to serve a model, run one beside it
+  # and declare it as `attached` (see the comments in the config file), or build
+  # an image FROM postrust/postrust-ai that has the server installed.
+  #
+  # It shares postrust_test with the other services; its tables live in schema
+  # `ai`, which it creates.
+  ai:
+    build:
+      context: .
+      dockerfile: Dockerfile.ai
+    container_name: postrust-ai
+    profiles: ["ai"]
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgres://postgres:postgres@postgres:5432/postrust_test
+      POSTRUST_AI_CONFIG: /etc/postrust-ai/postrust-ai.toml
+      POSTRUST_AI_NODE_ID: compose-ai-1
+      # Already the image's default; the advertise URL is what peers and the
+      # proxy use to reach this node, so it has to be a name they can resolve.
+      POSTRUST_AI_LISTEN: 0.0.0.0:7700
+      POSTRUST_AI_ADVERTISE_URL: http://ai:7700
+      # With no secret the API is open. Fine on a laptop; set one otherwise.
+      # POSTRUST_AI_JWT_SECRET: super-secret-jwt-key-for-testing-only-32-chars
+      RUST_LOG: info
+    ports:
+      - "7700:7700"
+    volumes:
+      - ./crates/postrust-ai/examples/postrust-ai.compose.toml:/etc/postrust-ai/postrust-ai.toml:ro
+      - ai_cache:/var/cache/postrust-ai
+    healthcheck:
+      # /readyz checks the database; /healthz would stay green without it.
+      test: ["CMD", "curl", "-f", "http://localhost:7700/readyz"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    # A GPU for `process` models, once the image has a server that uses one.
+    # Needs the NVIDIA Container Toolkit on the host.
+    # deploy:
+    #   resources:
+    #     reservations:
+    #       devices:
+    #         - driver: nvidia
+    #           count: 1
+    #           capabilities: [gpu]
+
   # --- ACME testing (profile: acme) ---------------------------------------
   # Pebble is Let's Encrypt's test CA. It deliberately misbehaves -- it rejects
   # a percentage of nonces, varies challenge ordering, and returns states a
@@ -108,6 +162,7 @@ volumes:
   postgres_data:
   cargo_cache:
   target_cache:
+  ai_cache:
 
 networks:
   # Fixed subnet so pebble's -dnsserver and challtestsrv's -defaultIPv4 can be

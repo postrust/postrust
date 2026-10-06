@@ -484,6 +484,9 @@ helm install postrust ./charts/postrust \
 helm upgrade postrust ./charts/postrust --reuse-values
 ```
 
+The chart can also run a `postrust-ai` node, with `--set ai.enabled=true`; see
+[AI Workers](ai-workers.md#docker-compose-and-helm).
+
 ## Cloudflare Workers
 
 > Note: Full Workers support requires Cloudflare Hyperdrive for database connections.

@@ -39,6 +39,28 @@ helm install postrust ./charts/postrust --set database.existingSecret=postrust-d
 | `service.type` | `ClusterIP` | |
 | `service.port` | `80` | |
 
+### AI node (optional)
+
+`ai.enabled=true` adds a second Deployment, a Service and a ConfigMap running
+`postrust-ai` ([docs/ai-workers.md](../../docs/ai-workers.md)) against the same
+database. It is off by default.
+
+| Key | Default | Notes |
+|---|---|---|
+| `ai.enabled` | `false` | |
+| `ai.replicas` | `1` | |
+| `ai.image.repository` | `postrust/postrust-ai` | No model servers in it; see `values.yaml` |
+| `ai.image.tag` | `0.1.0` | Its own version line, not `appVersion` |
+| `ai.config` | no models | The node's TOML, mounted as a file |
+| `ai.auth.jwtSecretRef` | `{}` | `{name, key}` of a Secret holding the HS256 secret; unset means an open API |
+| `ai.cache.persistence.enabled` | `false` | `emptyDir` when off |
+| `ai.service.port` | `7700` | |
+
+The chart sets the listen address, the node id (the pod name), the advertise URL
+(the pod IP) and `DATABASE_URL` (the same Secret as the API server). GPU
+scheduling (`ai.nodeSelector`, `ai.tolerations`, `ai.resources.limits`) is
+sketched in `values.yaml`.
+
 ## Notes
 
 `PGRST_SERVER_HOST` is set to `0.0.0.0` by the chart. The server binds

@@ -1,0 +1,127 @@
+{{- if .Values.ai.enabled }}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "postrust.ai.fullname" . }}
+  labels:
+    {{- include "postrust.ai.labels" . | nindent 4 }}
+spec:
+  replicas: {{ .Values.ai.replicas }}
+  selector:
+    matchLabels:
+      {{- include "postrust.ai.selectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      annotations:
+        # A changed config rolls the pods; a ConfigMap edit alone does not.
+        checksum/config: {{ .Values.ai.config | sha256sum }}
+        {{- with .Values.ai.podAnnotations }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+      labels:
+        {{- include "postrust.ai.selectorLabels" . | nindent 8 }}
+    spec:
+      # The image runs as uid 1000. A fresh emptyDir or volume is root-owned,
+      # and the node could not write model files to it without this.
+      securityContext:
+        fsGroup: 1000
+      containers:
+        - name: postrust-ai
+          image: "{{ .Values.ai.image.repository }}:{{ .Values.ai.image.tag }}"
+          imagePullPolicy: {{ .Values.ai.image.pullPolicy }}
+          ports:
+            - name: http
+              containerPort: {{ .Values.ai.port }}
+              protocol: TCP
+          env:
+            # Listens on 127.0.0.1 by default, which inside a pod means the
+            # Service reaches nothing.
+            - name: POSTRUST_AI_LISTEN
+              value: "0.0.0.0:{{ .Values.ai.port }}"
+            # Defined before the variables that reference it: Kubernetes
+            # expands $(VAR) only from variables declared earlier in the list.
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: POD_IP
+              valueFrom:
+                fieldRef:
+                  fieldPath: status.podIP
+            # Node ids must be unique across the cluster, and pod names are.
+            - name: POSTRUST_AI_NODE_ID
+              value: "$(POD_NAME)"
+            # What the other nodes and postrust-proxy connect to. A pod that
+            # restarts gets a new IP, and advertises that one.
+            - name: POSTRUST_AI_ADVERTISE_URL
+              value: "http://$(POD_IP):{{ .Values.ai.port }}"
+            - name: POSTRUST_AI_CONFIG
+              value: /etc/postrust-ai/postrust-ai.toml
+            - name: POSTRUST_AI_CACHE_DIR
+              value: /var/cache/postrust-ai
+            - name: DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "postrust.secretName" . }}
+                  key: DATABASE_URL
+            {{- with .Values.ai.auth.jwtSecretRef }}
+            - name: POSTRUST_AI_JWT_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .name }}
+                  key: {{ .key }}
+            {{- end }}
+            {{- with .Values.ai.env }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+          # /healthz reports the process is up; /readyz also checks the
+          # database, which is what should gate traffic.
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            initialDelaySeconds: 5
+            periodSeconds: 30
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: http
+            initialDelaySeconds: 3
+            periodSeconds: 10
+          volumeMounts:
+            - name: config
+              mountPath: /etc/postrust-ai
+              readOnly: true
+            - name: cache
+              mountPath: /var/cache/postrust-ai
+          resources:
+            {{- toYaml .Values.ai.resources | nindent 12 }}
+      volumes:
+        - name: config
+          configMap:
+            name: {{ include "postrust.ai.fullname" . }}
+        - name: cache
+          {{- if .Values.ai.cache.persistence.enabled }}
+          persistentVolumeClaim:
+            claimName: {{ .Values.ai.cache.persistence.existingClaim | default (printf "%s-cache" (include "postrust.ai.fullname" .)) }}
+          {{- else }}
+          emptyDir:
+            {{- with .Values.ai.cache.sizeLimit }}
+            sizeLimit: {{ . | quote }}
+            {{- else }}
+            {}
+            {{- end }}
+          {{- end }}
+      {{- with .Values.ai.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.ai.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.ai.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+{{- end }}

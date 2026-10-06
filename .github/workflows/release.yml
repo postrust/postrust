@@ -61,11 +61,14 @@ jobs:
           # published, so the proxy releases on the same tags without being
           # dragged along to 1.0.0.
           #
-          # Dependency order: leaves first. Nothing depends on postrust-proxy,
-          # so no 1.0.0 crate carries a 0.x dependency.
+          # postrust-ai is on its own 0.x line too, for the same reason.
+          #
+          # Dependency order: leaves first. Nothing depends on postrust-proxy
+          # or postrust-ai (the latter needs only postrust-auth, published
+          # above), so no 1.0.0 crate carries a 0.x dependency.
           for crate in postrust-sql postrust-auth postrust-core postrust-response \
                        postrust-graphql postrust-server postrust-lambda postrust-worker \
-                       postrust-proxy; do
+                       postrust-proxy postrust-ai; do
             crate_version=$(jq -r --arg c "${crate}" \
               '.packages[] | select(.name == $c) | .version' <<<"${metadata}")
             if [ -z "${crate_version}" ] || [ "${crate_version}" = "null" ]; then

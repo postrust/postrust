@@ -8,6 +8,7 @@ use postrust_ai::workflow::WorkflowDef;
 use postrust_ai::AiConfig;
 
 const CONFIG: &str = include_str!("../examples/postrust-ai.toml");
+const COMPOSE_CONFIG: &str = include_str!("../examples/postrust-ai.compose.toml");
 const WORKFLOW: &str = include_str!("../examples/video-summary.workflow.json");
 
 /// Models the workflow uses that the example config deliberately does not
@@ -51,6 +52,23 @@ fn example_config_parses_and_validates() {
     assert_eq!(
         file.model("llama3-8b").unwrap().served_name(),
         "llama3.1:8b"
+    );
+}
+
+/// docker-compose.yml mounts this file, and the `ai` service has to start and
+/// stay healthy with no model server beside it.
+#[test]
+fn compose_config_validates_and_declares_no_models() {
+    let config = AiConfig::from_toml(COMPOSE_CONFIG).expect("compose config validates");
+    assert!(
+        config.models.is_empty(),
+        "no model server exists in compose"
+    );
+    let file: AiConfig =
+        toml::from_str(COMPOSE_CONFIG).expect("compose config has no unknown keys");
+    assert_eq!(
+        file.cache.dir,
+        std::path::Path::new("/var/cache/postrust-ai")
     );
 }
 

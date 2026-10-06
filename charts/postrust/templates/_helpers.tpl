@@ -33,3 +33,24 @@ The Secret holding DATABASE_URL: either one this chart creates or one supplied.
 {{- include "postrust.fullname" . -}}
 {{- end -}}
 {{- end -}}
+
+{{/*
+The AI node is a second workload in the same release. Its pods carry a
+different app.kubernetes.io/name, so the API Service's selector (name and
+instance only) cannot match them and send API traffic to the AI node.
+*/}}
+{{- define "postrust.ai.fullname" -}}
+{{- printf "%s-ai" (include "postrust.fullname" .) | trunc 63 | trimSuffix "-" -}}
+{{- end -}}
+
+{{- define "postrust.ai.selectorLabels" -}}
+app.kubernetes.io/name: {{ printf "%s-ai" (include "postrust.name" .) | trunc 63 | trimSuffix "-" }}
+app.kubernetes.io/instance: {{ .Release.Name }}
+{{- end -}}
+
+{{- define "postrust.ai.labels" -}}
+{{ include "postrust.ai.selectorLabels" . }}
+app.kubernetes.io/version: {{ .Values.ai.image.tag | quote }}
+app.kubernetes.io/managed-by: {{ .Release.Service }}
+helm.sh/chart: {{ printf "%s-%s" .Chart.Name .Chart.Version | replace "+" "_" }}
+{{- end -}}

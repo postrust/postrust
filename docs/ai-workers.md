@@ -36,6 +36,28 @@ a test parses it, so the keys in it exist.
 The migration (schema `ai`) is applied at startup unless
 `database.migrate = false`. Logging follows `RUST_LOG` and defaults to `info`.
 
+### Docker, Compose and Helm
+
+`Dockerfile.ai` builds the node (`./docker-publish.sh --ai` tags it
+`postrust/postrust-ai`). It listens on `0.0.0.0:7700`, keeps its cache in the
+volume `/var/cache/postrust-ai`, and needs `DATABASE_URL`. **It contains no model
+servers.** The `process` runtime starts them as child processes, so either build
+an image `FROM postrust/postrust-ai` with the servers installed, or run the
+servers in their own containers and declare the models as `attached`.
+
+```bash
+docker compose --profile ai up ai   # Postgres + the node, with no models
+curl localhost:7700/readyz
+```
+
+The compose service uses
+[`examples/postrust-ai.compose.toml`](../crates/postrust-ai/examples/postrust-ai.compose.toml),
+which declares no models so it is healthy on its own. In Kubernetes,
+`helm install ... --set ai.enabled=true` adds the node to the chart
+(`charts/postrust`): the node id is the pod name and the advertise URL is the pod
+IP. The image, Compose service and chart have not been run *(unverified: no
+container runtime or cluster on the development machine)*.
+
 ## Concepts
 
 ### Models and servers
@@ -91,7 +113,9 @@ instance serves at once.
 Accounting is by declaration. Each model states `memory_mb` (host memory) and
 `gpu_mb` (VRAM on one GPU; 0 is CPU only), and the node keeps the sum of
 what is loaded under the budget in `[resources]`: detected memory minus
-`memory_reserve_mb`, and each GPU's VRAM minus `gpu_reserve_mb`. GPUs are
+`memory_reserve_mb`, and each GPU's VRAM minus `gpu_reserve_mb`. In a container
+with a memory limit, detected memory is the limit (cgroup v1 or v2), and free
+memory is the limit less the cgroup's working set, not the host's figures. GPUs are
 detected with `nvidia-smi` if it is installed, or listed in `resources.gpus`.
 With `respect_probe = true` the probed free memory must also cover a load, so
 memory taken by processes the node does not manage is noticed.

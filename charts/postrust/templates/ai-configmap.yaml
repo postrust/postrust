@@ -1,0 +1,11 @@
+{{- if .Values.ai.enabled }}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "postrust.ai.fullname" . }}
+  labels:
+    {{- include "postrust.ai.labels" . | nindent 4 }}
+data:
+  postrust-ai.toml: |
+    {{- .Values.ai.config | nindent 4 }}
+{{- end }}
