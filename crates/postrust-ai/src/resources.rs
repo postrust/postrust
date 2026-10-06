@@ -116,6 +116,12 @@ impl Probe {
             probe.mem_total_mb = total;
             probe.mem_available_mb = available;
         }
+        // In a container /proc/meminfo is the host's; the cgroup limit is
+        // what the kernel enforces, and loading past it gets the node killed.
+        if let Some(cgroup) = read_cgroup_memory().await {
+            (probe.mem_total_mb, probe.mem_available_mb) =
+                cgroup.cap(probe.mem_total_mb, probe.mem_available_mb);
+        }
         probe.gpus = read_nvidia_smi().await.unwrap_or_default();
         probe.load = tokio::fs::read_to_string("/proc/loadavg")
             .await
@@ -146,6 +152,74 @@ fn parse_meminfo(text: &str) -> (u64, u64) {
             .unwrap_or(0)
     };
     (field("MemTotal:"), field("MemAvailable:"))
+}
+
+/// A cgroup's memory limit and working set, bytes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct CgroupMemory {
+    limit: u64,
+    /// Usage less inactive page cache, which the kernel reclaims before it
+    /// kills anything: the figure the kubelet evicts on.
+    working_set: u64,
+}
+
+impl CgroupMemory {
+    /// `(total, available)` in MiB, capped by the cgroup. A limit at or above
+    /// host memory (v1 writes "no limit" as a huge number) changes nothing.
+    fn cap(self, total_mb: u64, available_mb: u64) -> (u64, u64) {
+        let limit_mb = self.limit / (1024 * 1024);
+        if total_mb > 0 && limit_mb >= total_mb {
+            return (total_mb, available_mb);
+        }
+        let free_mb = limit_mb.saturating_sub(self.working_set / (1024 * 1024));
+        let available_mb = if total_mb > 0 {
+            available_mb.min(free_mb)
+        } else {
+            free_mb
+        };
+        (limit_mb, available_mb)
+    }
+}
+
+/// cgroup v2, then v1. `None` outside a limited cgroup.
+async fn read_cgroup_memory() -> Option<CgroupMemory> {
+    let read = |path: &'static str| async move { tokio::fs::read_to_string(path).await.ok() };
+    if let Some(max) = read("/sys/fs/cgroup/memory.max").await {
+        return parse_cgroup_memory(
+            &max,
+            &read("/sys/fs/cgroup/memory.current").await?,
+            &read("/sys/fs/cgroup/memory.stat").await.unwrap_or_default(),
+            "inactive_file",
+        );
+    }
+    parse_cgroup_memory(
+        &read("/sys/fs/cgroup/memory/memory.limit_in_bytes").await?,
+        &read("/sys/fs/cgroup/memory/memory.usage_in_bytes").await?,
+        &read("/sys/fs/cgroup/memory/memory.stat")
+            .await
+            .unwrap_or_default(),
+        "total_inactive_file",
+    )
+}
+
+fn parse_cgroup_memory(
+    limit: &str,
+    usage: &str,
+    stat: &str,
+    inactive_key: &str,
+) -> Option<CgroupMemory> {
+    // v2 writes "max" for no limit.
+    let limit: u64 = limit.trim().parse().ok()?;
+    let usage: u64 = usage.trim().parse().ok()?;
+    let inactive = stat
+        .lines()
+        .find_map(|l| l.strip_prefix(inactive_key)?.strip_prefix(' '))
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .unwrap_or(0);
+    Some(CgroupMemory {
+        limit,
+        working_set: usage.saturating_sub(inactive),
+    })
 }
 
 async fn read_nvidia_smi() -> Option<Vec<GpuProbe>> {
@@ -450,6 +524,50 @@ mod tests {
         assert_eq!(parse_loadavg(""), None);
         assert_eq!(parse_loadavg("0.5 0.6"), None);
         assert_eq!(parse_loadavg("a b c"), None);
+    }
+
+    #[test]
+    fn a_cgroup_limit_caps_host_memory() {
+        const MIB: u64 = 1024 * 1024;
+        let stat = "anon 1\ninactive_file 1073741824\nactive_file 5\n";
+        let cg =
+            parse_cgroup_memory("8589934592\n", "3221225472\n", stat, "inactive_file").unwrap();
+        assert_eq!(cg.limit, 8192 * MIB);
+        assert_eq!(
+            cg.working_set,
+            2048 * MIB,
+            "inactive page cache is not counted"
+        );
+        // 64 GiB host with 40 GiB free; the container may use 8 GiB, 2 in use.
+        assert_eq!(cg.cap(65536, 40960), (8192, 6144));
+        // The host can be the tighter of the two.
+        assert_eq!(cg.cap(65536, 1000), (8192, 1000));
+    }
+
+    #[test]
+    fn no_cgroup_limit_changes_nothing() {
+        assert_eq!(
+            parse_cgroup_memory("max\n", "123\n", "", "inactive_file"),
+            None
+        );
+        // v1's "unlimited" is a huge number.
+        let v1 = parse_cgroup_memory(
+            "9223372036854771712",
+            "1048576",
+            "total_inactive_file 0\n",
+            "total_inactive_file",
+        )
+        .unwrap();
+        assert_eq!(v1.cap(65536, 40960), (65536, 40960));
+        // A key that merely starts like the wanted one is not it.
+        let cg = parse_cgroup_memory(
+            "4294967296",
+            "1073741824",
+            "inactive_file_x 999\n",
+            "inactive_file",
+        )
+        .unwrap();
+        assert_eq!(cg.working_set, 1073741824);
     }
 
     #[test]
