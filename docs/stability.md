@@ -11,13 +11,13 @@ honestly describe both.
 | Line | Crates | Promise |
 | --- | --- | --- |
 | **Stable** | `postrust-core`, `postrust-sql`, `postrust-auth`, `postrust-response`, `postrust-graphql`, `postrust-server`, `postrust-lambda` | Semver. A breaking change to the public Rust API needs a major bump. |
-| **Unstable** | `postrust-proxy`, `postrust-worker` | None. Each on its own `0.x`, where a minor bump may break anything. |
+| **Unstable** | `postrust-proxy`, `postrust-worker`, `postrust-ai` | None. Each on its own `0.x`, where a minor bump may break anything. |
 
-Nothing in the stable line depends on either unstable crate, so no crate that
+Nothing in the stable line depends on an unstable crate, so no crate that
 makes a semver promise carries a dependency that cannot keep one.
-`postrust-proxy` depends on `postrust-core`, not the other way round, and
-`postrust-worker` is built as a `cdylib`, which cannot be a Rust library
-dependency at all.
+`postrust-proxy` depends on `postrust-core`, not the other way round,
+`postrust-ai` depends on `postrust-auth`, and `postrust-worker` is built as a
+`cdylib`, which cannot be a Rust library dependency at all.
 
 Both lines release on the same git tags. A tag publishes whatever version each
 crate currently declares and skips what is already on crates.io, so the proxy
@@ -66,6 +66,19 @@ measured is not the same as lived with.
 The crate is useful and it is tested. It is not finished, and its version
 number says so.
 
+## Why the AI crate is held back
+
+`postrust-ai` is new, and is only part of the way to being lived with. Its
+queue, scheduler, workflows, sessions, gateway and caches are tested against a
+real PostgreSQL and a stub model server. It has **not** been run against real
+vLLM, Ollama or whisper.cpp servers, the container runtime, or nodes on
+separate machines, so how it drives each of them is written to their
+documentation rather than observed. It has no hot reload of its model
+registry, and each model runs on a single GPU: spreading models across GPUs
+and nodes for utilisation is not built. Its configuration keys, HTTP
+API and database schema may change in a minor release. See
+[AI Workers](./ai-workers.md) for what is and is not verified.
+
 ## What semver covers in the stable line
 
 Covered — a breaking change here requires a major bump:
@@ -87,7 +100,7 @@ does not need 3.0.0.
 
 Not covered:
 
-- `postrust-proxy` and `postrust-worker`, entirely.
+- `postrust-proxy`, `postrust-worker` and `postrust-ai`, entirely.
 - Anything reachable only through a `#[doc(hidden)]` item or a private module.
 - The exact wording of error messages, and log output.
 - Behaviour under configurations the documentation calls unsupported.

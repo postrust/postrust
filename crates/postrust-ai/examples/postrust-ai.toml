@@ -1,0 +1,178 @@
+# A complete postrust-ai configuration: three models and two queues.
+#
+# Every key shown is one the crate reads, and the values written out are the
+# defaults unless a comment says otherwise. Run it with
+#
+#     postrust-ai examples/postrust-ai.toml
+#
+# These settings can come from the environment instead, and the environment
+# wins: DATABASE_URL, POSTRUST_AI_NODE_ID, POSTRUST_AI_LISTEN,
+# POSTRUST_AI_ADVERTISE_URL, POSTRUST_AI_JWT_SECRET, POSTRUST_AI_CACHE_DIR.
+#
+# The model commands below follow each server's documented command line. They
+# have not been run against real vLLM, whisper.cpp or Ollama servers: check
+# them against the versions you install.
+
+[node]
+# Unique across the cluster. Defaults to the hostname.
+id = "gpu-1"
+listen = "127.0.0.1:7700"
+# What other nodes and the proxy use to reach this one. Set it when `listen`
+# is 0.0.0.0, or anything other nodes cannot connect to.
+# advertise_url = "http://gpu-1.internal:7700"
+
+[database]
+url = "postgres://postgres:postgres@localhost:5432/postgres"
+max_connections = 10
+# Apply the bundled migration (schema `ai`) at startup.
+migrate = true
+
+[resources]
+# Host memory budget in MiB. Absent: detected total minus memory_reserve_mb.
+# memory_mb = 24576
+memory_reserve_mb = 2048
+# GPUs to use. Absent: detected with nvidia-smi, if it is installed.
+# gpus = [{ index = 0, vram_mb = 24576 }]
+gpu_reserve_mb = 512
+# Also require the probed free memory to cover a load, so memory used by
+# processes this node does not manage is noticed.
+respect_probe = true
+max_instances = 16
+# Ports handed to the model servers it starts.
+port_range = [18000, 18999]
+
+[cache]
+dir = "/var/cache/postrust-ai"
+max_disk_gb = 100
+# Set true when the directory is shared between nodes over NFS or EFS.
+shared = false
+# Lifetime of a cached result. 0: no expiry.
+result_ttl_secs = 604800
+
+[sessions]
+# Requests carrying this header are routed to the instance holding the lock.
+header = "x-session-id"
+ttl_secs = 600
+max_per_instance = 64
+
+[gateway]
+# How long a request to /v1/infer waits for a model to load before it gets a
+# 503 with Retry-After. The load carries on.
+load_wait_secs = 30
+request_timeout_secs = 600
+forward_to_ready_nodes = true
+
+[scheduler]
+lease_secs = 60
+# At most half of lease_secs.
+heartbeat_secs = 15
+poll_secs = 5
+# A waiting job gains one priority point per aging_secs, up to aging_cap.
+# Superlow jobs never age.
+aging_secs = 60
+aging_cap = 99
+archive_after_secs = 86400
+maintenance_secs = 5
+
+# Register with postrust-proxy so /ai/... reaches the nodes. Remove this
+# section to run without a proxy.
+# [proxy]
+# admin_url = "http://127.0.0.1:9000/admin/api"
+# upstream_name = "postrust-ai"
+# route_prefix = "/ai/"
+# admin_token = "..."
+
+[auth]
+# With no secret the API is open. Put it behind something that authenticates,
+# or set one (HS256).
+# jwt_secret = "change-me"
+# audience = "postrust-ai"
+# Roles allowed to load and unload models and pause queues. Empty: any
+# authenticated caller.
+admin_roles = ["admin"]
+
+# ---------------------------------------------------------------------------
+# Queues
+# ---------------------------------------------------------------------------
+
+# Interactive work. Pausing a running job asks it to save a checkpoint and
+# gives it pause_grace_secs to stop; after that it is cancelled and resumes
+# from the last checkpoint it saved.
+[[queue]]
+name = "interactive"
+concurrency = 4
+pause_mode = "checkpoint"
+pause_grace_secs = 30
+max_attempts = 3
+retry_backoff_secs = 10
+result_cache = false
+
+# Bulk work. One job at a time on this node. Pausing cancels the job at once
+# and it starts over when it next runs.
+[[queue]]
+name = "background"
+concurrency = 1
+pause_mode = "requeue"
+max_attempts = 3
+
+# ---------------------------------------------------------------------------
+# Models
+# ---------------------------------------------------------------------------
+
+# vLLM, started and stopped by this node. `id` is what jobs and requests name,
+# and cannot contain '/'. `served_name` is what the server calls the model,
+# and is what {model} expands to. --enable-sleep-mode lets the node park the
+# instance (move its weights to host memory) instead of stopping it when only
+# VRAM is short.
+[[model]]
+id = "qwen2-7b"
+kind = "text"
+flavor = "vllm"
+served_name = "Qwen/Qwen2-7B-Instruct"
+memory_mb = 16384
+gpu_mb = 18000
+idle_timeout_secs = 600
+park_timeout_secs = 1800
+load_timeout_secs = 300
+max_concurrency = 8
+[model.runtime]
+type = "process"
+command = "vllm"
+args = [
+  "serve", "{model}",
+  "--host", "127.0.0.1",
+  "--port", "{port}",
+  "--enable-sleep-mode",
+]
+
+# whisper.cpp. The model file is fetched into the cache before the server
+# starts; {file:0} is its path. Add `sha256` to the file entry to verify it,
+# and to notice when the upstream file changes. Transcription is deterministic,
+# so its results are cached.
+[[model]]
+id = "whisper-large-v3-turbo"
+kind = "audio"
+flavor = "whisper_cpp"
+memory_mb = 2048
+gpu_mb = 3500
+result_cache = true
+files = [{ url = "hf://ggerganov/whisper.cpp/ggml-large-v3-turbo.bin" }]
+[model.runtime]
+type = "process"
+command = "whisper-server"
+args = ["-m", "{file:0}", "--host", "127.0.0.1", "--port", "{port}"]
+
+# Ollama, run by someone else. Nothing is started or stopped; the node asks the
+# server to load the model into memory and to unload it again. An attached
+# model has exactly one instance, so max_replicas stays 1. It is kept loaded
+# (pinned), and counted against the budget like any other model.
+[[model]]
+id = "llama3-8b"
+kind = "text"
+flavor = "ollama"
+served_name = "llama3.1:8b"
+memory_mb = 8192
+pinned = true
+[model.runtime]
+type = "attached"
+base_url = "http://127.0.0.1:11434"
