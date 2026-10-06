@@ -7,6 +7,7 @@ use std::time::{Duration, Instant};
 
 use serde_json::json;
 use sqlx::postgres::PgPoolOptions;
+use sqlx::PgPool;
 use tokio_util::sync::CancellationToken;
 
 use crate::api::{self, AppState};
@@ -45,12 +46,23 @@ impl Node {
         config: AiConfig,
         handlers: Vec<(String, Arc<dyn JobHandler>)>,
     ) -> AiResult<Self> {
-        let config = Arc::new(config);
         let pool = PgPoolOptions::new()
             .max_connections(config.database.max_connections.max(3))
             .acquire_timeout(Duration::from_secs(10))
             .connect(&config.database.url)
             .await?;
+        Self::build_with_pool(config, pool, handlers).await
+    }
+
+    /// Like [`build`](Self::build), on a pool the caller already holds: for
+    /// embedding the node in a larger application, and for tests that run
+    /// several nodes against one database.
+    pub async fn build_with_pool(
+        config: AiConfig,
+        pool: PgPool,
+        handlers: Vec<(String, Arc<dyn JobHandler>)>,
+    ) -> AiResult<Self> {
+        let config = Arc::new(config);
 
         let pg = PgJobStore::new(pool.clone());
         if config.database.migrate {

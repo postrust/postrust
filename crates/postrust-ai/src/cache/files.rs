@@ -482,4 +482,74 @@ mod tests {
 
         tokio::fs::remove_dir_all(dir).await.unwrap();
     }
+
+    /// Serves ten zero bytes at `/{name}`.
+    async fn blob_server() -> String {
+        let app =
+            axum::Router::new().route("/{name}", axum::routing::get(|| async { vec![0u8; 10] }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        format!("http://{addr}")
+    }
+
+    #[tokio::test]
+    async fn a_download_over_budget_evicts_the_least_recently_used_unpinned_blob() {
+        let url = blob_server().await;
+        let dir = std::env::temp_dir().join(format!("postrust-ai-cache-{}", uuid::Uuid::new_v4()));
+        let config = CacheConfig {
+            dir: dir.clone(),
+            ..Default::default()
+        };
+        let mut cache = FileCache::open(&config, reqwest::Client::new())
+            .await
+            .unwrap();
+        // The configured budget is in GiB; this needs room for two 10-byte
+        // blobs but not three.
+        cache.budget_bytes = 25;
+
+        let files: Vec<ModelFile> = ["a.bin", "b.bin", "c.bin"]
+            .iter()
+            .map(|n| file(&format!("{url}/{n}"), None))
+            .collect();
+        for f in &files[..2] {
+            cache.ensure_all(std::slice::from_ref(f)).await.unwrap();
+            cache.unpin(std::slice::from_ref(f));
+        }
+        // `last_used` has one-second resolution; make the order explicit:
+        // `b` is the oldest, then `a`.
+        let key_b = cache_key(&files[1]).unwrap();
+        for (f, age) in [(&files[0], 50), (&files[1], 100)] {
+            let meta = Meta {
+                url: f.url.clone(),
+                size: 10,
+                last_used: now_secs() - age,
+            };
+            let key = cache_key(f).unwrap();
+            tokio::fs::write(cache.meta_path(&key), serde_json::to_vec(&meta).unwrap())
+                .await
+                .unwrap();
+        }
+
+        // `b` is the least recently used but pinned, so `a` goes instead.
+        cache.pin(&key_b);
+        cache.ensure_all(&files[2..]).await.unwrap();
+
+        let mut left: Vec<String> = cache
+            .list()
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|f| f.key)
+            .collect();
+        left.sort();
+        let mut want = vec![key_b, cache_key(&files[2]).unwrap()];
+        want.sort();
+        assert_eq!(
+            left, want,
+            "the oldest unpinned blob went, not the pinned one"
+        );
+
+        tokio::fs::remove_dir_all(dir).await.unwrap();
+    }
 }
