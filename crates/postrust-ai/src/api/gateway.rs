@@ -50,6 +50,18 @@ const HOP_BY_HOP: &[&str] = &[
     "content-length",
 ];
 
+/// The caller's credentials for this node. A peer node checks them again; a
+/// model server has no use for them, and an attached one may be run by
+/// someone else.
+const CREDENTIALS: &[&str] = &["authorization", "cookie"];
+
+/// Where a request is going, which decides what of it is passed on.
+#[derive(Clone, Copy)]
+enum Hop {
+    ModelServer,
+    Peer,
+}
+
 pub(super) async fn infer(
     State(state): State<AppState>,
     Path((model, path)): Path<(String, String)>,
@@ -174,7 +186,7 @@ pub(super) async fn infer(
 
     let target = format!("{}/{}{}", lease.base_url(), path, query);
     let timeout = Duration::from_secs(state.config.gateway.request_timeout_secs);
-    let mut response = send(&state, &target, request, timeout, lease).await?;
+    let mut response = send(&state, &target, Hop::ModelServer, request, timeout, lease).await?;
 
     let h = response.headers_mut();
     if let Ok(v) = HeaderValue::from_str(&state.config.node.id) {
@@ -249,7 +261,7 @@ async fn forward_to_peer(
         base.trim_end_matches('/')
     );
     let timeout = Duration::from_secs(state.config.gateway.request_timeout_secs);
-    send(state, &target, request, timeout, ()).await
+    send(state, &target, Hop::Peer, request, timeout, ()).await
 }
 
 /// Forward `request` to `target`, streaming. `guard` is held until the
@@ -258,13 +270,14 @@ async fn forward_to_peer(
 async fn send<G: Send + 'static>(
     state: &AppState,
     target: &str,
+    hop: Hop,
     request: Request,
     timeout: Duration,
     guard: G,
 ) -> ApiResult<Response> {
     let method = reqwest::Method::from_bytes(request.method().as_str().as_bytes())
         .map_err(|_| AiError::BadRequest("unsupported method".into()))?;
-    let headers = filter_headers(request.headers());
+    let headers = filter_headers(request.headers(), hop);
     let body = reqwest::Body::wrap_stream(request.into_body().into_data_stream());
 
     let upstream = state
@@ -292,10 +305,13 @@ async fn send<G: Send + 'static>(
         .map_err(|e| AiError::Upstream(e.to_string()).into())
 }
 
-fn filter_headers(headers: &HeaderMap) -> reqwest::header::HeaderMap {
+fn filter_headers(headers: &HeaderMap, hop: Hop) -> reqwest::header::HeaderMap {
     let mut out = reqwest::header::HeaderMap::new();
     for (name, value) in headers {
         if HOP_BY_HOP.contains(&name.as_str()) {
+            continue;
+        }
+        if matches!(hop, Hop::ModelServer) && CREDENTIALS.contains(&name.as_str()) {
             continue;
         }
         if let (Ok(n), Ok(v)) = (
@@ -306,4 +322,29 @@ fn filter_headers(headers: &HeaderMap) -> reqwest::header::HeaderMap {
         }
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn credentials_reach_a_peer_but_not_a_model_server() {
+        let mut headers = HeaderMap::new();
+        headers.insert("authorization", HeaderValue::from_static("Bearer t"));
+        headers.insert("cookie", HeaderValue::from_static("s=1"));
+        headers.insert("content-type", HeaderValue::from_static("application/json"));
+        headers.insert("connection", HeaderValue::from_static("close"));
+
+        let to_model = filter_headers(&headers, Hop::ModelServer);
+        assert!(to_model.get("authorization").is_none());
+        assert!(to_model.get("cookie").is_none());
+        assert!(to_model.get("connection").is_none());
+        assert_eq!(to_model["content-type"], "application/json");
+
+        let to_peer = filter_headers(&headers, Hop::Peer);
+        assert_eq!(to_peer["authorization"], "Bearer t");
+        assert_eq!(to_peer["cookie"], "s=1");
+        assert!(to_peer.get("connection").is_none());
+    }
 }
