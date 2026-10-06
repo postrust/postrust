@@ -335,7 +335,9 @@ Everything except the three probes needs authentication when
 
 Errors are `{"error": "..."}`: 400 for a bad request or configuration, 404 for
 an unknown job, model, queue or workflow, 409 for a conflict, 502 when the
-model server failed to load or answered badly, 500 otherwise.
+model server failed to load or answered badly, 503 with `Retry-After` when a
+load is slow or resources are short, 500 otherwise. Authentication failures are
+401 and 403, as below.
 
 ### Authentication
 

@@ -87,8 +87,8 @@ maintenance_secs = 5
 # or set one (HS256).
 # jwt_secret = "change-me"
 # audience = "postrust-ai"
-# Roles allowed to load and unload models and pause queues. Empty: any
-# authenticated caller.
+# Roles allowed to load and unload models and pause queues. The default is
+# empty, which lets any authenticated caller.
 admin_roles = ["admin"]
 
 # ---------------------------------------------------------------------------
@@ -165,7 +165,9 @@ args = ["-m", "{file:0}", "--host", "127.0.0.1", "--port", "{port}"]
 # Ollama, run by someone else. Nothing is started or stopped; the node asks the
 # server to load the model into memory and to unload it again. An attached
 # model has exactly one instance, so max_replicas stays 1. It is kept loaded
-# (pinned), and counted against the budget like any other model.
+# (pinned), and counted against the budget like any other model. This one is
+# declared as CPU only: if Ollama runs on a GPU this node also uses, set
+# gpu_mb, or its VRAM goes unaccounted and a vLLM load can run out of memory.
 [[model]]
 id = "llama3-8b"
 kind = "text"
