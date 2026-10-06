@@ -97,6 +97,17 @@ pub fn stub_model(id: &str, url: &str, max_concurrency: usize) -> ModelSpec {
 
 /// A manager over `models` with a generous memory budget and no GPUs.
 pub async fn manager(node: &str, models: &[ModelSpec]) -> ModelManager {
+    manager_with(node, models, None, |_| {}).await
+}
+
+/// [`manager`], recording model events to `events` and with `tune` applied
+/// to the resource config (GPUs, a tighter memory budget).
+pub async fn manager_with(
+    node: &str,
+    models: &[ModelSpec],
+    events: Option<PgPool>,
+    tune: impl FnOnce(&mut ResourceConfig),
+) -> ModelManager {
     let mut resources = ResourceConfig::default();
     resources.memory_mb = Some(10_000);
     resources.gpus = Some(vec![]);
@@ -106,6 +117,7 @@ pub async fn manager(node: &str, models: &[ModelSpec]) -> ModelManager {
     static NEXT_RANGE: std::sync::atomic::AtomicU16 = std::sync::atomic::AtomicU16::new(0);
     let low = 20_000 + NEXT_RANGE.fetch_add(1, std::sync::atomic::Ordering::Relaxed) * 50;
     resources.port_range = (low, low + 49);
+    tune(&mut resources);
     let mut cache = CacheConfig::default();
     cache.dir = std::env::temp_dir().join(unique("postrust-ai-e2e"));
     let files = Arc::new(
@@ -120,7 +132,7 @@ pub async fn manager(node: &str, models: &[ModelSpec]) -> ModelManager {
         Probe::default(),
         reqwest::Client::new(),
         files,
-        None,
+        events,
     )
 }
 

@@ -73,6 +73,24 @@ pub struct Probe {
     pub mem_available_mb: u64,
     /// GPUs.
     pub gpus: Vec<GpuProbe>,
+    /// Load average, if `/proc/loadavg` exists. Information only: nothing in
+    /// scheduling or eviction reads it.
+    pub load: Option<LoadAvg>,
+    /// Logical CPUs available to this process, if the platform says.
+    pub cpus: Option<usize>,
+}
+
+/// The kernel's load averages: runnable plus uninterruptible tasks, averaged
+/// over the last 1, 5 and 15 minutes.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize)]
+#[non_exhaustive]
+pub struct LoadAvg {
+    /// Last minute.
+    pub one: f64,
+    /// Last five minutes.
+    pub five: f64,
+    /// Last fifteen minutes.
+    pub fifteen: f64,
 }
 
 /// One GPU's reading.
@@ -99,8 +117,23 @@ impl Probe {
             probe.mem_available_mb = available;
         }
         probe.gpus = read_nvidia_smi().await.unwrap_or_default();
+        probe.load = tokio::fs::read_to_string("/proc/loadavg")
+            .await
+            .ok()
+            .and_then(|text| parse_loadavg(&text));
+        probe.cpus = std::thread::available_parallelism().ok().map(|n| n.get());
         probe
     }
+}
+
+/// `0.52 0.58 0.59 1/467 12345`: the first three fields.
+fn parse_loadavg(text: &str) -> Option<LoadAvg> {
+    let mut fields = text.split_whitespace();
+    Some(LoadAvg {
+        one: fields.next()?.parse().ok()?,
+        five: fields.next()?.parse().ok()?,
+        fifteen: fields.next()?.parse().ok()?,
+    })
 }
 
 fn parse_meminfo(text: &str) -> (u64, u64) {
@@ -411,6 +444,15 @@ mod tests {
     }
 
     #[test]
+    fn loadavg_parses_its_first_three_fields() {
+        let load = parse_loadavg("0.52 1.58 2.59 3/467 12345\n").unwrap();
+        assert_eq!((load.one, load.five, load.fifteen), (0.52, 1.58, 2.59));
+        assert_eq!(parse_loadavg(""), None);
+        assert_eq!(parse_loadavg("0.5 0.6"), None);
+        assert_eq!(parse_loadavg("a b c"), None);
+    }
+
+    #[test]
     fn nvidia_smi_lines_parse() {
         let gpus = parse_nvidia_smi("0, NVIDIA RTX 4050, 6141, 12\n1, A100, 81920, 0\n");
         assert_eq!(gpus.len(), 2);
@@ -514,7 +556,7 @@ mod tests {
         p.update_probe(Probe {
             mem_total_mb: 64_000,
             mem_available_mb: 3000,
-            gpus: vec![],
+            ..Default::default()
         });
         assert_eq!(p.mem_free(), 3000);
     }

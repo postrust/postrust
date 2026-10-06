@@ -197,6 +197,29 @@ impl Metrics {
             );
         }
 
+        let _ = writeln!(out, "# HELP postrust_ai_instance_measured_mem_mb Host memory held by an instance's process group, as last measured.\n# TYPE postrust_ai_instance_measured_mem_mb gauge");
+        for i in instances {
+            if let Some(mb) = i.measured_mem_mb {
+                let _ = writeln!(
+                    out,
+                    "postrust_ai_instance_measured_mem_mb{{model=\"{}\",instance=\"{}\"}} {mb}",
+                    escape(&i.model_id),
+                    i.id
+                );
+            }
+        }
+        let _ = writeln!(out, "# HELP postrust_ai_instance_measured_gpu_mb VRAM held by an instance's process group, as last measured.\n# TYPE postrust_ai_instance_measured_gpu_mb gauge");
+        for i in instances {
+            if let Some(mb) = i.measured_gpu_mb {
+                let _ = writeln!(
+                    out,
+                    "postrust_ai_instance_measured_gpu_mb{{model=\"{}\",instance=\"{}\"}} {mb}",
+                    escape(&i.model_id),
+                    i.id
+                );
+            }
+        }
+
         let _ = writeln!(out, "# HELP postrust_ai_memory_mb Host memory budget and reservations.\n# TYPE postrust_ai_memory_mb gauge");
         let _ = writeln!(
             out,
@@ -221,6 +244,19 @@ impl Metrics {
                 g.index, g.reserved_mb
             );
         }
+        // Information only; nothing schedules on it.
+        if let Some(load) = pool.probe.load {
+            let _ = writeln!(out, "# HELP postrust_ai_cpu_load Load average of this machine.\n# TYPE postrust_ai_cpu_load gauge");
+            for (window, value) in [("1m", load.one), ("5m", load.five), ("15m", load.fifteen)] {
+                let _ = writeln!(out, "postrust_ai_cpu_load{{window=\"{window}\"}} {value}");
+            }
+        }
+        if let Some(cpus) = pool.probe.cpus {
+            let _ = writeln!(
+                out,
+                "# HELP postrust_ai_cpus Logical CPUs available to this process.\n# TYPE postrust_ai_cpus gauge\npostrust_ai_cpus {cpus}"
+            );
+        }
         out
     }
 }
@@ -230,4 +266,38 @@ fn escape(label: &str) -> String {
         .replace('\\', "\\\\")
         .replace('"', "\\\"")
         .replace('\n', "\\n")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::ResourceConfig;
+    use crate::resources::{LoadAvg, Probe};
+
+    #[test]
+    fn cpu_load_is_exposed_only_when_known() {
+        let config = ResourceConfig::default();
+        let metrics = Metrics::default();
+
+        let bare = metrics.render(&[], &[], &ResourcePool::new(&config, Probe::default()));
+        assert!(
+            !bare.contains("postrust_ai_cpu_load{"),
+            "no reading, no gauge"
+        );
+        assert!(!bare.contains("postrust_ai_cpus "));
+
+        let probe = Probe {
+            load: Some(LoadAvg {
+                one: 0.5,
+                five: 1.5,
+                fifteen: 2.5,
+            }),
+            cpus: Some(8),
+            ..Default::default()
+        };
+        let text = metrics.render(&[], &[], &ResourcePool::new(&config, probe));
+        assert!(text.contains("postrust_ai_cpu_load{window=\"1m\"} 0.5"));
+        assert!(text.contains("postrust_ai_cpu_load{window=\"15m\"} 2.5"));
+        assert!(text.contains("postrust_ai_cpus 8"));
+    }
 }

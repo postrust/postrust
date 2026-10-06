@@ -38,6 +38,14 @@ impl ServerHandle for ProcessHandle {
         self.exit.clone()
     }
 
+    fn pid(&self) -> Option<u32> {
+        // For a container the child is the `docker run` client, not the server.
+        if self.container.is_some() {
+            return None;
+        }
+        self.child.id()
+    }
+
     async fn stop(&mut self, grace: Duration) {
         if self.exited().is_some() {
             return;

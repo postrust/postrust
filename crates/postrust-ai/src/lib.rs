@@ -45,6 +45,7 @@ pub mod cache;
 pub mod config;
 pub mod executor;
 pub mod manager;
+pub mod measure;
 pub mod metrics;
 pub mod model;
 pub mod nodes;

@@ -63,6 +63,12 @@ pub trait ServerHandle: Send + Sync {
     /// `Some(why)` once the server has exited. Always `None` for attached
     /// servers, which this node does not own.
     fn exited(&mut self) -> Option<String>;
+    /// The process (and group) leader, for measuring what the server uses.
+    /// `None` for servers this node did not start, and for containers, whose
+    /// processes live in another namespace.
+    fn pid(&self) -> Option<u32> {
+        None
+    }
     /// Stop it: a polite signal, then force after `grace`.
     async fn stop(&mut self, grace: Duration);
 }

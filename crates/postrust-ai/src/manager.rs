@@ -45,6 +45,7 @@ use uuid::Uuid;
 use crate::cache::FileCache;
 use crate::config::ResourceConfig;
 use crate::error::{AiError, AiResult};
+use crate::measure;
 use crate::model::ModelSpec;
 use crate::queue::{ModelDemand, Priority};
 use crate::resources::{Need, Probe, Reservation, ResourcePool};
@@ -97,6 +98,11 @@ struct Instance {
     load_duration: Duration,
     /// Was asked to stop because of pressure rather than idleness.
     evicted: bool,
+    /// Last measured host memory and VRAM, MiB. Reported, never acted on.
+    measured_mem_mb: Option<u64>,
+    measured_gpu_mb: Option<u64>,
+    /// The over-budget warning has been given, so it is not repeated.
+    over_budget_reported: bool,
 }
 
 impl Instance {
@@ -134,6 +140,11 @@ pub struct InstanceInfo {
     pub reservation: Reservation,
     /// How long it took to load, in seconds.
     pub load_secs: f64,
+    /// Host memory the server's process group holds, MiB, as of the last
+    /// `maintain` pass. `None`: not measured (container, attached, loading).
+    pub measured_mem_mb: Option<u64>,
+    /// VRAM held by that group, MiB. `None` without `nvidia-smi`.
+    pub measured_gpu_mb: Option<u64>,
 }
 
 struct State {
@@ -579,11 +590,6 @@ impl ModelManager {
                     && (i.sessions == 0 || opts.priority == Priority::Critical)
             })
             .filter(|i| {
-                // Never below min_warm for a ready instance.
-                i.state == InstanceState::Parked
-                    || ready_counts.get(i.spec.id.as_str()).copied().unwrap_or(0) > i.spec.min_warm
-            })
-            .filter(|i| {
                 state
                     .demand
                     .get(&i.spec.id)
@@ -602,6 +608,35 @@ impl ModelManager {
                 break;
             }
             let instance = &state.instances[&id];
+            // Stopping something that frees nothing this request is short of
+            // is pure loss. Waking a parked instance asks only for VRAM, so
+            // without this the parked instance itself (its host memory is the
+            // one thing it holds) was the first victim, and was stopped to
+            // make room for waking it.
+            //
+            // Judged per dimension, not by whether the shortfall drops: the
+            // VRAM shortfall is that of the GPU closest to fitting, so freeing
+            // part of what another GPU lacks leaves it unchanged, though
+            // several such victims together may make room there.
+            let short = projected.shortfall(need);
+            let frees_mem = short.mem_mb > 0 && instance.reservation.mem_mb > 0;
+            let frees_gpu =
+                short.gpu_mb > 0 && instance.reservation.gpu.is_some_and(|(_, mb)| mb > 0);
+            if !frees_mem && !frees_gpu {
+                continue;
+            }
+            // Never below min_warm for a ready instance, counting the victims
+            // already chosen in this pass: the counts were taken before any
+            // were, so without this two idle replicas of a `min_warm = 1`
+            // model could both be picked. A parked instance is not counted
+            // as warm and may go.
+            if instance.state == InstanceState::Ready {
+                let left = ready_counts.entry(instance.spec.id.as_str()).or_default();
+                if *left <= instance.spec.min_warm {
+                    continue;
+                }
+                *left -= 1;
+            }
             if instance.state == InstanceState::Ready
                 && instance.spec.can_park()
                 && projected.shortfall(need).mem_mb == 0
@@ -753,6 +788,9 @@ impl ModelManager {
                 last_used: Instant::now(),
                 load_duration: Duration::ZERO,
                 evicted: false,
+                measured_mem_mb: None,
+                measured_gpu_mb: None,
+                over_budget_reported: false,
             },
         );
         tracing::info!(model = %spec.id, instance = %id, ?reservation, "loading model");
@@ -1009,18 +1047,64 @@ impl ModelManager {
                 .collect()
         };
         let mut crashed = Vec::new();
+        let mut pids: Vec<(Uuid, u32)> = Vec::new();
         for (id, model, handle) in handles {
             if let Ok(mut h) = handle.try_lock() {
                 if let Some(exit) = h.exited() {
                     crashed.push((id, model, exit));
+                } else if let Some(pid) = h.pid() {
+                    pids.push((id, pid));
                 }
             }
         }
+        // Once per pass, outside the state lock: it reads /proc and runs
+        // nvidia-smi.
+        let usage = measure::measure(&pids.iter().map(|(_, pid)| *pid).collect::<Vec<_>>()).await;
 
         let mut warm_up = Vec::new();
+        let mut over_budget = Vec::new();
         {
             let mut state = self.inner.state.lock();
             state.pool.update_probe(probe);
+
+            for (id, pid) in &pids {
+                let (Some(instance), Some(used)) = (state.instances.get_mut(id), usage.get(pid))
+                else {
+                    continue;
+                };
+                // An instance that moved on (stopping) keeps its last reading.
+                if !matches!(instance.state, InstanceState::Ready | InstanceState::Parked) {
+                    continue;
+                }
+                instance.measured_mem_mb = used.mem_mb;
+                instance.measured_gpu_mb = used.gpu_mb;
+                // Against what the instance holds now: a parked one holds its
+                // weights in host memory, and that is what is reserved.
+                let held_mem = instance.reservation.mem_mb;
+                let held_gpu = instance.reservation.gpu.map_or(0, |(_, mb)| mb);
+                let mem_over = used
+                    .mem_mb
+                    .is_some_and(|m| measure::is_over_budget(held_mem, m));
+                let gpu_over = used
+                    .gpu_mb
+                    .is_some_and(|m| measure::is_over_budget(held_gpu, m));
+                if (mem_over || gpu_over) && !instance.over_budget_reported {
+                    instance.over_budget_reported = true;
+                    let detail = serde_json::json!({
+                        "declared_mem_mb": held_mem,
+                        "measured_mem_mb": used.mem_mb,
+                        "declared_gpu_mb": held_gpu,
+                        "measured_gpu_mb": used.gpu_mb,
+                    });
+                    tracing::warn!(
+                        model = %instance.spec.id,
+                        instance = %id,
+                        %detail,
+                        "model server uses more than its spec declares; reservations are unchanged"
+                    );
+                    over_budget.push((instance.spec.id.clone(), *id, detail));
+                }
+            }
 
             for (id, model, exit) in &crashed {
                 tracing::error!(%model, instance = %id, %exit, "model server exited unexpectedly");
@@ -1104,6 +1188,9 @@ impl ModelManager {
                     warm_up.push(model.clone());
                 }
             }
+        }
+        for (model, id, detail) in over_budget {
+            self.event(&model, Some(id), "over_budget", detail);
         }
         if !crashed.is_empty() {
             for (id, model, exit) in crashed {
@@ -1269,6 +1356,8 @@ impl ModelManager {
                 idle_secs: i.last_used.elapsed().as_secs(),
                 reservation: i.reservation,
                 load_secs: i.load_duration.as_secs_f64(),
+                measured_mem_mb: i.measured_mem_mb,
+                measured_gpu_mb: i.measured_gpu_mb,
             })
             .collect();
         out.sort_by(|a, b| a.model_id.cmp(&b.model_id).then(a.id.cmp(&b.id)));

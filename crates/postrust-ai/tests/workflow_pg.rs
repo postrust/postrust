@@ -246,12 +246,25 @@ async fn a_permanent_step_failure_fails_the_run_and_cancels_outstanding_jobs() {
         "{failed:?}"
     );
 
-    let rows: Vec<(String, String)> =
-        sqlx::query_as("SELECT workflow_step, status FROM ai.jobs WHERE workflow_run_id = $1")
-            .bind(run.id)
-            .fetch_all(&h.pool)
-            .await
-            .unwrap();
+    // The run is marked failed first and its outstanding jobs are cancelled
+    // right after, in a second statement: poll for that, do not assume it.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    let rows = loop {
+        let rows: Vec<(String, String)> =
+            sqlx::query_as("SELECT workflow_step, status FROM ai.jobs WHERE workflow_run_id = $1")
+                .bind(run.id)
+                .fetch_all(&h.pool)
+                .await
+                .unwrap();
+        if rows
+            .iter()
+            .any(|(s, st)| s == "parked" && st == "cancelled")
+            || tokio::time::Instant::now() > deadline
+        {
+            break rows;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    };
     let status_of = |step: &str| {
         rows.iter()
             .find(|(s, _)| s == step)

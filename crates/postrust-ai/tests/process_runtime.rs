@@ -121,3 +121,42 @@ async fn shutdown_stops_every_child() {
     wait_until("the child to exit", || servers_on(port).is_empty()).await;
     let _ = std::fs::remove_dir_all(dir);
 }
+
+#[tokio::test]
+async fn maintain_measures_a_running_childs_memory() {
+    let dir = std::env::temp_dir().join(common::unique("postrust-ai-proc"));
+    std::fs::create_dir_all(&dir).unwrap();
+    let m = manager("proc-test", &[http_server_model("py", &dir)]).await;
+    let lease = m
+        .acquire(
+            "py",
+            AcquireOptions::new(Priority::Normal, Duration::from_secs(30)),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        m.instances()[0].measured_mem_mb,
+        None,
+        "nothing is measured before maintain runs"
+    );
+
+    m.maintain().await;
+    let info = m.instances().remove(0);
+    let mem = info
+        .measured_mem_mb
+        .expect("a python child has a resident set");
+    assert!(mem > 0, "python is bigger than 1 MiB");
+    assert_eq!(
+        info.measured_gpu_mb.is_some(),
+        std::process::Command::new("nvidia-smi")
+            .arg("-L")
+            .output()
+            .is_ok_and(|o| o.status.success()),
+        "VRAM is measured exactly when nvidia-smi can answer"
+    );
+    // Information only: the reservation is still the declared one.
+    assert_eq!(info.reservation.mem_mb, 50);
+    drop(lease);
+    m.shutdown().await;
+    let _ = std::fs::remove_dir_all(dir);
+}
