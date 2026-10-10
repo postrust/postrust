@@ -110,7 +110,11 @@ export default component$(() => {
               <code class="font-mono text-sm">invalid-jwt</code> error and
               should drop the token or refresh it. The public Rust API gains{" "}
               <code class="font-mono text-sm">postrust_graphql::hasura::invalid_jwt</code>{" "}
-              and loses nothing. Conformance is unchanged.
+              and loses nothing. Conformance is unchanged. The README, docs and
+              site also stop saying what nobody measured &mdash; &ldquo;serverless-first&rdquo;,
+              &ldquo;5&ndash;20 ms cold starts&rdquo;, a ~5 MB binary &mdash; and{" "}
+              <code class="font-mono text-sm">postrust-worker</code> 0.6.1 says on
+              crates.io that it is a placeholder.
             </p>
           </section>
 

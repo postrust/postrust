@@ -1,15 +1,17 @@
 # postrust-worker
 
-Cloudflare Workers adapter for Postrust, for edge REST APIs over PostgreSQL.
+A placeholder for a Cloudflare Workers adapter for Postrust. **It does not work
+yet:** its fetch handler answers `{"status": "stub"}`, it reaches no database,
+and it does not currently build for `wasm32-unknown-unknown`.
 
-- Compiles the Postrust request pipeline to WebAssembly for Cloudflare Workers.
-- Connects to PostgreSQL through Hyperdrive or a TCP-capable proxy.
+Making it real means separating Postrust's engine from its database driver and
+adding a driver that reaches PostgreSQL through Hyperdrive over a Workers
+socket. The plan, the requirements and how to help are in
+[issue #50](https://github.com/postrust/postrust/issues/50).
 
-## Install
-
-```bash
-cargo add postrust-worker
-```
+To run Postrust serverless today, use
+[`postrust-lambda`](https://crates.io/crates/postrust-lambda), which serves the
+same REST and GraphQL APIs as the server on AWS Lambda.
 
 ## Part of Postrust
 

@@ -2,13 +2,13 @@
 name = "postrust-worker"
 # Deliberately NOT `version.workspace = true`. This adapter is a stub, and the
 # rest of the workspace is heading for 1.0.0. See docs/stability.md.
-version = "0.6.0"
+version = "0.6.1"
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 authors.workspace = true
-description = "Cloudflare Workers adapter for Postrust, for edge REST APIs over PostgreSQL"
+description = "Placeholder for a Cloudflare Workers adapter for Postrust; not functional yet (see issue #50)"
 homepage.workspace = true
 readme = "README.md"
 keywords = ["cloudflare", "workers", "edge", "postgres", "wasm"]

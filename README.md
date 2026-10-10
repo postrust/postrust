@@ -16,7 +16,7 @@
 
 ## What is Postrust?
 
-Postrust is a serverless-first REST API server for PostgreSQL databases. Inspired by [PostgREST](https://postgrest.org), it automatically generates a RESTful API from your database schema, supporting filtering, pagination, embedding, and full CRUD operations.
+Postrust is one Rust binary that serves a PostgreSQL schema as a REST API in PostgREST's dialect and a GraphQL API in Hasura's, with an opt-in Apollo Federation v2 subgraph mode. Filtering, pagination, embedding, full CRUD, JWT and row-level security come from the schema; nothing is written per table. It runs as a server, in a container, or on AWS Lambda.
 
 **Why Postrust?**
 
@@ -355,7 +355,7 @@ cargo lambda build --release -p postrust-lambda
 # Run it in AWS's runtime image against PostgreSQL with RLS
 scripts/serverless/lambda.sh
 
-# Deploy with AWS SAM, Serverless Framework, or CDK
+# Deploy: docs/deployment.md has SAM and Serverless Framework templates
 ```
 
 Example SAM template:

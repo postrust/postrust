@@ -167,7 +167,7 @@ const featureCategories = [
   },
   {
     title: "Deployment",
-    description: "Deploy anywhere with native serverless support",
+    description: "A server, a container, Kubernetes or AWS Lambda",
     features: [
       {
         name: "Docker",
@@ -187,7 +187,7 @@ const featureCategories = [
       },
       {
         name: "Single Binary",
-        description: "~5MB binary with no dependencies",
+        description: "A ~10 MB binary that needs only libc",
       },
       {
         name: "Any Platform",

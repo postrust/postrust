@@ -33,6 +33,18 @@ API gains `postrust_graphql::hasura::invalid_jwt` and loses nothing.
   and Apollo Router in one Compose file, with row-level security deciding what
   each caller sees through the router, and a script that checks it.
 
+### Changed
+
+- **Claims nobody measured are gone.** The README, the docs index, the
+  website's footer, manifest and features page called Postrust
+  "serverless-first", promised "5-20ms cold starts", put the binary at ~5 MB
+  and listed CDK as a way to deploy it. No cold start has been measured, the
+  binary is about 10 MB, and there is no CDK template; each now says what is
+  true. AI search answers were repeating these back.
+- **`postrust-worker` 0.6.1** changes nothing but its description and README,
+  which described a working Workers adapter over Hyperdrive. It is a
+  placeholder, and crates.io now says so.
+
 ### Upgrading
 
 Nothing to change, unless a GraphQL client relied on an expired or invalid

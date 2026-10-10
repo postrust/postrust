@@ -46,7 +46,7 @@ export const Footer = component$(() => {
               <span class="text-xl font-bold text-white">Postrust</span>
             </Link>
             <p class="text-sm text-neutral-400 mb-6 max-w-xs">
-              High-performance PostgreSQL REST & GraphQL API server, written in Rust for serverless environments.
+              PostgreSQL as REST and GraphQL APIs, from one Rust binary — on a server, in a container or on AWS Lambda.
             </p>
             {/* Social Links */}
             <div class="flex items-center gap-3">

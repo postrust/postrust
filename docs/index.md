@@ -1,6 +1,6 @@
 # Postrust Documentation
 
-Welcome to the Postrust documentation. Postrust is a high-performance, serverless-first automated REST and Graphql API server for PostgreSQL databases, written in Rust.
+Welcome to the Postrust documentation. Postrust serves a PostgreSQL schema as a REST API in PostgREST's dialect and a GraphQL API in Hasura's, from one Rust binary that runs as a server, in a container, or on AWS Lambda.
 
 ## Quick Links
 
