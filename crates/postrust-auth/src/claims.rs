@@ -46,10 +46,14 @@ impl Claims {
         serde_json::to_string(&self.values).unwrap_or_else(|_| "{}".to_string())
     }
 
-    /// Get claims for a specific prefix (e.g., "request.jwt.claims.").
+    /// Get claims whose names can safely extend a PostgreSQL setting prefix.
+    ///
+    /// Claims whose dot-separated names are not PostgreSQL identifiers remain
+    /// available in the complete JSON document but cannot become settings.
     pub fn prefixed_entries(&self, prefix: &str) -> Vec<(String, String)> {
         self.values
             .iter()
+            .filter(|(key, _)| valid_setting_suffix(key))
             .map(|(k, v)| {
                 let key = format!("{}{}", prefix, k);
                 let value = match v {
@@ -60,6 +64,17 @@ impl Claims {
             })
             .collect()
     }
+}
+
+fn valid_setting_suffix(value: &str) -> bool {
+    !value.is_empty()
+        && value.split('.').all(|segment| {
+            let mut characters = segment.chars();
+            characters
+                .next()
+                .is_some_and(|first| first.is_ascii_alphabetic() || first == '_')
+                && characters.all(|character| character.is_ascii_alphanumeric() || character == '_')
+        })
 }
 
 impl From<HashMap<String, serde_json::Value>> for Claims {
@@ -112,5 +127,40 @@ mod tests {
         let entries = claims.prefixed_entries("request.jwt.claims.");
         assert_eq!(entries.len(), 2);
         assert!(entries.iter().any(|(k, _)| k == "request.jwt.claims.role"));
+    }
+
+    #[test]
+    fn prefixed_entries_render_structured_values_as_json() {
+        let mut claims = Claims::new();
+        claims.set("org_class", serde_json::json!(["defense", "datacenters"]));
+
+        let entries = claims.prefixed_entries("request.jwt.claims.");
+        assert_eq!(
+            entries,
+            vec![(
+                "request.jwt.claims.org_class".to_string(),
+                r#"["defense","datacenters"]"#.to_string()
+            )]
+        );
+    }
+
+    #[test]
+    fn prefixed_entries_skip_claim_names_that_are_not_postgresql_settings() {
+        let mut claims = Claims::new();
+        claims.set(
+            "https://hasura.io/jwt/claims",
+            serde_json::json!({"x-hasura-role": "user"}),
+        );
+        claims.set("2fa", serde_json::json!(true));
+        claims.set("user_id", serde_json::json!("user-1"));
+
+        let entries = claims.prefixed_entries("request.jwt.claims.");
+        assert_eq!(
+            entries,
+            vec![(
+                "request.jwt.claims.user_id".to_string(),
+                "user-1".to_string()
+            )]
+        );
     }
 }

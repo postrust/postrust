@@ -44,6 +44,19 @@ impl AuthResult {
     pub fn claims_json(&self) -> String {
         serde_json::to_string(&self.claims).unwrap_or_else(|_| "{}".to_string())
     }
+
+    /// Build transaction-local PostgreSQL settings for the verified claims.
+    ///
+    /// The complete JSON document preserves every claim. Claims with names
+    /// valid for custom PostgreSQL settings are also exposed individually for
+    /// policies using `request.jwt.claims.<name>`.
+    pub fn claim_settings(&self) -> Vec<(String, String)> {
+        let mut claims = Claims::from(self.claims.clone());
+        claims.set("role", serde_json::Value::String(self.role.clone()));
+        let mut settings = vec![("request.jwt.claims".to_string(), claims.to_json())];
+        settings.extend(claims.prefixed_entries("request.jwt.claims."));
+        settings
+    }
 }
 
 /// JWT configuration.
@@ -186,6 +199,39 @@ mod tests {
         let result = AuthResult::anonymous("anon");
         assert_eq!(result.role, "anon");
         assert!(result.claims.is_empty());
+    }
+
+    #[test]
+    fn auth_result_claim_settings_include_json_and_individual_claims() {
+        let result = AuthResult {
+            role: "authenticated_user".to_string(),
+            claims: HashMap::from([
+                ("role".to_string(), serde_json::json!("untrusted_role")),
+                ("user_id".to_string(), serde_json::json!("user-1")),
+                ("org_class".to_string(), serde_json::json!(["defense"])),
+            ]),
+        };
+
+        let settings = result.claim_settings();
+        let setting = |name: &str| {
+            settings
+                .iter()
+                .find(|(key, _)| key == name)
+                .map(|(_, value)| value.as_str())
+        };
+        let claims: serde_json::Value =
+            serde_json::from_str(setting("request.jwt.claims").unwrap()).unwrap();
+
+        assert_eq!(claims["role"], serde_json::json!("authenticated_user"));
+        assert_eq!(
+            setting("request.jwt.claims.role"),
+            Some("authenticated_user")
+        );
+        assert_eq!(setting("request.jwt.claims.user_id"), Some("user-1"));
+        assert_eq!(
+            setting("request.jwt.claims.org_class"),
+            Some(r#"["defense"]"#)
+        );
     }
 
     #[test]

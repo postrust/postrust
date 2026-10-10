@@ -1031,19 +1031,6 @@ async fn execute_plan(
                     .collect::<Vec<_>>()
                     .join(", ");
 
-                // The claims carry the role, as PostgREST's do: a policy
-                // reading `request.jwt.claims` finds the role it is running as
-                // whether or not the token named one.
-                let mut claims: serde_json::Map<String, serde_json::Value> = auth
-                    .claims
-                    .iter()
-                    .map(|(k, v)| (k.clone(), v.clone()))
-                    .collect();
-                claims.insert(
-                    "role".to_string(),
-                    serde_json::Value::String(auth.role.clone()),
-                );
-
                 let mut settings: Vec<(String, String)> = Vec::new();
 
                 // The settings a role carries come first, before the `role`
@@ -1058,10 +1045,6 @@ async fn execute_plan(
                 settings.extend([
                     ("search_path".to_string(), search_path),
                     ("role".to_string(), auth.role.clone()),
-                    (
-                        "request.jwt.claims".to_string(),
-                        serde_json::Value::Object(claims).to_string(),
-                    ),
                     ("request.method".to_string(), api_request.method.clone()),
                     ("request.path".to_string(), api_request.path.clone()),
                     (
@@ -1073,6 +1056,7 @@ async fn execute_plan(
                         json_object(&api_request.cookies),
                     ),
                 ]);
+                settings.extend(auth.claim_settings());
 
                 // `app_settings`, exposed as PostgREST spells them: a function
                 // or policy reads one back with

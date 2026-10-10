@@ -335,6 +335,27 @@ async fn execute(
     schema: &str,
     query: &str,
 ) -> async_graphql::Response {
+    execute_with_auth(
+        state,
+        pool,
+        schema,
+        query,
+        AuthResult {
+            role: TEST_ROLE.to_string(),
+            claims: HashMap::new(),
+        },
+    )
+    .await
+}
+
+/// Execute a GraphQL document with an explicit verified identity.
+async fn execute_with_auth(
+    state: &Arc<GraphQLState>,
+    pool: &PgPool,
+    schema: &str,
+    query: &str,
+    auth: AuthResult,
+) -> async_graphql::Response {
     let cache = SchemaCache::load(pool, &[schema.to_string()])
         .await
         .expect("failed to load schema cache");
@@ -343,15 +364,8 @@ async fn execute(
     // settles it -- so a test that only executes and never settles would leave
     // its rows uncommitted, exactly as the server would.
     let write: postrust_graphql::context::SharedWrite = Default::default();
-    let ctx = GraphQLContext::new(
-        pool.clone(),
-        SchemaCacheRef::from_static(cache),
-        AuthResult {
-            role: TEST_ROLE.to_string(),
-            claims: HashMap::new(),
-        },
-    )
-    .with_write(std::sync::Arc::clone(&write));
+    let ctx = GraphQLContext::new(pool.clone(), SchemaCacheRef::from_static(cache), auth)
+        .with_write(std::sync::Arc::clone(&write));
 
     let request = Request::new(query).data(ctx).data(pool.clone());
     let response = state.schema.execute(request).await;
@@ -2644,6 +2658,94 @@ async fn a_permission_may_consult_a_table_the_role_cannot_read() {
     );
 
     drop_schema(&pool, &schema).await;
+}
+
+/// Verified JWT claims must reach the same transaction as the GraphQL query.
+///
+/// Role switching alone is insufficient for policies that distinguish users
+/// sharing one database role. Individual claim settings are scoped to the
+/// transaction so a pooled connection cannot retain the prior identity.
+#[tokio::test]
+#[ignore = "requires PostgreSQL"]
+async fn verified_jwt_claims_are_available_to_graphql_rls_without_leaking() {
+    let pool = connect().await;
+    let schema = unique_schema_name("jwtclaims");
+    let reader_role = format!("{}_reader", schema);
+
+    drop_schema(&pool, &schema).await;
+    pool.execute(format!("DROP ROLE IF EXISTS {}", reader_role).as_str())
+        .await
+        .expect("failed to drop stale reader role");
+    pool.execute(format!("CREATE ROLE {} NOLOGIN", reader_role).as_str())
+        .await
+        .expect("failed to create reader role");
+    pool.execute(format!("CREATE SCHEMA {}", schema).as_str())
+        .await
+        .expect("failed to create schema");
+    pool.execute(
+        format!(
+            "CREATE TABLE {schema}.documents (
+                 id integer PRIMARY KEY,
+                 owner_id text NOT NULL,
+                 title text NOT NULL
+             );
+             INSERT INTO {schema}.documents (id, owner_id, title) VALUES
+                 (1, 'user-one', 'first'),
+                 (2, 'user-two', 'second');
+             ALTER TABLE {schema}.documents ENABLE ROW LEVEL SECURITY;
+             CREATE POLICY documents_owner_read ON {schema}.documents
+                 FOR SELECT TO {reader_role}
+                 USING (
+                     owner_id = NULLIF(
+                         current_setting('request.jwt.claims.user_id', true), ''
+                     )
+                 );
+             GRANT USAGE ON SCHEMA {schema} TO {reader_role};
+             GRANT SELECT ON {schema}.documents TO {reader_role};"
+        )
+        .as_str(),
+    )
+    .await
+    .expect("failed to create JWT RLS fixture");
+
+    let state = build_state(&pool, &schema, None, false).await;
+    let query = "{ documents(order_by: [{id: asc}]) { id owner_id } }";
+    let auth_for = |user_id: Option<&str>| {
+        let mut claims = HashMap::new();
+        claims.insert("role".to_string(), serde_json::json!(reader_role.clone()));
+        if let Some(user_id) = user_id {
+            claims.insert("user_id".to_string(), serde_json::json!(user_id));
+        }
+        AuthResult {
+            role: reader_role.clone(),
+            claims,
+        }
+    };
+
+    let first = execute_with_auth(&state, &pool, &schema, query, auth_for(Some("user-one"))).await;
+    let second = execute_with_auth(&state, &pool, &schema, query, auth_for(Some("user-two"))).await;
+    let claimless = execute_with_auth(&state, &pool, &schema, query, auth_for(None)).await;
+
+    drop(state);
+    drop_schema(&pool, &schema).await;
+    pool.execute(format!("DROP ROLE {}", reader_role).as_str())
+        .await
+        .expect("failed to drop reader role");
+
+    let successful_data = |response: async_graphql::Response| {
+        assert!(
+            response.errors.is_empty(),
+            "expected no GraphQL errors -- got: {:?}",
+            response.errors
+        );
+        serde_json::to_value(response.data).expect("data was not serialisable")
+    };
+    assert_eq!(ids_of(&successful_data(first), "documents"), vec![1]);
+    assert_eq!(ids_of(&successful_data(second), "documents"), vec![2]);
+    assert!(
+        ids_of(&successful_data(claimless), "documents").is_empty(),
+        "a later claimless request inherited a pooled connection's JWT identity"
+    );
 }
 
 /// Two tables, one key between them, and the columns a comparison needs.
