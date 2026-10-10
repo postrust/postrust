@@ -58,6 +58,13 @@ is set on every request; the per-claim settings are documented with
 `NULLIF(..., '')`, and with what they cannot reach: nested claims, and names
 that cannot be settings.
 
+**Check any policy written the old way.** Before this release the per-claim
+settings were never set, so a policy casting one read `NULL` and never failed
+-- it also never matched. From this release such a policy matches for a token
+carrying the claim, and fails for one without it on a connection that has
+served one with it. Read `request.jwt.claims` instead, or wrap the setting in
+`NULLIF(..., '')`.
+
 ## 2.0.0
 
 **Postrust can be an Apollo Federation v2 subgraph.** Set

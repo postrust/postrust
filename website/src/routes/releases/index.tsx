@@ -9,51 +9,31 @@ import {
   hasuraAgreement,
 } from "~/data/hasura-conformance";
 
-const VERSION = "2.0.0";
+const VERSION = "2.1.0";
 
 const added = [
   {
-    title: "Postrust can be an Apollo Federation v2 subgraph",
-    body: "Set PGRST_GRAPHQL_FEDERATION=true and the GraphQL API adds _service { sdl }, _entities(representations:) and the Federation directives, so an Apollo router or gateway can compose it with other services. It is opt-in: with the variable unset, Federation metadata is inert and adds nothing to the SDL, and a test holds it there.",
+    title: "GraphQL transactions carry the verified JWT claims",
+    body: "REST set request.jwt.claims for a row-level policy to read; GraphQL set only the role and Hasura's session variables, so a policy telling apart users who share a database role worked over one surface and not the other. Both now set the claims document, with role set to the role the request runs as, and each top-level claim whose name can be a setting as its own request.jwt.claims.<name>.",
   },
   {
-    title: "A table's primary key is its @key, and a table can be shared",
-    body: 'A table marked "federation": {"shared": true} in PGRST_GRAPHQL_METADATA keeps its unprefixed type name, so two subgraphs can both contribute to it, and its non-key columns, computed fields and relationships are marked @shareable. Key columns are shareable through @key already.',
-  },
-  {
-    title: "A prefix, so several Postrust subgraphs can be composed",
-    body: "PGRST_GRAPHQL_TYPE_PREFIX prefixes generated types and root fields, so subgraphs over different databases do not collide when composed. A shared entity's object type stays unprefixed; its root fields and helper types still take the prefix.",
-  },
-  {
-    title: "Root types a router expects",
-    body: "With Federation on, the root types are Query, Mutation and Subscription rather than Hasura's query_root family. With it off, nothing about the names changes.",
-  },
-  {
-    title: "_entities lets PostgreSQL decide what matches",
-    body: "Each type's representations are resolved in one query. A key that PostgreSQL considers equal but spells differently — an uppercase UUID, a citext value in another case, a timestamptz with a different offset — finds its row, and a key that matches nothing is a null in its position rather than an error for the whole list. Select permissions apply to _entities exactly as to any other read.",
-  },
-  {
-    title: "A column can be exposed as GraphQL ID",
-    body: 'PostgreSQL has no ID type, so a key that a router or client expects as ID could not be one. A column_types entry in PGRST_GRAPHQL_METADATA — {"id": "ID"} — changes the GraphQL type of a text, integer or UUID column without changing how it is read, bound or cast.',
-  },
-  {
-    title: "Apollo's own compatibility suite, in CI",
-    body: "Apollo's subgraph compatibility suite runs on every pull request that touches the GraphQL path, against a fixture pinned to Apollo's schema and data. A required-capability failure fails the build; an optional one is reported without failing it.",
+    title: "Subscriptions are authenticated as HTTP requests are",
+    body: 'A WebSocket connection is identified once, from its connection_init payload — {"headers": {"Authorization": "Bearer <token>"}}, as Hasura\'s clients send it, since a browser cannot set headers on a WebSocket — and the upgrade request\'s headers. It goes through the same code an HTTP request does: the admin secret, X-Hasura-Role against the token\'s allowed roles, the role\'s schema and its introspection setting. A connection HTTP would refuse is refused at connection_init, and every live query re-reads as the connection\'s identity, so one row-level policy covers queries and subscriptions alike.',
   },
 ];
 
-const changed = [
+const fixed = [
   {
-    title: "A boolean setting that is not a boolean now stops the server",
-    body: "Every PGRST_* true/false variable used to read anything other than an exact lowercase true as false, so PGRST_DB_AGGREGATES_ENABLED=TRUE, or =yes, or a typo silently disabled the feature. They now accept true/false, 1/0, yes/no and on/off in any case, and anything else fails startup with the variable's name.",
+    title: "GraphQL subscriptions over a WebSocket work",
+    body: "They had not, on the server as shipped: the handshake answered 101 and then nothing, not even connection_ack. The adapter that percent-encodes the > in select=data->>id before hyper parses a request line followed HTTP/1.1 framing and did not know about Upgrade, so after the handshake it read every WebSocket frame as the next request line — holding it back until a newline byte happened to arrive, and percent-encoding the high-bit bytes masked frames are full of. It now stops rewriting after a request that asks to switch protocols.",
   },
   {
-    title: "Configuration and schema structs are #[non_exhaustive]",
-    body: "Federation added public fields to AppConfig, SchemaConfig, TableNames, GeneratedSchema and eight other public structs, and adding a field breaks any code that builds one with an exhaustive struct literal. So that the next feature is not another major release, those structs and the related configuration, schema and metadata types are now #[non_exhaustive].",
+    title: "A subscription that fails says why",
+    body: "A live query whose read failed — a permission refused, a cast that cannot be made — ended with a bare complete, the error dropped on the way out, so a refused subscription looked exactly like one that had finished. The error is now sent, and the subscription ends after it.",
   },
   {
-    title: "postrust-proxy and postrust-worker go to 0.6.0",
-    body: "They depend on postrust-core, which is now 2.0.0. Neither changed otherwise.",
+    title: "The documented policies work on pooled connections",
+    body: "A per-claim setting a connection has ever held reads as '' rather than NULL once the transaction that set it ends. The documentation cast them straight to integer, so a token without the claim was answered on some connections and failed with invalid input syntax for type integer on others, depending only on what the connection had served before. The examples now read the claims document, which is set on every request; the per-claim settings are documented with NULLIF(..., '') and with what they cannot reach.",
   },
 ];
 
@@ -67,22 +47,21 @@ export default component$(() => {
         <div class="container-wide py-12">
           <div class="mb-4 flex items-center gap-3">
             <span class="rounded border border-neutral-200 bg-neutral-100 px-2 py-0.5 text-xs font-semibold text-neutral-800">
-              MAJOR
+              MINOR
             </span>
             <span class="text-sm text-neutral-500">
-              A major version for the Rust API; additive for the server
+              Additive; nothing breaks
             </span>
           </div>
           <h1 class="mb-4 text-4xl font-bold text-neutral-900">
             Postrust {VERSION}
           </h1>
           <p class="max-w-2xl text-lg text-neutral-600">
-            Postrust can now be an Apollo Federation v2 subgraph, so a router
-            can compose its GraphQL API with other services. It is opt-in, and
-            with it off the generated schema is what it was. The version is
-            2.0.0 because of the Rust API, not the server: if you run the binary
-            or the image, the one change you can notice is that a malformed
-            boolean setting now stops startup instead of reading as false.
+            Row-level security now sees the same identity over GraphQL as over
+            REST, including in subscriptions &mdash; which, it turned out, did
+            not work over a WebSocket at all until this release. One policy on
+            the verified JWT claims now covers a REST read, a GraphQL query and
+            a live query alike.
           </p>
         </div>
       </div>
@@ -143,9 +122,10 @@ export default component$(() => {
                 {hasuraConformanceMeta.commit.slice(0, 7)}
               </code>
               . This page reads them from the run&rsquo;s own record, so they
-              move when the suites are re-run and not otherwise. With Federation
-              off, this release adds nothing to the GraphQL schema the Hasura
-              suite measures.
+              move when the suites are re-run and not otherwise. Both suites
+              were re-run on this release&rsquo;s branch and reproduce these
+              figures case for case: the claims and the WebSocket fix change
+              nothing either of them measures.
             </p>
             <p class="mb-4 text-neutral-600">
               Neither harness interprets a test expectation. The reference
@@ -242,26 +222,19 @@ export default component$(() => {
           <section class="mb-12">
             <div class="rounded-lg border border-amber-200 bg-amber-50 p-5">
               <h2 class="mb-2 text-lg font-bold text-neutral-900">
-                What 2.0.0 means
+                What 2.1.0 means
               </h2>
               <p class="mb-2 text-neutral-700">
-                The features are additive for anyone running the server. The
-                major bump is for the Rust API: Federation added public fields
-                to <code class="text-sm">AppConfig</code>,{" "}
-                <code class="text-sm">SchemaConfig</code>,{" "}
-                <code class="text-sm">TableNames</code>,{" "}
-                <code class="text-sm">GeneratedSchema</code> and eight other
-                public structs, and adding a field breaks code that builds one
-                with an exhaustive struct literal. The stability policy covers
-                public struct fields, and{" "}
-                <code class="text-sm">cargo semver-checks</code> against 1.0.1
-                agrees.
+                A minor release. The public Rust API gains one function,{" "}
+                <code class="text-sm">AuthResult::claim_settings</code>, and
+                loses nothing: <code class="text-sm">cargo semver-checks</code>{" "}
+                against 2.0.0 passes for every stable crate. Everything else
+                here is behaviour you see by running the server.
               </p>
               <p class="text-neutral-700">
-                Those structs are now{" "}
-                <code class="text-sm">#[non_exhaustive]</code>, so a new field
-                or variant on one of them is a minor release from here, and a
-                feature that adds a setting does not need 3.0.0.
+                <code class="text-sm">postrust-proxy</code> and{" "}
+                <code class="text-sm">postrust-worker</code> stay at 0.6.0:
+                neither uses anything that changed.
               </p>
             </div>
           </section>
@@ -278,36 +251,37 @@ export default component$(() => {
               ))}
             </div>
             <p class="mt-4 text-neutral-600">
-              Thanks to @CBeardSafire, who asked for Federation in{" "}
+              Thanks to @CBeardSafire, who exposed the claims to GraphQL in{" "}
               <a
-                href="https://github.com/postrust/postrust/issues/40"
+                href="https://github.com/postrust/postrust/pull/45"
                 class="text-primary-600 hover:underline"
               >
-                #40
-              </a>{" "}
-              and built it in{" "}
-              <a
-                href="https://github.com/postrust/postrust/pull/42"
-                class="text-primary-600 hover:underline"
-              >
-                #42
+                #45
               </a>
-              . How to set it up is in{" "}
-              <Link
-                href="/docs/graphql"
+              ; testing that end to end is what found the WebSocket and the
+              documentation problems below, fixed in{" "}
+              <a
+                href="https://github.com/postrust/postrust/pull/47"
                 class="text-primary-600 hover:underline"
               >
-                the GraphQL docs
+                #47
+              </a>
+              . How to write the policies is in{" "}
+              <Link
+                href="/docs/authentication"
+                class="text-primary-600 hover:underline"
+              >
+                the authentication docs
               </Link>
               .
             </p>
           </section>
 
-          {/* Changed */}
+          {/* Fixed */}
           <section class="mb-12">
-            <h2 class="mb-4 text-2xl font-bold text-neutral-900">Changed</h2>
+            <h2 class="mb-4 text-2xl font-bold text-neutral-900">Fixed</h2>
             <div class="space-y-4">
-              {changed.map((c) => (
+              {fixed.map((c) => (
                 <div key={c.title} class="rounded-lg bg-neutral-50 p-4">
                   <h3 class="mb-1 font-semibold text-neutral-900">{c.title}</h3>
                   <p class="text-sm text-neutral-600">{c.body}</p>
@@ -320,50 +294,49 @@ export default component$(() => {
           <section class="mb-12">
             <h2 class="mb-4 text-2xl font-bold text-neutral-900">Upgrading</h2>
             <p class="mb-4 text-neutral-600">
-              <strong>If you run the server</strong>, check your boolean
-              settings. A deployment that was relying on a malformed value
-              reading as false will not start after upgrading. That is the point
-              &mdash; the value never meant what it looked like it meant &mdash;
-              and the error names the variable to fix. Nothing else changes: the
-              HTTP and GraphQL surfaces are the same, and Federation stays off
-              until you turn it on.
+              <strong>If you run the server</strong>, nothing is required. Two
+              things are worth checking.
             </p>
             <p class="mb-4 text-neutral-600">
-              <strong>If you depend on the crates</strong>, build the affected
-              types from their default and assign the fields you need. A struct
-              literal &mdash; including one ending in{" "}
-              <code class="font-mono text-sm">..Default::default()</code>{" "}
-              &mdash; no longer compiles for them from another crate:
+              <strong>Policies on per-claim settings.</strong> If you wrote one
+              the way the documentation used to show, casting{" "}
+              <code class="font-mono text-sm">
+                current_setting(&apos;request.jwt.claims.&lt;name&gt;&apos;,
+                true)
+              </code>{" "}
+              straight to a type, it will now fail for a token without that
+              claim on a connection that has served one with it &mdash; the
+              settings were never set before, so it never read anything. Read
+              the document instead, or wrap the setting in{" "}
+              <code class="font-mono text-sm">NULLIF(..., &apos;&apos;)</code>:
             </p>
             <div class="mb-4 overflow-hidden rounded-xl bg-neutral-900">
               <div class="border-b border-neutral-700 bg-neutral-800 px-4 py-2">
-                <span class="text-sm text-neutral-400">rust</span>
+                <span class="text-sm text-neutral-400">sql</span>
               </div>
               <pre class="overflow-x-auto p-4 text-sm">
-                <code class="text-neutral-100">{`let mut config = SchemaConfig::default();
-config.exposed_schemas = vec!["public".into()];
-config.enable_mutations = true;`}</code>
+                <code class="text-neutral-100">{`-- always defined, and reaches nested claims
+(current_setting('request.jwt.claims', true)::json->>'organization_id')::integer
+
+-- the per-claim form, safe on a reused connection
+NULLIF(current_setting('request.jwt.claims.organization_id', true), '')::integer`}</code>
               </pre>
             </div>
             <p class="mb-4 text-neutral-600">
-              An exhaustive <code class="font-mono text-sm">match</code> on{" "}
-              <code class="font-mono text-sm">ColumnTypeOverride</code> needs a
-              wildcard arm. The affected types are{" "}
-              <code class="font-mono text-sm">AppConfig</code> and{" "}
-              <code class="font-mono text-sm">RoleSettings</code> in{" "}
-              <code class="font-mono text-sm">postrust-core</code>; the schema
-              and field types in{" "}
-              <code class="font-mono text-sm">postrust_graphql::schema</code>;
-              and the metadata types in{" "}
-              <code class="font-mono text-sm">postrust_graphql::names</code>.
-              The changelog lists every one. Nothing else in the public API
-              changed.
+              <strong>Subscription clients.</strong> Send the token in the{" "}
+              <code class="font-mono text-sm">connection_init</code> payload, as
+              Hasura&rsquo;s clients already do. A connection with no token now
+              runs as the anonymous role, and where an admin secret is
+              configured with no unauthorized role it is refused &mdash; as the
+              same request over HTTP would be.
             </p>
             <p class="text-neutral-600">
-              <code class="font-mono text-sm">AppConfig::try_from_env</code>{" "}
-              returns the boolean error;{" "}
-              <code class="font-mono text-sm">AppConfig::from_env</code> panics
-              with it.
+              <strong>If you depend on the crates</strong>, nothing changes.{" "}
+              <code class="font-mono text-sm">
+                postrust_graphql::handler::graphql_ws_handler
+              </code>{" "}
+              is unchanged and now documented as authenticating nothing; the
+              server serves its WebSocket routes with its own handler.
             </p>
           </section>
 
@@ -371,7 +344,16 @@ config.enable_mutations = true;`}</code>
           <section class="mb-12">
             <h2 class="mb-4 text-2xl font-bold text-neutral-900">Known gaps</h2>
             <p class="mb-4 text-neutral-600">
-              In Federation: the primary key is the only{" "}
+              In subscriptions: a connection keeps the identity it was opened
+              with, so a token that expires while a subscription is open does
+              not end it &mdash; a client that needs that should reconnect with
+              a fresh token. A live query on a table without a trigger re-reads
+              on{" "}
+              <code class="font-mono text-sm">PGRST_SUBSCRIPTION_REFRESH</code>{" "}
+              (30 seconds by default) rather than when a row changes.
+            </p>
+            <p class="mb-4 text-neutral-600">
+              In Federation, unchanged from 2.0.0: the primary key is the only{" "}
               <code class="font-mono text-sm">@key</code>, so repeatable keys
               and nested keys are not expressible, and neither are extended or
               external fields, <code class="font-mono text-sm">@requires</code>,{" "}
@@ -380,17 +362,18 @@ config.enable_mutations = true;`}</code>
               <code class="font-mono text-sm">@tag</code>,{" "}
               <code class="font-mono text-sm">@inaccessible</code>,{" "}
               <code class="font-mono text-sm">@composeDirective</code>,{" "}
-              <code class="font-mono text-sm">@interfaceObject</code> or federated
-              tracing. Apollo counts these as optional capabilities; the
-              compatibility fixture keeps them in its target schema on purpose,
-              so they show in every report rather than being dropped from it.
-              The suite&rsquo;s <code class="font-mono text-sm">@shareable</code>{" "}
-              check also reports a failure: it looks for the directive on the
-              type, and Postrust puts it on each non-key field, which composes
-              the same way.
+              <code class="font-mono text-sm">@interfaceObject</code> or
+              federated tracing. Apollo counts these as optional capabilities;
+              the compatibility fixture keeps them in its target schema on
+              purpose, so they show in every report rather than being dropped
+              from it. The suite&rsquo;s{" "}
+              <code class="font-mono text-sm">@shareable</code> check also
+              reports a failure: it looks for the directive on the type, and
+              Postrust puts it on each non-key field, which composes the same
+              way.
             </p>
             <p class="mb-4 text-neutral-600">
-              In the dialects, unchanged from 1.0: the largest gap is{" "}
+              In the dialects, unchanged since 1.0: the largest gap is{" "}
               <strong>introspection</strong>, and it is not reachable from here
               &mdash; async-graphql builds its own registry and keeps it
               private, so the directives it installs and the order it lists
@@ -416,6 +399,38 @@ config.enable_mutations = true;`}</code>
               Previous releases
             </h2>
             <div class="space-y-4">
+              <div class="rounded-lg bg-neutral-50 p-4">
+                <h3 class="mb-1 font-semibold text-neutral-900">2.0.0</h3>
+                <p class="mb-2 text-sm text-neutral-600">
+                  <strong>
+                    Postrust can be an Apollo Federation v2 subgraph.
+                  </strong>{" "}
+                  Opt-in with{" "}
+                  <code class="font-mono">PGRST_GRAPHQL_FEDERATION=true</code>:{" "}
+                  <code class="font-mono">_service</code> and{" "}
+                  <code class="font-mono">_entities</code>, a table&rsquo;s
+                  primary key as its <code class="font-mono">@key</code>, shared
+                  entities, a type prefix for composing several Postrust
+                  subgraphs, and columns exposed as GraphQL{" "}
+                  <code class="font-mono">ID</code>. Apollo&rsquo;s
+                  compatibility suite gates the build. Thanks to @CBeardSafire,{" "}
+                  <a
+                    href="https://github.com/postrust/postrust/pull/42"
+                    class="text-primary-600 hover:underline"
+                  >
+                    #42
+                  </a>
+                  .
+                </p>
+                <p class="text-sm text-neutral-600">
+                  A major version for the Rust API only: Federation added public
+                  fields to configuration and schema structs, which are now{" "}
+                  <code class="font-mono">#[non_exhaustive]</code> so the next
+                  such feature is a minor release. For the server, the one
+                  change to notice was that a malformed boolean setting stopped
+                  startup instead of reading as false.
+                </p>
+              </div>
               <div class="rounded-lg bg-neutral-50 p-4">
                 <h3 class="mb-1 font-semibold text-neutral-900">1.0.1</h3>
                 <p class="mb-2 text-sm text-neutral-600">
@@ -451,8 +466,9 @@ config.enable_mutations = true;`}</code>
                 <h3 class="mb-1 font-semibold text-neutral-900">1.0.0</h3>
                 <p class="mb-2 text-sm text-neutral-600">
                   Seven crates took a semver promise: a breaking change to the
-                  public Rust API needs a major bump, which is why this release
-                  is 2.0.0. <code class="font-mono">postrust-proxy</code> and{" "}
+                  public Rust API needs a major bump, which is why the
+                  Federation release was 2.0.0.{" "}
+                  <code class="font-mono">postrust-proxy</code> and{" "}
                   <code class="font-mono">postrust-worker</code> moved to their
                   own 0.x lines, and nothing in the stable line depends on
                   either.
@@ -493,16 +509,18 @@ config.enable_mutations = true;`}</code>
               </pre>
             </div>
             <p class="mt-3 text-sm text-neutral-500">
-              Federation is off until{" "}
-              <code class="font-mono">PGRST_GRAPHQL_FEDERATION=true</code>. A
-              working subgraph fixture, and how to run Apollo&rsquo;s suite
-              against it, is in{" "}
-              <a
-                href="https://github.com/postrust/postrust/tree/main/scripts/apollo-federation"
+              Subscriptions are at{" "}
+              <code class="font-mono">ws://&lt;host&gt;/v1/graphql/ws</code>,
+              over <code class="font-mono">graphql-transport-ws</code> or the
+              older <code class="font-mono">graphql-ws</code>, with the token in
+              the <code class="font-mono">connection_init</code> payload. The
+              policies that read the claims are in{" "}
+              <Link
+                href="/docs/authentication"
                 class="text-primary-600 hover:underline"
               >
-                scripts/apollo-federation
-              </a>
+                the authentication docs
+              </Link>
               .
             </p>
           </section>
@@ -554,12 +572,12 @@ config.enable_mutations = true;`}</code>
 });
 
 export const head: DocumentHead = {
-  title: `Postrust ${VERSION} — an Apollo Federation subgraph, opt-in`,
+  title: `Postrust ${VERSION} — the same identity over GraphQL, subscriptions included`,
   links: [{ rel: "canonical", href: "https://postrust.org/releases" }],
   meta: [
     {
       name: "description",
-      content: `Postrust ${VERSION}: opt-in Apollo Federation v2 subgraph support, columns exposed as GraphQL ID, and boolean settings that fail startup when malformed. A major version for Rust API changes only; nothing else changes for the server.`,
+      content: `Postrust ${VERSION}: verified JWT claims reach GraphQL transactions as they do REST ones, GraphQL subscriptions over a WebSocket work and are authenticated as HTTP requests are, and the documented row-level policies hold on pooled connections. A minor release; nothing breaks.`,
     },
   ],
 };
