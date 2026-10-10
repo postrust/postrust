@@ -3,10 +3,29 @@
 Notable changes, newest first. This file starts at 1.0.0-alpha.1; earlier
 releases are described by their tags and the pull requests behind them.
 
-## Unreleased
+## 2.2.0
+
+A minor release: additions to the public Rust API (`postrust_server::build`,
+`App` and `Host`, the `graphql` feature, `schema_cache::enum_values`) and no
+breaking change -- `cargo semver-checks` against 2.1.0 passes for every stable
+crate. What people running Postrust will notice is that two deployments which
+did not work now do: the AWS Lambda adapter, and an authenticator set up the
+way PostgREST recommends. `postrust-proxy` and `postrust-worker` stay at
+0.6.0: neither changed.
 
 ### Fixed
 
+- **The Lambda adapter serves the server's router.** It used to carry a
+  request path of its own, which never bound a query's parameters -- so every
+  filter and every write failed with "bind message supplies 0 parameters" --
+  and never switched to the token's role or set its claims. Connected as a
+  least-privilege role, a function found no tables; connected as a superuser,
+  it answered every caller with every row, row-level security or not. It now
+  hands `postrust_server::build` to the Lambda runtime: REST, GraphQL
+  (including Federation), JWT, the role switch and the claims behave exactly as
+  they do in the binary. GraphQL subscriptions and the `NOTIFY` schema reloader
+  are left out, since a function can hold neither a WebSocket nor a listener.
+  The pool defaults to two connections per sandbox.
 - **A `NOINHERIT` authenticator sees the schema.** The schema cache read
   `information_schema`, whose views show a connection only what it can use
   without switching role. Connected as the authenticator PostgREST recommends
@@ -34,17 +53,6 @@ releases are described by their tags and the pull requests behind them.
 - A table's description is read from its own comment. It was looked up by OID
   alone, so a function whose OID matched the table's lent it its comment;
   PostgREST's `collision_test_table` fixture exists to catch exactly that.
-- **The Lambda adapter serves the server's router.** It used to carry a
-  request path of its own, which never bound a query's parameters -- so every
-  filter and every write failed with "bind message supplies 0 parameters" --
-  and never switched to the token's role or set its claims. Connected as a
-  least-privilege role, a function found no tables; connected as a superuser,
-  it answered every caller with every row, row-level security or not. It now
-  hands `postrust_server::build` to the Lambda runtime: REST, GraphQL
-  (including Federation), JWT, the role switch and the claims behave exactly as
-  they do in the binary. GraphQL subscriptions and the `NOTIFY` schema reloader
-  are left out, since a function can hold neither a WebSocket nor a listener.
-  The pool defaults to two connections per sandbox.
 - The docs and website no longer describe the Cloudflare Workers adapter as
   working. It is a stub, and does not build for WebAssembly yet.
 
@@ -53,9 +61,23 @@ releases are described by their tags and the pull requests behind them.
 - `postrust_server::build`, which builds the application a host serves, and a
   `graphql` feature on `postrust-server` that serves GraphQL without the admin
   UI (`admin-ui` implies it).
+- `postrust_core::schema_cache::enum_values`, which reads an enum table's
+  members as a role the connection can become that may read it.
+- Documentation of the role Postrust connects as: a `NOINHERIT`
+  authenticator granted the roles a token may name.
 - `scripts/serverless/lambda.sh`, run in CI: builds the function with
   cargo-lambda and tests it in AWS's `provided:al2023` image against
   PostgreSQL with row-level security.
+
+### Upgrading
+
+- **Lambda paths move under `/api`**, as on the server: `/api/todos`, not
+  `/todos`. Set `PGRST_COMPAT_MODE=true` to serve the REST surface at the root
+  as well. The old root paths only ever answered unfiltered reads.
+- **Lambda's pool** is two connections per sandbox unless
+  `PGRST_DB_POOL_SIZE` says otherwise; it was one, and not configurable.
+- **A `NOINHERIT` authenticator works now.** A deployment that switched to
+  `INHERIT` to get past "Could not find the table" can switch back.
 
 ## 2.1.0
 

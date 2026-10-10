@@ -1,9 +1,25 @@
 # postrust-lambda
 
-AWS Lambda adapter for Postrust, for serverless REST APIs over PostgreSQL.
+AWS Lambda adapter for Postrust, serving its REST and GraphQL APIs over
+PostgreSQL.
 
-- Runs the Postrust request pipeline behind a Lambda function URL or API Gateway.
-- Reuses the schema cache across warm invocations.
+- Serves the router the `postrust` binary serves, built by
+  `postrust_server::build`: REST under `/api`, GraphQL at `/v1/graphql`
+  (Apollo Federation included), JWT authentication, the role switch and the
+  claims row-level security reads. GraphQL subscriptions are left out, since a
+  function cannot hold a WebSocket.
+- Connects and loads the schema cache once per sandbox, in the init phase.
+- Tested in AWS's `provided:al2023` runtime image against PostgreSQL with
+  row-level security, through a `NOINHERIT` authenticator.
+
+Build the function with [cargo-lambda](https://www.cargo-lambda.info/):
+
+```bash
+cargo lambda build --release -p postrust-lambda
+```
+
+See the [deployment guide](https://github.com/postrust/postrust/blob/main/docs/deployment.md#aws-lambda)
+for SAM and Serverless Framework templates, stage paths and pool sizing.
 
 ## Install
 
