@@ -229,8 +229,16 @@ request switches to one, so nothing runs with more than the token allows. The
 schema cache describes every table a role the authenticator can become may
 use, so it does not need to read anything itself.
 
-Never connect as a superuser or as the tables' owner: both bypass row-level
-security.
+A request's queries run as the role it switched to, whatever the connection
+logged in as, so its grants and policies apply either way. What the login role
+decides is everything that runs *before* a switch, or without one -- loading the
+schema cache, reading GraphQL enum tables, and the subscription broker's
+triggers. Connected as a superuser or as the tables'
+owner, all of that runs with privileges that ignore grants and row-level
+security, and a request that somehow skipped its switch would too. With a
+`NOINHERIT` authenticator it can do nothing it was not given. On PostgreSQL 16
+and later, each grant must also carry the `SET` option (the default), since
+switching to the role is what a request does.
 
 ## Row-Level Security (RLS)
 

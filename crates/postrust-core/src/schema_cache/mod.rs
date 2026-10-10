@@ -12,6 +12,8 @@ pub use relationship::{
     Cardinality, Junction, MediaHandler, MediaHandlerMap, Relationship, RelationshipsMap,
 };
 pub use routine::{FuncVolatility, RetType, Routine, RoutineMap, RoutineParam};
+
+pub use queries::enum_values;
 pub use table::{Column, ColumnMap, ComputedColumn, Table, TablesMap};
 
 use crate::api_request::QualifiedIdentifier;

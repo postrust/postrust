@@ -10,6 +10,7 @@ use crate::error::{Error, Result};
 use indexmap::IndexMap;
 use sqlx::{PgPool, Row};
 use std::collections::{HashMap, HashSet};
+use std::sync::LazyLock;
 
 /// Get PostgreSQL version.
 pub async fn get_pg_version(pool: &PgPool) -> Result<i32> {
@@ -36,26 +37,46 @@ pub async fn get_pg_version(pool: &PgPool) -> Result<i32> {
 /// For a superuser, or an authenticator that inherits, the two answers are
 /// the same, so nothing about those deployments changes.
 ///
-/// `CASE` rather than `OR`: SQL does not promise to short-circuit, and
-/// `pg_has_role` refuses OID 0, which is how an ACL spells `PUBLIC`.
 fn acl_grants(acl: &str, privileges: &str) -> String {
     format!(
         "EXISTS (SELECT 1 FROM aclexplode({acl}) g \
           WHERE g.privilege_type = ANY ('{{{privileges}}}'::text[]) \
-            AND CASE WHEN g.grantee = 0 THEN true \
-                     ELSE pg_has_role(g.grantee, 'MEMBER') END)"
+            AND {grantee})",
+        grantee = can_become("g.grantee"),
     )
 }
+
+/// Whether this connection can become the role `role` (an OID expression), or
+/// `role` is `PUBLIC`, which every role is.
+///
+/// `CASE` rather than `OR`: SQL does not promise to short-circuit, and
+/// `pg_has_role` refuses OID 0, which is how an ACL spells `PUBLIC`.
+fn can_become(role: &str) -> String {
+    format!("CASE WHEN {role} = 0 THEN true ELSE pg_has_role({role}, 'MEMBER') END")
+}
+
+/// Whether this connection can become a predefined role that holds privileges
+/// on every table without appearing in any ACL: `pg_read_all_data` and
+/// `pg_write_all_data` (PostgreSQL 14 and later). `has_table_privilege`, which
+/// `information_schema` asks, counts them, so a scan of the ACLs alone hid
+/// every table from a deployment that grants one of these instead of
+/// per-table privileges. Looked up by name, so on a server too old to have
+/// them this is simply false rather than an error.
+const PREDEFINED_DATA_ROLE: &str = "EXISTS (SELECT 1 FROM pg_roles pr \
+     WHERE pr.rolname IN ('pg_read_all_data', 'pg_write_all_data') \
+       AND pg_has_role(pr.oid, 'MEMBER'))";
 
 /// A relation's own ACL, or the owner-only default it stands for when unset.
 const RELATION_ACL: &str = "COALESCE(c.relacl, acldefault('r', c.relowner))";
 
 /// Whether a relation is visible to this connection: `information_schema.tables`'
 /// condition, with `MEMBER` for `USAGE` (see `acl_grants`). A role it can
-/// become owns it, or holds a privilege on it or on one of its columns.
+/// become owns it, or holds a privilege on it or on one of its columns, or
+/// reads or writes every table (see `PREDEFINED_DATA_ROLE`).
 fn relation_visible() -> String {
     format!(
         "(pg_has_role(c.relowner, 'MEMBER') \
+          OR {PREDEFINED_DATA_ROLE} \
           OR {table} \
           OR EXISTS (SELECT 1 FROM pg_attribute ca \
                       WHERE ca.attrelid = c.oid AND ca.attnum > 0 \
@@ -78,9 +99,8 @@ fn privilege_granted(privilege: &str) -> String {
         "(c.relkind IN ('r', 'v', 'f', 'p') AND EXISTS (\
             SELECT 1 FROM aclexplode({RELATION_ACL}) g \
              WHERE g.privilege_type = '{privilege}' \
-               AND (CASE WHEN g.grantee = 0 THEN true \
-                         ELSE pg_has_role(g.grantee, 'MEMBER') END \
-                    OR pg_has_role(g.grantor, 'MEMBER'))))"
+               AND ({grantee} OR pg_has_role(g.grantor, 'MEMBER'))))",
+        grantee = can_become("g.grantee"),
     )
 }
 
@@ -90,9 +110,11 @@ pub async fn load_tables(pool: &PgPool, schemas: &[String]) -> Result<TablesMap>
 
     // From the catalogue rather than `information_schema`, whose views show a
     // connection only what it can use without switching role -- nothing, for
-    // a NOINHERIT authenticator. See `acl_grants`.
-    let sql = format!(
-        r#"
+    // a NOINHERIT authenticator. See `acl_grants`. Built once: it does not
+    // change between loads.
+    static SQL: LazyLock<String> = LazyLock::new(|| {
+        format!(
+            r#"
         SELECT
             t.table_schema,
             t.table_name,
@@ -176,12 +198,13 @@ pub async fn load_tables(pool: &PgPool, schemas: &[String]) -> Result<TablesMap>
           AND NOT t.relispartition
         ORDER BY t.table_schema, t.table_name
         "#,
-        insert = privilege_granted("INSERT"),
-        update = privilege_granted("UPDATE"),
-        delete = privilege_granted("DELETE"),
-        visible = relation_visible(),
-    );
-    let rows = sqlx::query(&sql)
+            insert = privilege_granted("INSERT"),
+            update = privilege_granted("UPDATE"),
+            delete = privilege_granted("DELETE"),
+            visible = relation_visible(),
+        )
+    });
+    let rows = sqlx::query(&SQL)
         .bind(schemas)
         .fetch_all(pool)
         .await
@@ -229,9 +252,10 @@ async fn load_columns(
     // expressions for every column used here, so a type is named exactly as it
     // was, and its visibility test with `MEMBER` for `USAGE` -- see
     // `acl_grants` for why the view itself shows a NOINHERIT authenticator
-    // nothing.
-    let sql = format!(
-        r#"
+    // nothing. Built once, as it runs once per table.
+    static SQL: LazyLock<String> = LazyLock::new(|| {
+        format!(
+            r#"
         SELECT
             c.column_name,
             c.ordinal_position,
@@ -308,6 +332,9 @@ async fn load_columns(
                 )::int AS character_maximum_length,
                 CASE WHEN t.typtype = 'd' THEN t.typname::text END AS domain_name,
                 COALESCE(bt.typname, t.typname)::text AS udt_name,
+                -- The same type by OID, for its enum labels: two schemas may
+                -- each have an enum of one name.
+                COALESCE(bt.oid, t.oid) AS udt_oid,
                 CASE WHEN a.attidentity IN ('a', 'd') THEN 'YES' ELSE 'NO' END AS is_identity,
                 CASE a.attidentity WHEN 'a' THEN 'ALWAYS' WHEN 'd' THEN 'BY DEFAULT' END
                     AS identity_generation,
@@ -325,22 +352,24 @@ async fn load_columns(
               AND a.attnum > 0 AND NOT a.attisdropped
               AND c.relkind IN ('r', 'v', 'f', 'p')
               AND (pg_has_role(c.relowner, 'MEMBER')
+                   OR {predefined}
                    OR {table_grant}
                    OR (a.attacl IS NOT NULL AND {column_grant}))
         ) c
-        LEFT JOIN pg_type t ON t.typname = c.udt_name
-        LEFT JOIN pg_enum e ON e.enumtypid = t.oid
+        LEFT JOIN pg_enum e ON e.enumtypid = c.udt_oid
         WHERE c.table_schema = $1 AND c.table_name = $2
         GROUP BY c.relid, c.table_schema, c.table_name, c.column_name, c.ordinal_position, c.is_nullable,
                  c.data_type, c.udt_name, c.domain_name, c.character_maximum_length,
                  c.column_default, c.is_identity, c.identity_generation, c.is_generated,
-                 t.oid, e.enumtypid
+                 c.udt_oid, e.enumtypid
         ORDER BY c.ordinal_position
         "#,
-        table_grant = acl_grants(RELATION_ACL, "SELECT,INSERT,UPDATE,REFERENCES"),
-        column_grant = acl_grants("a.attacl", "SELECT,INSERT,UPDATE,REFERENCES"),
-    );
-    let rows = sqlx::query(&sql)
+            predefined = PREDEFINED_DATA_ROLE,
+            table_grant = acl_grants(RELATION_ACL, "SELECT,INSERT,UPDATE,REFERENCES"),
+            column_grant = acl_grants("a.attacl", "SELECT,INSERT,UPDATE,REFERENCES"),
+        )
+    });
+    let rows = sqlx::query(&SQL)
         .bind(schema)
         .bind(table)
         .fetch_all(pool)
@@ -1033,24 +1062,34 @@ async fn load_catalog_columns(
 pub async fn load_representations(
     pool: &PgPool,
 ) -> Result<std::collections::HashMap<(String, String), String>> {
-    let rows = sqlx::query(
-        r#"
+    // Whether a request may call the cast function: owned by, or executable
+    // by, a role this connection can become. `has_function_privilege` asked
+    // whether the connection could call it *as itself*, which a NOINHERIT
+    // authenticator cannot once EXECUTE is revoked from PUBLIC -- and the
+    // representation was dropped. See `acl_grants`.
+    static SQL: LazyLock<String> = LazyLock::new(|| {
+        format!(
+            r#"
         SELECT c.castsource::regtype::text AS source,
                c.casttarget::regtype::text AS target,
                c.castfunc::regproc::text   AS function
           FROM pg_catalog.pg_cast c
           JOIN pg_catalog.pg_type src ON src.oid = c.castsource
           JOIN pg_catalog.pg_type dst ON dst.oid = c.casttarget
+          JOIN pg_catalog.pg_proc p ON p.oid = c.castfunc
          WHERE c.castcontext = 'i'
            AND c.castmethod = 'f'
-           AND has_function_privilege(c.castfunc, 'execute')
+           AND (pg_has_role(p.proowner, 'MEMBER') OR {execute})
            AND ((src.typtype = 'd' AND c.casttarget IN ('json'::regtype, 'text'::regtype))
              OR (dst.typtype = 'd' AND c.castsource IN ('json'::regtype, 'text'::regtype)))
         "#,
-    )
-    .fetch_all(pool)
-    .await
-    .map_err(|e| Error::SchemaCacheLoadFailed(e.to_string()))?;
+            execute = acl_grants("COALESCE(p.proacl, acldefault('f', p.proowner))", "EXECUTE"),
+        )
+    });
+    let rows = sqlx::query(&SQL)
+        .fetch_all(pool)
+        .await
+        .map_err(|e| Error::SchemaCacheLoadFailed(e.to_string()))?;
 
     Ok(rows
         .into_iter()
@@ -1422,5 +1461,80 @@ pub async fn load_primary_keys(
                 columns?,
             ))
         })
+        .collect())
+}
+
+/// The members of an enum table: its key column, and its `comment` column
+/// when it has one, ordered by key.
+///
+/// Read as a role that may read the table. The connection reads it as itself
+/// when it can, which a superuser or an inheriting authenticator always
+/// could; a NOINHERIT authenticator can read nothing as itself, so it becomes
+/// the first role it can become that holds SELECT on the table, inside a
+/// transaction that is then rolled back.
+pub async fn enum_values(
+    pool: &PgPool,
+    schema: &str,
+    table: &str,
+    key_column: &str,
+    has_comment: bool,
+) -> Result<Vec<(String, Option<String>)>> {
+    let failed = |e: sqlx::Error| Error::SchemaCacheLoadFailed(e.to_string());
+    let mut tx = pool.begin().await.map_err(failed)?;
+
+    let reader: Option<String> = sqlx::query_scalar(
+        r#"
+        SELECT r.rolname::text
+          FROM pg_class c
+          JOIN pg_namespace n ON n.oid = c.relnamespace
+          JOIN pg_roles r ON pg_has_role(r.oid, 'MEMBER')
+         WHERE n.nspname = $1 AND c.relname = $2
+           AND has_schema_privilege(r.oid, n.oid, 'USAGE')
+           AND has_table_privilege(r.oid, c.oid, 'SELECT')
+         ORDER BY r.rolname = current_user DESC, r.rolname
+         LIMIT 1
+        "#,
+    )
+    .bind(schema)
+    .bind(table)
+    .fetch_optional(&mut *tx)
+    .await
+    .map_err(failed)?;
+    let current: String = sqlx::query_scalar("SELECT current_user::text")
+        .fetch_one(&mut *tx)
+        .await
+        .map_err(failed)?;
+    // No role can read it: read as the connection anyway, so the error says
+    // what PostgreSQL says rather than something invented here.
+    if let Some(reader) = reader.filter(|reader| *reader != current) {
+        sqlx::query(&format!(
+            "SET LOCAL ROLE {}",
+            postrust_sql::escape_ident(&reader)
+        ))
+        .execute(&mut *tx)
+        .await
+        .map_err(failed)?;
+    }
+
+    let comment = match has_comment {
+        true => format!("{}::text", postrust_sql::escape_ident("comment")),
+        false => "NULL::text".to_string(),
+    };
+    let sql = format!(
+        "SELECT {}::text, {} FROM {}.{} ORDER BY 1",
+        postrust_sql::escape_ident(key_column),
+        comment,
+        postrust_sql::escape_ident(schema),
+        postrust_sql::escape_ident(table)
+    );
+    let rows: Vec<(Option<String>, Option<String>)> = sqlx::query_as(&sql)
+        .fetch_all(&mut *tx)
+        .await
+        .map_err(failed)?;
+    tx.rollback().await.map_err(failed)?;
+
+    Ok(rows
+        .into_iter()
+        .filter_map(|(value, comment)| value.map(|v| (v, comment)))
         .collect())
 }
