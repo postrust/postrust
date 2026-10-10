@@ -27,7 +27,8 @@ Postrust automatically generates a RESTful API from your PostgreSQL database sch
 - **Powerful filtering** with operators like `eq`, `gt`, `like`, `fts`, and more
 - **Resource embedding** via foreign key relationships
 - **JWT authentication** with PostgreSQL Row-Level Security
-- **Serverless deployment** to AWS Lambda and Cloudflare Workers
+- **Serverless deployment** to AWS Lambda, serving the same REST and GraphQL
+  APIs as the server (Cloudflare Workers is not supported yet)
 
 ## Why Postrust?
 
@@ -52,7 +53,7 @@ Postrust automatically generates a RESTful API from your PostgreSQL database sch
                      │             │
               ┌──────▼─────┐ ┌─────▼──────┐
               │ AWS Lambda │ │ Cloudflare │
-              │            │ │  Workers   │
+              │            │ │ (planned)  │
               └────────────┘ └────────────┘
 ```
 

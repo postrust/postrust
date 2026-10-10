@@ -11,7 +11,7 @@ const deploymentOptions = [
   },
   {
     name: "AWS Lambda",
-    description: "Serverless deployment with native adapter",
+    description: "The same REST and GraphQL router, behind the Lambda runtime",
     icon: "aws",
     command: "cargo lambda build --release -p postrust-lambda",
   },

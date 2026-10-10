@@ -4,7 +4,9 @@
 //!
 //! ## Features
 //!
-//! - `admin-ui` - Enables the admin UI with OpenAPI documentation,
+//! - `graphql` - Serves the GraphQL API at `/v1/graphql`, with Hasura's
+//!   contract, subscriptions and Apollo Federation.
+//! - `admin-ui` - Implies `graphql`, and enables the admin UI with OpenAPI documentation,
 //!   Swagger UI, Scalar, and GraphQL Playground at `/admin`.
 
 #![warn(missing_docs)]
@@ -17,6 +19,8 @@
 #![allow(clippy::result_large_err)]
 
 pub mod app;
+pub mod build;
+pub mod custom;
 pub mod lenient_uri;
 pub mod state;
 
@@ -24,6 +28,7 @@ pub mod state;
 pub mod admin;
 
 pub use app::handle_request;
+pub use build::{build, App, Host};
 pub use state::AppState;
 
 #[cfg(feature = "admin-ui")]

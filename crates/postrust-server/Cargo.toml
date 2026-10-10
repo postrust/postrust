@@ -24,7 +24,10 @@ mimalloc = "0.1"
 
 [features]
 default = []
-admin-ui = ["utoipa", "postrust-graphql", "async-graphql", "async-graphql-axum"]
+# The GraphQL API. Separate from the admin UI so a host can serve one without
+# the other -- the Lambda adapter serves GraphQL and has no use for Swagger.
+graphql = ["postrust-graphql", "async-graphql", "async-graphql-axum"]
+admin-ui = ["graphql", "utoipa"]
 
 # Return object keys in the order the columns were selected, as PostgREST does,
 # rather than alphabetically.

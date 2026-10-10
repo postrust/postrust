@@ -175,11 +175,11 @@ const featureCategories = [
       },
       {
         name: "AWS Lambda",
-        description: "Native Lambda adapter with connection pooling",
+        description: "The server's REST and GraphQL router behind the Lambda runtime",
       },
       {
         name: "Cloudflare Workers",
-        description: "Edge deployment with Hyperdrive support",
+        description: "Planned: a stub today, pending a Hyperdrive driver",
       },
       {
         name: "Kubernetes",
