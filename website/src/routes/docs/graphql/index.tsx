@@ -381,6 +381,25 @@ PGRST_GRAPHQL_TYPE_PREFIX=billing   # optional`} />
               <code class="font-mono">_entities</code> exactly as to any other read.
             </p>
 
+            <h3 class="text-lg font-semibold text-neutral-900 mt-6 mb-2">Two subgraphs behind a router</h3>
+            <p class="text-neutral-600 mb-4">
+              <Link href="/blog/postgresql-apollo-federation-subgraph" class="text-primary-600 hover:underline">
+                PostgreSQL as an Apollo Federation subgraph
+              </Link>{" "}
+              walks through two databases, a Postrust subgraph over each and Apollo Router in
+              front, with row-level security deciding what each caller sees through the router. It
+              runs as{" "}
+              <a
+                href="https://github.com/postrust/postrust/tree/main/examples/federation"
+                target="_blank"
+                rel="noopener noreferrer"
+                class="text-primary-600 hover:underline"
+              >
+                examples/federation
+              </a>
+              .
+            </p>
+
             <h3 class="text-lg font-semibold text-neutral-900 mt-6 mb-2">A working subgraph</h3>
             <p class="text-neutral-600 mb-4">
               <a

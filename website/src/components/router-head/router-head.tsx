@@ -12,7 +12,11 @@ export const RouterHead = component$(() => {
     <>
       <title>{head.title}</title>
 
-      <link rel="canonical" href={loc.url.href} />
+      {/* A page that names its canonical address keeps it; two canonicals
+          that disagree are as good as none. */}
+      {!head.links.some((l) => l.rel === "canonical") && (
+        <link rel="canonical" href={loc.url.href} />
+      )}
       <meta name="viewport" content="width=device-width, initial-scale=1.0" />
       <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
 

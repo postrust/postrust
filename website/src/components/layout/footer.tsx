@@ -20,6 +20,7 @@ export const Footer = component$(() => {
       { href: "/docs/conformance", label: "Conformance" },
       { href: "/docs/deployment", label: "Deployment" },
       { href: "/releases", label: "Releases" },
+      { href: "/blog", label: "Blog" },
     ],
     community: [
       { href: "https://github.com/postrust/postrust", label: "GitHub", external: true },

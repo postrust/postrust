@@ -10,6 +10,7 @@ export const Header = component$(() => {
     { href: "/packages", label: "Packages" },
     { href: "/pricing", label: "Pricing" },
     { href: "/compare", label: "Compare" },
+    { href: "/blog", label: "Blog" },
     { href: "/community", label: "Community" },
   ];
 

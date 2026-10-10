@@ -86,6 +86,16 @@
     <priority>0.6</priority>
   </url>
   <url>
+    <loc>https://postrust.org/blog</loc>
+    <lastmod>2026-10-10</lastmod>
+    <priority>0.7</priority>
+  </url>
+  <url>
+    <loc>https://postrust.org/blog/postgresql-apollo-federation-subgraph</loc>
+    <lastmod>2026-10-10</lastmod>
+    <priority>0.8</priority>
+  </url>
+  <url>
     <loc>https://postrust.org/packages</loc>
     <lastmod>2026-08-12</lastmod>
     <priority>0.6</priority>
