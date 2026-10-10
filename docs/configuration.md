@@ -727,8 +727,8 @@ DATABASE_URL="${DATABASE_URL}"
 PGRST_DB_ANON_ROLE="web_anon"
 PGRST_JWT_SECRET="${JWT_SECRET}"
 PGRST_LOG_LEVEL="info"
-# Note: Pool size should be small for Lambda
-PGRST_DB_POOL_SIZE="1"
+# Two per sandbox when unset; a sandbox answers one invocation at a time
+# PGRST_DB_POOL_SIZE="2"
 ```
 
 ## There is no configuration file, and no `.env`

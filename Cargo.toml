@@ -145,6 +145,7 @@ postrust-sql = { version = "2.1.0", path = "crates/postrust-sql" }
 postrust-auth = { version = "2.1.0", path = "crates/postrust-auth" }
 postrust-response = { version = "2.1.0", path = "crates/postrust-response" }
 postrust-graphql = { version = "2.1.0", path = "crates/postrust-graphql" }
+postrust-server = { version = "2.1.0", path = "crates/postrust-server" }
 
 [profile.release]
 lto = true

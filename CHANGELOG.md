@@ -22,6 +22,28 @@ releases are described by their tags and the pull requests behind them.
 - A table's description is read from its own comment. It was looked up by OID
   alone, so a function whose OID matched the table's lent it its comment;
   PostgREST's `collision_test_table` fixture exists to catch exactly that.
+- **The Lambda adapter serves the server's router.** It used to carry a
+  request path of its own, which never bound a query's parameters -- so every
+  filter and every write failed with "bind message supplies 0 parameters" --
+  and never switched to the token's role or set its claims. Connected as a
+  least-privilege role, a function found no tables; connected as a superuser,
+  it answered every caller with every row, row-level security or not. It now
+  hands `postrust_server::build` to the Lambda runtime: REST, GraphQL
+  (including Federation), JWT, the role switch and the claims behave exactly as
+  they do in the binary. GraphQL subscriptions and the `NOTIFY` schema reloader
+  are left out, since a function can hold neither a WebSocket nor a listener.
+  The pool defaults to two connections per sandbox.
+- The docs and website no longer describe the Cloudflare Workers adapter as
+  working. It is a stub, and does not build for WebAssembly yet.
+
+### Added
+
+- `postrust_server::build`, which builds the application a host serves, and a
+  `graphql` feature on `postrust-server` that serves GraphQL without the admin
+  UI (`admin-ui` implies it).
+- `scripts/serverless/lambda.sh`, run in CI: builds the function with
+  cargo-lambda and tests it in AWS's `provided:al2023` image against
+  PostgreSQL with row-level security.
 
 ## 2.1.0
 
