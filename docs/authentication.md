@@ -220,6 +220,15 @@ ALTER TABLE orders ENABLE ROW LEVEL SECURITY;
 
 ### Policy Examples
 
+The verified claims reach the database in every transaction a request runs,
+REST and GraphQL alike -- including each GraphQL subscription, which runs as
+the identity its WebSocket connection was opened with (see
+[Subscriptions](#subscriptions) below). The examples read them from
+`request.jwt.claims`, the whole token as one JSON document, which is set on
+every request and so is always defined; see
+[Accessing Claims in SQL](#accessing-claims-in-sql) for the per-claim
+settings and why they need more care.
+
 #### Users Can Only See Their Own Orders
 
 ```sql
@@ -227,7 +236,7 @@ CREATE POLICY orders_user_select ON orders
     FOR SELECT
     TO web_user
     USING (
-        user_id = current_setting('request.jwt.claims.sub', true)::integer
+        user_id = (current_setting('request.jwt.claims', true)::json->>'sub')::integer
     );
 ```
 
@@ -238,14 +247,14 @@ CREATE POLICY orders_user_insert ON orders
     FOR INSERT
     TO web_user
     WITH CHECK (
-        user_id = current_setting('request.jwt.claims.sub', true)::integer
+        user_id = (current_setting('request.jwt.claims', true)::json->>'sub')::integer
     );
 
 CREATE POLICY orders_user_update ON orders
     FOR UPDATE
     TO web_user
     USING (
-        user_id = current_setting('request.jwt.claims.sub', true)::integer
+        user_id = (current_setting('request.jwt.claims', true)::json->>'sub')::integer
     );
 ```
 
@@ -256,11 +265,17 @@ CREATE POLICY orders_org_access ON orders
     FOR ALL
     TO web_user
     USING (
-        organization_id = current_setting('request.jwt.claims.organization_id', true)::integer
+        organization_id =
+            (current_setting('request.jwt.claims', true)::json->>'organization_id')::integer
     );
 ```
 
 #### Role-Based Access
+
+The `role` claim is the database role the request runs as -- the token's
+`role`, or the anonymous role when it named none -- so a policy attached `TO`
+a role has already settled it. An application-level role that does not map to
+a database role belongs in a claim of its own:
 
 ```sql
 CREATE POLICY admin_full_access ON orders
@@ -272,28 +287,56 @@ CREATE POLICY user_own_orders ON orders
     FOR SELECT
     TO web_user
     USING (
-        user_id = current_setting('request.jwt.claims.sub', true)::integer
-        OR current_setting('request.jwt.claims.role', true) = 'manager'
+        user_id = (current_setting('request.jwt.claims', true)::json->>'sub')::integer
+        OR current_setting('request.jwt.claims', true)::json->>'app_role' = 'manager'
     );
 ```
 
 ## Accessing Claims in SQL
 
-JWT claims are available as GUC (Grand Unified Configuration) variables:
+The whole token is one setting, `request.jwt.claims`, a JSON document with
+`role` set to the role the request runs as. It is the form to reach for: it is
+set on every request, so it is never missing, and it reaches nested claims.
 
 ```sql
--- Get the role claim
-SELECT current_setting('request.jwt.claims.role', true);
+-- The role the request runs as
+SELECT current_setting('request.jwt.claims', true)::json->>'role';
 
--- Get the subject (user ID)
-SELECT current_setting('request.jwt.claims.sub', true);
+-- The subject (user ID)
+SELECT current_setting('request.jwt.claims', true)::json->>'sub';
 
--- Get custom claims
-SELECT current_setting('request.jwt.claims.organization_id', true)::integer;
+-- A custom claim
+SELECT (current_setting('request.jwt.claims', true)::json->>'organization_id')::integer;
 
--- Get nested claims
-SELECT current_setting('request.jwt.claims.user.email', true);
+-- A nested claim
+SELECT current_setting('request.jwt.claims', true)::json->'user'->>'email';
 ```
+
+Each top-level claim is also its own setting, `request.jwt.claims.<name>`, for
+a policy that would rather not parse JSON. Three things are true of those that
+are not true of the document:
+
+- **A missing claim reads as `''` as well as `NULL`.** PostgreSQL keeps a
+  setting a connection has ever seen, emptied, after the transaction that set it
+  ends. Connections are pooled, so a token without `organization_id` reads
+  `NULL` on a connection that has never served one with it and `''` on one that
+  has -- and `''::integer` is an error. Wrap every read in `NULLIF(..., '')`:
+
+  ```sql
+  SELECT NULLIF(current_setting('request.jwt.claims.organization_id', true), '')::integer;
+  ```
+
+- **Only top-level claims, and only names a setting can have.** A name made of
+  letters, digits and underscores, starting with a letter or underscore, with
+  dots between parts. `user_id` and `org.region` are settings; `2fa` and
+  `https://hasura.io/jwt/claims` are not, and are only in the document.
+- **A claim that is an object or array is its JSON text.** `user` holding
+  `{"email": "a@example.com"}` is one setting, `request.jwt.claims.user`, whose
+  value is that JSON; there is no `request.jwt.claims.user.email`. Read nested
+  claims from the document.
+
+Setting names are case-insensitive in PostgreSQL, so two claims whose names
+differ only in case are the same setting, and one of them is kept.
 
 ### In Functions
 
@@ -304,9 +347,32 @@ LANGUAGE sql
 SECURITY DEFINER
 AS $$
     SELECT * FROM orders
-    WHERE user_id = current_setting('request.jwt.claims.sub', true)::integer;
+    WHERE user_id = (current_setting('request.jwt.claims', true)::json->>'sub')::integer;
 $$;
 ```
+
+## Subscriptions
+
+A GraphQL subscription is authenticated as an HTTP request is, once per
+WebSocket connection. Browsers cannot set headers on a WebSocket, so the token
+goes in the `connection_init` payload, under `headers` as Hasura's clients send
+it or at the top level:
+
+```json
+{"type": "connection_init", "payload": {"headers": {"Authorization": "Bearer <token>"}}}
+```
+
+Headers on the upgrade request are read too, and the payload's win where both
+name the same header. `X-Hasura-Admin-Secret` and `X-Hasura-Role` are honoured
+from either place exactly as they are over HTTP. A connection HTTP would refuse
+-- a wrong admin secret, a role the token does not allow -- is refused at
+`connection_init`. Every operation on the connection then runs as that
+identity: its role, its session variables and its claims, in every transaction
+a live query re-reads in.
+
+The identity is the one the connection was opened with. A token that expires
+while a subscription is open does not end it; a client that needs it to should
+reconnect with a fresh token.
 
 ## Error Handling
 
