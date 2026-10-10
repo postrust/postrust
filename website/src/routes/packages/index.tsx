@@ -87,10 +87,11 @@ const packages: Pkg[] = [
     name: "postrust-lambda",
     role: "AWS Lambda",
     description:
-      "AWS Lambda adapter for Postrust, for serverless REST APIs over PostgreSQL.",
+      "AWS Lambda adapter for Postrust, serving its REST and GraphQL APIs over PostgreSQL.",
     highlights: [
-      "Runs behind a function URL or API Gateway",
-      "Reuses the schema cache across warm invocations",
+      "The server's own router, behind a function URL or API Gateway",
+      "Schema cache loaded once per sandbox, in the init phase",
+      "Tested in AWS's provided:al2023 runtime image against row-level security",
     ],
     install: "cargo add postrust-lambda",
   },
@@ -98,10 +99,10 @@ const packages: Pkg[] = [
     name: "postrust-worker",
     role: "Cloudflare Workers",
     description:
-      "Cloudflare Workers adapter for Postrust, for edge REST APIs over PostgreSQL.",
+      "A stub for a Cloudflare Workers adapter. It answers that it is a stub and reaches no database.",
     highlights: [
-      "Compiles to WebAssembly for Cloudflare Workers",
-      "Connects via Hyperdrive or a TCP-capable proxy",
+      "Not functional yet: needs the engine split from its database driver",
+      "Planned: a Hyperdrive connection over a Workers socket",
     ],
     install: "cargo add postrust-worker",
   },

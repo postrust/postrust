@@ -78,6 +78,13 @@ volumes:
           {/* AWS Lambda */}
           <section class="mb-12">
             <h2 class="text-2xl font-bold text-neutral-900 mb-4">AWS Lambda</h2>
+            <p class="text-neutral-600 mb-4">
+              The function serves what the server serves &mdash; the same router, so REST, GraphQL,
+              JWT authentication and row-level security behave identically. GraphQL subscriptions
+              are left out, since a function URL cannot hold a WebSocket. Connect it as a
+              least-privilege <code class="font-mono">authenticator</code> role, never as a
+              superuser, which would bypass row-level security.
+            </p>
             <div class="bg-neutral-900 rounded-xl overflow-hidden mb-4">
               <pre class="p-4 text-sm overflow-x-auto">
                 <code class="text-neutral-100">{`# Build for Lambda

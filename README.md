@@ -20,7 +20,7 @@ Postrust is a serverless-first REST API server for PostgreSQL databases. Inspire
 
 **Why Postrust?**
 
-- **Serverless-first**: A native AWS Lambda adapter with connection pooling (Cloudflare Workers is a stub, pending Hyperdrive)
+- **Serverless**: An AWS Lambda adapter that serves the same REST and GraphQL router as the server, tested in AWS's own runtime image (Cloudflare Workers is a stub, pending Hyperdrive)
 - **Measured**: Conformance against PostgREST's and Hasura's own test corpora, re-run on a schedule, and throughput measured on a pinned bare-metal host behind a self-consistency gate — see [Benchmarks](#benchmarks)
 - **Compatible**: Familiar PostgREST-style API; near drop-in with an opt-in [compatibility mode](#postgrest-compatibility) (see [Differences from PostgREST](#differences-from-postgrest))
 - **Type-safe**: Parameterized queries prevent SQL injection by design
@@ -49,7 +49,7 @@ Postrust is a serverless-first REST API server for PostgreSQL databases. Inspire
 | Platform | Status | Description |
 |----------|--------|-------------|
 | **HTTP Server** | ✅ | Standalone Axum-based server |
-| **AWS Lambda** | ✅ | Native Lambda adapter with connection pooling |
+| **AWS Lambda** | ✅ | The server's router behind the Lambda runtime: REST, GraphQL, JWT and RLS (no subscriptions) |
 | **Cloudflare Workers** | 🚧 | Stub (requires Hyperdrive for database) |
 
 ### Admin & Developer Tools
@@ -352,6 +352,9 @@ DATABASE_URL="postgres://..." ./target/release/postrust
 # Build for Lambda (requires cargo-lambda)
 cargo lambda build --release -p postrust-lambda
 
+# Run it in AWS's runtime image against PostgreSQL with RLS
+scripts/serverless/lambda.sh
+
 # Deploy with AWS SAM, Serverless Framework, or CDK
 ```
 
@@ -366,7 +369,7 @@ Resources:
     Type: AWS::Serverless::Function
     Properties:
       Handler: bootstrap
-      Runtime: provided.al2
+      Runtime: provided.al2023
       CodeUri: target/lambda/postrust-lambda/
       MemorySize: 256
       Timeout: 30
