@@ -234,6 +234,34 @@ volumes:
 
 ## AWS Lambda
 
+The function serves what the server binary serves: the same router, built by
+the same code. REST under `/api`, GraphQL at `/v1/graphql` (Hasura's contract,
+Apollo Federation when `PGRST_GRAPHQL_FEDERATION` is set), `/healthz`, JWT
+authentication, the role switch and the `request.jwt.claims` a row-level
+security policy reads. Two things a Lambda cannot do are left out:
+
+- **GraphQL subscriptions.** API Gateway and function URLs do not upgrade a
+  connection to a WebSocket, so the schema has no `Subscription` root.
+- **`PGRST_DB_CHANNEL_ENABLED`.** A sandbox is frozen between invocations, so a
+  `LISTEN` for schema reloads would be asleep when the `NOTIFY` arrived. A new
+  deployment, or a cold start, loads the schema afresh.
+
+The schema cache is loaded once per sandbox, in the init phase, so a warm
+invocation does not pay for it and a database that cannot be reached fails the
+init -- which Lambda reports and retries -- rather than every request.
+
+`scripts/serverless/lambda.sh` builds the function and runs it in AWS's
+`provided:al2023` image, against PostgreSQL with row-level security, and is
+what CI runs on every change that could reach it.
+
+> **Never connect the function as a superuser or a table owner.** Connect as
+> a `NOINHERIT` `authenticator` role with no privileges of its own, granted the
+> roles a token may name, exactly as for the server -- see
+> [The Role Postrust Connects As](authentication.md#the-role-postrust-connects-as).
+> Requests switch to the token's role, but loading the schema cache and
+> reading GraphQL enum tables run as the login role, and a superuser does
+> those with privileges that ignore grants and row-level security.
+
 ### Prerequisites
 
 ```bash
@@ -347,13 +375,20 @@ Deploy:
 serverless deploy
 ```
 
+### Paths and stages
+
+A function URL, and an HTTP API's `$default` stage, pass the path through
+unchanged: `/api/todos` reaches the function as `/api/todos`. A named stage
+prefixes it (`/prod/api/todos`); set `AWS_LAMBDA_HTTP_IGNORE_STAGE_IN_PATH=true`
+to have it removed.
+
 ### Lambda Best Practices
 
-1. **Connection Pooling**: fixed at one connection, and not configurable here.
-   A Lambda execution environment serves one request at a time, so a larger
-   pool buys nothing and multiplies connections by the concurrency limit
-   instead. `PGRST_DB_POOL_SIZE` is read by the server binary and ignored by
-   the Lambda adapter; setting it here has no effect.
+1. **Connection Pooling**: two connections per sandbox unless
+   `PGRST_DB_POOL_SIZE` says otherwise. A sandbox answers one invocation at a
+   time, so the server's larger default would hold connections nothing uses --
+   multiplied by every concurrent sandbox. Two rather than one because a
+   GraphQL mutation holds its transaction while its resolvers read.
 
 2. **VPC Configuration**: Place Lambda in the same VPC as RDS
 
@@ -486,39 +521,13 @@ helm upgrade postrust ./charts/postrust --reuse-values
 
 ## Cloudflare Workers
 
-> Note: Full Workers support requires Cloudflare Hyperdrive for database connections.
-
-### Building
-
-```bash
-# Install wrangler
-npm install -g wrangler
-
-# Build
-cargo build --release --target wasm32-unknown-unknown -p postrust-worker
-```
-
-### wrangler.toml
-
-```toml
-name = "postrust-api"
-main = "build/worker.js"
-compatibility_date = "2024-01-01"
-
-[vars]
-PGRST_DB_SCHEMAS = "public"
-PGRST_DB_ANON_ROLE = "web_anon"
-
-[[hyperdrive]]
-binding = "DB"
-id = "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
-```
-
-### Deploy
-
-```bash
-wrangler deploy
-```
+**Not supported yet.** `postrust-worker` is a stub: it answers
+`{"status": "stub"}`, reaches no database, and does not currently compile for
+`wasm32-unknown-unknown`, because the engine it would run depends on a Tokio
+network stack and on sqlx, neither of which exists in WebAssembly. Running
+Postrust on Workers needs the engine split from its database driver and a
+driver that speaks to Hyperdrive over a Workers socket; that work is planned,
+and this section will describe it when it ships.
 
 ## Reverse Proxy
 

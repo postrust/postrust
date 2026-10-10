@@ -6,7 +6,7 @@ rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 authors.workspace = true
-description = "AWS Lambda adapter for Postrust, for serverless REST APIs over PostgreSQL"
+description = "AWS Lambda adapter for Postrust, serving its REST and GraphQL APIs over PostgreSQL"
 homepage.workspace = true
 readme = "README.md"
 keywords = ["lambda", "serverless", "aws", "postgres", "api"]
@@ -33,19 +33,27 @@ serde_json.workspace = true
 
 # Error handling
 thiserror.workspace = true
-anyhow.workspace = true
-
 # Utilities
 tracing.workspace = true
 tracing-subscriber.workspace = true
 bytes.workspace = true
 http.workspace = true
 
+anyhow.workspace = true
+
 # Internal
+postrust-server = { workspace = true, features = ["graphql"] }
 postrust-core.workspace = true
 postrust-sql.workspace = true
 postrust-auth.workspace = true
 postrust-response.workspace = true
+
+[features]
+default = []
+# The admin UI (Swagger, Scalar, the GraphQL playground) at `/admin`. Off by
+# default: a function is billed for its size on every cold start, and the UI is
+# a development tool.
+admin-ui = ["postrust-server/admin-ui"]
 
 [dev-dependencies]
 pretty_assertions.workspace = true

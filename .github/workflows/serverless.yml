@@ -1,0 +1,45 @@
+name: Serverless
+
+# The Lambda adapter, built with cargo-lambda and run in AWS's provided:al2023
+# image against PostgreSQL with row-level security. It used to carry a request
+# path of its own that bound no parameters and switched to no role, and
+# nothing ran it; this is what runs it.
+
+on:
+  pull_request:
+    paths:
+      - ".github/workflows/serverless.yml"
+      - "Cargo.lock"
+      - "Cargo.toml"
+      - "crates/postrust-auth/**"
+      - "crates/postrust-core/**"
+      - "crates/postrust-graphql/**"
+      - "crates/postrust-lambda/**"
+      - "crates/postrust-response/**"
+      - "crates/postrust-server/**"
+      - "crates/postrust-sql/**"
+      - "scripts/serverless/**"
+  push:
+    branches: [main]
+    paths:
+      - "crates/postrust-lambda/**"
+      - "scripts/serverless/**"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: serverless-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  lambda:
+    name: Lambda in the runtime emulator
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build and test
+        run: scripts/serverless/lambda.sh

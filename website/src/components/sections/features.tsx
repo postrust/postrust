@@ -9,7 +9,7 @@ const features = [
   {
     icon: "cloud",
     title: "Runs on Lambda",
-    description: "A native AWS Lambda adapter with connection pooling, from the same binary that runs standalone. Cloudflare Workers is a stub pending Hyperdrive.",
+    description: "The Lambda adapter serves the router the standalone server serves — REST, GraphQL, JWT and row-level security — and is tested in AWS's own runtime image. Cloudflare Workers is a stub pending Hyperdrive.",
   },
   {
     icon: "graphql",

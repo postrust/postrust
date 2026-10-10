@@ -1,0 +1,1082 @@
+//! Building the application a host serves.
+//!
+//! Everything between a loaded configuration and a router answering requests:
+//! the pool, the schema cache, the REST surface, GraphQL and the layers around
+//! them. The `postrust` binary serves the result on a socket; the Lambda
+//! adapter hands the same router to the Lambda runtime. One path, so a request
+//! is answered the same way wherever it arrives -- the Lambda adapter used to
+//! be a second copy of the request path, and that copy bound no parameters and
+//! switched to no role.
+
+use crate::app::{self, handle_request};
+use crate::custom;
+use crate::state::AppState;
+use anyhow::Result;
+#[cfg(feature = "graphql")]
+use axum::routing::{get, post};
+use axum::{
+    extract::DefaultBodyLimit,
+    http::{HeaderValue, Method},
+    response::Json,
+    routing::any,
+    Router,
+};
+use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
+use std::sync::Arc;
+use tokio::sync::RwLock;
+use tower_http::cors::{AllowOrigin, Any as CorsAny, CorsLayer};
+use tracing::{error, info};
+
+/// What the host running the application can do beyond answering requests.
+///
+/// A server process lives as long as it likes and owns its sockets. A Lambda
+/// sandbox is frozen between invocations, so a task listening for `NOTIFY` is
+/// asleep exactly when the notification arrives, and API Gateway does not
+/// upgrade a connection to a WebSocket at all.
+#[derive(Clone, Copy, Debug)]
+#[non_exhaustive]
+pub struct Host {
+    /// Long-lived background work: the `NOTIFY` schema reloader
+    /// (`db_channel_enabled`) and the subscription broker's listener.
+    pub background_tasks: bool,
+    /// Upgrading a connection to a WebSocket, which GraphQL subscriptions are
+    /// served over.
+    pub websockets: bool,
+}
+
+impl Host {
+    /// A long-running server process.
+    pub const SERVER: Host = Host {
+        background_tasks: true,
+        websockets: true,
+    };
+
+    /// An AWS Lambda function: no background work, no WebSockets.
+    pub const LAMBDA: Host = Host {
+        background_tasks: false,
+        websockets: false,
+    };
+}
+
+/// The application, ready to serve.
+#[non_exhaustive]
+pub struct App {
+    /// Every route the configuration enables, with its layers and state.
+    pub router: Router,
+    /// The state the routes share, for anything served beside them -- the
+    /// binary's admin port answers health checks from it.
+    pub state: Arc<AppState>,
+}
+
+/// Connect, load the schema cache and build the router.
+///
+/// Fails rather than serving something partial when the database cannot be
+/// reached or a setting cannot be honoured. GraphQL is the exception: a schema
+/// that cannot be built is logged and the rest is served without it.
+pub async fn build(config: postrust_core::AppConfig, host: Host) -> Result<App> {
+    info!("Database: {}", mask_db_uri(&config.db_uri));
+
+    // Create database pool
+    let connect_options: PgConnectOptions = config
+        .db_uri
+        .parse()
+        .map_err(|e| anyhow::anyhow!("invalid database URI: {e}"))?;
+
+    // Prepared statements are sqlx's default and stay on unless asked. Turning
+    // them off is for a connection pooler in transaction mode -- PgBouncer and
+    // the like -- where the server connection a statement was prepared on is
+    // not the one the next query lands on, and every reuse fails with
+    // "prepared statement does not exist".
+    let connect_options = if config.db_prepared_statements {
+        connect_options
+    } else {
+        info!("Prepared statements disabled");
+        connect_options.statement_cache_capacity(0)
+    };
+
+    let pool = PgPoolOptions::new()
+        .max_connections(config.db_pool_size)
+        .acquire_timeout(std::time::Duration::from_secs(config.db_pool_timeout))
+        .connect_with(connect_options)
+        .await?;
+
+    info!("Connected to database");
+
+    // Load schema cache
+    let schema_cache = postrust_core::SchemaCache::load_with_search_path(
+        &pool,
+        &config.db_schemas,
+        &config.db_extra_search_path,
+    )
+    .await?;
+    info!("{}", schema_cache.summary());
+
+    // Create app state
+    let state = Arc::new(AppState {
+        pool,
+        schema_cache: RwLock::new(schema_cache),
+        config: config.clone(),
+        jwt_config: postrust_auth::JwtConfig {
+            secret: config.jwt_secret.clone(),
+            secret_is_base64: config.jwt_secret_is_base64,
+            audience: config.jwt_aud.clone(),
+            role_claim_key: config.jwt_role_claim_key.clone(),
+            anon_role: config.db_anon_role.clone(),
+        },
+        jwt_cache: postrust_auth::JwtCache::new(
+            config.jwt_cache_enabled,
+            config.jwt_cache_max_lifetime,
+        ),
+    });
+
+    // `db_channel_enabled`: reload the schema cache when PostgreSQL says the
+    // schema changed, instead of on a restart. A migration ends with
+    // `NOTIFY pgrst, 'reload schema'` and the API picks the new shape up.
+    //
+    // This refreshes the REST schema cache. The GraphQL schema is built once
+    // from a snapshot taken at start-up and is not rebuilt here.
+    if config.db_channel_enabled && host.background_tasks {
+        spawn_schema_reloader(state.clone(), config.db_channel.clone());
+    }
+
+    // Build REST API router (under /api prefix)
+    let api_router: Router<Arc<AppState>> = Router::new()
+        .route("/", any(handle_request))
+        .route("/{*path}", any(handle_request));
+
+    // Build main router
+    let mut app: Router<Arc<AppState>> = Router::new().nest("/api", api_router);
+
+    // Two endpoints every Hasura deployment has, and that the things around a
+    // deployment reach for without being asked to: `/healthz` is what a load
+    // balancer, a Kubernetes probe and `docker-compose` healthchecks are
+    // already configured to poll, and `/v1/version` is what a client library
+    // calls to decide which features to use. Serving them costs nothing and
+    // not serving them makes a drop-in replacement fail its first health
+    // check.
+    app = app
+        .route("/healthz", axum::routing::get(|| async { "OK" }))
+        .route(
+            "/v1/version",
+            axum::routing::get(|| async {
+                Json(serde_json::json!({ "version": env!("CARGO_PKG_VERSION") }))
+            }),
+        );
+
+    // Add custom routes (health checks, webhooks, etc.)
+    app = app.nest("/_", custom::custom_router());
+    info!("Custom routes enabled at /_");
+
+    // Add admin routes and GraphQL endpoint if feature is enabled
+    #[cfg(feature = "graphql")]
+    {
+        use async_graphql_axum::GraphQLBatchRequest as GqlRequest;
+        use axum::extract::State as AxumState;
+        use axum::http::HeaderMap;
+        use postrust_graphql::handler::GraphQLState;
+        use postrust_graphql::schema::SchemaConfig;
+
+        #[cfg(feature = "admin-ui")]
+        {
+            info!("Admin UI enabled at /admin");
+            app = app.nest("/admin", crate::admin::admin_router());
+        }
+
+        // Create GraphQL state with subscriptions enabled
+        let schema_cache_snapshot = state.schema_cache.read().await.clone();
+        let schema_cache_arc = Arc::new(schema_cache_snapshot);
+        // What Hasura keeps in metadata and a schema cannot carry: the names,
+        // and what each role may do. Absent, every name is derived exactly as
+        // before and there is no permission layer at all.
+        //
+        // Two spellings because the document outgrew the first one. `_NAMES`
+        // is what it was called when names were all it held, and a deployment
+        // already setting it should not have to change anything.
+        let names_var = ["PGRST_GRAPHQL_METADATA", "PGRST_GRAPHQL_NAMES"]
+            .into_iter()
+            .find_map(|name| std::env::var(name).ok().map(|value| (name, value)));
+
+        let graphql_names = match names_var {
+            Some((var, value)) => match postrust_graphql::names::NameOverrides::parse(&value) {
+                Ok(names) => {
+                    if !names.is_empty() {
+                        info!("GraphQL names given for {} tables", names.len());
+                    }
+                    if names.placed_functions() > 0 {
+                        info!(
+                            "GraphQL roots given for {} functions",
+                            names.placed_functions()
+                        );
+                    }
+                    if names.has_permissions() {
+                        info!(
+                            "GraphQL permissions given for {} roles, {} grants",
+                            names.roles().len(),
+                            names.granted()
+                        );
+                    }
+                    names
+                }
+                Err(e) => {
+                    // Serving the derived names instead would answer every
+                    // request under a name the client does not send, which
+                    // reads as a broken server rather than a bad setting. A
+                    // permission read wrong is worse still: it would serve
+                    // rows a rule was written to withhold.
+                    tracing::error!("{}: {}", var, e);
+                    return Err(anyhow::anyhow!("{}: {}", var, e));
+                }
+            },
+            None => postrust_graphql::names::NameOverrides::default(),
+        };
+
+        // An enum table's members are rows, not schema, so they are read here
+        // rather than reflected. Once, at startup: the values of a set of
+        // allowed values are not expected to change under a running server,
+        // and a GraphQL enum is part of the schema a client generated against.
+        let mut graphql_enum_values: std::collections::HashMap<
+            String,
+            Vec<(String, Option<String>)>,
+        > = std::collections::HashMap::new();
+        {
+            let cache = state.schema_cache.read().await;
+            for (schema, table) in graphql_names.enum_tables() {
+                let qi = postrust_core::api_request::QualifiedIdentifier::new(&schema, &table);
+                let Some(definition) = cache.get_table(&qi) else {
+                    tracing::warn!(
+                        "{}.{} is marked as an enumeration but was not found",
+                        schema,
+                        table
+                    );
+                    continue;
+                };
+                // One column identifies a member. A composite key names no
+                // single value, so there is nothing to call the member.
+                let [key_column] = definition.pk_cols.as_slice() else {
+                    tracing::warn!(
+                        "{}.{} is marked as an enumeration but its primary key is not one column",
+                        schema,
+                        table
+                    );
+                    continue;
+                };
+                // Hasura's convention, and a useful one: a `comment` column
+                // describes each value. Read as a role that may read the
+                // table, which a NOINHERIT authenticator is not by itself.
+                match postrust_core::schema_cache::enum_values(
+                    &state.pool,
+                    &schema,
+                    &table,
+                    key_column,
+                    definition.get_column("comment").is_some(),
+                )
+                .await
+                {
+                    Ok(values) => {
+                        graphql_enum_values.insert(format!("{}.{}", schema, table), values);
+                    }
+                    Err(e) => {
+                        tracing::warn!("cannot read the values of {}.{}: {}", schema, table, e)
+                    }
+                }
+            }
+        }
+
+        // How often a live query re-reads itself with nothing having
+        // notified it. The notifications do the work; this is the floor
+        // under what a trigger cannot see -- a view, an embedded row on a
+        // table with no trigger, a predicate written against the clock.
+        let subscription_refresh_seconds = std::env::var("PGRST_SUBSCRIPTION_REFRESH")
+            .ok()
+            .and_then(|value| value.trim().parse::<u64>().ok())
+            .unwrap_or(30);
+
+        let mut graphql_config = SchemaConfig::default();
+        // A subscription is a WebSocket, so a host that cannot hold one
+        // does not advertise a `Subscription` root it cannot serve.
+        graphql_config.enable_subscriptions = host.websockets;
+        graphql_config.subscription_refresh_seconds = subscription_refresh_seconds;
+        graphql_config.max_rows = config.db_max_rows;
+        graphql_config.enable_federation = config.graphql_federation;
+        graphql_config.type_prefix = config.graphql_type_prefix.clone();
+        // The GraphQL schema was built for `public` whatever the server
+        // was told to expose, so a table in any other schema of
+        // `PGRST_DB_SCHEMAS` was reachable over REST and invisible over
+        // GraphQL.
+        graphql_config.exposed_schemas = config.db_schemas.clone();
+        graphql_config.enum_values = graphql_enum_values;
+        graphql_config.names = graphql_names;
+        // A schema that cannot be built is a reason to serve without GraphQL,
+        // not a reason to exit. The REST surface, the admin UI and the health
+        // endpoint do not depend on it, and taking the process down with it
+        // turns one unrepresentable table into a server that will not start.
+        let built = GraphQLState::new(state.pool.clone(), schema_cache_arc.clone(), graphql_config);
+        if let Err(e) = &built {
+            tracing::error!(
+                "GraphQL schema could not be built, serving without it: {}",
+                e
+            );
+        }
+        if let Ok(graphql_state) = built {
+            let graphql_state = Arc::new(graphql_state);
+
+            // Initialize subscription broker
+            if !host.websockets {
+                info!("GraphQL subscriptions disabled: this host cannot hold a WebSocket");
+            } else if let Err(e) = graphql_state.init_subscriptions().await {
+                tracing::warn!("Failed to initialize subscription broker: {}. Subscriptions may not work until triggers are created.", e);
+            } else {
+                info!("GraphQL subscriptions enabled");
+            }
+
+            info!("GraphQL endpoint enabled at /api/graphql");
+
+            // Combined state for GraphQL routes (includes JWT config for auth)
+            #[derive(Clone)]
+            struct GraphQLAppState {
+                gql_state: Arc<GraphQLState>,
+                jwt_config: postrust_auth::JwtConfig,
+                hasura_auth: postrust_auth::HasuraAuthConfig,
+            }
+
+            let graphql_app_state = GraphQLAppState {
+                gql_state: graphql_state.clone(),
+                jwt_config: state.jwt_config.clone(),
+                hasura_auth: postrust_auth::HasuraAuthConfig {
+                    admin_secret: config.hasura_admin_secret.clone(),
+                    unauthorized_role: config.hasura_unauthorized_role.clone(),
+                },
+            };
+
+            // Wrapper handler that creates context from request with proper auth
+            /// A body that is a JSON *array* is a batch: several operations
+            /// in one request, answered with an array of responses in the
+            /// order they were sent. Each is its own operation with its own
+            /// transaction -- batching is a way to save round trips, not a
+            /// way to make several mutations atomic, which is what naming
+            /// several root fields in one mutation is for.
+            async fn handle_graphql(
+                AxumState(app_state): AxumState<GraphQLAppState>,
+                // Which of the three addresses this arrived at. The routes are
+                // nested, so the request's own path is `/` by the time it gets
+                // here and the original is the only thing that still says.
+                axum::extract::OriginalUri(uri): axum::extract::OriginalUri,
+                headers: HeaderMap,
+                req: GqlRequest,
+            ) -> (axum::http::StatusCode, Json<serde_json::Value>) {
+                // The status a refused write is answered with belongs to the
+                // endpoint rather than to the refusal: `/v1alpha1/graphql`
+                // reports it in the transport and `/v1/graphql` does not.
+                let endpoint = match uri.path().starts_with("/v1alpha1/") {
+                    true => postrust_graphql::hasura::Endpoint::Legacy,
+                    false => postrust_graphql::hasura::Endpoint::Current,
+                };
+                match req.0 {
+                    async_graphql::BatchRequest::Single(request) => {
+                        let body = one_graphql(app_state, headers, request).await;
+                        let status = axum::http::StatusCode::from_u16(
+                            postrust_graphql::hasura::status_for(&body, endpoint),
+                        )
+                        .unwrap_or(axum::http::StatusCode::OK);
+                        (status, Json(body))
+                    }
+                    async_graphql::BatchRequest::Batch(requests) => {
+                        let mut answers = Vec::with_capacity(requests.len());
+                        for request in requests {
+                            answers.push(
+                                one_graphql(app_state.clone(), headers.clone(), request).await,
+                            );
+                        }
+                        // A batch is answered 200 whatever its parts say: the
+                        // transport carried every one of them, and which of
+                        // them failed is in the array.
+                        (
+                            axum::http::StatusCode::OK,
+                            Json(serde_json::Value::Array(answers)),
+                        )
+                    }
+                }
+            }
+
+            /// Who is asking, settled once: per request over HTTP, and per
+            /// connection over a WebSocket, where the token arrives in the
+            /// `connection_init` payload rather than on every operation.
+            #[derive(Clone)]
+            struct GraphQLIdentity {
+                auth_result: postrust_auth::AuthResult,
+                hasura_role: Option<String>,
+                session: std::collections::HashMap<String, String>,
+                elevated: bool,
+                headers: HeaderMap,
+            }
+
+            /// An operation ready to run against the schema its role answers
+            /// from, and the transaction its writes will share.
+            struct PreparedOperation {
+                schema: async_graphql::dynamic::Schema,
+                request: async_graphql::Request,
+                write: postrust_graphql::context::SharedWrite,
+            }
+
+            /// The caller's identity, or the Hasura-shaped body refusing it.
+            fn graphql_identity(
+                app_state: &GraphQLAppState,
+                headers: HeaderMap,
+            ) -> Result<GraphQLIdentity, serde_json::Value> {
+                // Extract auth header and authenticate
+                let auth_header = headers.get("authorization").and_then(|v| v.to_str().ok());
+
+                let token = postrust_auth::authenticate(auth_header, &app_state.jwt_config);
+                // A token that was offered and verified. Not the same as
+                // `token.is_ok()`, which is also true of the anonymous
+                // fallback -- and an anonymous request is precisely the one
+                // that has not been authenticated.
+                let token_verified = auth_header.is_some() && token.is_ok();
+
+                let auth_result = match token {
+                    Ok(auth) => auth,
+                    Err(e) => {
+                        tracing::debug!("GraphQL auth failed: {}, using anon role", e);
+                        postrust_auth::AuthResult {
+                            role: app_state
+                                .jwt_config
+                                .anon_role
+                                .clone()
+                                .unwrap_or_else(|| "anon".to_string()),
+                            claims: std::collections::HashMap::new(),
+                        }
+                    }
+                };
+
+                tracing::debug!(
+                    "GraphQL request authenticated as role: {}",
+                    auth_result.role
+                );
+
+                // Who the caller is in Hasura's sense, which is a different
+                // question from which database user the transaction runs as.
+                // The secret goes first: a caller that tried to be an
+                // administrator and got the secret wrong is refused rather
+                // than asked for a token.
+                let pairs: Vec<(&str, &str)> = headers
+                    .iter()
+                    .filter_map(|(name, value)| {
+                        value.to_str().ok().map(|value| (name.as_str(), value))
+                    })
+                    .collect();
+
+                let (hasura_role, session, elevated) =
+                    match postrust_auth::hasura::from_admin_secret(
+                        &app_state.hasura_auth,
+                        &pairs[..],
+                    ) {
+                        postrust_auth::SecretOutcome::Accepted(identity) => {
+                            (Some(identity.role), identity.session, identity.elevated)
+                        }
+                        postrust_auth::SecretOutcome::Rejected => {
+                            return Err(postrust_graphql::hasura::denied(
+                                postrust_auth::hasura::SECRET_INVALID,
+                            ));
+                        }
+                        // Nothing settled by the secret. A verified token speaks
+                        // next, and session variables come from its claims.
+                        //
+                        // One header is read here and only here: `X-Hasura-Role`,
+                        // against the `x-hasura-allowed-roles` the token carries.
+                        // That list is inside the signature, so it lets a caller
+                        // choose among the identities it was issued and not add
+                        // one. Every other `x-hasura-*` header is still ignored --
+                        // on a server with no secret to gate them they would let
+                        // any caller name its own identity.
+                        _ if token_verified => {
+                            match postrust_auth::hasura::role_for_token(
+                                &auth_result.claims,
+                                &pairs[..],
+                            ) {
+                                postrust_auth::hasura::TokenRole::Is(role) => (
+                                    role,
+                                    postrust_auth::hasura::session_from_claims(&auth_result.claims),
+                                    false,
+                                ),
+                                postrust_auth::hasura::TokenRole::NotAllowed => {
+                                    return Err(postrust_graphql::hasura::denied(
+                                        postrust_auth::hasura::ROLE_NOT_ALLOWED,
+                                    ));
+                                }
+                            }
+                        }
+                        // A secret is configured and nothing authenticated this
+                        // request. Answering it as a stranger is a choice the
+                        // deployment makes; refusing is the default.
+                        _ if app_state.hasura_auth.is_configured() => {
+                            match postrust_auth::hasura::unauthenticated(&app_state.hasura_auth) {
+                                Some(identity) => (Some(identity.role), identity.session, false),
+                                None => {
+                                    return Err(postrust_graphql::hasura::denied(
+                                        postrust_auth::hasura::SECRET_MISSING,
+                                    ));
+                                }
+                            }
+                        }
+                        // No Hasura auth configured at all: unchanged from before
+                        // any of this existed.
+                        _ => (
+                            postrust_auth::hasura::role_from_claims(&auth_result.claims),
+                            postrust_auth::hasura::session_from_claims(&auth_result.claims),
+                            false,
+                        ),
+                    };
+
+                Ok(GraphQLIdentity {
+                    auth_result,
+                    hasura_role,
+                    session,
+                    elevated,
+                    headers,
+                })
+            }
+
+            /// Everything between knowing who is asking and running what they
+            /// asked: the checks Hasura makes before reading the document, the
+            /// schema the role answers from, and the context every resolver
+            /// reads the identity from.
+            fn prepare_operation(
+                app_state: &GraphQLAppState,
+                identity: &GraphQLIdentity,
+                req: async_graphql::Request,
+            ) -> Result<PreparedOperation, serde_json::Value> {
+                let GraphQLIdentity {
+                    auth_result,
+                    hasura_role,
+                    session,
+                    elevated,
+                    headers,
+                } = identity.clone();
+                let pairs: Vec<(&str, &str)> = headers
+                    .iter()
+                    .filter_map(|(name, value)| {
+                        value.to_str().ok().map(|value| (name.as_str(), value))
+                    })
+                    .collect();
+
+                // A protocol neither server implements, which only one of
+                // them says. See `hasura::persisted_query`.
+                if postrust_graphql::hasura::persisted_query(&req) {
+                    return Err(postrust_graphql::hasura::not_supported(
+                        "PersistedQueryNotSupported",
+                    ));
+                }
+
+                // A header Hasura reads itself, before it reads the
+                // document. `x-hasura-use-backend-only-permissions: random` is
+                // not false, and treating it as false would send a
+                // backend-only write down the path meant for everyone else on
+                // a header the client thought it had set.
+                if let Some(message) = postrust_auth::hasura::unreadable_boolean_header(&pairs[..])
+                {
+                    return Err(postrust_graphql::hasura::malformed(&message));
+                }
+
+                // Which schema answers. A permission is a statement about what
+                // exists, so the role decides the shape of the API before it
+                // decides anything about a row: a role the document does not
+                // name has no schema at all, and is refused here rather than
+                // being answered from someone else's.
+                let Some(schema) = app_state.gql_state.schema_for(
+                    hasura_role.as_deref(),
+                    postrust_auth::hasura::backend_only_requested(&pairs[..], elevated),
+                ) else {
+                    return Err(postrust_graphql::hasura::denied(&format!(
+                        "role \"{}\" is not defined in the permissions",
+                        hasura_role.as_deref().unwrap_or_default()
+                    )));
+                };
+
+                // Create SchemaCacheRef from the static Arc<SchemaCache>
+                //
+                // The unreduced cache, deliberately. The schema above decides
+                // what may be asked for; this is what a resolver looks a type
+                // up in once something has been asked, and a superset can only
+                // answer the same questions.
+                let schema_cache_ref = postrust_core::schema_cache::SchemaCacheRef::from_static(
+                    (*app_state.gql_state.schema_cache).clone(),
+                );
+
+                // Every write in this operation goes into one transaction, and
+                // this is the half that decides its fate: a mutation naming
+                // several root fields is all-or-nothing, so the second one
+                // failing has to take the first one's rows with it. Nothing to
+                // settle for a query, which never opens it.
+                let write: postrust_graphql::context::SharedWrite = Arc::default();
+
+                let gql_ctx = postrust_graphql::context::GraphQLContext::new(
+                    app_state.gql_state.pool.clone(),
+                    schema_cache_ref,
+                    auth_result,
+                )
+                .with_session(session)
+                .with_identity(hasura_role.clone(), elevated)
+                .with_write(Arc::clone(&write));
+
+                // A role may be told it cannot read the schema as data. Not a
+                // permission on a table, so it is not settled by which schema
+                // answers -- the schema is the thing being withheld.
+                //
+                // Not withheld from a caller holding the admin secret, whatever
+                // role it then names. That is measured rather than assumed: a
+                // v2.50.1 reference given `set_graphql_schema_introspection_
+                // options` answers `__schema` for the named role when the
+                // secret is sent beside the role header, and answers it from
+                // that role's own restricted schema. Reading the schema is an
+                // administrator's to do; the permissions still apply to it.
+                let introspection_disabled_for =
+                    hasura_role.as_deref().filter(|_| !elevated).filter(|role| {
+                        app_state
+                            .gql_state
+                            .config
+                            .names
+                            .introspection_disabled(role)
+                    });
+                let prepared = postrust_graphql::hasura::prepare(
+                    Some(schema),
+                    req,
+                    introspection_disabled_for,
+                );
+                let request = match prepared {
+                    Ok(request) => request,
+                    // Refused before it ran: nothing was written, so there is
+                    // nothing to settle.
+                    Err((_, errors)) => {
+                        let mut response = async_graphql::Response::new(async_graphql::Value::Null);
+                        response.errors = errors;
+                        return Err(postrust_graphql::hasura::envelope(response));
+                    }
+                };
+                let request = request
+                    .data(gql_ctx)
+                    .data(app_state.gql_state.pool.clone())
+                    .data(Arc::clone(&app_state.gql_state.broker));
+                Ok(PreparedOperation {
+                    schema: schema.clone(),
+                    request,
+                    write,
+                })
+            }
+
+            /// Settle an operation's writes before its answer goes out.
+            async fn settle_write(
+                write: &postrust_graphql::context::SharedWrite,
+                response: &mut async_graphql::Response,
+            ) {
+                if let Some(tx) = write.lock().await.take() {
+                    let settled = if response.errors.is_empty() {
+                        tx.commit().await
+                    } else {
+                        tx.rollback().await
+                    };
+                    // A commit that fails is a mutation that did not happen,
+                    // however well every statement in it went. Saying so is
+                    // the whole point of running them together.
+                    if let Err(e) = settled {
+                        tracing::error!("GraphQL mutation could not be settled: {}", e);
+                        response
+                            .errors
+                            .push(async_graphql::ServerError::new(e.to_string(), None));
+                        response.data = async_graphql::Value::Null;
+                    }
+                }
+            }
+
+            async fn one_graphql(
+                app_state: GraphQLAppState,
+                headers: HeaderMap,
+                req: async_graphql::Request,
+            ) -> serde_json::Value {
+                let identity = match graphql_identity(&app_state, headers) {
+                    Ok(identity) => identity,
+                    Err(refusal) => return refusal,
+                };
+                let PreparedOperation {
+                    schema,
+                    request,
+                    write,
+                } = match prepare_operation(&app_state, &identity, req) {
+                    Ok(operation) => operation,
+                    Err(refusal) => return refusal,
+                };
+                let mut response = schema.execute(request).await;
+                settle_write(&write, &mut response).await;
+                postrust_graphql::hasura::envelope(response)
+            }
+
+            /// A Hasura-shaped body as the response a WebSocket carries, so a
+            /// subscription is refused, and its errors read, exactly as the
+            /// same operation over HTTP would be.
+            fn hasura_response(body: serde_json::Value) -> async_graphql::Response {
+                let data = body
+                    .get("data")
+                    .cloned()
+                    .and_then(|data| async_graphql::Value::from_json(data).ok())
+                    .unwrap_or(async_graphql::Value::Null);
+                let mut response = async_graphql::Response::new(data);
+                for error in body
+                    .get("errors")
+                    .and_then(serde_json::Value::as_array)
+                    .into_iter()
+                    .flatten()
+                {
+                    let message = error
+                        .get("message")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or_default();
+                    let mut server_error = async_graphql::ServerError::new(message, None);
+                    if let Some(fields) = error
+                        .get("extensions")
+                        .and_then(serde_json::Value::as_object)
+                    {
+                        let mut extensions = async_graphql::ErrorExtensionValues::default();
+                        for (name, value) in fields {
+                            if let Ok(value) = async_graphql::Value::from_json(value.clone()) {
+                                extensions.set(name, value);
+                            }
+                        }
+                        server_error.extensions = Some(extensions);
+                    }
+                    response.errors.push(server_error);
+                }
+                response
+            }
+
+            /// The headers a WebSocket connection is authenticated with: the
+            /// upgrade request's, overlaid with those the `connection_init`
+            /// payload carries. A browser cannot set headers on a WebSocket,
+            /// so a client puts `Authorization` in the payload -- Hasura's own
+            /// clients under `headers`, others at the top level.
+            fn connection_headers(
+                mut headers: HeaderMap,
+                payload: &serde_json::Value,
+            ) -> HeaderMap {
+                let nested = payload
+                    .get("headers")
+                    .and_then(serde_json::Value::as_object);
+                for fields in [payload.as_object(), nested].into_iter().flatten() {
+                    for (name, value) in fields {
+                        let Some(value) = value.as_str() else {
+                            continue;
+                        };
+                        if let (Ok(name), Ok(value)) = (
+                            axum::http::HeaderName::from_bytes(name.as_bytes()),
+                            axum::http::HeaderValue::from_str(value),
+                        ) {
+                            headers.insert(name, value);
+                        }
+                    }
+                }
+                headers
+            }
+
+            /// Runs every WebSocket operation -- query, mutation or
+            /// subscription -- as the identity its connection was initialised
+            /// with, through the same preparation an HTTP request gets.
+            #[derive(Clone)]
+            struct WebSocketExecutor(GraphQLAppState);
+
+            impl async_graphql::Executor for WebSocketExecutor {
+                async fn execute(
+                    &self,
+                    request: async_graphql::Request,
+                ) -> async_graphql::Response {
+                    use async_graphql::futures_util::StreamExt;
+                    // Not reached over a WebSocket, which runs everything as a
+                    // stream; answered from the stream so the two cannot differ.
+                    self.execute_stream(request, None)
+                        .next()
+                        .await
+                        .unwrap_or_else(|| async_graphql::Response::new(async_graphql::Value::Null))
+                }
+
+                fn execute_stream(
+                    &self,
+                    request: async_graphql::Request,
+                    session_data: Option<Arc<async_graphql::Data>>,
+                ) -> async_graphql::futures_util::stream::BoxStream<'static, async_graphql::Response>
+                {
+                    use async_graphql::futures_util::{stream, StreamExt};
+                    let identity = session_data
+                        .as_deref()
+                        .and_then(|data| data.get(&std::any::TypeId::of::<GraphQLIdentity>()))
+                        .and_then(|identity| identity.downcast_ref::<GraphQLIdentity>())
+                        .cloned();
+                    // `connection_init` refuses a connection it cannot
+                    // identify, so an operation without an identity is one the
+                    // protocol let through before initialising. Refused rather
+                    // than run as nobody in particular.
+                    let Some(identity) = identity else {
+                        let refusal =
+                            postrust_graphql::hasura::denied("the connection was not initialised");
+                        return stream::once(async move { hasura_response(refusal) }).boxed();
+                    };
+                    match prepare_operation(&self.0, &identity, request) {
+                        Err(refusal) => {
+                            stream::once(async move { hasura_response(refusal) }).boxed()
+                        }
+                        Ok(PreparedOperation {
+                            schema,
+                            request,
+                            write,
+                        }) => {
+                            async_graphql::Executor::execute_stream(&schema, request, session_data)
+                                .then(move |mut response| {
+                                    let write = Arc::clone(&write);
+                                    async move {
+                                        settle_write(&write, &mut response).await;
+                                        hasura_response(postrust_graphql::hasura::envelope(
+                                            response,
+                                        ))
+                                    }
+                                })
+                                .boxed()
+                        }
+                    }
+                }
+            }
+
+            /// GraphQL over a WebSocket, authenticated as HTTP is. The
+            /// identity is settled once, from `connection_init`, and a
+            /// connection that would have been refused over HTTP -- a wrong
+            /// admin secret, a role the token does not allow -- is refused
+            /// there rather than served as the anonymous role.
+            async fn graphql_ws(
+                AxumState(app_state): AxumState<GraphQLAppState>,
+                protocol: async_graphql_axum::GraphQLProtocol,
+                headers: HeaderMap,
+                ws: axum::extract::ws::WebSocketUpgrade,
+            ) -> axum::response::Response {
+                ws.protocols(async_graphql::http::ALL_WEBSOCKET_PROTOCOLS)
+                    .on_upgrade(move |socket| async move {
+                        let init_state = app_state.clone();
+                        async_graphql_axum::GraphQLWebSocket::new(
+                            socket,
+                            WebSocketExecutor(app_state),
+                            protocol,
+                        )
+                        .on_connection_init(move |payload| async move {
+                            match graphql_identity(
+                                &init_state,
+                                connection_headers(headers, &payload),
+                            ) {
+                                Ok(identity) => {
+                                    let mut data = async_graphql::Data::default();
+                                    data.insert(identity);
+                                    Ok(data)
+                                }
+                                Err(refusal) => Err(async_graphql::Error::new(
+                                    refusal
+                                        .pointer("/errors/0/message")
+                                        .and_then(serde_json::Value::as_str)
+                                        .unwrap_or("connection refused"),
+                                )),
+                            }
+                        })
+                        .serve()
+                        .await
+                    })
+            }
+
+            // Add GraphQL routes with WebSocket support for subscriptions
+            let graphql_router = Router::new()
+                .route("/", post(handle_graphql))
+                .route("/", get(postrust_graphql::handler::graphql_playground))
+                .with_state(graphql_app_state.clone());
+
+            // The same state as HTTP, because a WebSocket is authenticated the
+            // same way: `postrust_graphql::handler::graphql_ws_handler` carries
+            // no caller identity, so every subscription it served ran without
+            // a role, a session or claims.
+            let ws_router = Router::new()
+                .route("/ws", get(graphql_ws))
+                .with_state(graphql_app_state);
+
+            let graphql_app = match host.websockets {
+                true => graphql_router.merge(ws_router),
+                false => graphql_router,
+            };
+            // `/v1/graphql` is where a Hasura client sends its queries, and it is
+            // the only address most of them can be told about: the endpoint is
+            // baked into generated clients and codegen configs. `/api/graphql`
+            // keeps working for anything already pointed at it, and
+            // `/v1alpha1/graphql` is the address Hasura served before `/v1`
+            // and still answers on -- a client old enough to have been
+            // pointed there is exactly the one that cannot be repointed.
+            app = app
+                .nest("/v1/graphql", graphql_app.clone())
+                .nest("/v1alpha1/graphql", graphql_app.clone())
+                .nest("/api/graphql", graphql_app);
+        }
+    }
+
+    // PostgREST compatibility mode: also serve the REST surface at the root so
+    // canonical PostgREST paths (`/rpc/<name>`, `/<table>`) work in addition to
+    // the `/api`-prefixed paths. Explicit routes (`/`, `/_`, `/admin`, `/api`)
+    // still take precedence; only otherwise-unmatched paths hit this fallback.
+    if config.compat_mode {
+        app = app.fallback(handle_request);
+        info!("PostgREST compatibility mode enabled: REST surface also served at /");
+
+        // Key ordering is fixed when the binary is compiled, so asking for
+        // compatibility at runtime cannot turn it on. Say so, rather than
+        // leaving someone to discover the difference by diffing responses.
+        if !cfg!(feature = "compat-key-order") {
+            tracing::warn!(
+                "compatibility mode: object keys will be returned in alphabetical order, \
+                 not in select order as PostgREST returns them. Build with \
+                 --features compat-key-order to match, at a cost of up to 15% throughput \
+                 on wide rows."
+            );
+        }
+    }
+
+    // Add root info endpoint.
+    //
+    // Not in compatibility mode: there `/` is part of the API surface -- it is
+    // where PostgREST serves the schema description, and where it reports an
+    // `Accept-Profile` naming a schema that is not exposed. A directory of
+    // this server's own endpoints in its place answers a different question
+    // from the one asked.
+    if !config.compat_mode {
+        app = app.route(
+            "/",
+            axum::routing::get(|| async {
+                Json(serde_json::json!({
+                    "name": "postrust",
+                    "version": env!("CARGO_PKG_VERSION"),
+                    "api": "/api",
+                    "custom": "/_",
+                    "health": "/_/health",
+                    "admin": "/admin",
+                    "docs": "/admin/swagger"
+                }))
+            }),
+        );
+    }
+
+    // An empty list is "any origin", which is the default and what
+    // `PGRST_SERVER_CORS_ORIGINS="*"` asks for. Anything that is not a valid
+    // header value is dropped with a warning rather than quietly widening the
+    // policy back to `*` -- a typo in an origin should cost that origin, not
+    // the restriction.
+    let allow_origin = if config.server_cors_origins.is_empty() {
+        AllowOrigin::any()
+    } else {
+        let origins: Vec<HeaderValue> = config
+            .server_cors_origins
+            .iter()
+            .filter_map(|o| match HeaderValue::from_str(o) {
+                Ok(v) => Some(v),
+                Err(_) => {
+                    tracing::warn!("Ignoring CORS origin {:?}: not a valid header value", o);
+                    None
+                }
+            })
+            .collect();
+        info!("CORS restricted to {} origin(s)", origins.len());
+        AllowOrigin::list(origins)
+    };
+
+    // Apply CORS and state
+    let app = app
+        .layer(
+            CorsLayer::new()
+                .allow_origin(allow_origin)
+                .allow_methods([
+                    Method::GET,
+                    Method::POST,
+                    Method::PUT,
+                    Method::PATCH,
+                    Method::DELETE,
+                    Method::OPTIONS,
+                    Method::HEAD,
+                ])
+                .allow_headers(CorsAny)
+                .expose_headers(CorsAny),
+        )
+        // For the routes whose handlers take a body *extractor* -- GraphQL,
+        // the admin surface -- which is what this layer reaches. The REST
+        // handler takes the whole `Request` and reads the body itself, so it
+        // applies `max_body_size` directly; see `app::process_request`.
+        .layer(DefaultBodyLimit::max(config.max_body_size))
+        // Outermost, so it runs before the CORS layer -- which answers every
+        // OPTIONS itself and never calls what it wraps, so nothing downstream
+        // of it can say what a resource allows.
+        .layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            app::options_allow,
+        ))
+        .with_state(state.clone());
+
+    Ok(App { router: app, state })
+}
+
+/// Reload the REST schema cache on `NOTIFY <channel>`.
+///
+/// Reconnects on its own: a listening connection is dropped by a restart of
+/// the database or anything between, and a reloader that gives up on the first
+/// error is one that stops working silently partway through a deployment.
+fn spawn_schema_reloader(state: Arc<AppState>, channel: String) {
+    const RETRY: std::time::Duration = std::time::Duration::from_secs(5);
+
+    tokio::spawn(async move {
+        loop {
+            let mut listener = match sqlx::postgres::PgListener::connect_with(&state.pool).await {
+                Ok(listener) => listener,
+                Err(e) => {
+                    error!("Schema reloader could not connect: {}; retrying", e);
+                    tokio::time::sleep(RETRY).await;
+                    continue;
+                }
+            };
+
+            if let Err(e) = listener.listen(&channel).await {
+                error!("Schema reloader could not LISTEN on {}: {}", channel, e);
+                tokio::time::sleep(RETRY).await;
+                continue;
+            }
+            info!("Listening on channel {} for schema reloads", channel);
+
+            // Inner loop until the connection fails, then reconnect.
+            loop {
+                match listener.recv().await {
+                    Ok(notification) => {
+                        info!("Schema reload requested: {:?}", notification.payload());
+                        match state.reload_schema().await {
+                            Ok(()) => {
+                                info!(
+                                    "Schema cache reloaded: {}",
+                                    state.schema_cache().await.summary()
+                                )
+                            }
+                            // The old cache is kept. Serving the previous
+                            // schema is better than serving none, and the next
+                            // notification tries again.
+                            Err(e) => error!("Schema cache reload failed: {}", e),
+                        }
+                    }
+                    Err(e) => {
+                        error!("Schema reloader lost its connection: {}; reconnecting", e);
+                        break;
+                    }
+                }
+            }
+        }
+    });
+}
+
+/// Mask database URI for logging.
+fn mask_db_uri(uri: &str) -> String {
+    if let Some(at_pos) = uri.find('@') {
+        if let Some(proto_end) = uri.find("://") {
+            return format!("{}://***@{}", &uri[..proto_end], &uri[at_pos + 1..]);
+        }
+    }
+    uri.to_string()
+}
