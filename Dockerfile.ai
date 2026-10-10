@@ -1,0 +1,70 @@
+# The postrust-ai node: a scheduler and gateway in front of model servers.
+#
+# There are NO model servers in this image (vLLM, whisper.cpp and Ollama are
+# separate programs with their own dependencies, and vLLM alone is several GB
+# of CUDA). That decides how a real deployment is built, because the `process`
+# runtime starts model servers as child processes of this one:
+#
+#   - build your own image FROM postrust/postrust-ai with the servers
+#     installed, and use `process` models; or
+#   - run the servers in sibling containers and declare the models as
+#     `attached`, pointing at them over the network.
+#
+# As shipped it starts and serves /healthz, /readyz and /metrics, and can run
+# `attached` and `generic` models; a `process` model whose command is not
+# installed here fails to load.
+#
+# Build stage
+FROM rustlang/rust:nightly-bookworm AS builder
+
+WORKDIR /app
+
+# Copy manifests
+COPY Cargo.toml Cargo.lock ./
+COPY crates ./crates
+
+RUN cargo build --release -p postrust-ai
+
+# Runtime stage
+FROM debian:bookworm-slim
+
+# Install runtime dependencies. No libssl: the binary links no OpenSSL (checked
+# with ldd), TLS is rustls. curl is only for the HEALTHCHECK.
+RUN apt-get update && apt-get install -y \
+    ca-certificates \
+    curl \
+    && rm -rf /var/lib/apt/lists/*
+
+# Copy binary from builder
+COPY --from=builder /app/target/release/postrust-ai /usr/local/bin/postrust-ai
+
+# Create non-root user, and the cache directory it owns. The directory is
+# created before the VOLUME instruction so a fresh named volume inherits this
+# ownership; created after it, the volume mounts root-owned and the node cannot
+# write model files to it.
+RUN useradd -m -u 1000 postrust \
+    && mkdir -p /var/cache/postrust-ai \
+    && chown postrust:postrust /var/cache/postrust-ai
+USER postrust
+
+# Downloaded model files and per-model caches. Persist it, or every restart
+# downloads the models again.
+VOLUME ["/var/cache/postrust-ai"]
+
+EXPOSE 7700
+
+# The node listens on 127.0.0.1:7700 by default, which inside a container means
+# a published port reaches nothing. The advertise URL is what other nodes and
+# postrust-proxy use to reach this one, and 0.0.0.0 is not an address anyone
+# can connect to: set POSTRUST_AI_ADVERTISE_URL to one that is when running
+# more than one node or registering with the proxy. DATABASE_URL is required.
+ENV POSTRUST_AI_LISTEN=0.0.0.0:7700
+
+# /healthz only reports that the process is up. /readyz also checks the
+# database, which is what an orchestrator should gate traffic on.
+HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
+    CMD curl -f http://localhost:7700/healthz || exit 1
+
+# Reads $POSTRUST_AI_CONFIG, else ./postrust-ai.toml, else defaults and the
+# environment.
+CMD ["postrust-ai"]

@@ -1,0 +1,61 @@
+{
+  "steps": [
+    {
+      "id": "extract_audio",
+      "model": "audio-extractor",
+      "input": {
+        "request": {
+          "path": "/extract",
+          "body": { "video_url": "${input.video_url}" }
+        }
+      }
+    },
+    {
+      "id": "transcribe",
+      "model": "whisper-large-v3-turbo",
+      "depends_on": ["extract_audio"],
+      "input": {
+        "request": {
+          "multipart": {
+            "file_url": "${steps.extract_audio.output.audio_url}",
+            "fields": { "response_format": "verbose_json" }
+          }
+        }
+      }
+    },
+    {
+      "id": "summarise",
+      "model": "llama3-8b",
+      "depends_on": ["transcribe"],
+      "when": { "exists": "steps.transcribe.output.text" },
+      "input": {
+        "request": {
+          "body": {
+            "messages": [
+              {
+                "role": "user",
+                "content": "Summarise this transcript in five sentences:\n\n${steps.transcribe.output.text}"
+              }
+            ]
+          }
+        }
+      }
+    },
+    {
+      "id": "embed_segments",
+      "model": "embedder",
+      "depends_on": ["transcribe"],
+      "for_each": "${steps.transcribe.output.segments}",
+      "input": {
+        "request": {
+          "path": "/api/embed",
+          "body": { "input": "${item.text}" }
+        }
+      }
+    }
+  ],
+  "output": {
+    "summary": "${steps.summarise.output}",
+    "segment_embeddings": "${steps.embed_segments.output}"
+  }
+}

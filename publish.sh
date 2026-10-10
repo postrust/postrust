@@ -43,5 +43,12 @@ cargo publish -p postrust-lambda
 echo "Publishing postrust-worker..."
 cargo publish -p postrust-worker
 
+# Level 5: postrust-ai, last. It is on its own 0.x version line (see
+# docs/stability.md) and needs only postrust-auth, published in step 1, so
+# nothing above waits on it and no 1.0.0 crate depends on a 0.x one.
+echo ""
+echo "=== Step 5: Publishing postrust-ai ==="
+cargo publish -p postrust-ai
+
 echo ""
 echo "All crates published successfully!"

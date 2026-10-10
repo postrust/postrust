@@ -1,0 +1,17 @@
+{{- if and .Values.ai.enabled .Values.ai.cache.persistence.enabled (not .Values.ai.cache.persistence.existingClaim) }}
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: {{ include "postrust.ai.fullname" . }}-cache
+  labels:
+    {{- include "postrust.ai.labels" . | nindent 4 }}
+spec:
+  accessModes:
+    - {{ .Values.ai.cache.persistence.accessMode }}
+  {{- with .Values.ai.cache.persistence.storageClass }}
+  storageClassName: {{ . | quote }}
+  {{- end }}
+  resources:
+    requests:
+      storage: {{ .Values.ai.cache.persistence.size }}
+{{- end }}

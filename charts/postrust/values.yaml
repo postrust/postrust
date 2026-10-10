@@ -48,3 +48,83 @@ podAnnotations: {}
 nodeSelector: {}
 tolerations: []
 affinity: {}
+
+# An optional postrust-ai node: scheduler and gateway in front of model
+# servers (docs/ai-workers.md). It is a separate Deployment and Service from
+# the API server above, uses the same database, and is off by default.
+#
+# The image has NO model servers in it. The `process` runtime starts them as
+# child processes, so a real deployment either builds an image FROM
+# postrust/postrust-ai with the servers installed and points image.repository
+# at it, or runs the servers as separate workloads and declares the models as
+# `attached` with their Service URLs in ai.config.
+ai:
+  enabled: false
+  replicas: 1
+  image:
+    repository: postrust/postrust-ai
+    # postrust-ai is on its own version line, so this does not follow the
+    # chart's appVersion.
+    tag: "0.1.0"
+    pullPolicy: IfNotPresent
+
+  port: 7700
+
+  # The node's TOML configuration, mounted as a file. This one declares no
+  # models, so the node is healthy by itself. The listen address, advertise
+  # URL, node id, database URL and cache directory are set by the chart through
+  # the environment, which wins over anything written here.
+  #
+  # The node's memory budget is the container's memory limit (its cgroup)
+  # minus `resources.memory_reserve_mb` (2048), so set resources.limits.memory
+  # with room for the model servers this node will start. Without a limit it
+  # is the node's whole memory.
+  config: |
+    [cache]
+    dir = "/var/cache/postrust-ai"
+
+  auth:
+    # With no secret the API is open. Reference a Secret you manage:
+    #   jwtSecretRef: { name: postrust-ai-jwt, key: secret }
+    jwtSecretRef: {}
+
+  # Extra container environment, as a list of Kubernetes env entries.
+  env: []
+
+  service:
+    type: ClusterIP
+    port: 7700
+
+  cache:
+    # Model files and per-model caches. The default emptyDir is lost when the
+    # pod is rescheduled, and the models are downloaded again.
+    sizeLimit: ""
+    persistence:
+      enabled: false
+      existingClaim: ""
+      size: 100Gi
+      storageClass: ""
+      # One claim is shared by every replica. ReadWriteOnce only works with
+      # one replica, or replicas on one node; otherwise use ReadWriteMany and
+      # `shared = true` under [cache] in ai.config.
+      accessMode: ReadWriteOnce
+
+  resources:
+    requests:
+      cpu: 100m
+      memory: 256Mi
+    # Uncomment on a GPU node, with the NVIDIA device plugin installed:
+    # limits:
+    #   nvidia.com/gpu: 1
+
+  podAnnotations: {}
+
+  # GPU example: schedule onto GPU nodes and tolerate their taint. The label
+  # and taint names depend on how the cluster labels its GPU nodes.
+  nodeSelector: {}
+  #  nvidia.com/gpu.present: "true"
+  tolerations: []
+  #  - key: nvidia.com/gpu
+  #    operator: Exists
+  #    effect: NoSchedule
+  affinity: {}

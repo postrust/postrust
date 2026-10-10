@@ -3,6 +3,51 @@
 Notable changes, newest first. This file starts at 1.0.0-alpha.1; earlier
 releases are described by their tags and the pull requests behind them.
 
+## Unreleased
+
+**`postrust-ai`: on-demand AI model serving, as a new crate on its own `0.1`
+line.** It runs model servers (vLLM, whisper.cpp, Ollama, or any HTTP server)
+as separate processes, containers or attached servers, loads a model the first
+time it is asked for, and parks or stops it when something else needs the room.
+It is unstable, like `postrust-proxy` and `postrust-worker`: no semver promise,
+and it is not part of the 2.x line. See [docs/ai-workers.md](docs/ai-workers.md)
+and [docs/stability.md](docs/stability.md).
+
+- Jobs queue in PostgreSQL (`FOR UPDATE SKIP LOCKED`, `NOTIFY` to wake
+  workers) in five priority classes, `superlow` to `critical`. Waiting jobs gain
+  priority over time, except superlow, which runs only on spare capacity and is
+  paused whenever anything else needs its slot or its resources.
+- Pausing is a per-queue setting: `checkpoint` (a grace period, then cancel and
+  keep the last saved checkpoint) or `requeue` (discard progress).
+- Workflows chain jobs into a graph with `depends_on`, `when`, and `for_each`
+  fan-out and fan-in. A run's state is rebuilt from its jobs on every advance,
+  so a crash or two nodes advancing at once cannot enqueue a step twice.
+- A synchronous gateway, `/v1/infer/{model}/{*path}`, loads the model if it has
+  to and answers 503 with `Retry-After` if that takes too long. Session locks
+  pin a conversation to one instance, and nodes forward to the owner.
+- Caching in five layers: model files on disk, loaded models, parked models,
+  server-side prompt caches kept useful by sessions, and job results.
+- Making room evicts the lowest-value idle instance, not simply the least
+  recently used; it parks when only VRAM is short, never goes below `min_warm`,
+  and spares models with higher-priority work waiting.
+- Each node reports host memory, GPUs, load average and CPU count, and measures
+  what each process-run server actually holds. Usage well over the declared
+  amount is logged once and recorded as an `over_budget` event; measurements
+  never change a reservation. The load average is information only.
+- Nodes register with `postrust-proxy` through its admin API.
+- JWT authentication through `postrust-auth`, with admin roles for the load,
+  unload and queue-pause endpoints.
+
+**Not verified.** Everything above is tested against a real PostgreSQL and a
+stub model server. It has not been run against real vLLM, Ollama or whisper.cpp
+servers, Docker, Hugging Face downloads, or nodes on separate machines.
+
+**Known limitations.** Routes the proxy creates for it time out after 30
+seconds, so long synchronous inference should be a job. Every node must declare
+the whole model registry. Concurrency limits and session counts are per node.
+Result-cache keys hash the input, so changed content behind an unchanged URL
+still hits. The full list is in [docs/ai-workers.md](docs/ai-workers.md).
+
 ## 2.0.0
 
 **Postrust can be an Apollo Federation v2 subgraph.** Set

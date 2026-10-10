@@ -5,13 +5,14 @@ set -e
 IMAGE_NAME="postrust/postrust"
 VERSION=$(grep -m1 'version = ' Cargo.toml | sed 's/.*"\(.*\)".*/\1/')
 
-echo "=== Postrust Docker Build & Push ==="
-echo "Version: $VERSION"
-echo ""
+DOCKERFILE="Dockerfile"
+VERSION_SET=false
+IMAGE_SET=false
 
 # Parse arguments
 PUSH=false
 LATEST=false
+AI=false
 
 while [[ $# -gt 0 ]]; do
     case $1 in
@@ -23,12 +24,18 @@ while [[ $# -gt 0 ]]; do
             LATEST=true
             shift
             ;;
+        --ai)
+            AI=true
+            shift
+            ;;
         --version)
             VERSION="$2"
+            VERSION_SET=true
             shift 2
             ;;
         --image)
             IMAGE_NAME="$2"
+            IMAGE_SET=true
             shift 2
             ;;
         -h|--help)
@@ -37,14 +44,16 @@ while [[ $# -gt 0 ]]; do
             echo "Options:"
             echo "  --push        Push image to Docker Hub after building"
             echo "  --latest      Also tag and push as 'latest'"
+            echo "  --ai          Build postrust-ai (Dockerfile.ai) as postrust/postrust-ai instead"
             echo "  --version     Override version (default: from Cargo.toml)"
-            echo "  --image       Override image name (default: postrust/postrust)"
+            echo "  --image       Override image name (default: postrust/postrust, or postrust/postrust-ai with --ai)"
             echo "  -h, --help    Show this help message"
             echo ""
             echo "Examples:"
             echo "  $0                          # Build only"
             echo "  $0 --push                   # Build and push"
             echo "  $0 --push --latest          # Build and push with latest tag"
+            echo "  $0 --ai --push              # Build and push the postrust-ai image"
             echo "  $0 --image myuser/postrust  # Use custom image name"
             exit 0
             ;;
@@ -55,12 +64,28 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
+# postrust-ai is its own image, on its own 0.x version line (see
+# docs/stability.md), so its tag is the crate's version and not the workspace's.
+if [ "$AI" = true ]; then
+    DOCKERFILE="Dockerfile.ai"
+    if [ "$IMAGE_SET" = false ]; then
+        IMAGE_NAME="postrust/postrust-ai"
+    fi
+    if [ "$VERSION_SET" = false ]; then
+        VERSION=$(grep -m1 '^version = ' crates/postrust-ai/Cargo.toml | sed 's/.*"\(.*\)".*/\1/')
+    fi
+fi
+
+echo "=== Postrust Docker Build & Push ==="
+echo "Version: $VERSION"
+echo ""
+
 echo "Image: $IMAGE_NAME:$VERSION"
 echo ""
 
 # Build the Docker image
 echo "=== Step 1: Building Docker image ==="
-docker build -t "$IMAGE_NAME:$VERSION" .
+docker build -f "$DOCKERFILE" -t "$IMAGE_NAME:$VERSION" .
 
 if [ "$LATEST" = true ]; then
     echo ""

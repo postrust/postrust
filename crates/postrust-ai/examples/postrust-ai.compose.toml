@@ -1,0 +1,33 @@
+# The configuration docker-compose.yml mounts for the `ai` service.
+#
+# It declares no models, so the node starts, migrates schema `ai`, and stays
+# healthy with nothing else running: the model servers in
+# examples/postrust-ai.toml (vLLM, whisper.cpp, Ollama) are not part of the
+# compose file, and the postrust-ai image does not contain them. With no
+# models, /healthz, /readyz and /metrics answer, and a request that names a
+# model is refused as an unknown model.
+#
+# To try inference, run a server beside it and declare it as `attached`, for
+# example Ollama as another compose service:
+#
+#     [[model]]
+#     id = "llama3-8b"
+#     kind = "text"
+#     flavor = "ollama"
+#     served_name = "llama3.1:8b"
+#     memory_mb = 8192
+#     [model.runtime]
+#     type = "attached"
+#     base_url = "http://ollama:11434"
+#
+# Left unpinned, the node asks Ollama to load the model on the first request
+# and not before.
+#
+# The listen address, advertise URL, node id and database URL are not set here:
+# docker-compose.yml sets them through the environment, which wins over the
+# file.
+
+
+[cache]
+# The default, written out because the compose file mounts a volume here.
+dir = "/var/cache/postrust-ai"
