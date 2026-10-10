@@ -7,7 +7,7 @@ type: application
 version: 0.2.0
 
 # The default image tag, which tracks the workspace version.
-appVersion: "2.0.0"
+appVersion: "2.1.0"
 
 home: https://postrust.org/
 sources:

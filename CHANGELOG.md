@@ -3,7 +3,13 @@
 Notable changes, newest first. This file starts at 1.0.0-alpha.1; earlier
 releases are described by their tags and the pull requests behind them.
 
-## Unreleased
+## 2.1.0
+
+A minor release: one addition to the public Rust API
+(`AuthResult::claim_settings`) and no breaking change -- `cargo semver-checks`
+against 2.0.0 passes for every stable crate. Everything else is behaviour
+people running the server will see. `postrust-proxy` and `postrust-worker` stay
+at 0.6.0: neither uses anything that changed.
 
 **GraphQL transactions carry the verified JWT claims.** REST set
 `request.jwt.claims` for a row-level policy to read; GraphQL set only the
