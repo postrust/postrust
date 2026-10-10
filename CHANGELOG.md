@@ -3,6 +3,68 @@
 Notable changes, newest first. This file starts at 1.0.0-alpha.1; earlier
 releases are described by their tags and the pull requests behind them.
 
+## 2.1.0
+
+A minor release: one addition to the public Rust API
+(`AuthResult::claim_settings`) and no breaking change -- `cargo semver-checks`
+against 2.0.0 passes for every stable crate. Everything else is behaviour
+people running the server will see. `postrust-proxy` and `postrust-worker` stay
+at 0.6.0: neither uses anything that changed.
+
+**GraphQL transactions carry the verified JWT claims.** REST set
+`request.jwt.claims` for a row-level policy to read; GraphQL set only the
+role and Hasura's session variables, so a policy telling apart users who share
+a database role worked over one surface and not the other. Both now set the
+claims document, with `role` set to the role the request runs as, and each
+top-level claim whose name can be a setting as its own
+`request.jwt.claims.<name>` -- the form `docs/authentication.md` had always
+shown and nothing had ever set. Thanks to @CBeardSafire,
+[#45](https://github.com/postrust/postrust/pull/45).
+
+**GraphQL subscriptions over a WebSocket work.** They had not, on the
+server as shipped: the handshake answered `101` and then nothing, not even
+`connection_ack`. The adapter that percent-encodes the `>` in
+`select=data->>id` before hyper parses a request line follows HTTP/1.1
+framing, and did not know about `Upgrade` -- after the handshake it read every
+WebSocket frame as the next request line, holding it back until a newline byte
+happened to arrive and percent-encoding the high-bit bytes masked frames are
+full of. It now stops rewriting after a request that asks to switch protocols,
+as it already did for chunked bodies and HTTP/2.
+
+**GraphQL subscriptions are authenticated.** The WebSocket route attached no
+identity to the operations it ran: no role, no session variables, no claims.
+A connection is now authenticated once, from its `connection_init` payload
+(`{"headers": {"Authorization": "Bearer <token>"}}`, as Hasura's clients send
+it) and the upgrade request's headers, through the same code an HTTP request
+goes through -- the admin secret, `X-Hasura-Role` against the token's allowed
+roles, the role's schema and its introspection setting. A connection HTTP would
+refuse is refused at `connection_init`, and each live query re-reads as the
+connection's identity. A mutation sent over the socket is committed or rolled
+back before its answer is sent, as over HTTP.
+
+**A subscription that fails says why.** A live query whose read failed -- a
+permission refused, a cast that cannot be made -- ended with a bare
+`complete`, the error dropped on the way out, so a refused subscription looked
+exactly like one that had finished. The error is now sent, and the subscription
+ends after it.
+
+**The documented policies work on pooled connections.** A per-claim setting a
+connection has ever held reads as `''`, not `NULL`, once the transaction that
+set it ends. `docs/authentication.md` cast them straight to `integer`, so a
+token without the claim was answered on some connections and failed with
+`invalid input syntax for type integer` on others, depending only on what the
+connection had served before. The examples now read the claims document, which
+is set on every request; the per-claim settings are documented with
+`NULLIF(..., '')`, and with what they cannot reach: nested claims, and names
+that cannot be settings.
+
+**Check any policy written the old way.** Before this release the per-claim
+settings were never set, so a policy casting one read `NULL` and never failed
+-- it also never matched. From this release such a policy matches for a token
+carrying the claim, and fails for one without it on a connection that has
+served one with it. Read `request.jwt.claims` instead, or wrap the setting in
+`NULLIF(..., '')`.
+
 ## 2.0.0
 
 **Postrust can be an Apollo Federation v2 subgraph.** Set

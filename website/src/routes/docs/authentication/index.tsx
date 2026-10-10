@@ -187,6 +187,15 @@ $$ LANGUAGE SQL STABLE;`}</code>
               </Link>{" "}
               for the surface itself.
             </p>
+            <p class="text-neutral-600 mt-4">
+              Either way the verified claims reach the database, so one RLS policy serves both:{" "}
+              <code class="font-mono">request.jwt.claims</code> is set in every GraphQL transaction as
+              it is in every REST one. That includes subscriptions. A WebSocket is authenticated once,
+              from the <code class="font-mono">connection_init</code> payload &mdash;{" "}
+              <code class="font-mono">{`{"headers": {"Authorization": "Bearer <token>"}}`}</code>, since a
+              browser cannot set headers on a WebSocket &mdash; and every live query on it re-reads as
+              that identity.
+            </p>
           </section>
 
           {/* Next */}

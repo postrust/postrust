@@ -24,7 +24,8 @@
 //! begin.
 //!
 //! The moment framing becomes something it does not model -- a chunked body, a
-//! header block too large to buffer, a request line it cannot make sense of --
+//! header block too large to buffer, a request line it cannot make sense of,
+//! a request asking to `Upgrade` the connection to another protocol --
 //! it stops rewriting for the remainder of the connection and copies bytes
 //! through verbatim. That degrades to exactly hyper's own behaviour. It is
 //! never left guessing whether the bytes in hand are a request line.
@@ -77,7 +78,11 @@ enum State {
     /// At the start of a message, reading the request line.
     RequestLine,
     /// Reading the header block that follows a request line.
-    Headers { content_length: u64 },
+    ///
+    /// `upgrade` is whether it asked to switch protocols. What follows such a
+    /// request, once it is accepted, is the new protocol's bytes -- WebSocket
+    /// frames, say -- and not another request line.
+    Headers { content_length: u64, upgrade: bool },
     /// Copying a body through; this many bytes still to come.
     Body(u64),
     /// Framing is no longer modelled: copy everything, rewrite nothing.
@@ -184,13 +189,29 @@ impl<T> LenientStream<T> {
         match self.state {
             State::RequestLine => {
                 self.out.extend_from_slice(&normalize_request_line(&line));
-                self.state = State::Headers { content_length: 0 };
+                self.state = State::Headers {
+                    content_length: 0,
+                    upgrade: false,
+                };
             }
-            State::Headers { content_length } => {
+            State::Headers {
+                content_length,
+                upgrade,
+            } => {
                 let is_blank = matches!(line.as_slice(), b"\r\n" | b"\n");
                 if is_blank {
                     self.out.extend_from_slice(&line);
-                    self.state = if content_length == 0 {
+                    // Whether the server accepts the switch is decided above
+                    // this adapter, and once it has, the bytes are frames:
+                    // masked WebSocket payloads are full of bytes a request
+                    // line would have percent-encoded, and seldom contain the
+                    // newline a line is buffered until. So copy through from
+                    // here either way. A declined upgrade loses only the
+                    // rewriting of that connection's later requests, which is
+                    // hyper's own behaviour.
+                    self.state = if upgrade {
+                        State::PassThrough
+                    } else if content_length == 0 {
                         State::RequestLine
                     } else {
                         State::Body(content_length)
@@ -223,7 +244,10 @@ impl<T> LenientStream<T> {
                 };
 
                 self.out.extend_from_slice(&line);
-                self.state = State::Headers { content_length };
+                self.state = State::Headers {
+                    content_length,
+                    upgrade: upgrade || header_is(&line, b"upgrade"),
+                };
             }
             State::Preface | State::Body(_) | State::PassThrough => {
                 unreachable!("not a line state")
@@ -540,6 +564,34 @@ mod tests {
             out,
             [H2_PREFACE, b"\xff\xfe->\n"].concat(),
             "an HTTP/2 connection was rewritten"
+        );
+    }
+
+    /// After a request asking to switch protocols the bytes are the new
+    /// protocol's. A masked WebSocket frame holding `>`, high-bit bytes and
+    /// spaces, read as a request line, would be percent-encoded -- and held
+    /// back until a newline arrived, which a frame need never contain.
+    #[test]
+    fn a_websocket_upgrade_is_passed_through_after_its_headers() {
+        let mut raw = Vec::new();
+        raw.extend_from_slice(
+            b"GET /v1/graphql/ws HTTP/1.1\r\nHost: x\r\nConnection: Upgrade\r\n\
+              Upgrade: websocket\r\nSec-WebSocket-Version: 13\r\n\r\n",
+        );
+        raw.extend_from_slice(b"\x81\xfe\x00\x8a\x12\x34 a>b \xff\xfe HTTP/1.1");
+        assert_eq!(run(&[&raw]), raw, "frames after the upgrade were altered");
+        // Including when the frame arrives as a read of its own.
+        let (head, frame) = raw.split_at(raw.len() - 21);
+        assert_eq!(run(&[head, frame]), raw);
+    }
+
+    /// The upgrade request's own target is still rewritten.
+    #[test]
+    fn an_upgrade_requests_target_is_still_rewritten() {
+        let out = run(&[b"GET /ws?s=a->b HTTP/1.1\r\nUpgrade: websocket\r\n\r\n\x81\x80>"]);
+        assert_eq!(
+            out,
+            b"GET /ws?s=a-%3Eb HTTP/1.1\r\nUpgrade: websocket\r\n\r\n\x81\x80>".to_vec()
         );
     }
 
