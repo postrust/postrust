@@ -2411,6 +2411,7 @@ dependencies = [
  "postrust-auth",
  "postrust-core",
  "postrust-response",
+ "postrust-server",
  "postrust-sql",
  "pretty_assertions",
  "serde",
