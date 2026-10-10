@@ -22,13 +22,13 @@ export default component$(() => (
               {formatDate(post.date)}
             </time>
             <h2 class="mt-1 mb-2 text-2xl font-bold text-neutral-900">
-              <Link href={`/blog/${post.slug}`} class="hover:text-primary-600">
+              <Link href={`/blog/${post.slug}/`} class="hover:text-primary-600">
                 {post.title}
               </Link>
             </h2>
             <p class="text-neutral-600">{post.description}</p>
             <Link
-              href={`/blog/${post.slug}`}
+              href={`/blog/${post.slug}/`}
               class="text-primary-600 mt-3 inline-block font-medium hover:underline"
             >
               Read the post →
@@ -43,7 +43,7 @@ export default component$(() => (
 const title = "Blog | Postrust";
 const description =
   "How Postrust works and how to use it: PostgreSQL as REST, GraphQL and Apollo Federation, with every example run before it was written down.";
-const url = "https://postrust.org/blog";
+const url = "https://postrust.org/blog/";
 
 export const head: DocumentHead = {
   title,

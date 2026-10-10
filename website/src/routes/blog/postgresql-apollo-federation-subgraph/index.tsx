@@ -1,6 +1,6 @@
 import { component$ } from "@builder.io/qwik";
 import { Link } from "@builder.io/qwik-city";
-import { Code, PostLayout, postHead } from "~/components/blog/post";
+import { Code, CodePair, PostLayout, postHead } from "~/components/blog/post";
 import { posts } from "~/data/posts";
 
 const SLUG = "postgresql-apollo-federation-subgraph";
@@ -9,10 +9,12 @@ const post = posts.find((p) => p.slug === SLUG)!;
 const EXAMPLE =
   "https://github.com/postrust/postrust/tree/main/examples/federation";
 
-const h2 = "mb-4 mt-12 text-2xl font-bold text-neutral-900";
-const p = "mb-4 text-neutral-600";
-const a = "text-primary-600 hover:underline";
-const code = "font-mono text-sm";
+const h2 =
+  "mb-5 mt-16 text-2xl font-bold tracking-tight text-neutral-950 md:text-[1.75rem]";
+const p = "mb-5 text-[1.0625rem] leading-8 text-neutral-700";
+const a =
+  "font-medium text-primary-700 underline decoration-primary-300 underline-offset-2 hover:decoration-primary-600";
+const code = "font-mono";
 
 /** As of October 2026; each row links to what it rests on. */
 const others = [
@@ -84,7 +86,7 @@ export default component$(() => (
     <p class={p}>
       A Federation v2 subgraph answers two fields beyond its own schema:
     </p>
-    <ul class="mb-4 list-disc space-y-2 pl-6 text-neutral-600">
+    <ul class="marker:text-primary-500 mb-5 list-disc space-y-2 pl-6 text-[1.0625rem] leading-8 text-neutral-700">
       <li>
         <code class={code}>_service {"{ sdl }"}</code> returns its schema, with
         Federation directives, for the router to compose with the others.
@@ -117,6 +119,7 @@ export default component$(() => (
     </p>
     <Code
       label="reviews.sql (excerpt)"
+      lang="sql"
       code={`CREATE TABLE products (id int PRIMARY KEY);
 CREATE TABLE reviews (
   id int PRIMARY KEY,
@@ -135,13 +138,14 @@ CREATE POLICY everything ON reviews FOR SELECT TO editor USING (true);`}
       <code class={code}>authenticator</code> role with no privileges of its
       own, which becomes the role the caller&rsquo;s token names for each
       request (<code class={code}>web_anon</code> without one) &mdash; the{" "}
-      <Link href="/docs/authentication" class={a}>
+      <Link href="/docs/authentication/" class={a}>
         setup PostgREST recommends
       </Link>
       .
     </p>
     <Code
       label="the catalog subgraph"
+      lang="bash"
       code={`docker run -p 3001:3000 \\
   -e DATABASE_URL=postgres://authenticator:authenticator@catalog-db:5432/postgres \\
   -e PGRST_DB_ANON_ROLE=web_anon \\
@@ -162,9 +166,10 @@ CREATE POLICY everything ON reviews FOR SELECT TO editor USING (true);`}
       thing the catalog cannot: that <code class={code}>products</code> in both
       databases is the same entity.
     </p>
-    <div class="grid gap-4 md:grid-cols-2">
+    <CodePair>
       <Code
         label="catalog.json"
+        lang="json"
         code={`{
   "tables": {
     "public.products": {
@@ -180,6 +185,7 @@ CREATE POLICY everything ON reviews FOR SELECT TO editor USING (true);`}
       />
       <Code
         label="reviews.json"
+        lang="json"
         code={`{
   "tables": {
     "public.products": {
@@ -202,16 +208,17 @@ CREATE POLICY everything ON reviews FOR SELECT TO editor USING (true);`}
   }
 }`}
       />
-    </div>
+    </CodePair>
     <p class={p}>
       A shared table keeps its unprefixed type name,{" "}
       <code class={code}>Product</code>, in both subgraphs, so the router sees
       one entity contributed to by two services. Each subgraph serves it with
       the fields its own database has:
     </p>
-    <div class="grid gap-4 md:grid-cols-2">
+    <CodePair>
       <Code
         label="catalog: _service { sdl } (excerpt)"
+        lang="graphql"
         code={`type Product @key(fields: "id") {
   id: Int!
   name: String! @shareable
@@ -220,13 +227,14 @@ CREATE POLICY everything ON reviews FOR SELECT TO editor USING (true);`}
       />
       <Code
         label="reviews: _service { sdl } (excerpt)"
+        lang="graphql"
         code={`type Product @key(fields: "id") {
   id: Int!
   reviews(...): [reviews_Review!]! @shareable
   reviews_aggregate(...): ... @shareable
 }`}
       />
-    </div>
+    </CodePair>
     <p class={p}>
       Every non-key field of a shared type is marked{" "}
       <code class={code}>@shareable</code>, which lets either subgraph resolve
@@ -240,9 +248,10 @@ CREATE POLICY everything ON reviews FOR SELECT TO editor USING (true);`}
       <code class={code}>_service</code> and composes the supergraph; Apollo
       Router serves it.
     </p>
-    <div class="grid gap-4 md:grid-cols-2">
+    <CodePair>
       <Code
         label="supergraph.yaml"
+        lang="yaml"
         code={`federation_version: =2.11.2
 subgraphs:
   catalog:
@@ -256,6 +265,7 @@ subgraphs:
       />
       <Code
         label="router.yaml"
+        lang="yaml"
         code={`supergraph:
   listen: 0.0.0.0:4000
 headers:
@@ -264,9 +274,10 @@ headers:
       - propagate:
           named: authorization`}
       />
-    </div>
+    </CodePair>
     <Code
       label="bash"
+      lang="bash"
       code={`rover supergraph compose --config supergraph.yaml --output supergraph.graphql
 router --config router.yaml --supergraph supergraph.graphql`}
     />
@@ -277,9 +288,10 @@ router --config router.yaml --supergraph supergraph.graphql`}
       than stop at it.
     </p>
     <p class={p}>One query now reads from both databases:</p>
-    <div class="grid gap-4 md:grid-cols-2">
+    <CodePair>
       <Code
         label="query"
+        lang="graphql"
         code={`{
   catalog_products {
     name
@@ -293,6 +305,7 @@ router --config router.yaml --supergraph supergraph.graphql`}
       />
       <Code
         label="response, anonymous"
+        lang="json"
         code={`{
   "data": {
     "catalog_products": [
@@ -316,7 +329,7 @@ router --config router.yaml --supergraph supergraph.graphql`}
   }
 }`}
       />
-    </div>
+    </CodePair>
     <p class={p}>
       The router asks the catalog for the products, then sends the reviews
       subgraph one <code class={code}>_entities</code> call with every product
@@ -324,9 +337,10 @@ router --config router.yaml --supergraph supergraph.graphql`}
       key, and an unknown key is a <code class={code}>null</code> in its
       position rather than an error for the whole list:
     </p>
-    <div class="grid gap-4 md:grid-cols-2">
+    <CodePair>
       <Code
         label="what the router sends, roughly"
+        lang="graphql"
         code={`{
   _entities(representations: [
     { __typename: "Product", id: 1 },
@@ -338,6 +352,7 @@ router --config router.yaml --supergraph supergraph.graphql`}
       />
       <Code
         label="reviews subgraph"
+        lang="json"
         code={`{
   "data": {
     "_entities": [
@@ -347,7 +362,7 @@ router --config router.yaml --supergraph supergraph.graphql`}
   }
 }`}
       />
-    </div>
+    </CodePair>
     <p class={p}>
       Keys are checked against the key column&rsquo;s type before anything
       reaches the database: sending <code class={code}>id: "1"</code> for an{" "}
@@ -360,9 +375,10 @@ router --config router.yaml --supergraph supergraph.graphql`}
       reviews database &mdash; to the catalog for the fields only the catalog
       has:
     </p>
-    <div class="grid gap-4 md:grid-cols-2">
+    <CodePair>
       <Code
         label="query"
+        lang="graphql"
         code={`{
   reviews_reviews {
     rating
@@ -375,6 +391,7 @@ router --config router.yaml --supergraph supergraph.graphql`}
       />
       <Code
         label="response, anonymous"
+        lang="json"
         code={`{
   "data": {
     "reviews_reviews": [
@@ -388,7 +405,7 @@ router --config router.yaml --supergraph supergraph.graphql`}
   }
 }`}
       />
-    </div>
+    </CodePair>
 
     <h2 class={h2}>Who is asking, across subgraphs</h2>
     <p class={p}>
@@ -398,6 +415,7 @@ router --config router.yaml --supergraph supergraph.graphql`}
     </p>
     <Code
       label="the keyboard's reviews, as an editor"
+      lang="json"
       code={`"reviews": [
   { "rating": 5, "body": "Best keyboard I have owned." },
   { "rating": 2, "body": "Pending moderation." }
@@ -426,6 +444,7 @@ router --config router.yaml --supergraph supergraph.graphql`}
     </p>
     <Code
       label="bash"
+      lang="bash"
       code={`git clone https://github.com/postrust/postrust
 cd postrust/examples/federation
 docker compose up --wait catalog reviews && docker compose up -d router
@@ -433,7 +452,7 @@ docker compose up --wait catalog reviews && docker compose up -d router
     />
     <p class={p}>
       The same GraphQL API, Federation included, is also served by the{" "}
-      <Link href="/docs/deployment" class={a}>
+      <Link href="/docs/deployment/" class={a}>
         AWS Lambda adapter
       </Link>{" "}
       since 2.2.0. The Cloudflare Workers adapter is not working yet;{" "}
@@ -463,7 +482,7 @@ docker compose up --wait catalog reviews && docker compose up -d router
       pass. The optional ones it does not pass are the Federation features a
       schema generated from tables has no way to express yet:
     </p>
-    <ul class="mb-4 list-disc space-y-2 pl-6 text-neutral-600">
+    <ul class="marker:text-primary-500 mb-5 list-disc space-y-2 pl-6 text-[1.0625rem] leading-8 text-neutral-700">
       <li>
         <code class={code}>@requires</code>, <code class={code}>@provides</code>
         , <code class={code}>@external</code> and{" "}
@@ -486,7 +505,7 @@ docker compose up --wait catalog reviews && docker compose up -d router
     </p>
     <p class={p}>
       The details are in the{" "}
-      <Link href="/docs/graphql#federation" class={a}>
+      <Link href="/docs/graphql/#federation" class={a}>
         Federation documentation
       </Link>
       .
@@ -499,23 +518,23 @@ docker compose up --wait catalog reviews && docker compose up -d router
       Where other tools that generate GraphQL from PostgreSQL stood on
       Federation in October 2026, from their own documentation:
     </p>
-    <div class="mb-4 overflow-x-auto">
-      <table class="w-full text-sm">
-        <thead>
-          <tr class="border-b border-neutral-200">
-            <th class="py-2 pr-4 text-left font-semibold text-neutral-900">
-              Tool
-            </th>
-            <th class="py-2 text-left font-semibold text-neutral-900">
-              As a Federation subgraph
+    <div class="post-wide mb-8 overflow-x-auto rounded-xl border border-neutral-200">
+      <table class="w-full text-left text-sm">
+        <thead class="bg-neutral-50">
+          <tr>
+            <th class="px-4 py-3 font-semibold text-neutral-900">Tool</th>
+            <th class="px-4 py-3 font-semibold text-neutral-900">
+              As a Federation subgraph, October 2026
             </th>
           </tr>
         </thead>
-        <tbody>
+        <tbody class="divide-y divide-neutral-200">
           {others.map((o) => (
-            <tr key={o.tool} class="border-b border-neutral-100 align-top">
-              <td class="py-2 pr-4 font-medium text-neutral-800">{o.tool}</td>
-              <td class="py-2 text-neutral-600">
+            <tr key={o.tool} class="align-top">
+              <td class="w-56 px-4 py-3 font-medium text-neutral-900">
+                {o.tool}
+              </td>
+              <td class="px-4 py-3 leading-6 text-neutral-600">
                 {o.answer}{" "}
                 <a
                   href={o.href}
@@ -533,11 +552,11 @@ docker compose up --wait catalog reviews && docker compose up -d router
     </div>
     <p class={p}>
       For how Postrust compares to these tools beyond Federation, see{" "}
-      <Link href="/compare/hasura" class={a}>
+      <Link href="/compare/hasura/" class={a}>
         Postrust vs Hasura
       </Link>{" "}
       and{" "}
-      <Link href="/compare/postgraphile" class={a}>
+      <Link href="/compare/postgraphile/" class={a}>
         Postrust vs PostGraphile
       </Link>
       .

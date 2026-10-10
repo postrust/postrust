@@ -9,6 +9,8 @@ export interface Post {
   /** ISO date the post was published. */
   date: string;
   author: string;
+  /** Rounded up, prose only: code is read at a different pace. */
+  readingMinutes: number;
   tags: string[];
 }
 
@@ -21,11 +23,12 @@ export const posts: Post[] = [
       "Two PostgreSQL databases, two generated subgraphs, one Apollo Router: what a resolver-less subgraph has to do, a worked example with row-level security carried through the router, and how the other tools that do this compare as of October 2026.",
     date: "2026-10-10",
     author: "The Postrust team",
+    readingMinutes: 8,
     tags: ["Apollo Federation", "PostgreSQL", "GraphQL"],
   },
 ];
 
-export const postUrl = (slug: string) => `https://postrust.org/blog/${slug}`;
+export const postUrl = (slug: string) => `https://postrust.org/blog/${slug}/`;
 
 export const formatDate = (iso: string) =>
   new Date(`${iso}T00:00:00Z`).toLocaleDateString("en-GB", {
