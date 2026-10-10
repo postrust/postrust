@@ -21,25 +21,88 @@ pub async fn get_pg_version(pool: &PgPool) -> Result<i32> {
     Ok(row.get("version"))
 }
 
+/// Whether a role this connection can become holds one of `privileges` in the
+/// ACL `acl`, or `PUBLIC` does.
+///
+/// This is the test `information_schema` makes, with one word changed. Its
+/// views ask `pg_has_role(role, 'USAGE')` -- does this connection hold the
+/// role's privileges *without* switching to it -- which is false of every role
+/// granted to a `NOINHERIT` authenticator. That is the setup PostgREST
+/// recommends, and the one where the API runs every request after `SET ROLE`:
+/// what the authenticator could do *as itself* is beside the point, and with
+/// `USAGE` the schema cache saw no tables at all. `MEMBER` asks whether the
+/// connection can become the role, which is what a request does.
+///
+/// For a superuser, or an authenticator that inherits, the two answers are
+/// the same, so nothing about those deployments changes.
+///
+/// `CASE` rather than `OR`: SQL does not promise to short-circuit, and
+/// `pg_has_role` refuses OID 0, which is how an ACL spells `PUBLIC`.
+fn acl_grants(acl: &str, privileges: &str) -> String {
+    format!(
+        "EXISTS (SELECT 1 FROM aclexplode({acl}) g \
+          WHERE g.privilege_type = ANY ('{{{privileges}}}'::text[]) \
+            AND CASE WHEN g.grantee = 0 THEN true \
+                     ELSE pg_has_role(g.grantee, 'MEMBER') END)"
+    )
+}
+
+/// A relation's own ACL, or the owner-only default it stands for when unset.
+const RELATION_ACL: &str = "COALESCE(c.relacl, acldefault('r', c.relowner))";
+
+/// Whether a relation is visible to this connection: `information_schema.tables`'
+/// condition, with `MEMBER` for `USAGE` (see `acl_grants`). A role it can
+/// become owns it, or holds a privilege on it or on one of its columns.
+fn relation_visible() -> String {
+    format!(
+        "(pg_has_role(c.relowner, 'MEMBER') \
+          OR {table} \
+          OR EXISTS (SELECT 1 FROM pg_attribute ca \
+                      WHERE ca.attrelid = c.oid AND ca.attnum > 0 \
+                        AND NOT ca.attisdropped AND ca.attacl IS NOT NULL \
+                        AND {column}))",
+        table = acl_grants(
+            RELATION_ACL,
+            "SELECT,INSERT,UPDATE,DELETE,TRUNCATE,REFERENCES,TRIGGER"
+        ),
+        column = acl_grants("ca.attacl", "SELECT,INSERT,UPDATE,REFERENCES"),
+    )
+}
+
+/// Whether a privilege on a relation is held by anyone this connection can
+/// act for: `information_schema.table_privileges`' condition -- the grant is
+/// visible when its grantor or its grantee is a role this connection can
+/// become, or the grantee is `PUBLIC` -- with `MEMBER` for `USAGE`.
+fn privilege_granted(privilege: &str) -> String {
+    format!(
+        "(c.relkind IN ('r', 'v', 'f', 'p') AND EXISTS (\
+            SELECT 1 FROM aclexplode({RELATION_ACL}) g \
+             WHERE g.privilege_type = '{privilege}' \
+               AND (CASE WHEN g.grantee = 0 THEN true \
+                         ELSE pg_has_role(g.grantee, 'MEMBER') END \
+                    OR pg_has_role(g.grantor, 'MEMBER'))))"
+    )
+}
+
 /// Load all tables and their columns.
 pub async fn load_tables(pool: &PgPool, schemas: &[String]) -> Result<TablesMap> {
     let mut tables = HashMap::new();
 
-    // Query tables/views from information_schema
-    let rows = sqlx::query(
+    // From the catalogue rather than `information_schema`, whose views show a
+    // connection only what it can use without switching role -- nothing, for
+    // a NOINHERIT authenticator. See `acl_grants`.
+    let sql = format!(
         r#"
         SELECT
             t.table_schema,
             t.table_name,
             t.table_type,
-            pg_catalog.obj_description(
-                (quote_ident(t.table_schema) || '.' || quote_ident(t.table_name))::regclass
-            ) as description,
+            pg_catalog.obj_description(t.oid, 'pg_class') as description,
             COALESCE(
-                (SELECT array_agg(a.attname ORDER BY array_position(i.indkey, a.attnum))
+                (SELECT array_agg(a.attname::text ORDER BY array_position(i.indkey, a.attnum))
                 FROM pg_index i
                 JOIN pg_attribute a ON a.attrelid = i.indrelid AND a.attnum = ANY(i.indkey)
-                WHERE i.indrelid = (quote_ident(t.table_schema) || '.' || quote_ident(t.table_name))::regclass
+                WHERE i.indrelid = t.oid
                   AND i.indisprimary),
                 ARRAY[]::text[]
             ) as pk_cols,
@@ -48,84 +111,81 @@ pub async fn load_tables(pool: &PgPool, schemas: &[String]) -> Result<TablesMap>
             -- enough for PostgreSQL to write through automatically, or where
             -- an INSTEAD OF trigger says how -- `projects_view_without_triggers`
             -- carries every grant and accepts nothing. Both halves have to
-            -- hold. A table has no row in `information_schema.views`, so the
-            -- grant is the whole answer there.
-            EXISTS (
-                SELECT 1 FROM information_schema.table_privileges tp
-                WHERE tp.table_schema = t.table_schema
-                  AND tp.table_name = t.table_name
-                  AND tp.privilege_type = 'INSERT'
-            ) AND COALESCE(
-                v.is_insertable_into = 'YES' OR v.is_trigger_insertable_into = 'YES',
-                true
+            -- hold. A table is not a view, so the grant is the whole answer
+            -- there.
+            --
+            -- The view half is `information_schema.views`' own: the bits of
+            -- `pg_relation_is_updatable` it reads, and the INSTEAD OF trigger
+            -- types (`tgtype` 69 insert, 81 update, 73 delete).
+            {insert} AND (
+                t.relkind <> 'v'
+                OR (pg_relation_is_updatable(t.oid, false) & 8) = 8
+                OR EXISTS (SELECT 1 FROM pg_trigger tg
+                            WHERE tg.tgrelid = t.oid AND (tg.tgtype::int & 69) = 69)
             ) as insertable,
-            EXISTS (
-                SELECT 1 FROM information_schema.table_privileges tp
-                WHERE tp.table_schema = t.table_schema
-                  AND tp.table_name = t.table_name
-                  AND tp.privilege_type = 'UPDATE'
-            ) AND COALESCE(
-                v.is_updatable = 'YES' OR v.is_trigger_updatable = 'YES',
-                true
+            {update} AND (
+                t.relkind <> 'v'
+                OR (pg_relation_is_updatable(t.oid, false) & 20) = 20
+                OR EXISTS (SELECT 1 FROM pg_trigger tg
+                            WHERE tg.tgrelid = t.oid AND (tg.tgtype::int & 81) = 81)
             ) as updatable,
-            EXISTS (
-                SELECT 1 FROM information_schema.table_privileges tp
-                WHERE tp.table_schema = t.table_schema
-                  AND tp.table_name = t.table_name
-                  AND tp.privilege_type = 'DELETE'
-            -- `is_updatable`, not a typo for a column that does not exist:
-            -- `information_schema.views` has no `is_deletable`, because a view
-            -- PostgreSQL can write through automatically is one it can delete
-            -- through as well. Only the trigger half is asked separately.
-            ) AND COALESCE(
-                v.is_updatable = 'YES' OR v.is_trigger_deletable = 'YES',
-                true
+            -- Updatable rather than a deletable bit, as `information_schema`
+            -- has it: a view PostgreSQL can write through automatically is
+            -- one it can delete through as well. Only the trigger half is
+            -- asked separately.
+            {delete} AND (
+                t.relkind <> 'v'
+                OR (pg_relation_is_updatable(t.oid, false) & 20) = 20
+                OR EXISTS (SELECT 1 FROM pg_trigger tg
+                            WHERE tg.tgrelid = t.oid AND (tg.tgtype::int & 73) = 73)
             ) as deletable,
-            COALESCE(k.is_partitioned, false) as is_partitioned
+            t.relkind = 'p' as is_partitioned
         FROM (
-            -- `information_schema.tables` has no row for a materialized view,
-            -- so one is added from the catalogue. Everything downstream keys
-            -- off `table_type`, and a materialized view is a view that cannot
-            -- be written to -- which is what the privilege lookups above
-            -- already report, since it has no INSERT/UPDATE/DELETE grants.
             -- A foreign table is a table: it has columns, it can be selected
             -- from and written to, and which server stores the rows is not
             -- the API's business. Leaving it out meant a schema that exposes
             -- one answered "no such table".
-            SELECT table_schema, table_name, table_type
-              FROM information_schema.tables
-             WHERE table_type IN ('BASE TABLE', 'VIEW', 'FOREIGN')
-            UNION ALL
-            SELECT n.nspname, c.relname, 'VIEW'
+            --
+            -- A materialized view is a view that cannot be written to, which
+            -- is what the privilege tests report for it -- they cover only
+            -- the relation kinds `information_schema.table_privileges` does,
+            -- and this is not one of them.
+            SELECT c.oid, c.relkind, c.relispartition,
+                   n.nspname::text AS table_schema,
+                   c.relname::text AS table_name,
+                   CASE WHEN c.relkind IN ('v', 'm') THEN 'VIEW'
+                        WHEN c.relkind = 'f' THEN 'FOREIGN'
+                        ELSE 'BASE TABLE' END AS table_type,
+                   {visible} OR c.relkind = 'm' AS visible
               FROM pg_class c
               JOIN pg_namespace n ON n.oid = c.relnamespace
-             WHERE c.relkind = 'm'
+             WHERE c.relkind IN ('r', 'v', 'f', 'p', 'm')
+               AND NOT pg_is_other_temp_schema(n.oid)
+               AND n.oid <> pg_my_temp_schema()
         ) t
-        LEFT JOIN LATERAL (
-            SELECT c.relkind = 'p' AS is_partitioned,
-                   c.relispartition AS is_partition
-              FROM pg_class c
-              JOIN pg_namespace n ON n.oid = c.relnamespace
-             WHERE n.nspname = t.table_schema AND c.relname = t.table_name
-        ) k ON true
-        LEFT JOIN information_schema.views v
-               ON v.table_schema = t.table_schema AND v.table_name = t.table_name
+        JOIN pg_class c ON c.oid = t.oid
         WHERE t.table_schema = ANY($1)
+          AND t.visible
           -- A partition is reached through the table it partitions, not on its
-          -- own. `information_schema.tables` lists every one of them, so a
-          -- schema with a year of monthly partitions exposed twelve endpoints
-          -- PostgREST does not have -- and a request naming one was answered
-          -- as though the table were real, which made a missing relationship
-          -- read as a missing column. The partitioned parent itself
-          -- (`relkind = 'p'`) is not a partition and stays.
-          AND NOT COALESCE(k.is_partition, false)
+          -- own. Listing every one of them gave a schema with a year of
+          -- monthly partitions twelve endpoints PostgREST does not have -- and
+          -- a request naming one was answered as though the table were real,
+          -- which made a missing relationship read as a missing column. The
+          -- partitioned parent itself (`relkind = 'p'`) is not a partition and
+          -- stays.
+          AND NOT t.relispartition
         ORDER BY t.table_schema, t.table_name
         "#,
-    )
-    .bind(schemas)
-    .fetch_all(pool)
-    .await
-    .map_err(|e| Error::SchemaCacheLoadFailed(e.to_string()))?;
+        insert = privilege_granted("INSERT"),
+        update = privilege_granted("UPDATE"),
+        delete = privilege_granted("DELETE"),
+        visible = relation_visible(),
+    );
+    let rows = sqlx::query(&sql)
+        .bind(schemas)
+        .fetch_all(pool)
+        .await
+        .map_err(|e| Error::SchemaCacheLoadFailed(e.to_string()))?;
 
     for row in rows {
         let schema: String = row.get("table_schema");
@@ -165,7 +225,12 @@ async fn load_columns(
 ) -> Result<ColumnMap> {
     let mut columns = IndexMap::new();
 
-    let rows = sqlx::query(
+    // `information_schema.columns`, read from the catalogue: the view's own
+    // expressions for every column used here, so a type is named exactly as it
+    // was, and its visibility test with `MEMBER` for `USAGE` -- see
+    // `acl_grants` for why the view itself shows a NOINHERIT authenticator
+    // nothing.
+    let sql = format!(
         r#"
         SELECT
             c.column_name,
@@ -210,30 +275,77 @@ async fn load_columns(
                     OR c.is_generated = 'ALWAYS',
                 false
             ) AS always_generated,
-            pg_catalog.col_description(
-                (quote_ident(c.table_schema) || '.' || quote_ident(c.table_name))::regclass,
-                c.ordinal_position
-            ) as description,
+            -- By OID: naming the table and casting to `regclass` needs USAGE
+            -- on its schema, which a NOINHERIT authenticator does not have.
+            pg_catalog.col_description(c.relid, c.ordinal_position) as description,
             CASE WHEN e.enumtypid IS NOT NULL
                  THEN array_agg(e.enumlabel ORDER BY e.enumsortorder)
                  ELSE ARRAY[]::text[]
             END as enum_values
-        FROM information_schema.columns c
+        FROM (
+            SELECT
+                c.oid AS relid,
+                nc.nspname::text AS table_schema,
+                c.relname::text AS table_name,
+                a.attname::text AS column_name,
+                a.attnum::int AS ordinal_position,
+                CASE WHEN a.attgenerated = '' THEN pg_get_expr(ad.adbin, ad.adrelid) END
+                    AS column_default,
+                CASE WHEN a.attnotnull OR (t.typtype = 'd' AND t.typnotnull)
+                     THEN 'NO' ELSE 'YES' END AS is_nullable,
+                CASE WHEN t.typtype = 'd' THEN
+                         CASE WHEN bt.typelem <> 0 AND bt.typlen = -1 THEN 'ARRAY'
+                              WHEN nbt.nspname = 'pg_catalog' THEN format_type(t.typbasetype, NULL)
+                              ELSE 'USER-DEFINED' END
+                     ELSE
+                         CASE WHEN t.typelem <> 0 AND t.typlen = -1 THEN 'ARRAY'
+                              WHEN nt.nspname = 'pg_catalog' THEN format_type(a.atttypid, NULL)
+                              ELSE 'USER-DEFINED' END
+                END AS data_type,
+                information_schema._pg_char_max_length(
+                    information_schema._pg_truetypid(a.*, t.*),
+                    information_schema._pg_truetypmod(a.*, t.*)
+                )::int AS character_maximum_length,
+                CASE WHEN t.typtype = 'd' THEN t.typname::text END AS domain_name,
+                COALESCE(bt.typname, t.typname)::text AS udt_name,
+                CASE WHEN a.attidentity IN ('a', 'd') THEN 'YES' ELSE 'NO' END AS is_identity,
+                CASE a.attidentity WHEN 'a' THEN 'ALWAYS' WHEN 'd' THEN 'BY DEFAULT' END
+                    AS identity_generation,
+                CASE WHEN a.attgenerated <> '' THEN 'ALWAYS' ELSE 'NEVER' END AS is_generated
+            FROM pg_attribute a
+            LEFT JOIN pg_attrdef ad ON a.attrelid = ad.adrelid AND a.attnum = ad.adnum
+            JOIN pg_class c ON a.attrelid = c.oid
+            JOIN pg_namespace nc ON c.relnamespace = nc.oid
+            JOIN pg_type t ON a.atttypid = t.oid
+            JOIN pg_namespace nt ON t.typnamespace = nt.oid
+            LEFT JOIN (pg_type bt JOIN pg_namespace nbt ON bt.typnamespace = nbt.oid)
+                   ON t.typtype = 'd' AND t.typbasetype = bt.oid
+            WHERE nc.nspname = $1 AND c.relname = $2
+              AND NOT pg_is_other_temp_schema(nc.oid)
+              AND a.attnum > 0 AND NOT a.attisdropped
+              AND c.relkind IN ('r', 'v', 'f', 'p')
+              AND (pg_has_role(c.relowner, 'MEMBER')
+                   OR {table_grant}
+                   OR (a.attacl IS NOT NULL AND {column_grant}))
+        ) c
         LEFT JOIN pg_type t ON t.typname = c.udt_name
         LEFT JOIN pg_enum e ON e.enumtypid = t.oid
         WHERE c.table_schema = $1 AND c.table_name = $2
-        GROUP BY c.table_schema, c.table_name, c.column_name, c.ordinal_position, c.is_nullable,
+        GROUP BY c.relid, c.table_schema, c.table_name, c.column_name, c.ordinal_position, c.is_nullable,
                  c.data_type, c.udt_name, c.domain_name, c.character_maximum_length,
                  c.column_default, c.is_identity, c.identity_generation, c.is_generated,
                  t.oid, e.enumtypid
         ORDER BY c.ordinal_position
         "#,
-    )
-    .bind(schema)
-    .bind(table)
-    .fetch_all(pool)
-    .await
-    .map_err(|e| Error::SchemaCacheLoadFailed(e.to_string()))?;
+        table_grant = acl_grants(RELATION_ACL, "SELECT,INSERT,UPDATE,REFERENCES"),
+        column_grant = acl_grants("a.attacl", "SELECT,INSERT,UPDATE,REFERENCES"),
+    );
+    let rows = sqlx::query(&sql)
+        .bind(schema)
+        .bind(table)
+        .fetch_all(pool)
+        .await
+        .map_err(|e| Error::SchemaCacheLoadFailed(e.to_string()))?;
 
     // A materialized view has no rows in `information_schema.columns`; its
     // columns come from the catalogue instead.
