@@ -1,0 +1,9 @@
+supergraph:
+  listen: 0.0.0.0:4000
+# Each subgraph verifies the caller's token itself, and runs the request as
+# the role it names -- so the router passes it on.
+headers:
+  all:
+    request:
+      - propagate:
+          named: authorization
