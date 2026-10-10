@@ -9,7 +9,18 @@ import {
   hasuraAgreement,
 } from "~/data/hasura-conformance";
 
-const VERSION = "2.2.0";
+const VERSION = "2.2.1";
+
+const patch = [
+  {
+    title: "__typename inside a relationship",
+    body: "Asking for __typename anywhere below the root — on an object or array relationship, or the rows a mutation returned — failed the whole query with column \"__typename\" does not exist; only the root and aggregate nodes answered it. Apollo Client adds __typename to every selection set by default, and a Federation router asks for it on every entity reference it follows, so a query that crossed from one subgraph to another through a relationship failed. It is now answered by the schema, as it is at the root.",
+  },
+  {
+    title: "A GraphQL token that does not verify is refused",
+    body: "A token signed with the wrong key, expired, or not a bearer token at all was served as the anonymous role over GraphQL, where REST refuses it with 401. The client kept getting answers, as someone else, with nothing to say why its rows had gone. It is now refused as invalid-jwt, as Hasura refuses it. With no JWT secret configured the Authorization header is still ignored, so a router forwarding it to every subgraph is unaffected.",
+  },
+];
 
 const added = [
   {
@@ -51,26 +62,62 @@ export default component$(() => {
         <div class="container-wide py-12">
           <div class="mb-4 flex items-center gap-3">
             <span class="rounded border border-neutral-200 bg-neutral-100 px-2 py-0.5 text-xs font-semibold text-neutral-800">
-              MINOR
+              PATCH
             </span>
             <span class="text-sm text-neutral-500">
-              Additive; nothing breaks
+              Two GraphQL fixes on 2.2.0
             </span>
           </div>
           <h1 class="mb-4 text-4xl font-bold text-neutral-900">
             Postrust {VERSION}
           </h1>
           <p class="max-w-2xl text-lg text-neutral-600">
-            Two deployments that did not work now do: AWS Lambda, which serves
-            the server&rsquo;s own REST and GraphQL router instead of a broken
-            copy of it, and an authenticator set up the way PostgREST
-            recommends, which the schema cache could not see through.
+            Found by running two Postrust subgraphs behind Apollo Router for{" "}
+            <Link
+              href="/blog/postgresql-apollo-federation-subgraph"
+              class="text-primary-600 hover:underline"
+            >
+              a post on Federation
+            </Link>
+            : <code class="text-base">__typename</code> inside a relationship
+            failed the query, and a GraphQL token that did not verify was
+            answered as the anonymous role. 2.2.0, below, is the release that
+            made AWS Lambda and a <code class="text-base">NOINHERIT</code>{" "}
+            authenticator work.
           </p>
         </div>
       </div>
 
       <div class="container-wide py-12">
         <div class="max-w-3xl">
+          {/* The patch */}
+          <section class="mb-12">
+            <h2 class="mb-4 text-2xl font-bold text-neutral-900">
+              Fixed in {VERSION}
+            </h2>
+            <div class="space-y-4">
+              {patch.map((c) => (
+                <div key={c.title} class="rounded-lg bg-neutral-50 p-4">
+                  <h3 class="mb-1 font-semibold text-neutral-900">{c.title}</h3>
+                  <p class="text-sm text-neutral-600">{c.body}</p>
+                </div>
+              ))}
+            </div>
+            <p class="mt-4 text-neutral-600">
+              <strong>Upgrading:</strong> nothing to change, unless a GraphQL
+              client relied on an expired or invalid token being answered
+              anonymously; it now gets an{" "}
+              <code class="font-mono text-sm">invalid-jwt</code> error and
+              should drop the token or refresh it. The public Rust API gains{" "}
+              <code class="font-mono text-sm">postrust_graphql::hasura::invalid_jwt</code>{" "}
+              and loses nothing. Conformance is unchanged.
+            </p>
+          </section>
+
+          <h2 class="mb-8 border-t border-neutral-200 pt-12 text-3xl font-bold text-neutral-900">
+            Postrust 2.2.0
+          </h2>
+
           {/* The numbers */}
           <section class="mb-12">
             <h2 class="mb-4 text-2xl font-bold text-neutral-900">
@@ -600,12 +647,12 @@ GRANT web_anon, web_user TO authenticator;`}</code>
 });
 
 export const head: DocumentHead = {
-  title: `Postrust ${VERSION} — AWS Lambda, and the authenticator PostgREST recommends`,
+  title: `Postrust ${VERSION} — GraphQL fixes on AWS Lambda and the authenticator PostgREST recommends`,
   links: [{ rel: "canonical", href: "https://postrust.org/releases" }],
   meta: [
     {
       name: "description",
-      content: `Postrust ${VERSION}: the AWS Lambda adapter serves the server's own REST and GraphQL router, with row-level security enforced, and a NOINHERIT authenticator sees the schema. A minor release; nothing breaks.`,
+      content: `Postrust ${VERSION}: __typename inside a GraphQL relationship works, and a GraphQL token that does not verify is refused. On 2.2.0, where the AWS Lambda adapter serves the server's own REST and GraphQL router, with row-level security enforced, and a NOINHERIT authenticator sees the schema.`,
     },
   ],
 };

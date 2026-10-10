@@ -3,6 +3,42 @@
 Notable changes, newest first. This file starts at 1.0.0-alpha.1; earlier
 releases are described by their tags and the pull requests behind them.
 
+## 2.2.1
+
+Two GraphQL fixes, found by running two Postrust subgraphs behind Apollo
+Router for the Federation example in `examples/federation`. The public Rust
+API gains `postrust_graphql::hasura::invalid_jwt` and loses nothing.
+
+### Fixed
+
+- **`__typename` inside a relationship.** Asking for it anywhere below the
+  root -- on an object or array relationship, or on the rows a mutation
+  returned -- failed the whole query with `column "__typename" does not
+  exist`; only the root and an aggregate's `nodes` answered it. Apollo Client
+  adds `__typename` to every selection set by default, and a Federation router
+  asks for it on every entity reference it follows, so a query crossing from
+  one subgraph to another through a relationship failed. It is now answered by
+  the schema, as it is at the root.
+- **A GraphQL token that does not verify is refused.** A token signed with
+  the wrong key, expired, or not a bearer token at all was served as the
+  anonymous role over GraphQL, where REST refuses it with 401: the client kept
+  getting answers, as someone else, with nothing to say why its rows had gone.
+  It is now refused as `invalid-jwt`, in the shape Hasura uses. With no JWT
+  secret configured the `Authorization` header is still ignored, so a router
+  forwarding it to every subgraph is unaffected.
+
+### Added
+
+- `examples/federation`: two databases, a Postrust subgraph over each, Rover
+  and Apollo Router in one Compose file, with row-level security deciding what
+  each caller sees through the router, and a script that checks it.
+
+### Upgrading
+
+Nothing to change, unless a GraphQL client relied on an expired or invalid
+token being answered anonymously; it now gets an `invalid-jwt` error, and
+should drop the token or refresh it.
+
 ## 2.2.0
 
 A minor release: additions to the public Rust API (`postrust_server::build`,
