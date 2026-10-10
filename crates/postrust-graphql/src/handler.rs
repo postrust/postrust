@@ -9369,7 +9369,10 @@ fn build_embed_expressions<'a>(
                     })
                 })
                 .unwrap_or(false);
-            if is_relationship {
+            // `__typename` is answered by the schema, not the row -- and it is
+            // asked for here constantly: Apollo Client adds it to every
+            // selection, and a Federation router to every entity reference.
+            if is_relationship || name == "__typename" {
                 continue;
             }
             // A computed column inside an embed is the same call, against the
@@ -9520,6 +9523,8 @@ fn embed_relationships<'f>(
                             Err(_) => project_everything = true,
                         }
                     }
+                    // Answered by the schema, not a column.
+                    None if name == "__typename" => {}
                     None => child_columns.push(name.to_string()),
                 }
             }
