@@ -243,7 +243,7 @@ export default component$(() => {
             </p>
             <div class="flex flex-col sm:flex-row items-center justify-center gap-4">
               <Link
-                href="/docs/getting-started"
+                href="/docs/getting-started/"
                 class="inline-flex items-center gap-2 px-6 py-3 text-base font-semibold text-white bg-neutral-900 hover:bg-neutral-800 rounded-lg transition-colors"
               >
                 Get Started
@@ -252,7 +252,7 @@ export default component$(() => {
                 </svg>
               </Link>
               <Link
-                href="/compare"
+                href="/compare/"
                 class="inline-flex items-center gap-2 px-6 py-3 text-base font-semibold text-neutral-700 bg-white border border-neutral-300 hover:bg-neutral-50 rounded-lg transition-colors"
               >
                 Compare Alternatives
@@ -307,7 +307,7 @@ export default component$(() => {
             Set up your PostgreSQL API in under 5 minutes.
           </p>
           <Link
-            href="/docs/getting-started"
+            href="/docs/getting-started/"
             class="inline-flex items-center gap-2 px-8 py-4 text-base font-semibold text-neutral-900 bg-white hover:bg-neutral-100 rounded-lg transition-colors"
           >
             Read the Documentation

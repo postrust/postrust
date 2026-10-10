@@ -46,7 +46,7 @@ export default component$(() => {
       <div class="bg-gradient-to-b from-neutral-50 to-white border-b border-neutral-200">
         <div class="container-wide py-12">
           <div class="flex items-center gap-2 text-sm text-neutral-500 mb-4">
-            <Link href="/docs" class="hover:text-primary-600">Docs</Link>
+            <Link href="/docs/" class="hover:text-primary-600">Docs</Link>
             <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
               <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 5l7 7-7 7"/>
             </svg>
@@ -233,13 +233,13 @@ node scripts/gen-hasura-conformance.mjs scripts/hasura-conformance/.work/diff.js
           </section>
 
           <div class="flex items-center justify-between pt-8 border-t border-neutral-200">
-            <Link href="/docs/conformance" class="flex items-center gap-2 text-neutral-600 hover:text-primary-600">
+            <Link href="/docs/conformance/" class="flex items-center gap-2 text-neutral-600 hover:text-primary-600">
               <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                 <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15 19l-7-7 7-7"/>
               </svg>
               PostgREST conformance
             </Link>
-            <Link href="/compare/hasura" class="flex items-center gap-2 text-neutral-600 hover:text-primary-600">
+            <Link href="/compare/hasura/" class="flex items-center gap-2 text-neutral-600 hover:text-primary-600">
               Postrust vs Hasura
               <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                 <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 5l7 7-7 7"/>
@@ -254,7 +254,7 @@ node scripts/gen-hasura-conformance.mjs scripts/hasura-conformance/.work/diff.js
 
 export const head: DocumentHead = {
   title: "Hasura Conformance - Postrust Documentation",
-  links: [{ rel: "canonical", href: "https://postrust.org/docs/conformance/hasura" }],
+  links: [{ rel: "canonical", href: "https://postrust.org/docs/conformance/hasura/" }],
   meta: [
     {
       name: "description",

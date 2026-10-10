@@ -13,7 +13,7 @@ export default component$(() => {
 const title = "Postrust vs Supabase: API server or platform";
 const description =
   "How Postrust compares to Supabase: a single API server in front of your database versus a full backend platform, and why Supabase's REST layer is really a PostgREST comparison.";
-const url = "https://postrust.org/compare/supabase";
+const url = "https://postrust.org/compare/supabase/";
 
 export const head: DocumentHead = {
   title,

@@ -51,7 +51,7 @@ export const ComparisonPage = component$<Props>(({ comparison: c }) => {
         <div class="container-wide">
           <div class="max-w-3xl">
             <nav class="mb-6 text-sm text-neutral-500">
-              <Link href="/compare" class="hover:text-neutral-900">
+              <Link href="/compare/" class="hover:text-neutral-900">
                 Compare
               </Link>
               <span class="mx-2">/</span>
@@ -245,7 +245,7 @@ export const ComparisonPage = component$<Props>(({ comparison: c }) => {
                     </>
                   )}{" "}
                   <Link
-                    href="/docs/benchmarks"
+                    href="/docs/benchmarks/"
                     class="text-primary-600 hover:text-primary-700"
                   >
                     Full benchmark method
@@ -347,13 +347,13 @@ export const ComparisonPage = component$<Props>(({ comparison: c }) => {
           </p>
           <div class="flex flex-wrap justify-center gap-4">
             <Link
-              href="/docs/getting-started"
+              href="/docs/getting-started/"
               class="inline-flex items-center gap-2 rounded-lg bg-neutral-900 px-8 py-4 text-base font-semibold text-white transition-colors hover:bg-neutral-800"
             >
               Get started
             </Link>
             <Link
-              href="/compare"
+              href="/compare/"
               class="inline-flex items-center gap-2 rounded-lg border border-neutral-300 bg-white px-8 py-4 text-base font-semibold text-neutral-900 transition-colors hover:border-neutral-400"
             >
               All comparisons

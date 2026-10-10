@@ -282,7 +282,7 @@ export default component$(() => {
                         Not measured separately: its REST layer is PostgREST, so
                         the{" "}
                         <Link
-                          href="/compare/postgrest"
+                          href="/compare/postgrest/"
                           class="text-primary-600 hover:underline"
                         >
                           PostgREST figures
@@ -449,7 +449,7 @@ export default component$(() => {
             Get started in minutes with our quick start guide.
           </p>
           <Link
-            href="/docs/getting-started"
+            href="/docs/getting-started/"
             class="inline-flex items-center gap-2 rounded-lg bg-neutral-900 px-8 py-4 text-base font-semibold text-white transition-colors hover:bg-neutral-800"
           >
             Get Started

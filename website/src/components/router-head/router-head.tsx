@@ -1,6 +1,12 @@
 import { component$ } from "@builder.io/qwik";
 import { useDocumentHead, useLocation } from "@builder.io/qwik-city";
 
+const SITE = "https://postrust.org";
+
+/** The address a path is served at in production, without redirecting. */
+const canonicalFor = (pathname: string) =>
+  SITE + (pathname.endsWith("/") ? pathname : `${pathname}/`);
+
 /**
  * The RouterHead component is placed inside of the document `<head>` element.
  */
@@ -13,9 +19,11 @@ export const RouterHead = component$(() => {
       <title>{head.title}</title>
 
       {/* A page that names its canonical address keeps it; two canonicals
-          that disagree are as good as none. */}
+          that disagree are as good as none. Otherwise it is the production
+          address of this path, with the trailing slash the server redirects
+          to and no query string -- not wherever this copy is being served. */}
       {!head.links.some((l) => l.rel === "canonical") && (
-        <link rel="canonical" href={loc.url.href} />
+        <link rel="canonical" href={canonicalFor(loc.url.pathname)} />
       )}
       <meta name="viewport" content="width=device-width, initial-scale=1.0" />
       <link rel="icon" type="image/svg+xml" href="/favicon.svg" />

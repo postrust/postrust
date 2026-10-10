@@ -74,7 +74,7 @@ export default component$(() => {
           <p class="max-w-2xl text-lg text-neutral-600">
             Found by running two Postrust subgraphs behind Apollo Router for{" "}
             <Link
-              href="/blog/postgresql-apollo-federation-subgraph"
+              href="/blog/postgresql-apollo-federation-subgraph/"
               class="text-primary-600 hover:underline"
             >
               a post on Federation
@@ -125,7 +125,7 @@ export default component$(() => {
             </h2>
             <div class="mb-4 grid gap-4 sm:grid-cols-2">
               <Link
-                href="/docs/conformance/postgrest"
+                href="/docs/conformance/postgrest/"
                 class="hover:border-primary-400 block rounded-lg border border-neutral-200 p-5 transition-colors"
               >
                 <div class="mb-1 text-sm text-neutral-500">
@@ -142,7 +142,7 @@ export default component$(() => {
                 </div>
               </Link>
               <Link
-                href="/docs/conformance/hasura"
+                href="/docs/conformance/hasura/"
                 class="hover:border-primary-400 block rounded-lg border border-neutral-200 p-5 transition-colors"
               >
                 <div class="mb-1 text-sm text-neutral-500">
@@ -323,7 +323,7 @@ export default component$(() => {
               </a>{" "}
               for the authenticator. How to set the authenticator up is in{" "}
               <Link
-                href="/docs/authentication"
+                href="/docs/authentication/"
                 class="text-primary-600 hover:underline"
               >
                 the authentication docs
@@ -591,7 +591,7 @@ GRANT web_anon, web_user TO authenticator;`}</code>
               the <code class="font-mono">connection_init</code> payload. The
               policies that read the claims are in{" "}
               <Link
-                href="/docs/authentication"
+                href="/docs/authentication/"
                 class="text-primary-600 hover:underline"
               >
                 the authentication docs
@@ -602,7 +602,7 @@ GRANT web_anon, web_user TO authenticator;`}</code>
 
           <div class="flex items-center justify-between border-t border-neutral-200 pt-8">
             <Link
-              href="/docs/getting-started"
+              href="/docs/getting-started/"
               class="hover:text-primary-600 flex items-center gap-2 text-neutral-600"
             >
               <svg
@@ -621,7 +621,7 @@ GRANT web_anon, web_user TO authenticator;`}</code>
               Getting Started
             </Link>
             <Link
-              href="/docs/conformance"
+              href="/docs/conformance/"
               class="hover:text-primary-600 flex items-center gap-2 text-neutral-600"
             >
               Conformance
@@ -648,7 +648,7 @@ GRANT web_anon, web_user TO authenticator;`}</code>
 
 export const head: DocumentHead = {
   title: `Postrust ${VERSION} — GraphQL fixes on AWS Lambda and the authenticator PostgREST recommends`,
-  links: [{ rel: "canonical", href: "https://postrust.org/releases" }],
+  links: [{ rel: "canonical", href: "https://postrust.org/releases/" }],
   meta: [
     {
       name: "description",

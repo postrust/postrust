@@ -13,7 +13,7 @@ export default component$(() => {
 
   const reports = [
     {
-      href: "/docs/conformance/postgrest",
+      href: "/docs/conformance/postgrest/",
       surface: "REST",
       against: `PostgREST ${conformanceMeta.postgrest}`,
       headline: pg.statusAndBody.pct,
@@ -25,7 +25,7 @@ export default component$(() => {
         "PostgREST's own spec suite cannot be pointed at another server, so the harness lifts the request literals out of the Haskell and replays them over HTTP against both.",
     },
     {
-      href: "/docs/conformance/hasura",
+      href: "/docs/conformance/hasura/",
       surface: "GraphQL",
       against: `Hasura ${hasuraConformanceMeta.hasura}`,
       headline: hg.sameData.pct,
@@ -43,7 +43,7 @@ export default component$(() => {
       <div class="bg-gradient-to-b from-neutral-50 to-white border-b border-neutral-200">
         <div class="container-wide py-12">
           <div class="flex items-center gap-2 text-sm text-neutral-500 mb-4">
-            <Link href="/docs" class="hover:text-primary-600">Docs</Link>
+            <Link href="/docs/" class="hover:text-primary-600">Docs</Link>
             <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
               <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 5l7 7-7 7"/>
             </svg>
@@ -130,13 +130,13 @@ export default component$(() => {
           </section>
 
           <div class="flex items-center justify-between pt-8 border-t border-neutral-200">
-            <Link href="/docs/benchmarks" class="flex items-center gap-2 text-neutral-600 hover:text-primary-600">
+            <Link href="/docs/benchmarks/" class="flex items-center gap-2 text-neutral-600 hover:text-primary-600">
               <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                 <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15 19l-7-7 7-7"/>
               </svg>
               Benchmarks
             </Link>
-            <Link href="/compare" class="flex items-center gap-2 text-neutral-600 hover:text-primary-600">
+            <Link href="/compare/" class="flex items-center gap-2 text-neutral-600 hover:text-primary-600">
               Compare
               <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                 <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 5l7 7-7 7"/>
@@ -151,7 +151,7 @@ export default component$(() => {
 
 export const head: DocumentHead = {
   title: "Conformance - Postrust Documentation",
-  links: [{ rel: "canonical", href: "https://postrust.org/docs/conformance" }],
+  links: [{ rel: "canonical", href: "https://postrust.org/docs/conformance/" }],
   meta: [
     {
       name: "description",

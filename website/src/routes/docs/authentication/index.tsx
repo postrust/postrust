@@ -8,7 +8,7 @@ export default component$(() => {
       <div class="bg-gradient-to-b from-neutral-50 to-white border-b border-neutral-200">
         <div class="container-wide py-12">
           <div class="flex items-center gap-2 text-sm text-neutral-500 mb-4">
-            <Link href="/docs" class="hover:text-primary-600">Docs</Link>
+            <Link href="/docs/" class="hover:text-primary-600">Docs</Link>
             <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
               <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 5l7 7-7 7"/>
             </svg>
@@ -178,11 +178,11 @@ $$ LANGUAGE SQL STABLE;`}</code>
               GraphQL side an <code class="font-mono">X-Hasura-Role</code> header may select any
               role the token&rsquo;s <code class="font-mono">x-hasura-allowed-roles</code> lists.
               See{" "}
-              <Link href="/docs/configuration" class="text-primary-600 hover:underline">
+              <Link href="/docs/configuration/" class="text-primary-600 hover:underline">
                 Configuration
               </Link>{" "}
               for the settings and{" "}
-              <Link href="/docs/graphql" class="text-primary-600 hover:underline">
+              <Link href="/docs/graphql/" class="text-primary-600 hover:underline">
                 GraphQL
               </Link>{" "}
               for the surface itself.
@@ -201,7 +201,7 @@ $$ LANGUAGE SQL STABLE;`}</code>
           {/* Next */}
           <div class="flex items-center justify-between pt-8 border-t border-neutral-200">
             <Link
-              href="/docs/api-reference"
+              href="/docs/api-reference/"
               class="flex items-center gap-2 text-neutral-600 hover:text-primary-600"
             >
               <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
@@ -210,7 +210,7 @@ $$ LANGUAGE SQL STABLE;`}</code>
               API Reference
             </Link>
             <Link
-              href="/docs/configuration"
+              href="/docs/configuration/"
               class="flex items-center gap-2 text-neutral-600 hover:text-primary-600"
             >
               Configuration

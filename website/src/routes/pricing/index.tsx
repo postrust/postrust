@@ -18,7 +18,7 @@ const plans = [
       "MIT License",
     ],
     cta: "Get Started",
-    ctaHref: "/docs/getting-started",
+    ctaHref: "/docs/getting-started/",
     highlighted: true,
   },
   {
@@ -36,7 +36,7 @@ const plans = [
       "Invoice billing",
     ],
     cta: "Contact Sales",
-    ctaHref: "/enterprise",
+    ctaHref: "/enterprise/",
     highlighted: false,
   },
 ];
@@ -180,7 +180,7 @@ export default component$(() => {
             Have questions about pricing or need a custom plan?
           </p>
           <Link
-            href="/enterprise"
+            href="/enterprise/"
             class="inline-flex items-center gap-2 text-primary-600 hover:text-primary-700 font-medium"
           >
             Contact our sales team

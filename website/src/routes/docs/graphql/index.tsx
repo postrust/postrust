@@ -83,7 +83,7 @@ export default component$(() => {
       <div class="bg-gradient-to-b from-neutral-50 to-white border-b border-neutral-200">
         <div class="container-wide py-12">
           <div class="flex items-center gap-2 text-sm text-neutral-500 mb-4">
-            <Link href="/docs" class="hover:text-primary-600">Docs</Link>
+            <Link href="/docs/" class="hover:text-primary-600">Docs</Link>
             <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
               <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 5l7 7-7 7"/>
             </svg>
@@ -96,7 +96,7 @@ export default component$(() => {
             points at this server unchanged.
           </p>
           <p class="mt-4">
-            <Link href="/docs/conformance/hasura" class="text-primary-600 hover:underline font-medium">
+            <Link href="/docs/conformance/hasura/" class="text-primary-600 hover:underline font-medium">
               How closely the two agree, measured →
             </Link>
           </p>
@@ -283,7 +283,7 @@ export default component$(() => {
             <p class="text-neutral-600 mt-4">
               The cursor-based half of Hasura&rsquo;s subscription surface —{" "}
               <code class="font-mono">_stream</code> — is not implemented. See{" "}
-              <Link href="/docs/realtime" class="text-primary-600 hover:underline">Realtime</Link>.
+              <Link href="/docs/realtime/" class="text-primary-600 hover:underline">Realtime</Link>.
             </p>
           </section>
 
@@ -383,7 +383,7 @@ PGRST_GRAPHQL_TYPE_PREFIX=billing   # optional`} />
 
             <h3 class="text-lg font-semibold text-neutral-900 mt-6 mb-2">Two subgraphs behind a router</h3>
             <p class="text-neutral-600 mb-4">
-              <Link href="/blog/postgresql-apollo-federation-subgraph" class="text-primary-600 hover:underline">
+              <Link href="/blog/postgresql-apollo-federation-subgraph/" class="text-primary-600 hover:underline">
                 PostgreSQL as an Apollo Federation subgraph
               </Link>{" "}
               walks through two databases, a Postrust subgraph over each and Apollo Router in
@@ -494,7 +494,7 @@ PGRST_GRAPHQL_TYPE_PREFIX=billing   # optional`} />
               <code class="font-mono">x-hasura-*</code> headers are ignored entirely and session
               variables come only from a verified token. This is a deliberate divergence from
               Hasura, which treats every caller on an unsecured deployment as an administrator. See{" "}
-              <Link href="/docs/configuration" class="text-primary-600 hover:underline">Configuration</Link>.
+              <Link href="/docs/configuration/" class="text-primary-600 hover:underline">Configuration</Link>.
             </p>
           </section>
 
@@ -528,13 +528,13 @@ PGRST_GRAPHQL_TYPE_PREFIX=billing   # optional`} />
           </section>
 
           <div class="flex items-center justify-between pt-8 border-t border-neutral-200">
-            <Link href="/docs/api-reference" class="flex items-center gap-2 text-neutral-600 hover:text-primary-600">
+            <Link href="/docs/api-reference/" class="flex items-center gap-2 text-neutral-600 hover:text-primary-600">
               <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                 <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15 19l-7-7 7-7"/>
               </svg>
               API Reference
             </Link>
-            <Link href="/docs/conformance/hasura" class="flex items-center gap-2 text-neutral-600 hover:text-primary-600">
+            <Link href="/docs/conformance/hasura/" class="flex items-center gap-2 text-neutral-600 hover:text-primary-600">
               Hasura Conformance
               <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                 <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 5l7 7-7 7"/>

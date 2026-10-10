@@ -113,7 +113,7 @@ export default component$(() => {
       <div class="border-b border-neutral-200 bg-gradient-to-b from-neutral-50 to-white">
         <div class="container-wide py-12">
           <div class="mb-4 flex items-center gap-2 text-sm text-neutral-500">
-            <Link href="/docs" class="hover:text-primary-600">
+            <Link href="/docs/" class="hover:text-primary-600">
               Docs
             </Link>
             <span>/</span>
@@ -296,7 +296,7 @@ export default component$(() => {
                 The conformance reports measure whether two servers give the
                 same answer, not how fast they give it.{" "}
                 <Link
-                  href="/docs/conformance"
+                  href="/docs/conformance/"
                   class="text-primary-600 font-medium hover:underline"
                 >
                   Read the conformance reports
@@ -308,13 +308,13 @@ export default component$(() => {
 
           <div class="flex items-center justify-between border-t border-neutral-200 pt-8">
             <Link
-              href="/docs/conformance"
+              href="/docs/conformance/"
               class="hover:text-primary-600 text-neutral-600"
             >
               ← Conformance
             </Link>
             <Link
-              href="/compare"
+              href="/compare/"
               class="hover:text-primary-600 text-neutral-600"
             >
               Compare →
@@ -328,7 +328,7 @@ export default component$(() => {
 
 export const head: DocumentHead = {
   title: "Benchmarks - Postrust Documentation",
-  links: [{ rel: "canonical", href: "https://postrust.org/docs/benchmarks" }],
+  links: [{ rel: "canonical", href: "https://postrust.org/docs/benchmarks/" }],
   meta: [
     {
       name: "description",

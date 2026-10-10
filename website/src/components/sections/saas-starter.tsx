@@ -78,7 +78,7 @@ export const SaasStarterSection = component$(() => {
                 View on GitHub
               </a>
               <a
-                href="/docs/getting-started"
+                href="/docs/getting-started/"
                 class="inline-flex items-center gap-2 px-6 py-3 border border-neutral-600 text-white font-semibold rounded-lg hover:bg-neutral-700 transition-colors"
               >
                 Documentation

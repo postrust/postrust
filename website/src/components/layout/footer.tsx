@@ -6,27 +6,27 @@ export const Footer = component$(() => {
 
   const footerLinks = {
     product: [
-      { href: "/features", label: "Features" },
-      { href: "/pricing", label: "Pricing" },
-      { href: "/compare", label: "Compare" },
-      { href: "/enterprise", label: "Enterprise" },
+      { href: "/features/", label: "Features" },
+      { href: "/pricing/", label: "Pricing" },
+      { href: "/compare/", label: "Compare" },
+      { href: "/enterprise/", label: "Enterprise" },
     ],
     resources: [
-      { href: "/docs", label: "Documentation" },
-      { href: "/docs/getting-started", label: "Getting Started" },
-      { href: "/docs/api-reference", label: "API Reference" },
-      { href: "/packages", label: "Packages" },
-      { href: "/docs/benchmarks", label: "Benchmarks" },
-      { href: "/docs/conformance", label: "Conformance" },
-      { href: "/docs/deployment", label: "Deployment" },
-      { href: "/releases", label: "Releases" },
-      { href: "/blog", label: "Blog" },
+      { href: "/docs/", label: "Documentation" },
+      { href: "/docs/getting-started/", label: "Getting Started" },
+      { href: "/docs/api-reference/", label: "API Reference" },
+      { href: "/packages/", label: "Packages" },
+      { href: "/docs/benchmarks/", label: "Benchmarks" },
+      { href: "/docs/conformance/", label: "Conformance" },
+      { href: "/docs/deployment/", label: "Deployment" },
+      { href: "/releases/", label: "Releases" },
+      { href: "/blog/", label: "Blog" },
     ],
     community: [
       { href: "https://github.com/postrust/postrust", label: "GitHub", external: true },
       { href: "https://github.com/postrust/postrust/issues", label: "Issues & Features", external: true },
       { href: "https://x.com/postrustorg", label: "Twitter / X", external: true },
-      { href: "/community", label: "Contributing" },
+      { href: "/community/", label: "Contributing" },
     ],
   };
 
