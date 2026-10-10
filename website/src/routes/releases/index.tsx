@@ -9,31 +9,35 @@ import {
   hasuraAgreement,
 } from "~/data/hasura-conformance";
 
-const VERSION = "2.1.0";
+const VERSION = "2.2.0";
 
 const added = [
   {
-    title: "GraphQL transactions carry the verified JWT claims",
-    body: "REST set request.jwt.claims for a row-level policy to read; GraphQL set only the role and Hasura's session variables, so a policy telling apart users who share a database role worked over one surface and not the other. Both now set the claims document, with role set to the role the request runs as, and each top-level claim whose name can be a setting as its own request.jwt.claims.<name>.",
+    title: "postrust_server::build, for serving the server's router elsewhere",
+    body: "Everything between a loaded configuration and a router answering requests — the pool, the schema cache, REST, GraphQL and the layers around them — is a library function, with a Host saying what the host can do beyond answering requests. The binary and the Lambda adapter both serve what it returns. A graphql feature on postrust-server serves GraphQL without the admin UI, which admin-ui still implies.",
   },
   {
-    title: "Subscriptions are authenticated as HTTP requests are",
-    body: 'A WebSocket connection is identified once, from its connection_init payload — {"headers": {"Authorization": "Bearer <token>"}}, as Hasura\'s clients send it, since a browser cannot set headers on a WebSocket — and the upgrade request\'s headers. It goes through the same code an HTTP request does: the admin secret, X-Hasura-Role against the token\'s allowed roles, the role\'s schema and its introspection setting. A connection HTTP would refuse is refused at connection_init, and every live query re-reads as the connection\'s identity, so one row-level policy covers queries and subscriptions alike.',
+    title: "The Lambda adapter is tested where it runs",
+    body: "A CI job builds the function with cargo-lambda and runs it in AWS's own provided:al2023 image, which carries the Lambda runtime emulator, against PostgreSQL with row-level security and a NOINHERIT authenticator: filters, writes allowed and refused, per-user rows over REST and GraphQL, functions seeing the token's role and claims, and the table state the writes leave behind.",
   },
 ];
 
 const fixed = [
   {
-    title: "GraphQL subscriptions over a WebSocket work",
-    body: "They had not, on the server as shipped: the handshake answered 101 and then nothing, not even connection_ack. The adapter that percent-encodes the > in select=data->>id before hyper parses a request line followed HTTP/1.1 framing and did not know about Upgrade, so after the handshake it read every WebSocket frame as the next request line — holding it back until a newline byte happened to arrive, and percent-encoding the high-bit bytes masked frames are full of. It now stops rewriting after a request that asks to switch protocols.",
+    title: "The Lambda adapter serves the server's router",
+    body: "It carried a request path of its own, and nothing ran it. That path never bound a query's parameters, so every filter and every write failed with bind message supplies 0 parameters; and it never switched to the token's role or set its claims, so a function connected as a superuser answered every caller with every row, row-level security or not, including callers whose token named a role that does not exist. It now hands the server's router to the Lambda runtime: REST, GraphQL with Federation, JWT, the role switch and the claims behave exactly as they do in the binary.",
   },
   {
-    title: "A subscription that fails says why",
-    body: "A live query whose read failed — a permission refused, a cast that cannot be made — ended with a bare complete, the error dropped on the way out, so a refused subscription looked exactly like one that had finished. The error is now sent, and the subscription ends after it.",
+    title: "A NOINHERIT authenticator sees the schema",
+    body: "The authenticator PostgREST recommends logs in with no privileges of its own and becomes the token's role for each request. The schema cache read information_schema, whose views show a connection only what it can use without switching role — through that authenticator, nothing — so every table was not found, on the server and on Lambda alike. Tables, columns, write permissions, data representations and GraphQL enum tables are now read for the roles the connection can become. Under a superuser or an inheriting authenticator the schema cache is unchanged, compared table by table and column by column over PostgREST's fixture schema.",
   },
   {
-    title: "The documented policies work on pooled connections",
-    body: "A per-claim setting a connection has ever held reads as '' rather than NULL once the transaction that set it ends. The documentation cast them straight to integer, so a token without the claim was answered on some connections and failed with invalid input syntax for type integer on others, depending only on what the connection had served before. The examples now read the claims document, which is set on every request; the per-claim settings are documented with NULLIF(..., '') and with what they cannot reach.",
+    title: "Enum labels and table comments come from the right object",
+    body: "Enum labels were looked up by type name alone, so same-named enums in two schemas could swap labels, and PostgREST's own fixture — which declares an enum named bit — had its bit(5) column reported as an enum of one and two. A table's description was looked up by OID alone, so a function that happened to share the table's OID lent it its comment. Both are now looked up on the object itself.",
+  },
+  {
+    title: "The documentation stops promising a Workers adapter",
+    body: "The docs and website described Cloudflare Workers support with Hyperdrive that compiles to WebAssembly. postrust-worker is a stub that answers that it is a stub, and does not currently build for WebAssembly; the pages now say so, and what it will take.",
   },
 ];
 
@@ -57,11 +61,10 @@ export default component$(() => {
             Postrust {VERSION}
           </h1>
           <p class="max-w-2xl text-lg text-neutral-600">
-            Row-level security now sees the same identity over GraphQL as over
-            REST, including in subscriptions &mdash; which, it turned out, did
-            not work over a WebSocket at all until this release. One policy on
-            the verified JWT claims now covers a REST read, a GraphQL query and
-            a live query alike.
+            Two deployments that did not work now do: AWS Lambda, which serves
+            the server&rsquo;s own REST and GraphQL router instead of a broken
+            copy of it, and an authenticator set up the way PostgREST
+            recommends, which the schema cache could not see through.
           </p>
         </div>
       </div>
@@ -123,9 +126,10 @@ export default component$(() => {
               </code>
               . This page reads them from the run&rsquo;s own record, so they
               move when the suites are re-run and not otherwise. Both suites
-              were re-run on this release&rsquo;s branch and reproduce these
-              figures case for case: the claims and the WebSocket fix change
-              nothing either of them measures.
+              were re-run on this release&rsquo;s code and reproduce these
+              figures case for case. Both connect as a superuser, which is
+              exactly why neither could see the authenticator problem this
+              release fixes; a test of its own now does.
             </p>
             <p class="mb-4 text-neutral-600">
               Neither harness interprets a test expectation. The reference
@@ -222,19 +226,23 @@ export default component$(() => {
           <section class="mb-12">
             <div class="rounded-lg border border-amber-200 bg-amber-50 p-5">
               <h2 class="mb-2 text-lg font-bold text-neutral-900">
-                What 2.1.0 means
+                What 2.2.0 means
               </h2>
               <p class="mb-2 text-neutral-700">
-                A minor release. The public Rust API gains one function,{" "}
-                <code class="text-sm">AuthResult::claim_settings</code>, and
+                A minor release. The public Rust API gains{" "}
+                <code class="text-sm">postrust_server::build</code>,{" "}
+                <code class="text-sm">App</code> and{" "}
+                <code class="text-sm">Host</code>, a{" "}
+                <code class="text-sm">graphql</code> feature and{" "}
+                <code class="text-sm">schema_cache::enum_values</code>, and
                 loses nothing: <code class="text-sm">cargo semver-checks</code>{" "}
-                against 2.0.0 passes for every stable crate. Everything else
-                here is behaviour you see by running the server.
+                against 2.1.0 passes for every stable crate. Everything else
+                here is behaviour you see by running Postrust.
               </p>
               <p class="text-neutral-700">
                 <code class="text-sm">postrust-proxy</code> and{" "}
                 <code class="text-sm">postrust-worker</code> stay at 0.6.0:
-                neither uses anything that changed.
+                neither changed.
               </p>
             </div>
           </section>
@@ -251,22 +259,22 @@ export default component$(() => {
               ))}
             </div>
             <p class="mt-4 text-neutral-600">
-              Thanks to @CBeardSafire, who exposed the claims to GraphQL in{" "}
+              Both came out of checking what the website said about serverless
+              before a post repeated it:{" "}
               <a
-                href="https://github.com/postrust/postrust/pull/45"
+                href="https://github.com/postrust/postrust/pull/48"
                 class="text-primary-600 hover:underline"
               >
-                #45
-              </a>
-              ; testing that end to end is what found the WebSocket and the
-              documentation problems below, fixed in{" "}
+                #48
+              </a>{" "}
+              for Lambda and{" "}
               <a
-                href="https://github.com/postrust/postrust/pull/47"
+                href="https://github.com/postrust/postrust/pull/49"
                 class="text-primary-600 hover:underline"
               >
-                #47
-              </a>
-              . How to write the policies is in{" "}
+                #49
+              </a>{" "}
+              for the authenticator. How to set the authenticator up is in{" "}
               <Link
                 href="/docs/authentication"
                 class="text-primary-600 hover:underline"
@@ -294,55 +302,49 @@ export default component$(() => {
           <section class="mb-12">
             <h2 class="mb-4 text-2xl font-bold text-neutral-900">Upgrading</h2>
             <p class="mb-4 text-neutral-600">
-              <strong>If you run the server</strong>, nothing is required. Two
-              things are worth checking.
-            </p>
-            <p class="mb-4 text-neutral-600">
-              <strong>Policies on per-claim settings.</strong> If you wrote one
-              the way the documentation used to show, casting{" "}
-              <code class="font-mono text-sm">
-                current_setting(&apos;request.jwt.claims.&lt;name&gt;&apos;,
-                true)
-              </code>{" "}
-              straight to a type, it will now fail for a token without that
-              claim on a connection that has served one with it &mdash; the
-              settings were never set before, so it never read anything. Read
-              the document instead, or wrap the setting in{" "}
-              <code class="font-mono text-sm">NULLIF(..., &apos;&apos;)</code>:
+              <strong>If you run the server</strong>, nothing is required. If
+              you switched your authenticator to{" "}
+              <code class="font-mono text-sm">INHERIT</code> to get past
+              &ldquo;Could not find the table&rdquo;, you can switch it back:
             </p>
             <div class="mb-4 overflow-hidden rounded-xl bg-neutral-900">
               <div class="border-b border-neutral-700 bg-neutral-800 px-4 py-2">
                 <span class="text-sm text-neutral-400">sql</span>
               </div>
               <pre class="overflow-x-auto p-4 text-sm">
-                <code class="text-neutral-100">{`-- always defined, and reaches nested claims
-(current_setting('request.jwt.claims', true)::json->>'organization_id')::integer
-
--- the per-claim form, safe on a reused connection
-NULLIF(current_setting('request.jwt.claims.organization_id', true), '')::integer`}</code>
+                <code class="text-neutral-100">{`CREATE ROLE authenticator LOGIN NOINHERIT PASSWORD '...';
+GRANT web_anon, web_user TO authenticator;`}</code>
               </pre>
             </div>
             <p class="mb-4 text-neutral-600">
-              <strong>Subscription clients.</strong> Send the token in the{" "}
-              <code class="font-mono text-sm">connection_init</code> payload, as
-              Hasura&rsquo;s clients already do. A connection with no token now
-              runs as the anonymous role, and where an admin secret is
-              configured with no unauthorized role it is refused &mdash; as the
-              same request over HTTP would be.
+              <strong>If you run the Lambda adapter</strong>, its paths move to
+              where the server has them: tables under{" "}
+              <code class="font-mono text-sm">/api</code>, GraphQL at{" "}
+              <code class="font-mono text-sm">/v1/graphql</code>. Set{" "}
+              <code class="font-mono text-sm">PGRST_COMPAT_MODE=true</code> to
+              serve the REST surface at the root as well; the old root paths
+              only ever answered unfiltered reads. The pool is two connections
+              per sandbox unless{" "}
+              <code class="font-mono text-sm">PGRST_DB_POOL_SIZE</code> says
+              otherwise, and the function must not connect as a superuser.
             </p>
             <p class="text-neutral-600">
-              <strong>If you depend on the crates</strong>, nothing changes.{" "}
-              <code class="font-mono text-sm">
-                postrust_graphql::handler::graphql_ws_handler
-              </code>{" "}
-              is unchanged and now documented as authenticating nothing; the
-              server serves its WebSocket routes with its own handler.
+              <strong>If you depend on the crates</strong>, nothing changes;
+              there is only more to call.
             </p>
           </section>
 
           {/* Gaps */}
           <section class="mb-12">
             <h2 class="mb-4 text-2xl font-bold text-neutral-900">Known gaps</h2>
+            <p class="mb-4 text-neutral-600">
+              On Lambda: no GraphQL subscriptions, since a function cannot hold
+              a WebSocket, and no{" "}
+              <code class="font-mono text-sm">PGRST_DB_CHANNEL_ENABLED</code>{" "}
+              schema reload, since a frozen sandbox cannot listen; a new
+              deployment or a cold start loads the schema afresh. Cloudflare
+              Workers is not supported yet.
+            </p>
             <p class="mb-4 text-neutral-600">
               In subscriptions: a connection keeps the identity it was opened
               with, so a token that expires while a subscription is open does
@@ -399,6 +401,32 @@ NULLIF(current_setting('request.jwt.claims.organization_id', true), '')::integer
               Previous releases
             </h2>
             <div class="space-y-4">
+              <div class="rounded-lg bg-neutral-50 p-4">
+                <h3 class="mb-1 font-semibold text-neutral-900">2.1.0</h3>
+                <p class="mb-2 text-sm text-neutral-600">
+                  <strong>
+                    Row-level security sees the same identity over GraphQL as
+                    over REST, subscriptions included.
+                  </strong>{" "}
+                  The verified JWT claims reach GraphQL transactions, and a
+                  WebSocket is authenticated from its{" "}
+                  <code class="font-mono">connection_init</code> payload as an
+                  HTTP request is. Subscriptions over a WebSocket had not worked
+                  on the server as shipped; they do. Thanks to @CBeardSafire,{" "}
+                  <a
+                    href="https://github.com/postrust/postrust/pull/45"
+                    class="text-primary-600 hover:underline"
+                  >
+                    #45
+                  </a>
+                  .
+                </p>
+                <p class="text-sm text-neutral-600">
+                  The documented per-claim policies were rewritten to hold on
+                  pooled connections, where a setting a connection once held
+                  reads as an empty string rather than NULL.
+                </p>
+              </div>
               <div class="rounded-lg bg-neutral-50 p-4">
                 <h3 class="mb-1 font-semibold text-neutral-900">2.0.0</h3>
                 <p class="mb-2 text-sm text-neutral-600">
@@ -572,12 +600,12 @@ NULLIF(current_setting('request.jwt.claims.organization_id', true), '')::integer
 });
 
 export const head: DocumentHead = {
-  title: `Postrust ${VERSION} — the same identity over GraphQL, subscriptions included`,
+  title: `Postrust ${VERSION} — AWS Lambda, and the authenticator PostgREST recommends`,
   links: [{ rel: "canonical", href: "https://postrust.org/releases" }],
   meta: [
     {
       name: "description",
-      content: `Postrust ${VERSION}: verified JWT claims reach GraphQL transactions as they do REST ones, GraphQL subscriptions over a WebSocket work and are authenticated as HTTP requests are, and the documented row-level policies hold on pooled connections. A minor release; nothing breaks.`,
+      content: `Postrust ${VERSION}: the AWS Lambda adapter serves the server's own REST and GraphQL router, with row-level security enforced, and a NOINHERIT authenticator sees the schema. A minor release; nothing breaks.`,
     },
   ],
 };
