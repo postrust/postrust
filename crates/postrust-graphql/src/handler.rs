@@ -411,6 +411,12 @@ pub async fn graphql_handler(
 ///
 /// This should be called with a WebSocket upgrade request to enable
 /// GraphQL subscriptions over WebSocket.
+///
+/// It authenticates nothing: no caller identity, session or JWT claims reach
+/// the operations it runs. `postrust-server` serves its WebSocket routes with
+/// its own handler, which settles the identity from `connection_init` exactly
+/// as an HTTP request's is settled; an embedder needing the same must insert a
+/// [`GraphQLContext`](crate::context::GraphQLContext) per operation itself.
 pub async fn graphql_ws_handler(
     State(state): State<Arc<GraphQLState>>,
     protocol: async_graphql_axum::GraphQLProtocol,
@@ -2718,6 +2724,8 @@ fn live<'a>(
         wake: futures::stream::BoxStream<'static, ()>,
         sent: Option<serde_json::Value>,
         started: bool,
+        /// An error has been sent, and the subscription ends after it.
+        failed: bool,
     }
 
     futures::stream::unfold(
@@ -2727,8 +2735,12 @@ fn live<'a>(
             wake,
             sent: None,
             started: false,
+            failed: false,
         },
         |mut live: Live<'a>| async move {
+            if live.failed {
+                return None;
+            }
             loop {
                 if live.started {
                     live.wake.next().await?;
@@ -2739,8 +2751,15 @@ fn live<'a>(
                 match read {
                     // An error ends the subscription: the client asked
                     // something that cannot be answered, and answering it
-                    // again on the next tick would only repeat that.
-                    Err(e) => return Some((Err(e), live)),
+                    // again on the next tick would only repeat that. It is
+                    // sent first, though -- ending on it unsent, as a
+                    // `take_while(is_ok)` here once did, answers a refused
+                    // subscription with a bare `complete` that reads exactly
+                    // like one that finished.
+                    Err(e) => {
+                        live.failed = true;
+                        return Some((Err(e), live));
+                    }
                     Ok((seen, value)) => {
                         if live.sent.as_ref() == Some(&seen) {
                             continue;
@@ -2753,7 +2772,6 @@ fn live<'a>(
             }
         },
     )
-    .take_while(|item| futures::future::ready(item.is_ok()))
 }
 
 /// Everything a query field's resolver needs about the field it serves.
