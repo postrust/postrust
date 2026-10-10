@@ -7,6 +7,33 @@ releases are described by their tags and the pull requests behind them.
 
 ### Fixed
 
+- **A `NOINHERIT` authenticator sees the schema.** The schema cache read
+  `information_schema`, whose views show a connection only what it can use
+  without switching role. Connected as the authenticator PostgREST recommends
+  -- `LOGIN NOINHERIT`, granted the roles a token may name -- that is nothing,
+  so every table answered "Could not find the table" and GraphQL had no fields.
+  Tables, columns and the grants that decide what may be written are now read
+  from the catalogue, with `information_schema`'s own definitions and one
+  change: a role counts when the connection can *become* it (`MEMBER`), not
+  only when it already holds its privileges (`USAGE`). Under a superuser or an
+  inheriting authenticator the schema cache is unchanged -- compared table by
+  table and column by column over PostgREST's fixture schema and this
+  project's -- except for the next item.
+- The rest of what a NOINHERIT authenticator used to miss: a data
+  representation whose cast function is executable only by the API's roles
+  (`REVOKE ... FROM PUBLIC`) is kept rather than dropped, and a GraphQL enum
+  table is read as a role that may read it rather than failing with
+  "permission denied". A deployment that grants `pg_read_all_data` or
+  `pg_write_all_data` instead of per-table privileges sees its tables, as it
+  did through `information_schema`.
+- A column's enum labels come from its own type. They were looked up by type
+  name alone, so two schemas with an enum of one name could swap labels, and
+  a column of a built-in type took the labels of any enum given the same
+  name -- PostgREST's fixtures declare an enum `bit`, and their `bit(5)`
+  column was reported as an enum of `one` and `two`.
+- A table's description is read from its own comment. It was looked up by OID
+  alone, so a function whose OID matched the table's lent it its comment;
+  PostgREST's `collision_test_table` fixture exists to catch exactly that.
 - **The Lambda adapter serves the server's router.** It used to carry a
   request path of its own, which never bound a query's parameters -- so every
   filter and every write failed with "bind message supplies 0 parameters" --

@@ -255,12 +255,12 @@ init -- which Lambda reports and retries -- rather than every request.
 what CI runs on every change that could reach it.
 
 > **Never connect the function as a superuser or a table owner.** Connect as
-> an `authenticator` role with no privileges of its own, granted the roles a
-> token may name, exactly as for the server. A superuser bypasses row-level
-> security outright. For now the authenticator must be `INHERIT` (the
-> default) rather than the `NOINHERIT` PostgREST recommends: the schema cache
-> reads `information_schema`, which shows a `NOINHERIT` role no tables at all,
-> in the server as much as on Lambda.
+> a `NOINHERIT` `authenticator` role with no privileges of its own, granted the
+> roles a token may name, exactly as for the server -- see
+> [The Role Postrust Connects As](authentication.md#the-role-postrust-connects-as).
+> Requests switch to the token's role, but loading the schema cache and
+> reading GraphQL enum tables run as the login role, and a superuser does
+> those with privileges that ignore grants and row-level security.
 
 ### Prerequisites
 

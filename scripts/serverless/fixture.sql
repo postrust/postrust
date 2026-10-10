@@ -1,12 +1,8 @@
 -- Row-level security as a deployment sets it up: the function logs in as a
 -- role with no privileges of its own, which becomes the role a token names.
---
--- INHERIT, not the NOINHERIT PostgREST's documentation recommends, for now:
--- the schema cache reads `information_schema`, which lists only what the
--- connecting role can use, so a NOINHERIT authenticator sees no tables at all
--- -- in the server binary as much as here. That is a schema cache bug of its
--- own, and when it is fixed this goes back to NOINHERIT.
-CREATE ROLE authenticator LOGIN PASSWORD 'authenticator';
+-- NOINHERIT, as PostgREST recommends: it holds none of those roles'
+-- privileges until a request switches to one.
+CREATE ROLE authenticator LOGIN NOINHERIT PASSWORD 'authenticator';
 CREATE ROLE web_anon NOLOGIN;
 CREATE ROLE web_user NOLOGIN;
 GRANT web_anon, web_user TO authenticator;

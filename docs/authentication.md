@@ -208,6 +208,38 @@ GRANT ALL ON ALL TABLES IN SCHEMA public TO web_admin;
 GRANT ALL ON ALL SEQUENCES IN SCHEMA public TO web_admin;
 ```
 
+### The Role Postrust Connects As
+
+Connect as a role with no privileges of its own, that can become the roles a
+token may name. Each request runs `SET LOCAL ROLE` to the token's role (or the
+anonymous one), so that role's grants and row-level security policies are what
+apply:
+
+```sql
+CREATE ROLE authenticator LOGIN NOINHERIT PASSWORD '...';
+GRANT web_anon, web_user, web_admin TO authenticator;
+```
+
+```bash
+DATABASE_URL=postgres://authenticator:...@db/app
+```
+
+`NOINHERIT` means the connection holds none of those roles' privileges until a
+request switches to one, so nothing runs with more than the token allows. The
+schema cache describes every table a role the authenticator can become may
+use, so it does not need to read anything itself.
+
+A request's queries run as the role it switched to, whatever the connection
+logged in as, so its grants and policies apply either way. What the login role
+decides is everything that runs *before* a switch, or without one -- loading the
+schema cache, reading GraphQL enum tables, and the subscription broker's
+triggers. Connected as a superuser or as the tables'
+owner, all of that runs with privileges that ignore grants and row-level
+security, and a request that somehow skipped its switch would too. With a
+`NOINHERIT` authenticator it can do nothing it was not given. On PostgreSQL 16
+and later, each grant must also carry the `SET` option (the default), since
+switching to the role is what a request does.
+
 ## Row-Level Security (RLS)
 
 RLS allows fine-grained access control at the row level.

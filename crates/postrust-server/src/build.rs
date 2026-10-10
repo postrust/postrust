@@ -261,30 +261,19 @@ pub async fn build(config: postrust_core::AppConfig, host: Host) -> Result<App> 
                     continue;
                 };
                 // Hasura's convention, and a useful one: a `comment` column
-                // describes each value.
-                let comment = if definition.get_column("comment").is_some() {
-                    format!("{}::text", postrust_sql::escape_ident("comment"))
-                } else {
-                    "NULL::text".to_string()
-                };
-                let sql = format!(
-                    "SELECT {}::text, {} FROM {}.{} ORDER BY 1",
-                    postrust_sql::escape_ident(key_column),
-                    comment,
-                    postrust_sql::escape_ident(&schema),
-                    postrust_sql::escape_ident(&table)
-                );
-                match sqlx::query_as::<_, (Option<String>, Option<String>)>(&sql)
-                    .fetch_all(&state.pool)
-                    .await
+                // describes each value. Read as a role that may read the
+                // table, which a NOINHERIT authenticator is not by itself.
+                match postrust_core::schema_cache::enum_values(
+                    &state.pool,
+                    &schema,
+                    &table,
+                    key_column,
+                    definition.get_column("comment").is_some(),
+                )
+                .await
                 {
-                    Ok(rows) => {
-                        graphql_enum_values.insert(
-                            format!("{}.{}", schema, table),
-                            rows.into_iter()
-                                .filter_map(|(value, comment)| value.map(|v| (v, comment)))
-                                .collect(),
-                        );
+                    Ok(values) => {
+                        graphql_enum_values.insert(format!("{}.{}", schema, table), values);
                     }
                     Err(e) => {
                         tracing::warn!("cannot read the values of {}.{}: {}", schema, table, e)
