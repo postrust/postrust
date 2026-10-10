@@ -432,6 +432,18 @@ pub async fn build(config: postrust_core::AppConfig, host: Host) -> Result<App> 
                 // fallback -- and an anonymous request is precisely the one
                 // that has not been authenticated.
                 let token_verified = auth_header.is_some() && token.is_ok();
+                // A token that was offered and failed verification. Without a
+                // secret there is nothing to verify against, and the header is
+                // ignored as Hasura ignores it when JWT mode is off -- a router
+                // forwarding `Authorization` to every subgraph relies on that.
+                let token_rejected = match &token {
+                    Ok(_)
+                    | Err(
+                        postrust_auth::JwtError::SecretMissing
+                        | postrust_auth::JwtError::NoIdentity,
+                    ) => None,
+                    Err(e) => Some(e.to_string()),
+                };
 
                 let auth_result = match token {
                     Ok(auth) => auth,
@@ -476,6 +488,11 @@ pub async fn build(config: postrust_core::AppConfig, host: Host) -> Result<App> 
                         postrust_auth::SecretOutcome::Rejected => {
                             return Err(postrust_graphql::hasura::denied(
                                 postrust_auth::hasura::SECRET_INVALID,
+                            ));
+                        }
+                        _ if token_rejected.is_some() => {
+                            return Err(postrust_graphql::hasura::invalid_jwt(
+                                token_rejected.as_deref().unwrap_or_default(),
                             ));
                         }
                         // Nothing settled by the secret. A verified token speaks
