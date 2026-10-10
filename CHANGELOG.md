@@ -3,6 +3,26 @@
 Notable changes, newest first. This file starts at 1.0.0-alpha.1; earlier
 releases are described by their tags and the pull requests behind them.
 
+## Unreleased
+
+### Fixed
+
+- **A `NOINHERIT` authenticator sees the schema.** The schema cache read
+  `information_schema`, whose views show a connection only what it can use
+  without switching role. Connected as the authenticator PostgREST recommends
+  -- `LOGIN NOINHERIT`, granted the roles a token may name -- that is nothing,
+  so every table answered "Could not find the table" and GraphQL had no fields.
+  Tables, columns and the grants that decide what may be written are now read
+  from the catalogue, with `information_schema`'s own definitions and one
+  change: a role counts when the connection can *become* it (`MEMBER`), not
+  only when it already holds its privileges (`USAGE`). Under a superuser or an
+  inheriting authenticator the schema cache is unchanged -- compared table by
+  table and column by column over PostgREST's fixture schema and this
+  project's -- except for the next item.
+- A table's description is read from its own comment. It was looked up by OID
+  alone, so a function whose OID matched the table's lent it its comment;
+  PostgREST's `collision_test_table` fixture exists to catch exactly that.
+
 ## 2.1.0
 
 A minor release: one addition to the public Rust API

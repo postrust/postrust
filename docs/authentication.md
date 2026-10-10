@@ -208,6 +208,30 @@ GRANT ALL ON ALL TABLES IN SCHEMA public TO web_admin;
 GRANT ALL ON ALL SEQUENCES IN SCHEMA public TO web_admin;
 ```
 
+### The Role Postrust Connects As
+
+Connect as a role with no privileges of its own, that can become the roles a
+token may name. Each request runs `SET LOCAL ROLE` to the token's role (or the
+anonymous one), so that role's grants and row-level security policies are what
+apply:
+
+```sql
+CREATE ROLE authenticator LOGIN NOINHERIT PASSWORD '...';
+GRANT web_anon, web_user, web_admin TO authenticator;
+```
+
+```bash
+DATABASE_URL=postgres://authenticator:...@db/app
+```
+
+`NOINHERIT` means the connection holds none of those roles' privileges until a
+request switches to one, so nothing runs with more than the token allows. The
+schema cache describes every table a role the authenticator can become may
+use, so it does not need to read anything itself.
+
+Never connect as a superuser or as the tables' owner: both bypass row-level
+security.
+
 ## Row-Level Security (RLS)
 
 RLS allows fine-grained access control at the row level.
