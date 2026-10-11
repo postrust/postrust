@@ -26,7 +26,12 @@ use std::sync::Arc;
 use tokio::sync::RwLock;
 use tower::ServiceExt;
 
-const SCHEMA: &str = "refused_writes";
+/// Each test's own schema, named after its table. One shared schema made
+/// the tests race: two concurrent `CREATE SCHEMA IF NOT EXISTS` can both find
+/// it missing, and the second fails on the catalog's unique index.
+fn schema(table: &str) -> String {
+    format!("refused_writes_{table}")
+}
 
 fn database_url() -> String {
     std::env::var("DATABASE_URL")
@@ -35,21 +40,22 @@ fn database_url() -> String {
 
 /// A table of its own per test, five rows of `n = 0`, writable by `web_anon`.
 async fn table(pool: &PgPool, name: &str) {
+    let schema = schema(name);
     for statement in [
-        format!("CREATE SCHEMA IF NOT EXISTS {SCHEMA}"),
-        format!("GRANT USAGE ON SCHEMA {SCHEMA} TO web_anon"),
-        format!("DROP TABLE IF EXISTS {SCHEMA}.{name}"),
-        format!("CREATE TABLE {SCHEMA}.{name} (id int PRIMARY KEY, n int NOT NULL)"),
-        format!("INSERT INTO {SCHEMA}.{name} SELECT g, 0 FROM generate_series(1, 5) g"),
-        format!("GRANT SELECT, UPDATE ON {SCHEMA}.{name} TO web_anon"),
+        format!("CREATE SCHEMA IF NOT EXISTS {schema}"),
+        format!("GRANT USAGE ON SCHEMA {schema} TO web_anon"),
+        format!("DROP TABLE IF EXISTS {schema}.{name}"),
+        format!("CREATE TABLE {schema}.{name} (id int PRIMARY KEY, n int NOT NULL)"),
+        format!("INSERT INTO {schema}.{name} SELECT g, 0 FROM generate_series(1, 5) g"),
+        format!("GRANT SELECT, UPDATE ON {schema}.{name} TO web_anon"),
     ] {
         sqlx::query(&statement).execute(pool).await.unwrap();
     }
 }
 
-async fn app(pool: PgPool) -> Router {
+async fn app(pool: PgPool, table: &str) -> Router {
     let mut config = AppConfig::default();
-    config.db_schemas = vec![SCHEMA.to_string()];
+    config.db_schemas = vec![schema(table)];
     config.db_anon_role = Some("web_anon".to_string());
     let schema_cache = SchemaCache::load(&pool, &config.db_schemas)
         .await
@@ -90,8 +96,9 @@ async fn patch_all(app: Router, table: &str, headers: &[(&str, &str)]) -> Status
 }
 
 async fn changed(pool: &PgPool, table: &str) -> i64 {
+    let schema = schema(table);
     sqlx::query_scalar(&format!(
-        "SELECT count(*) FROM {SCHEMA}.{table} WHERE n = 1"
+        "SELECT count(*) FROM {schema}.{table} WHERE n = 1"
     ))
     .fetch_one(pool)
     .await
@@ -111,7 +118,7 @@ async fn pool() -> PgPool {
 async fn more_rows_than_max_affected_allows_are_not_written() {
     let pool = pool().await;
     table(&pool, "max_affected").await;
-    let app = app(pool.clone()).await;
+    let app = app(pool.clone(), "max_affected").await;
 
     let status = patch_all(
         app.clone(),
@@ -142,7 +149,7 @@ async fn more_rows_than_max_affected_allows_are_not_written() {
 async fn several_rows_where_one_object_was_asked_for_are_not_written() {
     let pool = pool().await;
     table(&pool, "singular").await;
-    let app = app(pool.clone()).await;
+    let app = app(pool.clone(), "singular").await;
 
     let status = patch_all(
         app,
