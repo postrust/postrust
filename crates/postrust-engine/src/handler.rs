@@ -183,6 +183,20 @@ where
     // Create execution plan
     let plan = create_action_plan(&api_request, &schema_cache)?;
 
+    // Released before the query runs, not held through it. tokio's `RwLock`
+    // queues a reader behind any writer already waiting, so a schema reload
+    // arriving mid-request used to wait for this guard while `execute_plan`
+    // waited behind the reload for a guard of its own: neither moved again,
+    // and every request after them queued too. Passing this guard down would
+    // end the deadlock but keep the lock for as long as the query runs, and a
+    // reload waiting on one slow request would hold up every new one behind
+    // it. So the guard goes here, and `execute_plan` takes its own briefly
+    // where it needs the cache. A reload landing in between can mean the plan
+    // was made from the old cache and is finished against the new one; the
+    // schema changed under the request either way, and the database is what
+    // says whether the statement still holds.
+    drop(schema_cache);
+
     // Execute plan
     let (result, tx) = execute_plan(
         state,
@@ -192,6 +206,19 @@ where
         &added_join_columns,
     )
     .await?;
+
+    // A read has nothing for a refusal to undo -- it ran read-only -- so its
+    // transaction ends now, and the connection goes back before the response
+    // is serialised rather than after. A plain read has already committed,
+    // with its query; this is a read that had more to do after it: a count,
+    // embeds fetched by a second query, a rendered media type.
+    let tx = match tx {
+        Some(tx) if is_read_only(&api_request) => {
+            tx.commit().await.map_err(postrust_core::Error::from)?;
+            None
+        }
+        tx => tx,
+    };
 
     // Format response
     // A singular response the result cannot satisfy is the client's business,
@@ -214,10 +241,14 @@ where
     // `max-affected` allowed, several where it asked for one object -- must
     // not have happened, and PostgREST rolls it back. Committed any earlier, it
     // stayed written behind the error.
+    //
+    // A failure here is the database's answer, not the pool's: a deferred
+    // constraint is checked at COMMIT, and a serializable transaction can be
+    // refused there too. Each is reported with its own SQLSTATE and status --
+    // a deferred foreign key is a 409 like an immediate one. Only a
+    // connection that broke is reported as the database being unavailable.
     if let Some(tx) = tx {
-        tx.commit()
-            .await
-            .map_err(|e| postrust_core::Error::ConnectionPool(e.to_string()))?;
+        tx.commit().await.map_err(postrust_core::Error::from)?;
     }
 
     Ok(build_response(response))
@@ -1273,10 +1304,9 @@ async fn execute_plan<'s, S: State>(
             };
 
             if let (Some(parent_qi), Some(tx)) = (two_query_parent, tx.as_mut()) {
-                let schema_cache = state.schema_cache().await;
                 embed_relations(
+                    state,
                     tx,
-                    &schema_cache,
                     &parent_qi,
                     &api_request.query_params.select,
                     &mut json_rows,
@@ -1319,8 +1349,20 @@ async fn execute_plan<'s, S: State>(
             // they reach the response: a malformed one is a fault in the
             // schema, and saying so is more use than a header the client
             // cannot see or a status it cannot explain.
+            //
+            // That includes each name and value being one HTTP can carry. The
+            // response is only built after the commit, and a header it cannot
+            // hold -- a newline in a value, a space in a name -- failed there,
+            // where it was too late to undo the function's writes.
             if let Some(headers) = &guc_headers {
-                if postrust_response::parse_guc_headers(headers).is_none() {
+                let sendable =
+                    postrust_response::parse_guc_headers(headers).is_some_and(|headers| {
+                        headers.iter().all(|(name, value)| {
+                            http::HeaderName::try_from(name.as_str()).is_ok()
+                                && http::HeaderValue::try_from(value.as_str()).is_ok()
+                        })
+                    });
+                if !sendable {
                     return Err(postrust_core::Error::InvalidGucHeaders);
                 }
             }
@@ -3233,9 +3275,14 @@ type EmbedFuture<'f> = postrust_core::db::BoxFuture<'f, Result<(), postrust_core
 /// One query per relation per level: the parents' join keys are collected and
 /// passed as a single array, so embedding across a page of parents does not
 /// become a query per row. Recurses for nested embeds.
-fn embed_relations<'f, T: Tx>(
+///
+/// The schema cache is taken for each relation while its query is planned, and
+/// let go before the query runs. A reload waits for every guard to go, and
+/// every request after it waits for the reload: a guard held across a query
+/// holds them all up for as long as the query takes.
+fn embed_relations<'f, S: State, T: Tx>(
+    state: &'f S,
     conn: &'f mut T,
-    schema_cache: &'f postrust_core::SchemaCache,
     parent_qi: &'f postrust_core::api_request::QualifiedIdentifier,
     select: &'f [postrust_core::api_request::SelectItem],
     rows: &'f mut [serde_json::Value],
@@ -3269,6 +3316,8 @@ fn embed_relations<'f, T: Tx>(
                 SelectItem::Field { .. } => continue,
             };
 
+            let guard = state.schema_cache().await;
+            let schema_cache: &postrust_core::SchemaCache = &guard;
             let rel = schema_cache
                 .find_relationship(parent_qi, relation, hint.as_deref(), &parent_qi.schema)?
                 .ok_or_else(|| {
@@ -3329,6 +3378,7 @@ fn embed_relations<'f, T: Tx>(
             if project_everything {
                 child_columns.clear();
             }
+            drop(guard);
 
             let mut grouped = if keys.is_empty() {
                 std::collections::HashMap::new()
@@ -3378,8 +3428,8 @@ fn embed_relations<'f, T: Tx>(
                 }
 
                 embed_relations(
+                    state,
                     &mut *conn,
-                    schema_cache,
                     &child_qi,
                     nested,
                     &mut flat,
@@ -3488,9 +3538,13 @@ fn build_response(response: PgrstResponse) -> Response<Bytes> {
         builder = builder.header(key, value);
     }
 
-    builder
-        .body(response.body)
-        .unwrap_or_else(|_| Response::new(Bytes::new()))
+    // Every header has been checked by now, so this should not fail. If it
+    // does, an empty 200 would tell the client its request succeeded with
+    // nothing to say; a 500 and a log line at least say that something broke.
+    builder.body(response.body).unwrap_or_else(|e| {
+        error!("Could not build the response: {}", e);
+        error_response(postrust_core::Error::Internal(e.to_string()), false)
+    })
 }
 
 /// Build an error response.
