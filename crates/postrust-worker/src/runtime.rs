@@ -1,36 +1,4 @@
-//! Postrust's REST API in a Cloudflare Worker, reaching PostgreSQL through
-//! Hyperdrive.
-//!
-//! The request pipeline is `postrust-engine`, the same one the server runs, and
-//! the database driver is `postrust_core::db::PgSocketDb`: the PostgreSQL wire
-//! protocol over a `worker::Socket` to Hyperdrive. That driver is held to
-//! answering exactly as the server's sqlx driver does. Every request runs in a
-//! transaction that sets the token's role and claims, as on the server, so
-//! row-level security applies the same way.
-//!
-//! What is different here, and why:
-//!
-//! * **One connection per request.** A Worker may not share an I/O object
-//!   between requests. Hyperdrive pools connections on its side, so opening
-//!   one costs little.
-//! * **The schema cache is kept in Workers KV** (`POSTRUST_SCHEMA_CACHE`), so
-//!   a cold isolate reads it rather than querying the catalog. It is loaded
-//!   live on a miss, refreshed by a Cron Trigger or by an authenticated
-//!   `POST /_/reload`, and re-read from KV once `PGRST_WORKER_SCHEMA_TTL`
-//!   seconds (default 60) have passed.
-//! * **Rows are capped** at `PGRST_DB_MAX_ROWS`, 1000 unless set, because an
-//!   isolate has 128 MB. `PGRST_DB_MAX_ROWS=unlimited` lifts the cap.
-//! * **REST only.** No GraphQL, no subscriptions, no `LISTEN`.
-//!
-//! The REST API answers at the root, as PostgREST does: `/todos`, `/rpc/f`.
-//! Configuration is the server's own variables (`PGRST_DB_SCHEMAS`,
-//! `PGRST_DB_ANON_ROLE`, `PGRST_JWT_SECRET`, ...), set as Worker variables or
-//! secrets. See docs/workers.md.
-//!
-//! The crate is on its own `0.x` line. See docs/stability.md.
-
-#![cfg(target_arch = "wasm32")]
-
+use crate::settings::{self, Binding, Settings, Unconfigured};
 use bytes::Bytes;
 use http::{HeaderValue, Method, Response, StatusCode};
 use http_body_util::{BodyExt, Full};
@@ -53,12 +21,6 @@ const SCHEMA_KV: &str = "POSTRUST_SCHEMA_CACHE";
 /// The secret a `POST /_/reload` must carry as a bearer token. Without it the
 /// endpoint does not exist.
 const RELOAD_SECRET: &str = "POSTRUST_RELOAD_SECRET";
-/// The row ceiling when `PGRST_DB_MAX_ROWS` is not set. An isolate has 128 MB,
-/// and an unbounded read of a large table is the quickest way to run out.
-const DEFAULT_MAX_ROWS: i64 = 1000;
-/// How long an isolate trusts its copy of the schema cache before looking in
-/// KV for a newer one, unless `PGRST_WORKER_SCHEMA_TTL` says otherwise.
-const DEFAULT_SCHEMA_TTL_SECS: f64 = 60.0;
 
 type Body = Full<Bytes>;
 
@@ -79,47 +41,98 @@ fn start() {
 
 #[event(fetch)]
 async fn fetch(req: HttpRequest, env: Env, _ctx: Context) -> worker::Result<Response<Body>> {
-    let config = match config(&env) {
-        Ok(config) => config,
-        Err(e) => return Ok(plain(StatusCode::INTERNAL_SERVER_ERROR, &e)),
+    let origin = req.headers().get(http::header::ORIGIN).cloned();
+    let health = req.method() == Method::GET && req.uri().path() == "/_/health";
+    let mut response = match config(&env) {
+        Ok(settings) => {
+            // Every answer carries the CORS headers, the ones produced before
+            // the engine runs as well: a browser cannot read an error
+            // without them.
+            let origins = settings.config.server_cors_origins.clone();
+            let preflight = req.method() == Method::OPTIONS;
+            let response = route(req, &env, settings).await;
+            cors(&origins, origin.as_ref(), response, preflight)
+        }
+        Err(unconfigured) => {
+            drain(req.into_body()).await;
+            unconfigured_response(unconfigured, health, origin.as_ref())
+        }
     };
-    let path = req.uri().path().to_string();
-    let response = match (req.method(), path.as_str()) {
-        (&Method::GET, "/_/health") => plain(StatusCode::OK, "OK"),
-        (&Method::POST, "/_/reload") => reload(&req, &env, &config).await,
-        _ => rest(req, &env, config).await,
-    };
+    for name in settings::drop_unsendable_headers(response.headers_mut()) {
+        worker::console_error!(
+            "postrust: dropped the response header {name}: a Worker cannot send its value"
+        );
+    }
     Ok(response)
+}
+
+async fn route(req: HttpRequest, env: &Env, settings: Settings) -> Response<Body> {
+    let path = req.uri().path().to_string();
+    match (req.method(), path.as_str()) {
+        (&Method::GET, "/_/health") => {
+            drain(req.into_body()).await;
+            plain(StatusCode::OK, "OK")
+        }
+        (&Method::POST, "/_/reload") => reload(req, env, &settings).await,
+        _ => rest(req, env, settings).await,
+    }
+}
+
+/// The answer when the configuration cannot be read: the reason, with the
+/// CORS origins if those at least could be. `/_/health` reports the Worker
+/// unhealthy (503) -- the server would not have started at all with this
+/// configuration -- and anything else is a 500.
+fn unconfigured_response(
+    unconfigured: Unconfigured,
+    health: bool,
+    origin: Option<&HeaderValue>,
+) -> Response<Body> {
+    worker::console_error!("postrust: {}", unconfigured.reason);
+    let status = if health {
+        StatusCode::SERVICE_UNAVAILABLE
+    } else {
+        StatusCode::INTERNAL_SERVER_ERROR
+    };
+    let response = plain(status, &unconfigured.reason);
+    match &unconfigured.cors_origins {
+        Some(origins) => cors(origins, origin, response, false),
+        None => response,
+    }
 }
 
 #[event(scheduled)]
 async fn scheduled(_event: ScheduledEvent, env: Env, _ctx: ScheduleContext) {
-    if let Ok(config) = config(&env) {
-        if let Err(e) = refresh(&env, &config).await {
-            worker::console_error!("postrust: scheduled schema reload failed: {e}");
+    match config(&env) {
+        Ok(settings) => {
+            if let Err(e) = refresh(&env, &settings).await {
+                worker::console_error!("postrust: scheduled schema reload failed: {e}");
+            }
         }
+        Err(unconfigured) => worker::console_error!(
+            "postrust: scheduled schema reload skipped: {}",
+            unconfigured.reason
+        ),
     }
 }
 
 /// A request to the REST API.
-async fn rest(req: HttpRequest, env: &Env, config: AppConfig) -> Response<Body> {
-    let verbatim = config.compat_mode;
-    let state = match State::new(env, config).await {
-        Ok(state) => state,
-        Err(e) => return postrust_engine::error_response(e, verbatim).map(Body::new),
-    };
-    let origin = req.headers().get(http::header::ORIGIN).cloned();
-
-    if req.method() == Method::OPTIONS {
-        return preflight(&state, req, origin).await;
-    }
-
+async fn rest(req: HttpRequest, env: &Env, settings: Settings) -> Response<Body> {
+    let verbatim = settings.config.compat_mode;
+    // Read before anything can answer: see `read_body`.
     let (parts, body) = req.into_parts();
-    let body = read_body(body, state.config.max_body_size).await;
-    let req = http::Request::from_parts(parts, body);
-    let (method, path) = (req.method().clone(), req.uri().path().to_string());
-    let response = postrust_engine::handle(&state, req).await;
-    state.db.connector().closed().await;
+    let body = read_body(body, settings.config.max_body_size).await;
+    let (method, path) = (parts.method.clone(), parts.uri.path().to_string());
+
+    let response = match State::new(env, settings).await {
+        Err(e) => postrust_engine::error_response(e, verbatim),
+        Ok(state) if method == Method::OPTIONS => preflight(&state, parts).await,
+        Ok(state) => {
+            let req = http::Request::from_parts(parts, body);
+            let response = postrust_engine::handle(&state, req).await;
+            state.db.connector().closed().await;
+            response
+        }
+    };
     // The engine logs through `tracing`, which nothing collects in a Worker.
     // A failure on this side is worth a line in the Workers console; the body
     // has the detail the configuration allows a client to see.
@@ -130,12 +143,7 @@ async fn rest(req: HttpRequest, env: &Env, config: AppConfig) -> Response<Body> 
             String::from_utf8_lossy(response.body())
         );
     }
-    cors(
-        &state.config,
-        origin.as_ref(),
-        response.map(Body::new),
-        false,
-    )
+    response.map(Body::new)
 }
 
 /// The request body, read to its end before the engine sees it.
@@ -182,37 +190,46 @@ async fn read_body(mut body: worker::Body, limit: usize) -> ReadBody {
     }
 }
 
-/// An `OPTIONS`: what the resource allows, with the CORS answer the server's
-/// layer would give.
-async fn preflight(state: &State, req: HttpRequest, origin: Option<HeaderValue>) -> Response<Body> {
-    let (parts, _) = req.into_parts();
+/// A request body nobody wants, read to its end and thrown away, for the
+/// reason `read_body` gives: an unread one takes the isolate down after the
+/// response.
+async fn drain(mut body: worker::Body) {
+    while let Some(frame) = body.frame().await {
+        if frame.is_err() {
+            break;
+        }
+    }
+}
+
+/// An `OPTIONS`: what the resource allows. `fetch` adds the CORS answer the
+/// server's layer would give.
+async fn preflight(state: &State, parts: http::request::Parts) -> Response<Bytes> {
     let probe = http::Request::from_parts(parts, Bytes::new());
     let allowed = postrust_engine::allow(state, probe).await;
     state.db.connector().closed().await;
-    let response = match allowed {
+    match allowed {
         Ok(allow) => {
-            let mut response = Response::new(Body::default());
+            let mut response = Response::new(Bytes::new());
             if let Ok(value) = HeaderValue::from_str(&allow) {
                 response.headers_mut().insert(http::header::ALLOW, value);
             }
             response
         }
-        Err(e) => postrust_engine::error_response(e, state.config.compat_mode).map(Body::new),
-    };
-    cors(&state.config, origin.as_ref(), response, true)
+        Err(e) => postrust_engine::error_response(e, state.config.compat_mode),
+    }
 }
 
 /// The headers tower-http's `CorsLayer` adds on the server, configured as the
 /// server configures it: any or the listed origins, the seven methods, any
 /// request header, every response header exposed.
 fn cors(
-    config: &AppConfig,
+    origins: &[String],
     origin: Option<&HeaderValue>,
     mut response: Response<Body>,
     preflight: bool,
 ) -> Response<Body> {
     let headers = response.headers_mut();
-    let allowed = match &config.server_cors_origins[..] {
+    let allowed = match origins {
         [] => Some(HeaderValue::from_static("*")),
         list => origin
             .filter(|o| {
@@ -250,12 +267,16 @@ fn cors(
 
 /// `POST /_/reload`: load the schema cache from the catalog now, for every
 /// isolate, rather than waiting for the cron or the TTL.
-async fn reload(req: &HttpRequest, env: &Env, config: &AppConfig) -> Response<Body> {
+async fn reload(req: HttpRequest, env: &Env, settings: &Settings) -> Response<Body> {
+    // Nothing here wants the body, but it is read all the same: see
+    // `read_body`.
+    let (parts, body) = req.into_parts();
+    drain(body).await;
     let Ok(secret) = env.secret(RELOAD_SECRET).map(|s| s.to_string()) else {
         return plain(StatusCode::NOT_FOUND, "Not Found");
     };
-    let presented = req
-        .headers()
+    let presented = parts
+        .headers
         .get(http::header::AUTHORIZATION)
         .and_then(|v| v.to_str().ok())
         .and_then(|v| v.strip_prefix("Bearer "))
@@ -263,7 +284,7 @@ async fn reload(req: &HttpRequest, env: &Env, config: &AppConfig) -> Response<Bo
     if !constant_time_eq(presented.as_bytes(), secret.as_bytes()) {
         return plain(StatusCode::UNAUTHORIZED, "Unauthorized");
     }
-    match refresh(env, config).await {
+    match refresh(env, settings).await {
         Ok(()) => Response::builder()
             .status(StatusCode::NO_CONTENT)
             .body(Body::default())
@@ -284,31 +305,38 @@ fn plain(status: StatusCode, text: &str) -> Response<Body> {
         .unwrap_or_default()
 }
 
-/// The configuration, from the Worker's variables and secrets -- the server's
-/// own names, read from bindings rather than a process environment.
-fn config(env: &Env) -> Result<AppConfig, String> {
+/// The configuration, from the Worker's variables and secrets (see
+/// `settings::settings`).
+fn config(env: &Env) -> Result<Settings, Unconfigured> {
     let env: &JsValue = env.as_ref();
     let pairs = js_sys::Object::entries(env.unchecked_ref())
         .iter()
         .filter_map(|entry| {
             let entry: js_sys::Array = entry.into();
-            Some((entry.get(0).as_string()?, entry.get(1).as_string()?))
+            let name = entry.get(0).as_string()?;
+            let value = entry.get(1);
+            let binding = if let Some(text) = value.as_string() {
+                Binding::Text(text)
+            } else if let Some(b) = value.as_bool() {
+                Binding::Bool(b)
+            } else if let Some(n) = value.as_f64() {
+                Binding::Number(n)
+            } else if value.is_null() || value.is_undefined() {
+                return None;
+            } else {
+                Binding::Other
+            };
+            let text = settings::binding_text(binding);
+            if text.is_none() && settings::is_setting(&name) {
+                worker::console_warn!(
+                    "postrust: ignoring {name}: it is a JSON object or array, not a value a \
+                     setting can take; give it as a string"
+                );
+            }
+            Some((name, text?))
         })
         .collect::<Vec<_>>();
-    // `unlimited` is how a deployment that has thought about it says so; the
-    // server would warn about the word and ignore it, which here would leave
-    // the default ceiling in place.
-    let uncapped = pairs
-        .iter()
-        .any(|(k, v)| k == "PGRST_DB_MAX_ROWS" && v.trim().eq_ignore_ascii_case("unlimited"));
-    let pairs = pairs
-        .into_iter()
-        .filter(|(k, _)| !(uncapped && k == "PGRST_DB_MAX_ROWS"));
-    let mut config = AppConfig::try_from_vars(pairs).map_err(|e| e.to_string())?;
-    if config.db_max_rows.is_none() && !uncapped {
-        config.db_max_rows = Some(DEFAULT_MAX_ROWS);
-    }
-    Ok(config)
+    settings::settings(pairs)
 }
 
 /// Hyperdrive, as a socket per transaction.
@@ -388,7 +416,6 @@ struct Isolate {
 }
 
 /// A schema cache, and when this isolate last made sure it was current.
-#[derive(Clone)]
 struct Schema {
     cache: Rc<SchemaCache>,
     key: String,
@@ -400,76 +427,58 @@ thread_local! {
     static ISOLATE: RefCell<Isolate> = RefCell::default();
 }
 
-/// The KV record a schema cache is kept as.
+/// The KV record a schema cache is kept as: written from a borrowed cache,
+/// read back as an owned one.
 #[derive(serde::Serialize, serde::Deserialize)]
-struct Stored {
+struct Stored<C> {
     /// When it was loaded from the catalog, in milliseconds since the epoch.
     loaded_at: f64,
-    cache: SchemaCache,
-}
-
-/// The KV key for a configuration's schema cache: which schemas it describes
-/// and which build wrote it, since another version may shape it differently.
-fn schema_key(config: &AppConfig) -> String {
-    use std::hash::{Hash, Hasher};
-    let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    config.db_schemas.hash(&mut hasher);
-    config.db_extra_search_path.hash(&mut hasher);
-    format!(
-        "postrust/{}/schema-cache/{:016x}",
-        env!("CARGO_PKG_VERSION"),
-        hasher.finish()
-    )
-}
-
-fn ttl_ms(env: &Env) -> f64 {
-    env.var("PGRST_WORKER_SCHEMA_TTL")
-        .ok()
-        .and_then(|v| v.to_string().trim().parse::<f64>().ok())
-        .unwrap_or(DEFAULT_SCHEMA_TTL_SECS)
-        * 1000.0
+    cache: C,
 }
 
 /// The schema cache this request runs against: the isolate's own while it is
-/// fresh, else KV's if KV has a newer one, else the catalog's.
-async fn schema(env: &Env, config: &AppConfig) -> Result<Rc<SchemaCache>, postrust_core::Error> {
-    let key = schema_key(config);
+/// fresh, else KV's if KV has one, else the catalog's.
+async fn schema(env: &Env, settings: &Settings) -> Result<Rc<SchemaCache>, postrust_core::Error> {
+    let key = settings::schema_key(&settings.config);
     let now = js_sys::Date::now();
-    let held = ISOLATE
-        .with(|i| i.borrow().schema.clone())
-        .filter(|s| s.key == key);
-    if let Some(held) = &held {
-        if now - held.checked_at < ttl_ms(env) {
-            return Ok(held.cache.clone());
-        }
+    let fresh = ISOLATE.with(|i| {
+        i.borrow()
+            .schema
+            .as_ref()
+            .filter(|s| s.key == key && now - s.checked_at < settings.schema_ttl_secs * 1000.0)
+            .map(|s| s.cache.clone())
+    });
+    if let Some(cache) = fresh {
+        return Ok(cache);
     }
 
     if let Ok(kv) = env.kv(SCHEMA_KV) {
-        if let Ok(Some(stored)) = kv.get(&key).json::<Stored>().await {
-            let schema = match held {
-                Some(held) if held.loaded_at >= stored.loaded_at => Schema {
-                    checked_at: now,
-                    ..held
-                },
-                _ => Schema {
+        match kv.get(&key).json::<Stored<SchemaCache>>().await {
+            Ok(Some(stored)) => {
+                return Ok(keep(Schema {
                     cache: Rc::new(stored.cache),
                     key,
                     loaded_at: stored.loaded_at,
                     checked_at: now,
-                },
-            };
-            let cache = schema.cache.clone();
-            ISOLATE.with(|i| i.borrow_mut().schema = Some(schema));
-            return Ok(cache);
+                }))
+            }
+            Ok(None) => {}
+            // A record that does not read back is a miss: the catalog's copy
+            // replaces it below.
+            Err(e) => worker::console_warn!(
+                "postrust: the schema cache in KV could not be read, loading it from the \
+                 catalog: {e}"
+            ),
         }
     }
 
-    load(env, config).await
+    load(env, settings).await
 }
 
 /// Load the schema cache from the catalog, keep it in this isolate, and write
 /// it to KV for the rest.
-async fn load(env: &Env, config: &AppConfig) -> Result<Rc<SchemaCache>, postrust_core::Error> {
+async fn load(env: &Env, settings: &Settings) -> Result<Rc<SchemaCache>, postrust_core::Error> {
+    let config = &settings.config;
     let db = database(env)?;
     let cache = SchemaCache::load_with_search_path_from(
         &db,
@@ -480,19 +489,28 @@ async fn load(env: &Env, config: &AppConfig) -> Result<Rc<SchemaCache>, postrust
     db.connector().closed().await;
     let cache = cache?;
     let now = js_sys::Date::now();
-    let key = schema_key(config);
+    let key = settings::schema_key(config);
+    let cache = Rc::new(cache);
     if let Ok(kv) = env.kv(SCHEMA_KV) {
         let stored = Stored {
             loaded_at: now,
-            cache,
+            cache: &*cache,
         };
         // As a JSON string, not as the value: `put` of a `Serialize` value
         // goes through `serde_wasm_bindgen`, which makes every map a
         // JavaScript `Map` -- and KV stores what `JSON.stringify` makes of a
         // `Map`, which is `{}`. Every table read back had no columns.
+        //
+        // It expires, so that a migration is seen without the cron or a
+        // reload: the next isolate to miss reads the catalog again.
+        let expiration = settings::kv_expiration_secs(settings.schema_ttl_secs);
         let written = match serde_json::to_string(&stored) {
             Ok(json) => match kv.put(&key, json) {
-                Ok(put) => put.execute().await.map_err(|e| e.to_string()),
+                Ok(put) => put
+                    .expiration_ttl(expiration)
+                    .execute()
+                    .await
+                    .map_err(|e| e.to_string()),
                 Err(e) => Err(e.to_string()),
             },
             Err(e) => Err(e.to_string()),
@@ -500,28 +518,43 @@ async fn load(env: &Env, config: &AppConfig) -> Result<Rc<SchemaCache>, postrust
         if let Err(e) = written {
             worker::console_error!("postrust: could not write the schema cache to KV: {e}");
         }
-        let cache = Rc::new(stored.cache);
-        keep(cache.clone(), key, now);
-        return Ok(cache);
     }
-    let cache = Rc::new(cache);
-    keep(cache.clone(), key, now);
-    Ok(cache)
+    Ok(keep(Schema {
+        cache,
+        key,
+        loaded_at: now,
+        checked_at: now,
+    }))
 }
 
-fn keep(cache: Rc<SchemaCache>, key: String, loaded_at: f64) {
+/// Keep `candidate` as this isolate's schema cache, unless what the isolate
+/// holds by now is newer, and return whichever it keeps.
+///
+/// The decision is made here, after every `await`, against what is held at
+/// this moment: a request that read KV or the catalog while a reload or the
+/// cron installed a newer copy must not put its older one back.
+fn keep(candidate: Schema) -> Rc<SchemaCache> {
     ISOLATE.with(|i| {
-        i.borrow_mut().schema = Some(Schema {
-            cache,
-            key,
-            loaded_at,
-            checked_at: loaded_at,
-        })
-    });
+        let mut isolate = i.borrow_mut();
+        if let Some(held) = isolate.schema.as_mut() {
+            if !settings::supersedes(
+                Some((&held.key, held.loaded_at)),
+                &candidate.key,
+                candidate.loaded_at,
+            ) {
+                // Nothing newer than the copy held: it is current as of now.
+                held.checked_at = held.checked_at.max(candidate.checked_at);
+                return held.cache.clone();
+            }
+        }
+        let cache = candidate.cache.clone();
+        isolate.schema = Some(candidate);
+        cache
+    })
 }
 
-async fn refresh(env: &Env, config: &AppConfig) -> Result<(), postrust_core::Error> {
-    load(env, config).await.map(|_| ())
+async fn refresh(env: &Env, settings: &Settings) -> Result<(), postrust_core::Error> {
+    load(env, settings).await.map(|_| ())
 }
 
 /// What a request runs against.
@@ -534,9 +567,10 @@ struct State {
 }
 
 impl State {
-    async fn new(env: &Env, config: AppConfig) -> Result<Self, postrust_core::Error> {
+    async fn new(env: &Env, settings: Settings) -> Result<Self, postrust_core::Error> {
         let db = database(env)?;
-        let schema = schema(env, &config).await?;
+        let schema = schema(env, &settings).await?;
+        let config = settings.config;
         let jwt_config = JwtConfig {
             secret: config.jwt_secret.clone(),
             secret_is_base64: config.jwt_secret_is_base64,

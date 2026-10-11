@@ -9,15 +9,16 @@ Postrust's REST API in a Cloudflare Worker, reaching PostgreSQL through
   server's does.
 - Every request runs in a transaction that takes on the token's role and
   claims, so row-level security applies as it does on the server.
-- The schema cache is kept in Workers KV. It is refreshed by a Cron Trigger
-  or by an authenticated `POST /_/reload`.
+- The schema cache is kept in Workers KV. It is refreshed by a Cron Trigger,
+  by an authenticated `POST /_/reload`, or when the KV copy expires after
+  `PGRST_WORKER_SCHEMA_TTL`.
 - REST only, served at the root as PostgREST serves it. There is no GraphQL
   and no `LISTEN`/`NOTIFY`.
 
 Setup, configuration, measured costs and limits:
 [docs/workers.md](https://github.com/postrust/postrust/blob/main/docs/workers.md).
 The crate is built with `worker-build` for `wasm32-unknown-unknown`; for any
-other target it is empty.
+other target it is only its configuration logic, there to be unit-tested.
 
 This crate is on its own `0.x` line and makes no stability promise yet. See
 [docs/stability.md](https://github.com/postrust/postrust/blob/main/docs/stability.md).
