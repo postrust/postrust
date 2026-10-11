@@ -66,9 +66,13 @@ trap cleanup EXIT
 # default features and overwrites it, so a build, then a test run, then a
 # conformance run silently measured a binary with neither feature. Nothing said
 # so; the binary was simply 1.1 MB smaller.
-say "Building the candidate"
+# `CONFORMANCE_EXTRA_FEATURES` adds to them. `pg-socket` is the one it is for:
+# REST requests then run through the driver a Cloudflare Worker uses, over a
+# socket per request, and the figures say whether it answers as sqlx does.
+FEATURES="admin-ui,compat-key-order${CONFORMANCE_EXTRA_FEATURES:+,$CONFORMANCE_EXTRA_FEATURES}"
+say "Building the candidate ($FEATURES)"
 cargo build --release --manifest-path "$REPO_ROOT/Cargo.toml" \
-    -p postrust-server --features admin-ui,compat-key-order >&2
+    -p postrust-server --features "$FEATURES" >&2
 
 # The server says so itself when compatibility mode is on without the feature,
 # so the log is checked once it starts. Belt and braces: the build above should
@@ -217,7 +221,7 @@ python3 "$HERE/run.py" "$WORK/cases.json" "http://localhost:$CAND_PORT" \
 cat > "$WORK/run-meta.json" <<META
 {
   "postgrest": "$PGRST_VERSION",
-  "features": "admin-ui,compat-key-order",
+  "features": "$FEATURES",
   "compatMode": true,
   "commit": "$(git -C "$REPO_ROOT" rev-parse HEAD)",
   "measured": "$(date -u +%Y-%m-%d)"

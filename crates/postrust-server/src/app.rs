@@ -16,9 +16,101 @@ use std::sync::Arc;
 
 /// Main request handler.
 pub async fn handle_request(State(state): State<Arc<AppState>>, request: Request) -> Response {
-    postrust_engine::handle(state.as_ref(), request)
-        .await
-        .map(Body::from)
+    #[cfg(not(feature = "pg-socket"))]
+    let response = postrust_engine::handle(state.as_ref(), request).await;
+    #[cfg(feature = "pg-socket")]
+    let response = postrust_engine::handle(&via_socket::ViaSocket(state), request).await;
+    response.map(Body::from)
+}
+
+/// The test-only `pg-socket` feature: REST through the Worker's driver.
+#[cfg(feature = "pg-socket")]
+mod via_socket {
+    use crate::state::AppState;
+    use postrust_auth::{JwtCache, JwtConfig};
+    use postrust_core::db::tokio_postgres::{config::Host, Config, NoTls};
+    use postrust_core::db::{BoxFuture, Connector, PgSocketDb};
+    use postrust_core::{AppConfig, SchemaCache};
+    use std::sync::{Arc, OnceLock};
+    use tokio::sync::RwLockReadGuard;
+
+    /// A TCP socket per request, where a Worker opens one to Hyperdrive.
+    pub struct Tcp {
+        host: String,
+        port: u16,
+    }
+
+    impl Connector for Tcp {
+        type Stream = tokio::net::TcpStream;
+        type Tls = NoTls;
+
+        async fn connect(&self) -> std::io::Result<tokio::net::TcpStream> {
+            let stream = tokio::net::TcpStream::connect((self.host.as_str(), self.port)).await?;
+            stream.set_nodelay(true)?;
+            Ok(stream)
+        }
+
+        fn tls(&self) -> NoTls {
+            NoTls
+        }
+
+        fn spawn(&self, connection: BoxFuture<'static, ()>) {
+            tokio::spawn(connection);
+        }
+    }
+
+    static DB: OnceLock<PgSocketDb<Tcp>> = OnceLock::new();
+
+    /// The server's state, with the socket driver in place of the pool.
+    ///
+    /// Owns its `Arc` rather than borrowing: a borrowed state gives the
+    /// request future a lifetime the router cannot prove `Send` for every
+    /// choice of.
+    pub struct ViaSocket(pub Arc<AppState>);
+
+    impl postrust_engine::State for ViaSocket {
+        type Db = PgSocketDb<Tcp>;
+        type SchemaCache<'a>
+            = RwLockReadGuard<'a, SchemaCache>
+        where
+            Self: 'a;
+
+        fn db(&self) -> &PgSocketDb<Tcp> {
+            DB.get_or_init(|| {
+                let config: Config = self
+                    .0
+                    .config
+                    .db_uri
+                    .parse()
+                    .expect("pg-socket: the database URI does not parse");
+                let (host, port) = match (config.get_hosts().first(), config.get_ports().first()) {
+                    (Some(Host::Tcp(host)), port) => (host.clone(), port.copied().unwrap_or(5432)),
+                    _ => panic!("pg-socket: the database URI needs a TCP host"),
+                };
+                tracing::warn!(
+                    "pg-socket: REST requests run through the socket driver, one connection \
+                     per request to {host}:{port}. This build is for testing."
+                );
+                PgSocketDb::new(Tcp { host, port }, config)
+            })
+        }
+
+        async fn schema_cache(&self) -> RwLockReadGuard<'_, SchemaCache> {
+            self.0.schema_cache().await
+        }
+
+        fn config(&self) -> &AppConfig {
+            &self.0.config
+        }
+
+        fn jwt_config(&self) -> &JwtConfig {
+            &self.0.jwt_config
+        }
+
+        fn jwt_cache(&self) -> Option<&JwtCache> {
+            self.0.jwt_cache.as_ref()
+        }
+    }
 }
 
 /// Answer an `OPTIONS` with the methods its resource actually has.

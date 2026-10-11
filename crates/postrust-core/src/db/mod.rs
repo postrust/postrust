@@ -22,6 +22,14 @@ use crate::error::{DatabaseError, Error};
 use postrust_sql::SqlParam;
 use std::future::Future;
 
+#[cfg(feature = "pg-socket")]
+mod socket;
+#[cfg(feature = "pg-socket")]
+pub use socket::{Connector, PgSocketDb, SocketTx};
+/// The client library [`PgSocketDb`] speaks through, for its `Config` and TLS
+/// types.
+#[cfg(feature = "pg-socket")]
+pub use tokio_postgres;
 #[cfg(feature = "sqlx")]
 mod sqlx_impl;
 #[cfg(feature = "sqlx")]
@@ -151,7 +159,9 @@ impl RawRows {
 #[derive(Debug)]
 pub struct DbError {
     message: String,
-    database: Option<DatabaseError>,
+    // Boxed: a failure is rare, and every `Result` a driver returns would
+    // otherwise be as large as PostgreSQL's whole error report.
+    database: Option<Box<DatabaseError>>,
 }
 
 impl DbError {
@@ -168,13 +178,13 @@ impl DbError {
     pub fn database(message: impl Into<String>, error: DatabaseError) -> Self {
         Self {
             message: message.into(),
-            database: Some(error),
+            database: Some(Box::new(error)),
         }
     }
 
     /// The error PostgreSQL reported, if it was one.
     pub fn as_database(&self) -> Option<&DatabaseError> {
-        self.database.as_ref()
+        self.database.as_deref()
     }
 }
 
@@ -189,7 +199,7 @@ impl std::error::Error for DbError {}
 impl From<DbError> for Error {
     fn from(error: DbError) -> Self {
         match error.database {
-            Some(database) => Error::Database(database),
+            Some(database) => Error::Database(*database),
             None => Error::Internal(error.message),
         }
     }

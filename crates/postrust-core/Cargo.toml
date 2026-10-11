@@ -18,6 +18,10 @@ default = ["sqlx"]
 # schema cache it is given -- which is what a host with no sqlx (a Cloudflare
 # Worker, on wasm32) needs. See issue #50.
 sqlx = ["dep:sqlx"]
+# The PostgreSQL wire protocol over a socket the host opens, through
+# tokio-postgres with no runtime of its own: `db::PgSocketDb`. What a
+# Cloudflare Worker reaches Hyperdrive with (issue #50).
+pg-socket = ["dep:tokio-postgres", "dep:bigdecimal", "dep:uuid"]
 # Mirrors `postrust-server`'s feature of the same name, which turns it on here
 # too. Two things follow from it, and both have to agree or the feature only
 # half works:
@@ -37,6 +41,15 @@ tokio.workspace = true
 
 # Database
 sqlx = { workspace = true, optional = true }
+tokio-postgres = { version = "0.7.18", default-features = false, optional = true, features = [
+    "with-serde_json-1",
+    "with-uuid-1",
+    "with-chrono-0_4",
+] }
+# For `numeric`, decoded exactly as sqlx's BigDecimal decodes it; the same
+# version sqlx uses, so the printed digits cannot differ.
+bigdecimal = { version = "0.4", optional = true }
+uuid = { workspace = true, optional = true }
 
 # Serialization
 serde.workspace = true
@@ -60,6 +73,10 @@ chrono.workspace = true
 
 # Internal
 postrust-sql.workspace = true
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+# SCRAM's nonce needs randomness, which on wasm32 is the host's.
+tokio-postgres = { version = "0.7.18", default-features = false, optional = true, features = ["js"] }
 
 [dev-dependencies]
 pretty_assertions.workspace = true
