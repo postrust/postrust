@@ -184,7 +184,7 @@ where
     let plan = create_action_plan(&api_request, &schema_cache)?;
 
     // Execute plan
-    let result = execute_plan(
+    let (result, tx) = execute_plan(
         state,
         &api_request,
         &plan,
@@ -208,6 +208,17 @@ where
         }
         other => postrust_core::Error::Internal(other.to_string()),
     })?;
+
+    // The transaction commits last, once nothing is left that can refuse the
+    // request. A write the client is told failed -- more rows than
+    // `max-affected` allowed, several where it asked for one object -- must
+    // not have happened, and PostgREST rolls it back. Committed any earlier, it
+    // stayed written behind the error.
+    if let Some(tx) = tx {
+        tx.commit()
+            .await
+            .map_err(|e| postrust_core::Error::ConnectionPool(e.to_string()))?;
+    }
 
     Ok(build_response(response))
 }
@@ -419,13 +430,17 @@ fn jwt_error(error: postrust_auth::JwtError) -> postrust_core::Error {
 }
 
 /// Execute an action plan.
-async fn execute_plan<S: State>(
-    state: &S,
+///
+/// Returns the transaction it ran in, still open, for the caller to commit
+/// once the response is known to be one it can send. `None` where there is
+/// nothing to commit: no statement ran, or a read already committed.
+async fn execute_plan<'s, S: State>(
+    state: &'s S,
     api_request: &ApiRequest,
     plan: &ActionPlan,
     auth: &postrust_auth::AuthResult,
     added_join_columns: &[String],
-) -> Result<QueryResult, postrust_core::Error> {
+) -> Result<(QueryResult, Option<<S::Db as Db>::Tx<'s>>), postrust_core::Error> {
     match plan {
         ActionPlan::Db(db_plan) => {
             // A media type the schema renders itself replaces the whole
@@ -660,7 +675,7 @@ async fn execute_plan<S: State>(
             )?;
 
             if !query.has_main() {
-                return Ok(QueryResult::default());
+                return Ok((QueryResult::default(), None));
             }
 
             let (mut sql, params) = query.build_main();
@@ -995,7 +1010,11 @@ async fn execute_plan<S: State>(
             // A role's own setting wins over the server-wide
             // `PGRST_DB_TX_ISOLATION`, and both are closed enums rendered by
             // `to_sql` -- never caller text. Issued only when it differs from
-            // PostgreSQL's own default, so the common case costs no round trip.
+            // PostgreSQL's own default, so the common case sends nothing.
+            //
+            // This and every statement up to the query are queued rather than
+            // run: they go out with the query, in one flight where the driver
+            // can pipeline, and a failure among them is the query's.
             let isolation = state
                 .config()
                 .role_settings
@@ -1003,11 +1022,10 @@ async fn execute_plan<S: State>(
                 .and_then(|r| r.isolation_level.as_ref())
                 .unwrap_or(&state.config().db_tx_isolation);
             if *isolation != postrust_core::IsolationLevel::ReadCommitted {
-                tx.execute(
+                tx.queue(
                     &format!("SET TRANSACTION ISOLATION LEVEL {}", isolation.to_sql()),
                     &[],
-                )
-                .await?;
+                );
             }
 
             // A read request runs in a read-only transaction.
@@ -1018,7 +1036,7 @@ async fn execute_plan<S: State>(
             // from the statement -- a volatile function, a trigger, a rule --
             // rather than only what the planner thought to look at.
             if is_read_only(api_request) {
-                tx.execute("SET TRANSACTION READ ONLY", &[]).await?;
+                tx.queue("SET TRANSACTION READ ONLY", &[]);
             }
 
             // Everything the request tells the database about itself, in
@@ -1099,7 +1117,7 @@ async fn execute_plan<S: State>(
                         ]
                     })
                     .collect();
-                tx.execute(&sql, &params).await?;
+                tx.queue(&sql, &params);
             }
 
             // `db_pre_request`: a function called before the request's own
@@ -1116,7 +1134,7 @@ async fn execute_plan<S: State>(
                     .map(postrust_sql::escape_ident)
                     .collect::<Vec<_>>()
                     .join(".");
-                tx.execute(&format!("SELECT {qualified}()"), &[]).await?;
+                tx.queue(&format!("SELECT {qualified}()"), &[]);
             }
 
             // The main query. A logged failure names the driver's account of
@@ -1191,30 +1209,73 @@ async fn execute_plan<S: State>(
                     total,
                 );
 
-                tx.commit()
-                    .await
-                    .map_err(|e| postrust_core::Error::ConnectionPool(e.to_string()))?;
-                return Ok(QueryResult {
-                    status: StatusCode::OK,
-                    raw_body: Some((media_type, body)),
-                    content_range: Some(content_range),
-                    ..QueryResult::default()
-                });
+                return Ok((
+                    QueryResult {
+                        status: StatusCode::OK,
+                        raw_body: Some((media_type, body)),
+                        content_range: Some(content_range),
+                        ..QueryResult::default()
+                    },
+                    Some(tx),
+                ));
             }
 
-            let mut json_rows = tx.fetch_json(&sql, &params).await.map_err(log)?;
-
             // Embeds already came back with the parent query when the SELECT
-            // list carried relations. This path remains for anything the
-            // single-query form did not handle.
+            // list carried relations. The second-query path remains for
+            // anything the single-query form did not handle -- and only
+            // where there are relations to fetch, since the statements after
+            // the query can go with it when there is nothing in between.
             let two_query_parent = {
                 let schema_cache = state.schema_cache().await;
                 read_target(api_request, Some(db_plan), &schema_cache)
+            }
+            .filter(|_| {
+                !embed_level.saw_relations
+                    && api_request.query_params.select.iter().any(|item| {
+                        matches!(
+                            item,
+                            postrust_core::api_request::SelectItem::Relation { .. }
+                                | postrust_core::api_request::SelectItem::SpreadRelation { .. }
+                        )
+                    })
+            });
+
+            // A function can set the response's status and headers, and only
+            // it knows whether it did -- so the settings are read back after
+            // it has run, on the same transaction. Reads cannot set them
+            // without a function of their own having run, which is what a
+            // call or a mutation is.
+            let reads_response_settings =
+                is_mutation(db_plan) || matches!(db_plan, DbActionPlan::Call { .. });
+            let counts = api_request.preferences.count.is_some() && count_sql.is_some();
+
+            // The query, and with it whatever can go in the same flight. A
+            // read with nothing after it commits there and then: committing
+            // a read-only transaction changes nothing, so no later refusal
+            // needs it open. A call or a write reads its settings back in the
+            // same flight, unless embeds have to be fetched in between.
+            let (mut json_rows, response_settings, mut tx) = if is_read_only(api_request)
+                && !reads_response_settings
+                && !counts
+                && two_query_parent.is_none()
+            {
+                let rows = tx.fetch_json_and_commit(&sql, &params).await.map_err(log)?;
+                (rows, None, None)
+            } else if reads_response_settings && two_query_parent.is_none() {
+                let (rows, settings) = tx
+                    .fetch_json_then(&sql, &params, RESPONSE_SETTINGS)
+                    .await
+                    .map_err(log)?;
+                (rows, Some(settings), Some(tx))
+            } else {
+                let rows = tx.fetch_json(&sql, &params).await.map_err(log)?;
+                (rows, None, Some(tx))
             };
-            if let Some(parent_qi) = two_query_parent.filter(|_| !embed_level.saw_relations) {
+
+            if let (Some(parent_qi), Some(tx)) = (two_query_parent, tx.as_mut()) {
                 let schema_cache = state.schema_cache().await;
                 embed_relations(
-                    &mut tx,
+                    tx,
                     &schema_cache,
                     &parent_qi,
                     &api_request.query_params.select,
@@ -1224,23 +1285,20 @@ async fn execute_plan<S: State>(
                 .await?;
             }
 
-            // A function can set the response's status and headers, and only
-            // it knows whether it did -- so the settings are read back after
-            // it has run, on the same transaction. Reads cannot set them
-            // without a function of their own having run, which is what a
-            // call or a mutation is.
             let (guc_headers, guc_status) =
-                match is_mutation(db_plan) || matches!(db_plan, DbActionPlan::Call { .. }) {
-                    false => (None, None),
-                    true => {
-                        let row = first_row(
-                            tx.fetch_values(
-                                "SELECT current_setting('response.headers', true), \
-                                 current_setting('response.status', true)",
-                                &[],
-                            )
-                            .await?,
-                        )?;
+                match (reads_response_settings, response_settings, tx.as_mut()) {
+                    (false, _, _) => (None, None),
+                    (true, settings, tx) => {
+                        let settings = match (settings, tx) {
+                            (Some(settings), _) => settings,
+                            (None, Some(tx)) => tx.fetch_values(RESPONSE_SETTINGS, &[]).await?,
+                            (None, None) => {
+                                return Err(postrust_core::Error::Internal(
+                                    "the response settings were not read".into(),
+                                ))
+                            }
+                        };
+                        let row = first_row(settings)?;
                         // Empty is absent. Once any transaction on this
                         // connection has defined a custom setting, PostgreSQL
                         // keeps the name for the rest of the session and
@@ -1280,25 +1338,12 @@ async fn execute_plan<S: State>(
 
             // The count runs on the same transaction and so under the same
             // snapshot as the page it describes.
-            let total = match (&api_request.preferences.count, &count_sql) {
-                (Some(preference), Some(count_sql)) => {
-                    resolve_count(
-                        &mut tx,
-                        preference,
-                        count_sql,
-                        &params,
-                        api_request.max_rows,
-                    )
-                    .await?
+            let total = match (&api_request.preferences.count, &count_sql, tx.as_mut()) {
+                (Some(preference), Some(count_sql), Some(tx)) => {
+                    resolve_count(tx, preference, count_sql, &params, api_request.max_rows).await?
                 }
                 _ => None,
             };
-
-            // Reads take no locks worth holding and write plans commit their
-            // work, so the transaction is committed either way.
-            tx.commit()
-                .await
-                .map_err(|e| postrust_core::Error::ConnectionPool(e.to_string()))?;
 
             // Drop columns that were only selected to join the embeds.
             //
@@ -1473,7 +1518,7 @@ async fn execute_plan<S: State>(
                 )));
             }
 
-            Ok(QueryResult {
+            let result = QueryResult {
                 // A status the function set outright wins: it knows things
                 // about the outcome that the request's shape cannot say.
                 status: match (guc_status, returns_void) {
@@ -1498,7 +1543,10 @@ async fn execute_plan<S: State>(
                 guc_headers,
                 raw_body: geojson_body,
                 ..Default::default()
-            })
+            };
+            // Committed by the caller, once the response is known to be one
+            // it can send: refusals still to come undo the write.
+            Ok((result, tx))
         }
         ActionPlan::Info(info_plan) => {
             use postrust_core::plan::InfoPlan;
@@ -1529,14 +1577,21 @@ async fn execute_plan<S: State>(
                 }
             };
 
-            Ok(QueryResult {
-                status: StatusCode::OK,
-                rows: vec![response_data],
-                ..Default::default()
-            })
+            Ok((
+                QueryResult {
+                    status: StatusCode::OK,
+                    rows: vec![response_data],
+                    ..Default::default()
+                },
+                None,
+            ))
         }
     }
 }
+
+/// A function's response settings, read back after it ran.
+const RESPONSE_SETTINGS: &str = "SELECT current_setting('response.headers', true), \
+                                 current_setting('response.status', true)";
 
 /// What the resource this request names allows, or why it cannot say.
 ///

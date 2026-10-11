@@ -1,6 +1,6 @@
 //! [`Db`] over a sqlx pool: the driver the server and the Lambda adapter use.
 
-use super::{Db, DbError, RawRows, Tx};
+use super::{Db, DbError, FetchedThen, RawRows, Tx};
 use crate::error::DatabaseError;
 use crate::row_json::{row_to_json, row_to_values};
 use postrust_sql::SqlParam;
@@ -10,20 +10,43 @@ use sqlx::{Postgres, Row, ValueRef};
 
 /// A transaction on a pooled connection, which goes back to the pool when this
 /// is committed or dropped.
-pub struct SqlxTx(sqlx::Transaction<'static, Postgres>);
+///
+/// sqlx cannot pipeline, so [`Tx::queue`]d statements run one after another
+/// ahead of the next statement -- the round trips they always took. On a pool
+/// next to the database each is a fraction of a millisecond.
+pub struct SqlxTx {
+    tx: sqlx::Transaction<'static, Postgres>,
+    queued: Vec<(String, Vec<SqlParam>)>,
+}
 
 impl Db for PgPool {
     type Tx<'a> = SqlxTx;
 
     async fn begin(&self) -> Result<SqlxTx, DbError> {
-        Ok(SqlxTx(PgPool::begin(self).await?))
+        Ok(SqlxTx {
+            tx: PgPool::begin(self).await?,
+            queued: Vec::new(),
+        })
+    }
+}
+
+impl SqlxTx {
+    /// Run what was queued, in order.
+    async fn flush(&mut self) -> Result<(), DbError> {
+        for (sql, params) in std::mem::take(&mut self.queued) {
+            bind(sqlx::query(&sql), &params)
+                .execute(&mut *self.tx)
+                .await?;
+        }
+        Ok(())
     }
 }
 
 impl Tx for SqlxTx {
     async fn execute(&mut self, sql: &str, params: &[SqlParam]) -> Result<u64, DbError> {
+        self.flush().await?;
         Ok(bind(sqlx::query(sql), params)
-            .execute(&mut *self.0)
+            .execute(&mut *self.tx)
             .await?
             .rows_affected())
     }
@@ -36,7 +59,8 @@ impl Tx for SqlxTx {
         // `into_iter` matters for large result sets: each row's buffers are
         // freed as soon as it has been converted, rather than the whole
         // `Vec<PgRow>` staying alive alongside the whole `Vec<Value>`.
-        Ok(fetch_all(&mut self.0, sql, params)
+        self.flush().await?;
+        Ok(fetch_all(&mut self.tx, sql, params)
             .await?
             .into_iter()
             .map(|row| row_to_json(&row))
@@ -48,7 +72,8 @@ impl Tx for SqlxTx {
         sql: &str,
         params: &[SqlParam],
     ) -> Result<Vec<Vec<serde_json::Value>>, DbError> {
-        Ok(fetch_all(&mut self.0, sql, params)
+        self.flush().await?;
+        Ok(fetch_all(&mut self.tx, sql, params)
             .await?
             .into_iter()
             .map(|row| row_to_values(&row))
@@ -61,7 +86,8 @@ impl Tx for SqlxTx {
         params: &[SqlParam],
         count_column: &str,
     ) -> Result<RawRows, DbError> {
-        let rows = fetch_all(&mut self.0, sql, params).await?;
+        self.flush().await?;
+        let rows = fetch_all(&mut self.tx, sql, params).await?;
         let first = rows.first().and_then(|row| {
             let value = row.try_get_raw(0).ok()?;
             if value.is_null() {
@@ -75,8 +101,29 @@ impl Tx for SqlxTx {
         Ok(RawRows::new(rows.len(), first, count))
     }
 
-    async fn commit(self) -> Result<(), DbError> {
-        Ok(self.0.commit().await?)
+    async fn commit(mut self) -> Result<(), DbError> {
+        self.flush().await?;
+        Ok(self.tx.commit().await?)
+    }
+
+    fn queue(&mut self, sql: &str, params: &[SqlParam]) {
+        self.queued.push((sql.to_string(), params.to_vec()));
+    }
+
+    async fn fetch_json_then(&mut self, sql: &str, params: &[SqlParam], then: &str) -> FetchedThen {
+        let rows = self.fetch_json(sql, params).await?;
+        let then = self.fetch_values(then, &[]).await?;
+        Ok((rows, then))
+    }
+
+    async fn fetch_json_and_commit(
+        mut self,
+        sql: &str,
+        params: &[SqlParam],
+    ) -> Result<Vec<serde_json::Value>, DbError> {
+        let rows = self.fetch_json(sql, params).await?;
+        self.commit().await?;
+        Ok(rows)
     }
 }
 

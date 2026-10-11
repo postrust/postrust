@@ -515,3 +515,260 @@ async fn a_transaction_that_is_not_committed_is_rolled_back() {
     check(&pool, "agree_rollback_sqlx").await;
     check(&socket, "agree_rollback_socket").await;
 }
+
+/// Statements sent together are still run as they would be one at a time:
+/// in order, each seeing what the last did, and the first failure is the one
+/// reported -- by either driver, whether it can pipeline or not.
+#[tokio::test]
+#[ignore = "needs a PostgreSQL database"]
+async fn queued_statements_run_first_in_order() {
+    let (pool, socket) = drivers().await;
+    async fn check<D: Db>(db: &D) -> Vec<Answer> {
+        let mut answers = Vec::new();
+        let settings = [SqlParam::Text("agree.a".into()), SqlParam::Text("1".into())];
+
+        // In order, and before the statement that follows.
+        let mut tx = db.begin().await.unwrap();
+        tx.queue("SELECT set_config($1, $2, true)", &settings);
+        tx.queue(
+            "SELECT set_config('agree.a', current_setting('agree.a') || '2', true)",
+            &[],
+        );
+        let rows = tx
+            .fetch_json("SELECT current_setting('agree.a') AS a", &[])
+            .await;
+        answers.push(rows.map_or_else(failed, |json| Answer::Rows {
+            json,
+            values: vec![],
+            raw: RawRows::default(),
+        }));
+
+        // A queued failure is reported in place of the statement after it.
+        let mut tx = db.begin().await.unwrap();
+        tx.queue("SELECT set_config($1, $2, true)", &settings);
+        tx.queue("SELECT 1 / 0", &[]);
+        tx.queue("SELECT 'x'::int", &[]);
+        answers.push(match tx.fetch_json("SELECT 1 AS v", &[]).await {
+            Ok(rows) => panic!("expected a failure, got {rows:?}"),
+            Err(e) => failed(e),
+        });
+
+        // The statement after: run after the first, and not at all when the
+        // first failed.
+        let mut tx = db.begin().await.unwrap();
+        let (rows, then) = tx
+            .fetch_json_then(
+                "SELECT set_config('response.status', '201', true) AS s",
+                &[],
+                "SELECT current_setting('response.status', true)",
+            )
+            .await
+            .unwrap();
+        answers.push(Answer::Rows {
+            json: rows,
+            values: then,
+            raw: RawRows::default(),
+        });
+        let mut tx = db.begin().await.unwrap();
+        answers.push(
+            match tx.fetch_json_then("SELECT nope", &[], "SELECT 1 / 0").await {
+                Ok(rows) => panic!("expected a failure, got {rows:?}"),
+                Err(e) => failed(e),
+            },
+        );
+        answers
+    }
+    let sqlx = check(&pool).await;
+    assert_eq!(sqlx, check(&socket).await);
+    assert_eq!(rows(&sqlx[0]), [json!({"a": "12"})]);
+    assert!(matches!(&sqlx[1], Answer::Failed { code: Some(c), .. } if c == "22012"));
+    assert!(matches!(&sqlx[2], Answer::Rows { values, .. } if values == &[vec![json!("201")]]));
+    assert!(matches!(&sqlx[3], Answer::Failed { code: Some(c), .. } if c == "42703"));
+}
+
+/// A query sent with its `COMMIT` is committed when it succeeds, and rolled
+/// back, with its own error, when it fails.
+#[tokio::test]
+#[ignore = "needs a PostgreSQL database"]
+async fn a_query_committed_with_its_commit() {
+    let (pool, socket) = drivers().await;
+    sqlx::query("DROP TABLE IF EXISTS agree_commit")
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query("CREATE TABLE agree_commit (n int PRIMARY KEY)")
+        .execute(&pool)
+        .await
+        .unwrap();
+    async fn check<D: Db>(db: &D, n: i64) -> (Answer, Answer) {
+        let insert = "INSERT INTO agree_commit VALUES ($1) RETURNING n";
+        let tx = db.begin().await.unwrap();
+        let ok = tx
+            .fetch_json_and_commit(insert, &[SqlParam::Int(n)])
+            .await
+            .map_or_else(failed, |json| Answer::Rows {
+                json,
+                values: vec![],
+                raw: RawRows::default(),
+            });
+        // A duplicate key: nothing new is committed.
+        let mut tx = db.begin().await.unwrap();
+        tx.queue(insert, &[SqlParam::Int(n + 100)]);
+        let duplicate = tx
+            .fetch_json_and_commit(insert, &[SqlParam::Int(n)])
+            .await
+            .map_or_else(failed, |rows| panic!("expected a failure, got {rows:?}"));
+        (ok, duplicate)
+    }
+    let (sqlx_ok, sqlx_failed) = check(&pool, 1).await;
+    let (socket_ok, socket_failed) = check(&socket, 2).await;
+    assert_eq!(rows(&sqlx_ok), [json!({"n": 1})]);
+    assert_eq!(rows(&socket_ok), [json!({"n": 2})]);
+    // Each driver inserted its own key, so the details name different rows.
+    for failed in [&sqlx_failed, &socket_failed] {
+        assert!(matches!(failed, Answer::Failed { code: Some(c), .. } if c == "23505"));
+    }
+    let committed: Vec<i32> = sqlx::query_scalar("SELECT n FROM agree_commit ORDER BY n")
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+    assert_eq!(committed, [1, 2]);
+    sqlx::query("DROP TABLE agree_commit")
+        .execute(&pool)
+        .await
+        .unwrap();
+}
+
+/// The point of pipelining: how many times the socket driver waits on the
+/// database. A flight is a burst of writes followed by a wait for the answer,
+/// and on a real network each one is a round trip.
+#[tokio::test]
+#[ignore = "needs a PostgreSQL database"]
+async fn a_read_is_one_flight_and_a_write_two() {
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::sync::Arc;
+    use std::task::{Context, Poll};
+    use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
+
+    #[derive(Default)]
+    struct Flights {
+        count: AtomicUsize,
+        writing: AtomicBool,
+    }
+
+    /// A socket that counts its flights: a write after a read starts one.
+    struct Counted(tokio::net::TcpStream, Arc<Flights>);
+
+    impl AsyncRead for Counted {
+        fn poll_read(
+            mut self: std::pin::Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            buf: &mut ReadBuf<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            let before = buf.filled().len();
+            let poll = std::pin::Pin::new(&mut self.0).poll_read(cx, buf);
+            if buf.filled().len() > before {
+                self.1.writing.store(false, Ordering::SeqCst);
+            }
+            poll
+        }
+    }
+
+    impl AsyncWrite for Counted {
+        fn poll_write(
+            mut self: std::pin::Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            buf: &[u8],
+        ) -> Poll<std::io::Result<usize>> {
+            if !self.1.writing.swap(true, Ordering::SeqCst) {
+                self.1.count.fetch_add(1, Ordering::SeqCst);
+            }
+            std::pin::Pin::new(&mut self.0).poll_write(cx, buf)
+        }
+
+        fn poll_flush(
+            mut self: std::pin::Pin<&mut Self>,
+            cx: &mut Context<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            std::pin::Pin::new(&mut self.0).poll_flush(cx)
+        }
+
+        fn poll_shutdown(
+            mut self: std::pin::Pin<&mut Self>,
+            cx: &mut Context<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            std::pin::Pin::new(&mut self.0).poll_shutdown(cx)
+        }
+    }
+
+    struct CountingTcp(Tcp, Arc<Flights>);
+
+    impl Connector for CountingTcp {
+        type Stream = Counted;
+        type Tls = tokio_postgres::NoTls;
+
+        async fn connect(&self) -> std::io::Result<Counted> {
+            Ok(Counted(self.0.connect().await?, self.1.clone()))
+        }
+
+        fn tls(&self) -> tokio_postgres::NoTls {
+            tokio_postgres::NoTls
+        }
+
+        fn spawn(&self, connection: BoxFuture<'static, ()>) {
+            tokio::spawn(connection);
+        }
+    }
+
+    let (pool, _) = drivers().await;
+    sqlx::query("CREATE TABLE IF NOT EXISTS agree_flights (n int)")
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    let config: tokio_postgres::Config = database_url().parse().unwrap();
+    let (host, port) = match (config.get_hosts().first(), config.get_ports().first()) {
+        (Some(tokio_postgres::config::Host::Tcp(host)), Some(port)) => (host.clone(), *port),
+        _ => panic!("DATABASE_URL needs a TCP host and port"),
+    };
+    let flights = Arc::new(Flights::default());
+    let db = PgSocketDb::new(CountingTcp(Tcp { host, port }, flights.clone()), config);
+    // Flights from opening a transaction until it is answered.
+    let after_connecting = || {
+        let flights = flights.clone();
+        let start = flights.count.load(Ordering::SeqCst);
+        move || flights.count.load(Ordering::SeqCst) - start
+    };
+    let settings = [SqlParam::Text("agree.a".into()), SqlParam::Text("1".into())];
+
+    // A read, as the engine sends one: the transaction set up, the query, and
+    // the commit.
+    let mut tx = db.begin().await.unwrap();
+    let read = after_connecting();
+    tx.queue("SET TRANSACTION READ ONLY", &[]);
+    tx.queue("SELECT set_config($1, $2, true)", &settings);
+    tx.fetch_json_and_commit("SELECT n FROM agree_flights", &[])
+        .await
+        .unwrap();
+    assert_eq!(read(), 1, "a read");
+
+    // A write: set up, the statement and the function's settings read back,
+    // and then the commit, which waits on the response being sendable.
+    let mut tx = db.begin().await.unwrap();
+    let write = after_connecting();
+    tx.queue("SELECT set_config($1, $2, true)", &settings);
+    tx.fetch_json_then(
+        "INSERT INTO agree_flights VALUES (1) RETURNING n",
+        &[],
+        "SELECT current_setting('response.status', true)",
+    )
+    .await
+    .unwrap();
+    tx.commit().await.unwrap();
+    assert_eq!(write(), 2, "a write");
+
+    sqlx::query("DROP TABLE agree_flights")
+        .execute(&pool)
+        .await
+        .unwrap();
+}

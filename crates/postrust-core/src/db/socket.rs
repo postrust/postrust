@@ -12,15 +12,28 @@
 //! pools on its side, so there is nothing to keep. A transaction dropped
 //! without [`Tx::commit`] closes its connection, and PostgreSQL rolls it back.
 //!
+//! Statements are pipelined where the caller allows it. The `BEGIN`, every
+//! [`Tx::queue`]d statement and the next real one go out together, and the
+//! answers are read in order afterwards; a read's `COMMIT` can go with its
+//! query ([`Tx::fetch_json_and_commit`]). Over a network every statement waited
+//! on is a round trip, so a plain read is one flight after the connection is
+//! open where it was five, and a write two where it was five or six. Each
+//! statement has its own `Sync`, so they are still separate statements: when
+//! one fails, PostgreSQL refuses the rest of the transaction, and the error
+//! reported is the first one, as if they had been sent one at a time.
+//!
 //! A statement whose result has a type PostgreSQL does not build in -- an
 //! enum, a domain, a composite, an extension's type -- is prepared before it
 //! is run. `tokio-postgres` looks such a type up in the catalog when the
 //! result's description arrives, and for an unprepared statement that is
 //! after the statement has run: if it failed, the transaction is aborted, the
 //! lookup fails with `25P02`, and the statement's own error is lost. Prepared
-//! first, the lookups run before anything can have failed. That costs a round
-//! trip, so which statements need it is remembered (`ResultTypes`), and one
-//! whose columns are all built in runs in one.
+//! first, the lookups run before anything can have failed. A flight stops
+//! short of such a statement, which is prepared once those before it have
+//! answered and starts the next flight. That costs round trips, so which
+//! statements need it is remembered (`ResultTypes`): one whose columns are
+//! all built in is pipelined like any other, and one not seen before is
+//! prepared, the first time, to find out.
 //!
 //! Two things have to match sqlx exactly, and both are done by hand rather
 //! than left to `tokio-postgres`:
@@ -34,7 +47,7 @@
 //!   sent, with the conversions sqlx applies. One example: a `numeric` keeps
 //!   the scale of its base-10000 digits, so `0.1` is `0.1000`.
 
-use super::{BoxFuture, Db, DbError, MaybeSend, MaybeSync, RawRows, Tx};
+use super::{BoxFuture, Db, DbError, FetchedThen, MaybeSend, MaybeSync, RawRows, Tx};
 use crate::error::DatabaseError;
 use postrust_sql::SqlParam;
 use std::collections::HashMap;
@@ -44,7 +57,7 @@ use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio_postgres::tls::TlsConnect;
 use tokio_postgres::types::{FromSql, ToSql, Type};
-use tokio_postgres::{Client, Row};
+use tokio_postgres::{Client, Row, Statement};
 
 /// How a [`PgSocketDb`] reaches PostgreSQL: the host's socket, the host's TLS,
 /// and the host's way of running a background task.
@@ -108,6 +121,9 @@ pub struct SocketTx {
     client: Client,
     /// Why the connection ended, if it ended with an error of its own.
     closed: Arc<Mutex<Option<DbError>>>,
+    /// Statements to send ahead of the next one: the `BEGIN`, and whatever
+    /// was [`Tx::queue`]d.
+    queued: Vec<(String, Vec<SqlParam>)>,
 }
 
 impl<C> Db for PgSocketDb<C>
@@ -162,25 +178,19 @@ where
                 }
             }
         }));
-        let tx = SocketTx { client, closed };
-        tx.client
-            .batch_execute("BEGIN")
-            .await
-            .map_err(|e| tx.error(e))?;
-        Ok(tx)
+        // Sent with the first statement, not on its own.
+        Ok(SocketTx {
+            client,
+            closed,
+            queued: vec![("BEGIN".to_string(), Vec::new())],
+        })
     }
 }
 
 impl Tx for SocketTx {
     async fn execute(&mut self, sql: &str, params: &[SqlParam]) -> Result<u64, DbError> {
-        // Unlike a query, this reads no rows, so it needs no column types,
-        // and looks none up (see the module docs).
-        let bound = Bound::new(params);
-        let params: Vec<_> = bound.iter().collect();
-        self.client
-            .execute_typed(sql, &params)
-            .await
-            .map_err(|e| self.error(e))
+        let [(_, affected)] = self.send([(sql, params)]).await?;
+        Ok(affected)
     }
 
     async fn fetch_json(
@@ -233,52 +243,101 @@ impl Tx for SocketTx {
         Ok(RawRows::new(rows.len(), first, count))
     }
 
-    async fn commit(self) -> Result<(), DbError> {
-        self.client
-            .batch_execute("COMMIT")
-            .await
-            .map_err(|e| self.error(e))
+    async fn commit(mut self) -> Result<(), DbError> {
+        self.send([("COMMIT", &[][..])]).await?;
+        Ok(())
+    }
+
+    fn queue(&mut self, sql: &str, params: &[SqlParam]) {
+        self.queued.push((sql.to_string(), params.to_vec()));
+    }
+
+    async fn fetch_json_then(&mut self, sql: &str, params: &[SqlParam], then: &str) -> FetchedThen {
+        let [(rows, _), (then, _)] = self.send([(sql, params), (then, &[][..])]).await?;
+        Ok((
+            rows.iter().map(row_to_json).collect(),
+            then.iter().map(row_to_values).collect(),
+        ))
+    }
+
+    async fn fetch_json_and_commit(
+        mut self,
+        sql: &str,
+        params: &[SqlParam],
+    ) -> Result<Vec<serde_json::Value>, DbError> {
+        let [(rows, _), _] = self.send([(sql, params), ("COMMIT", &[][..])]).await?;
+        Ok(rows.iter().map(row_to_json).collect())
     }
 }
 
 impl SocketTx {
-    /// A statement's rows. Run in one round trip where its columns are known
-    /// to be built-in types, and prepared first otherwise (see the module
-    /// docs).
-    async fn query(&self, sql: &str, params: &[SqlParam]) -> Result<Vec<Row>, DbError> {
-        let bound = Bound::new(params);
-        let rows = if RESULT_TYPES.built_in(sql) {
-            let stream = self
-                .client
-                .query_typed_raw(sql, bound.iter())
-                .await
-                .map_err(|e| self.error(e))?;
-            let rows: Vec<Row> = futures::TryStreamExt::try_collect(stream)
-                .await
-                .map_err(|e| self.error(e))?;
-            // A schema changed since: the column has a type of its own now.
-            if let Some(row) = rows.first() {
-                RESULT_TYPES.learn(sql, row.columns());
-            }
-            rows
-        } else {
-            let types: Vec<Type> = bound.iter().map(|(_, ty)| ty).collect();
-            let statement = self
-                .client
-                .prepare_typed(sql, &types)
-                .await
-                .map_err(|e| self.error(e))?;
-            RESULT_TYPES.learn(sql, statement.columns());
-            let stream = self
-                .client
-                .query_raw(&statement, bound.iter().map(|(value, _)| value))
-                .await
-                .map_err(|e| self.error(e))?;
-            futures::TryStreamExt::try_collect(stream)
-                .await
-                .map_err(|e| self.error(e))?
-        };
+    async fn query(&mut self, sql: &str, params: &[SqlParam]) -> Result<Vec<Row>, DbError> {
+        let [(rows, _)] = self.send([(sql, params)]).await?;
         Ok(rows)
+    }
+
+    /// Send what was queued and then `statements`, and read every answer.
+    /// Each statement's rows and the rows it affected, for `statements` only;
+    /// the first failure, in the order they were sent, if any failed.
+    ///
+    /// They go out in as few flights as they can: all at once, unless one of
+    /// `statements` has to be prepared first (see the module docs). That one
+    /// is prepared once everything before it has answered, and starts the
+    /// next flight -- a statement sent after it would otherwise run before
+    /// it. What was queued is never prepared -- its rows are never read --
+    /// and nor is a `COMMIT`.
+    async fn send<const N: usize>(
+        &mut self,
+        statements: [(&str, &[SqlParam]); N],
+    ) -> Result<[(Vec<Row>, u64); N], DbError> {
+        let queued = std::mem::take(&mut self.queued);
+        let all: Vec<(&str, &[SqlParam])> = queued
+            .iter()
+            .map(|(sql, params)| (sql.as_str(), params.as_slice()))
+            .chain(statements)
+            .collect();
+        let prepare_first = |index: usize| {
+            let sql = all[index].0;
+            index >= queued.len() && sql != "COMMIT" && !RESULT_TYPES.built_in(sql)
+        };
+        let mut answers = Vec::with_capacity(all.len());
+        let mut start = 0;
+        while start < all.len() {
+            let end = (start + 1..all.len())
+                .find(|&index| prepare_first(index))
+                .unwrap_or(all.len());
+            let mut prepared = match prepare_first(start) {
+                true => Some(self.prepare(all[start].0, all[start].1).await?),
+                false => None,
+            };
+            let client = &self.client;
+            let futures: Vec<_> = all[start..end]
+                .iter()
+                .map(|(sql, params)| Box::pin(run(client, sql, params, prepared.take())))
+                .collect();
+            for answer in in_order(futures).await {
+                answers.push(answer.map_err(|e| self.error(e))?);
+            }
+            start = end;
+        }
+        // The queued statements' answers mattered only if they failed.
+        answers
+            .split_off(queued.len())
+            .try_into()
+            .map_err(|_| DbError::other("a pipelined statement went unanswered"))
+    }
+
+    /// `sql` prepared with its parameters' types, and its result's types
+    /// looked up and remembered.
+    async fn prepare(&self, sql: &str, params: &[SqlParam]) -> Result<Statement, DbError> {
+        let types: Vec<Type> = Bound::new(params).iter().map(|(_, ty)| ty).collect();
+        let statement = self
+            .client
+            .prepare_typed(sql, &types)
+            .await
+            .map_err(|e| self.error(e))?;
+        RESULT_TYPES.learn(sql, statement.columns());
+        Ok(statement)
     }
 
     /// A failure, as the caller should hear of it: where the connection was
@@ -336,6 +395,62 @@ impl ResultTypes {
         }
         known.insert(sql.into(), built_in);
     }
+}
+
+/// One statement: its rows, and the rows it affected. `prepared` is the
+/// statement, where it had to be prepared first.
+async fn run(
+    client: &Client,
+    sql: &str,
+    params: &[SqlParam],
+    prepared: Option<Statement>,
+) -> Result<(Vec<Row>, u64), tokio_postgres::Error> {
+    let bound = Bound::new(params);
+    let stream = match &prepared {
+        Some(statement) => {
+            client
+                .query_raw(statement, bound.iter().map(|(value, _)| value))
+                .await?
+        }
+        None => client.query_typed_raw(sql, bound.iter()).await?,
+    };
+    futures::pin_mut!(stream);
+    let mut rows = Vec::new();
+    while let Some(row) = futures::StreamExt::next(&mut stream).await.transpose()? {
+        rows.push(row);
+    }
+    // A schema changed since: the column has a type of its own now.
+    if let (None, Some(row)) = (&prepared, rows.first()) {
+        RESULT_TYPES.learn(sql, row.columns());
+    }
+    Ok((rows, stream.rows_affected().unwrap_or_default()))
+}
+
+/// Every future to completion, each polled for the first time in the order
+/// given, and their outputs in that order.
+///
+/// The order is the point. A statement's messages are written to the
+/// connection when its future is first polled, so polling them in turn sends
+/// them in turn, all before any answer is waited on -- and PostgreSQL runs
+/// them in the order it received them. `join_all` makes no promise about the
+/// order of its first polls once there are more than a few futures.
+async fn in_order<F: Future + Unpin>(futures: Vec<F>) -> Vec<F::Output> {
+    let mut slots: Vec<(F, Option<F::Output>)> = futures.into_iter().map(|f| (f, None)).collect();
+    std::future::poll_fn(|cx| {
+        let mut pending = false;
+        for (future, output) in slots.iter_mut().filter(|(_, output)| output.is_none()) {
+            match std::pin::Pin::new(future).poll(cx) {
+                std::task::Poll::Ready(value) => *output = Some(value),
+                std::task::Poll::Pending => pending = true,
+            }
+        }
+        match pending {
+            true => std::task::Poll::Pending,
+            false => std::task::Poll::Ready(()),
+        }
+    })
+    .await;
+    slots.into_iter().filter_map(|(_, output)| output).collect()
 }
 
 /// Parameters as sqlx binds them: each with the type of its Rust value.
