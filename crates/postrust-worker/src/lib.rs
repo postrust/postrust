@@ -486,15 +486,19 @@ async fn load(env: &Env, config: &AppConfig) -> Result<Rc<SchemaCache>, postrust
             loaded_at: now,
             cache,
         };
-        match kv.put(&key, &stored) {
-            Ok(put) => {
-                if let Err(e) = put.execute().await {
-                    worker::console_error!("postrust: could not write the schema cache to KV: {e}");
-                }
-            }
-            Err(e) => {
-                worker::console_error!("postrust: could not write the schema cache to KV: {e}")
-            }
+        // As a JSON string, not as the value: `put` of a `Serialize` value
+        // goes through `serde_wasm_bindgen`, which makes every map a
+        // JavaScript `Map` -- and KV stores what `JSON.stringify` makes of a
+        // `Map`, which is `{}`. Every table read back had no columns.
+        let written = match serde_json::to_string(&stored) {
+            Ok(json) => match kv.put(&key, json) {
+                Ok(put) => put.execute().await.map_err(|e| e.to_string()),
+                Err(e) => Err(e.to_string()),
+            },
+            Err(e) => Err(e.to_string()),
+        };
+        if let Err(e) = written {
+            worker::console_error!("postrust: could not write the schema cache to KV: {e}");
         }
         let cache = Rc::new(stored.cache);
         keep(cache.clone(), key, now);
