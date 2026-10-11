@@ -19,10 +19,16 @@ ignore = [
     # rsa 0.9.9 -- Marvin attack, timing side channel in PKCS#1 v1.5
     # decryption.
     #
-    # Not in any build graph: `cargo tree -i rsa` prints nothing. It is an
-    # optional dependency of sqlx behind the MySQL feature, which this
-    # workspace does not enable -- postrust is PostgreSQL only. No RSA
-    # decryption code is compiled, let alone reachable.
+    # Not in any native build graph: `cargo tree -i rsa` prints nothing. It is
+    # an optional dependency of sqlx behind the MySQL feature, which this
+    # workspace does not enable -- postrust is PostgreSQL only.
+    #
+    # On wasm32 it *is* compiled (`cargo tree -i rsa --target
+    # wasm32-unknown-unknown`): jsonwebtoken's RustCrypto backend, which the
+    # Cloudflare Worker build uses (issue #50), verifies RS256/PS256 with it.
+    # Verification uses only a public key. The advisory is about the timing of
+    # PKCS#1 v1.5 *decryption* with a private key, which postrust never holds
+    # or performs, so there is still no path to it.
     #
     # There is also no fixed version to move to; the advisory lists no patched
     # release, because the fix requires an API change upstream has not made.

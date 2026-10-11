@@ -42,6 +42,7 @@ pub mod embed;
 pub mod error;
 pub mod plan;
 pub mod query;
+#[cfg(feature = "sqlx")]
 pub mod row_json;
 pub mod schema_cache;
 

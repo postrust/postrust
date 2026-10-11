@@ -327,18 +327,41 @@ impl AppConfig {
     /// Load configuration from environment variables, rejecting invalid
     /// boolean values.
     pub fn try_from_env() -> Result<Self, ConfigError> {
+        // A variable whose name or value is not UTF-8 is skipped, as
+        // `std::env::var` would have refused it.
+        Self::try_from_vars(
+            std::env::vars_os()
+                .filter_map(|(k, v)| Some((k.into_string().ok()?, v.into_string().ok()?))),
+        )
+    }
+
+    /// Load configuration from name/value pairs spelled as the environment
+    /// variables are, for a host with no process environment -- a Cloudflare
+    /// Worker reads its bindings instead. Where a name appears twice, the last
+    /// one wins.
+    pub fn try_from_vars<I, K, V>(vars: I) -> Result<Self, ConfigError>
+    where
+        I: IntoIterator<Item = (K, V)>,
+        K: Into<String>,
+        V: Into<String>,
+    {
+        let vars: HashMap<String, String> = vars
+            .into_iter()
+            .map(|(k, v)| (k.into(), v.into()))
+            .collect();
+        let get = |key: &str| vars.get(key).cloned().ok_or(());
         let mut config = Self::default();
 
-        if let Ok(uri) = std::env::var("PGRST_DB_URI") {
+        if let Ok(uri) = get("PGRST_DB_URI") {
             config.db_uri = uri;
         }
-        if let Ok(uri) = std::env::var("DATABASE_URL") {
+        if let Ok(uri) = get("DATABASE_URL") {
             config.db_uri = uri;
         }
-        if let Ok(schemas) = std::env::var("PGRST_DB_SCHEMAS") {
+        if let Ok(schemas) = get("PGRST_DB_SCHEMAS") {
             config.db_schemas = schemas.split(',').map(|s| s.trim().to_string()).collect();
         }
-        if let Ok(role) = std::env::var("PGRST_DB_ANON_ROLE") {
+        if let Ok(role) = get("PGRST_DB_ANON_ROLE") {
             config.db_anon_role = Some(role);
         }
         // `PGRST_DB_POOL` is PostgREST's own name; `PGRST_DB_POOL_SIZE` is the
@@ -347,20 +370,20 @@ impl AppConfig {
         // so anybody who followed our own instructions silently kept the
         // default pool.
         for var in ["PGRST_DB_POOL", "PGRST_DB_POOL_SIZE"] {
-            if let Ok(size) = std::env::var(var) {
+            if let Ok(size) = get(var) {
                 match size.parse::<u32>() {
                     Ok(n) if n > 0 => config.db_pool_size = n,
                     _ => warn_ignored(var, &size, "a positive integer"),
                 }
             }
         }
-        if let Ok(secs) = std::env::var("PGRST_DB_POOL_TIMEOUT") {
+        if let Ok(secs) = get("PGRST_DB_POOL_TIMEOUT") {
             match secs.parse::<u64>() {
                 Ok(n) if n > 0 => config.db_pool_timeout = n,
                 _ => warn_ignored("PGRST_DB_POOL_TIMEOUT", &secs, "a positive integer"),
             }
         }
-        if let Ok(level) = std::env::var("PGRST_DB_TX_ISOLATION") {
+        if let Ok(level) = get("PGRST_DB_TX_ISOLATION") {
             match IsolationLevel::parse_config(&level) {
                 Some(l) => config.db_tx_isolation = l,
                 None => warn_ignored(
@@ -370,7 +393,7 @@ impl AppConfig {
                 ),
             }
         }
-        if let Ok(v) = std::env::var("PGRST_DB_EXTRA_SEARCH_PATH") {
+        if let Ok(v) = get("PGRST_DB_EXTRA_SEARCH_PATH") {
             config.db_extra_search_path = v
                 .split(',')
                 .map(|s| s.trim().to_string())
@@ -378,59 +401,59 @@ impl AppConfig {
                 .collect();
         }
 
-        if let Ok(v) = std::env::var("PGRST_DB_AGGREGATES_ENABLED") {
+        if let Ok(v) = get("PGRST_DB_AGGREGATES_ENABLED") {
             config.db_aggregates_enabled = env_bool("PGRST_DB_AGGREGATES_ENABLED", &v)?;
         }
-        if let Ok(v) = std::env::var("PGRST_DB_PREPARED_STATEMENTS") {
+        if let Ok(v) = get("PGRST_DB_PREPARED_STATEMENTS") {
             config.db_prepared_statements = env_bool("PGRST_DB_PREPARED_STATEMENTS", &v)?;
         }
-        if let Ok(v) = std::env::var("PGRST_DB_PRE_REQUEST") {
+        if let Ok(v) = get("PGRST_DB_PRE_REQUEST") {
             if !v.trim().is_empty() {
                 config.db_pre_request = Some(v.trim().to_string());
             }
         }
-        if let Ok(v) = std::env::var("PGRST_DB_CHANNEL") {
+        if let Ok(v) = get("PGRST_DB_CHANNEL") {
             if !v.trim().is_empty() {
                 config.db_channel = v.trim().to_string();
             }
         }
-        if let Ok(v) = std::env::var("PGRST_DB_CHANNEL_ENABLED") {
+        if let Ok(v) = get("PGRST_DB_CHANNEL_ENABLED") {
             config.db_channel_enabled = env_bool("PGRST_DB_CHANNEL_ENABLED", &v)?;
         }
 
         // `PGRST_DB_MAX_ROWS` mirrors PostgREST's `db-max-rows`. Accept both.
         for var in ["PGRST_DB_MAX_ROWS", "PGRST_MAX_ROWS"] {
-            if let Ok(max_rows) = std::env::var(var) {
+            if let Ok(max_rows) = get(var) {
                 match max_rows.parse::<i64>() {
                     Ok(n) if n >= 0 => config.db_max_rows = Some(n),
                     _ => warn_ignored(var, &max_rows, "a non-negative integer"),
                 }
             }
         }
-        if let Ok(secret) = std::env::var("PGRST_JWT_SECRET") {
+        if let Ok(secret) = get("PGRST_JWT_SECRET") {
             config.jwt_secret = Some(secret);
         }
-        if let Ok(aud) = std::env::var("PGRST_JWT_AUD") {
+        if let Ok(aud) = get("PGRST_JWT_AUD") {
             config.jwt_aud = Some(aud);
         }
         // Both of these reach the JWT layer already -- `JwtConfig` is built
         // from them in every binary. Only the environment read was missing, so
         // a base64 secret was verified against its own text and a role claim
         // outside `role` was never found.
-        if let Ok(v) = std::env::var("PGRST_JWT_SECRET_IS_BASE64") {
+        if let Ok(v) = get("PGRST_JWT_SECRET_IS_BASE64") {
             config.jwt_secret_is_base64 = env_bool("PGRST_JWT_SECRET_IS_BASE64", &v)?;
         }
-        if let Ok(key) = std::env::var("PGRST_JWT_ROLE_CLAIM_KEY") {
+        if let Ok(key) = get("PGRST_JWT_ROLE_CLAIM_KEY") {
             if !key.trim().is_empty() {
                 config.jwt_role_claim_key = key;
             }
         }
-        if let Ok(v) = std::env::var("PGRST_JWT_CACHE_ENABLED") {
+        if let Ok(v) = get("PGRST_JWT_CACHE_ENABLED") {
             config.jwt_cache_enabled = env_bool("PGRST_JWT_CACHE_ENABLED", &v)?;
         }
         // Zero is meaningful here -- it turns the cache off, as in PostgREST --
         // so unlike the other durations it is not rejected.
-        if let Ok(v) = std::env::var("PGRST_JWT_CACHE_MAX_LIFETIME") {
+        if let Ok(v) = get("PGRST_JWT_CACHE_MAX_LIFETIME") {
             match v.parse::<u64>() {
                 Ok(n) => config.jwt_cache_max_lifetime = n,
                 Err(_) => warn_ignored(
@@ -446,7 +469,7 @@ impl AppConfig {
         // `PGRST_` name wins where both are set, on the grounds that it is the
         // more specific instruction to this server.
         for var in ["HASURA_GRAPHQL_ADMIN_SECRET", "PGRST_HASURA_ADMIN_SECRET"] {
-            if let Ok(secret) = std::env::var(var) {
+            if let Ok(secret) = get(var) {
                 if !secret.is_empty() {
                     config.hasura_admin_secret = Some(secret);
                 }
@@ -456,21 +479,21 @@ impl AppConfig {
             "HASURA_GRAPHQL_UNAUTHORIZED_ROLE",
             "PGRST_HASURA_UNAUTHORIZED_ROLE",
         ] {
-            if let Ok(role) = std::env::var(var) {
+            if let Ok(role) = get(var) {
                 if !role.is_empty() {
                     config.hasura_unauthorized_role = Some(role);
                 }
             }
         }
-        if let Ok(host) = std::env::var("PGRST_SERVER_HOST") {
+        if let Ok(host) = get("PGRST_SERVER_HOST") {
             config.server_host = host;
         }
-        if let Ok(port) = std::env::var("PGRST_SERVER_PORT") {
+        if let Ok(port) = get("PGRST_SERVER_PORT") {
             if let Ok(p) = port.parse() {
                 config.server_port = p;
             }
         }
-        if let Ok(port) = std::env::var("PORT") {
+        if let Ok(port) = get("PORT") {
             if let Ok(p) = port.parse() {
                 config.server_port = p;
             }
@@ -478,7 +501,7 @@ impl AppConfig {
         // A bare `*` is the documented way to spell "any origin", and is the
         // default. An empty list means the same thing, so a value of only
         // separators does not accidentally lock everybody out.
-        if let Ok(origins) = std::env::var("PGRST_SERVER_CORS_ORIGINS") {
+        if let Ok(origins) = get("PGRST_SERVER_CORS_ORIGINS") {
             config.server_cors_origins = if origins.trim() == "*" {
                 Vec::new()
             } else {
@@ -489,13 +512,13 @@ impl AppConfig {
                     .collect()
             };
         }
-        if let Ok(bytes) = std::env::var("PGRST_MAX_BODY_SIZE") {
+        if let Ok(bytes) = get("PGRST_MAX_BODY_SIZE") {
             match bytes.parse::<usize>() {
                 Ok(n) if n > 0 => config.max_body_size = n,
                 _ => warn_ignored("PGRST_MAX_BODY_SIZE", &bytes, "a positive integer"),
             }
         }
-        if let Ok(level) = std::env::var("PGRST_LOG_LEVEL") {
+        if let Ok(level) = get("PGRST_LOG_LEVEL") {
             match LogLevel::parse_config(&level) {
                 Some(l) => config.log_level = l,
                 None => warn_ignored(
@@ -505,23 +528,23 @@ impl AppConfig {
                 ),
             }
         }
-        if let Ok(path) = std::env::var("PGRST_SERVER_UNIX_SOCKET") {
+        if let Ok(path) = get("PGRST_SERVER_UNIX_SOCKET") {
             if !path.trim().is_empty() {
                 config.server_unix_socket = Some(path.trim().to_string());
             }
         }
-        if let Ok(port) = std::env::var("PGRST_ADMIN_SERVER_PORT") {
+        if let Ok(port) = get("PGRST_ADMIN_SERVER_PORT") {
             match port.parse::<u16>() {
                 Ok(p) if p > 0 => config.admin_server_port = Some(p),
                 _ => warn_ignored("PGRST_ADMIN_SERVER_PORT", &port, "a port number"),
             }
         }
-        if let Ok(uri) = std::env::var("PGRST_OPENAPI_SERVER_PROXY_URI") {
+        if let Ok(uri) = get("PGRST_OPENAPI_SERVER_PROXY_URI") {
             if !uri.trim().is_empty() {
                 config.openapi_server_proxy_uri = Some(uri.trim().to_string());
             }
         }
-        if let Ok(mode) = std::env::var("PGRST_OPENAPI_MODE") {
+        if let Ok(mode) = get("PGRST_OPENAPI_MODE") {
             match OpenApiMode::parse_config(&mode) {
                 Some(m) => config.openapi_mode = m,
                 None => warn_ignored(
@@ -535,7 +558,7 @@ impl AppConfig {
         // `PGRST_ROLE_SETTINGS` is JSON rather than a per-role variable,
         // because a PostgreSQL role name may hold characters an environment
         // variable name cannot.
-        if let Ok(raw) = std::env::var("PGRST_ROLE_SETTINGS") {
+        if let Ok(raw) = get("PGRST_ROLE_SETTINGS") {
             match serde_json::from_str::<HashMap<String, RoleSettings>>(&raw) {
                 Ok(settings) => config.role_settings = settings,
                 Err(e) => warn_ignored(
@@ -546,10 +569,10 @@ impl AppConfig {
             }
         }
 
-        if let Ok(value) = std::env::var("PGRST_GRAPHQL_FEDERATION") {
+        if let Ok(value) = get("PGRST_GRAPHQL_FEDERATION") {
             config.graphql_federation = env_bool("PGRST_GRAPHQL_FEDERATION", &value)?;
         }
-        if let Ok(value) = std::env::var("PGRST_GRAPHQL_TYPE_PREFIX") {
+        if let Ok(value) = get("PGRST_GRAPHQL_TYPE_PREFIX") {
             match parse_graphql_type_prefix(&value) {
                 Ok(prefix) => config.graphql_type_prefix = prefix,
                 Err(expected) => warn_ignored("PGRST_GRAPHQL_TYPE_PREFIX", &value, expected),
@@ -558,17 +581,19 @@ impl AppConfig {
 
         // `PGRST_APP_SETTINGS_<NAME>` becomes `app.settings.<name>`, which is
         // where PostgREST puts it and where a policy expects to read it back.
-        for (key, value) in std::env::vars() {
+        for (key, value) in &vars {
             if let Some(name) = key.strip_prefix("PGRST_APP_SETTINGS_") {
                 if !name.is_empty() {
-                    config.app_settings.insert(name.to_ascii_lowercase(), value);
+                    config
+                        .app_settings
+                        .insert(name.to_ascii_lowercase(), value.clone());
                 }
             }
         }
         // Accept either the PGRST_-prefixed name (for parity with other options)
         // or a POSTRUST_-prefixed alias.
         for var in ["PGRST_COMPAT_MODE", "POSTRUST_COMPAT_MODE"] {
-            if let Ok(v) = std::env::var(var) {
+            if let Ok(v) = get(var) {
                 config.compat_mode = env_bool(var, &v)?;
             }
         }
@@ -1048,6 +1073,33 @@ mod tests {
                 "https://b.example".to_string()
             ]
         );
+    }
+
+    #[test]
+    fn variables_can_come_from_somewhere_other_than_the_environment() {
+        // What a Cloudflare Worker does with its bindings: nothing here is in
+        // the process environment, and the app settings, which are found by
+        // prefix rather than by name, arrive all the same.
+        let config = AppConfig::try_from_vars([
+            ("PGRST_DB_SCHEMAS", "api, extra"),
+            ("PGRST_DB_ANON_ROLE", "web_anon"),
+            ("PGRST_JWT_SECRET", "a-secret"),
+            ("PGRST_DB_MAX_ROWS", "100"),
+            ("PGRST_APP_SETTINGS_Tenant", "acme"),
+        ])
+        .unwrap();
+
+        assert_eq!(config.db_schemas, ["api", "extra"]);
+        assert_eq!(config.db_anon_role.as_deref(), Some("web_anon"));
+        assert_eq!(config.jwt_secret.as_deref(), Some("a-secret"));
+        assert_eq!(config.db_max_rows, Some(100));
+        assert_eq!(
+            config.app_settings.get("tenant").map(String::as_str),
+            Some("acme")
+        );
+
+        let refused = AppConfig::try_from_vars([("PGRST_DB_AGGREGATES_ENABLED", "maybe")]);
+        assert!(refused.is_err());
     }
 
     #[test]

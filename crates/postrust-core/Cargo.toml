@@ -12,6 +12,12 @@ readme = "README.md"
 keywords = ["postgres", "rest", "api", "query-planner", "postgrest"]
 
 [features]
+default = ["sqlx"]
+# Loading the schema cache from a database and decoding rows, both through
+# sqlx. Without it the crate still parses, plans and builds queries, and holds a
+# schema cache it is given -- which is what a host with no sqlx (a Cloudflare
+# Worker, on wasm32) needs. See issue #50.
+sqlx = ["dep:sqlx"]
 # Mirrors `postrust-server`'s feature of the same name, which turns it on here
 # too. Two things follow from it, and both have to agree or the feature only
 # half works:
@@ -30,7 +36,7 @@ futures.workspace = true
 tokio.workspace = true
 
 # Database
-sqlx.workspace = true
+sqlx = { workspace = true, optional = true }
 
 # Serialization
 serde.workspace = true
@@ -55,6 +61,10 @@ chrono.workspace = true
 # Internal
 postrust-sql.workspace = true
 
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+# chrono's clock comes from the JavaScript host on wasm32.
+chrono = { workspace = true, features = ["wasmbind"] }
+
 [dev-dependencies]
 pretty_assertions.workspace = true
-tokio = { workspace = true, features = ["test-util", "macros"] }
+tokio = { workspace = true, features = ["full", "test-util"] }

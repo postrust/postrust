@@ -13,14 +13,35 @@ keywords = ["jwt", "authentication", "postgres", "rls", "auth"]
 
 [dependencies]
 async-trait.workspace = true
-jsonwebtoken.workspace = true
 base64.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
 chrono.workspace = true
 tracing.workspace = true
+web-time = "1.1"
+
+# jsonwebtoken 9 natively, verifying with ring -- which sqlx's TLS already
+# links into the server, so it costs nothing.
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+jsonwebtoken.workspace = true
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+# On wasm32 (a Cloudflare Worker) ring needs a C cross toolchain, so the
+# verifying is done by jsonwebtoken 10's pure-Rust RustCrypto backend instead.
+# Renamed, and aliased back to `jsonwebtoken` in lib.rs: the API this crate
+# uses is the same in both. Not used natively, where the RustCrypto backend
+# would cost the server binary 0.7 MB and aws-lc-rs 2.6 MB.
+jsonwebtoken10 = { package = "jsonwebtoken", version = "10.4", default-features = false, features = [
+    "use_pem",
+    "rust_crypto",
+] }
+# Not used directly: these turn on the browser/Workers backends of crates that
+# otherwise refuse wasm32 -- randomness for the RustCrypto keys, the clock for
+# chrono.
+getrandom = { version = "0.2", features = ["js"] }
+chrono = { workspace = true, features = ["wasmbind"] }
 
 [dev-dependencies]
 pretty_assertions.workspace = true
-tokio = { workspace = true, features = ["test-util", "macros"] }
+tokio = { workspace = true, features = ["full", "test-util"] }
