@@ -16,91 +16,115 @@ pub fn row_to_json(row: &sqlx::postgres::PgRow) -> serde_json::Value {
 
     let mut map = serde_json::Map::new();
 
+    // By name, not by position: where two columns share a name, both read the
+    // *last* one's value -- sqlx's name lookup is a map the later column
+    // overwrote -- and the object holds that one value under the name. That
+    // is how this has always behaved, and the socket driver matches it.
     for column in row.columns() {
         let name = column.name();
-        let type_name = column.type_info().name();
-
-        let value = match type_name {
-            "INT2" | "SMALLINT" => row
-                .try_get::<i16, _>(name)
-                .ok()
-                .map(|v| serde_json::Value::Number(v.into())),
-            "INT4" | "INT" | "INTEGER" => row
-                .try_get::<i32, _>(name)
-                .ok()
-                .map(|v| serde_json::Value::Number(v.into())),
-            "INT8" | "BIGINT" => row
-                .try_get::<i64, _>(name)
-                .ok()
-                .map(|v| serde_json::Value::Number(v.into())),
-            "FLOAT4" | "REAL" => row
-                .try_get::<f32, _>(name)
-                .ok()
-                .and_then(|v| serde_json::Number::from_f64(v as f64))
-                .map(serde_json::Value::Number),
-            "FLOAT8" | "DOUBLE PRECISION" => row
-                .try_get::<f64, _>(name)
-                .ok()
-                .and_then(serde_json::Number::from_f64)
-                .map(serde_json::Value::Number),
-            // PostgreSQL's own row_to_json emits NUMERIC as a JSON number, and so
-            // does PostgREST, so returning a string here made every numeric column
-            // arrive at the client quoted.
-            //
-            // The value is parsed from its exact decimal text rather than through
-            // f64, so a NUMERIC(20, 6) keeps the digits it was stored with. NUMERIC
-            // also permits NaN, which JSON has no number for; that falls back to a
-            // string, which is what row_to_json does as well.
-            "NUMERIC" | "DECIMAL" => {
-                row.try_get::<sqlx::types::BigDecimal, _>(name)
-                    .ok()
-                    .map(|v| {
-                        let text = v.to_string();
-                        serde_json::from_str::<serde_json::Value>(&text)
-                            .ok()
-                            .filter(serde_json::Value::is_number)
-                            .unwrap_or(serde_json::Value::String(text))
-                    })
-            }
-            "BOOL" | "BOOLEAN" => row
-                .try_get::<bool, _>(name)
-                .ok()
-                .map(serde_json::Value::Bool),
-            "JSON" | "JSONB" => row.try_get::<serde_json::Value, _>(name).ok(),
-            "UUID" => row
-                .try_get::<sqlx::types::Uuid, _>(name)
-                .ok()
-                .map(|v| serde_json::Value::String(v.to_string())),
-            "TIMESTAMPTZ" | "TIMESTAMP WITH TIME ZONE" => row
-                .try_get::<chrono::DateTime<chrono::Utc>, _>(name)
-                .ok()
-                .map(|v| serde_json::Value::String(v.to_rfc3339())),
-            // ISO 8601, with `T` between the date and the time. `to_string`
-            // puts a space there, which is PostgreSQL's *display* format but
-            // not what it writes in JSON -- and a client parsing the result
-            // as a timestamp is parsing JSON.
-            "TIMESTAMP" | "TIMESTAMP WITHOUT TIME ZONE" => row
-                .try_get::<chrono::NaiveDateTime, _>(name)
-                .ok()
-                .map(|v| serde_json::Value::String(v.format("%Y-%m-%dT%H:%M:%S%.f").to_string())),
-            "DATE" => row
-                .try_get::<chrono::NaiveDate, _>(name)
-                .ok()
-                .map(|v| serde_json::Value::String(v.to_string())),
-            "TIME" | "TIME WITHOUT TIME ZONE" => row
-                .try_get::<chrono::NaiveTime, _>(name)
-                .ok()
-                .map(|v| serde_json::Value::String(v.to_string())),
-            _ => row
-                .try_get::<String, _>(name)
-                .ok()
-                .map(serde_json::Value::String),
-        };
-
-        map.insert(name.to_string(), value.unwrap_or(serde_json::Value::Null));
+        let value = decode(row, name, column.type_info().name());
+        map.insert(name.to_string(), value);
     }
 
     serde_json::Value::Object(map)
+}
+
+/// A row's columns in order, decoded by the rules [`row_to_json`] uses.
+pub fn row_to_values(row: &sqlx::postgres::PgRow) -> Vec<serde_json::Value> {
+    use sqlx::{Column, Row, TypeInfo};
+
+    row.columns()
+        .iter()
+        .map(|column| decode(row, column.ordinal(), column.type_info().name()))
+        .collect()
+}
+
+/// One column, by name or by position, decoded by its PostgreSQL type.
+fn decode<I>(row: &sqlx::postgres::PgRow, index: I, type_name: &str) -> serde_json::Value
+where
+    I: sqlx::ColumnIndex<sqlx::postgres::PgRow> + Copy,
+{
+    use sqlx::Row;
+    // `name` reads as it always has; it may be a position.
+    let name = index;
+
+    let value = match type_name {
+        "INT2" | "SMALLINT" => row
+            .try_get::<i16, _>(name)
+            .ok()
+            .map(|v| serde_json::Value::Number(v.into())),
+        "INT4" | "INT" | "INTEGER" => row
+            .try_get::<i32, _>(name)
+            .ok()
+            .map(|v| serde_json::Value::Number(v.into())),
+        "INT8" | "BIGINT" => row
+            .try_get::<i64, _>(name)
+            .ok()
+            .map(|v| serde_json::Value::Number(v.into())),
+        "FLOAT4" | "REAL" => row
+            .try_get::<f32, _>(name)
+            .ok()
+            .and_then(|v| serde_json::Number::from_f64(v as f64))
+            .map(serde_json::Value::Number),
+        "FLOAT8" | "DOUBLE PRECISION" => row
+            .try_get::<f64, _>(name)
+            .ok()
+            .and_then(serde_json::Number::from_f64)
+            .map(serde_json::Value::Number),
+        // PostgreSQL's own row_to_json emits NUMERIC as a JSON number, and so
+        // does PostgREST, so returning a string here made every numeric column
+        // arrive at the client quoted.
+        //
+        // The value is parsed from its exact decimal text rather than through
+        // f64, so a NUMERIC(20, 6) keeps the digits it was stored with. NUMERIC
+        // also permits NaN, which JSON has no number for; that falls back to a
+        // string, which is what row_to_json does as well.
+        "NUMERIC" | "DECIMAL" => row
+            .try_get::<sqlx::types::BigDecimal, _>(name)
+            .ok()
+            .map(|v| {
+                let text = v.to_string();
+                serde_json::from_str::<serde_json::Value>(&text)
+                    .ok()
+                    .filter(serde_json::Value::is_number)
+                    .unwrap_or(serde_json::Value::String(text))
+            }),
+        "BOOL" | "BOOLEAN" => row
+            .try_get::<bool, _>(name)
+            .ok()
+            .map(serde_json::Value::Bool),
+        "JSON" | "JSONB" => row.try_get::<serde_json::Value, _>(name).ok(),
+        "UUID" => row
+            .try_get::<sqlx::types::Uuid, _>(name)
+            .ok()
+            .map(|v| serde_json::Value::String(v.to_string())),
+        "TIMESTAMPTZ" | "TIMESTAMP WITH TIME ZONE" => row
+            .try_get::<chrono::DateTime<chrono::Utc>, _>(name)
+            .ok()
+            .map(|v| serde_json::Value::String(v.to_rfc3339())),
+        // ISO 8601, with `T` between the date and the time. `to_string`
+        // puts a space there, which is PostgreSQL's *display* format but
+        // not what it writes in JSON -- and a client parsing the result
+        // as a timestamp is parsing JSON.
+        "TIMESTAMP" | "TIMESTAMP WITHOUT TIME ZONE" => row
+            .try_get::<chrono::NaiveDateTime, _>(name)
+            .ok()
+            .map(|v| serde_json::Value::String(v.format("%Y-%m-%dT%H:%M:%S%.f").to_string())),
+        "DATE" => row
+            .try_get::<chrono::NaiveDate, _>(name)
+            .ok()
+            .map(|v| serde_json::Value::String(v.to_string())),
+        "TIME" | "TIME WITHOUT TIME ZONE" => row
+            .try_get::<chrono::NaiveTime, _>(name)
+            .ok()
+            .map(|v| serde_json::Value::String(v.to_string())),
+        _ => row
+            .try_get::<String, _>(name)
+            .ok()
+            .map(serde_json::Value::String),
+    };
+
+    value.unwrap_or(serde_json::Value::Null)
 }
 
 #[cfg(test)]

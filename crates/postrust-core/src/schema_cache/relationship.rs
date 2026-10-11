@@ -428,7 +428,7 @@ mod tests {
 /// `create domain "application/geo+json" as jsonb` and an aggregate over the
 /// table's rows returning it. The aggregate is then applied to the rows the
 /// request selected and its result is the whole response body.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct MediaHandler {
     /// The aggregate to apply.
     pub aggregate: QualifiedIdentifier,

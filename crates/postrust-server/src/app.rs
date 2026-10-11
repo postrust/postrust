@@ -16,7 +16,7 @@ use std::sync::Arc;
 
 /// Main request handler.
 pub async fn handle_request(State(state): State<Arc<AppState>>, request: Request) -> Response {
-    postrust_engine::handle(&state, request)
+    postrust_engine::handle(state.as_ref(), request)
         .await
         .map(Body::from)
 }
@@ -56,7 +56,7 @@ pub async fn options_allow(
     // which a middleware has to be.
     let probe = probe_request(&request, path);
     let allow = match probe {
-        Ok(probe) => postrust_engine::allow(&state, probe).await,
+        Ok(probe) => postrust_engine::allow(state.as_ref(), probe).await,
         Err(error) => Err(error),
     };
 
