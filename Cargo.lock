@@ -2554,6 +2554,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "postrust-engine"
+version = "2.2.1"
+dependencies = [
+ "bytes",
+ "http",
+ "http-body",
+ "http-body-util",
+ "postrust-auth",
+ "postrust-core",
+ "postrust-response",
+ "postrust-sql",
+ "serde_json",
+ "sqlx",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "postrust-graphql"
 version = "2.2.1"
 dependencies = [
@@ -2686,6 +2704,7 @@ dependencies = [
  "mimalloc",
  "postrust-auth",
  "postrust-core",
+ "postrust-engine",
  "postrust-graphql",
  "postrust-response",
  "postrust-sql",

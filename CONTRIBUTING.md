@@ -171,6 +171,7 @@ crates/
 ├── postrust-sql/       # SQL builder
 ├── postrust-auth/      # Authentication
 ├── postrust-response/  # Response formatting
+├── postrust-engine/    # REST request pipeline
 ├── postrust-server/    # HTTP server
 ├── postrust-lambda/    # Lambda adapter
 └── postrust-worker/    # Workers adapter

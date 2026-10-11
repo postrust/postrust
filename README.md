@@ -475,6 +475,7 @@ Postrust crates at the same version work together. Browse them at
 | Crate | Description | Links |
 |-------|-------------|-------|
 | `postrust-server` | Standalone HTTP server (Axum), ships the `postrust` binary | [crates.io](https://crates.io/crates/postrust-server) · [docs](https://docs.rs/postrust-server) |
+| `postrust-engine` | The REST request pipeline, from HTTP request to response, with no web framework | [crates.io](https://crates.io/crates/postrust-engine) · [docs](https://docs.rs/postrust-engine) |
 | `postrust-core` | Request parsing, schema cache, query planning | [crates.io](https://crates.io/crates/postrust-core) · [docs](https://docs.rs/postrust-core) |
 | `postrust-sql` | Type-safe SQL builder with parameterized queries | [crates.io](https://crates.io/crates/postrust-sql) · [docs](https://docs.rs/postrust-sql) |
 | `postrust-auth` | JWT authentication and role extraction | [crates.io](https://crates.io/crates/postrust-auth) · [docs](https://docs.rs/postrust-auth) |
@@ -484,7 +485,7 @@ Postrust crates at the same version work together. Browse them at
 | `postrust-worker` | Cloudflare Workers adapter — **stub; `0.x`, no stability promise** | [crates.io](https://crates.io/crates/postrust-worker) · [docs](https://docs.rs/postrust-worker) |
 | `postrust-proxy` | Reverse proxy with load balancing and automatic TLS — **`0.x`, no stability promise** | [guide](docs/proxy.md) · [crates.io](https://crates.io/crates/postrust-proxy) · [docs](https://docs.rs/postrust-proxy) |
 
-The first seven crates share one version and one semver promise. The last two
+The first eight crates share one version and one semver promise. The last two
 are each on their own `0.x` line and carry none:
 
 - `postrust-proxy` is useful and measured — h2spec, Autobahn, and the HTTP
@@ -552,6 +553,7 @@ postrust/
 │   │       ├── resolver/       # Query/mutation resolvers
 │   │       ├── input/          # Filter/order/mutation inputs
 │   │       └── handler.rs      # Axum handler
+│   ├── postrust-engine/    # REST request pipeline
 │   ├── postrust-server/    # HTTP server
 │   ├── postrust-lambda/    # Lambda adapter
 │   └── postrust-worker/    # Workers adapter

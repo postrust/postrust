@@ -10,7 +10,7 @@ honestly describe both.
 
 | Line | Crates | Promise |
 | --- | --- | --- |
-| **Stable** | `postrust-core`, `postrust-sql`, `postrust-auth`, `postrust-response`, `postrust-graphql`, `postrust-server`, `postrust-lambda` | Semver. A breaking change to the public Rust API needs a major bump. |
+| **Stable** | `postrust-core`, `postrust-sql`, `postrust-auth`, `postrust-response`, `postrust-engine`, `postrust-graphql`, `postrust-server`, `postrust-lambda` | Semver. A breaking change to the public Rust API needs a major bump. |
 | **Unstable** | `postrust-proxy`, `postrust-worker` | None. Each on its own `0.x`, where a minor bump may break anything. |
 
 Nothing in the stable line depends on either unstable crate, so no crate that
