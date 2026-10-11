@@ -113,6 +113,12 @@ jobs:
           done
           exit $status
 
+      # A Worker verifies tokens with jsonwebtoken 10 and RustCrypto, where the
+      # server uses jsonwebtoken 9 and ring. The test-only feature switches a
+      # native build to the Worker's path, so the auth tests cover both.
+      - name: Auth tests (jsonwebtoken 10, the Worker's backend)
+        run: cargo test --locked -p postrust-auth --features jwt-rust-crypto
+
   audit:
     name: dependency audit
     runs-on: ubuntu-latest

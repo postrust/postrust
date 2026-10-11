@@ -1876,14 +1876,12 @@ dependencies = [
  "js-sys",
  "p256",
  "p384",
- "pem 3.0.6",
  "rand 0.8.8",
  "rsa",
  "serde",
  "serde_json",
  "sha2",
  "signature",
- "simple_asn1",
  "zeroize",
 ]
 

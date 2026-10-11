@@ -24,11 +24,15 @@ ignore = [
     # workspace does not enable -- postrust is PostgreSQL only.
     #
     # On wasm32 it *is* compiled (`cargo tree -i rsa --target
-    # wasm32-unknown-unknown`): jsonwebtoken's RustCrypto backend, which the
-    # Cloudflare Worker build uses (issue #50), verifies RS256/PS256 with it.
-    # Verification uses only a public key. The advisory is about the timing of
-    # PKCS#1 v1.5 *decryption* with a private key, which postrust never holds
-    # or performs, so there is still no path to it.
+    # wasm32-unknown-unknown`), and so is it natively under postrust-auth's
+    # test-only `jwt-rust-crypto` feature: jsonwebtoken 10's `rust_crypto`
+    # feature, which the Cloudflare Worker build uses (issue #50), brings it in
+    # for the RSA algorithms whether or not they are used. They are not:
+    # postrust accepts HS256 tokens only (`Validation::new(Algorithm::HS256)`
+    # in postrust-auth's jwt.rs), so no rsa code is reachable. Even an RSA
+    # verification would use only a public key, and the advisory is about the
+    # timing of PKCS#1 v1.5 *decryption* with a private key, which postrust
+    # never holds or performs.
     #
     # There is also no fixed version to move to; the advisory lists no patched
     # release, because the fix requires an API change upstream has not made.

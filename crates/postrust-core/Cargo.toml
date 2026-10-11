@@ -61,10 +61,6 @@ chrono.workspace = true
 # Internal
 postrust-sql.workspace = true
 
-[target.'cfg(target_arch = "wasm32")'.dependencies]
-# chrono's clock comes from the JavaScript host on wasm32.
-chrono = { workspace = true, features = ["wasmbind"] }
-
 [dev-dependencies]
 pretty_assertions.workspace = true
 tokio = { workspace = true, features = ["full", "test-util"] }

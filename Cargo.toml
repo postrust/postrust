@@ -101,7 +101,12 @@ url = "2.5"
 percent-encoding = "2.3"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+# Default features kept: `wasmbind` is one, and gives chrono its clock on
+# wasm32 (a Cloudflare Worker, issue #50).
 chrono = { version = "0.4", features = ["serde"] }
+# `std::time`'s clocks panic on wasm32-unknown-unknown; this is `std::time`
+# everywhere else and the JavaScript clock there.
+web-time = "1.1"
 uuid = { version = "1.11", features = ["v4", "v5", "serde"] }
 
 # Testing

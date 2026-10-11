@@ -19,11 +19,11 @@ bytes.workspace = true
 chrono.workspace = true
 uuid.workspace = true
 
-# On wasm32, uuid's v4 needs a source of randomness and chrono a clock; both come
-# from the JavaScript host (a Cloudflare Worker). See issue #50.
+# On wasm32, uuid's v4 needs a source of randomness, which comes from the
+# JavaScript host (a Cloudflare Worker). See issue #50. chrono's clock comes
+# from there too, through its default `wasmbind` feature.
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 uuid = { workspace = true, features = ["js"] }
-chrono = { workspace = true, features = ["wasmbind"] }
 
 [dev-dependencies]
 pretty_assertions.workspace = true
