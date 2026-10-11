@@ -2686,7 +2686,7 @@ dependencies = [
 
 [[package]]
 name = "postrust-auth"
-version = "2.2.1"
+version = "2.3.0"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
@@ -2705,7 +2705,7 @@ dependencies = [
 
 [[package]]
 name = "postrust-core"
-version = "2.2.1"
+version = "2.3.0"
 dependencies = [
  "async-trait",
  "bigdecimal",
@@ -2732,7 +2732,7 @@ dependencies = [
 
 [[package]]
 name = "postrust-engine"
-version = "2.2.1"
+version = "2.3.0"
 dependencies = [
  "bytes",
  "http",
@@ -2748,7 +2748,7 @@ dependencies = [
 
 [[package]]
 name = "postrust-graphql"
-version = "2.2.1"
+version = "2.3.0"
 dependencies = [
  "async-graphql",
  "async-graphql-axum",
@@ -2774,7 +2774,7 @@ dependencies = [
 
 [[package]]
 name = "postrust-lambda"
-version = "2.2.1"
+version = "2.3.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -2849,7 +2849,7 @@ dependencies = [
 
 [[package]]
 name = "postrust-response"
-version = "2.2.1"
+version = "2.3.0"
 dependencies = [
  "bytes",
  "http",
@@ -2864,7 +2864,7 @@ dependencies = [
 
 [[package]]
 name = "postrust-server"
-version = "2.2.1"
+version = "2.3.0"
 dependencies = [
  "anyhow",
  "async-graphql",
@@ -2901,7 +2901,7 @@ dependencies = [
 
 [[package]]
 name = "postrust-sql"
-version = "2.2.1"
+version = "2.3.0"
 dependencies = [
  "bytes",
  "chrono",

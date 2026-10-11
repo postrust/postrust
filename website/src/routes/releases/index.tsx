@@ -9,9 +9,40 @@ import {
   hasuraAgreement,
 } from "~/data/hasura-conformance";
 
-const VERSION = "2.2.1";
+const VERSION = "2.3.0";
+
+const minorAdded = [
+  {
+    title: "The Cloudflare Workers adapter works",
+    body: "postrust-worker 0.7.0 serves the REST API in a Worker and reaches PostgreSQL through Hyperdrive. Every request runs in a transaction that switches to the token's role and sets its claims, as on the server; the schema cache lives in Workers KV and is refreshed by a Cron Trigger or an authenticated POST /_/reload. It scores 1422 of PostgREST's 1499 conformance cases in workerd. REST only.",
+  },
+  {
+    title: "postrust-engine, the request pipeline with no web framework",
+    body: "The REST pipeline came out of the server: handle(&state, request) takes an http::Request and returns an http::Response. The server is an axum wrapper around it, and the Worker runs the same code. Server throughput is unchanged, measured on pinned cores, and the binary is 1% larger.",
+  },
+  {
+    title: "A driver-neutral database interface, and statement pipelining",
+    body: "postrust_core::db's Db and Tx traits are implemented by sqlx's pool and by PgSocketDb, which speaks the wire protocol through tokio-postgres over any socket. A differential test suite holds the two to identical answers. Over the socket driver a plain read is one flight to the database after connecting, where it was five, and a write two: from Singapore to a database in Delhi, through Hyperdrive, a read went from 380 to 240 ms.",
+  },
+];
 
 const patch = [
+  {
+    title: "A write the response refuses is rolled back",
+    body: "Refusals that can only be made after the statement has run — more rows than Prefer: max-affected allowed, several rows where one object was asked for, a PUT whose body names another row, a function setting an invalid response.status or response.headers — were made after the transaction had been committed, so the client was told the request failed while every row stayed changed. PostgREST rolls these back, and now so does Postrust, on either driver.",
+  },
+  {
+    title: "A schema reload no longer deadlocks a request in flight",
+    body: "A request held the schema cache's read lock from planning to the end of its query and took it again along the way. A reload (NOTIFY pgrst) queued in between waited on the request while the request waited on the reload, and every request after them queued behind both until the server was restarted. The lock is now released before the query runs.",
+  },
+  {
+    title: "A write refused at COMMIT is reported as what it is",
+    body: "A deferred constraint fails at COMMIT, and that was answered 500 Service temporarily unavailable, as if the pool had failed. It is now the database's error with its SQLSTATE: a deferred foreign key violation is a 409, as an immediate one is.",
+  },
+  {
+    title: "A header a pre-request function sets reaches a read",
+    body: "db-pre-request can set response headers and status on any request, and PostgREST honours them on a GET — a Cache-Control, say. They were read back only after a function call or a write.",
+  },
   {
     title: "__typename inside a relationship or an aggregate",
     body: "Asking for __typename anywhere below the root — on an object or array relationship, the rows a mutation returned, or inside an aggregate's functions such as max { __typename id } — failed the whole query with column \"__typename\" does not exist; only the root and aggregate nodes answered it. Apollo Client adds __typename to every selection set by default, and a Federation router asks for it on every entity reference it follows, so a query that crossed from one subgraph to another through a relationship failed. It is now answered by the schema, as it is at the root.",
@@ -62,35 +93,56 @@ export default component$(() => {
         <div class="container-wide py-12">
           <div class="mb-4 flex items-center gap-3">
             <span class="rounded border border-neutral-200 bg-neutral-100 px-2 py-0.5 text-xs font-semibold text-neutral-800">
-              PATCH
+              MINOR
             </span>
             <span class="text-sm text-neutral-500">
-              Two GraphQL fixes on 2.2.0
+              Cloudflare Workers, refused writes rolled back, two GraphQL fixes
             </span>
           </div>
           <h1 class="mb-4 text-4xl font-bold text-neutral-900">
             Postrust {VERSION}
           </h1>
           <p class="max-w-2xl text-lg text-neutral-600">
-            Found by running two Postrust subgraphs behind Apollo Router for{" "}
+            The{" "}
+            <Link href="/docs/workers/" class="text-primary-600 hover:underline">
+              Cloudflare Workers adapter
+            </Link>{" "}
+            serves the REST API over Hyperdrive, on the server&rsquo;s own
+            request pipeline. A write the response refuses is rolled back, as
+            PostgREST rolls it back. And two GraphQL fixes, found by running
+            two Postrust subgraphs behind Apollo Router for{" "}
             <Link
               href="/blog/postgresql-apollo-federation-subgraph/"
               class="text-primary-600 hover:underline"
             >
               a post on Federation
             </Link>
-            : <code class="text-base">__typename</code> inside a relationship
-            failed the query, and a GraphQL token that did not verify was
-            answered as the anonymous role. 2.2.0, below, is the release that
-            made AWS Lambda and a <code class="text-base">NOINHERIT</code>{" "}
-            authenticator work.
+            , first cut as 2.2.1 and released here instead. No breaking
+            change: <code class="text-base">cargo semver-checks</code> against
+            2.2.0 passes for every stable crate. 2.2.0, below, is the release
+            that made AWS Lambda and a{" "}
+            <code class="text-base">NOINHERIT</code> authenticator work.
           </p>
         </div>
       </div>
 
       <div class="container-wide py-12">
         <div class="max-w-3xl">
-          {/* The patch */}
+          {/* The minor release */}
+          <section class="mb-12">
+            <h2 class="mb-4 text-2xl font-bold text-neutral-900">
+              Added in {VERSION}
+            </h2>
+            <div class="space-y-4">
+              {minorAdded.map((c) => (
+                <div key={c.title} class="rounded-lg bg-neutral-50 p-4">
+                  <h3 class="mb-1 font-semibold text-neutral-900">{c.title}</h3>
+                  <p class="text-sm text-neutral-600">{c.body}</p>
+                </div>
+              ))}
+            </div>
+          </section>
+
           <section class="mb-12">
             <h2 class="mb-4 text-2xl font-bold text-neutral-900">
               Fixed in {VERSION}
@@ -108,13 +160,16 @@ export default component$(() => {
               client relied on an expired or invalid token being answered
               anonymously; it now gets an{" "}
               <code class="font-mono text-sm">invalid-jwt</code> error and
-              should drop the token or refresh it. The public Rust API gains{" "}
-              <code class="font-mono text-sm">postrust_graphql::hasura::invalid_jwt</code>{" "}
-              and loses nothing. Conformance is unchanged. The README, docs and
-              site also stop saying what nobody measured &mdash; &ldquo;serverless-first&rdquo;,
-              &ldquo;5&ndash;20 ms cold starts&rdquo;, a ~5 MB binary &mdash; and{" "}
-              <code class="font-mono text-sm">postrust-worker</code> 0.6.1 says on
-              crates.io that it is a placeholder.
+              should drop the token or refresh it. A{" "}
+              <code class="font-mono text-sm">db-pre-request</code> function
+              that sets response headers now has them applied to reads too, as
+              PostgREST does. The public Rust API gains a crate,{" "}
+              <code class="font-mono text-sm">postrust-engine</code>, and{" "}
+              <code class="font-mono text-sm">postrust_core::db</code>, and
+              loses nothing. Conformance is unchanged: PostgREST 1424/1499,
+              Hasura 454/468. The README, docs and site also stop saying what
+              nobody measured &mdash; &ldquo;serverless-first&rdquo;,
+              &ldquo;5&ndash;20 ms cold starts&rdquo;, a ~5 MB binary.
             </p>
           </section>
 
@@ -651,12 +706,12 @@ GRANT web_anon, web_user TO authenticator;`}</code>
 });
 
 export const head: DocumentHead = {
-  title: `Postrust ${VERSION} — GraphQL fixes on AWS Lambda and the authenticator PostgREST recommends`,
+  title: `Postrust ${VERSION} — the REST API on Cloudflare Workers, and refused writes rolled back`,
   links: [{ rel: "canonical", href: "https://postrust.org/releases/" }],
   meta: [
     {
       name: "description",
-      content: `Postrust ${VERSION}: __typename inside a GraphQL relationship works, and a GraphQL token that does not verify is refused. On 2.2.0, where the AWS Lambda adapter serves the server's own REST and GraphQL router, with row-level security enforced, and a NOINHERIT authenticator sees the schema.`,
+      content: `Postrust ${VERSION}: the REST API in a Cloudflare Worker over Hyperdrive, on the server's own request pipeline; a write the response refuses is rolled back; __typename inside a GraphQL relationship works, and a GraphQL token that does not verify is refused.`,
     },
   ],
 };

@@ -3,7 +3,7 @@
 name: postrust-federation-example
 
 x-postrust: &postrust
-  image: ${POSTRUST_IMAGE:-postrust/postrust:2.2.1}
+  image: ${POSTRUST_IMAGE:-postrust/postrust:2.3.0}
   healthcheck:
     test: ["CMD", "curl", "--fail", "--silent", "http://localhost:3000/_/health"]
     interval: 2s
