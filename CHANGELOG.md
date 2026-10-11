@@ -18,11 +18,18 @@ planned it in phases, and each phase was measured against the one before.
   - Every request runs in a transaction that switches to the token's role and
     sets its claims, as on the server.
   - The schema cache is kept in Workers KV and refreshed by a Cron Trigger or
-    an authenticated `POST /_/reload`.
-  - Rows are capped at 1000 unless `PGRST_DB_MAX_ROWS` says otherwise.
+    an authenticated `POST /_/reload`. The KV copy expires after
+    `PGRST_WORKER_SCHEMA_TTL` (at least 60 seconds), so a migration is seen
+    without either.
+  - Rows are capped at 1000 unless `PGRST_DB_MAX_ROWS` (or `PGRST_MAX_ROWS`)
+    says otherwise.
+  - Unquoted `wrangler.toml` variables, which wrangler passes as numbers and
+    booleans, are read as the server would read them.
   - REST only.
   - Tested in workerd by `scripts/serverless/worker.sh`, and against
     PostgREST's own suite. See `docs/workers.md`.
+- **`postrust_core::VERSION`**, the crate's version. The Worker keys the KV
+  copy of the schema cache by it, since the cache's shape is core's.
 - **`postrust-engine`**, a new crate on the stable line. It is the REST
   request pipeline with no web framework: `handle(&state, request)` takes an
   `http::Request` and returns an `http::Response<Bytes>`. The server is now an

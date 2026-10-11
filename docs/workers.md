@@ -120,28 +120,42 @@ Four settings are the Worker's own:
 
 | Setting | Default | What it does |
 |---|---|---|
-| `PGRST_DB_MAX_ROWS` | `1000` | As on the server, but with a ceiling by default: an isolate has 128 MB. `unlimited` lifts it. |
-| `PGRST_WORKER_SCHEMA_TTL` | `60` | How many seconds an isolate trusts its copy of the schema cache before checking KV for a newer one. |
+| `PGRST_DB_MAX_ROWS` | `1000` | As on the server (`PGRST_MAX_ROWS` too), but with a ceiling by default: an isolate has 128 MB. `unlimited` under either name lifts it. |
+| `PGRST_WORKER_SCHEMA_TTL` | `60` | How many seconds an isolate trusts its copy of the schema cache before checking KV for a newer one, and how long the KV copy lives (at least 60, KV's minimum). Anything but a non-negative number of seconds is a configuration error. |
 | `POSTRUST_RELOAD_SECRET` | unset | A secret. When set, `POST /_/reload` with `Authorization: Bearer <secret>` reloads the schema cache. When unset, the endpoint does not exist. |
 | `compat-key-order` (Cargo feature) | off | Object keys in select order, as PostgREST returns them; build with `worker-build --release --features compat-key-order`. |
+
+A variable may be given unquoted in `wrangler.toml`: wrangler passes
+`PGRST_DB_MAX_ROWS = 5000` as a number and `PGRST_JWT_SECRET_IS_BASE64 = true`
+as a boolean, and the Worker reads them as `5000` and `true`. A `PGRST_`
+variable set to a JSON object or array is ignored, with a warning in the log.
+
+When the configuration cannot be read, every request answers with the reason:
+`/_/health` with a 503, anything else with a 500.
 
 ## The schema cache
 
 The server reads the catalog once at start-up. A Worker has no start-up worth
 the name: isolates come and go. So the cache is kept in Workers KV, under a
-key that names the exposed schemas and the build that wrote it, and handled
-like this:
+key that names the exposed schemas and the versions of `postrust-worker` and
+`postrust-core` that wrote it, and handled like this:
 
 - **A request** uses its isolate's copy while it is younger than
   `PGRST_WORKER_SCHEMA_TTL`, then looks in KV for a newer one.
-- **A cold isolate** reads KV. Only when KV has nothing does it load from the
-  catalog, and then it writes what it loaded to KV for every other isolate.
+- **A cold isolate** reads KV. Only when KV has nothing, or has a record that
+  does not read back, does it load from the catalog, and then it writes what it
+  loaded to KV for every other isolate.
+- **The KV copy expires** after the TTL, or 60 seconds if the TTL is shorter
+  (KV's minimum). The next isolate to miss loads the catalog again, so a
+  migration is seen without anyone asking: within the expiration plus the TTL,
+  plus up to about 60 seconds that KV may serve a cached read at the edge.
 - **After a migration**, reload with `POST /_/reload` or wait for the cron
   trigger. Both load from the catalog and write KV, and isolates pick the new
-  cache up within the TTL.
+  cache up within the TTL, plus up to about 60 seconds of KV edge caching.
 
 Without a KV binding everything still works, but each new isolate loads the
-catalog itself.
+catalog itself, and each isolate loads it again every
+`PGRST_WORKER_SCHEMA_TTL` seconds.
 
 ## What it costs
 

@@ -354,7 +354,10 @@ export default component$(() => {
             <ul class="list-disc pl-5 text-neutral-600 space-y-3 mb-4">
               <li>
                 <code class={code}>PGRST_WORKER_SCHEMA_TTL</code> (default 60): how many seconds an
-                isolate trusts its copy of the schema cache before checking KV for a newer one.
+                isolate trusts its copy of the schema cache before checking KV for a newer one,
+                and how long the KV copy lives (at least 60 seconds, KV&rsquo;s minimum). Once it
+                expires, the next isolate to miss reloads the catalog, so a migration is seen
+                without a reload.
               </li>
               <li>
                 <code class={code}>POSTRUST_RELOAD_SECRET</code>, a secret: enables{" "}
@@ -363,7 +366,8 @@ export default component$(() => {
               </li>
               <li>
                 The <code class={code}>POSTRUST_SCHEMA_CACHE</code> KV binding: optional. Without it,
-                each new isolate reads the catalog itself, one query per table for its columns.
+                each new isolate reads the catalog itself, one query per table for its columns,
+                and again every TTL.
               </li>
             </ul>
             <p class={p}>
