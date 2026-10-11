@@ -131,7 +131,9 @@ async fn cut_at_the_first_statement(client: TcpStream, server: TcpStream) {
             from_client.read_exact(&mut body).await?;
             to_server.write_all(&length).await?;
             to_server.write_all(&body).await?;
-            let code = body.get(..4).map(|c| u32::from_be_bytes(c.try_into().unwrap()));
+            let code = body
+                .get(..4)
+                .map(|c| u32::from_be_bytes(c.try_into().unwrap()));
             if !matches!(code, Some(80877103) | Some(80877104)) {
                 break;
             }

@@ -1301,27 +1301,26 @@ async fn execute_plan<'s, S: State>(
             // between.
             let ends_with_the_query =
                 is_read_only(api_request) && !counts && two_query_parent.is_none();
-            let (mut json_rows, response_settings, mut tx) = if ends_with_the_query
-                && !reads_response_settings
-            {
-                let rows = tx.fetch_json_and_commit(&sql, &params).await.map_err(log)?;
-                (rows, None, None)
-            } else if ends_with_the_query {
-                let (rows, settings) = tx
-                    .fetch_json_then_and_commit(&sql, &params, RESPONSE_SETTINGS)
-                    .await
-                    .map_err(log)?;
-                (rows, Some(settings), None)
-            } else if reads_response_settings && two_query_parent.is_none() {
-                let (rows, settings) = tx
-                    .fetch_json_then(&sql, &params, RESPONSE_SETTINGS)
-                    .await
-                    .map_err(log)?;
-                (rows, Some(settings), Some(tx))
-            } else {
-                let rows = tx.fetch_json(&sql, &params).await.map_err(log)?;
-                (rows, None, Some(tx))
-            };
+            let (mut json_rows, response_settings, mut tx) =
+                if ends_with_the_query && !reads_response_settings {
+                    let rows = tx.fetch_json_and_commit(&sql, &params).await.map_err(log)?;
+                    (rows, None, None)
+                } else if ends_with_the_query {
+                    let (rows, settings) = tx
+                        .fetch_json_then_and_commit(&sql, &params, RESPONSE_SETTINGS)
+                        .await
+                        .map_err(log)?;
+                    (rows, Some(settings), None)
+                } else if reads_response_settings && two_query_parent.is_none() {
+                    let (rows, settings) = tx
+                        .fetch_json_then(&sql, &params, RESPONSE_SETTINGS)
+                        .await
+                        .map_err(log)?;
+                    (rows, Some(settings), Some(tx))
+                } else {
+                    let rows = tx.fetch_json(&sql, &params).await.map_err(log)?;
+                    (rows, None, Some(tx))
+                };
 
             if let (Some(parent_qi), Some(tx)) = (two_query_parent, tx.as_mut()) {
                 embed_relations(
@@ -3447,15 +3446,7 @@ fn embed_relations<'f, S: State, T: Tx>(
                     flat.extend(children);
                 }
 
-                embed_relations(
-                    state,
-                    &mut *conn,
-                    &child_qi,
-                    nested,
-                    &mut flat,
-                    max_rows,
-                )
-                .await?;
+                embed_relations(state, &mut *conn, &child_qi, nested, &mut flat, max_rows).await?;
 
                 let mut rest = flat.into_iter();
                 for (key, count) in order {
