@@ -73,8 +73,10 @@ pub trait Db: MaybeSend + MaybeSync {
     where
         Self: 'a;
 
-    /// Open a transaction. Nothing is sent before the caller's first
-    /// statement, so `SET TRANSACTION` may still follow.
+    /// Open a transaction. `BEGIN` is sent here, before this returns, so a
+    /// connection that cannot be had fails now rather than at the first
+    /// statement. Nothing else is: `SET TRANSACTION` may still follow, as the
+    /// caller's first statement.
     fn begin(&self) -> impl Future<Output = Result<Self::Tx<'_>, DbError>> + MaybeSend;
 }
 
