@@ -171,6 +171,15 @@ as production latency:
   `SET TRANSACTION READ ONLY`, the settings, the query, `COMMIT`. Each waits
   for the last, so on a real network each is a round trip to Hyperdrive.
   Sending them together is an obvious next step, and is not done yet.
+  It would cut a read to two flights (or one) and a write to two. The saving
+  depends only on the distance to the database. These are projections, not
+  measurements:
+
+  | Round trip to the database | Saved per read | Saved per write |
+  |---|---|---|
+  | ~1 ms | ~3-4 ms | ~4 ms |
+  | ~20 ms | ~60-80 ms | ~80 ms |
+  | ~60 ms | ~180-240 ms | ~240 ms |
 - **The bundle** is 2.7 MB of wasm, 0.93 MB gzipped, within the free plan's
   3 MB.
 

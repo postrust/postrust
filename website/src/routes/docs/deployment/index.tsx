@@ -130,16 +130,12 @@ npx wrangler deploy`}</code>
               </pre>
             </div>
             <p class="text-neutral-600 text-sm">
-              Configuration, the schema cache, measured costs and limits are in the{" "}
-              <a
-                href="https://github.com/postrust/postrust/blob/main/docs/workers.md"
-                target="_blank"
-                rel="noopener noreferrer"
-                class="text-primary-600 hover:text-primary-700 underline"
-              >
-                Workers guide
-              </a>
-              .
+              How it differs from the server &mdash; what it serves, where its answers differ,
+              conformance, measured costs and limits &mdash; is on the{" "}
+              <Link href="/docs/workers/" class="text-primary-600 hover:text-primary-700 underline">
+                Cloudflare Workers
+              </Link>{" "}
+              page.
             </p>
           </section>
 
