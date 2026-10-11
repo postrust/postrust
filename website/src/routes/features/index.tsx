@@ -167,7 +167,7 @@ const featureCategories = [
   },
   {
     title: "Deployment",
-    description: "A server, a container, Kubernetes or AWS Lambda",
+    description: "A server, a container, Kubernetes, AWS Lambda or Cloudflare Workers",
     features: [
       {
         name: "Docker",
@@ -179,7 +179,7 @@ const featureCategories = [
       },
       {
         name: "Cloudflare Workers",
-        description: "Planned: a stub today, pending a Hyperdrive driver",
+        description: "The REST API in a Worker, over Hyperdrive, with the schema cache in KV",
       },
       {
         name: "Kubernetes",

@@ -1,41 +1,56 @@
 [package]
 name = "postrust-worker"
-# Deliberately NOT `version.workspace = true`. This adapter is a stub, and the
-# rest of the workspace is heading for 1.0.0. See docs/stability.md.
-version = "0.6.1"
+# Deliberately NOT `version.workspace = true`. This adapter is new, and runs in
+# a runtime the rest of the workspace does not; it makes no stability promise
+# yet. See docs/stability.md.
+version = "0.7.0"
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 authors.workspace = true
-description = "Placeholder for a Cloudflare Workers adapter for Postrust; not functional yet (see issue #50)"
+description = "Cloudflare Workers adapter for Postrust: the PostgREST-dialect REST API in a Worker, over Hyperdrive"
 homepage.workspace = true
 readme = "README.md"
-keywords = ["cloudflare", "workers", "edge", "postgres", "wasm"]
+keywords = ["cloudflare", "workers", "hyperdrive", "postgres", "rest"]
 
 [lib]
 crate-type = ["cdylib"]
 
-[dependencies]
-# Cloudflare Workers
-worker = "0.4"
+# The crate is empty for any other target.
+[package.metadata.docs.rs]
+targets = ["wasm32-unknown-unknown"]
 
-# Async
-async-trait.workspace = true
+# Smallest rather than fastest: the bundle is what a cold start downloads, and
+# the free plan allows 3 MB compressed.
+[package.metadata.wasm-pack.profile.release]
+wasm-opt = ["-Oz"]
+
+[features]
+# Object keys in select order, as PostgREST returns them; the server's feature
+# of the same name, and off for the same reason (see postrust-server).
+compat-key-order = ["serde_json/preserve_order", "postrust-core/compat-key-order"]
+
+# Everything is wasm32-only. A Worker's sockets, bindings and futures are
+# JavaScript objects, none of them `Send`, so the generic pipeline cannot be
+# instantiated over them natively -- and natively there is nothing to run them
+# on. Built for any other target this crate is empty, which keeps
+# `cargo build --workspace` working.
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+# `=`: 0.8.7 declares rust-version 1.91, above the workspace's 1.88.
+worker = { version = "=0.8.6", features = ["http", "tokio-postgres"] }
+wasm-bindgen-futures = "0.4"
 futures.workspace = true
+console_error_panic_hook = "0.1"
+js-sys = "0.3"
 
-# Serialization
 serde.workspace = true
 serde_json.workspace = true
+bytes.workspace = true
+http.workspace = true
+http-body = "1"
+http-body-util.workspace = true
 
-# Error handling
-thiserror.workspace = true
-
-# Internal
-postrust-core.workspace = true
-postrust-sql.workspace = true
+postrust-core = { workspace = true, features = ["pg-socket"] }
+postrust-engine.workspace = true
 postrust-auth.workspace = true
-postrust-response.workspace = true
-
-[dev-dependencies]
-pretty_assertions.workspace = true

@@ -1,0 +1,29 @@
+# Copy to wrangler.toml and fill in the two IDs. See docs/workers.md.
+name = "postrust"
+main = "build/worker/shim.mjs"
+compatibility_date = "2025-09-01"
+
+[build]
+command = "cargo install -q worker-build --version 0.8.6 --locked && worker-build --release"
+
+# `npx wrangler hyperdrive create postrust --connection-string=...`, connecting
+# as a NOINHERIT authenticator that holds no privileges of its own.
+[[hyperdrive]]
+binding = "HYPERDRIVE"
+id = "<hyperdrive id>"
+
+# `npx wrangler kv namespace create POSTRUST_SCHEMA_CACHE`. Optional, but
+# without it every new isolate reads the catalog itself.
+[[kv_namespaces]]
+binding = "POSTRUST_SCHEMA_CACHE"
+id = "<namespace id>"
+
+# Reload the schema cache, so a migration shows up without a redeploy.
+[triggers]
+crons = ["*/15 * * * *"]
+
+# The server's own variables. Secrets -- PGRST_JWT_SECRET and, to enable
+# POST /_/reload, POSTRUST_RELOAD_SECRET -- go in with `wrangler secret put`.
+[vars]
+PGRST_DB_SCHEMAS = "public"
+PGRST_DB_ANON_ROLE = "web_anon"

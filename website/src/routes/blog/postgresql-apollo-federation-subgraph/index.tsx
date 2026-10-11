@@ -455,16 +455,8 @@ docker compose up --wait catalog reviews && docker compose up -d router
       <Link href="/docs/deployment/" class={a}>
         AWS Lambda adapter
       </Link>{" "}
-      since 2.2.0. The Cloudflare Workers adapter is not working yet;{" "}
-      <a
-        href="https://github.com/postrust/postrust/issues/50"
-        target="_blank"
-        rel="noopener noreferrer"
-        class={a}
-      >
-        the plan is open for contributions
-      </a>
-      .
+      since 2.2.0. The Cloudflare Workers adapter serves the REST API only,
+      so it cannot be a subgraph.
     </p>
 
     <h2 class={h2}>What it does not do</h2>

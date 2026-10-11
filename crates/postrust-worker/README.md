@@ -1,17 +1,26 @@
 # postrust-worker
 
-A placeholder for a Cloudflare Workers adapter for Postrust. **It does not work
-yet:** its fetch handler answers `{"status": "stub"}`, it reaches no database,
-and it does not currently build for `wasm32-unknown-unknown`.
+Postrust's REST API in a Cloudflare Worker, reaching PostgreSQL through
+[Hyperdrive](https://developers.cloudflare.com/hyperdrive/).
 
-Making it real means separating Postrust's engine from its database driver and
-adding a driver that reaches PostgreSQL through Hyperdrive over a Workers
-socket. The plan, the requirements and how to help are in
-[issue #50](https://github.com/postrust/postrust/issues/50).
+- The request pipeline is [`postrust-engine`](https://crates.io/crates/postrust-engine),
+  the same one the server runs. The database driver speaks the PostgreSQL wire
+  protocol over a Workers socket and is tested to answer exactly as the
+  server's does.
+- Every request runs in a transaction that takes on the token's role and
+  claims, so row-level security applies as it does on the server.
+- The schema cache is kept in Workers KV. It is refreshed by a Cron Trigger
+  or by an authenticated `POST /_/reload`.
+- REST only, served at the root as PostgREST serves it. There is no GraphQL
+  and no `LISTEN`/`NOTIFY`.
 
-To run Postrust serverless today, use
-[`postrust-lambda`](https://crates.io/crates/postrust-lambda), which serves the
-same REST and GraphQL APIs as the server on AWS Lambda.
+Setup, configuration, measured costs and limits:
+[docs/workers.md](https://github.com/postrust/postrust/blob/main/docs/workers.md).
+The crate is built with `worker-build` for `wasm32-unknown-unknown`; for any
+other target it is empty.
+
+This crate is on its own `0.x` line and makes no stability promise yet. See
+[docs/stability.md](https://github.com/postrust/postrust/blob/main/docs/stability.md).
 
 ## Part of Postrust
 
@@ -27,6 +36,7 @@ published as a set of crates so you can depend on only the part you need:
 | [`postrust-response`](https://crates.io/crates/postrust-response) | Response formatting | [docs.rs](https://docs.rs/postrust-response) |
 | [`postrust-graphql`](https://crates.io/crates/postrust-graphql) | GraphQL | [docs.rs](https://docs.rs/postrust-graphql) |
 | [`postrust-lambda`](https://crates.io/crates/postrust-lambda) | AWS Lambda | [docs.rs](https://docs.rs/postrust-lambda) |
+| [`postrust-engine`](https://crates.io/crates/postrust-engine) | REST request pipeline | [docs.rs](https://docs.rs/postrust-engine) |
 | **`postrust-worker`** (this crate) | Cloudflare Workers | [docs.rs](https://docs.rs/postrust-worker) |
 | [`postrust-proxy`](https://crates.io/crates/postrust-proxy) | Reverse proxy | [docs.rs](https://docs.rs/postrust-proxy) |
 

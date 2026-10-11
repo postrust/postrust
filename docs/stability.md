@@ -31,14 +31,13 @@ newest `0.x`. Only an explicit request reaches code that predates the split.
 
 ## Why the worker is held back
 
-`postrust-worker` is a stub, and says so in its own response body: the fetch
-handler answers `{"status": "stub"}` and nothing else. It does not parse
-requests, reach a database, or return data. Finishing it needs Cloudflare
-pieces that are not written yet -- Hyperdrive for database connections, KV or
-Durable Objects for the schema cache.
-
-A 1.0.0 on that would be a promise to keep an interface that does not do
-anything yet.
+`postrust-worker` works: it serves the REST API in a Worker, over Hyperdrive,
+and is tested in workerd and against PostgREST's suite (see
+[workers.md](workers.md)). What is not settled is its surface, which is not
+Rust at all but configuration and behaviour: the KV key and record a schema
+cache is kept under, the `/_/reload` endpoint, the row ceiling it applies by
+default, and the `worker` crate it builds against, which is itself `0.x`.
+Those should meet a few deployments before they are promised.
 
 ## Why the proxy is held back
 

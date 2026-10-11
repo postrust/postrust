@@ -1,9 +1,14 @@
 name: Serverless
 
-# The Lambda adapter, built with cargo-lambda and run in AWS's provided:al2023
-# image against PostgreSQL with row-level security. It used to carry a request
-# path of its own that bound no parameters and switched to no role, and
-# nothing ran it; this is what runs it.
+# The serverless adapters, each in the runtime it runs in, against PostgreSQL
+# with row-level security:
+#
+# * Lambda, built with cargo-lambda and run in AWS's provided:al2023 image. It
+#   used to carry a request path of its own that bound no parameters and
+#   switched to no role, and nothing ran it; this is what runs it.
+# * The Cloudflare Worker, built with worker-build and served by
+#   `wrangler dev` -- workerd, the Workers runtime -- reaching the database
+#   through a Hyperdrive binding.
 
 on:
   pull_request:
@@ -19,11 +24,13 @@ on:
       - "crates/postrust-response/**"
       - "crates/postrust-server/**"
       - "crates/postrust-sql/**"
+      - "crates/postrust-worker/**"
       - "scripts/serverless/**"
   push:
     branches: [main]
     paths:
       - "crates/postrust-lambda/**"
+      - "crates/postrust-worker/**"
       - "scripts/serverless/**"
   workflow_dispatch:
 
@@ -44,3 +51,13 @@ jobs:
 
       - name: Build and test
         run: scripts/serverless/lambda.sh
+
+  worker:
+    name: Cloudflare Worker in workerd
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build and test
+        run: scripts/serverless/worker.sh

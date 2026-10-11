@@ -3,6 +3,105 @@
 Notable changes, newest first. This file starts at 1.0.0-alpha.1; earlier
 releases are described by their tags and the pull requests behind them.
 
+## Unreleased
+
+The Cloudflare Workers adapter works. `postrust-worker` 0.7.0 serves the REST
+API in a Worker and reaches PostgreSQL through Hyperdrive. It was a stub that
+answered `{"status": "stub"}`. Getting there took the request pipeline out of
+the server and off sqlx, without changing what the server does. Issue #50
+planned it in phases, and each phase was measured against the one before.
+
+### Added
+
+- **`postrust-worker` 0.7.0.** The server's REST pipeline in a Worker, over
+  Hyperdrive.
+  - Every request runs in a transaction that switches to the token's role and
+    sets its claims, as on the server.
+  - The schema cache is kept in Workers KV and refreshed by a Cron Trigger or
+    an authenticated `POST /_/reload`.
+  - Rows are capped at 1000 unless `PGRST_DB_MAX_ROWS` says otherwise.
+  - REST only.
+  - Tested in workerd by `scripts/serverless/worker.sh`, and against
+    PostgREST's own suite. See `docs/workers.md`.
+- **`postrust-engine`**, a new crate on the stable line. It is the REST
+  request pipeline with no web framework: `handle(&state, request)` takes an
+  `http::Request` and returns an `http::Response<Bytes>`. The server is now an
+  axum wrapper around it.
+- **`postrust_core::db`**: the database as the pipeline and the schema-cache
+  loader use it.
+  - The `Db` and `Tx` traits, with drivers that decode rows straight to JSON
+    and are used generically.
+  - sqlx's `PgPool` implements them.
+  - `PgSocketDb` (feature `pg-socket`) speaks the wire protocol through
+    tokio-postgres over any socket.
+  - `crates/postrust-server/tests/drivers_agree.rs` holds the two drivers to
+    identical answers: every column type, parameter typing, and errors down to
+    the SQLSTATE and constraint.
+- `SchemaCache::load_from` and `load_with_search_path_from` load the cache
+  through any `Db`. The sqlx-typed `load` and `load_with_search_path` are
+  unchanged.
+- `AppConfig::try_from_vars`, to build the configuration from name/value
+  pairs rather than the process environment.
+- `SchemaCache` implements `Serialize` and `Deserialize`.
+- `scripts/conformance/conformance.sh` takes `CONFORMANCE_EXTRA_FEATURES`
+  (for example `pg-socket`, which routes REST through the socket driver) and
+  `CONFORMANCE_WORKER_BUILD`, which makes the Worker in workerd the candidate.
+
+### Changed
+
+- **`postrust-core`, `-sql`, `-auth`, `-response` and `-engine` build for
+  `wasm32-unknown-unknown`.** CI checks it, and checks that nothing native
+  (ring, aws-lc, mio, sqlx) reaches that build.
+  - sqlx is an optional, default-on feature of `postrust-core`.
+  - The workspace's tokio asks for `sync` and `macros` only.
+  - jsonwebtoken is now 10: aws-lc-rs natively, RustCrypto on wasm32.
+- **The schema cache is loaded through the same database interface as
+  requests,** on one transaction. Each catalog query returns its row as JSON,
+  so a driver only has to decode `json` to load one. A dump of the loaded
+  cache was compared with the old loader's on PostgREST's fixtures and ours,
+  and it is identical.
+- `.gitignore` no longer ignores every directory named `db` or `plan`, only
+  the ones at the root. The bare patterns had been silently leaving new
+  source files out of commits.
+
+### Measured
+
+Each phase was checked against 2.2.1 on the same host. Conformance was
+replayed in full for every phase and for the final tree.
+
+- **Conformance unchanged:** PostgREST 1424/1499 and Hasura 454/468, case for
+  case.
+- **Database tests:** all pass, including the driver differential suite (7
+  tests) and the schema-cache round trip.
+- **Deployment checks:** Lambda 15/15, e2e 50/50.
+- **semver:** `cargo semver-checks` against 2.2.0 reports no update required
+  for every existing stable crate.
+- **Throughput unchanged.** Six alternating rounds per tree, with database,
+  server and load generator on their own cores. Each final-tree range overlaps
+  2.2.1's, and the differences go both ways:
+
+  | Scenario | 2.2.1 | final | change |
+  |---|---|---|---|
+  | point lookup | 3209 req/s | 3345 req/s | +4.3% |
+  | 25-row page | 2967 | 2974 | +0.2% |
+  | filtered + ordered page | 2793 | 2867 | +2.6% |
+  | page with exact count | 283 | 285 | +0.7% |
+  | range filter on numeric | 2761 | 2687 | -2.7% |
+
+- **Binary size:** 9,971,968 bytes to 10,067,688 (+1.0%). jsonwebtoken 10
+  natively would have cost 2.6 MB (aws-lc-rs) or 0.7 MB (RustCrypto), so
+  native builds stay on 9.
+- **The Worker:**
+  - PostgREST's suite in workerd scores 1422/1499. The difference from the
+    server is two explained cases: named prepared statements, and a gzip'd
+    empty preflight body.
+  - `worker.sh` passes 28/28.
+  - The bundle is 0.93 MB gzipped.
+  - Locally each request costs about 11 ms, or about 54 ms when PostgreSQL
+    asks for SCRAM: 4,096 PBKDF2 rounds in wasm per connection. See
+    `docs/workers.md` for what that does and does not say about production.
+
+
 ## 2.2.1
 
 Two GraphQL fixes, found by running two Postrust subgraphs behind Apollo

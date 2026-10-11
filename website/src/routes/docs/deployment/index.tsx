@@ -16,7 +16,7 @@ export default component$(() => {
           </div>
           <h1 class="text-4xl font-bold text-neutral-900 mb-4">Deployment</h1>
           <p class="text-lg text-neutral-600 max-w-2xl">
-            Deploy Postrust to Docker, AWS Lambda, Kubernetes, and more.
+            Deploy Postrust to Docker, AWS Lambda, Cloudflare Workers, Kubernetes, and more.
           </p>
         </div>
       </div>
@@ -105,6 +105,41 @@ sam build && sam deploy --guided`}</code>
                 deployment guide
               </a>{" "}
               for SAM templates and Serverless Framework examples.
+            </p>
+          </section>
+
+          {/* Cloudflare Workers */}
+          <section class="mb-12">
+            <h2 class="text-2xl font-bold text-neutral-900 mb-4">Cloudflare Workers</h2>
+            <p class="text-neutral-600 mb-4">
+              The REST API runs in a Worker, reaching PostgreSQL through Hyperdrive. It is the
+              server&rsquo;s own request pipeline over a socket driver that is tested to answer as
+              the server&rsquo;s does, and every request takes on the token&rsquo;s role and claims,
+              so row-level security applies unchanged. The schema cache is kept in Workers KV. There
+              is no GraphQL on Workers; use the server or Lambda for that.
+            </p>
+            <div class="bg-neutral-900 rounded-xl overflow-hidden mb-4">
+              <pre class="p-4 text-sm overflow-x-auto">
+                <code class="text-neutral-100">{`npx wrangler hyperdrive create postrust --connection-string="postgres://authenticator:...@db:5432/app"
+npx wrangler kv namespace create POSTRUST_SCHEMA_CACHE
+
+# In a checkout: copy wrangler.example.toml to wrangler.toml, fill in the IDs
+cd crates/postrust-worker
+npx wrangler secret put PGRST_JWT_SECRET
+npx wrangler deploy`}</code>
+              </pre>
+            </div>
+            <p class="text-neutral-600 text-sm">
+              Configuration, the schema cache, measured costs and limits are in the{" "}
+              <a
+                href="https://github.com/postrust/postrust/blob/main/docs/workers.md"
+                target="_blank"
+                rel="noopener noreferrer"
+                class="text-primary-600 hover:text-primary-700 underline"
+              >
+                Workers guide
+              </a>
+              .
             </p>
           </section>
 
@@ -204,7 +239,7 @@ export const head: DocumentHead = {
   meta: [
     {
       name: "description",
-      content: "Deploy Postrust to Docker, AWS Lambda, Kubernetes, Fly.io, Railway, and more.",
+      content: "Deploy Postrust to Docker, AWS Lambda, Cloudflare Workers, Kubernetes, Fly.io, Railway, and more.",
     },
   ],
 };

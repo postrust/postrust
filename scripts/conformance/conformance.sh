@@ -49,7 +49,7 @@ say() { printf '\n==> %s\n' "$*"; }
 
 cleanup() {
     pkill -f 'target/release/postrust' 2>/dev/null || true
-    docker rm -f "$REF" "$DB" >/dev/null 2>&1 || true
+    docker rm -f "$REF" "$DB" pgrst-conf-worker >/dev/null 2>&1 || true
     docker network rm "$NET" >/dev/null 2>&1 || true
 }
 trap cleanup EXIT
@@ -199,6 +199,45 @@ full_load
 write_reset_assets
 pkill -f 'target/release/postrust' 2>/dev/null || true
 sleep 2
+if [ -n "${CONFORMANCE_WORKER_BUILD:-}" ]; then
+    # The Cloudflare Worker as the candidate: a worker-build output, served by
+    # `wrangler dev` (workerd), reaching the fixture database through a
+    # Hyperdrive binding. Same configuration as the server below.
+    WK=pgrst-conf-worker
+    docker rm -f "$WK" >/dev/null 2>&1 || true
+    rm -rf "$WORK/worker" && mkdir -p "$WORK/worker" && cp -r "$CONFORMANCE_WORKER_BUILD" "$WORK/worker/build"
+    python3 - "$WORK/worker" "$DB" "$SCHEMA" "$ANON_ROLE" "$EXTRA_SEARCH_PATH" "$JWT_SECRET" <<'TOML'
+import json, sys
+out, db, schema, anon, extra, secret = sys.argv[1:]
+s = lambda v: json.dumps(v)  # a JSON string is a valid TOML basic string
+open(out + "/wrangler.toml", "w").write(f"""name = "postrust-conformance"
+main = "build/worker/shim.mjs"
+compatibility_date = "2025-09-01"
+
+[[hyperdrive]]
+binding = "HYPERDRIVE"
+id = "00000000000000000000000000000000"
+localConnectionString = {s(f"postgres://postgres:postgres@{db}:5432/pgrst_conf?sslmode=disable")}
+
+[vars]
+PGRST_DB_SCHEMAS = {s(schema)}
+PGRST_DB_ANON_ROLE = {s(anon)}
+PGRST_DB_EXTRA_SEARCH_PATH = {s(extra)}
+PGRST_DB_MAX_ROWS = "unlimited"
+PGRST_COMPAT_MODE = "true"
+PGRST_WORKER_SCHEMA_TTL = "86400"
+""")
+open(out + "/.dev.vars", "w").write(f"PGRST_JWT_SECRET={secret}\n")
+TOML
+    docker run -d --name "$WK" --network "$NET" -p "$CAND_PORT:8787" \
+        -v "$WORK/worker":/app -w /app -v pgrst-conf-npm:/root/.npm \
+        node:22 npx --yes wrangler@4.40.0 dev --ip 0.0.0.0 --port 8787 \
+            --show-interactive-dev-session=false >/dev/null
+    for _ in $(seq 180); do curl -s -o /dev/null "http://localhost:$CAND_PORT/" && break; sleep 1; done
+    # The first request loads the schema cache; take it out of the timing.
+    curl -s -o /dev/null "http://localhost:$CAND_PORT/"
+    FEATURES="worker:$(basename "$(dirname "$CONFORMANCE_WORKER_BUILD")")"
+else
 DATABASE_URL="postgres://postgres:postgres@localhost:$DB_PORT/pgrst_conf" \
 PGRST_DB_SCHEMAS="$SCHEMA" PGRST_DB_ANON_ROLE="$ANON_ROLE" PGRST_JWT_SECRET="$JWT_SECRET" \
 PGRST_DB_EXTRA_SEARCH_PATH="$EXTRA_SEARCH_PATH" \
@@ -207,6 +246,7 @@ PGRST_COMPAT_MODE=true PGRST_LOG_LEVEL=warn \
     "$REPO_ROOT/target/release/postrust" >"$WORK/postrust.log" 2>&1 &
 sleep 9
 assert_key_order
+fi
 python3 "$HERE/run.py" "$WORK/cases.json" "http://localhost:$CAND_PORT" \
     "$WORK/cand.json" "$RESET_CMD >/dev/null 2>&1"
 

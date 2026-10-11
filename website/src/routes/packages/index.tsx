@@ -72,6 +72,18 @@ const packages: Pkg[] = [
     install: "cargo add postrust-response",
   },
   {
+    name: "postrust-engine",
+    role: "REST request pipeline",
+    description:
+      "The REST request pipeline of Postrust, from HTTP request to response, independent of any web framework and of the database driver.",
+    highlights: [
+      "Authentication, parsing, planning and execution in one call",
+      "Each request in a transaction carrying the token's role and claims",
+      "Runs on the server over sqlx and in a Cloudflare Worker over a socket",
+    ],
+    install: "cargo add postrust-engine",
+  },
+  {
     name: "postrust-graphql",
     role: "GraphQL",
     description:
@@ -99,12 +111,13 @@ const packages: Pkg[] = [
     name: "postrust-worker",
     role: "Cloudflare Workers",
     description:
-      "A stub for a Cloudflare Workers adapter. It answers that it is a stub and reaches no database.",
+      "Cloudflare Workers adapter: the REST API in a Worker, reaching PostgreSQL through Hyperdrive.",
     highlights: [
-      "Not functional yet: needs the engine split from its database driver",
-      "Planned: a Hyperdrive connection over a Workers socket",
+      "The server's own request pipeline, over a socket driver tested to answer as the server's does",
+      "The token's role and claims on every request, so row-level security applies unchanged",
+      "Schema cache in Workers KV, refreshed by a Cron Trigger or POST /_/reload",
     ],
-    install: "cargo add postrust-worker",
+    install: "git clone https://github.com/postrust/postrust && cd postrust/crates/postrust-worker",
   },
   {
     name: "postrust-proxy",
@@ -129,7 +142,7 @@ export default component$(() => {
           <p class="text-lg text-neutral-600 max-w-2xl">
             Postrust is published to crates.io as a set of crates, so you can run the
             whole server or depend on only the piece you need. All of them are released
-            together; the seven stable crates share a version.
+            together; the eight stable crates share a version.
           </p>
           <div class="mt-6 flex flex-wrap gap-3">
             <a
@@ -281,7 +294,7 @@ export default component$(() => {
         <div class="max-w-4xl mt-12 p-6 bg-neutral-50 rounded-xl border border-neutral-200">
           <h2 class="text-lg font-bold text-neutral-900 mb-2">Versioning</h2>
           <p class="text-neutral-600 text-sm">
-            The seven stable crates share the workspace version, currently 2.0.0, and carry a
+            The eight stable crates share the workspace version and carry a
             semver promise: a breaking change to the public Rust API needs a major bump. Any two
             of them at the same version are known to work together, so pin them to the same
             version in your{" "}
@@ -289,7 +302,7 @@ export default component$(() => {
             <code class="px-1 py-0.5 bg-white border border-neutral-200 rounded">postrust-proxy</code>{" "}
             and{" "}
             <code class="px-1 py-0.5 bg-white border border-neutral-200 rounded">postrust-worker</code>{" "}
-            are on their own 0.x line, currently 0.6.0, with no stability promise. Both lines are
+            are each on their own 0.x line, with no stability promise. Both lines are
             published together from the same{" "}
             <code class="px-1 py-0.5 bg-white border border-neutral-200 rounded">v*</code> tags.
           </p>

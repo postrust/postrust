@@ -47,6 +47,36 @@ Takes about ten minutes per server, most of it restoring fixture data between
 mutating cases. See [`scripts/conformance/README.md`](../scripts/conformance/README.md)
 for the mechanics.
 
+## Through other drivers and hosts
+
+The same suite, with the same reference responses, against the REST pipeline
+on its other driver and in its other host (issue #50):
+
+| Candidate | Full contract | Status and body | What differs from the server |
+|---|---|---|---|
+| The server (sqlx) | 1424/1499 | 1451 | — |
+| The server, REST through the socket driver (`CONFORMANCE_EXTRA_FEATURES=pg-socket`) | 1423/1499 | 1450 | One case, below |
+| The Cloudflare Worker in workerd (`CONFORMANCE_WORKER_BUILD=...`) | 1422/1499 | 1449 | Two cases, below |
+
+The socket driver answers the suite as sqlx does, except in
+`PreparedStatementsSpec`. That case asks `pg_prepared_statements` whether the
+session holds named statements. sqlx caches them, so the answer is yes. The
+socket driver sends every statement unnamed, in one round trip, because its
+connection never outlives the request that opened it.
+
+The Worker runs on the socket driver, so it differs in that case too, and in
+one more: the `CorsSpec` preflight that sends `Accept-Encoding: gzip`. workerd
+compresses the empty response body. The bytes are a valid gzip stream of
+nothing, so a client that decodes it sees the empty body the server sends;
+the harness compares raw bytes.
+
+The Worker's first run scored 1405. It found a real bug: a request whose body
+the pipeline never read, such as a write refused for its token, left the
+request stream to throw after the response. That restarted the isolate and
+failed the next request. The Worker now reads the body itself before the
+pipeline sees it. `scripts/serverless/worker.sh` checks that sequence, and
+also checks the Worker's log for uncaught exceptions.
+
 ## What "conformance" counts
 
 Agreement is reported at four strictness levels, because one systemic gap — a
