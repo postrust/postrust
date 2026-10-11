@@ -8,8 +8,8 @@ const features = [
   },
   {
     icon: "cloud",
-    title: "Runs on Lambda",
-    description: "The Lambda adapter serves the router the standalone server serves — REST, GraphQL, JWT and row-level security — and is tested in AWS's own runtime image. Cloudflare Workers is a stub pending Hyperdrive.",
+    title: "Runs on Lambda and Workers",
+    description: "The Lambda adapter serves the router the standalone server serves — REST, GraphQL, JWT and row-level security — tested in AWS's own runtime image. The Cloudflare Workers adapter runs the same REST pipeline over Hyperdrive, tested in workerd.",
   },
   {
     icon: "graphql",

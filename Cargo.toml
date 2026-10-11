@@ -169,3 +169,9 @@ lto = true
 codegen-units = 1
 panic = "abort"
 strip = true
+
+# wasm-bindgen reads tables and sections out of the module that stripping
+# removes, and fails with "externref table required for catch wrappers".
+# worker-build shrinks the module itself with wasm-opt.
+[profile.release.package.postrust-worker]
+strip = false

@@ -94,6 +94,13 @@ impl<C: Connector> PgSocketDb<C> {
     pub fn new(connector: C, config: tokio_postgres::Config) -> Self {
         Self { connector, config }
     }
+
+    /// The connector, for a host that has to know when the connections it
+    /// spawned have closed -- a Worker must not leave one running past the
+    /// request that opened it.
+    pub fn connector(&self) -> &C {
+        &self.connector
+    }
 }
 
 /// A transaction on its own connection.
