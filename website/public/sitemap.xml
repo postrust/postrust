@@ -141,6 +141,11 @@
     <priority>0.6</priority>
   </url>
   <url>
+    <loc>https://postrust.org/docs/workers/</loc>
+    <lastmod>2026-10-11</lastmod>
+    <priority>0.6</priority>
+  </url>
+  <url>
     <loc>https://postrust.org/docs/saas-domains/</loc>
     <lastmod>2026-10-10</lastmod>
     <priority>0.6</priority>

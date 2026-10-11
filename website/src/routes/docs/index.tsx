@@ -64,6 +64,12 @@ const docSections = [
     icon: "cloud",
   },
   {
+    title: "Cloudflare Workers",
+    description: "The REST API in a Worker over Hyperdrive, and every way it differs from the server",
+    href: "/docs/workers/",
+    icon: "cloud",
+  },
+  {
     title: "Benchmarks",
     description: "Measured binary size, latency and memory, and the script that reproduces them",
     href: "/docs/benchmarks/",
