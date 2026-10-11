@@ -45,6 +45,32 @@ impl Connector for Tcp {
     fn spawn(&self, connection: BoxFuture<'static, ()>) {
         tokio::spawn(connection);
     }
+
+    async fn sleep(&self, duration: std::time::Duration) {
+        tokio::time::sleep(duration).await
+    }
+}
+
+fn socket_host() -> String {
+    match database_url()
+        .parse::<tokio_postgres::Config>()
+        .unwrap()
+        .get_hosts()
+        .first()
+    {
+        Some(tokio_postgres::config::Host::Tcp(host)) => host.clone(),
+        _ => panic!("DATABASE_URL needs a TCP host"),
+    }
+}
+
+fn socket_port() -> u16 {
+    database_url()
+        .parse::<tokio_postgres::Config>()
+        .unwrap()
+        .get_ports()
+        .first()
+        .copied()
+        .unwrap_or(5432)
 }
 
 async fn drivers() -> (sqlx::PgPool, PgSocketDb<Tcp>) {
@@ -182,7 +208,7 @@ async fn every_type_decodes_alike() {
 
 #[tokio::test]
 #[ignore = "needs a PostgreSQL database"]
-async fn a_shared_column_name_reads_the_first_column() {
+async fn a_shared_column_name_reads_the_last_column() {
     agree("", "SELECT 1 AS a, 2 AS a, 'x' AS b", &[]).await;
 }
 
@@ -300,26 +326,192 @@ async fn a_rendered_body_is_read_raw_alike() {
     .await;
     agree("", "SELECT NULL::text AS body, 0::int8 AS count", &[]).await;
     agree("", "SELECT 'x' AS body WHERE false", &[]).await;
+    // Two count columns: the last is the count, as for every other read.
+    let answer = agree(
+        "",
+        "SELECT 'x' AS body, 1::int8 AS count, 2::int8 AS count",
+        &[],
+    )
+    .await;
+    match answer {
+        Answer::Rows { raw, .. } => assert_eq!(raw.count, Some(2)),
+        failed => panic!("expected rows, got {failed:?}"),
+    }
+}
+
+#[tokio::test]
+#[ignore = "needs a PostgreSQL database"]
+async fn a_failure_is_its_own_whatever_types_the_result_has() {
+    // A statement that fails after PostgreSQL has described its result, with
+    // a column of a type that is not built in. `tokio-postgres` looks such a
+    // type up when the description arrives -- and if the statement has
+    // already failed, that lookup is refused (`25P02`) and its error was the
+    // one reported.
+    let setup = format!(
+        "{ZOO};
+CREATE TEMP TABLE agree_typed (id int PRIMARY KEY, mood pg_temp.mood, label pg_temp.label);
+INSERT INTO agree_typed VALUES (1, 'sad', 'a');
+CREATE FUNCTION pg_temp.agree_raise() RETURNS pg_temp.mood LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'raised' USING ERRCODE = 'P0001'; END $$"
+    );
+    let cases = [
+        ("INSERT INTO agree_typed VALUES (1, 'happy', 'b') RETURNING id, mood", "23505"),
+        ("INSERT INTO agree_typed VALUES (2, 'happy', 'b') RETURNING id, label, 1 / (id - 2) AS z", "22012"),
+        ("SELECT mood, 1 / (id - 1) AS z FROM agree_typed", "22012"),
+        ("SELECT pg_temp.agree_raise() AS mood", "P0001"),
+        ("SELECT ROW(id, mood) AS r, 1 / (id - 1) AS z FROM agree_typed", "22012"),
+    ];
+    for (sql, code) in cases {
+        let answer = agree(&setup, sql, &[]).await;
+        assert!(
+            matches!(&answer, Answer::Failed { code: Some(c), .. } if c == code),
+            "{sql}: {answer:?}"
+        );
+    }
+    // And the same columns read alike where nothing fails.
+    let answer = agree(&setup, "SELECT id, mood, label FROM agree_typed", &[]).await;
+    assert_eq!(rows(&answer)[0]["label"], "a");
+}
+
+#[tokio::test]
+#[ignore = "needs a PostgreSQL database"]
+async fn a_refused_connection_says_why_as_sqlx_does() {
+    let mut config: tokio_postgres::Config = database_url().parse().unwrap();
+    config.password("not the password");
+    let wrong = PgSocketDb::new(
+        Tcp {
+            host: socket_host(),
+            port: socket_port(),
+        },
+        config,
+    );
+    let tokio = match wrong.begin().await {
+        Err(e) => e.to_string(),
+        Ok(_) => panic!("a wrong password was accepted"),
+    };
+    let options: sqlx::postgres::PgConnectOptions = database_url().parse().unwrap();
+    let pool = sqlx::postgres::PgPoolOptions::new()
+        .acquire_timeout(std::time::Duration::from_secs(5))
+        .connect_lazy_with(options.password("not the password"));
+    let sqlx = match Db::begin(&pool).await {
+        Err(e) => e.to_string(),
+        Ok(_) => panic!("a wrong password was accepted"),
+    };
+    assert!(tokio.contains("password authentication failed"), "{tokio}");
+    assert_eq!(tokio, sqlx);
+}
+
+#[tokio::test]
+#[ignore = "needs a PostgreSQL database"]
+async fn a_connection_ended_by_the_server_says_why() {
+    let (pool, socket) = drivers().await;
+    let mut tx = socket.begin().await.unwrap();
+    let pid = tx
+        .fetch_values("SELECT pg_backend_pid()", &[])
+        .await
+        .unwrap();
+    let pid = pid[0][0].as_i64().unwrap();
+    sqlx::query("SELECT pg_terminate_backend($1::int)")
+        .bind(pid)
+        .execute(&pool)
+        .await
+        .unwrap();
+    // The FATAL arrives while the connection is idle, and ends it.
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    let e = tx.fetch_values("SELECT 1", &[]).await.unwrap_err();
+    assert_eq!(
+        e.as_database().map(|d| d.code.as_str()),
+        Some("57P01"),
+        "{e}"
+    );
+}
+
+#[tokio::test]
+#[ignore = "needs a PostgreSQL database"]
+async fn a_server_that_never_answers_times_out() {
+    // Accepts the connection and then says nothing at all.
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let silent = tokio::spawn(async move {
+        let mut held = Vec::new();
+        while let Ok((stream, _)) = listener.accept().await {
+            held.push(stream);
+        }
+    });
+    let mut config: tokio_postgres::Config = database_url().parse().unwrap();
+    config.connect_timeout(std::time::Duration::from_secs(1));
+    let db = PgSocketDb::new(
+        Tcp {
+            host: "127.0.0.1".into(),
+            port,
+        },
+        config,
+    );
+    let started = std::time::Instant::now();
+    let e = match db.begin().await {
+        Err(e) => e,
+        Ok(_) => panic!("a silent server opened a transaction"),
+    };
+    assert!(started.elapsed() < std::time::Duration::from_secs(5));
+    assert!(e.to_string().contains("timed out"), "{e}");
+    silent.abort();
 }
 
 #[tokio::test]
 #[ignore = "needs a PostgreSQL database"]
 async fn a_transaction_that_is_not_committed_is_rolled_back() {
     let (pool, socket) = drivers().await;
-    async fn check<D: Db>(db: &D) {
+    // A table of each driver's own, committed, with one row in it.
+    async fn check<D: Db>(db: &D, table: &str) {
         let mut tx = db.begin().await.unwrap();
-        tx.execute("CREATE TABLE agree_rollback (id int)", &[])
+        tx.execute(&format!("DROP TABLE IF EXISTS {table}"), &[])
             .await
             .unwrap();
+        tx.execute(&format!("CREATE TABLE {table} (id int PRIMARY KEY)"), &[])
+            .await
+            .unwrap();
+        tx.execute(&format!("INSERT INTO {table} VALUES (1)"), &[])
+            .await
+            .unwrap();
+        tx.commit().await.unwrap();
+
+        // A write and a row lock, then dropped without a commit.
+        let mut tx = db.begin().await.unwrap();
+        tx.execute(&format!("INSERT INTO {table} VALUES (2)"), &[])
+            .await
+            .unwrap();
+        tx.fetch_values(
+            &format!("SELECT id FROM {table} WHERE id = 1 FOR UPDATE"),
+            &[],
+        )
+        .await
+        .unwrap();
         drop(tx);
+
+        // Neither outlives it. The lock is waited for a while rather than
+        // refused at once: the rollback happens on the server, a moment
+        // after the drop.
         let mut tx = db.begin().await.unwrap();
-        let exists = tx
-            .fetch_values("SELECT to_regclass('agree_rollback') IS NOT NULL", &[])
+        tx.execute("SET LOCAL lock_timeout = '5s'", &[])
             .await
             .unwrap();
-        assert_eq!(exists, vec![vec![Value::Bool(false)]]);
+        let locked = tx
+            .fetch_values(
+                &format!("SELECT id FROM {table} WHERE id = 1 FOR UPDATE"),
+                &[],
+            )
+            .await
+            .unwrap_or_else(|e| panic!("{table}: the dropped transaction kept its lock: {e}"));
+        assert_eq!(locked, vec![vec![json!(1)]]);
+        let written = tx
+            .fetch_values(&format!("SELECT count(*) FROM {table} WHERE id = 2"), &[])
+            .await
+            .unwrap();
+        assert_eq!(written, vec![vec![json!(0)]], "{table}");
+        tx.execute(&format!("DROP TABLE {table}"), &[])
+            .await
+            .unwrap();
         tx.commit().await.unwrap();
     }
-    check(&pool).await;
-    check(&socket).await;
+    check(&pool, "agree_rollback_sqlx").await;
+    check(&socket, "agree_rollback_socket").await;
 }

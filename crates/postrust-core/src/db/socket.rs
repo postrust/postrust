@@ -12,6 +12,16 @@
 //! pools on its side, so there is nothing to keep. A transaction dropped
 //! without [`Tx::commit`] closes its connection, and PostgreSQL rolls it back.
 //!
+//! A statement whose result has a type PostgreSQL does not build in -- an
+//! enum, a domain, a composite, an extension's type -- is prepared before it
+//! is run. `tokio-postgres` looks such a type up in the catalog when the
+//! result's description arrives, and for an unprepared statement that is
+//! after the statement has run: if it failed, the transaction is aborted, the
+//! lookup fails with `25P02`, and the statement's own error is lost. Prepared
+//! first, the lookups run before anything can have failed. That costs a round
+//! trip, so which statements need it is remembered (`ResultTypes`), and one
+//! whose columns are all built in runs in one.
+//!
 //! Two things have to match sqlx exactly, and both are done by hand rather
 //! than left to `tokio-postgres`:
 //!
@@ -27,7 +37,10 @@
 use super::{BoxFuture, Db, DbError, MaybeSend, MaybeSync, RawRows, Tx};
 use crate::error::DatabaseError;
 use postrust_sql::SqlParam;
+use std::collections::HashMap;
 use std::future::Future;
+use std::sync::{Arc, LazyLock, Mutex};
+use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio_postgres::tls::TlsConnect;
 use tokio_postgres::types::{FromSql, ToSql, Type};
@@ -50,7 +63,20 @@ pub trait Connector: MaybeSend + MaybeSync {
     /// Run a connection's I/O until it closes: `tokio::spawn` natively,
     /// `wasm_bindgen_futures::spawn_local` in a Worker.
     fn spawn(&self, connection: BoxFuture<'static, ()>);
+
+    /// Wait for `duration`: `tokio::time::sleep` natively. It bounds how long
+    /// opening a connection may take (see [`PgSocketDb::new`]); there is no
+    /// timer that works on every host, so each brings its own. One that does
+    /// not -- this default never wakes -- has no connect timeout.
+    fn sleep(&self, duration: Duration) -> impl Future<Output = ()> + MaybeSend {
+        let _ = duration;
+        std::future::pending()
+    }
 }
+
+/// How long opening a connection may take when the configuration does not
+/// say (`connect_timeout`): the socket, the startup and the authentication.
+pub const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// A database reached over a socket per transaction. See the module docs.
 pub struct PgSocketDb<C> {
@@ -59,9 +85,12 @@ pub struct PgSocketDb<C> {
 }
 
 impl<C: Connector> PgSocketDb<C> {
-    /// A database at `config`, reached through `connector`. The host, port
-    /// and TLS settings in `config` are not used to connect -- the connector
-    /// decides those -- only the user, password, database and options.
+    /// A database at `config`, reached through `connector`. The host and port
+    /// in `config` are not used to connect -- the connector decides those --
+    /// only the user, password, database and options, `sslmode` (with the
+    /// connector's TLS), and `connect_timeout`, which bounds opening a
+    /// connection when the connector has a timer ([`Connector::sleep`]),
+    /// [`DEFAULT_CONNECT_TIMEOUT`] where it is not set.
     pub fn new(connector: C, config: tokio_postgres::Config) -> Self {
         Self { connector, config }
     }
@@ -70,6 +99,8 @@ impl<C: Connector> PgSocketDb<C> {
 /// A transaction on its own connection.
 pub struct SocketTx {
     client: Client,
+    /// Why the connection ended, if it ended with an error of its own.
+    closed: Arc<Mutex<Option<DbError>>>,
 }
 
 impl<C> Db for PgSocketDb<C>
@@ -84,36 +115,65 @@ where
         Self: 'a;
 
     async fn begin(&self) -> Result<SocketTx, DbError> {
-        let stream = self
-            .connector
-            .connect()
-            .await
-            .map_err(|e| DbError::other(e.to_string()))?;
-        let (client, connection) = self
+        let timeout = self
             .config
-            .connect_raw(stream, self.connector.tls())
-            .await?;
+            .get_connect_timeout()
+            .copied()
+            .unwrap_or(DEFAULT_CONNECT_TIMEOUT);
+        let connect = std::pin::pin!(async {
+            let stream =
+                self.connector.connect().await.map_err(|e| {
+                    DbError::other(format!("error connecting to the database: {e}"))
+                })?;
+            Ok::<_, DbError>(
+                self.config
+                    .connect_raw(stream, self.connector.tls())
+                    .await?,
+            )
+        });
+        let expired = std::pin::pin!(self.connector.sleep(timeout));
+        let (client, connection) = match futures::future::select(connect, expired).await {
+            futures::future::Either::Left((connected, _)) => connected?,
+            futures::future::Either::Right(_) => {
+                return Err(DbError::other(format!(
+                    "timed out after {timeout:?} connecting to the database"
+                )))
+            }
+        };
+        let closed = Arc::new(Mutex::new(None));
+        let died = closed.clone();
         self.connector.spawn(Box::pin(async move {
-            // An error here is the connection dying, which the client sees as
-            // the failure of whatever it was waiting for.
-            let _ = connection.await;
+            // A connection ends with an error of its own when PostgreSQL ends
+            // it between statements -- an administrator's shutdown, an idle
+            // transaction's timeout. The client sees only that it is closed,
+            // so the reason is kept for it to report. Kept before the
+            // connection is dropped, which is what closes the client.
+            let mut connection = std::pin::pin!(connection);
+            if let Err(e) = connection.as_mut().await {
+                if let Ok(mut died) = died.lock() {
+                    *died = Some(DbError::from(e));
+                }
+            }
         }));
-        client.batch_execute("BEGIN").await?;
-        Ok(SocketTx { client })
+        let tx = SocketTx { client, closed };
+        tx.client
+            .batch_execute("BEGIN")
+            .await
+            .map_err(|e| tx.error(e))?;
+        Ok(tx)
     }
 }
 
 impl Tx for SocketTx {
     async fn execute(&mut self, sql: &str, params: &[SqlParam]) -> Result<u64, DbError> {
+        // Unlike a query, this reads no rows, so it needs no column types,
+        // and looks none up (see the module docs).
         let bound = Bound::new(params);
-        let stream = self.client.query_typed_raw(sql, bound.iter()).await?;
-        futures::pin_mut!(stream);
-        while futures::StreamExt::next(&mut stream)
+        let params: Vec<_> = bound.iter().collect();
+        self.client
+            .execute_typed(sql, &params)
             .await
-            .transpose()?
-            .is_some()
-        {}
-        Ok(stream.rows_affected().unwrap_or_default())
+            .map_err(|e| self.error(e))
     }
 
     async fn fetch_json(
@@ -152,11 +212,12 @@ impl Tx for SocketTx {
         let first = rows
             .first()
             .and_then(|row| row.try_get::<_, Raw>(0).ok()?.0.map(<[u8]>::to_vec));
+        // The last column of the name, as sqlx reads one (see `row_to_json`).
         let count = rows.first().and_then(|row| {
             let index = row
                 .columns()
                 .iter()
-                .position(|c| c.name() == count_column)?;
+                .rposition(|c| c.name() == count_column)?;
             match row.columns()[index].type_().oid() {
                 oid::INT8 => be_bytes(raw(row, index)?).map(i64::from_be_bytes),
                 _ => None,
@@ -166,15 +227,107 @@ impl Tx for SocketTx {
     }
 
     async fn commit(self) -> Result<(), DbError> {
-        Ok(self.client.batch_execute("COMMIT").await?)
+        self.client
+            .batch_execute("COMMIT")
+            .await
+            .map_err(|e| self.error(e))
     }
 }
 
 impl SocketTx {
+    /// A statement's rows. Run in one round trip where its columns are known
+    /// to be built-in types, and prepared first otherwise (see the module
+    /// docs).
     async fn query(&self, sql: &str, params: &[SqlParam]) -> Result<Vec<Row>, DbError> {
         let bound = Bound::new(params);
-        let stream = self.client.query_typed_raw(sql, bound.iter()).await?;
-        Ok(futures::TryStreamExt::try_collect(stream).await?)
+        let rows = if RESULT_TYPES.built_in(sql) {
+            let stream = self
+                .client
+                .query_typed_raw(sql, bound.iter())
+                .await
+                .map_err(|e| self.error(e))?;
+            let rows: Vec<Row> = futures::TryStreamExt::try_collect(stream)
+                .await
+                .map_err(|e| self.error(e))?;
+            // A schema changed since: the column has a type of its own now.
+            if let Some(row) = rows.first() {
+                RESULT_TYPES.learn(sql, row.columns());
+            }
+            rows
+        } else {
+            let types: Vec<Type> = bound.iter().map(|(_, ty)| ty).collect();
+            let statement = self
+                .client
+                .prepare_typed(sql, &types)
+                .await
+                .map_err(|e| self.error(e))?;
+            RESULT_TYPES.learn(sql, statement.columns());
+            let stream = self
+                .client
+                .query_raw(&statement, bound.iter().map(|(value, _)| value))
+                .await
+                .map_err(|e| self.error(e))?;
+            futures::TryStreamExt::try_collect(stream)
+                .await
+                .map_err(|e| self.error(e))?
+        };
+        Ok(rows)
+    }
+
+    /// A failure, as the caller should hear of it: where the connection was
+    /// closed under it, why it was.
+    fn error(&self, e: tokio_postgres::Error) -> DbError {
+        if e.is_closed() {
+            if let Some(why) = self.closed.lock().ok().and_then(|mut why| why.take()) {
+                return why;
+            }
+        }
+        e.into()
+    }
+}
+
+/// Whether a statement's columns are all of types PostgreSQL builds in, by
+/// its SQL, for every statement this process has run on a socket.
+///
+/// Process-wide rather than per [`PgSocketDb`], because a Worker makes a
+/// `PgSocketDb` per request. Nothing goes wrong when it is out of date: a
+/// statement wrongly thought built-in runs as before this existed, with its
+/// errors liable to the `25P02` described in the module docs, and one wrongly
+/// thought otherwise costs a round trip. A statement's types are learned
+/// again every time it runs.
+struct ResultTypes(Mutex<HashMap<Box<str>, bool>>);
+
+/// How many statements [`ResultTypes`] remembers before it starts over. The
+/// SQL a request builds depends on its columns and filters, so there is no
+/// fixed set of them.
+const RESULT_TYPES_KEPT: usize = 1024;
+
+static RESULT_TYPES: LazyLock<ResultTypes> =
+    LazyLock::new(|| ResultTypes(Mutex::new(HashMap::new())));
+
+impl ResultTypes {
+    /// Whether `sql` is known to return only built-in types.
+    fn built_in(&self, sql: &str) -> bool {
+        self.0
+            .lock()
+            .is_ok_and(|known| known.get(sql).copied().unwrap_or_default())
+    }
+
+    /// What `sql` returned, as its result's `columns` describe it.
+    fn learn(&self, sql: &str, columns: &[tokio_postgres::Column]) {
+        let built_in = columns
+            .iter()
+            .all(|c| Type::from_oid(c.type_().oid()).is_some());
+        let Ok(mut known) = self.0.lock() else {
+            return;
+        };
+        if known.get(sql) == Some(&built_in) {
+            return;
+        }
+        if known.len() >= RESULT_TYPES_KEPT {
+            known.clear();
+        }
+        known.insert(sql.into(), built_in);
     }
 }
 
@@ -186,7 +339,7 @@ impl Bound {
         Self(params.iter().map(bind).collect())
     }
 
-    fn iter(&self) -> impl Iterator<Item = (&(dyn ToSql + Sync), Type)> {
+    fn iter(&self) -> impl ExactSizeIterator<Item = (&(dyn ToSql + Sync), Type)> {
         self.0
             .iter()
             .map(|(value, ty)| (&**value as &(dyn ToSql + Sync), ty.clone()))
@@ -441,7 +594,22 @@ fn numeric(raw: &[u8]) -> Option<String> {
 
 impl From<tokio_postgres::Error> for DbError {
     fn from(e: tokio_postgres::Error) -> Self {
-        let message = e.to_string();
+        // `tokio-postgres` says only "db error" or "error communicating with
+        // the server"; what went wrong is in the error it wraps. Phrased as
+        // sqlx phrases it, so a log reads the same whichever driver wrote it.
+        let message = match e.as_db_error() {
+            Some(db) => format!("error returned from database: {}", db.message()),
+            None => {
+                let mut message = e.to_string();
+                let mut source = std::error::Error::source(&e);
+                while let Some(cause) = source {
+                    message.push_str(": ");
+                    message.push_str(&cause.to_string());
+                    source = cause.source();
+                }
+                message
+            }
+        };
         match e.as_db_error() {
             Some(db) => DbError::database(
                 message,
