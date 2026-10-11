@@ -490,6 +490,20 @@ PGRST_GRAPHQL_TYPE_PREFIX=billing   # optional`} />
               cannot add one.
             </p>
             <p class="text-neutral-600 mt-4">
+              A token that does not verify &mdash; the wrong key, expired, not a bearer token &mdash;
+              is refused with <code class="font-mono">invalid-jwt</code>, and one that verifies but
+              names no role, on a server with no anonymous role, with{" "}
+              <code class="font-mono">jwt-missing-role-claims</code>. Neither is answered as the
+              anonymous role. A request with no <code class="font-mono">Authorization</code> header
+              at all is the anonymous role, as before.
+            </p>
+            <p class="text-neutral-600 mt-4">
+              With <strong>no JWT secret configured</strong>, there is nothing to verify a token
+              against, and GraphQL ignores the <code class="font-mono">Authorization</code> header
+              &mdash; as Hasura does with JWT mode off, and unlike REST, which refuses it. A router
+              forwarding the header to every subgraph relies on that.
+            </p>
+            <p class="text-neutral-600 mt-4">
               With <strong>no admin secret configured</strong>,{" "}
               <code class="font-mono">x-hasura-*</code> headers are ignored entirely and session
               variables come only from a verified token. This is a deliberate divergence from

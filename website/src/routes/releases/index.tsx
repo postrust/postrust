@@ -13,12 +13,12 @@ const VERSION = "2.2.1";
 
 const patch = [
   {
-    title: "__typename inside a relationship",
-    body: "Asking for __typename anywhere below the root — on an object or array relationship, or the rows a mutation returned — failed the whole query with column \"__typename\" does not exist; only the root and aggregate nodes answered it. Apollo Client adds __typename to every selection set by default, and a Federation router asks for it on every entity reference it follows, so a query that crossed from one subgraph to another through a relationship failed. It is now answered by the schema, as it is at the root.",
+    title: "__typename inside a relationship or an aggregate",
+    body: "Asking for __typename anywhere below the root — on an object or array relationship, the rows a mutation returned, or inside an aggregate's functions such as max { __typename id } — failed the whole query with column \"__typename\" does not exist; only the root and aggregate nodes answered it. Apollo Client adds __typename to every selection set by default, and a Federation router asks for it on every entity reference it follows, so a query that crossed from one subgraph to another through a relationship failed. It is now answered by the schema, as it is at the root.",
   },
   {
     title: "A GraphQL token that does not verify is refused",
-    body: "A token signed with the wrong key, expired, or not a bearer token at all was served as the anonymous role over GraphQL, where REST refuses it with 401. The client kept getting answers, as someone else, with nothing to say why its rows had gone. It is now refused as invalid-jwt, as Hasura refuses it. With no JWT secret configured the Authorization header is still ignored, so a router forwarding it to every subgraph is unaffected.",
+    body: "A token signed with the wrong key, expired, or not a bearer token at all was served as the anonymous role over GraphQL, where REST refuses it with 401. The client kept getting answers, as someone else, with nothing to say why its rows had gone. It is now refused as invalid-jwt, as Hasura refuses it, and a verified token naming no role on a server with no anonymous role as jwt-missing-role-claims. With no JWT secret configured the Authorization header is still ignored, so a router forwarding it to every subgraph is unaffected.",
   },
 ];
 

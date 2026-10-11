@@ -7,14 +7,19 @@ releases are described by their tags and the pull requests behind them.
 
 Two GraphQL fixes, found by running two Postrust subgraphs behind Apollo
 Router for the Federation example in `examples/federation`. The public Rust
-API gains `postrust_graphql::hasura::invalid_jwt` and loses nothing.
+API loses nothing; `postrust_graphql::hasura` gains `invalid_jwt` and
+`missing_role_claim`, hidden from the docs, for the server crate's use.
 
 ### Fixed
 
-- **`__typename` inside a relationship.** Asking for it anywhere below the
-  root -- on an object or array relationship, or on the rows a mutation
-  returned -- failed the whole query with `column "__typename" does not
-  exist`; only the root and an aggregate's `nodes` answered it. Apollo Client
+- **`__typename` inside a relationship or an aggregate.** Asking for it
+  anywhere below the root -- on an object or array relationship, on the rows a
+  mutation returned, or inside an aggregate's functions (`max { __typename id
+  }`), at the root or through a relationship -- failed the whole query with
+  `column "__typename" does not exist`; only the root and an aggregate's
+  `nodes` answered it. A function or `aggregate` object asked for nothing but
+  `__typename` came back null; it is now the object, named as Hasura names it
+  (`books_max_fields`, `books_aggregate_fields`). Apollo Client
   adds `__typename` to every selection set by default, and a Federation router
   asks for it on every entity reference it follows, so a query crossing from
   one subgraph to another through a relationship failed. It is now answered by
@@ -23,9 +28,15 @@ API gains `postrust_graphql::hasura::invalid_jwt` and loses nothing.
   the wrong key, expired, or not a bearer token at all was served as the
   anonymous role over GraphQL, where REST refuses it with 401: the client kept
   getting answers, as someone else, with nothing to say why its rows had gone.
-  It is now refused as `invalid-jwt`, in the shape Hasura uses. With no JWT
-  secret configured the `Authorization` header is still ignored, so a router
-  forwarding it to every subgraph is unaffected.
+  It is now refused as `invalid-jwt`, in the shape Hasura uses -- over HTTP,
+  in each part of a batch, and at a WebSocket's `connection_init`. A token
+  that verifies and names no role, on a server with no anonymous role, is
+  refused as `jwt-missing-role-claims` rather than run as a role called
+  `anon`; REST answers both 401. The admin secret still wins over a bad token
+  beside it, as in Hasura, and a request with no `Authorization` header is
+  unchanged. With no JWT secret configured the header is still ignored, so a
+  router forwarding it to every subgraph is unaffected. GraphQL now verifies
+  tokens through the same cache as REST (`PGRST_JWT_CACHE_MAX_LIFETIME`).
 
 ### Added
 
@@ -49,7 +60,8 @@ API gains `postrust_graphql::hasura::invalid_jwt` and loses nothing.
 
 Nothing to change, unless a GraphQL client relied on an expired or invalid
 token being answered anonymously; it now gets an `invalid-jwt` error, and
-should drop the token or refresh it.
+should drop the token or refresh it. Likewise a token with no role claim on a
+server with no anonymous role, which now gets `jwt-missing-role-claims`.
 
 ## 2.2.0
 
