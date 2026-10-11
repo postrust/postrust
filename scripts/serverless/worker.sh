@@ -11,18 +11,25 @@
 #   scripts/serverless/worker.sh                  # build, then test
 #   KEEP=1 scripts/serverless/worker.sh           # leave it running afterwards
 #   BUILD=path/to/build scripts/serverless/worker.sh   # test a worker-build output
+#   PREFIX=mine-wk PORT=59021 scripts/serverless/worker.sh   # beside another run
 #
 # Needs docker, python3 and curl. Containers, the network and volumes are all
-# named `postrust-wk-*` and removed on exit, except the build caches.
+# named `$PREFIX-*` (`postrust-wk-*` unless set) and removed on exit, except
+# the build caches.
 set -uo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT="$(cd "$HERE/../.." && pwd)"
 PORT="${PORT:-59020}"
-NET=postrust-wk-net
-PG=postrust-wk-pg
-WK=postrust-wk-worker
+PREFIX="${PREFIX:-postrust-wk}"
+NET=$PREFIX-net
+PG=$PREFIX-pg
+WK=$PREFIX-worker
+# Tokens are signed with SECRET; the Worker is given it base64-encoded, with
+# PGRST_JWT_SECRET_IS_BASE64 as an unquoted TOML boolean -- which wrangler
+# passes as a boolean, not a string, and which the Worker once dropped.
 SECRET=reallyreallyreallyreallyverysafe
+SECRET_B64=$(printf %s "$SECRET" | base64)
 RELOAD=a-reload-secret
 RUST_IMAGE="${RUST_IMAGE:-rust:1.98.1}"
 NODE_IMAGE="${NODE_IMAGE:-node:22}"
@@ -39,7 +46,29 @@ cleanup() {
     fi
     docker rm -f "$PG" "$WK" >/dev/null 2>&1
     docker network rm "$NET" >/dev/null 2>&1
+    # wrangler runs as root in its container, and leaves .wrangler/ behind
+    # owned by root; hand it back before removing it.
+    if [ -d "$OUT/.wrangler" ]; then
+        docker run --rm -v "$OUT":/out "$NODE_IMAGE" chown -R "$(id -u):$(id -g)" /out \
+            >/dev/null 2>&1
+    fi
     rm -rf "$OUT"
+}
+# fail MESSAGE -- stop here, with the Worker's log if it has one.
+fail() {
+    echo "$1" >&2
+    docker logs "$WK" 2>&1 | tail -40 >&2
+    exit 1
+}
+# wait_healthy -- until the Worker answers its health check, or fail.
+wait_healthy() {
+    for _ in $(seq 180); do
+        curl -sf -o /dev/null "$URL/_/health" && return 0
+        docker inspect -f '{{.State.Running}}' "$WK" 2>/dev/null | grep -q true \
+            || fail "the Worker's container is not running"
+        sleep 1
+    done
+    fail "the Worker never answered $URL/_/health"
 }
 trap cleanup EXIT
 KEEP=0 cleanup
@@ -49,13 +78,16 @@ if [ -n "${BUILD:-}" ]; then
     cp -r "$BUILD" "$OUT/build"
 else
     echo "==> Building the Worker"
+    # As root, since the caches are root's, but whatever it writes into the
+    # source tree is handed back to whoever ran this, however the build ends.
     docker run --rm -v "$ROOT":/src -w /src/crates/postrust-worker \
         -v postrust-wk-cargo:/usr/local/cargo/registry \
         -v postrust-wk-bin:/usr/local/cargo/bin-extra \
-        -v postrust-wk-target:/target -e CARGO_TARGET_DIR=/target \
+        -v "$PREFIX-target":/target -e CARGO_TARGET_DIR=/target \
         -v postrust-wk-cache:/root/.cache \
         "$RUST_IMAGE" bash -c "
             set -e
+            trap 'chown -R $(id -u):$(id -g) /src/crates/postrust-worker/build 2>/dev/null || true' EXIT
             rustup target add wasm32-unknown-unknown >/dev/null 2>&1
             export PATH=/usr/local/cargo/bin-extra/bin:\$PATH
             command -v worker-build >/dev/null || cargo install -q --root /usr/local/cargo/bin-extra \
@@ -70,9 +102,17 @@ echo "    wasm: $(wc -c < "$OUT/build/index_bg.wasm") bytes, $(gzip -9 -c "$OUT/
 echo "==> Starting PostgreSQL and the Worker"
 docker network create "$NET" >/dev/null
 docker run -d --name "$PG" --network "$NET" -e POSTGRES_PASSWORD=postgres postgres:16-alpine >/dev/null
-for _ in $(seq 60); do docker exec "$PG" pg_isready -U postgres -q 2>/dev/null && break; sleep 1; done
+ready=0
+for _ in $(seq 60); do
+    docker exec "$PG" pg_isready -U postgres -q 2>/dev/null && { ready=1; break; }
+    sleep 1
+done
+[ "$ready" = 1 ] || { docker logs "$PG" 2>&1 | tail -20; echo "PostgreSQL never became ready"; exit 1; }
 sleep 1
 docker exec -i "$PG" psql -q -v ON_ERROR_STOP=1 -U postgres < "$HERE/fixture.sql" || exit 1
+# More rows than the default ceiling, so the ceiling has something to cut.
+docker exec "$PG" psql -q -v ON_ERROR_STOP=1 -U postgres -c "CREATE TABLE many (id int PRIMARY KEY); \
+    INSERT INTO many SELECT generate_series(1, 1500); GRANT SELECT ON many TO web_anon;" || exit 1
 
 cat > "$OUT/wrangler.toml" <<TOML
 name = "postrust-test"
@@ -92,9 +132,13 @@ id = "00000000000000000000000000000000"
 PGRST_DB_SCHEMAS = "public"
 PGRST_DB_ANON_ROLE = "web_anon"
 PGRST_SERVER_CORS_ORIGINS = "https://app.example"
+# Unquoted, so wrangler passes a boolean and a number, not strings. The TTL
+# also keeps the KV copy from expiring while the checks below run.
+PGRST_JWT_SECRET_IS_BASE64 = true
+PGRST_WORKER_SCHEMA_TTL = 600
 TOML
 cat > "$OUT/.dev.vars" <<VARS
-PGRST_JWT_SECRET=$SECRET
+PGRST_JWT_SECRET=$SECRET_B64
 POSTRUST_RELOAD_SECRET=$RELOAD
 VARS
 
@@ -103,7 +147,7 @@ docker run -d --name "$WK" --network "$NET" -p "127.0.0.1:$PORT:8787" \
     "$NODE_IMAGE" npx --yes "wrangler@$WRANGLER_VERSION" dev --ip 0.0.0.0 --port 8787 \
         --test-scheduled --show-interactive-dev-session=false --log-level debug >/dev/null
 URL="http://127.0.0.1:$PORT"
-for _ in $(seq 180); do curl -s -o /dev/null "$URL/_/health" && break; sleep 1; done
+wait_healthy
 
 ALICE=$(python3 "$HERE/jwt.py" "$SECRET" web_user alice)
 BOB=$(python3 "$HERE/jwt.py" "$SECRET" web_user bob)
@@ -112,7 +156,8 @@ NOBODY=$(python3 "$HERE/jwt.py" "$SECRET" no_such_role mallory)
 passed=0
 failed=0
 # expect LABEL STATUS BODY -- curl arguments...
-#   BODY is JSON compared as a value, `~text` for a substring, or `*` for any.
+#   BODY is JSON compared as a value, `~text` for a substring, `#N` for a JSON
+#   array of N elements, or `*` for any.
 expect() {
     local label="$1" status="$2" body="$3"
     shift 4
@@ -127,6 +172,12 @@ if want == "*":
     sys.exit(0)
 if want.startswith("~"):
     sys.exit(0 if want[1:] in got else 1)
+if want.startswith("#"):
+    try:
+        got = json.loads(got)
+    except ValueError:
+        sys.exit(1)
+    sys.exit(0 if isinstance(got, list) and len(got) == int(want[1:]) else 1)
 try:
     sys.exit(0 if json.loads(want) == json.loads(got) else 1)
 except ValueError:
@@ -176,8 +227,8 @@ expect "a missing table names itself" 404 '~todo' \
     -- "$URL/todo"
 expect "a singular read of many rows is refused" 406 '*' \
     -- "$URL/todos?select=id" -H "$(auth "$ALICE")" -H "Accept: application/vnd.pgrst.object+json"
-expect "rows are capped at the default ceiling" 200 '*' \
-    -- "$URL/todos?select=id&limit=5000"
+expect "rows are capped at the default ceiling" 200 '#1000' \
+    -- "$URL/many?select=id&limit=5000"
 
 echo "==> One request cannot take the next one down"
 # A write refused for its token never has its body read. In a Worker an
@@ -191,6 +242,11 @@ for i in 1 2 3; do
         -H "Content-Type: application/json" -d '{"owner":"x","task":"y"}'
     curl -s -o /dev/null -X POST "$URL/rpc/whoami" -H "$(auth "$NOBODY")" \
         -H "Content-Type: application/json" -d '{}'
+    # Answered without looking at the body, before the engine is involved.
+    curl -s -o /dev/null -X POST "$URL/_/reload" -H "Authorization: Bearer wrong" \
+        -H "Content-Type: application/json" -d '{"a body":"nobody reads"}'
+    curl -s -o /dev/null -X OPTIONS "$URL/todos" -H "Origin: https://app.example" \
+        -d 'a preflight with a body'
 done
 expect "the request after refused writes is answered" 200 '[{"id":1}]' \
     -- "$URL/todos?select=id&id=eq.1"
@@ -242,7 +298,7 @@ echo "==> A fresh isolate, with the schema cache from KV"
 # not know the table at all (PGRST205).
 docker exec "$PG" psql -q -U postgres -c "DROP TABLE later;" >/dev/null
 docker restart "$WK" >/dev/null
-for _ in $(seq 180); do curl -s -o /dev/null "$URL/_/health" && break; sleep 1; done
+wait_healthy
 expect "a filter on a typed column, with the cache read from KV" 200 '[{"id":1,"body":"hello"}]' \
     -- "$URL/notes?id=eq.1"
 expect "the cache was read from KV: it still has the table dropped since" 404 '~PGRST504' \
@@ -256,6 +312,32 @@ if [ "$state" = "1:alice:alice public,2:alice:alice private,3:bob:bob private,4:
 else
     printf '    FAIL  table state\n          got  %s\n' "$state"
     failed=$((failed + 1))
+fi
+
+echo "==> With the database gone"
+# A fresh isolate with nothing in KV and no PostgreSQL to load the schema cache
+# from: the request fails before the engine runs. A browser must still be able
+# to read that answer, and the body nobody read must not take the isolate down.
+docker stop "$PG" >/dev/null
+docker stop "$WK" >/dev/null
+docker run --rm -v "$OUT":/app "$NODE_IMAGE" rm -rf /app/.wrangler/state
+docker start "$WK" >/dev/null
+wait_healthy
+for i in 1 2 3; do
+    early=$(curl -s -D - -o /dev/null -X POST "$URL/todos" -H "Origin: https://app.example" \
+        -H "Content-Type: application/json" -d '{"owner":"x","task":"y"}' | tr -d '\r')
+done
+grep -q '^HTTP/[0-9.]* 5' <<<"$early" \
+    && grep -qi '^access-control-allow-origin: https://app.example' <<<"$early" \
+    && { printf '    ok    an error before the engine still carries the CORS headers\n'; passed=$((passed + 1)); } \
+    || { printf '    FAIL  an error before the engine\n%s\n' "$early"; failed=$((failed + 1)); }
+expect "the Worker still answers after them" 200 '~OK' \
+    -- "$URL/_/health"
+restarts=$(docker logs "$WK" 2>&1 | grep -c "uncaught exception")
+if [ "$restarts" = 0 ]; then
+    printf '    ok    still no uncaught exception in the Worker log\n'; passed=$((passed + 1))
+else
+    printf '    FAIL  %s uncaught exceptions in the Worker log\n' "$restarts"; failed=$((failed + 1))
 fi
 
 echo
