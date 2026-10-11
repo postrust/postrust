@@ -54,7 +54,8 @@ planned it in phases, and each phase was measured against the one before.
   (ring, aws-lc, mio, sqlx) reaches that build.
   - sqlx is an optional, default-on feature of `postrust-core`.
   - The workspace's tokio asks for `sync` and `macros` only.
-  - jsonwebtoken is now 10: aws-lc-rs natively, RustCrypto on wasm32.
+  - On wasm32, tokens are verified by jsonwebtoken 10 with its pure-Rust
+    RustCrypto backend. Native builds stay on jsonwebtoken 9 (see Measured).
 - **The schema cache is loaded through the same database interface as
   requests,** on one transaction. Each catalog query returns its row as JSON,
   so a driver only has to decode `json` to load one. A dump of the loaded

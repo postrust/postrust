@@ -124,7 +124,49 @@ pub trait Tx: MaybeSend {
 
     /// Commit the transaction.
     fn commit(self) -> impl Future<Output = Result<(), DbError>> + MaybeSend;
+
+    /// Run a statement for its effect, but not yet: it is sent with the next
+    /// statement, ahead of it, and a failure is reported as that statement's.
+    ///
+    /// For the statements that set a transaction up -- `SET TRANSACTION`, the
+    /// request's settings, a pre-request function -- whose only answer worth
+    /// having is whether they failed. A driver that can pipeline sends them
+    /// together with the query in one flight rather than waiting on each in
+    /// turn; one that cannot runs them first, one by one, which is what the
+    /// caller would have done anyway. Either way they run in order, before the
+    /// next statement, and if one fails nothing after it does.
+    fn queue(&mut self, sql: &str, params: &[SqlParam]);
+
+    /// [`Tx::fetch_json`], and then `then` -- a statement with no parameters,
+    /// whose columns are read by position, as by [`Tx::fetch_values`].
+    ///
+    /// Two statements whose order matters but whose second does not depend on
+    /// what the first returned, so a driver that can pipeline sends both at
+    /// once. For a function's response settings, read back after it ran.
+    fn fetch_json_then(
+        &mut self,
+        sql: &str,
+        params: &[SqlParam],
+        then: &str,
+    ) -> impl Future<Output = FetchedThen> + MaybeSend;
+
+    /// [`Tx::fetch_json`] as the transaction's last statement, and
+    /// [`Tx::commit`].
+    ///
+    /// For a read, where nothing that follows can change whether it should
+    /// commit, so a driver that can pipeline sends the `COMMIT` with the
+    /// query. A failed query is reported as it would be by
+    /// [`Tx::fetch_json`], and the transaction rolls back.
+    fn fetch_json_and_commit(
+        self,
+        sql: &str,
+        params: &[SqlParam],
+    ) -> impl Future<Output = Result<Vec<serde_json::Value>, DbError>> + MaybeSend;
 }
+
+/// What [`Tx::fetch_json_then`] returns: the rows, and the second statement's
+/// rows, by position.
+pub type FetchedThen = Result<(Vec<serde_json::Value>, Vec<Vec<serde_json::Value>>), DbError>;
 
 /// What [`Tx::fetch_raw`] reads from a result.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
