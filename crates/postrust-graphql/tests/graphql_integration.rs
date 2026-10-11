@@ -2288,6 +2288,87 @@ async fn typename_inside_relationships_is_answered_by_the_schema() {
     drop_schema(&pool, &schema).await;
 }
 
+/// `__typename` inside an aggregate is answered by the schema too, at every
+/// level of it -- the aggregate object, each function's object, and the rows --
+/// both at the root and through a relationship. A function's sub-fields were
+/// all read as columns, so `max { __typename id }` became `max("__typename")`.
+#[tokio::test]
+#[ignore = "requires PostgreSQL"]
+async fn typename_inside_aggregates_is_answered_by_the_schema() {
+    let pool = connect().await;
+    let schema = unique_schema_name("aggtypename");
+    create_related_schema(&pool, &schema).await;
+
+    let state = build_state(&pool, &schema, None, false).await;
+    let data = execute_ok(
+        &state,
+        &pool,
+        &schema,
+        "{ books_aggregate(order_by: [{id: asc}], limit: 1) { __typename \
+           aggregate { __typename count max { __typename id } min { __typename } } \
+           nodes { __typename id } } }",
+    )
+    .await;
+    assert_eq!(
+        data["books_aggregate"],
+        serde_json::json!({
+            "__typename": "books_aggregate",
+            "aggregate": {
+                "__typename": "books_aggregate_fields",
+                "count": 1,
+                "max": { "__typename": "books_max_fields", "id": 1 },
+                "min": { "__typename": "books_min_fields" }
+            },
+            "nodes": [{ "__typename": "books", "id": 1 }]
+        })
+    );
+
+    // Nothing but `__typename`, at each level: still objects, not nulls.
+    let data = execute_ok(
+        &state,
+        &pool,
+        &schema,
+        "{ books_aggregate { aggregate { __typename } } }",
+    )
+    .await;
+    assert_eq!(
+        data["books_aggregate"]["aggregate"],
+        serde_json::json!({ "__typename": "books_aggregate_fields" })
+    );
+
+    let data = execute_ok(
+        &state,
+        &pool,
+        &schema,
+        "{ authors(where: {id: {_eq: 1}}) { __typename \
+           books_aggregate(order_by: [{id: asc}]) { __typename \
+             aggregate { __typename count max { __typename id } sum { __typename } } \
+             nodes { __typename title } } } }",
+    )
+    .await;
+    assert_eq!(
+        data["authors"][0],
+        serde_json::json!({
+            "__typename": "authors",
+            "books_aggregate": {
+                "__typename": "books_aggregate",
+                "aggregate": {
+                    "__typename": "books_aggregate_fields",
+                    "count": 2,
+                    "max": { "__typename": "books_max_fields", "id": 2 },
+                    "sum": { "__typename": "books_sum_fields" }
+                },
+                "nodes": [
+                    { "__typename": "books", "title": "a-one" },
+                    { "__typename": "books", "title": "a-two" }
+                ]
+            }
+        })
+    );
+
+    drop_schema(&pool, &schema).await;
+}
+
 /// The query a Federation router sends when a field of another subgraph's
 /// entity is reached through a relationship: the reference, with its
 /// `__typename`, from inside an `_entities` answer.
