@@ -57,6 +57,8 @@ fn code_for(error: &ServerError) -> &'static str {
                 "access-denied" => "access-denied",
                 // A token was offered and did not verify.
                 "invalid-jwt" => "invalid-jwt",
+                // A token that verified and named no role to be.
+                "jwt-missing-role-claims" => "jwt-missing-role-claims",
                 // What Hasura answers when a permission needs a session
                 // variable the caller does not carry: the variable was looked
                 // for and is not there.
@@ -229,8 +231,27 @@ pub fn denied(message: &str) -> Value {
 /// expired token or a claim out of place is a credential the client believes
 /// in, and serving it as a stranger hides that it stopped working. REST says
 /// 401; Hasura says `invalid-jwt`, in the same shape as [`denied`].
+//
+// Hidden: public only so that `postrust-server`, which authenticates, can
+// call it. It is not an API anyone else should build on.
+#[doc(hidden)]
 pub fn invalid_jwt(reason: &str) -> Value {
     refused(&format!("Could not verify JWT: {reason}"), "invalid-jwt")
+}
+
+/// A request whose token verified and named no role, where there is no
+/// anonymous role to fall back to.
+///
+/// REST says 401. Hasura refuses a token without its role claims as
+/// `jwt-missing-role-claims`, naming the claim, and so does this.
+//
+// Hidden for the reason [`invalid_jwt`] is.
+#[doc(hidden)]
+pub fn missing_role_claim(claim: &str) -> Value {
+    refused(
+        &format!("JWT claim does not contain {claim}"),
+        "jwt-missing-role-claims",
+    )
 }
 
 fn refused(message: &str, code: &str) -> Value {

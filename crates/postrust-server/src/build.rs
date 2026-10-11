@@ -335,13 +335,16 @@ pub async fn build(config: postrust_core::AppConfig, host: Host) -> Result<App> 
             #[derive(Clone)]
             struct GraphQLAppState {
                 gql_state: Arc<GraphQLState>,
-                jwt_config: postrust_auth::JwtConfig,
+                /// REST's state, for the JWT configuration and the cache of
+                /// verified tokens: one token is verified once, whichever
+                /// surface it is presented to.
+                rest: Arc<AppState>,
                 hasura_auth: postrust_auth::HasuraAuthConfig,
             }
 
             let graphql_app_state = GraphQLAppState {
                 gql_state: graphql_state.clone(),
-                jwt_config: state.jwt_config.clone(),
+                rest: state.clone(),
                 hasura_auth: postrust_auth::HasuraAuthConfig {
                     admin_secret: config.hasura_admin_secret.clone(),
                     unauthorized_role: config.hasura_unauthorized_role.clone(),
@@ -426,23 +429,37 @@ pub async fn build(config: postrust_core::AppConfig, host: Host) -> Result<App> 
                 // Extract auth header and authenticate
                 let auth_header = headers.get("authorization").and_then(|v| v.to_str().ok());
 
-                let token = postrust_auth::authenticate(auth_header, &app_state.jwt_config);
+                // Through the token cache where one is configured, as REST
+                // authenticates.
+                let jwt_config = &app_state.rest.jwt_config;
+                let token = match &app_state.rest.jwt_cache {
+                    Some(cache) => cache.authenticate(auth_header, jwt_config),
+                    None => postrust_auth::authenticate(auth_header, jwt_config),
+                };
                 // A token that was offered and verified. Not the same as
                 // `token.is_ok()`, which is also true of the anonymous
                 // fallback -- and an anonymous request is precisely the one
                 // that has not been authenticated.
                 let token_verified = auth_header.is_some() && token.is_ok();
-                // A token that was offered and failed verification. Without a
-                // secret there is nothing to verify against, and the header is
-                // ignored as Hasura ignores it when JWT mode is off -- a router
-                // forwarding `Authorization` to every subgraph relies on that.
-                let token_rejected = match &token {
-                    Ok(_)
-                    | Err(
-                        postrust_auth::JwtError::SecretMissing
-                        | postrust_auth::JwtError::NoIdentity,
-                    ) => None,
-                    Err(e) => Some(e.to_string()),
+                // A token that was offered and is refused: REST answers each of
+                // these 401. Without a secret there is nothing to verify
+                // against, and the header is ignored as Hasura ignores it when
+                // JWT mode is off -- a router forwarding `Authorization` to
+                // every subgraph relies on that. With no header at all, and no
+                // anonymous role, the request goes on as it always has.
+                let token_refusal = match (&token, auth_header) {
+                    (Ok(_) | Err(postrust_auth::JwtError::SecretMissing), _) | (Err(_), None) => {
+                        None
+                    }
+                    // Verified, and naming no role, with no anonymous role to
+                    // fall back to. Served as anyone, it would be served as a
+                    // role nobody chose.
+                    (Err(postrust_auth::JwtError::NoIdentity), Some(_)) => Some(
+                        postrust_graphql::hasura::missing_role_claim(&jwt_config.role_claim_key),
+                    ),
+                    (Err(e), Some(_)) => {
+                        Some(postrust_graphql::hasura::invalid_jwt(&e.to_string()))
+                    }
                 };
 
                 let auth_result = match token {
@@ -450,8 +467,7 @@ pub async fn build(config: postrust_core::AppConfig, host: Host) -> Result<App> 
                     Err(e) => {
                         tracing::debug!("GraphQL auth failed: {}, using anon role", e);
                         postrust_auth::AuthResult {
-                            role: app_state
-                                .jwt_config
+                            role: jwt_config
                                 .anon_role
                                 .clone()
                                 .unwrap_or_else(|| "anon".to_string()),
@@ -477,72 +493,68 @@ pub async fn build(config: postrust_core::AppConfig, host: Host) -> Result<App> 
                     })
                     .collect();
 
-                let (hasura_role, session, elevated) =
-                    match postrust_auth::hasura::from_admin_secret(
-                        &app_state.hasura_auth,
-                        &pairs[..],
-                    ) {
-                        postrust_auth::SecretOutcome::Accepted(identity) => {
-                            (Some(identity.role), identity.session, identity.elevated)
-                        }
-                        postrust_auth::SecretOutcome::Rejected => {
-                            return Err(postrust_graphql::hasura::denied(
-                                postrust_auth::hasura::SECRET_INVALID,
-                            ));
-                        }
-                        _ if token_rejected.is_some() => {
-                            return Err(postrust_graphql::hasura::invalid_jwt(
-                                token_rejected.as_deref().unwrap_or_default(),
-                            ));
-                        }
-                        // Nothing settled by the secret. A verified token speaks
-                        // next, and session variables come from its claims.
-                        //
-                        // One header is read here and only here: `X-Hasura-Role`,
-                        // against the `x-hasura-allowed-roles` the token carries.
-                        // That list is inside the signature, so it lets a caller
-                        // choose among the identities it was issued and not add
-                        // one. Every other `x-hasura-*` header is still ignored --
-                        // on a server with no secret to gate them they would let
-                        // any caller name its own identity.
-                        _ if token_verified => {
-                            match postrust_auth::hasura::role_for_token(
-                                &auth_result.claims,
-                                &pairs[..],
-                            ) {
-                                postrust_auth::hasura::TokenRole::Is(role) => (
-                                    role,
-                                    postrust_auth::hasura::session_from_claims(&auth_result.claims),
-                                    false,
-                                ),
-                                postrust_auth::hasura::TokenRole::NotAllowed => {
-                                    return Err(postrust_graphql::hasura::denied(
-                                        postrust_auth::hasura::ROLE_NOT_ALLOWED,
-                                    ));
-                                }
+                let (hasura_role, session, elevated) = match (
+                    postrust_auth::hasura::from_admin_secret(&app_state.hasura_auth, &pairs[..]),
+                    token_refusal,
+                ) {
+                    (postrust_auth::SecretOutcome::Accepted(identity), _) => {
+                        (Some(identity.role), identity.session, identity.elevated)
+                    }
+                    (postrust_auth::SecretOutcome::Rejected, _) => {
+                        return Err(postrust_graphql::hasura::denied(
+                            postrust_auth::hasura::SECRET_INVALID,
+                        ));
+                    }
+                    // The secret settled nothing, so the token is refused
+                    // -- and an administrator's secret beside it wins, as
+                    // it does in Hasura.
+                    (_, Some(refusal)) => return Err(refusal),
+                    // Nothing settled by the secret. A verified token speaks
+                    // next, and session variables come from its claims.
+                    //
+                    // One header is read here and only here: `X-Hasura-Role`,
+                    // against the `x-hasura-allowed-roles` the token carries.
+                    // That list is inside the signature, so it lets a caller
+                    // choose among the identities it was issued and not add
+                    // one. Every other `x-hasura-*` header is still ignored --
+                    // on a server with no secret to gate them they would let
+                    // any caller name its own identity.
+                    _ if token_verified => {
+                        match postrust_auth::hasura::role_for_token(&auth_result.claims, &pairs[..])
+                        {
+                            postrust_auth::hasura::TokenRole::Is(role) => (
+                                role,
+                                postrust_auth::hasura::session_from_claims(&auth_result.claims),
+                                false,
+                            ),
+                            postrust_auth::hasura::TokenRole::NotAllowed => {
+                                return Err(postrust_graphql::hasura::denied(
+                                    postrust_auth::hasura::ROLE_NOT_ALLOWED,
+                                ));
                             }
                         }
-                        // A secret is configured and nothing authenticated this
-                        // request. Answering it as a stranger is a choice the
-                        // deployment makes; refusing is the default.
-                        _ if app_state.hasura_auth.is_configured() => {
-                            match postrust_auth::hasura::unauthenticated(&app_state.hasura_auth) {
-                                Some(identity) => (Some(identity.role), identity.session, false),
-                                None => {
-                                    return Err(postrust_graphql::hasura::denied(
-                                        postrust_auth::hasura::SECRET_MISSING,
-                                    ));
-                                }
+                    }
+                    // A secret is configured and nothing authenticated this
+                    // request. Answering it as a stranger is a choice the
+                    // deployment makes; refusing is the default.
+                    _ if app_state.hasura_auth.is_configured() => {
+                        match postrust_auth::hasura::unauthenticated(&app_state.hasura_auth) {
+                            Some(identity) => (Some(identity.role), identity.session, false),
+                            None => {
+                                return Err(postrust_graphql::hasura::denied(
+                                    postrust_auth::hasura::SECRET_MISSING,
+                                ));
                             }
                         }
-                        // No Hasura auth configured at all: unchanged from before
-                        // any of this existed.
-                        _ => (
-                            postrust_auth::hasura::role_from_claims(&auth_result.claims),
-                            postrust_auth::hasura::session_from_claims(&auth_result.claims),
-                            false,
-                        ),
-                    };
+                    }
+                    // No Hasura auth configured at all: unchanged from before
+                    // any of this existed.
+                    _ => (
+                        postrust_auth::hasura::role_from_claims(&auth_result.claims),
+                        postrust_auth::hasura::session_from_claims(&auth_result.claims),
+                        false,
+                    ),
+                };
 
                 Ok(GraphQLIdentity {
                     auth_result,
