@@ -19,6 +19,7 @@ pub async fn get_pg_version<T: Tx>(tx: &mut T) -> Result<i32> {
         tx,
         "SELECT current_setting('server_version_num')::int as version",
         &[],
+        &[],
     )
     .await?;
     match rows.first() {
@@ -39,22 +40,38 @@ pub async fn get_pg_version<T: Tx>(tx: &mut T) -> Result<i32> {
 pub(super) struct CatalogRow(serde_json::Map<String, serde_json::Value>);
 
 impl CatalogRow {
-    /// A column, by name. A column that is not there reads as null, and a
-    /// value of the wrong type fails the load rather than the process.
+    /// A column, by name. A value of the wrong type fails the load rather than
+    /// the process.
+    ///
+    /// A column the query does not have is an error too, not a null.
+    /// `row_to_json` writes every column, null ones included, so an absent key
+    /// is a name misspelled here or in the query's alias -- and read as null it
+    /// would turn every `Option` field it fills into `None`, silently.
     pub(super) fn get<V: serde::de::DeserializeOwned>(&self, column: &str) -> Result<V> {
-        let value = self.0.get(column).cloned().unwrap_or_default();
-        serde_json::from_value(value)
+        let value = self.0.get(column).ok_or_else(|| {
+            Error::SchemaCacheLoadFailed(format!("catalog query has no column \"{column}\""))
+        })?;
+        V::deserialize(value)
             .map_err(|e| Error::SchemaCacheLoadFailed(format!("catalog column \"{column}\": {e}")))
     }
 }
 
-/// Run a catalog query, reading each row as [`CatalogRow`].
+/// Run a catalog query, reading each row as [`CatalogRow`], ordered by the
+/// query's output columns `order_by`. Empty where the order does not matter.
 ///
-/// The order of the rows is the query's own: wrapping a subquery in a plain
-/// projection does not re-sort it.
-async fn catalog<T: Tx>(tx: &mut T, sql: &str, params: &[SqlParam]) -> Result<Vec<CatalogRow>> {
-    let wrapped = format!("SELECT row_to_json(pgrst_catalog) FROM ({sql}) AS pgrst_catalog");
-    tx.fetch_values(&wrapped, params)
+/// The query's own `ORDER BY` is not enough. It sorts the subquery the
+/// wrapper reads from, and SQL promises nothing about the order a query
+/// reads a sorted subquery in. PostgreSQL keeps it today, but where a row
+/// order reaches the client (see `load_relationships`) that is not a thing to
+/// lean on. The planner sees that the subquery is already in this order, so
+/// asking again costs no second sort.
+async fn catalog<T: Tx>(
+    tx: &mut T,
+    sql: &str,
+    order_by: &[&str],
+    params: &[SqlParam],
+) -> Result<Vec<CatalogRow>> {
+    tx.fetch_values(&catalog_sql(sql, order_by), params)
         .await
         .map_err(|e| Error::SchemaCacheLoadFailed(e.to_string()))?
         .into_iter()
@@ -65,6 +82,18 @@ async fn catalog<T: Tx>(tx: &mut T, sql: &str, params: &[SqlParam]) -> Result<Ve
             ))),
         })
         .collect()
+}
+
+/// A catalog query, wrapped to return each row as one `json` value, in the
+/// order of its output columns `order_by`. See [`catalog`].
+fn catalog_sql(sql: &str, order_by: &[&str]) -> String {
+    let mut wrapped = format!("SELECT row_to_json(pgrst_catalog) FROM ({sql}) AS pgrst_catalog");
+    for (i, column) in order_by.iter().enumerate() {
+        wrapped.push_str(if i == 0 { " ORDER BY " } else { ", " });
+        wrapped.push_str("pgrst_catalog.");
+        wrapped.push_str(column);
+    }
+    wrapped
 }
 
 /// A text parameter.
@@ -259,7 +288,7 @@ pub async fn load_tables<T: Tx>(tx: &mut T, schemas: &[String]) -> Result<Tables
             visible = relation_visible(),
         )
     });
-    let rows = catalog(tx, &SQL, &[texts(schemas)]).await?;
+    let rows = catalog(tx, &SQL, &["table_schema", "table_name"], &[texts(schemas)]).await?;
 
     for row in rows {
         let schema: String = row.get("table_schema")?;
@@ -420,7 +449,13 @@ async fn load_columns<T: Tx>(
             column_grant = acl_grants("a.attacl", "SELECT,INSERT,UPDATE,REFERENCES"),
         )
     });
-    let rows = catalog(tx, &SQL, &[text(schema), text(table)]).await?;
+    let rows = catalog(
+        tx,
+        &SQL,
+        &["ordinal_position"],
+        &[text(schema), text(table)],
+    )
+    .await?;
 
     // A materialized view has no rows in `information_schema.columns`; its
     // columns come from the catalogue instead.
@@ -516,6 +551,7 @@ pub async fn load_relationships<T: Tx>(tx: &mut T, schemas: &[String]) -> Result
         -- the conformance cases covering it flip between runs.
         ORDER BY ns1.nspname, t1.relname, c.conname
         "#,
+        &["table_schema", "table_name", "constraint_name"],
         &[texts(schemas)],
     )
     .await?;
@@ -669,6 +705,7 @@ async fn load_computed_relationships<T: Tx>(
           AND t.relkind = ANY (ARRAY['r','v','m','f','p'])
           AND f.relkind = ANY (ARRAY['r','v','m','f','p'])
         "#,
+        &[],
         &[texts(schemas)],
     )
     .await?;
@@ -882,6 +919,7 @@ pub async fn load_routines<T: Tx>(tx: &mut T, schemas: &[String]) -> Result<Rout
           )
         ORDER BY n.nspname, p.proname
         "#,
+        &["schema", "name"],
         &[texts(schemas)],
     )
     .await?;
@@ -967,7 +1005,7 @@ pub async fn load_routines<T: Tx>(tx: &mut T, schemas: &[String]) -> Result<Rout
 
 /// Load valid timezone names.
 pub async fn load_timezones<T: Tx>(tx: &mut T) -> Result<HashSet<String>> {
-    let rows = catalog(tx, "SELECT name FROM pg_timezone_names", &[]).await?;
+    let rows = catalog(tx, "SELECT name FROM pg_timezone_names", &[], &[]).await?;
 
     rows.iter().map(|r| r.get("name")).collect()
 }
@@ -1004,6 +1042,7 @@ pub async fn load_media_handlers<T: Tx>(tx: &mut T, schemas: &[String]) -> Resul
           AND t.typtype = 'd'
           AND t.typname LIKE '%/%'
         "#,
+        &[],
         &[texts(schemas)],
     )
     .await?;
@@ -1080,6 +1119,7 @@ async fn load_catalog_columns<T: Tx>(
         WHERE n.nspname = $1 AND c.relname = $2
         ORDER BY a.attnum
         "#,
+        &["ordinal_position"],
         &[text(schema), text(table)],
     )
     .await
@@ -1123,7 +1163,7 @@ pub async fn load_representations<T: Tx>(
             execute = acl_grants("COALESCE(p.proacl, acldefault('f', p.proowner))", "EXECUTE"),
         )
     });
-    let rows = catalog(tx, &SQL, &[]).await?;
+    let rows = catalog(tx, &SQL, &[], &[]).await?;
 
     rows.into_iter()
         .map(|row| {
@@ -1194,6 +1234,7 @@ pub async fn load_computed_columns<T: Tx>(
            AND fn.nspname = ANY($2)
            AND tn.nspname = ANY($1)
         "#,
+        &[],
         &[texts(schemas), texts(function_schemas)],
     )
     .await?;
@@ -1371,6 +1412,7 @@ pub async fn load_view_columns<T: Tx>(tx: &mut T, schemas: &[String]) -> Result<
                                AND NOT col.attisdropped
          WHERE rec.resorigtbl <> 0
         "#,
+        &[],
         &[texts(schemas)],
     )
     .await?;
@@ -1429,6 +1471,7 @@ pub async fn load_unique_constraints<T: Tx>(
         WHERE con.contype IN ('p', 'u')
           AND n.nspname = ANY($1)
         "#,
+        &[],
         &[texts(schemas)],
     )
     .await?;
@@ -1472,6 +1515,7 @@ pub async fn load_primary_keys<T: Tx>(
         WHERE i.indisprimary
           AND n.nspname = ANY($1)
         "#,
+        &[],
         &[texts(schemas)],
     )
     .await?;
@@ -1566,4 +1610,56 @@ pub async fn enum_values(
         .into_iter()
         .filter_map(|(value, comment)| value.map(|v| (v, comment)))
         .collect())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    fn row(value: serde_json::Value) -> CatalogRow {
+        match value {
+            serde_json::Value::Object(map) => CatalogRow(map),
+            other => panic!("not an object: {other}"),
+        }
+    }
+
+    #[test]
+    fn a_null_column_reads_as_none() {
+        let row = row(json!({"description": null}));
+        assert_eq!(row.get::<Option<String>>("description").unwrap(), None);
+    }
+
+    #[test]
+    fn a_column_the_query_does_not_have_fails_the_load() {
+        // A misspelled name: read as null, it would quietly be `None`.
+        let row = row(json!({"description": "a table"}));
+        let error = row.get::<Option<String>>("descripton").unwrap_err();
+        assert!(
+            matches!(&error, Error::SchemaCacheLoadFailed(m) if m.contains("descripton")),
+            "{error:?}"
+        );
+    }
+
+    #[test]
+    fn a_value_of_the_wrong_type_fails_the_load() {
+        let row = row(json!({"is_unique": "yes"}));
+        assert!(matches!(
+            row.get::<bool>("is_unique"),
+            Err(Error::SchemaCacheLoadFailed(_))
+        ));
+    }
+
+    #[test]
+    fn the_wrapper_sorts_by_the_order_it_is_given() {
+        assert_eq!(
+            catalog_sql("SELECT 1 AS a, 2 AS b ORDER BY a", &["a", "b"]),
+            "SELECT row_to_json(pgrst_catalog) FROM (SELECT 1 AS a, 2 AS b ORDER BY a) \
+             AS pgrst_catalog ORDER BY pgrst_catalog.a, pgrst_catalog.b"
+        );
+        assert_eq!(
+            catalog_sql("SELECT 1 AS a", &[]),
+            "SELECT row_to_json(pgrst_catalog) FROM (SELECT 1 AS a) AS pgrst_catalog"
+        );
+    }
 }
