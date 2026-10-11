@@ -37,19 +37,29 @@ const conformance: { candidate: string; full: string; body: string; note: string
   },
 ];
 
-/** Measured side by side on one machine, with the same database and load client. */
-const latency: { what: string; one: string; eight: string }[] = [
-  { what: "Server, point lookup", one: "1.1 ms", eight: "2,981 req/s" },
-  { what: "Worker, point lookup, PostgreSQL asking for SCRAM", one: "54 ms", eight: "22 req/s" },
-  { what: "Worker, point lookup, no password authentication", one: "11 ms", eight: "254 req/s" },
-  { what: "Worker, 25-row page, no password authentication", one: "11 ms", eight: "239 req/s" },
+/** On Cloudflare through a real Hyperdrive: each request's wall time inside the Worker. */
+const cloudflare: { where: string; read: string; write: string }[] = [
+  { where: "Singapore, database in Singapore", read: "41 ms", write: "45 ms" },
+  { where: "Singapore, database in Delhi (80 ms away)", read: "255 ms", write: "318 ms" },
+  { where: "The same, Worker placed in Delhi", read: "170 ms", write: "190 ms" },
+  { where: "London, database in Delhi", read: "428 ms", write: "574 ms" },
+  { where: "Amsterdam, database in Delhi", read: "586 ms", write: "813 ms" },
 ];
 
-/** What pipelining would save per read, by round-trip time to the database. */
-const pipelining: { rtt: string; read: string; write: string }[] = [
-  { rtt: "~1 ms (database in the user's region)", read: "~3-4 ms", write: "~4 ms" },
-  { rtt: "~20 ms (another region)", read: "~60-80 ms", write: "~80 ms" },
-  { rtt: "~60 ms (another continent)", read: "~180-240 ms", write: "~240 ms" },
+/** Statement pipelining, before and after, on Cloudflare. */
+const pipelined: { where: string; rb: string; ra: string; wb: string; wa: string }[] = [
+  { where: "Singapore, database in Singapore", rb: "69 ms", ra: "48 ms", wb: "60 ms", wa: "53 ms" },
+  { where: "Singapore, database in Delhi", rb: "380 ms", ra: "240 ms", wb: "424 ms", wa: "306 ms" },
+  { where: "London, database in Delhi", rb: "869 ms", ra: "428 ms", wb: "836 ms", wa: "574 ms" },
+  { where: "Amsterdam, database in Delhi", rb: "1283 ms", ra: "586 ms", wb: "1266 ms", wa: "813 ms" },
+];
+
+/** The round trip set exactly with tc netem, in local workerd, beside the server. */
+const netem: { rtt: string; rb: string; ra: string; wb: string; wa: string; server: string }[] = [
+  { rtt: "0 ms", rb: "11.5 ms", ra: "10.4 ms", wb: "11.5 ms", wa: "10.7 ms", server: "1.0 ms" },
+  { rtt: "5 ms", rb: "49 ms", ra: "26 ms", wb: "50 ms", wa: "32 ms", server: "34 ms" },
+  { rtt: "20 ms", rb: "155 ms", ra: "72 ms", wb: "156 ms", wa: "93 ms", server: "124 ms" },
+  { rtt: "60 ms", rb: "436 ms", ra: "192 ms", wb: "436 ms", wa: "253 ms", server: "364 ms" },
 ];
 
 const th = "text-left py-3 px-4 font-semibold text-neutral-900";
@@ -217,27 +227,27 @@ export default component$(() => {
           <section class="mb-12">
             <h2 class={h2}>What it costs</h2>
             <p class={p}>
-              Measured on one machine: the server, and the Worker under{" "}
-              <code class={code}>wrangler dev</code>, against the same PostgreSQL with 100,000 rows,
-              with the same requests and the same keep-alive load client. Local workerd is not
-              Cloudflare&rsquo;s edge, and there is no real Hyperdrive in it. These figures show
-              what the Worker&rsquo;s design costs, not production latency.
+              Measured on Cloudflare through a real Hyperdrive, with its query caching off so every
+              request reached the database, from a client in Singapore. Each figure is the
+              request&rsquo;s wall time inside the Worker, as <code class={code}>wrangler tail</code>{" "}
+              reports it, so the client&rsquo;s own distance to Cloudflare is not in it: the median
+              of 64 to 150 point lookups and one-row inserts on the benchmark dataset.
             </p>
             <div class="overflow-x-auto rounded-xl border border-neutral-200 mb-4">
               <table class="w-full text-sm">
                 <thead class="bg-neutral-50">
                   <tr class="border-b border-neutral-200">
-                    <th class={th}>&nbsp;</th>
-                    <th class={th}>One at a time, p50</th>
-                    <th class={th}>8 concurrent</th>
+                    <th class={th}>Where the Worker ran</th>
+                    <th class={th}>Read</th>
+                    <th class={th}>Write</th>
                   </tr>
                 </thead>
                 <tbody class="divide-y divide-neutral-100">
-                  {latency.map((row) => (
-                    <tr key={row.what}>
-                      <td class={`${td} font-medium text-neutral-900`}>{row.what}</td>
-                      <td class={`${td} font-mono`}>{row.one}</td>
-                      <td class={`${td} font-mono`}>{row.eight}</td>
+                  {cloudflare.map((row) => (
+                    <tr key={row.where}>
+                      <td class={`${td} font-medium text-neutral-900`}>{row.where}</td>
+                      <td class={`${td} font-mono`}>{row.read}</td>
+                      <td class={`${td} font-mono`}>{row.write}</td>
                     </tr>
                   ))}
                 </tbody>
@@ -245,20 +255,28 @@ export default component$(() => {
             </div>
             <ul class="list-disc pl-5 text-neutral-600 space-y-3 mb-4">
               <li>
-                <strong class="text-neutral-900">The authentication handshake is most of it.</strong>{" "}
-                Every request opens a connection. With <code class={code}>scram-sha-256</code>, the
-                client derives its key with 4,096 rounds of PBKDF2-SHA-256 in WebAssembly, about 43
-                ms of CPU per request locally. Whether Hyperdrive asks a Worker for SCRAM can only be
-                measured on a real deployment. Measure it against your plan&rsquo;s CPU-time limit
-                before relying on these numbers.
+                <strong class="text-neutral-900">The distance to the database is the cost.</strong>{" "}
+                Connecting to Hyperdrive takes 3 to 6 ms, because Hyperdrive answers the connection
+                near the Worker. Every wait on a statement is a round trip to the database: about 75
+                to 80 ms from Singapore to Delhi.
               </li>
               <li>
-                <strong class="text-neutral-900">Without SCRAM, about 11 ms a request.</strong> That
-                covers WebAssembly, a fresh connection, and the statements a request sends one after
-                another (below).
+                <strong class="text-neutral-900">
+                  Put the Worker near the database when it is far from your users.
+                </strong>{" "}
+                A request waits on the database several times and on the client once.{" "}
+                <code class={code}>[placement]</code> in <code class={code}>wrangler.toml</code>, a
+                region or <code class={code}>mode = "smart"</code>, moves it: placed in Delhi, a read
+                from Singapore went from 255 ms to 170 ms.
               </li>
               <li>
-                <strong class="text-neutral-900">The bundle</strong> is 2.7 MB of WebAssembly, 0.93
+                <strong class="text-neutral-900">CPU is 4 to 11 ms a request.</strong> Hyperdrive
+                does not ask the Worker for a SCRAM exchange, which costs about 43 ms of CPU against a
+                PostgreSQL in local workerd. Workers Free allows 10 ms of CPU a request, so production
+                belongs on Workers Paid.
+              </li>
+              <li>
+                <strong class="text-neutral-900">The bundle</strong> is 2.7 MB of WebAssembly, 0.94
                 MB gzipped, within the free plan&rsquo;s 3 MB.
               </li>
               <li>
@@ -271,84 +289,131 @@ export default component$(() => {
           </section>
 
           <section class="mb-12">
-            <h2 class={h2}>Round trips, and statement pipelining</h2>
+            <h2 class={h2}>Statement pipelining</h2>
             <p class={p}>
-              Each request sends its statements one at a time and waits for each reply before the
-              next. On the server that wait is a local pool, measured in microseconds. From a
-              Worker, each one is a round trip to the database through Hyperdrive.
-            </p>
-            <ul class="list-disc pl-5 text-neutral-600 space-y-2 mb-4">
-              <li>
-                <strong class="text-neutral-900">A read: five.</strong>{" "}
-                <code class={code}>BEGIN</code>, <code class={code}>SET TRANSACTION READ ONLY</code>,
-                the settings (role, claims, request headers), the query,{" "}
-                <code class={code}>COMMIT</code>.
-              </li>
-              <li>
-                <strong class="text-neutral-900">A write or function call: five or six.</strong>{" "}
-                <code class={code}>BEGIN</code>, the settings, the statement, reading back the
-                response headers and status, <code class={code}>COMMIT</code>.
-              </li>
-              <li>
-                <strong class="text-neutral-900">One more each</strong> for a non-default isolation
-                level, <code class={code}>db-pre-request</code>, or{" "}
-                <code class={code}>Prefer: count</code>.
-              </li>
-            </ul>
-            <p class={p}>
-              <strong class="text-neutral-900">Pipelining is planned, not done.</strong> It would send
-              the same statements, in the same order, without waiting between them:
-            </p>
-            <ul class="list-disc pl-5 text-neutral-600 space-y-2 mb-4">
-              <li>
-                <strong class="text-neutral-900">Reads</strong> would take two flights, or one, since
-                a read-only transaction has nothing to commit.
-              </li>
-              <li>
-                <strong class="text-neutral-900">Writes</strong> would take two. The commit still has
-                to wait for the result to be checked, because a singular response that matched
-                several rows must roll back.
-              </li>
-            </ul>
-            <p class={p}>
-              What that saves depends only on the distance to the database. These are projected
-              savings, not measurements:
+              A request sends its statements in as few flights as it can. A read sends{" "}
+              <code class={code}>BEGIN</code>, <code class={code}>SET TRANSACTION READ ONLY</code>,
+              the settings (role, claims, request headers), the query and{" "}
+              <code class={code}>COMMIT</code> in one. A write or a function call sends everything up
+              to reading back its response settings in one, and <code class={code}>COMMIT</code> in a
+              second, once the response is known to be one it can send. Each statement keeps its own
+              sync point, so a failure is reported as if they had been sent one at a time.
             </p>
             <div class="overflow-x-auto rounded-xl border border-neutral-200 mb-4">
               <table class="w-full text-sm">
                 <thead class="bg-neutral-50">
                   <tr class="border-b border-neutral-200">
-                    <th class={th}>Round trip to the database</th>
-                    <th class={th}>Saved per read</th>
-                    <th class={th}>Saved per write</th>
+                    <th class={th}>On Cloudflare</th>
+                    <th class={th}>Read, before</th>
+                    <th class={th}>Read, after</th>
+                    <th class={th}>Write, before</th>
+                    <th class={th}>Write, after</th>
                   </tr>
                 </thead>
                 <tbody class="divide-y divide-neutral-100">
-                  {pipelining.map((row) => (
-                    <tr key={row.rtt}>
-                      <td class={`${td} font-medium text-neutral-900`}>{row.rtt}</td>
-                      <td class={`${td} font-mono`}>{row.read}</td>
-                      <td class={`${td} font-mono`}>{row.write}</td>
+                  {pipelined.map((row) => (
+                    <tr key={row.where}>
+                      <td class={`${td} font-medium text-neutral-900`}>{row.where}</td>
+                      <td class={`${td} font-mono`}>{row.rb}</td>
+                      <td class={`${td} font-mono`}>{row.ra}</td>
+                      <td class={`${td} font-mono`}>{row.wb}</td>
+                      <td class={`${td} font-mono`}>{row.wa}</td>
                     </tr>
                   ))}
                 </tbody>
               </table>
             </div>
             <p class={p}>
-              Pipelining does not shorten the connection handshake, which every request still pays.
-              It is tracked in{" "}
-              <a
-                href="https://github.com/postrust/postrust/issues/50"
-                target="_blank"
-                rel="noopener noreferrer"
-                class={a}
-              >
-                issue #50
-              </a>
-              .
+              Hyperdrive does not pass a pipeline on to the database whole: from Singapore, five
+              statements sent together took about 218 ms against 78 ms for one. The saving is still
+              a third to a half of every request whose database is in another region.
+            </p>
+            <p class={p}>
+              With the round trip set exactly, by delaying every packet the database sends, in local
+              workerd beside the server:
+            </p>
+            <div class="overflow-x-auto rounded-xl border border-neutral-200 mb-4">
+              <table class="w-full text-sm">
+                <thead class="bg-neutral-50">
+                  <tr class="border-b border-neutral-200">
+                    <th class={th}>Added round trip</th>
+                    <th class={th}>Read, before</th>
+                    <th class={th}>Read, after</th>
+                    <th class={th}>Write, before</th>
+                    <th class={th}>Write, after</th>
+                    <th class={th}>Server</th>
+                  </tr>
+                </thead>
+                <tbody class="divide-y divide-neutral-100">
+                  {netem.map((row) => (
+                    <tr key={row.rtt}>
+                      <td class={`${td} font-medium text-neutral-900`}>{row.rtt}</td>
+                      <td class={`${td} font-mono`}>{row.rb}</td>
+                      <td class={`${td} font-mono`}>{row.ra}</td>
+                      <td class={`${td} font-mono`}>{row.wb}</td>
+                      <td class={`${td} font-mono`}>{row.wa}</td>
+                      <td class={`${td} font-mono`}>{row.server}</td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+            <p class={p}>
+              Over a plain connection the pipeline is whole: a read is three round trips (two to
+              connect, one flight) where it was seven. Past a few milliseconds of distance the Worker
+              answers sooner than the server, whose driver waits on every statement.
             </p>
           </section>
 
+          <section class="mb-12">
+            <h2 class={h2}>Cold starts</h2>
+            <p class={p}>
+              The first request in a new isolate, on Cloudflare, timed inside the Worker: a handful
+              of trials each from Singapore, so these are sizes rather than precise figures.
+            </p>
+            <div class="overflow-x-auto rounded-xl border border-neutral-200 mb-4">
+              <table class="w-full text-sm">
+                <thead class="bg-neutral-50">
+                  <tr class="border-b border-neutral-200">
+                    <th class={th}>&nbsp;</th>
+                    <th class={th}>Without KV</th>
+                    <th class={th}>Schema cache in KV</th>
+                  </tr>
+                </thead>
+                <tbody class="divide-y divide-neutral-100">
+                  <tr>
+                    <td class={`${td} font-medium text-neutral-900`}>Database in Singapore</td>
+                    <td class={`${td} font-mono`}>~440 ms</td>
+                    <td class={`${td} font-mono`}>~230 ms</td>
+                  </tr>
+                  <tr>
+                    <td class={`${td} font-medium text-neutral-900`}>Database in Delhi</td>
+                    <td class={`${td} font-mono`}>~2,000 ms</td>
+                    <td class={`${td} font-mono`}>~400 ms</td>
+                  </tr>
+                </tbody>
+              </table>
+            </div>
+            <ul class="list-disc pl-5 text-neutral-600 space-y-3 mb-4">
+              <li>
+                <strong class="text-neutral-900">Keep the KV binding.</strong> Without it, a new
+                isolate reads the catalog itself, one query per table, each a round trip to the
+                database. With it, the isolate reads one KV value.
+              </li>
+              <li>
+                <strong class="text-neutral-900">
+                  An isolate&rsquo;s first request uses 60 to 250 ms of CPU
+                </strong>
+                , against 4 to 11 ms after it, mostly starting the WebAssembly. Workers Free allows 10
+                ms a request.
+              </li>
+              <li>
+                <strong class="text-neutral-900">A reload spreads at KV&rsquo;s pace.</strong> KV is
+                eventually consistent, and a location can serve the previous value for a minute or
+                more after a write.
+              </li>
+            </ul>
+          </section>
           <section class="mb-12">
             <h2 class={h2}>Settings only the Worker has</h2>
             <ul class="list-disc pl-5 text-neutral-600 space-y-3 mb-4">

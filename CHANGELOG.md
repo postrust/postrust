@@ -43,9 +43,33 @@ planned it in phases, and each phase was measured against the one before.
 - `AppConfig::try_from_vars`, to build the configuration from name/value
   pairs rather than the process environment.
 - `SchemaCache` implements `Serialize` and `Deserialize`.
+- **Statement pipelining.** `Tx` gains `queue`, `fetch_json_then` and
+  `fetch_json_and_commit`. `PgSocketDb` uses them to send the statements
+  that set a transaction up, the query, and what follows it in one flight:
+  a read is one flight after connecting, where it was five, and a write two,
+  where it was five or six. sqlx cannot pipeline, so the server runs the
+  same statements one after another, as before. `drivers_agree.rs` holds
+  both drivers to the same order and the same first error, and counts the
+  socket driver's flights.
 - `scripts/conformance/conformance.sh` takes `CONFORMANCE_EXTRA_FEATURES`
   (for example `pg-socket`, which routes REST through the socket driver) and
   `CONFORMANCE_WORKER_BUILD`, which makes the Worker in workerd the candidate.
+
+### Fixed
+
+- **A write the response refuses is rolled back.** `Prefer: max-affected`
+  with `handling=strict`, and a singular `Accept` on a write that touched
+  several rows, were refused after the transaction had been committed, so
+  the client got `PGRST124`/`PGRST116` while every row stayed changed. The
+  transaction now commits only once the response is known to be one the
+  server can send. (Also in #58, for 2.2.x.)
+- **The Worker's schema cache keeps its columns in KV.** `KvStore::put` of a
+  `Serialize` value goes through `serde_wasm_bindgen`, which turns maps into
+  JavaScript `Map`s that KV stores as `{}`. Any isolate that read the cache
+  from KV had tables with no columns, and a filter failed with "No operator
+  matches the given name and argument types". Found on Cloudflare; locally
+  one isolate never reads back what it wrote. The cache is now written as a
+  JSON string, and `worker.sh` restarts workerd to read it back.
 
 ### Changed
 
@@ -72,8 +96,8 @@ replayed in full for every phase and for the final tree.
 
 - **Conformance unchanged:** PostgREST 1424/1499 and Hasura 454/468, case for
   case.
-- **Database tests:** all pass, including the driver differential suite (7
-  tests) and the schema-cache round trip.
+- **Database tests:** all pass, including the driver differential suite (10
+  tests), the schema-cache round trip, and the refused-write rollback (2).
 - **Deployment checks:** Lambda 15/15, e2e 50/50.
 - **semver:** `cargo semver-checks` against 2.2.0 reports no update required
   for every existing stable crate.
@@ -96,11 +120,31 @@ replayed in full for every phase and for the final tree.
   - PostgREST's suite in workerd scores 1422/1499. The difference from the
     server is two explained cases: named prepared statements, and a gzip'd
     empty preflight body.
-  - `worker.sh` passes 28/28.
+  - `worker.sh` passes 30/30.
   - The bundle is 0.93 MB gzipped.
-  - Locally each request costs about 11 ms, or about 54 ms when PostgreSQL
-    asks for SCRAM: 4,096 PBKDF2 rounds in wasm per connection. See
-    `docs/workers.md` for what that does and does not say about production.
+  - **On Cloudflare, through a real Hyperdrive** (query caching off; wall
+    time inside the Worker, from `wrangler tail`; medians of 64-150
+    requests):
+
+    | Where the Worker ran | Read | Write |
+    |---|---|---|
+    | Singapore, database in Singapore | 41 ms | 45 ms |
+    | Singapore, database in Delhi | 255 ms | 318 ms |
+    | The same, Worker placed in Delhi | 170 ms | 190 ms |
+    | London, database in Delhi | 428 ms | 574 ms |
+    | Amsterdam, database in Delhi | 586 ms | 813 ms |
+
+    CPU is 4-11 ms a request: Hyperdrive does not make the Worker do SCRAM,
+    which costs about 43 ms in local workerd. Connecting to Hyperdrive takes
+    3-6 ms.
+  - **Pipelining**, before and after on Cloudflare: a read from Singapore
+    to a database in Delhi 380 -> 240 ms, a write 424 -> 306 ms; from London
+    869 -> 428 and 836 -> 574 ms; from Amsterdam 1283 -> 586 and
+    1266 -> 813 ms; in the database's own region 69 -> 48 and 60 -> 53 ms.
+    Hyperdrive forwards part of a pipeline one statement at a time, so five
+    statements cost about three round trips there. Over a plain connection,
+    with 20 ms added to every round trip (`tc netem`), a read went from 155
+    to 72 ms and a write from 156 to 93 ms, against 124 ms for the server.
 
 
 ## 2.2.1
