@@ -233,6 +233,21 @@ expect "the cron trigger reloads it too" 200 '*' \
 expect "the table the cron found answers" 200 '[]' \
     -- "$URL/later"
 
+echo "==> A fresh isolate, with the schema cache from KV"
+# workerd keeps KV under .wrangler/state in the mounted directory, so a
+# restart is a new isolate -- no cache of its own -- reading what the reload
+# above wrote. A table dropped since is still in that copy, which is how the
+# check knows the cache came from KV and not from the catalog: PostgreSQL
+# refuses the query (PGRST504), where a cache just read from the catalog would
+# not know the table at all (PGRST205).
+docker exec "$PG" psql -q -U postgres -c "DROP TABLE later;" >/dev/null
+docker restart "$WK" >/dev/null
+for _ in $(seq 180); do curl -s -o /dev/null "$URL/_/health" && break; sleep 1; done
+expect "a filter on a typed column, with the cache read from KV" 200 '[{"id":1,"body":"hello"}]' \
+    -- "$URL/notes?id=eq.1"
+expect "the cache was read from KV: it still has the table dropped since" 404 '~PGRST504' \
+    -- "$URL/later"
+
 echo "==> What the writes left behind"
 state=$(docker exec "$PG" psql -U postgres -Atc "SELECT string_agg(id || ':' || owner || ':' || task, ',' ORDER BY id) FROM todos")
 if [ "$state" = "1:alice:alice public,2:alice:alice private,3:bob:bob private,4:alice:new" ]; then
