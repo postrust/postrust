@@ -209,8 +209,13 @@ the benchmark dataset:
 ### Statement pipelining
 
 A request sends its statements in as few flights as it can, rather than one
-at a time. A read sends `BEGIN`, `SET TRANSACTION READ ONLY`, its settings,
-the query and `COMMIT` in one flight. A write or a function call sends
+at a time. A plain read sends `BEGIN`, `SET TRANSACTION READ ONLY`, its
+settings, the query and `COMMIT` in one flight -- a `GET` to a function too,
+and with a pre-request function configured the read-back of the response
+settings it may have set goes in the same flight. A read with more to do
+after its query -- a count, or a media type the schema renders -- takes a
+flight or two more, since it commits only once its last statement has
+answered. A write or a `POST` to a function sends
 `BEGIN`, the settings, the statement and the read-back of its response
 settings in one flight, and `COMMIT` in a second, once the response is known
 to be one it can send. Each statement still has its own `Sync`: when one
@@ -218,7 +223,11 @@ fails, PostgreSQL refuses the rest of the transaction, and the error reported
 is the first one, as if they had been sent one at a time.
 
 Before and after, on Cloudflare, by where the Worker ran (the database in
-Delhi unless noted):
+Delhi unless noted). These were measured as an A/B pair on one hostname, in
+a run of their own, so an "after" figure need not match the table above: the
+Singapore rows here read 240/306 ms and 48/53 ms where that table, from
+another run, reads 255/318 ms and 41/45 ms. The difference is the spread
+between runs, not a change:
 
 | | Read, before | Read, after | Write, before | Write, after |
 |---|---|---|---|---|
@@ -229,8 +238,9 @@ Delhi unless noted):
 
 Hyperdrive does not pass a pipeline on to the database whole. From Singapore,
 five statements sent together took about 218 ms against 78 ms for one: about
-three round trips, not one. The saving is still a third to a half of every
-request whose database is in another region.
+three round trips, not one. With the database in another region a read
+still came out 37-54% faster and a write 28-36% faster; in the database's
+own region, 30% for a read and 12% for a write.
 
 With the round trip set exactly, by delaying every packet the database sends
 (`tc netem`, local workerd, same machine and database for all three):
@@ -242,14 +252,15 @@ With the round trip set exactly, by delaying every packet the database sends
 | 20 ms | 155 ms | 72 ms | 156 ms | 93 ms | 124 ms |
 | 60 ms | 436 ms | 192 ms | 436 ms | 253 ms | 364 ms |
 
-Over a plain connection the pipeline is whole: a read is three round trips
-(two to connect, and the one flight) where it was seven.
+Over a plain connection the pipeline is whole: a plain read is three round
+trips (two to connect, and the one flight) where it was seven.
 Past a few milliseconds of distance the Worker answers sooner than the server
 does, because sqlx waits on every statement.
 
 The native server is unaffected by any of this. Its throughput was measured
-against 2.2.1 before and after the change and is the same, within the noise
-of the host (see the CHANGELOG).
+before and after the change, against the tree it started from (2.2.0 with
+the GraphQL fixes that ship beside it in 2.3.0), and is the same, within the
+noise of the host (see the CHANGELOG).
 
 ### Cold starts
 

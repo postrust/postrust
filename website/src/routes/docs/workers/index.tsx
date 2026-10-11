@@ -281,9 +281,9 @@ export default component$(() => {
               </li>
               <li>
                 <strong class="text-neutral-900">The server is unaffected.</strong> Separating the
-                pipeline from its driver was measured against 2.2.1 on pinned cores, six alternating
-                rounds per build: throughput within the noise of the host on every scenario, and the
-                binary 1.0% larger.
+                pipeline from its driver was measured against the tree it started from on pinned
+                cores, six alternating rounds per build: throughput within the noise of the host on
+                every scenario, and the binary 1.0% larger.
               </li>
             </ul>
           </section>
@@ -291,13 +291,21 @@ export default component$(() => {
           <section class="mb-12">
             <h2 class={h2}>Statement pipelining</h2>
             <p class={p}>
-              A request sends its statements in as few flights as it can. A read sends{" "}
+              A request sends its statements in as few flights as it can. A plain read sends{" "}
               <code class={code}>BEGIN</code>, <code class={code}>SET TRANSACTION READ ONLY</code>,
               the settings (role, claims, request headers), the query and{" "}
-              <code class={code}>COMMIT</code> in one. A write or a function call sends everything up
+              <code class={code}>COMMIT</code> in one &mdash; a <code class={code}>GET</code> to a
+              function too. A read with a count, or a media type the schema renders, takes a flight or
+              two more. A write or a <code class={code}>POST</code> to a function sends everything up
               to reading back its response settings in one, and <code class={code}>COMMIT</code> in a
               second, once the response is known to be one it can send. Each statement keeps its own
               sync point, so a failure is reported as if they had been sent one at a time.
+            </p>
+            <p class={p}>
+              Before and after were measured as an A/B pair on one hostname, in a run of their own,
+              so an &ldquo;after&rdquo; figure need not match the table above: from Singapore it
+              reads 240 and 306 ms here against 255 and 318 ms there, and 48 and 53 ms against 41
+              and 45 ms in the database&rsquo;s own region. That is the spread between runs.
             </p>
             <div class="overflow-x-auto rounded-xl border border-neutral-200 mb-4">
               <table class="w-full text-sm">
@@ -325,8 +333,9 @@ export default component$(() => {
             </div>
             <p class={p}>
               Hyperdrive does not pass a pipeline on to the database whole: from Singapore, five
-              statements sent together took about 218 ms against 78 ms for one. The saving is still
-              a third to a half of every request whose database is in another region.
+              statements sent together took about 218 ms against 78 ms for one. With the database in
+              another region a read still came out 37&ndash;54% faster and a write 28&ndash;36%
+              faster; in its own region, 30% for a read and 12% for a write.
             </p>
             <p class={p}>
               With the round trip set exactly, by delaying every packet the database sends, in local
@@ -359,7 +368,7 @@ export default component$(() => {
               </table>
             </div>
             <p class={p}>
-              Over a plain connection the pipeline is whole: a read is three round trips (two to
+              Over a plain connection the pipeline is whole: a plain read is three round trips (two to
               connect, one flight) where it was seven. Past a few milliseconds of distance the Worker
               answers sooner than the server, whose driver waits on every statement.
             </p>
