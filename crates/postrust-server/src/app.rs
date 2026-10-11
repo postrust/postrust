@@ -167,7 +167,7 @@ async fn process_request(
     let plan = create_action_plan(&api_request, &schema_cache)?;
 
     // Execute plan
-    let result = execute_plan(
+    let (result, tx) = execute_plan(
         &state,
         &api_request,
         &plan,
@@ -191,6 +191,17 @@ async fn process_request(
         }
         other => postrust_core::Error::Internal(other.to_string()),
     })?;
+
+    // The transaction commits last, once nothing is left that can refuse the
+    // request. A write the client is told failed -- more rows than
+    // `max-affected` allowed, several where it asked for one object -- must
+    // not have happened, and PostgREST rolls it back. Committed any earlier, it
+    // stayed written behind the error.
+    if let Some(tx) = tx {
+        tx.commit()
+            .await
+            .map_err(|e| postrust_core::Error::ConnectionPool(e.to_string()))?;
+    }
 
     Ok(build_response(response))
 }
@@ -402,13 +413,23 @@ fn jwt_error(error: postrust_auth::JwtError) -> postrust_core::Error {
 }
 
 /// Execute an action plan.
+///
+/// Returns the transaction it ran in, still open, for the caller to commit
+/// once the response is known to be one it can send. `None` where no
+/// statement ran.
 async fn execute_plan(
     state: &AppState,
     api_request: &ApiRequest,
     plan: &ActionPlan,
     auth: &postrust_auth::AuthResult,
     added_join_columns: &[String],
-) -> Result<QueryResult, postrust_core::Error> {
+) -> Result<
+    (
+        QueryResult,
+        Option<sqlx::Transaction<'static, sqlx::Postgres>>,
+    ),
+    postrust_core::Error,
+> {
     match plan {
         ActionPlan::Db(db_plan) => {
             // A media type the schema renders itself replaces the whole
@@ -643,7 +664,7 @@ async fn execute_plan(
             )?;
 
             if !query.has_main() {
-                return Ok(QueryResult::default());
+                return Ok((QueryResult::default(), None));
             }
 
             let (mut sql, params) = query.build_main();
@@ -1184,15 +1205,15 @@ async fn execute_plan(
                     total,
                 );
 
-                tx.commit()
-                    .await
-                    .map_err(|e| postrust_core::Error::ConnectionPool(e.to_string()))?;
-                return Ok(QueryResult {
-                    status: StatusCode::OK,
-                    raw_body: Some((media_type, body)),
-                    content_range: Some(content_range),
-                    ..QueryResult::default()
-                });
+                return Ok((
+                    QueryResult {
+                        status: StatusCode::OK,
+                        raw_body: Some((media_type, body)),
+                        content_range: Some(content_range),
+                        ..QueryResult::default()
+                    },
+                    Some(tx),
+                ));
             }
 
             let mut json_rows: Vec<serde_json::Value> = rows
@@ -1289,12 +1310,6 @@ async fn execute_plan(
                 }
                 _ => None,
             };
-
-            // Reads take no locks worth holding and write plans commit their
-            // work, so the transaction is committed either way.
-            tx.commit()
-                .await
-                .map_err(|e| postrust_core::Error::ConnectionPool(e.to_string()))?;
 
             // Drop columns that were only selected to join the embeds.
             //
@@ -1469,7 +1484,7 @@ async fn execute_plan(
                 )));
             }
 
-            Ok(QueryResult {
+            let result = QueryResult {
                 // A status the function set outright wins: it knows things
                 // about the outcome that the request's shape cannot say.
                 status: match (guc_status, returns_void) {
@@ -1494,7 +1509,10 @@ async fn execute_plan(
                 guc_headers,
                 raw_body: geojson_body,
                 ..Default::default()
-            })
+            };
+            // Committed by the caller, once the response is known to be one
+            // it can send: refusals still to come undo the write.
+            Ok((result, Some(tx)))
         }
         ActionPlan::Info(info_plan) => {
             use postrust_core::plan::InfoPlan;
@@ -1525,11 +1543,14 @@ async fn execute_plan(
                 }
             };
 
-            Ok(QueryResult {
-                status: StatusCode::OK,
-                rows: vec![response_data],
-                ..Default::default()
-            })
+            Ok((
+                QueryResult {
+                    status: StatusCode::OK,
+                    rows: vec![response_data],
+                    ..Default::default()
+                },
+                None,
+            ))
         }
     }
 }

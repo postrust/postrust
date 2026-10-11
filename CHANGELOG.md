@@ -3,6 +3,21 @@
 Notable changes, newest first. This file starts at 1.0.0-alpha.1; earlier
 releases are described by their tags and the pull requests behind them.
 
+## Unreleased
+
+### Fixed
+
+- **A write the response refuses is rolled back.** Two refusals can only be
+  made after the statement has run, because they are about what it did:
+  `Prefer: max-affected=N` with `handling=strict` when more than N rows were
+  touched (`PGRST124`), and `Accept: application/vnd.pgrst.object+json` when
+  a write touched more than one row (`PGRST116`). The transaction was
+  committed before either check, so the client was told the request failed
+  while every row stayed changed. PostgREST rolls these back, and now so does
+  Postrust: the transaction commits only once the response is known to be one
+  it can send. `crates/postrust-server/tests/refused_writes_roll_back.rs`
+  covers both.
+
 ## 2.2.0
 
 A minor release: additions to the public Rust API (`postrust_server::build`,
