@@ -299,10 +299,11 @@ export default component$(() => {
             of them at the same version are known to work together, so pin them to the same
             version in your{" "}
             <code class="px-1 py-0.5 bg-white border border-neutral-200 rounded">Cargo.toml</code>.{" "}
-            <code class="px-1 py-0.5 bg-white border border-neutral-200 rounded">postrust-proxy</code>{" "}
-            and{" "}
             <code class="px-1 py-0.5 bg-white border border-neutral-200 rounded">postrust-worker</code>{" "}
-            are each on their own 0.x line, with no stability promise. Both lines are
+            keeps semver on a version of its own, over its configuration, bindings and
+            endpoints;{" "}
+            <code class="px-1 py-0.5 bg-white border border-neutral-200 rounded">postrust-proxy</code>{" "}
+            is on its own 0.x line, with no stability promise. All of them are
             published together from the same{" "}
             <code class="px-1 py-0.5 bg-white border border-neutral-200 rounded">v*</code> tags.
           </p>

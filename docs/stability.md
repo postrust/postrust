@@ -11,33 +11,48 @@ honestly describe both.
 | Line | Crates | Promise |
 | --- | --- | --- |
 | **Stable** | `postrust-core`, `postrust-sql`, `postrust-auth`, `postrust-response`, `postrust-engine`, `postrust-graphql`, `postrust-server`, `postrust-lambda` | Semver. A breaking change to the public Rust API needs a major bump. |
-| **Unstable** | `postrust-proxy`, `postrust-worker` | None. Each on its own `0.x`, where a minor bump may break anything. |
+| **Stable, versioned on its own** | `postrust-worker` (from 1.0.0) | Semver, over its configuration and behaviour rather than a Rust API. See below. |
+| **Unstable** | `postrust-proxy` | None. On its own `0.x`, where a minor bump may break anything. |
 
-Nothing in the stable line depends on either unstable crate, so no crate that
+Nothing in the stable line depends on the unstable crate, so no crate that
 makes a semver promise carries a dependency that cannot keep one.
 `postrust-proxy` depends on `postrust-core`, not the other way round, and
 `postrust-worker` is built as a `cdylib`, which cannot be a Rust library
 dependency at all.
 
-Both lines release on the same git tags. A tag publishes whatever version each
-crate currently declares and skips what is already on crates.io, so the proxy
-is not dragged along to a version it has not earned.
+Every line releases on the same git tags. A tag publishes whatever version
+each crate currently declares and skips what is already on crates.io, so the
+proxy is not dragged along to a version it has not earned, and the worker
+keeps a number of its own.
 
-One wrinkle from the transition: both unstable crates were published at
-`1.0.0-alpha.1` and `1.0.0-alpha.2` before the split, and that `1.0.0` line
-will never get a stable successor for either. Both are prereleases, so Cargo
-will not select them by default — `cargo add postrust-proxy` resolves to the
-newest `0.x`. Only an explicit request reaches code that predates the split.
+One wrinkle from the transition: both `postrust-proxy` and `postrust-worker`
+were published at `1.0.0-alpha.1` and `1.0.0-alpha.2` before the split. Those
+are prereleases, so Cargo does not select them by default, and they predate
+the split. For the proxy, that `1.0.0` line will never get a stable successor;
+`cargo add postrust-proxy` resolves to the newest `0.x`. The worker's stable
+`1.0.0` is not those prereleases' successor either: it is the Workers adapter
+released in 2.3.0 as `0.7.0`, and shares nothing with them but a name.
 
-## Why the worker is held back
+## What the worker promises
 
-`postrust-worker` works: it serves the REST API in a Worker, over Hyperdrive,
-and is tested in workerd and against PostgREST's suite (see
-[workers.md](workers.md)). What is not settled is its surface, which is not
-Rust at all but configuration and behaviour: the KV key and record a schema
-cache is kept under, the `/_/reload` endpoint, the row ceiling it applies by
-default, and the `worker` crate it builds against, which is itself `0.x`.
-Those should meet a few deployments before they are promised.
+`postrust-worker` is not used as a Rust library -- a Worker is built from it
+-- so its surface is configuration and behaviour, and that is what its semver
+covers from 1.0.0. A change that would break a deployment that upgrades
+without touching its `wrangler.toml` needs a major version:
+
+- **Configuration.** The variables it reads (the server's `PGRST_*` names it
+  documents, and `PGRST_WORKER_SCHEMA_TTL`), what each means, and their
+  defaults -- the 1000-row ceiling included.
+- **Bindings and secrets.** The names it looks for: `HYPERDRIVE`, the KV
+  namespace `POSTRUST_SCHEMA_CACHE`, the `POSTRUST_RELOAD_SECRET` secret, and
+  what a Cron Trigger does.
+- **Endpoints.** The REST API under the same rules as the server, `/_/health`
+  and the authenticated `POST /_/reload`.
+
+Not covered: the KV key and record the schema cache is kept under, which carry
+the worker's and `postrust-core`'s versions and are rebuilt from the database
+when they do not match, and the `worker` crate it builds against, which is
+itself `0.x` and does not appear in the Worker's surface.
 
 ## Why the proxy is held back
 
@@ -86,7 +101,8 @@ does not need 3.0.0.
 
 Not covered:
 
-- `postrust-proxy` and `postrust-worker`, entirely.
+- `postrust-proxy`, entirely, and `postrust-worker`'s Rust items: it is
+  promised as a Worker (above), not as a library.
 - Anything reachable only through a `#[doc(hidden)]` item or a private module.
 - The exact wording of error messages, and log output.
 - Behaviour under configurations the documentation calls unsupported.

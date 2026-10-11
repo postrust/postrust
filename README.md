@@ -482,20 +482,18 @@ Postrust crates at the same version work together. Browse them at
 | `postrust-response` | Response formatting (JSON, CSV, OpenAPI) | [crates.io](https://crates.io/crates/postrust-response) · [docs](https://docs.rs/postrust-response) |
 | `postrust-graphql` | GraphQL API with dynamic schema generation | [crates.io](https://crates.io/crates/postrust-graphql) · [docs](https://docs.rs/postrust-graphql) |
 | `postrust-lambda` | AWS Lambda adapter | [crates.io](https://crates.io/crates/postrust-lambda) · [docs](https://docs.rs/postrust-lambda) |
-| `postrust-worker` | Cloudflare Workers adapter (REST over Hyperdrive) — **`0.x`, no stability promise** | [crates.io](https://crates.io/crates/postrust-worker) · [docs](https://docs.rs/postrust-worker) |
+| `postrust-worker` | Cloudflare Workers adapter (REST over Hyperdrive) — **1.x, its own version** | [crates.io](https://crates.io/crates/postrust-worker) · [docs](https://docs.rs/postrust-worker) |
 | `postrust-proxy` | Reverse proxy with load balancing and automatic TLS — **`0.x`, no stability promise** | [guide](docs/proxy.md) · [crates.io](https://crates.io/crates/postrust-proxy) · [docs](https://docs.rs/postrust-proxy) |
 
-The first eight crates share one version and one semver promise. The last two
-are each on their own `0.x` line and carry none:
+The first eight crates share one version and one semver promise.
+`postrust-worker` keeps semver on a version of its own, over what a deployment
+sees -- its configuration, bindings and endpoints -- rather than a Rust API.
+`postrust-proxy` is on its own `0.x` line and carries none: it is useful and
+measured — h2spec, Autobahn, and the HTTP Garden differential fuzzer — but
+parts of its public surface are undocumented, and a shared version number would
+promise a stability it cannot keep.
 
-- `postrust-proxy` is useful and measured — h2spec, Autobahn, and the HTTP
-  Garden differential fuzzer — but parts of its public surface are
-  undocumented, and a shared version number would promise a stability it
-  cannot keep.
-- `postrust-worker` works, but its deployment surface -- the KV record, the
-  reload endpoint, its defaults -- has not met real deployments yet.
-
-Nothing in the stable line depends on either. See
+Nothing in the stable line depends on the proxy. See
 [Stability and Versioning](docs/stability.md).
 
 ## Development

@@ -9,6 +9,7 @@ import {
   hasuraAgreement,
 } from "~/data/hasura-conformance";
 
+const LATEST = "2.3.1";
 const VERSION = "2.3.0";
 
 const minorAdded = [
@@ -45,7 +46,7 @@ const patch = [
   },
   {
     title: "__typename inside a relationship or an aggregate",
-    body: "Asking for __typename anywhere below the root — on an object or array relationship, the rows a mutation returned, or inside an aggregate's functions such as max { __typename id } — failed the whole query with column \"__typename\" does not exist; only the root and aggregate nodes answered it. Apollo Client adds __typename to every selection set by default, and a Federation router asks for it on every entity reference it follows, so a query that crossed from one subgraph to another through a relationship failed. It is now answered by the schema, as it is at the root.",
+    body: 'Asking for __typename anywhere below the root — on an object or array relationship, the rows a mutation returned, or inside an aggregate\'s functions such as max { __typename id } — failed the whole query with column "__typename" does not exist; only the root and aggregate nodes answered it. Apollo Client adds __typename to every selection set by default, and a Federation router asks for it on every entity reference it follows, so a query that crossed from one subgraph to another through a relationship failed. It is now answered by the schema, as it is at the root.',
   },
   {
     title: "A GraphQL token that does not verify is refused",
@@ -93,41 +94,61 @@ export default component$(() => {
         <div class="container-wide py-12">
           <div class="mb-4 flex items-center gap-3">
             <span class="rounded border border-neutral-200 bg-neutral-100 px-2 py-0.5 text-xs font-semibold text-neutral-800">
-              MINOR
+              PATCH
             </span>
-            <span class="text-sm text-neutral-500">
-              Cloudflare Workers, refused writes rolled back, two GraphQL fixes
-            </span>
+            <span class="text-sm text-neutral-500">postrust-worker 1.0.0</span>
           </div>
           <h1 class="mb-4 text-4xl font-bold text-neutral-900">
-            Postrust {VERSION}
+            Postrust {LATEST}
           </h1>
-          <p class="max-w-2xl text-lg text-neutral-600">
+          <p class="mb-4 max-w-2xl text-lg text-neutral-600">
             The{" "}
-            <Link href="/docs/workers/" class="text-primary-600 hover:underline">
+            <Link
+              href="/docs/workers/"
+              class="text-primary-600 hover:underline"
+            >
+              Cloudflare Workers adapter
+            </Link>{" "}
+            is released as <code class="text-base">postrust-worker</code> 1.0.0,
+            and keeps semver from here, on a version of its own. Its promise
+            covers what a deployment sees rather than a Rust API: the variables
+            it reads, the bindings it looks for, its endpoints and defaults.
+            Nothing else changed; the other crates and the images carry{" "}
+            {VERSION}&rsquo;s code as {LATEST}.
+          </p>
+          <p class="max-w-2xl text-lg text-neutral-600">
+            {VERSION}: the{" "}
+            <Link
+              href="/docs/workers/"
+              class="text-primary-600 hover:underline"
+            >
               Cloudflare Workers adapter
             </Link>{" "}
             serves the REST API over Hyperdrive, on the server&rsquo;s own
             request pipeline. A write the response refuses is rolled back, as
-            PostgREST rolls it back. And two GraphQL fixes, found by running
-            two Postrust subgraphs behind Apollo Router for{" "}
+            PostgREST rolls it back. And two GraphQL fixes, found by running two
+            Postrust subgraphs behind Apollo Router for{" "}
             <Link
               href="/blog/postgresql-apollo-federation-subgraph/"
               class="text-primary-600 hover:underline"
             >
               a post on Federation
             </Link>
-            , first cut as 2.2.1 and released here instead. No breaking
-            change: <code class="text-base">cargo semver-checks</code> against
-            2.2.0 passes for every stable crate. 2.2.0, below, is the release
-            that made AWS Lambda and a{" "}
-            <code class="text-base">NOINHERIT</code> authenticator work.
+            , first cut as 2.2.1 and released here instead. No breaking change:{" "}
+            <code class="text-base">cargo semver-checks</code> against 2.2.0
+            passes for every stable crate. 2.2.0, below, is the release that
+            made AWS Lambda and a <code class="text-base">NOINHERIT</code>{" "}
+            authenticator work.
           </p>
         </div>
       </div>
 
       <div class="container-wide py-12">
         <div class="max-w-3xl">
+          <h2 class="mb-8 text-3xl font-bold text-neutral-900">
+            Postrust {VERSION}
+          </h2>
+
           {/* The minor release */}
           <section class="mb-12">
             <h2 class="mb-4 text-2xl font-bold text-neutral-900">
@@ -172,10 +193,6 @@ export default component$(() => {
               &ldquo;5&ndash;20 ms cold starts&rdquo;, a ~5 MB binary.
             </p>
           </section>
-
-          <h2 class="mb-8 border-t border-neutral-200 pt-12 text-3xl font-bold text-neutral-900">
-            Postrust 2.2.0
-          </h2>
 
           {/* The numbers */}
           <section class="mb-12">
@@ -231,11 +248,18 @@ export default component$(() => {
                 {hasuraConformanceMeta.commit.slice(0, 7)}
               </code>
               . This page reads them from the run&rsquo;s own record, so they
-              move when the suites are re-run and not otherwise. Both suites
-              were re-run on this release&rsquo;s code and reproduce these
-              figures case for case. Both connect as a superuser, which is
-              exactly why neither could see the authenticator problem this
-              release fixes; a test of its own now does.
+              move when the suites are re-run and not otherwise. Both were run
+              on this release&rsquo;s code, and score what 2.2.0 scored. Through
+              the socket driver the Worker uses, PostgREST&rsquo;s suite agrees
+              on every case but one, a function that asks whether it runs as a
+              named prepared statement; see{" "}
+              <Link
+                href="/docs/conformance/postgrest/"
+                class="text-primary-600 hover:underline"
+              >
+                the conformance notes
+              </Link>
+              .
             </p>
             <p class="mb-4 text-neutral-600">
               Neither harness interprets a test expectation. The reference
@@ -258,6 +282,10 @@ export default component$(() => {
               someone else to find.
             </p>
           </section>
+
+          <h2 class="mb-8 border-t border-neutral-200 pt-12 text-3xl font-bold text-neutral-900">
+            Postrust 2.2.0
+          </h2>
 
           {/* Transports */}
           <section class="mb-12">

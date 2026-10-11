@@ -3,6 +3,26 @@
 Notable changes, newest first. This file starts at 1.0.0-alpha.1; earlier
 releases are described by their tags and the pull requests behind them.
 
+## 2.3.1
+
+**`postrust-worker` 1.0.0.** The Cloudflare Workers adapter released in 2.3.0
+as 0.7.0 keeps semver from here, on a version of its own. Its promise covers
+what a deployment sees rather than a Rust API -- the variables it reads and
+their defaults, the `HYPERDRIVE` and `POSTRUST_SCHEMA_CACHE` bindings, the
+`POSTRUST_RELOAD_SECRET` secret, `/_/health` and `POST /_/reload` -- so a
+change that would break a `wrangler.toml` nobody touched needs 2.0.0. The KV
+record the schema cache is kept under is not part of it. See
+`docs/stability.md`. It is unrelated to the `1.0.0-alpha` prereleases
+published before the crates split into lines.
+
+Nothing else changed. The other crates and the images carry 2.3.0's code as
+2.3.1, and `postrust-proxy` stays at 0.6.0.
+
+### Measured
+
+- The website's conformance figures are from runs on 2.3.0's code (commit
+  `98ec7a1`): PostgREST 1424/1499 and Hasura 454/468, as on 2.2.0.
+
 ## 2.3.0
 
 A minor release: additions to the public Rust API -- a new crate,

@@ -44,8 +44,8 @@ export const conformanceMeta = {
   postgrest: "v16.1",
   features: "admin-ui,compat-key-order",
   compatMode: true,
-  commit: "c0dbe0045aa9ba4203ac400dae36cd432b522670",
-  measured: "2026-09-09",
+  commit: "98ec7a12560eb0c35b55ad9b0d85bb95be99bbb3",
+  measured: "2026-10-11",
   cases: 1499,
 } as const;
 
@@ -143,8 +143,8 @@ export const worstSpecs = [
   },
   {
     spec: "Query/QuerySpec.hs",
-    total: 302,
-    passed: 287,
+    total: 301,
+    passed: 286,
     pct: 95,
   },
   {

@@ -470,9 +470,10 @@ export default component$(() => {
               .
             </p>
             <p class={p}>
-              <code class={code}>postrust-worker</code> is on its own <code class={code}>0.x</code>{" "}
-              line. The request pipeline underneath it is the stable one; what is not settled yet is
-              the Worker&rsquo;s own surface: the KV record, the reload endpoint, its defaults.
+              <code class={code}>postrust-worker</code> is stable from 1.0.0, on a version of its
+              own. Its semver covers what a deployment sees rather than a Rust API: the variables it
+              reads, the bindings it looks for, its endpoints and defaults. A change that would break
+              a <code class={code}>wrangler.toml</code> nobody touched needs 2.0.0.
             </p>
           </section>
 

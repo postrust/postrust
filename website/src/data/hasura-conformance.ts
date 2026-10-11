@@ -31,8 +31,8 @@ export const hasuraConformanceMeta = {
   hasura: "v2.50.1",
   features: "admin-ui,compat-key-order",
   referenceReused: false,
-  commit: "c0dbe0045aa9ba4203ac400dae36cd432b522670",
-  measured: "2026-09-09",
+  commit: "98ec7a12560eb0c35b55ad9b0d85bb95be99bbb3",
+  measured: "2026-10-11",
   cases: 468,
   groups: 59,
 } as const;

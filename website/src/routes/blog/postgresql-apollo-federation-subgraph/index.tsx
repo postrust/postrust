@@ -154,7 +154,7 @@ CREATE POLICY everything ON reviews FOR SELECT TO editor USING (true);`}
   -e PGRST_GRAPHQL_TYPE_PREFIX=catalog \\
   -e PGRST_GRAPHQL_METADATA=/config/metadata.json \\
   -v ./catalog.json:/config/metadata.json:ro \\
-  postrust/postrust:2.3.0`}
+  postrust/postrust:2.3.1`}
     />
     <p class={p}>
       <code class={code}>PGRST_GRAPHQL_FEDERATION</code> turns on{" "}
