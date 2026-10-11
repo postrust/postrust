@@ -12,8 +12,10 @@ PostgreSQL through [Hyperdrive](https://developers.cloudflare.com/hyperdrive/).
   switches to the token's role and sets its claims before anything else. The
   login role should be a `NOINHERIT` authenticator, as PostgREST recommends,
   so row-level security applies exactly as it does on the server.
-- **Unstable.** The crate is on its own `0.x` line with no stability promise
-  yet. See [stability.md](stability.md).
+- **Stable from 1.0.0.** Semver covers what a deployment sees: the variables
+  it reads, the bindings it looks for, its endpoints and defaults. A change
+  that would break a `wrangler.toml` that is not touched needs 2.0.0. See
+  [stability.md](stability.md#what-the-worker-promises).
 
 ## How it is tested
 

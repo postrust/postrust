@@ -1,9 +1,9 @@
 [package]
 name = "postrust-worker"
-# Deliberately NOT `version.workspace = true`. This adapter is new, and runs in
-# a runtime the rest of the workspace does not; it makes no stability promise
-# yet. See docs/stability.md.
-version = "0.7.0"
+# Deliberately NOT `version.workspace = true`. Its semver is over what a
+# deployment sees -- configuration, bindings, endpoints -- not a Rust API, so
+# it keeps a number of its own. See docs/stability.md.
+version = "1.0.0"
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true

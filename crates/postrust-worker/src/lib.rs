@@ -29,7 +29,8 @@
 //! `PGRST_DB_ANON_ROLE`, `PGRST_JWT_SECRET`, ...), set as Worker variables or
 //! secrets. See docs/workers.md.
 //!
-//! The crate is on its own `0.x` line. See docs/stability.md.
+//! Its semver covers what a deployment sees, not Rust items: see
+//! docs/stability.md.
 
 // The Worker itself is wasm32-only: a Worker's sockets, bindings and futures
 // are JavaScript objects. What it decides without them is in `settings`,

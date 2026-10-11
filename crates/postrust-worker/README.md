@@ -20,7 +20,9 @@ Setup, configuration, measured costs and limits:
 The crate is built with `worker-build` for `wasm32-unknown-unknown`; for any
 other target it is only its configuration logic, there to be unit-tested.
 
-This crate is on its own `0.x` line and makes no stability promise yet. See
+From 1.0.0 this crate keeps semver over what a deployment sees -- the
+variables it reads, the bindings it looks for, its endpoints and defaults --
+on a version of its own. See
 [docs/stability.md](https://github.com/postrust/postrust/blob/main/docs/stability.md).
 
 ## Part of Postrust
