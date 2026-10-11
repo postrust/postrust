@@ -91,17 +91,27 @@ jobs:
       # A crate that compiles C (ring, aws-lc-sys), needs tokio's networking
       # (mio) or is sqlx can build here by accident -- the runner has clang --
       # and still fail where a Worker is built. None of them may be in the
-      # wasm32 graph at all.
+      # wasm32 graph at all. The graph is listed once and searched, rather
+      # than asked about each crate with `cargo tree -i`: that fails outright
+      # when two versions of a crate are locked ("specification is
+      # ambiguous"), and a failure must not read as "absent".
       - name: No native-only crates in the wasm32 graph
         run: |
+          graph=$(cargo tree --locked --target wasm32-unknown-unknown -e normal \
+                    -p postrust-worker --prefix none) || {
+            echo "::error::cargo tree failed, so the wasm32 graph was not checked"
+            exit 1
+          }
+          status=0
           for krate in ring aws-lc-sys aws-lc-rs mio sqlx sqlx-core; do
-            if cargo tree --locked --target wasm32-unknown-unknown -e normal \
-                 -p postrust-worker -i "$krate" 2>/dev/null | grep -q .; then
+            if grep -q "^$krate v" <<<"$graph"; then
               echo "::error::$krate is in the wasm32 dependency graph"
-              cargo tree --locked --target wasm32-unknown-unknown -e normal -p postrust-worker -i "$krate"
-              exit 1
+              cargo tree --locked --target wasm32-unknown-unknown -e normal \
+                -p postrust-worker -i "$krate@$(grep -m1 "^$krate v" <<<"$graph" | cut -d' ' -f2 | tr -d v)"
+              status=1
             fi
           done
+          exit $status
 
   audit:
     name: dependency audit
