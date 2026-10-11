@@ -5,6 +5,7 @@ members = [
     "crates/postrust-sql",
     "crates/postrust-auth",
     "crates/postrust-response",
+    "crates/postrust-engine",
     "crates/postrust-server",
     "crates/postrust-lambda",
     "crates/postrust-worker",
@@ -153,6 +154,7 @@ postrust-core = { version = "2.2.1", path = "crates/postrust-core", default-feat
 postrust-sql = { version = "2.2.1", path = "crates/postrust-sql" }
 postrust-auth = { version = "2.2.1", path = "crates/postrust-auth" }
 postrust-response = { version = "2.2.1", path = "crates/postrust-response" }
+postrust-engine = { version = "2.2.1", path = "crates/postrust-engine" }
 postrust-graphql = { version = "2.2.1", path = "crates/postrust-graphql" }
 postrust-server = { version = "2.2.1", path = "crates/postrust-server" }
 

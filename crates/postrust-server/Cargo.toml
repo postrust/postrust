@@ -79,6 +79,7 @@ postrust-core = { workspace = true, features = ["sqlx"] }
 postrust-sql.workspace = true
 postrust-auth.workspace = true
 postrust-response.workspace = true
+postrust-engine.workspace = true
 
 # Admin UI (optional)
 utoipa = { version = "5", features = ["axum_extras"], optional = true }

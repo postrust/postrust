@@ -1,0 +1,35 @@
+[package]
+name = "postrust-engine"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "The REST request pipeline of Postrust, from HTTP request to response, independent of any web framework"
+homepage.workspace = true
+readme = "README.md"
+keywords = ["postgres", "rest", "api", "postgrest", "engine"]
+
+[dependencies]
+# The schema cache is behind a tokio `RwLock`; `sync` is all that needs.
+tokio.workspace = true
+
+# Database
+sqlx.workspace = true
+
+# Serialization
+serde_json.workspace = true
+
+# HTTP, with no server attached
+http.workspace = true
+http-body = "1"
+http-body-util.workspace = true
+bytes.workspace = true
+tracing.workspace = true
+
+# Internal
+postrust-core = { workspace = true, features = ["sqlx"] }
+postrust-sql.workspace = true
+postrust-auth.workspace = true
+postrust-response.workspace = true
