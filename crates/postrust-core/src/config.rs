@@ -313,6 +313,24 @@ fn parse_graphql_type_prefix(value: &str) -> Result<Option<String>, &'static str
     Ok(Some(value.to_string()))
 }
 
+/// The name an environment variable is looked up by. Windows environment
+/// names are case-insensitive, and `std::env::var("PGRST_DB_URI")` finds
+/// `pgrst_db_uri` there; the names collected for [`AppConfig::try_from_vars`]
+/// are matched exactly, so on Windows they are upper-cased to keep that.
+/// App settings lose nothing by it: their names are lower-cased anyway.
+fn env_name(name: String) -> String {
+    if cfg!(windows) {
+        upper_env_name(name)
+    } else {
+        name
+    }
+}
+
+fn upper_env_name(mut name: String) -> String {
+    name.make_ascii_uppercase();
+    name
+}
+
 impl AppConfig {
     /// Load configuration from environment variables.
     ///
@@ -330,26 +348,35 @@ impl AppConfig {
         // A variable whose name or value is not UTF-8 is skipped, as
         // `std::env::var` would have refused it.
         Self::try_from_vars(
-            std::env::vars_os()
-                .filter_map(|(k, v)| Some((k.into_string().ok()?, v.into_string().ok()?))),
+            std::env::vars_os().filter_map(|(k, v)| {
+                Some((env_name(k.into_string().ok()?), v.into_string().ok()?))
+            }),
         )
     }
 
     /// Load configuration from name/value pairs spelled as the environment
     /// variables are, for a host with no process environment -- a Cloudflare
     /// Worker reads its bindings instead. Where a name appears twice, the last
-    /// one wins.
+    /// one wins. Names are matched exactly, case included.
     pub fn try_from_vars<I, K, V>(vars: I) -> Result<Self, ConfigError>
     where
         I: IntoIterator<Item = (K, V)>,
         K: Into<String>,
         V: Into<String>,
     {
-        let vars: HashMap<String, String> = vars
+        // Kept in the order given as well as looked up by name: the app
+        // settings are found by walking the pairs, and two of them that differ
+        // only in case name the same setting, so which one wins has to depend
+        // on that order and not on a hash.
+        let pairs: Vec<(String, String)> = vars
             .into_iter()
             .map(|(k, v)| (k.into(), v.into()))
             .collect();
-        let get = |key: &str| vars.get(key).cloned().ok_or(());
+        let vars: HashMap<&str, &str> = pairs
+            .iter()
+            .map(|(k, v)| (k.as_str(), v.as_str()))
+            .collect();
+        let get = |key: &str| vars.get(key).map(|v| v.to_string()).ok_or(());
         let mut config = Self::default();
 
         if let Ok(uri) = get("PGRST_DB_URI") {
@@ -581,7 +608,10 @@ impl AppConfig {
 
         // `PGRST_APP_SETTINGS_<NAME>` becomes `app.settings.<name>`, which is
         // where PostgREST puts it and where a policy expects to read it back.
-        for (key, value) in &vars {
+        // Names that differ only in case (`..._Tenant`, `..._TENANT`) are the
+        // same setting; the one that comes later in the pairs wins, as the
+        // later of two equal names does.
+        for (key, value) in &pairs {
             if let Some(name) = key.strip_prefix("PGRST_APP_SETTINGS_") {
                 if !name.is_empty() {
                     config
@@ -1100,6 +1130,54 @@ mod tests {
 
         let refused = AppConfig::try_from_vars([("PGRST_DB_AGGREGATES_ENABLED", "maybe")]);
         assert!(refused.is_err());
+    }
+
+    #[test]
+    fn app_settings_differing_only_in_case_take_the_later_value() {
+        // Both name `app.settings.tenant`. Run it a few times: with the pairs
+        // in a hash map the winner changed from one run to the next.
+        for _ in 0..16 {
+            let config = AppConfig::try_from_vars([
+                ("PGRST_APP_SETTINGS_Tenant", "first"),
+                ("PGRST_APP_SETTINGS_TENANT", "second"),
+                ("PGRST_APP_SETTINGS_tenant", "third"),
+            ])
+            .unwrap();
+            assert_eq!(
+                config.app_settings.get("tenant").map(String::as_str),
+                Some("third")
+            );
+
+            let config = AppConfig::try_from_vars([
+                ("PGRST_APP_SETTINGS_tenant", "third"),
+                ("PGRST_APP_SETTINGS_TENANT", "second"),
+            ])
+            .unwrap();
+            assert_eq!(
+                config.app_settings.get("tenant").map(String::as_str),
+                Some("second")
+            );
+        }
+    }
+
+    #[test]
+    fn windows_environment_names_are_matched_whatever_their_case() {
+        // What `env_name` does on Windows, where `std::env::var` ignored case.
+        let config = AppConfig::try_from_vars([
+            (upper_env_name("pgrst_db_schemas".into()), "api"),
+            (upper_env_name("Pgrst_App_Settings_Tenant".into()), "acme"),
+        ])
+        .unwrap();
+        assert_eq!(config.db_schemas, ["api"]);
+        assert_eq!(
+            config.app_settings.get("tenant").map(String::as_str),
+            Some("acme")
+        );
+        assert_eq!(env_name("PGRST_DB_URI".into()), "PGRST_DB_URI");
+        assert_eq!(
+            env_name("pgrst_db_uri".into()) == "PGRST_DB_URI",
+            cfg!(windows)
+        );
     }
 
     #[test]
