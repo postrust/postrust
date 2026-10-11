@@ -109,6 +109,14 @@ async fn admin() -> PgPool {
         .expect("failed to connect to test database")
 }
 
+/// `DATABASE_URL`, logging in as `role`.
+fn url_as(role: &str) -> String {
+    let url = database_url();
+    let (scheme, rest) = url.split_once("://").expect("DATABASE_URL is a URL");
+    let host = rest.split_once('@').map_or(rest, |(_, host)| host);
+    format!("{scheme}://{role}:{PASSWORD}@{host}")
+}
+
 /// A pool logged in as `role`.
 async fn connect_as(role: &str) -> PgPool {
     let options = PgConnectOptions::from_str(&database_url())
@@ -231,6 +239,11 @@ async fn a_request_is_answered_through_the_authenticator() {
     let mut config = AppConfig::default();
     config.db_schemas = schemas();
     config.db_anon_role = Some("web_anon".to_string());
+    // The login the pool has, for a build that serves requests through a
+    // connection of its own (`pg-socket`). Left at its default, that build
+    // connected to `postgresql://localhost/postgres` -- no such login -- and
+    // answered 500.
+    config.db_uri = url_as(NOINHERIT);
 
     let schema_cache = SchemaCache::load(&authenticator, &config.db_schemas)
         .await

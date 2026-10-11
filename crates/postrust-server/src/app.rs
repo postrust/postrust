@@ -32,7 +32,7 @@ mod via_socket {
     use postrust_core::db::tokio_postgres::{Config, NoTls};
     use postrust_core::db::{BoxFuture, Connector, PgSocketDb};
     use postrust_core::{AppConfig, SchemaCache};
-    use std::sync::{Arc, OnceLock};
+    use std::sync::{Arc, Mutex};
     use tokio::sync::RwLockReadGuard;
 
     /// A TCP socket per request, where a Worker opens one to Hyperdrive.
@@ -102,7 +102,24 @@ mod via_socket {
         PgSocketDb::new(Tcp(target), config)
     }
 
-    static DB: OnceLock<PgSocketDb<Tcp>> = OnceLock::new();
+    /// One database per URI, made the first time a request names it.
+    ///
+    /// Per URI rather than one for the process: the first request's state used
+    /// to decide it for every state after, so a second `AppState` -- a test's,
+    /// logging in as another role -- was served through the first one's
+    /// login. Leaked, since a database is needed for as long as the process
+    /// runs, and a process has a URI or two.
+    static DBS: Mutex<Vec<(String, &'static PgSocketDb<Tcp>)>> = Mutex::new(Vec::new());
+
+    fn database_for(uri: &str) -> &'static PgSocketDb<Tcp> {
+        let mut known = DBS.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some((_, db)) = known.iter().find(|(known, _)| known == uri) {
+            return db;
+        }
+        let db: &'static PgSocketDb<Tcp> = Box::leak(Box::new(database(uri)));
+        known.push((uri.to_string(), db));
+        db
+    }
 
     /// The server's state, with the socket driver in place of the pool.
     ///
@@ -119,7 +136,7 @@ mod via_socket {
             Self: 'a;
 
         fn db(&self) -> &PgSocketDb<Tcp> {
-            DB.get_or_init(|| database(&self.0.config.db_uri))
+            database_for(&self.0.config.db_uri)
         }
 
         async fn schema_cache(&self) -> RwLockReadGuard<'_, SchemaCache> {
