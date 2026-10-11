@@ -12,12 +12,6 @@ readme = "README.md"
 keywords = ["postgres", "rest", "api", "postgrest", "engine"]
 
 [dependencies]
-# The schema cache is behind a tokio `RwLock`; `sync` is all that needs.
-tokio.workspace = true
-
-# Database
-sqlx.workspace = true
-
 # Serialization
 serde_json.workspace = true
 
@@ -29,7 +23,7 @@ bytes.workspace = true
 tracing.workspace = true
 
 # Internal
-postrust-core = { workspace = true, features = ["sqlx"] }
+postrust-core.workspace = true
 postrust-sql.workspace = true
 postrust-auth.workspace = true
 postrust-response.workspace = true

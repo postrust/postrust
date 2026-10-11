@@ -1,11 +1,12 @@
 //! Request handling: from an HTTP request to the response the REST API gives
 //! it, with no web framework in between.
 
-use crate::state::AppState;
+use crate::state::State;
 use bytes::Bytes;
 use http::{Response, StatusCode};
 use http_body_util::BodyExt;
 use postrust_auth::authenticate;
+use postrust_core::db::{Db, Tx};
 use postrust_core::{
     create_action_plan, parse_request, ActionPlan, ApiRequest, CallPlan, DbActionPlan,
 };
@@ -41,8 +42,9 @@ const PARENT_ROW_COLUMN_REF: &str = "\"src\".\"pgrst_parent_row\"";
 /// The path is the API's own -- `/items`, `/rpc/f` -- with whatever prefix the
 /// host mounted it under already taken off. The body is read here, after the
 /// token has been checked, and no further than `max_body_size`.
-pub async fn handle<B>(state: &AppState, request: http::Request<B>) -> Response<Bytes>
+pub async fn handle<S, B>(state: &S, request: http::Request<B>) -> Response<Bytes>
 where
+    S: State,
     B: http_body::Body<Data = Bytes>,
     B::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
 {
@@ -51,7 +53,7 @@ where
 
     debug!("{} {}", method, path);
 
-    let verbatim_db_errors = state.config.compat_mode;
+    let verbatim_db_errors = state.config().compat_mode;
 
     match process_request(state, request).await {
         Ok(response) => response,
@@ -60,11 +62,12 @@ where
 }
 
 /// Process a request and return a response.
-async fn process_request<B>(
-    state: &AppState,
+async fn process_request<S, B>(
+    state: &S,
     request: http::Request<B>,
 ) -> Result<Response<Bytes>, postrust_core::Error>
 where
+    S: State,
     B: http_body::Body<Data = Bytes>,
     B::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
 {
@@ -75,9 +78,9 @@ where
         .and_then(|v| v.to_str().ok());
 
     // Authenticate, through the token cache where one is configured.
-    let auth_result = match &state.jwt_cache {
-        Some(cache) => cache.authenticate(auth_header, &state.jwt_config),
-        None => authenticate(auth_header, &state.jwt_config),
+    let auth_result = match state.jwt_cache() {
+        Some(cache) => cache.authenticate(auth_header, state.jwt_config()),
+        None => authenticate(auth_header, state.jwt_config()),
     }
     .map_err(jwt_error)?;
 
@@ -98,7 +101,7 @@ where
     //
     // What `axum::body::to_bytes` does, spelled out so it needs no axum: the
     // same limit, the same collection, and the same error text.
-    let body_bytes = http_body_util::Limited::new(body, state.config.max_body_size)
+    let body_bytes = http_body_util::Limited::new(body, state.config().max_body_size)
         .collect()
         .await
         .map(|collected| collected.to_bytes())
@@ -122,7 +125,7 @@ where
         &http_request,
         state.default_schema(),
         state.schemas(),
-        state.config.db_max_rows,
+        state.config().db_max_rows,
     )?;
 
     // Parse payload
@@ -173,7 +176,7 @@ where
     // way is removed from the response once the embed is attached.
     let added_join_columns = add_embed_join_columns(&mut api_request, &schema_cache)?;
 
-    if !state.config.db_aggregates_enabled && selects_an_aggregate(&api_request) {
+    if !state.config().db_aggregates_enabled && selects_an_aggregate(&api_request) {
         return Err(postrust_core::Error::AggregatesNotAllowed);
     }
 
@@ -416,8 +419,8 @@ fn jwt_error(error: postrust_auth::JwtError) -> postrust_core::Error {
 }
 
 /// Execute an action plan.
-async fn execute_plan(
-    state: &AppState,
+async fn execute_plan<S: State>(
+    state: &S,
     api_request: &ApiRequest,
     plan: &ActionPlan,
     auth: &postrust_auth::AuthResult,
@@ -981,7 +984,7 @@ async fn execute_plan(
             // parent row and its children come from one snapshot rather than
             // from two separate reads.
             let mut tx = state
-                .pool
+                .db()
                 .begin()
                 .await
                 .map_err(|e| postrust_core::Error::ConnectionPool(e.to_string()))?;
@@ -994,19 +997,17 @@ async fn execute_plan(
             // `to_sql` -- never caller text. Issued only when it differs from
             // PostgreSQL's own default, so the common case costs no round trip.
             let isolation = state
-                .config
+                .config()
                 .role_settings
                 .get(&auth.role)
                 .and_then(|r| r.isolation_level.as_ref())
-                .unwrap_or(&state.config.db_tx_isolation);
+                .unwrap_or(&state.config().db_tx_isolation);
             if *isolation != postrust_core::IsolationLevel::ReadCommitted {
-                sqlx::query(&format!(
-                    "SET TRANSACTION ISOLATION LEVEL {}",
-                    isolation.to_sql()
-                ))
-                .execute(&mut *tx)
-                .await
-                .map_err(map_sqlx_error)?;
+                tx.execute(
+                    &format!("SET TRANSACTION ISOLATION LEVEL {}", isolation.to_sql()),
+                    &[],
+                )
+                .await?;
             }
 
             // A read request runs in a read-only transaction.
@@ -1017,10 +1018,7 @@ async fn execute_plan(
             // from the statement -- a volatile function, a trigger, a rule --
             // rather than only what the planner thought to look at.
             if is_read_only(api_request) {
-                sqlx::query("SET TRANSACTION READ ONLY")
-                    .execute(&mut *tx)
-                    .await
-                    .map_err(map_sqlx_error)?;
+                tx.execute("SET TRANSACTION READ ONLY", &[]).await?;
             }
 
             // Everything the request tells the database about itself, in
@@ -1038,7 +1036,7 @@ async fn execute_plan(
             // authenticator still applies when they are set.
             {
                 let mut path = vec![api_request.schema.clone()];
-                path.extend(state.config.db_extra_search_path.iter().cloned());
+                path.extend(state.config().db_extra_search_path.iter().cloned());
                 let search_path = path
                     .iter()
                     .map(|s| postrust_sql::escape_ident(s))
@@ -1050,7 +1048,7 @@ async fn execute_plan(
                 // The settings a role carries come first, before the `role`
                 // that follows them -- see the note above on
                 // `GRANT SET ON PARAMETER`.
-                if let Some(role_settings) = state.config.role_settings.get(&auth.role) {
+                if let Some(role_settings) = state.config().role_settings.get(&auth.role) {
                     if let Some(timeout) = role_settings.statement_timeout {
                         settings.push(("statement_timeout".to_string(), timeout.to_string()));
                     }
@@ -1075,7 +1073,7 @@ async fn execute_plan(
                 // `app_settings`, exposed as PostgREST spells them: a function
                 // or policy reads one back with
                 // `current_setting('app.settings.<key>')`.
-                for (key, value) in &state.config.app_settings {
+                for (key, value) in &state.config().app_settings {
                     settings.push((format!("app.settings.{key}"), value.clone()));
                 }
 
@@ -1092,11 +1090,16 @@ async fn execute_plan(
                     .collect::<Vec<_>>()
                     .join(", ");
                 let sql = format!("SELECT {}", calls);
-                let mut query = sqlx::query(&sql);
-                for (name, value) in &settings {
-                    query = query.bind(name).bind(value);
-                }
-                query.execute(&mut *tx).await.map_err(map_sqlx_error)?;
+                let params: Vec<postrust_sql::SqlParam> = settings
+                    .into_iter()
+                    .flat_map(|(name, value)| {
+                        [
+                            postrust_sql::SqlParam::Text(name),
+                            postrust_sql::SqlParam::Text(value),
+                        ]
+                    })
+                    .collect();
+                tx.execute(&sql, &params).await?;
             }
 
             // `db_pre_request`: a function called before the request's own
@@ -1107,32 +1110,22 @@ async fn execute_plan(
             // The name is an identifier from the configuration, not from the
             // request, and is escaped as one -- a schema-qualified name stays
             // two identifiers so `auth.check` does not become `"auth.check"`.
-            if let Some(pre_request) = &state.config.db_pre_request {
+            if let Some(pre_request) = &state.config().db_pre_request {
                 let qualified = pre_request
                     .split('.')
                     .map(postrust_sql::escape_ident)
                     .collect::<Vec<_>>()
                     .join(".");
-                sqlx::query(&format!("SELECT {qualified}()"))
-                    .execute(&mut *tx)
-                    .await
-                    .map_err(map_sqlx_error)?;
+                tx.execute(&format!("SELECT {qualified}()"), &[]).await?;
             }
 
-            // Execute main query with bound parameters
-            let rows = bind_params(sqlx::query(&sql), &params)
-                .fetch_all(&mut *tx)
-                .await
-                .map_err(|e| {
-                    error!("Query error: {}", e);
-                    map_sqlx_error(e)
-                })?;
+            // The main query. A logged failure names the driver's account of
+            // it, which says more than the response is allowed to.
+            let log = |e: postrust_core::db::DbError| {
+                error!("Query error: {}", e);
+                postrust_core::Error::from(e)
+            };
 
-            // Convert rows to JSON.
-            //
-            // `into_iter` matters for large result sets: each row's buffers are
-            // freed as soon as it has been converted, rather than the whole
-            // `Vec<PgRow>` staying alive alongside the whole `Vec<Value>`.
             // A rendered media type is a single value, not a row set: the
             // aggregate already produced the entire body.
             if let Some((media_type, base_type)) = media_handler
@@ -1140,14 +1133,19 @@ async fn execute_plan(
                 .map(|(m, _, _, base)| (m.clone(), base.clone()))
                 .or_else(|| declared_media_type(db_plan, api_request))
             {
+                let raw = tx
+                    .fetch_raw(&sql, &params, MEDIA_ROW_COUNT_COLUMN)
+                    .await
+                    .map_err(log)?;
+
                 // The value's type is a domain this side has no mapping for,
                 // so it arrives as PostgreSQL's text rendering of it. For
                 // anything text-like that rendering *is* the value; for a
                 // `bytea` it is `\x` and hex, which describes the bytes
                 // rather than being them.
-                let mut body = rows
-                    .first()
-                    .and_then(|row| raw_column(row, &base_type))
+                let mut body = raw
+                    .first
+                    .map(|bytes| raw_column(bytes, &base_type))
                     .unwrap_or_default();
 
                 // PostgREST reads a handler's value as raw bytes in binary
@@ -1161,7 +1159,7 @@ async fn execute_plan(
                 // where this server sets out to be PostgREST rather than to be
                 // right, and a client written against PostgREST's bytes gets
                 // PostgREST's bytes.
-                if state.config.compat_mode && base_type == "jsonb" {
+                if state.config().compat_mode && base_type == "jsonb" {
                     body.insert(0, 0x01);
                 }
 
@@ -1171,13 +1169,8 @@ async fn execute_plan(
                 // where the value is a function's media-type domain there was
                 // no aggregate, and the rows in hand are the answer.
                 let rendered_rows = match media_handler.is_some() {
-                    true => rows
-                        .first()
-                        .and_then(|row| {
-                            sqlx::Row::try_get::<i64, _>(row, MEDIA_ROW_COUNT_COLUMN).ok()
-                        })
-                        .unwrap_or_default(),
-                    false => rows.len() as i64,
+                    true => raw.count.unwrap_or_default(),
+                    false => raw.rows as i64,
                 };
                 let total = match (&api_request.preferences.count, &count_sql) {
                     (Some(preference), Some(count_sql)) => {
@@ -1209,10 +1202,7 @@ async fn execute_plan(
                 });
             }
 
-            let mut json_rows: Vec<serde_json::Value> = rows
-                .into_iter()
-                .map(|row| postrust_core::row_json::row_to_json(&row))
-                .collect();
+            let mut json_rows = tx.fetch_json(&sql, &params).await.map_err(log)?;
 
             // Embeds already came back with the parent query when the SELECT
             // list carried relations. This path remains for anything the
@@ -1243,14 +1233,14 @@ async fn execute_plan(
                 match is_mutation(db_plan) || matches!(db_plan, DbActionPlan::Call { .. }) {
                     false => (None, None),
                     true => {
-                        use sqlx::Row;
-                        let row = sqlx::query(
-                            "SELECT current_setting('response.headers', true), \
-                         current_setting('response.status', true)",
-                        )
-                        .fetch_one(&mut *tx)
-                        .await
-                        .map_err(map_sqlx_error)?;
+                        let row = first_row(
+                            tx.fetch_values(
+                                "SELECT current_setting('response.headers', true), \
+                                 current_setting('response.status', true)",
+                                &[],
+                            )
+                            .await?,
+                        )?;
                         // Empty is absent. Once any transaction on this
                         // connection has defined a custom setting, PostgreSQL
                         // keeps the name for the rest of the session and
@@ -1258,10 +1248,10 @@ async fn execute_plan(
                         // that set nothing would otherwise inherit "the empty
                         // headers" from whichever request last set some.
                         let setting = |index: usize| {
-                            row.try_get::<Option<String>, _>(index)
-                                .ok()
-                                .flatten()
+                            row.get(index)
+                                .and_then(serde_json::Value::as_str)
                                 .filter(|value| !value.trim().is_empty())
+                                .map(str::to_string)
                         };
                         (setting(0), setting(1))
                     }
@@ -1346,7 +1336,7 @@ async fn execute_plan(
             // In PostgREST-compatibility mode, reshape RPC responses to match
             // PostgREST: un-nest the function-name-keyed column and return a
             // bare value for non-set-returning functions.
-            let (mut json_rows, singular) = if state.config.compat_mode {
+            let (mut json_rows, singular) = if state.config().compat_mode {
                 if let ActionPlan::Db(DbActionPlan::Call { call, .. }) = plan {
                     unwrap_rpc_rows(json_rows, call)
                 } else {
@@ -1554,8 +1544,8 @@ async fn execute_plan(
 /// splitting on `/` here, so a percent-encoded table name, an `Accept-Profile`
 /// naming another schema, and the `/rpc/` prefix all mean what they mean
 /// everywhere else.
-pub async fn allow(
-    state: &AppState,
+pub async fn allow<S: State>(
+    state: &S,
     probe: http::Request<bytes::Bytes>,
 ) -> Result<String, postrust_core::Error> {
     use postrust_core::api_request::Action;
@@ -1564,7 +1554,7 @@ pub async fn allow(
         &probe,
         state.default_schema(),
         state.schemas(),
-        state.config.db_max_rows,
+        state.config().db_max_rows,
     )?;
 
     let schema_cache = state.schema_cache().await;
@@ -1794,22 +1784,15 @@ fn top_level_offset(api_request: &ApiRequest) -> i64 {
 /// own text rendering. For text, xml or json that rendering is the value. For
 /// `bytea` it is `\x` followed by hex, which is a description of the bytes
 /// and not the bytes, so it is decoded back.
-fn raw_column(row: &sqlx::postgres::PgRow, base_type: &str) -> Option<Vec<u8>> {
-    use sqlx::{Row, ValueRef};
-
-    let value = row.try_get_raw(0).ok()?;
-    if value.is_null() {
-        return None;
-    }
-    let bytes = value.as_bytes().ok()?.to_vec();
+fn raw_column(bytes: Vec<u8>, base_type: &str) -> Vec<u8> {
     if base_type != "bytea" {
-        return Some(bytes);
+        return bytes;
     }
     // Text or binary, depending on whether this connection asked for a format
     // it could name -- so the `\x` rendering is decoded where it appears and
     // the bytes are passed through where they do not.
     let Some(hex) = bytes.strip_prefix(b"\\x") else {
-        return Some(bytes);
+        return bytes;
     };
     hex.chunks(2)
         .map(|pair| {
@@ -1817,7 +1800,7 @@ fn raw_column(row: &sqlx::postgres::PgRow, base_type: &str) -> Option<Vec<u8>> {
             u8::from_str_radix(digits, 16).ok()
         })
         .collect::<Option<Vec<u8>>>()
-        .or(Some(bytes))
+        .unwrap_or(bytes)
 }
 
 /// Whether the selection is the one a table has when none was asked for.
@@ -2014,8 +1997,8 @@ fn unpaged_sql(
 /// matters: below the server's row ceiling the exact count is already paid for,
 /// so it is used, and above it the larger of the two is reported -- an estimate
 /// that came in under a count we have actually taken would be plainly wrong.
-async fn resolve_count(
-    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+async fn resolve_count<T: Tx>(
+    tx: &mut T,
     preference: &postrust_core::api_request::PreferCount,
     count_sql: &str,
     params: &[postrust_sql::SqlParam],
@@ -2038,35 +2021,27 @@ async fn resolve_count(
 }
 
 /// The number of rows the filters match.
-async fn exact_count(
-    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+async fn exact_count<T: Tx>(
+    tx: &mut T,
     count_sql: &str,
     params: &[postrust_sql::SqlParam],
 ) -> Result<Option<i64>, postrust_core::Error> {
-    use sqlx::Row;
-
     let sql = format!("SELECT count(*) FROM ({}) AS pgrst_count", count_sql);
-    let row = bind_params(sqlx::query(&sql), params)
-        .fetch_one(&mut **tx)
-        .await
-        .map_err(map_sqlx_error)?;
-    Ok(row.try_get::<i64, _>(0).ok())
+    let row = first_row(tx.fetch_values(&sql, params).await?)?;
+    Ok(row.first().and_then(serde_json::Value::as_i64))
 }
 
 /// The number of rows the query planner expects, without running the query.
-async fn planned_count(
-    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+async fn planned_count<T: Tx>(
+    tx: &mut T,
     count_sql: &str,
     params: &[postrust_sql::SqlParam],
 ) -> Result<Option<i64>, postrust_core::Error> {
-    use sqlx::Row;
-
     let sql = format!("EXPLAIN (FORMAT JSON) {}", count_sql);
-    let row = bind_params(sqlx::query(&sql), params)
-        .fetch_one(&mut **tx)
-        .await
-        .map_err(map_sqlx_error)?;
-    let plan: serde_json::Value = row.try_get(0).unwrap_or(serde_json::Value::Null);
+    let plan = first_row(tx.fetch_values(&sql, params).await?)?
+        .into_iter()
+        .next()
+        .unwrap_or(serde_json::Value::Null);
     Ok(plan
         .get(0)
         .and_then(|node| node.get("Plan"))
@@ -3196,17 +3171,15 @@ fn yields_columns(select: &[postrust_core::api_request::SelectItem]) -> bool {
     })
 }
 
-type EmbedFuture<'f> = std::pin::Pin<
-    Box<dyn std::future::Future<Output = Result<(), postrust_core::Error>> + Send + 'f>,
->;
+type EmbedFuture<'f> = postrust_core::db::BoxFuture<'f, Result<(), postrust_core::Error>>;
 
 /// Attach the relations requested in `select` onto `rows`.
 ///
 /// One query per relation per level: the parents' join keys are collected and
 /// passed as a single array, so embedding across a page of parents does not
 /// become a query per row. Recurses for nested embeds.
-fn embed_relations<'f>(
-    conn: &'f mut sqlx::PgConnection,
+fn embed_relations<'f, T: Tx>(
+    conn: &'f mut T,
     schema_cache: &'f postrust_core::SchemaCache,
     parent_qi: &'f postrust_core::api_request::QualifiedIdentifier,
     select: &'f [postrust_core::api_request::SelectItem],
@@ -3307,24 +3280,20 @@ fn embed_relations<'f>(
             } else {
                 let sql = plan.children_grouped_sql(max_rows, &child_columns)?;
 
-                let fetched = sqlx::query(&sql)
-                    .bind(&keys)
-                    .fetch_all(&mut *conn)
-                    .await
-                    .map_err(map_sqlx_error)?;
+                let keys = postrust_sql::SqlParam::Array(
+                    keys.into_iter().map(postrust_sql::SqlParam::Text).collect(),
+                );
+                let fetched = conn.fetch_values(&sql, &[keys]).await?;
 
                 // The query returns the join key and a JSON array of that
                 // key's children, so the values are read straight out of the
                 // columns -- the typed row converter would wrap them under the
                 // expression name.
-                use sqlx::Row;
                 let pairs: Vec<(serde_json::Value, serde_json::Value)> = fetched
                     .into_iter()
                     .filter_map(|row| {
-                        Some((
-                            row.try_get::<serde_json::Value, _>(0).ok()?,
-                            row.try_get::<serde_json::Value, _>(1).ok()?,
-                        ))
+                        let mut columns = row.into_iter();
+                        Some((columns.next()?, columns.next()?))
                     })
                     .collect();
 
@@ -3444,70 +3413,16 @@ fn embed_relations<'f>(
     })
 }
 
-/// Bind SqlParam values to a sqlx query.
-fn bind_params<'q>(
-    mut query: sqlx::query::Query<'q, sqlx::Postgres, sqlx::postgres::PgArguments>,
-    params: &'q [postrust_sql::SqlParam],
-) -> sqlx::query::Query<'q, sqlx::Postgres, sqlx::postgres::PgArguments> {
-    use postrust_sql::SqlParam;
-
-    for param in params {
-        query = match param {
-            SqlParam::Null => query.bind(None::<String>),
-            SqlParam::Bool(b) => query.bind(b),
-            SqlParam::Int(n) => query.bind(n),
-            SqlParam::Float(f) => query.bind(f),
-            SqlParam::Text(s) => query.bind(s),
-            SqlParam::Bytes(b) => query.bind(b),
-            SqlParam::Json(j) => query.bind(j),
-            SqlParam::Uuid(u) => query.bind(u),
-            SqlParam::Timestamp(t) => query.bind(t),
-            SqlParam::Array(arr) => {
-                // Convert array to Vec<String> for text arrays
-                let strings: Vec<String> = arr
-                    .iter()
-                    .map(|p| match p {
-                        SqlParam::Text(s) => s.clone(),
-                        SqlParam::Int(n) => n.to_string(),
-                        SqlParam::Bool(b) => b.to_string(),
-                        other => format!("{:?}", other),
-                    })
-                    .collect();
-                query.bind(strings)
-            }
-        };
-    }
-
-    query
-}
-
-/// Map sqlx error to our error type.
-fn map_sqlx_error(e: sqlx::Error) -> postrust_core::Error {
-    match e {
-        sqlx::Error::Database(db_err) => {
-            // Try to downcast to Postgres-specific error for additional details
-            let (details, hint) = db_err
-                .try_downcast_ref::<sqlx::postgres::PgDatabaseError>()
-                .map(|pg_err| {
-                    (
-                        pg_err.detail().map(String::from),
-                        pg_err.hint().map(String::from),
-                    )
-                })
-                .unwrap_or((None, None));
-
-            postrust_core::Error::Database(postrust_core::error::DatabaseError {
-                code: db_err.code().map(|c| c.to_string()).unwrap_or_default(),
-                message: db_err.message().to_string(),
-                details,
-                hint,
-                constraint: db_err.constraint().map(|s| s.to_string()),
-                table: db_err.table().map(|s| s.to_string()),
-                column: None,
-            })
-        }
-        other => postrust_core::Error::Internal(other.to_string()),
-    }
+/// The first row of a statement that always returns one, as `fetch_one`
+/// would have read it.
+fn first_row(
+    rows: Vec<Vec<serde_json::Value>>,
+) -> Result<Vec<serde_json::Value>, postrust_core::Error> {
+    rows.into_iter().next().ok_or_else(|| {
+        postrust_core::Error::Internal(
+            "no rows returned by a query that expected to return at least one row".into(),
+        )
+    })
 }
 
 /// Build an HTTP response from our response type.

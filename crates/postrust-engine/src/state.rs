@@ -1,50 +1,47 @@
-//! Application state.
+//! What a request runs against: a database, a schema cache, configuration.
 
 use postrust_auth::{JwtCache, JwtConfig};
+use postrust_core::db::{Db, MaybeSend, MaybeSync};
 use postrust_core::{AppConfig, SchemaCache};
-use sqlx::PgPool;
-use tokio::sync::RwLock;
+use std::future::Future;
+use std::ops::Deref;
 
-/// Shared application state.
-pub struct AppState {
-    /// Database connection pool
-    pub pool: PgPool,
-    /// Cached schema metadata
-    pub schema_cache: RwLock<SchemaCache>,
-    /// Application configuration
-    pub config: AppConfig,
-    /// JWT configuration
-    pub jwt_config: JwtConfig,
-    /// Cache of validated tokens, when `jwt_cache_enabled` asks for one.
-    pub jwt_cache: Option<JwtCache>,
-}
+/// Everything the pipeline needs from its host.
+///
+/// The server's `AppState` is one, over a sqlx pool. A host with no sqlx -- a
+/// Cloudflare Worker -- brings its own, over its own [`Db`]. The pipeline is
+/// generic over this, so nothing on the native path goes through a vtable.
+pub trait State: MaybeSync {
+    /// The database requests run on.
+    type Db: Db;
 
-impl AppState {
-    /// Get a read lock on the schema cache.
-    pub async fn schema_cache(&self) -> tokio::sync::RwLockReadGuard<'_, SchemaCache> {
-        self.schema_cache.read().await
+    /// A borrow of the schema cache, held for as long as a request needs it.
+    type SchemaCache<'a>: Deref<Target = SchemaCache> + MaybeSend + MaybeSync
+    where
+        Self: 'a;
+
+    /// The database requests run on.
+    fn db(&self) -> &Self::Db;
+
+    /// The schema cache.
+    fn schema_cache(&self) -> impl Future<Output = Self::SchemaCache<'_>> + MaybeSend;
+
+    /// Configuration.
+    fn config(&self) -> &AppConfig;
+
+    /// How tokens are verified.
+    fn jwt_config(&self) -> &JwtConfig;
+
+    /// The cache of verified tokens, where one is configured.
+    fn jwt_cache(&self) -> Option<&JwtCache>;
+
+    /// The schema a request names when it names none.
+    fn default_schema(&self) -> &str {
+        self.config().default_schema()
     }
 
-    /// Reload the schema cache. Used by the `db_channel_enabled` listener.
-    pub async fn reload_schema(&self) -> Result<(), postrust_core::Error> {
-        let new_cache = SchemaCache::load_with_search_path(
-            &self.pool,
-            &self.config.db_schemas,
-            &self.config.db_extra_search_path,
-        )
-        .await?;
-        let mut guard = self.schema_cache.write().await;
-        *guard = new_cache;
-        Ok(())
-    }
-
-    /// Get the default schema.
-    pub fn default_schema(&self) -> &str {
-        self.config.default_schema()
-    }
-
-    /// Get exposed schemas.
-    pub fn schemas(&self) -> &[String] {
-        &self.config.db_schemas
+    /// The schemas the API exposes.
+    fn schemas(&self) -> &[String] {
+        &self.config().db_schemas
     }
 }

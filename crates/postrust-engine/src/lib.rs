@@ -18,4 +18,4 @@ mod handler;
 mod state;
 
 pub use handler::{allow, error_response, handle};
-pub use state::AppState;
+pub use state::State;

@@ -2566,8 +2566,6 @@ dependencies = [
  "postrust-response",
  "postrust-sql",
  "serde_json",
- "sqlx",
- "tokio",
  "tracing",
 ]
 

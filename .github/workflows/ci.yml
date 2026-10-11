@@ -86,7 +86,7 @@ jobs:
         run: >
           cargo clippy --locked --target wasm32-unknown-unknown --no-default-features
           -p postrust-core -p postrust-sql -p postrust-auth -p postrust-response
-          -p postrust-worker -- -D warnings
+          -p postrust-engine -p postrust-worker -- -D warnings
 
       # A crate that compiles C (ring, aws-lc-sys), needs tokio's networking
       # (mio) or is sqlx can build here by accident -- the runner has clang --
@@ -97,19 +97,21 @@ jobs:
       # ambiguous"), and a failure must not read as "absent".
       - name: No native-only crates in the wasm32 graph
         run: |
-          graph=$(cargo tree --locked --target wasm32-unknown-unknown -e normal \
-                    -p postrust-worker --prefix none) || {
-            echo "::error::cargo tree failed, so the wasm32 graph was not checked"
-            exit 1
-          }
           status=0
-          for krate in ring aws-lc-sys aws-lc-rs mio sqlx sqlx-core; do
-            if grep -q "^$krate v" <<<"$graph"; then
-              echo "::error::$krate is in the wasm32 dependency graph"
-              cargo tree --locked --target wasm32-unknown-unknown -e normal \
-                -p postrust-worker -i "$krate@$(grep -m1 "^$krate v" <<<"$graph" | cut -d' ' -f2 | tr -d v)"
-              status=1
-            fi
+          for package in postrust-engine postrust-worker; do
+            graph=$(cargo tree --locked --target wasm32-unknown-unknown -e normal --no-default-features \
+                      -p "$package" --prefix none) || {
+              echo "::error::cargo tree failed, so the wasm32 graph of $package was not checked"
+              exit 1
+            }
+            for krate in ring aws-lc-sys aws-lc-rs mio sqlx sqlx-core; do
+              if grep -q "^$krate v" <<<"$graph"; then
+                echo "::error::$krate is in the wasm32 dependency graph of $package"
+                cargo tree --locked --target wasm32-unknown-unknown -e normal --no-default-features \
+                  -p "$package" -i "$krate@$(grep -m1 "^$krate v" <<<"$graph" | cut -d' ' -f2 | tr -d v)"
+                status=1
+              fi
+            done
           done
           exit $status
 

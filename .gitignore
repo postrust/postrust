@@ -1,6 +1,6 @@
 .DS_Store
-db
-plan
+/db
+/plan
 target
 dist
 .cabal-sandbox
