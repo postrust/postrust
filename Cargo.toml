@@ -135,6 +135,7 @@ instant-acme = { version = "0.8", default-features = false, features = [
 x509-parser = "0.18"
 
 hyper-util = { version = "0.1", features = ["full"] }
+http-body = "1"
 http-body-util = "0.1"
 
 # Hot-reload

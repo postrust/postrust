@@ -1032,7 +1032,7 @@ pub async fn build(config: postrust_core::AppConfig, host: Host) -> Result<App> 
         // For the routes whose handlers take a body *extractor* -- GraphQL,
         // the admin surface -- which is what this layer reaches. The REST
         // handler takes the whole `Request` and reads the body itself, so it
-        // applies `max_body_size` directly; see `app::process_request`.
+        // applies `max_body_size` directly; see `postrust_engine::handle`.
         .layer(DefaultBodyLimit::max(config.max_body_size))
         // Outermost, so it runs before the CORS layer -- which answers every
         // OPTIONS itself and never calls what it wraps, so nothing downstream

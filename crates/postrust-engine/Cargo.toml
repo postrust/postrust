@@ -23,7 +23,7 @@ serde_json.workspace = true
 
 # HTTP, with no server attached
 http.workspace = true
-http-body = "1"
+http-body.workspace = true
 http-body-util.workspace = true
 bytes.workspace = true
 tracing.workspace = true
