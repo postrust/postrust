@@ -216,3 +216,13 @@ jobs:
         run: |
           cargo test -p postrust-server --features compat-key-order \
             --lib --bins --tests -- --ignored
+
+      # `pg-socket` serves REST requests through the socket driver a
+      # Cloudflare Worker uses, which pipelines a request's statements and
+      # owns the transaction they run in. Run over the server's whole suite,
+      # so that a refused write is proved to roll back on that driver too, and
+      # every request answers as it does on sqlx.
+      - name: Integration tests (pg-socket)
+        run: |
+          cargo test -p postrust-server --features pg-socket \
+            --lib --bins --tests -- --ignored
