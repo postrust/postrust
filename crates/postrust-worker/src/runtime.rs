@@ -389,6 +389,11 @@ impl Connector for Hyperdrive {
             let _ = done.send(());
         });
     }
+
+    // A timer the Workers runtime runs, cleared if the connection opens first.
+    async fn sleep(&self, duration: std::time::Duration) {
+        worker::Delay::from(duration).await;
+    }
 }
 
 fn database(env: &Env) -> Result<PgSocketDb<Hyperdrive>, postrust_core::Error> {

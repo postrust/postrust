@@ -23,17 +23,16 @@
 //! reported is the first one, as if they had been sent one at a time.
 //!
 //! A statement whose result has a type PostgreSQL does not build in -- an
-//! enum, a domain, a composite, an extension's type -- is prepared before it
-//! is run. `tokio-postgres` looks such a type up in the catalog when the
-//! result's description arrives, and for an unprepared statement that is
-//! after the statement has run: if it failed, the transaction is aborted, the
-//! lookup fails with `25P02`, and the statement's own error is lost. Prepared
-//! first, the lookups run before anything can have failed. A flight stops
-//! short of such a statement, which is prepared once those before it have
-//! answered and starts the next flight. That costs round trips, so which
-//! statements need it is remembered (`ResultTypes`): one whose columns are
-//! all built in is pipelined like any other, and one not seen before is
-//! prepared, the first time, to find out.
+//! enum, a domain, a composite, an extension's type -- can lose its own
+//! error. `tokio-postgres` looks such a type up in the catalog when the
+//! result's description arrives, and for a statement not prepared first that
+//! is after it has run: if it failed, the transaction is aborted, the lookup
+//! fails with `25P02`, and the statement's error is lost. Preparing every
+//! statement first would cost a round trip each, which is what pipelining
+//! saves, so it is done only for the statements this has happened to
+//! (`ResultTypes`), and the transaction that first lost one is run again to
+//! find it. A flight stops short of a statement to be prepared, which is
+//! prepared once those before it have answered, and starts the next one.
 //!
 //! Two things have to match sqlx exactly, and both are done by hand rather
 //! than left to `tokio-postgres`:
@@ -50,11 +49,12 @@
 use super::{BoxFuture, Db, DbError, FetchedThen, MaybeSend, MaybeSync, RawRows, Tx};
 use crate::error::DatabaseError;
 use postrust_sql::SqlParam;
-use std::collections::HashMap;
+use std::collections::HashSet;
 use std::future::Future;
 use std::sync::{Arc, LazyLock, Mutex};
 use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncWrite};
+use tokio_postgres::error::SqlState;
 use tokio_postgres::tls::TlsConnect;
 use tokio_postgres::types::{FromSql, ToSql, Type};
 use tokio_postgres::{Client, Row, Statement};
@@ -124,6 +124,9 @@ pub struct SocketTx {
     /// Statements to send ahead of the next one: the `BEGIN`, and whatever
     /// was [`Tx::queue`]d.
     queued: Vec<(String, Vec<SqlParam>)>,
+    /// Every statement sent so far, from the `BEGIN`: what is run again when
+    /// a statement's error was lost (see `send`).
+    sent: Vec<(String, Vec<SqlParam>)>,
 }
 
 impl<C> Db for PgSocketDb<C>
@@ -183,6 +186,7 @@ where
             client,
             closed,
             queued: vec![("BEGIN".to_string(), Vec::new())],
+            sent: Vec::new(),
         })
     }
 }
@@ -280,26 +284,67 @@ impl SocketTx {
     /// Each statement's rows and the rows it affected, for `statements` only;
     /// the first failure, in the order they were sent, if any failed.
     ///
-    /// They go out in as few flights as they can: all at once, unless one of
-    /// `statements` has to be prepared first (see the module docs). That one
-    /// is prepared once everything before it has answered, and starts the
-    /// next flight -- a statement sent after it would otherwise run before
-    /// it. What was queued is never prepared -- its rows are never read --
-    /// and nor is a `COMMIT`.
+    /// A statement whose own error was lost to a type lookup (see the module
+    /// docs) is known from then on to need preparing, and the transaction is
+    /// run again to find that error: it failed, so nothing it did is kept,
+    /// and the same statements in the same order fail the same way.
     async fn send<const N: usize>(
         &mut self,
         statements: [(&str, &[SqlParam]); N],
     ) -> Result<[(Vec<Row>, u64); N], DbError> {
-        let queued = std::mem::take(&mut self.queued);
-        let all: Vec<(&str, &[SqlParam])> = queued
+        let mut ahead = std::mem::take(&mut self.queued);
+        // Each run again prepares one more statement, so there are at most
+        // as many as there are statements.
+        for _ in 0..=ahead.len() + N + self.sent.len() {
+            match self.flights(&ahead, &statements).await {
+                Ok(answers) => {
+                    self.sent.extend(ahead);
+                    self.sent.extend(
+                        statements
+                            .iter()
+                            .map(|(sql, params)| (sql.to_string(), params.to_vec())),
+                    );
+                    return answers
+                        .try_into()
+                        .map_err(|_| DbError::other("a pipelined statement went unanswered"));
+                }
+                Err(Failed::Error(error)) => return Err(error),
+                Err(Failed::Masked(sql, error)) => {
+                    if !RESULT_TYPES.remember(&sql) {
+                        return Err(error);
+                    }
+                    self.client
+                        .batch_execute("ROLLBACK")
+                        .await
+                        .map_err(|e| self.error(e))?;
+                    ahead = std::mem::take(&mut self.sent)
+                        .into_iter()
+                        .chain(ahead)
+                        .collect();
+                }
+            }
+        }
+        Err(DbError::other(
+            "a statement's error was lost to a type lookup",
+        ))
+    }
+
+    /// `ahead` and then `statements`, in as few flights as they can go: all at
+    /// once, unless one has to be prepared first (see the module docs). That
+    /// one is prepared once everything before it has answered, and starts the
+    /// next flight -- a statement sent after it would otherwise run before
+    /// it. The answers to `statements`.
+    async fn flights(
+        &self,
+        ahead: &[(String, Vec<SqlParam>)],
+        statements: &[(&str, &[SqlParam])],
+    ) -> Result<Vec<(Vec<Row>, u64)>, Failed> {
+        let all: Vec<(&str, &[SqlParam])> = ahead
             .iter()
             .map(|(sql, params)| (sql.as_str(), params.as_slice()))
-            .chain(statements)
+            .chain(statements.iter().copied())
             .collect();
-        let prepare_first = |index: usize| {
-            let sql = all[index].0;
-            index >= queued.len() && sql != "COMMIT" && !RESULT_TYPES.built_in(sql)
-        };
+        let prepare_first = |index: usize| RESULT_TYPES.must_prepare(all[index].0);
         let mut answers = Vec::with_capacity(all.len());
         let mut start = 0;
         while start < all.len() {
@@ -307,37 +352,48 @@ impl SocketTx {
                 .find(|&index| prepare_first(index))
                 .unwrap_or(all.len());
             let mut prepared = match prepare_first(start) {
-                true => Some(self.prepare(all[start].0, all[start].1).await?),
+                true => Some(
+                    self.prepare(all[start].0, all[start].1)
+                        .await
+                        .map_err(Failed::Error)?,
+                ),
                 false => None,
             };
+            let was_prepared = prepared.is_some();
             let client = &self.client;
             let futures: Vec<_> = all[start..end]
                 .iter()
                 .map(|(sql, params)| Box::pin(run(client, sql, params, prepared.take())))
                 .collect();
-            for answer in in_order(futures).await {
-                answers.push(answer.map_err(|e| self.error(e))?);
+            for (offset, answer) in in_order(futures).await.into_iter().enumerate() {
+                match answer {
+                    Ok(answer) => answers.push(answer),
+                    // Every statement before it answered, so the transaction
+                    // was not aborted before it ran: the 25P02 is its type
+                    // lookup's, after it failed.
+                    Err(e)
+                        if e.code() == Some(&SqlState::IN_FAILED_SQL_TRANSACTION)
+                            && !(offset == 0 && was_prepared) =>
+                    {
+                        let sql = all[start + offset].0.to_string();
+                        return Err(Failed::Masked(sql, self.error(e)));
+                    }
+                    Err(e) => return Err(Failed::Error(self.error(e))),
+                }
             }
             start = end;
         }
-        // The queued statements' answers mattered only if they failed.
-        answers
-            .split_off(queued.len())
-            .try_into()
-            .map_err(|_| DbError::other("a pipelined statement went unanswered"))
+        Ok(answers.split_off(ahead.len()))
     }
 
     /// `sql` prepared with its parameters' types, and its result's types
-    /// looked up and remembered.
+    /// looked up.
     async fn prepare(&self, sql: &str, params: &[SqlParam]) -> Result<Statement, DbError> {
         let types: Vec<Type> = Bound::new(params).iter().map(|(_, ty)| ty).collect();
-        let statement = self
-            .client
+        self.client
             .prepare_typed(sql, &types)
             .await
-            .map_err(|e| self.error(e))?;
-        RESULT_TYPES.learn(sql, statement.columns());
-        Ok(statement)
+            .map_err(|e| self.error(e))
     }
 
     /// A failure, as the caller should hear of it: where the connection was
@@ -352,16 +408,23 @@ impl SocketTx {
     }
 }
 
-/// Whether a statement's columns are all of types PostgreSQL builds in, by
-/// its SQL, for every statement this process has run on a socket.
+/// Why a flight failed.
+enum Failed {
+    /// A statement failed, with this error.
+    Error(DbError),
+    /// The statement with this SQL failed, and its type lookup hid its error
+    /// behind this one (see the module docs).
+    Masked(String, DbError),
+}
+
+/// The statements whose own errors a type lookup has hidden, by their SQL:
+/// those with a result column of a type PostgreSQL does not build in, which
+/// are prepared before they run from then on (see the module docs).
 ///
 /// Process-wide rather than per [`PgSocketDb`], because a Worker makes a
-/// `PgSocketDb` per request. Nothing goes wrong when it is out of date: a
-/// statement wrongly thought built-in runs as before this existed, with its
-/// errors liable to the `25P02` described in the module docs, and one wrongly
-/// thought otherwise costs a round trip. A statement's types are learned
-/// again every time it runs.
-struct ResultTypes(Mutex<HashMap<Box<str>, bool>>);
+/// `PgSocketDb` per request. Nothing goes wrong when it forgets: a statement
+/// it no longer holds is found again the next time it fails.
+struct ResultTypes(Mutex<HashSet<Box<str>>>);
 
 /// How many statements [`ResultTypes`] remembers before it starts over. The
 /// SQL a request builds depends on its columns and filters, so there is no
@@ -369,31 +432,27 @@ struct ResultTypes(Mutex<HashMap<Box<str>, bool>>);
 const RESULT_TYPES_KEPT: usize = 1024;
 
 static RESULT_TYPES: LazyLock<ResultTypes> =
-    LazyLock::new(|| ResultTypes(Mutex::new(HashMap::new())));
+    LazyLock::new(|| ResultTypes(Mutex::new(HashSet::new())));
 
 impl ResultTypes {
-    /// Whether `sql` is known to return only built-in types.
-    fn built_in(&self, sql: &str) -> bool {
-        self.0
-            .lock()
-            .is_ok_and(|known| known.get(sql).copied().unwrap_or_default())
+    /// Whether `sql` is prepared before it runs.
+    fn must_prepare(&self, sql: &str) -> bool {
+        self.0.lock().is_ok_and(|known| known.contains(sql))
     }
 
-    /// What `sql` returned, as its result's `columns` describe it.
-    fn learn(&self, sql: &str, columns: &[tokio_postgres::Column]) {
-        let built_in = columns
-            .iter()
-            .all(|c| Type::from_oid(c.type_().oid()).is_some());
+    /// That `sql` is to be prepared before it runs. False if it already was,
+    /// and so cannot have been what hid an error.
+    fn remember(&self, sql: &str) -> bool {
         let Ok(mut known) = self.0.lock() else {
-            return;
+            return false;
         };
-        if known.get(sql) == Some(&built_in) {
-            return;
+        if known.contains(sql) {
+            return false;
         }
         if known.len() >= RESULT_TYPES_KEPT {
             known.clear();
         }
-        known.insert(sql.into(), built_in);
+        known.insert(sql.into())
     }
 }
 
@@ -418,10 +477,6 @@ async fn run(
     let mut rows = Vec::new();
     while let Some(row) = futures::StreamExt::next(&mut stream).await.transpose()? {
         rows.push(row);
-    }
-    // A schema changed since: the column has a type of its own now.
-    if let (None, Some(row)) = (&prepared, rows.first()) {
-        RESULT_TYPES.learn(sql, row.columns());
     }
     Ok((rows, stream.rows_affected().unwrap_or_default()))
 }
