@@ -28,24 +28,29 @@ pub async fn handle_request(State(state): State<Arc<AppState>>, request: Request
 mod via_socket {
     use crate::state::AppState;
     use postrust_auth::{JwtCache, JwtConfig};
-    use postrust_core::db::tokio_postgres::{config::Host, Config, NoTls};
+    use postrust_core::db::tokio_postgres::config::{Host, SslMode};
+    use postrust_core::db::tokio_postgres::{Config, NoTls};
     use postrust_core::db::{BoxFuture, Connector, PgSocketDb};
     use postrust_core::{AppConfig, SchemaCache};
     use std::sync::{Arc, OnceLock};
     use tokio::sync::RwLockReadGuard;
 
     /// A TCP socket per request, where a Worker opens one to Hyperdrive.
-    pub struct Tcp {
-        host: String,
-        port: u16,
-    }
+    ///
+    /// Or why there can be none: a database URI this build cannot use fails
+    /// each request with the reason, rather than panicking inside one.
+    pub struct Tcp(Result<(String, u16), String>);
 
     impl Connector for Tcp {
         type Stream = tokio::net::TcpStream;
         type Tls = NoTls;
 
         async fn connect(&self) -> std::io::Result<tokio::net::TcpStream> {
-            let stream = tokio::net::TcpStream::connect((self.host.as_str(), self.port)).await?;
+            let (host, port) = self
+                .0
+                .as_ref()
+                .map_err(|e| std::io::Error::other(e.clone()))?;
+            let stream = tokio::net::TcpStream::connect((host.as_str(), *port)).await?;
             stream.set_nodelay(true)?;
             Ok(stream)
         }
@@ -57,6 +62,44 @@ mod via_socket {
         fn spawn(&self, connection: BoxFuture<'static, ()>) {
             tokio::spawn(connection);
         }
+
+        async fn sleep(&self, duration: std::time::Duration) {
+            tokio::time::sleep(duration).await
+        }
+    }
+
+    /// The database a URI names, as this build can reach it: plain TCP, no
+    /// TLS. `sslmode=require` is refused here, saying so, rather than at
+    /// every connection as a failed TLS handshake.
+    pub(super) fn database(uri: &str) -> PgSocketDb<Tcp> {
+        let parsed = uri
+            .parse::<Config>()
+            .map_err(|e| format!("pg-socket: the database URI does not parse: {e}"));
+        let (config, target) = match parsed {
+            Ok(config) => {
+                let target = match (config.get_hosts().first(), config.get_ports().first()) {
+                    _ if config.get_ssl_mode() == SslMode::Require => Err(
+                        "pg-socket: this build connects without TLS, and the database URI \
+                         says sslmode=require"
+                            .to_string(),
+                    ),
+                    (Some(Host::Tcp(host)), port) => {
+                        Ok((host.clone(), port.copied().unwrap_or(5432)))
+                    }
+                    _ => Err("pg-socket: the database URI needs a TCP host".to_string()),
+                };
+                (config, target)
+            }
+            Err(e) => (Config::new(), Err(e)),
+        };
+        match &target {
+            Ok((host, port)) => tracing::warn!(
+                "pg-socket: REST requests run through the socket driver, one connection \
+                 per request to {host}:{port}. This build is for testing."
+            ),
+            Err(e) => tracing::error!("{e}"),
+        }
+        PgSocketDb::new(Tcp(target), config)
     }
 
     static DB: OnceLock<PgSocketDb<Tcp>> = OnceLock::new();
@@ -76,23 +119,7 @@ mod via_socket {
             Self: 'a;
 
         fn db(&self) -> &PgSocketDb<Tcp> {
-            DB.get_or_init(|| {
-                let config: Config = self
-                    .0
-                    .config
-                    .db_uri
-                    .parse()
-                    .expect("pg-socket: the database URI does not parse");
-                let (host, port) = match (config.get_hosts().first(), config.get_ports().first()) {
-                    (Some(Host::Tcp(host)), port) => (host.clone(), port.copied().unwrap_or(5432)),
-                    _ => panic!("pg-socket: the database URI needs a TCP host"),
-                };
-                tracing::warn!(
-                    "pg-socket: REST requests run through the socket driver, one connection \
-                     per request to {host}:{port}. This build is for testing."
-                );
-                PgSocketDb::new(Tcp { host, port }, config)
-            })
+            DB.get_or_init(|| database(&self.0.config.db_uri))
         }
 
         async fn schema_cache(&self) -> RwLockReadGuard<'_, SchemaCache> {
@@ -308,5 +335,28 @@ mod tests {
             super::api_path("/administrators", true),
             Some("/administrators")
         );
+    }
+
+    /// A database URI the socket build cannot use fails the request that
+    /// needs it, saying why. It used to panic inside the request handler.
+    #[cfg(feature = "pg-socket")]
+    #[tokio::test]
+    async fn an_unusable_database_uri_fails_requests_rather_than_the_process() {
+        use postrust_core::db::Db;
+
+        for (uri, says) in [
+            ("postgres://u@:what/db", "does not parse"),
+            (
+                "postgres://u@localhost/db?sslmode=require",
+                "sslmode=require",
+            ),
+            ("host=/var/run/postgresql dbname=db", "TCP host"),
+        ] {
+            let db = super::via_socket::database(uri);
+            match db.begin().await {
+                Err(e) => assert!(e.to_string().contains(says), "{uri}: {e}"),
+                Ok(_) => panic!("{uri}: connected"),
+            }
+        }
     }
 }
