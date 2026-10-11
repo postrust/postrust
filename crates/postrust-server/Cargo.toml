@@ -47,7 +47,7 @@ compat-key-order = ["serde_json/preserve_order", "postrust-core/compat-key-order
 
 [dependencies]
 # Async
-tokio.workspace = true
+tokio = { workspace = true, features = ["full"] }
 async-trait.workspace = true
 
 # Web
@@ -75,7 +75,7 @@ tracing-subscriber.workspace = true
 chrono.workspace = true
 
 # Internal
-postrust-core.workspace = true
+postrust-core = { workspace = true, features = ["sqlx"] }
 postrust-sql.workspace = true
 postrust-auth.workspace = true
 postrust-response.workspace = true

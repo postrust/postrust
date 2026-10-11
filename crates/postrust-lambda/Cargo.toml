@@ -21,7 +21,7 @@ lambda_http = "0.14"
 lambda_runtime = "0.14"
 
 # Async
-tokio.workspace = true
+tokio = { workspace = true, features = ["full"] }
 async-trait.workspace = true
 
 # Database

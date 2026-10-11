@@ -4,6 +4,11 @@
 
 #![warn(missing_docs)]
 
+// jsonwebtoken 10 on wasm32, under another name so it cannot be mistaken for
+// the native one; see Cargo.toml. Everything below says `jsonwebtoken`.
+#[cfg(target_arch = "wasm32")]
+extern crate jsonwebtoken10 as jsonwebtoken;
+
 mod cache;
 mod claims;
 pub mod hasura;

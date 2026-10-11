@@ -3,6 +3,7 @@
 //! This module provides functionality to discover and cache database schema
 //! metadata including tables, columns, relationships, and functions.
 
+#[cfg(feature = "sqlx")]
 mod queries;
 mod relationship;
 mod routine;
@@ -13,14 +14,17 @@ pub use relationship::{
 };
 pub use routine::{FuncVolatility, RetType, Routine, RoutineMap, RoutineParam};
 
+#[cfg(feature = "sqlx")]
 pub use queries::enum_values;
 pub use table::{Column, ColumnMap, ComputedColumn, Table, TablesMap};
 
 use crate::api_request::QualifiedIdentifier;
 use crate::error::{Error, Result};
+#[cfg(feature = "sqlx")]
 use sqlx::PgPool;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
+#[cfg(feature = "sqlx")]
 use tracing::info;
 
 /// Cached PostgreSQL schema metadata.
@@ -47,6 +51,7 @@ pub struct SchemaCache {
 
 impl SchemaCache {
     /// Load schema cache from the database.
+    #[cfg(feature = "sqlx")]
     pub async fn load(pool: &PgPool, schemas: &[String]) -> Result<Self> {
         Self::load_with_search_path(pool, schemas, &[]).await
     }
@@ -56,6 +61,7 @@ impl SchemaCache {
     /// A computed column's function is reached the way the database reaches
     /// it, which is along the search path -- so it may live in a schema the
     /// API does not expose. The table it reads must still be exposed.
+    #[cfg(feature = "sqlx")]
     pub async fn load_with_search_path(
         pool: &PgPool,
         schemas: &[String],
@@ -670,6 +676,7 @@ fn edit_distance(a: &str, b: &str) -> usize {
 /// through the base table is a `permission denied for schema private` at
 /// request time even though the relationship itself is real. Where a view over
 /// it is exposed and carries both keys, that view is joined through instead.
+#[cfg(feature = "sqlx")]
 fn substitute_hidden_junctions(
     tables: &TablesMap,
     view_columns: &[queries::ViewColumn],
@@ -779,6 +786,7 @@ fn substitute_hidden_junctions(
 /// column twice under different names, each spelling is a relationship of its
 /// own -- they are genuinely different joins, and `!t1_id1` is how a client
 /// tells them apart.
+#[cfg(feature = "sqlx")]
 fn add_view_relationships(
     tables: &TablesMap,
     view_columns: &[queries::ViewColumn],
@@ -958,6 +966,7 @@ fn add_view_relationships(
 ///
 /// `near` and `far` are given in the order the cardinality lists them, so the
 /// nth name replaces the nth column. `None` leaves that end alone.
+#[cfg(feature = "sqlx")]
 fn rename_cardinality(
     cardinality: &Cardinality,
     near: Option<&[String]>,
@@ -1037,6 +1046,7 @@ fn rename_cardinality(
 /// Only where the view exposes every one of them: a key missing a column is
 /// not that key, and a junction is exactly the relation whose key *is* the
 /// pairing.
+#[cfg(feature = "sqlx")]
 fn view_primary_keys(
     primary_keys: &std::collections::HashMap<QualifiedIdentifier, Vec<String>>,
     view_columns: &[queries::ViewColumn],
@@ -1087,6 +1097,7 @@ fn view_primary_keys(
 ///
 /// Both sides get the relationship, named after the table across the junction,
 /// so `/users?select=name,tasks(name)` works from either end.
+#[cfg(feature = "sqlx")]
 fn add_junction_relationships(
     primary_keys: &std::collections::HashMap<QualifiedIdentifier, Vec<String>>,
     relationships: &mut RelationshipsMap,
@@ -1204,6 +1215,7 @@ impl SchemaCacheRef {
     }
 
     /// Load or reload the schema cache.
+    #[cfg(feature = "sqlx")]
     pub async fn load(&self, pool: &PgPool, schemas: &[String]) -> Result<()> {
         let cache = SchemaCache::load(pool, schemas).await?;
         let mut guard = self.0.write().await;
