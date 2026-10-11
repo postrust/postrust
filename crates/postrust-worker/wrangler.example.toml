@@ -22,6 +22,13 @@ id = "<namespace id>"
 [triggers]
 crons = ["*/15 * * * *"]
 
+# Run the Worker near the database rather than near each client: a request
+# waits on the database several times and on the client once. Name the
+# region your database is in, or use mode = "smart". Region hints need a
+# recent wrangler.
+# [placement]
+# region = "aws:us-east-1"
+
 # The server's own variables. Secrets -- PGRST_JWT_SECRET and, to enable
 # POST /_/reload, POSTRUST_RELOAD_SECRET -- go in with `wrangler secret put`.
 [vars]
