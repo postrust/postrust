@@ -36,7 +36,8 @@ impl SqlxTx {
         for (sql, params) in std::mem::take(&mut self.queued) {
             bind(sqlx::query(&sql), &params)
                 .execute(&mut *self.tx)
-                .await?;
+                .await
+                .map_err(|e| DbError::from(e).queued())?;
         }
         Ok(())
     }
@@ -200,6 +201,13 @@ impl From<sqlx::Error> for DbError {
                     },
                 )
             }
+            // The connection, not a statement on it: it broke, it could not be
+            // had from the pool in time, or the pool is gone.
+            sqlx::Error::Io(_)
+            | sqlx::Error::Tls(_)
+            | sqlx::Error::PoolTimedOut
+            | sqlx::Error::PoolClosed
+            | sqlx::Error::WorkerCrashed => DbError::connection(message),
             _ => DbError::other(message),
         }
     }

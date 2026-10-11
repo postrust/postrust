@@ -81,10 +81,13 @@ pub trait Db: MaybeSend + MaybeSync {
     where
         Self: 'a;
 
-    /// Open a transaction. `BEGIN` is sent here, before this returns, so a
-    /// connection that cannot be had fails now rather than at the first
-    /// statement. Nothing else is: `SET TRANSACTION` may still follow, as the
-    /// caller's first statement.
+    /// Open a transaction. The connection is had here, before this returns,
+    /// so one that cannot be had fails now rather than at the first statement.
+    /// `BEGIN` is sent here or, by a driver that pipelines, with the first
+    /// statement; nothing else is, so `SET TRANSACTION` may still follow, as
+    /// the caller's first statement. A connection that breaks after this is
+    /// reported by the statement that finds out, as
+    /// [`DbError::is_connection`].
     fn begin(&self) -> impl Future<Output = Result<Self::Tx<'_>, DbError>> + MaybeSend;
 }
 
@@ -136,7 +139,14 @@ pub trait Tx: MaybeSend {
     /// together with the query in one flight rather than waiting on each in
     /// turn; one that cannot runs them first, one by one, which is what the
     /// caller would have done anyway. Either way they run in order, before the
-    /// next statement, and if one fails nothing after it does.
+    /// next statement.
+    ///
+    /// If one fails, nothing after it takes effect. One PostgreSQL refuses
+    /// aborts the transaction, so a statement already sent behind it is
+    /// refused in turn (and a `COMMIT` behind it rolls back); one that fails
+    /// before it is sent -- a parameter that cannot be encoded -- stops the
+    /// statements behind it from being sent at all. The failure is reported
+    /// as the next statement's, marked [`DbError::was_queued`].
     fn queue(&mut self, sql: &str, params: &[SqlParam]);
 
     /// [`Tx::fetch_json`], and then `then` -- a statement with no parameters,
@@ -151,6 +161,29 @@ pub trait Tx: MaybeSend {
         params: &[SqlParam],
         then: &str,
     ) -> impl Future<Output = FetchedThen> + MaybeSend;
+
+    /// [`Tx::fetch_json_then`] as the transaction's last statements, and
+    /// [`Tx::commit`].
+    ///
+    /// For a read that has to read its response settings back -- one a
+    /// pre-request function may have set them on -- and then has nothing left
+    /// that could change whether it should commit. A driver that can pipeline
+    /// sends all three at once; the default runs them in turn.
+    fn fetch_json_then_and_commit(
+        mut self,
+        sql: &str,
+        params: &[SqlParam],
+        then: &str,
+    ) -> impl Future<Output = FetchedThen> + MaybeSend
+    where
+        Self: Sized,
+    {
+        async move {
+            let fetched = self.fetch_json_then(sql, params, then).await?;
+            self.commit().await?;
+            Ok(fetched)
+        }
+    }
 
     /// [`Tx::fetch_json`] as the transaction's last statement, and
     /// [`Tx::commit`].
@@ -196,37 +229,68 @@ impl RawRows {
 ///
 /// Its `Display` is the driver's own account, which is what gets logged.
 /// Converted to [`Error`] it is the database's error where PostgreSQL sent
-/// one -- SQLSTATE, message, detail, hint, constraint -- and an internal error
-/// otherwise.
+/// one -- SQLSTATE, message, detail, hint, constraint -- a connection error
+/// where the connection could not be used, and an internal error otherwise.
 #[derive(Debug)]
 pub struct DbError {
     message: String,
     // Boxed: a failure is rare, and every `Result` a driver returns would
     // otherwise be as large as PostgreSQL's whole error report.
     database: Option<Box<DatabaseError>>,
+    connection: bool,
+    queued: bool,
 }
 
 impl DbError {
-    /// A failure that is not PostgreSQL's: a broken connection, a protocol or
-    /// decoding fault.
+    /// A failure that is not PostgreSQL's: a protocol or decoding fault.
     pub fn other(message: impl Into<String>) -> Self {
         Self {
             message: message.into(),
             database: None,
+            connection: false,
+            queued: false,
+        }
+    }
+
+    /// A connection that cannot be used: one that could not be opened in
+    /// time, was closed, or failed reading or writing.
+    pub fn connection(message: impl Into<String>) -> Self {
+        Self {
+            connection: true,
+            ..Self::other(message)
         }
     }
 
     /// An error PostgreSQL reported, with `message` as the driver phrased it.
     pub fn database(message: impl Into<String>, error: DatabaseError) -> Self {
         Self {
-            message: message.into(),
             database: Some(Box::new(error)),
+            ..Self::other(message)
+        }
+    }
+
+    /// This failure, as a [`Tx::queue`]d statement's.
+    pub fn queued(self) -> Self {
+        Self {
+            queued: true,
+            ..self
         }
     }
 
     /// The error PostgreSQL reported, if it was one.
     pub fn as_database(&self) -> Option<&DatabaseError> {
         self.database.as_deref()
+    }
+
+    /// Whether the connection was what failed, rather than a statement on it.
+    pub fn is_connection(&self) -> bool {
+        self.connection
+    }
+
+    /// Whether a [`Tx::queue`]d statement failed, rather than the one it was
+    /// reported by -- a pre-request function refusing the request, say.
+    pub fn was_queued(&self) -> bool {
+        self.queued
     }
 }
 
@@ -242,7 +306,23 @@ impl From<DbError> for Error {
     fn from(error: DbError) -> Self {
         match error.database {
             Some(database) => Error::Database(*database),
+            None if error.connection => Error::ConnectionPool(error.message),
             None => Error::Internal(error.message),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A connection that broke is the database being unavailable, whichever
+    /// statement found out; anything else with no SQLSTATE is internal.
+    #[test]
+    fn a_broken_connection_is_reported_as_one() {
+        let error = Error::from(DbError::connection("connection closed").queued());
+        assert!(matches!(error, Error::ConnectionPool(_)), "{error:?}");
+        let error = Error::from(DbError::other("could not decode"));
+        assert!(matches!(error, Error::Internal(_)), "{error:?}");
     }
 }

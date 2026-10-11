@@ -1170,8 +1170,18 @@ async fn execute_plan<'s, S: State>(
 
             // The main query. A logged failure names the driver's account of
             // it, which says more than the response is allowed to.
+            //
+            // Not a queued statement's, which is reported along with the
+            // query but is not its failure: a pre-request function raising to
+            // refuse a request is doing its job, and a log line at error level
+            // for every refusal would bury the failures that are faults. The
+            // statements were run on their own before they were queued, and
+            // their failures went unlogged then too.
             let log = |e: postrust_core::db::DbError| {
-                error!("Query error: {}", e);
+                match e.was_queued() && !e.is_connection() {
+                    true => debug!("Refused before the query: {}", e),
+                    false => error!("Query error: {}", e),
+                }
                 postrust_core::Error::from(e)
             };
 
@@ -1273,25 +1283,35 @@ async fn execute_plan<'s, S: State>(
 
             // A function can set the response's status and headers, and only
             // it knows whether it did -- so the settings are read back after
-            // it has run, on the same transaction. Reads cannot set them
-            // without a function of their own having run, which is what a
-            // call or a mutation is.
-            let reads_response_settings =
-                is_mutation(db_plan) || matches!(db_plan, DbActionPlan::Call { .. });
+            // it has run, on the same transaction. That is a call, a mutation
+            // (through a trigger), or any request at all where a pre-request
+            // function runs first: PostgREST honours what it sets on a plain
+            // read too, a `Cache-Control` say.
+            let reads_response_settings = is_mutation(db_plan)
+                || matches!(db_plan, DbActionPlan::Call { .. })
+                || state.config().db_pre_request.is_some();
             let counts = api_request.preferences.count.is_some() && count_sql.is_some();
 
             // The query, and with it whatever can go in the same flight. A
             // read with nothing after it commits there and then: committing
             // a read-only transaction changes nothing, so no later refusal
-            // needs it open. A call or a write reads its settings back in the
-            // same flight, unless embeds have to be fetched in between.
-            let (mut json_rows, response_settings, mut tx) = if is_read_only(api_request)
+            // needs it open -- and one that reads its settings back reads
+            // them in that flight too. A call or a write reads its settings
+            // back in the same flight, unless embeds have to be fetched in
+            // between.
+            let ends_with_the_query =
+                is_read_only(api_request) && !counts && two_query_parent.is_none();
+            let (mut json_rows, response_settings, mut tx) = if ends_with_the_query
                 && !reads_response_settings
-                && !counts
-                && two_query_parent.is_none()
             {
                 let rows = tx.fetch_json_and_commit(&sql, &params).await.map_err(log)?;
                 (rows, None, None)
+            } else if ends_with_the_query {
+                let (rows, settings) = tx
+                    .fetch_json_then_and_commit(&sql, &params, RESPONSE_SETTINGS)
+                    .await
+                    .map_err(log)?;
+                (rows, Some(settings), None)
             } else if reads_response_settings && two_query_parent.is_none() {
                 let (rows, settings) = tx
                     .fetch_json_then(&sql, &params, RESPONSE_SETTINGS)

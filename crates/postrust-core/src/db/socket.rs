@@ -147,10 +147,9 @@ where
             .copied()
             .unwrap_or(DEFAULT_CONNECT_TIMEOUT);
         let connect = std::pin::pin!(async {
-            let stream =
-                self.connector.connect().await.map_err(|e| {
-                    DbError::other(format!("error connecting to the database: {e}"))
-                })?;
+            let stream = self.connector.connect().await.map_err(|e| {
+                DbError::connection(format!("error connecting to the database: {e}"))
+            })?;
             Ok::<_, DbError>(
                 self.config
                     .connect_raw(stream, self.connector.tls())
@@ -161,7 +160,7 @@ where
         let (client, connection) = match futures::future::select(connect, expired).await {
             futures::future::Either::Left((connected, _)) => connected?,
             futures::future::Either::Right(_) => {
-                return Err(DbError::other(format!(
+                return Err(DbError::connection(format!(
                     "timed out after {timeout:?} connecting to the database"
                 )))
             }
@@ -264,6 +263,21 @@ impl Tx for SocketTx {
         ))
     }
 
+    async fn fetch_json_then_and_commit(
+        mut self,
+        sql: &str,
+        params: &[SqlParam],
+        then: &str,
+    ) -> FetchedThen {
+        let [(rows, _), (then, _), _] = self
+            .send([(sql, params), (then, &[][..]), ("COMMIT", &[][..])])
+            .await?;
+        Ok((
+            rows.iter().map(row_to_json).collect(),
+            then.iter().map(row_to_values).collect(),
+        ))
+    }
+
     async fn fetch_json_and_commit(
         mut self,
         sql: &str,
@@ -351,11 +365,17 @@ impl SocketTx {
             let end = (start + 1..all.len())
                 .find(|&index| prepare_first(index))
                 .unwrap_or(all.len());
+            // A failure among `ahead` is a queued statement's, which the
+            // caller hears of as such (`DbError::was_queued`).
+            let queued = |index: usize, e: DbError| match index < ahead.len() {
+                true => e.queued(),
+                false => e,
+            };
             let mut prepared = match prepare_first(start) {
                 true => Some(
                     self.prepare(all[start].0, all[start].1)
                         .await
-                        .map_err(Failed::Error)?,
+                        .map_err(|e| Failed::Error(queued(start, e)))?,
                 ),
                 false => None,
             };
@@ -376,9 +396,9 @@ impl SocketTx {
                             && !(offset == 0 && was_prepared) =>
                     {
                         let sql = all[start + offset].0.to_string();
-                        return Err(Failed::Masked(sql, self.error(e)));
+                        return Err(Failed::Masked(sql, queued(start + offset, self.error(e))));
                     }
-                    Err(e) => return Err(Failed::Error(self.error(e))),
+                    Err(e) => return Err(Failed::Error(queued(start + offset, self.error(e)))),
                 }
             }
             start = end;
@@ -482,20 +502,53 @@ async fn run(
 }
 
 /// Every future to completion, each polled for the first time in the order
-/// given, and their outputs in that order.
+/// given, and their outputs in that order -- up to the first that failed
+/// before any later one was started, which none after it is.
 ///
 /// The order is the point. A statement's messages are written to the
 /// connection when its future is first polled, so polling them in turn sends
 /// them in turn, all before any answer is waited on -- and PostgreSQL runs
 /// them in the order it received them. `join_all` makes no promise about the
 /// order of its first polls once there are more than a few futures.
-async fn in_order<F: Future + Unpin>(futures: Vec<F>) -> Vec<F::Output> {
-    let mut slots: Vec<(F, Option<F::Output>)> = futures.into_iter().map(|f| (f, None)).collect();
+///
+/// A statement that fails on its first poll was never sent: a parameter that
+/// would not encode, say. PostgreSQL never refused it, so the transaction is
+/// not aborted, and a statement sent behind it -- a `COMMIT` -- would take
+/// effect. So nothing after it is sent.
+async fn in_order<F, T, E>(futures: Vec<F>) -> Vec<Result<T, E>>
+where
+    F: Future<Output = Result<T, E>> + Unpin,
+{
+    struct Slot<F, O> {
+        future: F,
+        started: bool,
+        output: Option<O>,
+    }
+    let mut slots: Vec<Slot<F, Result<T, E>>> = futures
+        .into_iter()
+        .map(|future| Slot {
+            future,
+            started: false,
+            output: None,
+        })
+        .collect();
     std::future::poll_fn(|cx| {
         let mut pending = false;
-        for (future, output) in slots.iter_mut().filter(|(_, output)| output.is_none()) {
-            match std::pin::Pin::new(future).poll(cx) {
-                std::task::Poll::Ready(value) => *output = Some(value),
+        let mut failed = false;
+        for slot in slots.iter_mut() {
+            if let Some(output) = &slot.output {
+                failed |= output.is_err();
+                continue;
+            }
+            if failed && !slot.started {
+                continue;
+            }
+            slot.started = true;
+            match std::pin::Pin::new(&mut slot.future).poll(cx) {
+                std::task::Poll::Ready(value) => {
+                    failed |= value.is_err();
+                    slot.output = Some(value);
+                }
                 std::task::Poll::Pending => pending = true,
             }
         }
@@ -505,7 +558,7 @@ async fn in_order<F: Future + Unpin>(futures: Vec<F>) -> Vec<F::Output> {
         }
     })
     .await;
-    slots.into_iter().filter_map(|(_, output)| output).collect()
+    slots.into_iter().map_while(|slot| slot.output).collect()
 }
 
 /// Parameters as sqlx binds them: each with the type of its Rust value.
@@ -801,7 +854,22 @@ impl From<tokio_postgres::Error> for DbError {
                     column: None,
                 },
             ),
+            // Closed, or failed reading or writing: the connection is gone,
+            // whatever statement was on it.
+            None if e.is_closed() || io_error(&e) => DbError::connection(message),
             None => DbError::other(message),
         }
     }
+}
+
+/// Whether an input or output failure is behind `e`.
+fn io_error(e: &tokio_postgres::Error) -> bool {
+    let mut source = std::error::Error::source(e);
+    while let Some(cause) = source {
+        if cause.is::<std::io::Error>() {
+            return true;
+        }
+        source = cause.source();
+    }
+    false
 }

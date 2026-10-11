@@ -543,14 +543,19 @@ async fn queued_statements_run_first_in_order() {
             raw: RawRows::default(),
         }));
 
-        // A queued failure is reported in place of the statement after it.
+        // A queued failure is reported in place of the statement after it,
+        // and says it was a queued statement's: the engine does not log a
+        // pre-request function's refusal as the query failing.
         let mut tx = db.begin().await.unwrap();
         tx.queue("SELECT set_config($1, $2, true)", &settings);
         tx.queue("SELECT 1 / 0", &[]);
         tx.queue("SELECT 'x'::int", &[]);
         answers.push(match tx.fetch_json("SELECT 1 AS v", &[]).await {
             Ok(rows) => panic!("expected a failure, got {rows:?}"),
-            Err(e) => failed(e),
+            Err(e) => {
+                assert!(e.was_queued(), "{e}");
+                failed(e)
+            }
         });
 
         // The statement after: run after the first, and not at all when the
@@ -573,7 +578,10 @@ async fn queued_statements_run_first_in_order() {
         answers.push(
             match tx.fetch_json_then("SELECT nope", &[], "SELECT 1 / 0").await {
                 Ok(rows) => panic!("expected a failure, got {rows:?}"),
-                Err(e) => failed(e),
+                Err(e) => {
+                    assert!(!e.was_queued(), "{e}");
+                    failed(e)
+                }
             },
         );
         answers
@@ -752,6 +760,23 @@ async fn a_read_is_one_flight_and_a_write_two() {
         .unwrap();
     assert_eq!(read(), 1, "a read");
 
+    // The settings that went out with the query held: a read-only request
+    // that tries to write is refused, in the same one flight.
+    let mut tx = db.begin().await.unwrap();
+    let refused = after_connecting();
+    tx.queue("SET TRANSACTION READ ONLY", &[]);
+    tx.queue("SELECT set_config($1, $2, true)", &settings);
+    let e = tx
+        .fetch_json_and_commit("INSERT INTO agree_flights VALUES (2) RETURNING n", &[])
+        .await
+        .unwrap_err();
+    assert_eq!(
+        e.as_database().map(|d| d.code.as_str()),
+        Some("25006"),
+        "{e}"
+    );
+    assert_eq!(refused(), 1, "a refused read");
+
     // A write: set up, the statement and the function's settings read back,
     // and then the commit, which waits on the response being sendable.
     let mut tx = db.begin().await.unwrap();
@@ -768,6 +793,46 @@ async fn a_read_is_one_flight_and_a_write_two() {
     assert_eq!(write(), 2, "a write");
 
     sqlx::query("DROP TABLE agree_flights")
+        .execute(&pool)
+        .await
+        .unwrap();
+}
+
+/// A queued statement that fails before it is sent -- here, one with more
+/// parameters than the protocol can carry -- stops everything after it. The
+/// socket driver used to send the rest of the flight all the same, `COMMIT`
+/// included, and PostgreSQL, having refused nothing, committed it.
+#[tokio::test]
+#[ignore = "needs a PostgreSQL database"]
+async fn a_queued_statement_that_cannot_be_sent_stops_the_rest() {
+    async fn check<D: Db>(db: &D, pool: &sqlx::PgPool) {
+        let mut tx = db.begin().await.unwrap();
+        let too_many: Vec<SqlParam> = (0..70_000).map(SqlParam::Int).collect();
+        tx.queue("SELECT 1", &too_many);
+        let e = tx
+            .fetch_json_and_commit("INSERT INTO agree_unsent VALUES (1) RETURNING n", &[])
+            .await
+            .unwrap_err();
+        assert!(e.was_queued(), "{e}");
+        let written: i64 = sqlx::query_scalar("SELECT count(*) FROM agree_unsent")
+            .fetch_one(pool)
+            .await
+            .unwrap();
+        assert_eq!(written, 0, "the statement after a failed one was committed");
+    }
+
+    let (pool, socket) = drivers().await;
+    sqlx::query("DROP TABLE IF EXISTS agree_unsent")
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query("CREATE TABLE agree_unsent (n int)")
+        .execute(&pool)
+        .await
+        .unwrap();
+    check(&pool, &pool).await;
+    check(&socket, &pool).await;
+    sqlx::query("DROP TABLE agree_unsent")
         .execute(&pool)
         .await
         .unwrap();
