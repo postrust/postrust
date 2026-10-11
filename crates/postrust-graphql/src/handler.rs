@@ -3802,6 +3802,7 @@ async fn aggregate_value(
     // object under two names, so the columns are the union of what both named
     // and the object is built once.
     let mut wants_nodes = false;
+    let mut wants_aggregate = false;
     let mut wanted: BTreeMap<String, Vec<String>> = BTreeMap::new();
     // `count` is different: each occurrence may count something else, so each
     // is answered under the name it was asked for.
@@ -3810,7 +3811,12 @@ async fn aggregate_value(
         match selection.name() {
             "nodes" => wants_nodes = true,
             "aggregate" => {
+                wants_aggregate = true;
                 for function in selection.selection_set() {
+                    // Answered by the schema, at this level and the one below.
+                    if function.name() == "__typename" {
+                        continue;
+                    }
                     if function.name() == "count" {
                         counts.push((
                             function.alias().unwrap_or("count").to_string(),
@@ -3823,10 +3829,12 @@ async fn aggregate_value(
                         ));
                         continue;
                     }
+                    // Entered even when it names no column: `max { __typename }`
+                    // is an object with nothing in it, not a null.
                     let columns = wanted.entry(function.name().to_string()).or_default();
                     for column in function.selection_set() {
                         let name = column.name().to_string();
-                        if !columns.contains(&name) {
+                        if name != "__typename" && !columns.contains(&name) {
                             columns.push(name);
                         }
                     }
@@ -3835,11 +3843,12 @@ async fn aggregate_value(
             _ => {}
         }
     }
-    wanted.retain(|_, columns| !columns.is_empty());
 
     let mut result = async_graphql::indexmap::IndexMap::new();
 
-    if !counts.is_empty() || !wanted.is_empty() {
+    // Whatever `aggregate` names -- even if that is only `__typename` -- it is
+    // an object, so it is answered rather than left null.
+    if wants_aggregate {
         // `count` is answered whether or not it was asked for: the aggregate
         // type's own resolver reads a missing key as zero, and a client that
         // asked for nothing else still gets a number rather than a null.
@@ -8702,7 +8711,8 @@ fn nested_aggregate_select(
                     let columns = wanted.entry(sql_function).or_default();
                     for column in function.selection_set() {
                         let name = column.name().to_string();
-                        if !columns.contains(&name) {
+                        // Answered by the schema, not a column.
+                        if name != "__typename" && !columns.contains(&name) {
                             columns.push(name);
                         }
                     }
@@ -8732,13 +8742,13 @@ fn nested_aggregate_select(
                             )
                         })
                         .collect();
-                    if !columns.is_empty() {
-                        fields.push(format!(
-                            "'{}', json_build_object({})",
-                            sql_function,
-                            columns.join(", ")
-                        ));
-                    }
+                    // Pushed even when empty, as at the root: `max { __typename }`
+                    // is an object with nothing in it, not a null.
+                    fields.push(format!(
+                        "'{}', json_build_object({})",
+                        sql_function,
+                        columns.join(", ")
+                    ));
                 }
                 parts.push(format!(
                     "json_build_object({}) AS {}",
@@ -9369,7 +9379,10 @@ fn build_embed_expressions<'a>(
                     })
                 })
                 .unwrap_or(false);
-            if is_relationship {
+            // `__typename` is answered by the schema, not the row -- and it is
+            // asked for here constantly: Apollo Client adds it to every
+            // selection, and a Federation router to every entity reference.
+            if is_relationship || name == "__typename" {
                 continue;
             }
             // A computed column inside an embed is the same call, against the
@@ -9520,6 +9533,8 @@ fn embed_relationships<'f>(
                             Err(_) => project_everything = true,
                         }
                     }
+                    // Answered by the schema, not a column.
+                    None if name == "__typename" => {}
                     None => child_columns.push(name.to_string()),
                 }
             }

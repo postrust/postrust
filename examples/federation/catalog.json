@@ -1,0 +1,9 @@
+{
+  "tables": {
+    "public.products": {
+      "name": "Product",
+      "federation": { "shared": true },
+      "roots": { "select": "products", "select_by_pk": "product" }
+    }
+  }
+}

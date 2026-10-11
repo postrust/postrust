@@ -10,6 +10,7 @@ on:
       - "crates/postrust-graphql/**"
       - "crates/postrust-server/**"
       - "scripts/apollo-federation/**"
+      - "examples/federation/**"
   workflow_dispatch:
 
 permissions:
@@ -20,6 +21,24 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  example:
+    name: Two subgraphs behind Apollo Router
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      # The example and the blog post built on it, run against this change
+      # rather than the published image: both directions across the two
+      # subgraphs, row-level security through the router, a refused token.
+      - name: Build Postrust
+        run: docker build -t postrust:example -f scripts/apollo-federation/Dockerfile .
+
+      - name: Run examples/federation/check.sh
+        env:
+          POSTRUST_IMAGE: postrust:example
+        run: examples/federation/check.sh
+
   compatibility:
     name: Apollo subgraph compatibility
     runs-on: ubuntu-latest

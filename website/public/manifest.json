@@ -6,5 +6,5 @@
   "display": "standalone",
   "background_color": "#ffffff",
   "theme_color": "#f5912c",
-  "description": "High-performance PostgreSQL REST & GraphQL API server written in Rust. Serverless-first with 5-20ms cold starts."
+  "description": "PostgreSQL as REST and GraphQL APIs, from one Rust binary."
 }

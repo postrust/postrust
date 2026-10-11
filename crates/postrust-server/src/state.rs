@@ -2,8 +2,9 @@
 
 use postrust_auth::{JwtCache, JwtConfig};
 use postrust_core::{AppConfig, SchemaCache};
+use postrust_engine::State;
 use sqlx::PgPool;
-use tokio::sync::RwLock;
+use tokio::sync::{RwLock, RwLockReadGuard};
 
 /// Shared application state.
 pub struct AppState {
@@ -21,7 +22,7 @@ pub struct AppState {
 
 impl AppState {
     /// Get a read lock on the schema cache.
-    pub async fn schema_cache(&self) -> tokio::sync::RwLockReadGuard<'_, SchemaCache> {
+    pub async fn schema_cache(&self) -> RwLockReadGuard<'_, SchemaCache> {
         self.schema_cache.read().await
     }
 
@@ -46,5 +47,30 @@ impl AppState {
     /// Get exposed schemas.
     pub fn schemas(&self) -> &[String] {
         &self.config.db_schemas
+    }
+}
+
+impl State for AppState {
+    type Db = PgPool;
+    type SchemaCache<'a> = RwLockReadGuard<'a, SchemaCache>;
+
+    fn db(&self) -> &PgPool {
+        &self.pool
+    }
+
+    async fn schema_cache(&self) -> RwLockReadGuard<'_, SchemaCache> {
+        self.schema_cache.read().await
+    }
+
+    fn config(&self) -> &AppConfig {
+        &self.config
+    }
+
+    fn jwt_config(&self) -> &JwtConfig {
+        &self.jwt_config
+    }
+
+    fn jwt_cache(&self) -> Option<&JwtCache> {
+        self.jwt_cache.as_ref()
     }
 }

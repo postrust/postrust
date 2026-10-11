@@ -3,6 +3,270 @@
 Notable changes, newest first. This file starts at 1.0.0-alpha.1; earlier
 releases are described by their tags and the pull requests behind them.
 
+## 2.3.0
+
+A minor release: additions to the public Rust API -- a new crate,
+`postrust-engine`, and the driver-neutral database interface in
+`postrust_core::db` -- and no breaking change: `cargo semver-checks` against
+2.2.0 passes for every stable crate. Three things in it:
+
+- **The Cloudflare Workers adapter works.** `postrust-worker` 0.7.0 serves
+  the REST API in a Worker and reaches PostgreSQL through Hyperdrive. It was
+  a stub that answered `{"status": "stub"}`. Getting there took the request
+  pipeline out of the server and off sqlx, without changing what the server
+  does. Issue #50 planned it in phases, and each phase was measured against
+  the one before.
+- **A write the response refuses is rolled back,** and a schema reload no
+  longer deadlocks a request in flight.
+- **Two GraphQL fixes,** found by running two Postrust subgraphs behind
+  Apollo Router for the Federation example in `examples/federation`. They
+  were cut as 2.2.1 and are released here instead.
+
+`postrust-proxy` stays at 0.6.0: nothing in it changed.
+
+### Added
+
+- **`postrust-worker` 0.7.0.** The server's REST pipeline in a Worker, over
+  Hyperdrive.
+  - Every request runs in a transaction that switches to the token's role and
+    sets its claims, as on the server.
+  - The schema cache is kept in Workers KV and refreshed by a Cron Trigger or
+    an authenticated `POST /_/reload`. The KV copy expires after
+    `PGRST_WORKER_SCHEMA_TTL` (at least 60 seconds), so a migration is seen
+    without either.
+  - Rows are capped at 1000 unless `PGRST_DB_MAX_ROWS` (or `PGRST_MAX_ROWS`)
+    says otherwise.
+  - Unquoted `wrangler.toml` variables, which wrangler passes as numbers and
+    booleans, are read as the server would read them.
+  - REST only.
+  - Tested in workerd by `scripts/serverless/worker.sh`, and against
+    PostgREST's own suite. See `docs/workers.md`.
+- **`postrust-engine`**, a new crate on the stable line. It is the REST
+  request pipeline with no web framework: `handle(&state, request)` takes an
+  `http::Request` and returns an `http::Response<Bytes>`. The server is now an
+  axum wrapper around it.
+- **`postrust_core::db`**: the database as the pipeline and the schema-cache
+  loader use it.
+  - The `Db` and `Tx` traits, with drivers that decode rows straight to JSON
+    and are used generically.
+  - sqlx's `PgPool` implements them.
+  - `PgSocketDb` (feature `pg-socket`) speaks the wire protocol through
+    tokio-postgres over any socket.
+  - `DbError` says whether PostgreSQL refused a statement (`as_database`),
+    whether the connection was what failed (`is_connection`), and whether
+    the failure was a queued statement's (`was_queued`).
+  - `crates/postrust-server/tests/drivers_agree.rs` holds the two drivers to
+    identical answers: every column type, parameter typing, and errors down to
+    the SQLSTATE and constraint.
+- **Statement pipelining.** `Tx` gains `queue`, `fetch_json_then`,
+  `fetch_json_and_commit` and `fetch_json_then_and_commit`. `PgSocketDb`
+  uses them to send the statements that set a transaction up, the query, and
+  what follows it in one flight: a plain read -- and a `GET` to a function --
+  is one flight after connecting, where it was five, and a write two, where
+  it was five or six. A read with a count, or a media type the schema
+  renders, takes a flight or two more: it commits after its last statement
+  has answered. sqlx cannot pipeline, so the server
+  runs the same statements one after another, as before. `drivers_agree.rs`
+  holds both drivers to the same order and the same first error, and counts
+  the socket driver's flights.
+- **`postrust_core::VERSION`**, the crate's version. The Worker keys the KV
+  copy of the schema cache by it, since the cache's shape is core's.
+- `SchemaCache::load_from` and `load_with_search_path_from` load the cache
+  through any `Db`. The sqlx-typed `load` and `load_with_search_path` are
+  unchanged.
+- `AppConfig::try_from_vars`, to build the configuration from name/value
+  pairs rather than the process environment.
+- `SchemaCache` implements `Serialize` and `Deserialize`.
+- `scripts/conformance/conformance.sh` takes `CONFORMANCE_EXTRA_FEATURES`
+  (for example `pg-socket`, which routes REST through the socket driver) and
+  `CONFORMANCE_WORKER_BUILD`, which makes the Worker in workerd the candidate.
+  CI runs the server's database tests with `pg-socket` too.
+- `examples/federation`: two databases, a Postrust subgraph over each, Rover
+  and Apollo Router in one Compose file, with row-level security deciding what
+  each caller sees through the router, and a script that checks it.
+- `postrust_graphql::hasura` gains `invalid_jwt` and `missing_role_claim`,
+  hidden from the docs, for the server crate's use.
+
+### Fixed
+
+- **A write the response refuses is rolled back.** `Prefer: max-affected`
+  with `handling=strict`, and a singular `Accept` on a write that touched
+  several rows, were refused after the transaction had been committed, so
+  the client got `PGRST124`/`PGRST116` while every row stayed changed.
+  PostgREST rolls these back, and now so does Postrust: the transaction
+  commits only once the response is known to be one it can send. The same
+  holds for every other refusal made after the statement: a `PUT` whose body
+  names a different row than its URL (`PGRST115`), an offset past the end of
+  a counted call's result (`416`), a function asking for one object and
+  answering none or several, and a function setting an invalid
+  `response.status` (`PGRST112`) or `response.headers` (`PGRST111`).
+  `crates/postrust-server/tests/refused_writes_roll_back.rs` covers them, on
+  sqlx and on the socket driver.
+- **A schema reload no longer deadlocks a request in flight.** A request held
+  the schema cache's read lock from planning to the end of its query and took
+  it again along the way. The lock queues readers behind a waiting writer, so
+  a reload (`NOTIFY pgrst`) arriving in between waited on the request while
+  the request waited on the reload -- and every request after them queued
+  behind both, until the server was restarted. The lock is now released
+  before the query runs, and never held across a query.
+- **A write the database refuses at COMMIT is reported as what it is.** A
+  `DEFERRABLE INITIALLY DEFERRED` constraint is only checked at COMMIT, and a
+  failure there was answered `500` "Service temporarily unavailable", as if
+  the connection pool had failed. It is now reported like any other database
+  error, with its SQLSTATE and status: a deferred foreign key violation is a
+  `409`, as an immediate one is.
+- **A header a function sets that HTTP cannot carry is refused before the
+  commit.** `response.headers` was checked only for its JSON shape; a name or
+  value HTTP cannot carry -- a newline in a value, say -- failed when the
+  response was built, after the function's writes were committed, and the
+  client got an empty `200`. It is now refused with `PGRST111` and the writes
+  are rolled back. A response that cannot be built for any other reason is
+  logged and answered `500` rather than an empty `200`.
+- **A header or status a pre-request function sets reaches a read.**
+  `db-pre-request` can set `response.headers` and `response.status` on any
+  request, and PostgREST honours them on a `GET` -- a `Cache-Control`, say.
+  They were read back only after a function call or a write, so on a read of
+  a table they were dropped.
+- **`__typename` inside a relationship or an aggregate.** Asking for it
+  anywhere below the root -- on an object or array relationship, on the rows a
+  mutation returned, or inside an aggregate's functions (`max { __typename id
+  }`), at the root or through a relationship -- failed the whole query with
+  `column "__typename" does not exist`; only the root and an aggregate's
+  `nodes` answered it. A function or `aggregate` object asked for nothing but
+  `__typename` came back null; it is now the object, named as Hasura names it
+  (`books_max_fields`, `books_aggregate_fields`). Apollo Client
+  adds `__typename` to every selection set by default, and a Federation router
+  asks for it on every entity reference it follows, so a query crossing from
+  one subgraph to another through a relationship failed. It is now answered by
+  the schema, as it is at the root.
+- **A GraphQL token that does not verify is refused.** A token signed with
+  the wrong key, expired, or not a bearer token at all was served as the
+  anonymous role over GraphQL, where REST refuses it with 401: the client kept
+  getting answers, as someone else, with nothing to say why its rows had gone.
+  It is now refused as `invalid-jwt`, in the shape Hasura uses -- over HTTP,
+  in each part of a batch, and at a WebSocket's `connection_init`. A token
+  that verifies and names no role, on a server with no anonymous role, is
+  refused as `jwt-missing-role-claims` rather than run as a role called
+  `anon`; REST answers both 401. The admin secret still wins over a bad token
+  beside it, as in Hasura, and a request with no `Authorization` header is
+  unchanged. With no JWT secret configured the header is still ignored, so a
+  router forwarding it to every subgraph is unaffected. GraphQL now verifies
+  tokens through the same cache as REST (`PGRST_JWT_CACHE_MAX_LIFETIME`).
+- **The Worker's schema cache keeps its columns in KV.** `KvStore::put` of a
+  `Serialize` value goes through `serde_wasm_bindgen`, which turns maps into
+  JavaScript `Map`s that KV stores as `{}`. Any isolate that read the cache
+  from KV had tables with no columns, and a filter failed with "No operator
+  matches the given name and argument types". Found on Cloudflare; locally
+  one isolate never reads back what it wrote. The cache is now written as a
+  JSON string, and `worker.sh` restarts workerd to read it back.
+
+### Changed
+
+- **`postrust-core`, `-sql`, `-auth`, `-response` and `-engine` build for
+  `wasm32-unknown-unknown`.** CI checks it, and checks that nothing native
+  (ring, aws-lc, mio, sqlx) reaches that build.
+  - sqlx is an optional, default-on feature of `postrust-core`.
+  - The workspace's tokio asks for `sync` and `macros` only.
+  - On wasm32, tokens are verified by jsonwebtoken 10 with its pure-Rust
+    RustCrypto backend. Native builds stay on jsonwebtoken 9 (see Measured).
+- **The schema cache is loaded through the same database interface as
+  requests,** on one transaction. Each catalog query returns its row as JSON,
+  so a driver only has to decode `json` to load one. A dump of the loaded
+  cache was compared with the old loader's on PostgREST's fixtures and ours,
+  and it is identical.
+- **A read's transaction ends before its response is serialised.** A plain
+  read commits with its query; one with a count or a rendered media type
+  commits as soon as the last of its statements has answered, so its
+  connection goes back to the pool before the response is formatted rather
+  than after.
+- **Claims nobody measured are gone.** The README, the docs index, the
+  website's footer, manifest and features page called Postrust
+  "serverless-first", promised "5-20ms cold starts", put the binary at ~5 MB
+  and listed CDK as a way to deploy it. No cold start has been measured, the
+  binary is about 10 MB, and there is no CDK template; each now says what is
+  true. AI search answers were repeating these back.
+- `.gitignore` no longer ignores every directory named `db` or `plan`, only
+  the ones at the root. The bare patterns had been silently leaving new
+  source files out of commits.
+
+### Measured
+
+Each phase of the Workers work was checked against the tree it started from
+-- 2.2.0 with the GraphQL fixes, cut as 2.2.1 and called that below -- on
+the same host. Conformance was replayed in full for every phase and for the
+final tree.
+
+- **Conformance unchanged:** PostgREST 1424/1499 and Hasura 454/468, case for
+  case.
+- **Database tests:** all pass, on sqlx and with the server's requests
+  routed through the socket driver (`--features pg-socket`), including the
+  driver differential suite, the schema-cache round trip, and the
+  refused-write rollback.
+- **Deployment checks:** Lambda 15/15, e2e 50/50.
+- **semver:** `cargo semver-checks` against 2.2.0 reports no major change
+  for any stable crate.
+- **Throughput unchanged.** Six alternating rounds per tree, with database,
+  server and load generator on their own cores. Each final-tree range overlaps
+  2.2.1's, and the differences go both ways:
+
+  | Scenario | 2.2.1 | final | change |
+  |---|---|---|---|
+  | point lookup | 3209 req/s | 3345 req/s | +4.3% |
+  | 25-row page | 2967 | 2974 | +0.2% |
+  | filtered + ordered page | 2793 | 2867 | +2.6% |
+  | page with exact count | 283 | 285 | +0.7% |
+  | range filter on numeric | 2761 | 2687 | -2.7% |
+
+- **Binary size:** 9,971,968 bytes to 10,067,688 (+1.0%). jsonwebtoken 10
+  natively would have cost 2.6 MB (aws-lc-rs) or 0.7 MB (RustCrypto), so
+  native builds stay on 9.
+- **The Worker:**
+  - PostgREST's suite in workerd scores 1422/1499. The difference from the
+    server is two explained cases: named prepared statements, and a gzip'd
+    empty preflight body.
+  - `worker.sh` passes 30/30.
+  - The bundle is 0.93 MB gzipped.
+  - **On Cloudflare, through a real Hyperdrive** (query caching off; wall
+    time inside the Worker, from `wrangler tail`; medians of 64-150
+    requests):
+
+    | Where the Worker ran | Read | Write |
+    |---|---|---|
+    | Singapore, database in Singapore | 41 ms | 45 ms |
+    | Singapore, database in Delhi | 255 ms | 318 ms |
+    | The same, Worker placed in Delhi | 170 ms | 190 ms |
+    | London, database in Delhi | 428 ms | 574 ms |
+    | Amsterdam, database in Delhi | 586 ms | 813 ms |
+
+    CPU is 4-11 ms a request: Hyperdrive does not make the Worker do SCRAM,
+    which costs about 43 ms in local workerd. Connecting to Hyperdrive takes
+    3-6 ms.
+  - **Pipelining**, before and after on Cloudflare, measured as an A/B pair
+    on one hostname in a run of its own -- so its "after" figures from
+    Singapore (240/306 ms, and 48/53 ms in the database's own region) are
+    not the table's above (255/318 and 41/45 ms), which came from another
+    run. A read from Singapore to a database in Delhi went 380 -> 240 ms, a
+    write 424 -> 306 ms; from London 869 -> 428 and 836 -> 574 ms; from
+    Amsterdam 1283 -> 586 and 1266 -> 813 ms; in the database's own region
+    69 -> 48 and 60 -> 53 ms. That is a read 37-54% faster and a write
+    28-36% faster with the database in another region, and 30% and 12% in
+    its own. Hyperdrive forwards part of a pipeline one statement at a time,
+    so five statements cost about three round trips there. Over a plain
+    connection, with 20 ms added to every round trip (`tc netem`), a read
+    went from 155 to 72 ms and a write from 156 to 93 ms, against 124 ms for
+    the server.
+
+### Upgrading
+
+Nothing to change, unless a GraphQL client relied on an expired or invalid
+token being answered anonymously; it now gets an `invalid-jwt` error, and
+should drop the token or refresh it. Likewise a token with no role claim on a
+server with no anonymous role, which now gets `jwt-missing-role-claims`.
+
+A `db-pre-request` function that sets `response.headers` or
+`response.status` now has them applied to reads as well, as PostgREST does.
+One that set them meaning only for writes should check `request.method`.
+
 ## 2.2.0
 
 A minor release: additions to the public Rust API (`postrust_server::build`,

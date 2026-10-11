@@ -407,8 +407,8 @@ Read these before quoting any throughput number:
 - **`ab` is the weakest of the three load generators.** It is HTTP/1.0 only and
   its percentiles are coarse. Install `oha` for numbers worth comparing between
   runs.
-- **Cold start is not measured here.** The ~50 ms Lambda figure comes from a
-  different environment and is not produced by this harness.
+- **Cold start is not measured.** Nothing here, or anywhere the project
+  publishes figures, states a Lambda cold-start time.
 - **`bench.sh` measures this server alone.** PostgREST, Hasura and PostGraphile
   are measured by [`scripts/bench-compare.sh`](../scripts/bench-compare.sh),
   which runs all four as containers on one network against one database. No

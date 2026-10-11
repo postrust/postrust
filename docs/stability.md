@@ -10,7 +10,7 @@ honestly describe both.
 
 | Line | Crates | Promise |
 | --- | --- | --- |
-| **Stable** | `postrust-core`, `postrust-sql`, `postrust-auth`, `postrust-response`, `postrust-graphql`, `postrust-server`, `postrust-lambda` | Semver. A breaking change to the public Rust API needs a major bump. |
+| **Stable** | `postrust-core`, `postrust-sql`, `postrust-auth`, `postrust-response`, `postrust-engine`, `postrust-graphql`, `postrust-server`, `postrust-lambda` | Semver. A breaking change to the public Rust API needs a major bump. |
 | **Unstable** | `postrust-proxy`, `postrust-worker` | None. Each on its own `0.x`, where a minor bump may break anything. |
 
 Nothing in the stable line depends on either unstable crate, so no crate that
@@ -31,14 +31,13 @@ newest `0.x`. Only an explicit request reaches code that predates the split.
 
 ## Why the worker is held back
 
-`postrust-worker` is a stub, and says so in its own response body: the fetch
-handler answers `{"status": "stub"}` and nothing else. It does not parse
-requests, reach a database, or return data. Finishing it needs Cloudflare
-pieces that are not written yet -- Hyperdrive for database connections, KV or
-Durable Objects for the schema cache.
-
-A 1.0.0 on that would be a promise to keep an interface that does not do
-anything yet.
+`postrust-worker` works: it serves the REST API in a Worker, over Hyperdrive,
+and is tested in workerd and against PostgREST's suite (see
+[workers.md](workers.md)). What is not settled is its surface, which is not
+Rust at all but configuration and behaviour: the KV key and record a schema
+cache is kept under, the `/_/reload` endpoint, the row ceiling it applies by
+default, and the `worker` crate it builds against, which is itself `0.x`.
+Those should meet a few deployments before they are promised.
 
 ## Why the proxy is held back
 

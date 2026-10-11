@@ -16,11 +16,11 @@
 
 ## What is Postrust?
 
-Postrust is a serverless-first REST API server for PostgreSQL databases. Inspired by [PostgREST](https://postgrest.org), it automatically generates a RESTful API from your database schema, supporting filtering, pagination, embedding, and full CRUD operations.
+Postrust is one Rust binary that serves a PostgreSQL schema as a REST API in PostgREST's dialect and a GraphQL API in Hasura's, with an opt-in Apollo Federation v2 subgraph mode. Filtering, pagination, embedding, full CRUD, JWT and row-level security come from the schema; nothing is written per table. It runs as a server, in a container, on AWS Lambda, or -- the REST API -- in a Cloudflare Worker.
 
 **Why Postrust?**
 
-- **Serverless**: An AWS Lambda adapter that serves the same REST and GraphQL router as the server, tested in AWS's own runtime image (Cloudflare Workers is a stub, pending Hyperdrive)
+- **Serverless**: An AWS Lambda adapter that serves the same REST and GraphQL router as the server, tested in AWS's own runtime image; and a Cloudflare Workers adapter that runs the same REST pipeline over Hyperdrive, tested in workerd ([docs/workers.md](docs/workers.md))
 - **Measured**: Conformance against PostgREST's and Hasura's own test corpora, re-run on a schedule, and throughput measured on a pinned bare-metal host behind a self-consistency gate — see [Benchmarks](#benchmarks)
 - **Compatible**: Familiar PostgREST-style API; near drop-in with an opt-in [compatibility mode](#postgrest-compatibility) (see [Differences from PostgREST](#differences-from-postgrest))
 - **Type-safe**: Parameterized queries prevent SQL injection by design
@@ -50,7 +50,7 @@ Postrust is a serverless-first REST API server for PostgreSQL databases. Inspire
 |----------|--------|-------------|
 | **HTTP Server** | ✅ | Standalone Axum-based server |
 | **AWS Lambda** | ✅ | The server's router behind the Lambda runtime: REST, GraphQL, JWT and RLS (no subscriptions) |
-| **Cloudflare Workers** | 🚧 | Stub (requires Hyperdrive for database) |
+| **Cloudflare Workers** | ✅ | The REST API over Hyperdrive, schema cache in KV, JWT and RLS (no GraphQL) — [docs/workers.md](docs/workers.md) |
 
 ### Admin & Developer Tools
 
@@ -355,7 +355,7 @@ cargo lambda build --release -p postrust-lambda
 # Run it in AWS's runtime image against PostgreSQL with RLS
 scripts/serverless/lambda.sh
 
-# Deploy with AWS SAM, Serverless Framework, or CDK
+# Deploy: docs/deployment.md has SAM and Serverless Framework templates
 ```
 
 Example SAM template:
@@ -475,25 +475,25 @@ Postrust crates at the same version work together. Browse them at
 | Crate | Description | Links |
 |-------|-------------|-------|
 | `postrust-server` | Standalone HTTP server (Axum), ships the `postrust` binary | [crates.io](https://crates.io/crates/postrust-server) · [docs](https://docs.rs/postrust-server) |
+| `postrust-engine` | The REST request pipeline, from HTTP request to response, with no web framework | [crates.io](https://crates.io/crates/postrust-engine) · [docs](https://docs.rs/postrust-engine) |
 | `postrust-core` | Request parsing, schema cache, query planning | [crates.io](https://crates.io/crates/postrust-core) · [docs](https://docs.rs/postrust-core) |
 | `postrust-sql` | Type-safe SQL builder with parameterized queries | [crates.io](https://crates.io/crates/postrust-sql) · [docs](https://docs.rs/postrust-sql) |
 | `postrust-auth` | JWT authentication and role extraction | [crates.io](https://crates.io/crates/postrust-auth) · [docs](https://docs.rs/postrust-auth) |
 | `postrust-response` | Response formatting (JSON, CSV, OpenAPI) | [crates.io](https://crates.io/crates/postrust-response) · [docs](https://docs.rs/postrust-response) |
 | `postrust-graphql` | GraphQL API with dynamic schema generation | [crates.io](https://crates.io/crates/postrust-graphql) · [docs](https://docs.rs/postrust-graphql) |
 | `postrust-lambda` | AWS Lambda adapter | [crates.io](https://crates.io/crates/postrust-lambda) · [docs](https://docs.rs/postrust-lambda) |
-| `postrust-worker` | Cloudflare Workers adapter — **stub; `0.x`, no stability promise** | [crates.io](https://crates.io/crates/postrust-worker) · [docs](https://docs.rs/postrust-worker) |
+| `postrust-worker` | Cloudflare Workers adapter (REST over Hyperdrive) — **`0.x`, no stability promise** | [crates.io](https://crates.io/crates/postrust-worker) · [docs](https://docs.rs/postrust-worker) |
 | `postrust-proxy` | Reverse proxy with load balancing and automatic TLS — **`0.x`, no stability promise** | [guide](docs/proxy.md) · [crates.io](https://crates.io/crates/postrust-proxy) · [docs](https://docs.rs/postrust-proxy) |
 
-The first seven crates share one version and one semver promise. The last two
+The first eight crates share one version and one semver promise. The last two
 are each on their own `0.x` line and carry none:
 
 - `postrust-proxy` is useful and measured — h2spec, Autobahn, and the HTTP
   Garden differential fuzzer — but parts of its public surface are
   undocumented, and a shared version number would promise a stability it
   cannot keep.
-- `postrust-worker` is a stub. It answers `{"status": "stub"}` and needs
-  Cloudflare Hyperdrive and a KV-backed schema cache before it does anything
-  else.
+- `postrust-worker` works, but its deployment surface -- the KV record, the
+  reload endpoint, its defaults -- has not met real deployments yet.
 
 Nothing in the stable line depends on either. See
 [Stability and Versioning](docs/stability.md).
@@ -552,6 +552,7 @@ postrust/
 │   │       ├── resolver/       # Query/mutation resolvers
 │   │       ├── input/          # Filter/order/mutation inputs
 │   │       └── handler.rs      # Axum handler
+│   ├── postrust-engine/    # REST request pipeline
 │   ├── postrust-server/    # HTTP server
 │   ├── postrust-lambda/    # Lambda adapter
 │   └── postrust-worker/    # Workers adapter
@@ -728,7 +729,8 @@ where the two disagree on purpose, and what is still open.
 - [x] Admin UI with Swagger, Scalar, and GraphQL Playground
 - [ ] GraphQL subscriptions (LISTEN/NOTIFY)
 - [ ] Connection pooling improvements
-- [ ] Cloudflare Workers full support (Hyperdrive)
+- [x] Cloudflare Workers: the REST API over Hyperdrive
+- [ ] GraphQL on Cloudflare Workers
 - [ ] Prometheus metrics endpoint
 - [ ] Admin API for schema reload
 

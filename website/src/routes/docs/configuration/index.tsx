@@ -177,7 +177,7 @@ export default component$(() => {
       <div class="border-b border-neutral-200 bg-gradient-to-b from-neutral-50 to-white">
         <div class="container-wide py-12">
           <div class="mb-4 flex items-center gap-2 text-sm text-neutral-500">
-            <Link href="/docs" class="hover:text-primary-600">
+            <Link href="/docs/" class="hover:text-primary-600">
               Docs
             </Link>
             <svg
@@ -392,7 +392,7 @@ curl 'localhost:3000/api/users?select=status,name,id&limit=1'
             </p>
             <p class="text-neutral-600">
               See{" "}
-              <Link href="/docs/conformance/hasura" class="text-primary-600 hover:underline">
+              <Link href="/docs/conformance/hasura/" class="text-primary-600 hover:underline">
                 Hasura conformance
               </Link>{" "}
               for how much of the dialect this covers, measured.
@@ -438,7 +438,7 @@ PGRST_LOG_LEVEL=info`}</code>
           {/* Next */}
           <div class="flex items-center justify-between border-t border-neutral-200 pt-8">
             <Link
-              href="/docs/authentication"
+              href="/docs/authentication/"
               class="hover:text-primary-600 flex items-center gap-2 text-neutral-600"
             >
               <svg
@@ -457,7 +457,7 @@ PGRST_LOG_LEVEL=info`}</code>
               Authentication
             </Link>
             <Link
-              href="/docs/deployment"
+              href="/docs/deployment/"
               class="hover:text-primary-600 flex items-center gap-2 text-neutral-600"
             >
               Deployment

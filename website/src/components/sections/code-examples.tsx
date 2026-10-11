@@ -370,7 +370,7 @@ export const CodeExamplesSection = component$(() => {
         {/* CTA */}
         <div class="mt-12 text-center">
           <a
-            href="/docs/api-reference"
+            href="/docs/api-reference/"
             class="inline-flex items-center gap-2 text-primary-600 hover:text-primary-700 font-medium"
           >
             View full API reference

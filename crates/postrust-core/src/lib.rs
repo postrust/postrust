@@ -38,10 +38,12 @@
 
 pub mod api_request;
 pub mod config;
+pub mod db;
 pub mod embed;
 pub mod error;
 pub mod plan;
 pub mod query;
+#[cfg(feature = "sqlx")]
 pub mod row_json;
 pub mod schema_cache;
 
@@ -56,6 +58,11 @@ pub use embed::EmbedRendering;
 pub use error::{Error, Result};
 pub use plan::{create_action_plan, ActionPlan, CallPlan, DbActionPlan, MutatePlan, ReadPlan};
 pub use schema_cache::{Column, Relationship, Routine, SchemaCache, SchemaCacheRef, Table};
+
+/// This crate's version. A schema cache serialized by one version may not
+/// read back, or may not mean the same, in another, so a copy kept outside
+/// the process -- the Cloudflare Worker's, in KV -- is keyed by it.
+pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 /// Prelude for common imports.
 pub mod prelude {

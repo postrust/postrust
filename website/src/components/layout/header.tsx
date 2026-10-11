@@ -5,12 +5,13 @@ export const Header = component$(() => {
   const isMenuOpen = useSignal(false);
 
   const navLinks = [
-    { href: "/features", label: "Features" },
-    { href: "/docs", label: "Documentation" },
-    { href: "/packages", label: "Packages" },
-    { href: "/pricing", label: "Pricing" },
-    { href: "/compare", label: "Compare" },
-    { href: "/community", label: "Community" },
+    { href: "/features/", label: "Features" },
+    { href: "/docs/", label: "Documentation" },
+    { href: "/packages/", label: "Packages" },
+    { href: "/pricing/", label: "Pricing" },
+    { href: "/compare/", label: "Compare" },
+    { href: "/blog/", label: "Blog" },
+    { href: "/community/", label: "Community" },
   ];
 
   return (
@@ -56,7 +57,7 @@ export const Header = component$(() => {
               GitHub
             </a>
             <Link
-              href="/docs"
+              href="/docs/"
               class="px-4 py-2 text-sm font-semibold text-white bg-neutral-900 hover:bg-neutral-800 rounded-lg transition-colors"
             >
               Get Started
@@ -108,7 +109,7 @@ export const Header = component$(() => {
                 GitHub
               </a>
               <Link
-                href="/docs"
+                href="/docs/"
                 class="mx-4 mt-2 px-4 py-3 text-center text-base font-semibold text-white bg-neutral-900 hover:bg-neutral-800 rounded-lg transition-colors"
               >
                 Get Started

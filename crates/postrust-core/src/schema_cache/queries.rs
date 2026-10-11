@@ -6,20 +6,104 @@ use super::relationship::{
 use super::routine::{FuncVolatility, RetType, Routine, RoutineMap, RoutineParam};
 use super::table::{Column, ColumnMap, Table, TablesMap};
 use crate::api_request::QualifiedIdentifier;
+use crate::db::Tx;
 use crate::error::{Error, Result};
 use indexmap::IndexMap;
-use sqlx::{PgPool, Row};
+use postrust_sql::SqlParam;
 use std::collections::{HashMap, HashSet};
 use std::sync::LazyLock;
 
 /// Get PostgreSQL version.
-pub async fn get_pg_version(pool: &PgPool) -> Result<i32> {
-    let row = sqlx::query("SELECT current_setting('server_version_num')::int as version")
-        .fetch_one(pool)
-        .await
-        .map_err(|e| Error::SchemaCacheLoadFailed(e.to_string()))?;
+pub async fn get_pg_version<T: Tx>(tx: &mut T) -> Result<i32> {
+    let rows = catalog(
+        tx,
+        "SELECT current_setting('server_version_num')::int as version",
+        &[],
+        &[],
+    )
+    .await?;
+    match rows.first() {
+        Some(row) => row.get("version"),
+        None => Err(Error::SchemaCacheLoadFailed(
+            "no rows returned by a query that expected to return at least one row".into(),
+        )),
+    }
+}
 
-    Ok(row.get("version"))
+/// A row of a catalog query, as PostgreSQL's own `row_to_json` rendered it.
+///
+/// The catalog is read through the same driver-neutral interface as requests
+/// (`crate::db`), whose drivers decode the types a response carries. Catalog
+/// rows carry others -- `name[]`, `text[]` -- so each query is wrapped to
+/// return its row as one `json` value and PostgreSQL does the decoding. A
+/// driver then needs nothing but `json` to load a schema cache.
+pub(super) struct CatalogRow(serde_json::Map<String, serde_json::Value>);
+
+impl CatalogRow {
+    /// A column, by name. A value of the wrong type fails the load rather than
+    /// the process.
+    ///
+    /// A column the query does not have is an error too, not a null.
+    /// `row_to_json` writes every column, null ones included, so an absent key
+    /// is a name misspelled here or in the query's alias -- and read as null it
+    /// would turn every `Option` field it fills into `None`, silently.
+    pub(super) fn get<V: serde::de::DeserializeOwned>(&self, column: &str) -> Result<V> {
+        let value = self.0.get(column).ok_or_else(|| {
+            Error::SchemaCacheLoadFailed(format!("catalog query has no column \"{column}\""))
+        })?;
+        V::deserialize(value)
+            .map_err(|e| Error::SchemaCacheLoadFailed(format!("catalog column \"{column}\": {e}")))
+    }
+}
+
+/// Run a catalog query, reading each row as [`CatalogRow`], ordered by the
+/// query's output columns `order_by`. Empty where the order does not matter.
+///
+/// The query's own `ORDER BY` is not enough. It sorts the subquery the
+/// wrapper reads from, and SQL promises nothing about the order a query
+/// reads a sorted subquery in. PostgreSQL keeps it today, but where a row
+/// order reaches the client (see `load_relationships`) that is not a thing to
+/// lean on. The planner sees that the subquery is already in this order, so
+/// asking again costs no second sort.
+async fn catalog<T: Tx>(
+    tx: &mut T,
+    sql: &str,
+    order_by: &[&str],
+    params: &[SqlParam],
+) -> Result<Vec<CatalogRow>> {
+    tx.fetch_values(&catalog_sql(sql, order_by), params)
+        .await
+        .map_err(|e| Error::SchemaCacheLoadFailed(e.to_string()))?
+        .into_iter()
+        .map(|row| match row.into_iter().next() {
+            Some(serde_json::Value::Object(map)) => Ok(CatalogRow(map)),
+            other => Err(Error::SchemaCacheLoadFailed(format!(
+                "a catalog row was not an object: {other:?}"
+            ))),
+        })
+        .collect()
+}
+
+/// A catalog query, wrapped to return each row as one `json` value, in the
+/// order of its output columns `order_by`. See [`catalog`].
+fn catalog_sql(sql: &str, order_by: &[&str]) -> String {
+    let mut wrapped = format!("SELECT row_to_json(pgrst_catalog) FROM ({sql}) AS pgrst_catalog");
+    for (i, column) in order_by.iter().enumerate() {
+        wrapped.push_str(if i == 0 { " ORDER BY " } else { ", " });
+        wrapped.push_str("pgrst_catalog.");
+        wrapped.push_str(column);
+    }
+    wrapped
+}
+
+/// A text parameter.
+fn text(value: &str) -> SqlParam {
+    SqlParam::Text(value.to_string())
+}
+
+/// A `text[]` parameter.
+fn texts(values: &[String]) -> SqlParam {
+    SqlParam::Array(values.iter().cloned().map(SqlParam::Text).collect())
 }
 
 /// Whether a role this connection can become holds one of `privileges` in the
@@ -105,7 +189,7 @@ fn privilege_granted(privilege: &str) -> String {
 }
 
 /// Load all tables and their columns.
-pub async fn load_tables(pool: &PgPool, schemas: &[String]) -> Result<TablesMap> {
+pub async fn load_tables<T: Tx>(tx: &mut T, schemas: &[String]) -> Result<TablesMap> {
     let mut tables = HashMap::new();
 
     // From the catalogue rather than `information_schema`, whose views show a
@@ -204,32 +288,28 @@ pub async fn load_tables(pool: &PgPool, schemas: &[String]) -> Result<TablesMap>
             visible = relation_visible(),
         )
     });
-    let rows = sqlx::query(&SQL)
-        .bind(schemas)
-        .fetch_all(pool)
-        .await
-        .map_err(|e| Error::SchemaCacheLoadFailed(e.to_string()))?;
+    let rows = catalog(tx, &SQL, &["table_schema", "table_name"], &[texts(schemas)]).await?;
 
     for row in rows {
-        let schema: String = row.get("table_schema");
-        let name: String = row.get("table_name");
+        let schema: String = row.get("table_schema")?;
+        let name: String = row.get("table_name")?;
         let qi = QualifiedIdentifier::new(&schema, &name);
 
-        let table_type: String = row.get("table_type");
-        let pk_cols: Vec<String> = row.get("pk_cols");
+        let table_type: String = row.get("table_type")?;
+        let pk_cols: Vec<String> = row.get("pk_cols")?;
 
         let table = Table {
             schema: schema.clone(),
             name: name.clone(),
-            description: row.get("description"),
+            description: row.get("description")?,
             is_view: table_type == "VIEW",
-            is_partitioned: row.get("is_partitioned"),
-            insertable: row.get("insertable"),
-            updatable: row.get("updatable"),
-            deletable: row.get("deletable"),
+            is_partitioned: row.get("is_partitioned")?,
+            insertable: row.get("insertable")?,
+            updatable: row.get("updatable")?,
+            deletable: row.get("deletable")?,
             pk_cols: pk_cols.clone(),
             unique_constraints: Vec::new(),
-            columns: load_columns(pool, &schema, &name, &pk_cols).await?,
+            columns: load_columns(tx, &schema, &name, &pk_cols).await?,
             computed_columns: Default::default(),
         };
 
@@ -240,8 +320,8 @@ pub async fn load_tables(pool: &PgPool, schemas: &[String]) -> Result<TablesMap>
 }
 
 /// Load columns for a table.
-async fn load_columns(
-    pool: &PgPool,
+async fn load_columns<T: Tx>(
+    tx: &mut T,
     schema: &str,
     table: &str,
     pk_cols: &[String],
@@ -369,42 +449,43 @@ async fn load_columns(
             column_grant = acl_grants("a.attacl", "SELECT,INSERT,UPDATE,REFERENCES"),
         )
     });
-    let rows = sqlx::query(&SQL)
-        .bind(schema)
-        .bind(table)
-        .fetch_all(pool)
-        .await
-        .map_err(|e| Error::SchemaCacheLoadFailed(e.to_string()))?;
+    let rows = catalog(
+        tx,
+        &SQL,
+        &["ordinal_position"],
+        &[text(schema), text(table)],
+    )
+    .await?;
 
     // A materialized view has no rows in `information_schema.columns`; its
     // columns come from the catalogue instead.
     let rows = match rows.is_empty() {
-        true => load_catalog_columns(pool, schema, table).await?,
+        true => load_catalog_columns(tx, schema, table).await?,
         false => rows,
     };
 
     for row in rows {
-        let name: String = row.get("column_name");
-        let is_nullable: String = row.get("is_nullable");
-        let data_type: String = row.get("data_type");
-        let udt_name: String = row.get("udt_name");
-        let max_len: Option<i32> = row.get("character_maximum_length");
-        let enum_values: Vec<String> = row.get("enum_values");
-        let position: i32 = row.get("ordinal_position");
+        let name: String = row.get("column_name")?;
+        let is_nullable: String = row.get("is_nullable")?;
+        let data_type: String = row.get("data_type")?;
+        let udt_name: String = row.get("udt_name")?;
+        let max_len: Option<i32> = row.get("character_maximum_length")?;
+        let enum_values: Vec<String> = row.get("enum_values")?;
+        let position: i32 = row.get("ordinal_position")?;
 
         let column = Column {
             name: name.clone(),
-            description: row.get("description"),
+            description: row.get("description")?,
             nullable: is_nullable == "YES",
             data_type,
             nominal_type: udt_name,
-            domain_type: row.get("domain_name"),
+            domain_type: row.get("domain_name")?,
             max_len,
-            default: row.get("column_default"),
+            default: row.get("column_default")?,
             enum_values,
             is_pk: pk_cols.contains(&name),
             position,
-            always_generated: row.get("always_generated"),
+            always_generated: row.get("always_generated")?,
         };
 
         columns.insert(name, column);
@@ -414,10 +495,11 @@ async fn load_columns(
 }
 
 /// Load foreign key relationships.
-pub async fn load_relationships(pool: &PgPool, schemas: &[String]) -> Result<RelationshipsMap> {
+pub async fn load_relationships<T: Tx>(tx: &mut T, schemas: &[String]) -> Result<RelationshipsMap> {
     let mut relationships: RelationshipsMap = HashMap::new();
 
-    let rows = sqlx::query(
+    let rows = catalog(
+        tx,
         r#"
         SELECT
             c.conname as constraint_name,
@@ -469,23 +551,22 @@ pub async fn load_relationships(pool: &PgPool, schemas: &[String]) -> Result<Rel
         -- the conformance cases covering it flip between runs.
         ORDER BY ns1.nspname, t1.relname, c.conname
         "#,
+        &["table_schema", "table_name", "constraint_name"],
+        &[texts(schemas)],
     )
-    .bind(schemas)
-    .fetch_all(pool)
-    .await
-    .map_err(|e| Error::SchemaCacheLoadFailed(e.to_string()))?;
+    .await?;
 
     for row in rows {
-        let table_schema: String = row.get("table_schema");
-        let table_name: String = row.get("table_name");
-        let foreign_schema: String = row.get("foreign_table_schema");
-        let foreign_name: String = row.get("foreign_table_name");
-        let constraint_name: String = row.get("constraint_name");
-        let columns: Vec<String> = row.get("columns");
-        let foreign_columns: Vec<String> = row.get("foreign_columns");
-        let table_is_view: bool = row.get("table_is_view");
-        let foreign_is_view: bool = row.get("foreign_table_is_view");
-        let is_unique: bool = row.get("is_unique");
+        let table_schema: String = row.get("table_schema")?;
+        let table_name: String = row.get("table_name")?;
+        let foreign_schema: String = row.get("foreign_table_schema")?;
+        let foreign_name: String = row.get("foreign_table_name")?;
+        let constraint_name: String = row.get("constraint_name")?;
+        let columns: Vec<String> = row.get("columns")?;
+        let foreign_columns: Vec<String> = row.get("foreign_columns")?;
+        let table_is_view: bool = row.get("table_is_view")?;
+        let foreign_is_view: bool = row.get("foreign_table_is_view")?;
+        let is_unique: bool = row.get("is_unique")?;
 
         let table_qi = QualifiedIdentifier::new(&table_schema, &table_name);
         let foreign_qi = QualifiedIdentifier::new(&foreign_schema, &foreign_name);
@@ -563,7 +644,7 @@ pub async fn load_relationships(pool: &PgPool, schemas: &[String]) -> Result<Rel
             .push(reverse_rel);
     }
 
-    load_computed_relationships(pool, schemas, &mut relationships).await?;
+    load_computed_relationships(tx, schemas, &mut relationships).await?;
 
     Ok(relationships)
 }
@@ -579,12 +660,13 @@ pub async fn load_relationships(pool: &PgPool, schemas: &[String]) -> Result<Rel
 ///
 /// The relationship is named after the function, not after the table it
 /// returns, so that two functions returning the same table stay distinct.
-async fn load_computed_relationships(
-    pool: &PgPool,
+async fn load_computed_relationships<T: Tx>(
+    tx: &mut T,
     schemas: &[String],
     relationships: &mut RelationshipsMap,
 ) -> Result<()> {
-    let rows = sqlx::query(
+    let rows = catalog(
+        tx,
         r#"
         SELECT
             pn.nspname  AS function_schema,
@@ -623,22 +705,21 @@ async fn load_computed_relationships(
           AND t.relkind = ANY (ARRAY['r','v','m','f','p'])
           AND f.relkind = ANY (ARRAY['r','v','m','f','p'])
         "#,
+        &[],
+        &[texts(schemas)],
     )
-    .bind(schemas)
-    .fetch_all(pool)
-    .await
-    .map_err(|e| Error::SchemaCacheLoadFailed(e.to_string()))?;
+    .await?;
 
     for row in rows {
         let function = QualifiedIdentifier::new(
-            row.get::<String, _>("function_schema"),
-            row.get::<String, _>("function_name"),
+            row.get::<String>("function_schema")?,
+            row.get::<String>("function_name")?,
         );
-        let table_schema: String = row.get("table_schema");
-        let table = QualifiedIdentifier::new(&table_schema, row.get::<String, _>("table_name"));
+        let table_schema: String = row.get("table_schema")?;
+        let table = QualifiedIdentifier::new(&table_schema, row.get::<String>("table_name")?);
         let foreign_table = QualifiedIdentifier::new(
-            row.get::<String, _>("foreign_table_schema"),
-            row.get::<String, _>("foreign_table_name"),
+            row.get::<String>("foreign_table_schema")?,
+            row.get::<String>("foreign_table_name")?,
         );
         let is_self = table == foreign_table;
 
@@ -650,9 +731,9 @@ async fn load_computed_relationships(
                 table: table.clone(),
                 foreign_table: foreign_table.clone(),
                 table_alias: table,
-                to_one: row.get("to_one"),
+                to_one: row.get("to_one")?,
                 is_self,
-                row_argument: row.get::<Option<String>, _>("row_argument"),
+                row_argument: row.get::<Option<String>>("row_argument")?,
             });
     }
 
@@ -704,10 +785,11 @@ fn parse_routine_params(value: serde_json::Value) -> Vec<RoutineParam> {
 }
 
 /// Load stored functions.
-pub async fn load_routines(pool: &PgPool, schemas: &[String]) -> Result<RoutineMap> {
+pub async fn load_routines<T: Tx>(tx: &mut T, schemas: &[String]) -> Result<RoutineMap> {
     let mut routines: RoutineMap = HashMap::new();
 
-    let rows = sqlx::query(
+    let rows = catalog(
+        tx,
         r#"
         -- What a type is once every domain over it is stripped away.
         --
@@ -837,20 +919,19 @@ pub async fn load_routines(pool: &PgPool, schemas: &[String]) -> Result<RoutineM
           )
         ORDER BY n.nspname, p.proname
         "#,
+        &["schema", "name"],
+        &[texts(schemas)],
     )
-    .bind(schemas)
-    .fetch_all(pool)
-    .await
-    .map_err(|e| Error::SchemaCacheLoadFailed(e.to_string()))?;
+    .await?;
 
     for row in rows {
-        let schema: String = row.get("schema");
-        let name: String = row.get("name");
+        let schema: String = row.get("schema")?;
+        let name: String = row.get("name")?;
         let qi = QualifiedIdentifier::new(&schema, &name);
 
-        let volatility: String = row.get("volatility");
-        let return_type_str: String = row.get("return_type");
-        let returns_set: bool = row.get("returns_set");
+        let volatility: String = row.get("volatility")?;
+        let return_type_str: String = row.get("return_type")?;
+        let returns_set: bool = row.get("returns_set")?;
 
         let return_type = if return_type_str == "void" {
             RetType::Void
@@ -865,12 +946,12 @@ pub async fn load_routines(pool: &PgPool, schemas: &[String]) -> Result<RoutineM
         // scalar returns yield a single column named after the function. Void
         // is pseudo too but renders as a function-named null column, so it
         // counts as non-composite.
-        let ret_typtype: Option<String> = row.get("ret_typtype");
+        let ret_typtype: Option<String> = row.get("ret_typtype")?;
         // A named row type always expands. `record` expands only when the
         // function declares its columns as `OUT` parameters or a `RETURNS
         // TABLE` -- a bare `RETURNS record` has none, and PostgreSQL refuses
         // to put one in a `FROM` clause without being told what they are.
-        let has_out_params: bool = row.get("has_out_params");
+        let has_out_params: bool = row.get("has_out_params")?;
         let returns_composite = !matches!(return_type, RetType::Void)
             && (ret_typtype.as_deref() == Some("c")
                 || (ret_typtype.as_deref() == Some("p") && has_out_params));
@@ -878,18 +959,18 @@ pub async fn load_routines(pool: &PgPool, schemas: &[String]) -> Result<RoutineM
         let routine = Routine {
             schema,
             name,
-            description: row.get("description"),
-            params: parse_routine_params(row.get("params")),
+            description: row.get("description")?,
+            params: parse_routine_params(row.get("params")?),
             return_type,
             returns_composite,
             volatility: FuncVolatility::from_char(volatility.chars().next().unwrap_or('v')),
-            has_variadic: row.get("has_variadic"),
+            has_variadic: row.get("has_variadic")?,
             isolation_level: None,
             settings: vec![],
-            is_procedure: row.get("is_procedure"),
-            media_type: row.get("media_type"),
-            media_base_type: row.get("media_base_type"),
-            output_columns: parse_routine_params(row.get("out_params"))
+            is_procedure: row.get("is_procedure")?,
+            media_type: row.get("media_type")?,
+            media_base_type: row.get("media_base_type")?,
+            output_columns: parse_routine_params(row.get("out_params")?)
                 .into_iter()
                 .filter(|param| !param.name.is_empty())
                 .map(|param| (param.name, param.param_type))
@@ -923,13 +1004,10 @@ pub async fn load_routines(pool: &PgPool, schemas: &[String]) -> Result<RoutineM
 }
 
 /// Load valid timezone names.
-pub async fn load_timezones(pool: &PgPool) -> Result<HashSet<String>> {
-    let rows = sqlx::query("SELECT name FROM pg_timezone_names")
-        .fetch_all(pool)
-        .await
-        .map_err(|e| Error::SchemaCacheLoadFailed(e.to_string()))?;
+pub async fn load_timezones<T: Tx>(tx: &mut T) -> Result<HashSet<String>> {
+    let rows = catalog(tx, "SELECT name FROM pg_timezone_names", &[], &[]).await?;
 
-    Ok(rows.iter().map(|r| r.get("name")).collect())
+    rows.iter().map(|r| r.get("name")).collect()
 }
 
 /// Load user-defined renderers for media types.
@@ -941,8 +1019,9 @@ pub async fn load_timezones(pool: &PgPool) -> Result<HashSet<String>> {
 ///
 /// The aggregate's argument says what it renders: a table's composite type
 /// renders that table, and `anyelement` renders anything in the schema.
-pub async fn load_media_handlers(pool: &PgPool, schemas: &[String]) -> Result<MediaHandlerMap> {
-    let rows = sqlx::query(
+pub async fn load_media_handlers<T: Tx>(tx: &mut T, schemas: &[String]) -> Result<MediaHandlerMap> {
+    let rows = catalog(
+        tx,
         r#"
         SELECT
             n.nspname    AS agg_schema,
@@ -963,19 +1042,18 @@ pub async fn load_media_handlers(pool: &PgPool, schemas: &[String]) -> Result<Me
           AND t.typtype = 'd'
           AND t.typname LIKE '%/%'
         "#,
+        &[],
+        &[texts(schemas)],
     )
-    .bind(schemas)
-    .fetch_all(pool)
-    .await
-    .map_err(|e| Error::SchemaCacheLoadFailed(e.to_string()))?;
+    .await?;
 
     let mut handlers: MediaHandlerMap = HashMap::new();
     for row in rows {
-        let agg_schema: String = row.get("agg_schema");
-        let media_type: String = row.get("media_type");
+        let agg_schema: String = row.get("agg_schema")?;
+        let media_type: String = row.get("media_type")?;
         let table = match (
-            row.get::<Option<String>, _>("arg_schema"),
-            row.get::<Option<String>, _>("arg_table"),
+            row.get::<Option<String>>("arg_schema")?,
+            row.get::<Option<String>>("arg_table")?,
         ) {
             (Some(schema), Some(name)) => Some(QualifiedIdentifier::new(schema, name)),
             _ => None,
@@ -985,9 +1063,9 @@ pub async fn load_media_handlers(pool: &PgPool, schemas: &[String]) -> Result<Me
             .entry((agg_schema.clone(), media_type))
             .or_default()
             .push(MediaHandler {
-                aggregate: QualifiedIdentifier::new(agg_schema, row.get::<String, _>("agg_name")),
+                aggregate: QualifiedIdentifier::new(agg_schema, row.get::<String>("agg_name")?),
                 table,
-                base_type: row.get("media_base_type"),
+                base_type: row.get("media_base_type")?,
             });
     }
 
@@ -1009,12 +1087,13 @@ pub async fn load_media_handlers(pool: &PgPool, schemas: &[String]) -> Result<Me
 ///
 /// The columns are shaped to match what the `information_schema` query
 /// returns, so the caller cannot tell which of the two answered.
-async fn load_catalog_columns(
-    pool: &PgPool,
+async fn load_catalog_columns<T: Tx>(
+    tx: &mut T,
     schema: &str,
     table: &str,
-) -> Result<Vec<sqlx::postgres::PgRow>> {
-    sqlx::query(
+) -> Result<Vec<CatalogRow>> {
+    catalog(
+        tx,
         r#"
         SELECT
             a.attname AS column_name,
@@ -1040,12 +1119,10 @@ async fn load_catalog_columns(
         WHERE n.nspname = $1 AND c.relname = $2
         ORDER BY a.attnum
         "#,
+        &["ordinal_position"],
+        &[text(schema), text(table)],
     )
-    .bind(schema)
-    .bind(table)
-    .fetch_all(pool)
     .await
-    .map_err(|e| Error::SchemaCacheLoadFailed(e.to_string()))
 }
 
 /// Casts a schema declares between one of its domains and `json` or `text`.
@@ -1059,8 +1136,8 @@ async fn load_catalog_columns(
 ///
 /// Keyed by `(source type, target type)` so both directions come out of one
 /// query: the render is `(domain, json)` and the parse is `(text, domain)`.
-pub async fn load_representations(
-    pool: &PgPool,
+pub async fn load_representations<T: Tx>(
+    tx: &mut T,
 ) -> Result<std::collections::HashMap<(String, String), String>> {
     // Whether a request may call the cast function: owned by, or executable
     // by, a role this connection can become. `has_function_privilege` asked
@@ -1086,23 +1163,16 @@ pub async fn load_representations(
             execute = acl_grants("COALESCE(p.proacl, acldefault('f', p.proowner))", "EXECUTE"),
         )
     });
-    let rows = sqlx::query(&SQL)
-        .fetch_all(pool)
-        .await
-        .map_err(|e| Error::SchemaCacheLoadFailed(e.to_string()))?;
+    let rows = catalog(tx, &SQL, &[], &[]).await?;
 
-    Ok(rows
-        .into_iter()
+    rows.into_iter()
         .map(|row| {
-            (
-                (
-                    row.get::<String, _>("source"),
-                    row.get::<String, _>("target"),
-                ),
-                row.get::<String, _>("function"),
-            )
+            Ok((
+                (row.get::<String>("source")?, row.get::<String>("target")?),
+                row.get::<String>("function")?,
+            ))
         })
-        .collect())
+        .collect()
 }
 
 /// Functions of a table's row type, which read as though they were columns.
@@ -1120,8 +1190,8 @@ pub async fn load_representations(
 /// lives in `public`, so requiring the function to be in an exposed schema
 /// left `?always_false=is.false` answered "column does not exist" for a field
 /// PostgREST reads as a column.
-pub async fn load_computed_columns(
-    pool: &PgPool,
+pub async fn load_computed_columns<T: Tx>(
+    tx: &mut T,
     schemas: &[String],
     function_schemas: &[String],
 ) -> Result<Vec<ComputedColumnRow>> {
@@ -1132,7 +1202,8 @@ pub async fn load_computed_columns(
     //
     // Every argument has to be named: one that is not cannot be given by name,
     // and a call with more than the row has to be.
-    let rows = sqlx::query(
+    let rows = catalog(
+        tx,
         r#"
         SELECT tn.nspname AS table_schema,
                t.relname  AS table_name,
@@ -1163,32 +1234,31 @@ pub async fn load_computed_columns(
            AND fn.nspname = ANY($2)
            AND tn.nspname = ANY($1)
         "#,
+        &[],
+        &[texts(schemas), texts(function_schemas)],
     )
-    .bind(schemas)
-    .bind(function_schemas)
-    .fetch_all(pool)
-    .await
-    .map_err(|e| Error::SchemaCacheLoadFailed(e.to_string()))?;
+    .await?;
 
-    Ok(rows
-        .into_iter()
-        .map(|row| ComputedColumnRow {
-            table: QualifiedIdentifier::new(
-                row.get::<String, _>("table_schema"),
-                row.get::<String, _>("table_name"),
-            ),
-            name: row.get::<String, _>("function_name"),
-            function: QualifiedIdentifier::new(
-                row.get::<String, _>("function_schema"),
-                row.get::<String, _>("function_name"),
-            ),
-            return_type: row.get::<String, _>("return_type"),
-            description: row.get::<Option<String>, _>("description"),
-            row_argument: row.get::<Option<String>, _>("row_argument"),
-            session_argument: row.get::<Option<String>, _>("session_argument"),
-            takes_arguments: row.get::<bool, _>("takes_arguments"),
+    rows.into_iter()
+        .map(|row| -> Result<_> {
+            Ok(ComputedColumnRow {
+                table: QualifiedIdentifier::new(
+                    row.get::<String>("table_schema")?,
+                    row.get::<String>("table_name")?,
+                ),
+                name: row.get::<String>("function_name")?,
+                function: QualifiedIdentifier::new(
+                    row.get::<String>("function_schema")?,
+                    row.get::<String>("function_name")?,
+                ),
+                return_type: row.get::<String>("return_type")?,
+                description: row.get::<Option<String>>("description")?,
+                row_argument: row.get::<Option<String>>("row_argument")?,
+                session_argument: row.get::<Option<String>>("session_argument")?,
+                takes_arguments: row.get::<bool>("takes_arguments")?,
+            })
         })
-        .collect())
+        .collect()
 }
 
 /// One function that reads as a column of a table.
@@ -1241,8 +1311,9 @@ pub struct ViewColumn {
 ///
 /// One base column may arrive under several names (`select t1_id as t1_id1,
 /// t1_id as t1_id2`), so a single mapping is a row per name.
-pub async fn load_view_columns(pool: &PgPool, schemas: &[String]) -> Result<Vec<ViewColumn>> {
-    let rows = sqlx::query(
+pub async fn load_view_columns<T: Tx>(tx: &mut T, schemas: &[String]) -> Result<Vec<ViewColumn>> {
+    let rows = catalog(
+        tx,
         r#"
         WITH RECURSIVE
         views AS (
@@ -1341,27 +1412,27 @@ pub async fn load_view_columns(pool: &PgPool, schemas: &[String]) -> Result<Vec<
                                AND NOT col.attisdropped
          WHERE rec.resorigtbl <> 0
         "#,
+        &[],
+        &[texts(schemas)],
     )
-    .bind(schemas)
-    .fetch_all(pool)
-    .await
-    .map_err(|e| Error::SchemaCacheLoadFailed(e.to_string()))?;
+    .await?;
 
-    Ok(rows
-        .into_iter()
-        .map(|row| ViewColumn {
-            view: QualifiedIdentifier::new(
-                row.get::<String, _>("view_schema"),
-                row.get::<String, _>("view_name"),
-            ),
-            base: QualifiedIdentifier::new(
-                row.get::<String, _>("base_schema"),
-                row.get::<String, _>("base_name"),
-            ),
-            base_column: row.get::<String, _>("base_column"),
-            view_column: row.get::<String, _>("view_column"),
+    rows.into_iter()
+        .map(|row| -> Result<_> {
+            Ok(ViewColumn {
+                view: QualifiedIdentifier::new(
+                    row.get::<String>("view_schema")?,
+                    row.get::<String>("view_name")?,
+                ),
+                base: QualifiedIdentifier::new(
+                    row.get::<String>("base_schema")?,
+                    row.get::<String>("base_name")?,
+                ),
+                base_column: row.get::<String>("base_column")?,
+                view_column: row.get::<String>("view_column")?,
+            })
         })
-        .collect())
+        .collect()
 }
 
 /// Primary key columns for every table in the given schemas.
@@ -1379,11 +1450,12 @@ pub async fn load_view_columns(pool: &PgPool, schemas: &[String]) -> Result<Vec<
 /// Only constraints, not bare unique indexes. `ON CONFLICT ON CONSTRAINT`
 /// takes a constraint name, and a unique index created without one has no name
 /// to give it.
-pub async fn load_unique_constraints(
-    pool: &PgPool,
+pub async fn load_unique_constraints<T: Tx>(
+    tx: &mut T,
     schemas: &[String],
 ) -> Result<HashMap<QualifiedIdentifier, Vec<(String, Vec<String>)>>> {
-    let rows = sqlx::query(
+    let rows = catalog(
+        tx,
         r#"
         SELECT
             n.nspname AS table_schema,
@@ -1399,24 +1471,23 @@ pub async fn load_unique_constraints(
         WHERE con.contype IN ('p', 'u')
           AND n.nspname = ANY($1)
         "#,
+        &[],
+        &[texts(schemas)],
     )
-    .bind(schemas)
-    .fetch_all(pool)
-    .await
-    .map_err(|e| Error::SchemaCacheLoadFailed(e.to_string()))?;
+    .await?;
 
     let mut by_table: HashMap<QualifiedIdentifier, Vec<(String, Vec<String>)>> = HashMap::new();
     for row in rows {
-        let Some(columns): Option<Vec<String>> = row.get("columns") else {
+        let Some(columns): Option<Vec<String>> = row.get("columns")? else {
             continue;
         };
         by_table
             .entry(QualifiedIdentifier::new(
-                row.get::<String, _>("table_schema"),
-                row.get::<String, _>("table_name"),
+                row.get::<String>("table_schema")?,
+                row.get::<String>("table_name")?,
             ))
             .or_default()
-            .push((row.get::<String, _>("constraint_name"), columns));
+            .push((row.get::<String>("constraint_name")?, columns));
     }
     for constraints in by_table.values_mut() {
         constraints.sort();
@@ -1424,11 +1495,12 @@ pub async fn load_unique_constraints(
     Ok(by_table)
 }
 
-pub async fn load_primary_keys(
-    pool: &PgPool,
+pub async fn load_primary_keys<T: Tx>(
+    tx: &mut T,
     schemas: &[String],
 ) -> Result<HashMap<QualifiedIdentifier, Vec<String>>> {
-    let rows = sqlx::query(
+    let rows = catalog(
+        tx,
         r#"
         SELECT
             n.nspname AS table_schema,
@@ -1443,25 +1515,25 @@ pub async fn load_primary_keys(
         WHERE i.indisprimary
           AND n.nspname = ANY($1)
         "#,
+        &[],
+        &[texts(schemas)],
     )
-    .bind(schemas)
-    .fetch_all(pool)
-    .await
-    .map_err(|e| Error::SchemaCacheLoadFailed(e.to_string()))?;
+    .await?;
 
-    Ok(rows
-        .into_iter()
-        .filter_map(|row| {
-            let columns: Option<Vec<String>> = row.get("pk_cols");
-            Some((
-                QualifiedIdentifier::new(
-                    row.get::<String, _>("table_schema"),
-                    row.get::<String, _>("table_name"),
-                ),
-                columns?,
-            ))
-        })
-        .collect())
+    let mut keys = HashMap::new();
+    for row in rows {
+        let Some(columns): Option<Vec<String>> = row.get("pk_cols")? else {
+            continue;
+        };
+        keys.insert(
+            QualifiedIdentifier::new(
+                row.get::<String>("table_schema")?,
+                row.get::<String>("table_name")?,
+            ),
+            columns,
+        );
+    }
+    Ok(keys)
 }
 
 /// The members of an enum table: its key column, and its `comment` column
@@ -1472,8 +1544,9 @@ pub async fn load_primary_keys(
 /// could; a NOINHERIT authenticator can read nothing as itself, so it becomes
 /// the first role it can become that holds SELECT on the table, inside a
 /// transaction that is then rolled back.
+#[cfg(feature = "sqlx")]
 pub async fn enum_values(
-    pool: &PgPool,
+    pool: &sqlx::PgPool,
     schema: &str,
     table: &str,
     key_column: &str,
@@ -1537,4 +1610,56 @@ pub async fn enum_values(
         .into_iter()
         .filter_map(|(value, comment)| value.map(|v| (v, comment)))
         .collect())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    fn row(value: serde_json::Value) -> CatalogRow {
+        match value {
+            serde_json::Value::Object(map) => CatalogRow(map),
+            other => panic!("not an object: {other}"),
+        }
+    }
+
+    #[test]
+    fn a_null_column_reads_as_none() {
+        let row = row(json!({"description": null}));
+        assert_eq!(row.get::<Option<String>>("description").unwrap(), None);
+    }
+
+    #[test]
+    fn a_column_the_query_does_not_have_fails_the_load() {
+        // A misspelled name: read as null, it would quietly be `None`.
+        let row = row(json!({"description": "a table"}));
+        let error = row.get::<Option<String>>("descripton").unwrap_err();
+        assert!(
+            matches!(&error, Error::SchemaCacheLoadFailed(m) if m.contains("descripton")),
+            "{error:?}"
+        );
+    }
+
+    #[test]
+    fn a_value_of_the_wrong_type_fails_the_load() {
+        let row = row(json!({"is_unique": "yes"}));
+        assert!(matches!(
+            row.get::<bool>("is_unique"),
+            Err(Error::SchemaCacheLoadFailed(_))
+        ));
+    }
+
+    #[test]
+    fn the_wrapper_sorts_by_the_order_it_is_given() {
+        assert_eq!(
+            catalog_sql("SELECT 1 AS a, 2 AS b ORDER BY a", &["a", "b"]),
+            "SELECT row_to_json(pgrst_catalog) FROM (SELECT 1 AS a, 2 AS b ORDER BY a) \
+             AS pgrst_catalog ORDER BY pgrst_catalog.a, pgrst_catalog.b"
+        );
+        assert_eq!(
+            catalog_sql("SELECT 1 AS a", &[]),
+            "SELECT row_to_json(pgrst_catalog) FROM (SELECT 1 AS a) AS pgrst_catalog"
+        );
+    }
 }

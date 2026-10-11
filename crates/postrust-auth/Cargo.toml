@@ -13,14 +13,45 @@ keywords = ["jwt", "authentication", "postgres", "rls", "auth"]
 
 [dependencies]
 async-trait.workspace = true
-jsonwebtoken.workspace = true
 base64.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
 chrono.workspace = true
 tracing.workspace = true
+web-time.workspace = true
+
+# jsonwebtoken 9 natively, verifying with ring -- which sqlx's TLS already
+# links into the server, so it costs nothing.
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+jsonwebtoken.workspace = true
+# Only for the `jwt-rust-crypto` feature below.
+jsonwebtoken10 = { package = "jsonwebtoken", version = "10.4", default-features = false, features = [
+    "rust_crypto",
+], optional = true }
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+# On wasm32 (a Cloudflare Worker) ring needs a C cross toolchain, so the
+# verifying is done by jsonwebtoken 10's pure-Rust RustCrypto backend instead.
+# Renamed, and aliased back to `jsonwebtoken` in lib.rs: the API this crate
+# uses is the same in both. Not used natively, where the RustCrypto backend
+# would cost the server binary 0.7 MB and aws-lc-rs 2.6 MB. HMAC only, so no
+# `use_pem`: postrust accepts HS256 tokens and nothing else.
+jsonwebtoken10 = { package = "jsonwebtoken", version = "10.4", default-features = false, features = [
+    "rust_crypto",
+] }
+# Not used directly: this turns on the browser/Workers randomness backend that
+# the RustCrypto keys need, and that otherwise refuses wasm32. chrono's clock
+# comes from its default `wasmbind` feature.
+getrandom = { version = "0.2", features = ["js"] }
+
+[features]
+# For testing only, and not part of the crate's public promise: verify tokens
+# natively with jsonwebtoken 10 and RustCrypto, the code path a wasm32 build
+# (a Cloudflare Worker) takes, so CI can run this crate's tests against it
+# without a JavaScript host.
+jwt-rust-crypto = ["dep:jsonwebtoken10"]
 
 [dev-dependencies]
 pretty_assertions.workspace = true
-tokio = { workspace = true, features = ["test-util", "macros"] }
+tokio = { workspace = true, features = ["full", "test-util"] }

@@ -1,0 +1,14 @@
+{
+  "tables": {
+    "public.products": {
+      "name": "Product",
+      "federation": { "shared": true },
+      "relationships": { "reviews_product_id_fkey": "reviews" }
+    },
+    "public.reviews": {
+      "name": "Review",
+      "roots": { "select": "reviews", "select_by_pk": "review" },
+      "relationships": { "reviews_product_id_fkey": "product" }
+    }
+  }
+}

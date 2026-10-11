@@ -50,7 +50,7 @@ export const head: DocumentHead = {
     },
     {
       property: "og:url",
-      content: "https://postrust.org",
+      content: "https://postrust.org/",
     },
     {
       name: "twitter:card",

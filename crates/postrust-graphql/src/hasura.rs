@@ -55,6 +55,10 @@ fn code_for(error: &ServerError) -> &'static str {
                 // not one it may claim. Distinct from `permission-error`,
                 // which is a rule refusing an authenticated caller.
                 "access-denied" => "access-denied",
+                // A token was offered and did not verify.
+                "invalid-jwt" => "invalid-jwt",
+                // A token that verified and named no role to be.
+                "jwt-missing-role-claims" => "jwt-missing-role-claims",
                 // What Hasura answers when a permission needs a session
                 // variable the caller does not carry: the variable was looked
                 // for and is not there.
@@ -218,9 +222,42 @@ pub fn status_for(body: &Value, endpoint: Endpoint) -> u16 {
 /// and no operation to blame -- which is why Hasura answers `$` here and this
 /// does too. Still a 200: a GraphQL error is a value in the body.
 pub fn denied(message: &str) -> Value {
+    refused(message, "access-denied")
+}
+
+/// A request whose token was offered and could not be verified.
+///
+/// Refused rather than answered as the anonymous role: a bad signature, an
+/// expired token or a claim out of place is a credential the client believes
+/// in, and serving it as a stranger hides that it stopped working. REST says
+/// 401; Hasura says `invalid-jwt`, in the same shape as [`denied`].
+//
+// Hidden: public only so that `postrust-server`, which authenticates, can
+// call it. It is not an API anyone else should build on.
+#[doc(hidden)]
+pub fn invalid_jwt(reason: &str) -> Value {
+    refused(&format!("Could not verify JWT: {reason}"), "invalid-jwt")
+}
+
+/// A request whose token verified and named no role, where there is no
+/// anonymous role to fall back to.
+///
+/// REST says 401. Hasura refuses a token without its role claims as
+/// `jwt-missing-role-claims`, naming the claim, and so does this.
+//
+// Hidden for the reason [`invalid_jwt`] is.
+#[doc(hidden)]
+pub fn missing_role_claim(claim: &str) -> Value {
+    refused(
+        &format!("JWT claim does not contain {claim}"),
+        "jwt-missing-role-claims",
+    )
+}
+
+fn refused(message: &str, code: &str) -> Value {
     let mut error = ServerError::new(message, None);
     let mut extensions = async_graphql::ErrorExtensionValues::default();
-    extensions.set("code", "access-denied");
+    extensions.set("code", code);
     error.extensions = Some(extensions);
 
     let mut response = Response::new(async_graphql::Value::Null);

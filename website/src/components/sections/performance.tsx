@@ -184,7 +184,7 @@ export const PerformanceSection = component$(() => {
             {measurementContext.spreadPct.postgrest}%, so its multiples carry
             roughly ±{measurementContext.postgrestRatioTolerancePct}%.{" "}
             <Link
-              href="/docs/benchmarks"
+              href="/docs/benchmarks/"
               class="text-primary-600 hover:text-primary-700"
             >
               Full method

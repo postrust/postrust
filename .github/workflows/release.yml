@@ -64,7 +64,7 @@ jobs:
           # Dependency order: leaves first. Nothing depends on postrust-proxy,
           # so no 1.0.0 crate carries a 0.x dependency.
           for crate in postrust-sql postrust-auth postrust-core postrust-response \
-                       postrust-graphql postrust-server postrust-lambda postrust-worker \
+                       postrust-engine postrust-graphql postrust-server postrust-lambda postrust-worker \
                        postrust-proxy; do
             crate_version=$(jq -r --arg c "${crate}" \
               '.packages[] | select(.name == $c) | .version' <<<"${metadata}")

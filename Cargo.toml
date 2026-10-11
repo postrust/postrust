@@ -5,6 +5,7 @@ members = [
     "crates/postrust-sql",
     "crates/postrust-auth",
     "crates/postrust-response",
+    "crates/postrust-engine",
     "crates/postrust-server",
     "crates/postrust-lambda",
     "crates/postrust-worker",
@@ -13,7 +14,7 @@ members = [
 ]
 
 [workspace.package]
-version = "2.2.0"
+version = "2.3.0"
 edition = "2021"
 # Verified, not assumed: 1.88.0 builds the workspace clean and 1.87.0 is
 # refused outright -- hickory-{net,proto,resolver} 0.26 and time 0.3.55 all
@@ -29,7 +30,12 @@ authors = ["Bhanu Pratap Chaudhary"]
 
 [workspace.dependencies]
 # Async runtime
-tokio = { version = "1.43", features = ["full"] }
+#
+# Only what the request-handling crates need. `full` pulls in mio, which has no
+# networking on wasm32, so the crates that serve or connect (server, Lambda,
+# proxy, GraphQL) ask for it themselves. A Cloudflare Worker builds
+# postrust-core and its siblings without it -- see issue #50.
+tokio = { version = "1.43", default-features = false, features = ["sync", "macros"] }
 async-trait = "0.1"
 futures = "0.3"
 
@@ -96,7 +102,12 @@ url = "2.5"
 percent-encoding = "2.3"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+# Default features kept: `wasmbind` is one, and gives chrono its clock on
+# wasm32 (a Cloudflare Worker, issue #50).
 chrono = { version = "0.4", features = ["serde"] }
+# `std::time`'s clocks panic on wasm32-unknown-unknown; this is `std::time`
+# everywhere else and the JavaScript clock there.
+web-time = "1.1"
 uuid = { version = "1.11", features = ["v4", "v5", "serde"] }
 
 # Testing
@@ -124,6 +135,7 @@ instant-acme = { version = "0.8", default-features = false, features = [
 x509-parser = "0.18"
 
 hyper-util = { version = "0.1", features = ["full"] }
+http-body = "1"
 http-body-util = "0.1"
 
 # Hot-reload
@@ -140,15 +152,26 @@ toml = "0.8"
 regex = "1"
 
 # Internal crates
-postrust-core = { version = "2.2.0", path = "crates/postrust-core" }
-postrust-sql = { version = "2.2.0", path = "crates/postrust-sql" }
-postrust-auth = { version = "2.2.0", path = "crates/postrust-auth" }
-postrust-response = { version = "2.2.0", path = "crates/postrust-response" }
-postrust-graphql = { version = "2.2.0", path = "crates/postrust-graphql" }
-postrust-server = { version = "2.2.0", path = "crates/postrust-server" }
+# Without sqlx by default, so a member that must not link it (the Worker, on
+# wasm32) can leave it out; the ones that load a schema cache or decode rows ask
+# for `features = ["sqlx"]`. The crate's own default keeps sqlx on for anybody
+# depending on it from crates.io.
+postrust-core = { version = "2.3.0", path = "crates/postrust-core", default-features = false }
+postrust-sql = { version = "2.3.0", path = "crates/postrust-sql" }
+postrust-auth = { version = "2.3.0", path = "crates/postrust-auth" }
+postrust-response = { version = "2.3.0", path = "crates/postrust-response" }
+postrust-engine = { version = "2.3.0", path = "crates/postrust-engine" }
+postrust-graphql = { version = "2.3.0", path = "crates/postrust-graphql" }
+postrust-server = { version = "2.3.0", path = "crates/postrust-server" }
 
 [profile.release]
 lto = true
 codegen-units = 1
 panic = "abort"
 strip = true
+
+# wasm-bindgen reads tables and sections out of the module that stripping
+# removes, and fails with "externref table required for catch wrappers".
+# worker-build shrinks the module itself with wasm-opt.
+[profile.release.package.postrust-worker]
+strip = false

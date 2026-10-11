@@ -65,6 +65,62 @@ jobs:
       - name: Check (workspace)
         run: cargo +1.88 check --workspace --all-targets --locked
 
+  wasm32:
+    name: wasm32 (Cloudflare Workers)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust (from rust-toolchain.toml) and the wasm32 target
+        run: |
+          rustup show active-toolchain
+          rustup target add wasm32-unknown-unknown
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: wasm32
+
+      # The crates a Worker is built from (issue #50). `--locked` for the same
+      # reason as the MSRV job.
+      - name: Clippy (core crates and the Worker, wasm32)
+        run: >
+          cargo clippy --locked --target wasm32-unknown-unknown --no-default-features
+          -p postrust-core -p postrust-sql -p postrust-auth -p postrust-response
+          -p postrust-engine -p postrust-worker -- -D warnings
+
+      # A crate that compiles C (ring, aws-lc-sys), needs tokio's networking
+      # (mio) or is sqlx can build here by accident -- the runner has clang --
+      # and still fail where a Worker is built. None of them may be in the
+      # wasm32 graph at all. The graph is listed once and searched, rather
+      # than asked about each crate with `cargo tree -i`: that fails outright
+      # when two versions of a crate are locked ("specification is
+      # ambiguous"), and a failure must not read as "absent".
+      - name: No native-only crates in the wasm32 graph
+        run: |
+          status=0
+          for package in postrust-engine postrust-worker; do
+            graph=$(cargo tree --locked --target wasm32-unknown-unknown -e normal --no-default-features \
+                      -p "$package" --prefix none) || {
+              echo "::error::cargo tree failed, so the wasm32 graph of $package was not checked"
+              exit 1
+            }
+            for krate in ring aws-lc-sys aws-lc-rs mio sqlx sqlx-core; do
+              if grep -q "^$krate v" <<<"$graph"; then
+                echo "::error::$krate is in the wasm32 dependency graph of $package"
+                cargo tree --locked --target wasm32-unknown-unknown -e normal --no-default-features \
+                  -p "$package" -i "$krate@$(grep -m1 "^$krate v" <<<"$graph" | cut -d' ' -f2 | tr -d v)"
+                status=1
+              fi
+            done
+          done
+          exit $status
+
+      # A Worker verifies tokens with jsonwebtoken 10 and RustCrypto, where the
+      # server uses jsonwebtoken 9 and ring. The test-only feature switches a
+      # native build to the Worker's path, so the auth tests cover both.
+      - name: Auth tests (jsonwebtoken 10, the Worker's backend)
+        run: cargo test --locked -p postrust-auth --features jwt-rust-crypto
+
   audit:
     name: dependency audit
     runs-on: ubuntu-latest
@@ -159,4 +215,14 @@ jobs:
       - name: Integration tests (compat-key-order)
         run: |
           cargo test -p postrust-server --features compat-key-order \
+            --lib --bins --tests -- --ignored
+
+      # `pg-socket` serves REST requests through the socket driver a
+      # Cloudflare Worker uses, which pipelines a request's statements and
+      # owns the transaction they run in. Run over the server's whole suite,
+      # so that a refused write is proved to roll back on that driver too, and
+      # every request answers as it does on sqlx.
+      - name: Integration tests (pg-socket)
+        run: |
+          cargo test -p postrust-server --features pg-socket \
             --lib --bins --tests -- --ignored

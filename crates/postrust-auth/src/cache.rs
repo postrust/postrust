@@ -12,7 +12,9 @@
 
 use std::collections::HashMap;
 use std::sync::Mutex;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+// `std::time` natively; on wasm32, where `Instant::now()` and
+// `SystemTime::now()` panic, the JavaScript host's clock.
+use web_time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::{extract_bearer_token, validate_token, AuthResult, JwtConfig, JwtError};
 

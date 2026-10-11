@@ -33,14 +33,14 @@ export const HeroSection = component$(() => {
             One Rust binary that serves a PostgreSQL schema over REST and
             GraphQL, with a native AWS Lambda adapter. It answers{" "}
             <Link
-              href="/docs/conformance"
+              href="/docs/conformance/"
               class="underline decoration-neutral-300 underline-offset-4 hover:decoration-primary-600 hover:text-primary-700"
             >
               PostgREST&rsquo;s dialect
             </Link>{" "}
             and{" "}
             <Link
-              href="/docs/conformance/hasura"
+              href="/docs/conformance/hasura/"
               class="underline decoration-neutral-300 underline-offset-4 hover:decoration-primary-600 hover:text-primary-700"
             >
               Hasura&rsquo;s
@@ -52,7 +52,7 @@ export const HeroSection = component$(() => {
           {/* CTAs */}
           <div class="flex flex-col sm:flex-row items-center justify-center gap-4 mb-12">
             <Link
-              href="/docs/getting-started"
+              href="/docs/getting-started/"
               class="inline-flex items-center gap-2 px-6 py-3 text-base font-semibold text-white bg-neutral-900 hover:bg-neutral-800 rounded-lg transition-all shadow-lg shadow-neutral-900/20 hover:shadow-xl hover:shadow-neutral-900/30"
             >
               Get Started

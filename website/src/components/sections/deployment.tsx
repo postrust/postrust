@@ -143,7 +143,7 @@ export const DeploymentSection = component$(() => {
         {/* CTA */}
         <div class="mt-12 text-center">
           <a
-            href="/docs/deployment"
+            href="/docs/deployment/"
             class="text-primary-600 hover:text-primary-700 inline-flex items-center gap-2 font-medium"
           >
             View deployment guides

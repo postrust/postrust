@@ -9,7 +9,7 @@ export default component$(() => {
       <div class="bg-gradient-to-b from-neutral-50 to-white border-b border-neutral-200">
         <div class="container-wide py-12">
           <div class="flex items-center gap-2 text-sm text-neutral-500 mb-4">
-            <Link href="/docs" class="hover:text-primary-600">Docs</Link>
+            <Link href="/docs/" class="hover:text-primary-600">Docs</Link>
             <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
               <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 5l7 7-7 7"/>
             </svg>
@@ -77,7 +77,7 @@ curl http://localhost:3000/`}</code>
                 is served under <code class="font-mono">/api</code> (e.g.{" "}
                 <code class="font-mono">GET /api/products</code>). The examples in this guide use
                 root-level paths like <code class="font-mono">/products</code> — these work as-is
-                with <Link href="/docs/configuration" class="text-primary-600 hover:underline">
+                with <Link href="/docs/configuration/" class="text-primary-600 hover:underline">
                 compatibility mode</Link> (<code class="font-mono">PGRST_COMPAT_MODE=true</code>)
                 enabled; otherwise prefix them with <code class="font-mono">/api</code>.
               </div>
@@ -318,7 +318,7 @@ curl http://localhost:3000/products \\
             <h2 class="text-2xl font-bold text-neutral-900 mb-6">Next Steps</h2>
             <div class="grid sm:grid-cols-2 gap-4">
               <Link
-                href="/docs/configuration"
+                href="/docs/configuration/"
                 class="group p-4 bg-neutral-50 hover:bg-primary-50 rounded-xl border border-neutral-200 hover:border-primary-200 transition-colors"
               >
                 <h3 class="font-semibold text-neutral-900 group-hover:text-primary-600 mb-1">
@@ -327,7 +327,7 @@ curl http://localhost:3000/products \\
                 <p class="text-sm text-neutral-600">All configuration options</p>
               </Link>
               <Link
-                href="/docs/api-reference"
+                href="/docs/api-reference/"
                 class="group p-4 bg-neutral-50 hover:bg-primary-50 rounded-xl border border-neutral-200 hover:border-primary-200 transition-colors"
               >
                 <h3 class="font-semibold text-neutral-900 group-hover:text-primary-600 mb-1">
@@ -336,7 +336,7 @@ curl http://localhost:3000/products \\
                 <p class="text-sm text-neutral-600">Complete API documentation</p>
               </Link>
               <Link
-                href="/docs/authentication"
+                href="/docs/authentication/"
                 class="group p-4 bg-neutral-50 hover:bg-primary-50 rounded-xl border border-neutral-200 hover:border-primary-200 transition-colors"
               >
                 <h3 class="font-semibold text-neutral-900 group-hover:text-primary-600 mb-1">
@@ -345,7 +345,7 @@ curl http://localhost:3000/products \\
                 <p class="text-sm text-neutral-600">JWT and Row-Level Security</p>
               </Link>
               <Link
-                href="/docs/deployment"
+                href="/docs/deployment/"
                 class="group p-4 bg-neutral-50 hover:bg-primary-50 rounded-xl border border-neutral-200 hover:border-primary-200 transition-colors"
               >
                 <h3 class="font-semibold text-neutral-900 group-hover:text-primary-600 mb-1">

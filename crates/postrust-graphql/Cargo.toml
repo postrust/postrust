@@ -26,7 +26,7 @@ axum.workspace = true
 base64 = "0.22"
 
 # Async
-tokio.workspace = true
+tokio = { workspace = true, features = ["full"] }
 tokio-stream = { version = "0.1", features = ["sync"] }
 futures.workspace = true
 
@@ -49,10 +49,10 @@ tracing.workspace = true
 chrono.workspace = true
 
 # Internal
-postrust-core.workspace = true
+postrust-core = { workspace = true, features = ["sqlx"] }
 postrust-sql.workspace = true
 postrust-auth.workspace = true
 
 [dev-dependencies]
 pretty_assertions.workspace = true
-tokio = { workspace = true, features = ["test-util", "macros"] }
+tokio = { workspace = true, features = ["full", "test-util"] }

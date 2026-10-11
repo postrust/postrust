@@ -175,10 +175,11 @@ fn check_claims(
     Ok(())
 }
 
-/// Seconds since the epoch.
+/// Seconds since the epoch. `web_time` is `std::time` natively; on wasm32,
+/// where `SystemTime::now()` panics, it asks the JavaScript host.
 fn now() -> i64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
+    web_time::SystemTime::now()
+        .duration_since(web_time::UNIX_EPOCH)
         .map(|elapsed| elapsed.as_secs() as i64)
         .unwrap_or_default()
 }

@@ -1,6 +1,6 @@
 # Postrust Documentation
 
-Welcome to the Postrust documentation. Postrust is a high-performance, serverless-first automated REST and Graphql API server for PostgreSQL databases, written in Rust.
+Welcome to the Postrust documentation. Postrust serves a PostgreSQL schema as a REST API in PostgREST's dialect and a GraphQL API in Hasura's, from one Rust binary that runs as a server, in a container, or on AWS Lambda.
 
 ## Quick Links
 
@@ -28,7 +28,8 @@ Postrust automatically generates a RESTful API from your PostgreSQL database sch
 - **Resource embedding** via foreign key relationships
 - **JWT authentication** with PostgreSQL Row-Level Security
 - **Serverless deployment** to AWS Lambda, serving the same REST and GraphQL
-  APIs as the server (Cloudflare Workers is not supported yet)
+  APIs as the server, and to Cloudflare Workers through Hyperdrive, serving
+  the REST API ([workers.md](workers.md))
 
 ## Why Postrust?
 

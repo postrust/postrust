@@ -4,6 +4,12 @@
 
 #![warn(missing_docs)]
 
+// jsonwebtoken 10 on wasm32 (and natively under the test-only
+// `jwt-rust-crypto` feature), under another name so it cannot be mistaken for
+// the native one; see Cargo.toml. Everything below says `jsonwebtoken`.
+#[cfg(any(target_arch = "wasm32", feature = "jwt-rust-crypto"))]
+extern crate jsonwebtoken10 as jsonwebtoken;
+
 mod cache;
 mod claims;
 pub mod hasura;

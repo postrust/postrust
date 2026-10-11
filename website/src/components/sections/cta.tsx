@@ -34,7 +34,7 @@ export const CTASection = component$(() => {
           {/* CTAs */}
           <div class="flex flex-col sm:flex-row items-center justify-center gap-4 mb-12">
             <Link
-              href="/docs/getting-started"
+              href="/docs/getting-started/"
               class="inline-flex items-center gap-2 px-8 py-4 text-base font-semibold text-neutral-900 bg-white hover:bg-neutral-100 rounded-lg transition-all shadow-lg hover:shadow-xl"
             >
               Get Started for Free
@@ -80,7 +80,7 @@ export const CTASection = component$(() => {
               <span class="text-sm font-medium">Follow @postrustorg</span>
             </a>
             <Link
-              href="/community"
+              href="/community/"
               class="flex items-center gap-2 text-neutral-400 hover:text-white transition-colors"
             >
               <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">

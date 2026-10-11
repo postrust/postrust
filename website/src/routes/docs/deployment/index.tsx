@@ -8,7 +8,7 @@ export default component$(() => {
       <div class="bg-gradient-to-b from-neutral-50 to-white border-b border-neutral-200">
         <div class="container-wide py-12">
           <div class="flex items-center gap-2 text-sm text-neutral-500 mb-4">
-            <Link href="/docs" class="hover:text-primary-600">Docs</Link>
+            <Link href="/docs/" class="hover:text-primary-600">Docs</Link>
             <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
               <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 5l7 7-7 7"/>
             </svg>
@@ -16,7 +16,7 @@ export default component$(() => {
           </div>
           <h1 class="text-4xl font-bold text-neutral-900 mb-4">Deployment</h1>
           <p class="text-lg text-neutral-600 max-w-2xl">
-            Deploy Postrust to Docker, AWS Lambda, Kubernetes, and more.
+            Deploy Postrust to Docker, AWS Lambda, Cloudflare Workers, Kubernetes, and more.
           </p>
         </div>
       </div>
@@ -108,6 +108,37 @@ sam build && sam deploy --guided`}</code>
             </p>
           </section>
 
+          {/* Cloudflare Workers */}
+          <section class="mb-12">
+            <h2 class="text-2xl font-bold text-neutral-900 mb-4">Cloudflare Workers</h2>
+            <p class="text-neutral-600 mb-4">
+              The REST API runs in a Worker, reaching PostgreSQL through Hyperdrive. It is the
+              server&rsquo;s own request pipeline over a socket driver that is tested to answer as
+              the server&rsquo;s does, and every request takes on the token&rsquo;s role and claims,
+              so row-level security applies unchanged. The schema cache is kept in Workers KV. There
+              is no GraphQL on Workers; use the server or Lambda for that.
+            </p>
+            <div class="bg-neutral-900 rounded-xl overflow-hidden mb-4">
+              <pre class="p-4 text-sm overflow-x-auto">
+                <code class="text-neutral-100">{`npx wrangler hyperdrive create postrust --connection-string="postgres://authenticator:...@db:5432/app"
+npx wrangler kv namespace create POSTRUST_SCHEMA_CACHE
+
+# In a checkout: copy wrangler.example.toml to wrangler.toml, fill in the IDs
+cd crates/postrust-worker
+npx wrangler secret put PGRST_JWT_SECRET
+npx wrangler deploy`}</code>
+              </pre>
+            </div>
+            <p class="text-neutral-600 text-sm">
+              How it differs from the server &mdash; what it serves, where its answers differ,
+              conformance, measured costs and limits &mdash; is on the{" "}
+              <Link href="/docs/workers/" class="text-primary-600 hover:text-primary-700 underline">
+                Cloudflare Workers
+              </Link>{" "}
+              page.
+            </p>
+          </section>
+
           {/* Fly.io */}
           <section class="mb-12">
             <h2 class="text-2xl font-bold text-neutral-900 mb-4">Fly.io</h2>
@@ -175,7 +206,7 @@ railway up`}</code>
           {/* Next */}
           <div class="flex items-center justify-between pt-8 border-t border-neutral-200">
             <Link
-              href="/docs/configuration"
+              href="/docs/configuration/"
               class="flex items-center gap-2 text-neutral-600 hover:text-primary-600"
             >
               <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
@@ -184,7 +215,7 @@ railway up`}</code>
               Configuration
             </Link>
             <Link
-              href="/docs/graphql"
+              href="/docs/graphql/"
               class="flex items-center gap-2 text-neutral-600 hover:text-primary-600"
             >
               GraphQL
@@ -204,7 +235,7 @@ export const head: DocumentHead = {
   meta: [
     {
       name: "description",
-      content: "Deploy Postrust to Docker, AWS Lambda, Kubernetes, Fly.io, Railway, and more.",
+      content: "Deploy Postrust to Docker, AWS Lambda, Cloudflare Workers, Kubernetes, Fly.io, Railway, and more.",
     },
   ],
 };

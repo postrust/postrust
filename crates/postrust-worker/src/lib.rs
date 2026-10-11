@@ -1,67 +1,41 @@
-//! Postrust Cloudflare Workers adapter.
+//! Postrust's REST API in a Cloudflare Worker, reaching PostgreSQL through
+//! Hyperdrive.
 //!
-//! Deploys Postrust as a Cloudflare Worker.
+//! The request pipeline is `postrust-engine`, the same one the server runs, and
+//! the database driver is `postrust_core::db::PgSocketDb`: the PostgreSQL wire
+//! protocol over a `worker::Socket` to Hyperdrive. That driver is held to
+//! answering exactly as the server's sqlx driver does. Every request runs in a
+//! transaction that sets the token's role and claims, as on the server, so
+//! row-level security applies the same way.
 //!
-//! **This is a stub.** The fetch handler answers with a JSON body saying so;
-//! it does not parse requests, reach a database, or return data. A real
-//! implementation needs Cloudflare-specific pieces that are not here yet:
-//! Hyperdrive for database connections, and KV or Durable Objects for the
-//! schema cache.
+//! What is different here, and why:
 //!
-//! Because of that the crate is on its own 0.x version line rather than the
-//! workspace's, and carries no stability promise. See docs/stability.md.
+//! * **One connection per request.** A Worker may not share an I/O object
+//!   between requests. Hyperdrive pools connections on its side, so opening
+//!   one costs little.
+//! * **The schema cache is kept in Workers KV** (`POSTRUST_SCHEMA_CACHE`), so
+//!   a cold isolate reads it rather than querying the catalog. It is loaded
+//!   live on a miss, refreshed by a Cron Trigger or by an authenticated
+//!   `POST /_/reload`, and re-read from KV once `PGRST_WORKER_SCHEMA_TTL`
+//!   seconds (default 60) have passed. The KV copy expires after the TTL (at
+//!   least 60 seconds), so a migration is seen without a reload too.
+//! * **Rows are capped** at `PGRST_DB_MAX_ROWS`, 1000 unless set, because an
+//!   isolate has 128 MB. `unlimited`, under that name or `PGRST_MAX_ROWS`,
+//!   lifts the cap.
+//! * **REST only.** No GraphQL, no subscriptions, no `LISTEN`.
+//!
+//! The REST API answers at the root, as PostgREST does: `/todos`, `/rpc/f`.
+//! Configuration is the server's own variables (`PGRST_DB_SCHEMAS`,
+//! `PGRST_DB_ANON_ROLE`, `PGRST_JWT_SECRET`, ...), set as Worker variables or
+//! secrets. See docs/workers.md.
+//!
+//! The crate is on its own `0.x` line. See docs/stability.md.
 
-use worker::*;
+// The Worker itself is wasm32-only: a Worker's sockets, bindings and futures
+// are JavaScript objects. What it decides without them is in `settings`,
+// built for every target so that it is tested natively.
+#[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
+mod settings;
 
-#[event(fetch)]
-async fn main(req: Request, env: Env, _ctx: Context) -> Result<Response> {
-    // Log request
-    console_log!("{} {}", req.method().to_string(), req.path());
-
-    // Get configuration from environment
-    let _db_url = env.var("DATABASE_URL").map(|v| v.to_string()).ok();
-    let _jwt_secret = env.secret("JWT_SECRET").map(|v| v.to_string()).ok();
-    let _schemas = env
-        .var("PGRST_DB_SCHEMAS")
-        .map(|v| v.to_string())
-        .unwrap_or_else(|_| "public".to_string());
-
-    // For now, return a placeholder response
-    // Full implementation would:
-    // 1. Use Hyperdrive for database connections
-    // 2. Cache schema in KV or Durable Objects
-    // 3. Process requests using postrust-core
-
-    let response_body = serde_json::json!({
-        "message": "Postrust Worker is running",
-        "status": "stub",
-        "note": "Full implementation requires Hyperdrive configuration"
-    });
-
-    Response::from_json(&response_body)
-}
-
-/// Process a request using Postrust core.
-///
-/// This is a placeholder for the full implementation.
-#[allow(dead_code)]
-async fn process_request(_req: Request, _env: &Env) -> Result<Response> {
-    // In a full implementation:
-    // 1. Get Hyperdrive binding: env.hyperdrive("DB")?
-    // 2. Parse request using postrust-core
-    // 3. Execute query
-    // 4. Format response
-
-    Response::error("Not implemented", 501)
-}
-
-/// Get or load schema cache from KV.
-#[allow(dead_code)]
-async fn get_schema_cache(_env: &Env) -> Result<Option<String>> {
-    // In a full implementation:
-    // 1. Check KV for cached schema
-    // 2. If not found, load from database
-    // 3. Cache in KV with TTL
-
-    Ok(None)
-}
+#[cfg(target_arch = "wasm32")]
+mod runtime;

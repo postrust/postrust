@@ -13,42 +13,100 @@ pub use relationship::{
 };
 pub use routine::{FuncVolatility, RetType, Routine, RoutineMap, RoutineParam};
 
+#[cfg(feature = "sqlx")]
 pub use queries::enum_values;
 pub use table::{Column, ColumnMap, ComputedColumn, Table, TablesMap};
 
 use crate::api_request::QualifiedIdentifier;
+use crate::db::{Db, Tx};
 use crate::error::{Error, Result};
-use sqlx::PgPool;
+use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use tracing::info;
 
 /// Cached PostgreSQL schema metadata.
-#[derive(Clone, Debug)]
+///
+/// Serializable, so a host that cannot afford to load it on every cold start
+/// -- a Cloudflare Worker -- can keep a copy elsewhere. The maps keyed by more
+/// than a string are written as lists of `[key, value]` pairs, since a JSON
+/// object can only be keyed by a string.
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct SchemaCache {
     /// Tables and views by qualified identifier.
+    #[serde(with = "pairs")]
     pub tables: TablesMap,
     /// Relationships between tables.
+    #[serde(with = "pairs")]
     pub relationships: RelationshipsMap,
     /// Stored functions/procedures.
+    #[serde(with = "pairs")]
     pub routines: RoutineMap,
     /// Valid timezone names.
     pub timezones: HashSet<String>,
     /// PostgreSQL version.
     pub pg_version: i32,
     /// User-defined renderers for media types, by (schema, media type).
+    #[serde(with = "pairs")]
     pub media_handlers: MediaHandlerMap,
     /// Casts between a domain and `json`/`text`, by (source, target) type.
     ///
     /// A schema uses these to decide how a value of one of its domains is
     /// written on the wire and how one written by a client is read back.
+    #[serde(with = "pairs")]
     pub representations: std::collections::HashMap<(String, String), String>,
+}
+
+/// A map written as a list of `[key, value]` pairs, for keys a JSON object
+/// cannot have.
+mod pairs {
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+    use std::collections::HashMap;
+    use std::hash::Hash;
+
+    pub fn serialize<K, V, S>(map: &HashMap<K, V>, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        K: Serialize,
+        V: Serialize,
+        S: Serializer,
+    {
+        serializer.collect_seq(map.iter())
+    }
+
+    pub fn deserialize<'de, K, V, D>(deserializer: D) -> Result<HashMap<K, V>, D::Error>
+    where
+        K: Deserialize<'de> + Eq + Hash,
+        V: Deserialize<'de>,
+        D: Deserializer<'de>,
+    {
+        Ok(Vec::<(K, V)>::deserialize(deserializer)?
+            .into_iter()
+            .collect())
+    }
 }
 
 impl SchemaCache {
     /// Load schema cache from the database.
-    pub async fn load(pool: &PgPool, schemas: &[String]) -> Result<Self> {
-        Self::load_with_search_path(pool, schemas, &[]).await
+    #[cfg(feature = "sqlx")]
+    pub async fn load(pool: &sqlx::PgPool, schemas: &[String]) -> Result<Self> {
+        Self::load_from(pool, schemas).await
+    }
+
+    /// Load the cache, resolving functions along `extra_search_path` as well.
+    /// See [`Self::load_with_search_path_from`].
+    #[cfg(feature = "sqlx")]
+    pub async fn load_with_search_path(
+        pool: &sqlx::PgPool,
+        schemas: &[String],
+        extra_search_path: &[String],
+    ) -> Result<Self> {
+        Self::load_with_search_path_from(pool, schemas, extra_search_path).await
+    }
+
+    /// Load schema cache through any [`Db`] -- a sqlx pool, or the socket
+    /// driver a Cloudflare Worker uses.
+    pub async fn load_from<D: Db>(db: &D, schemas: &[String]) -> Result<Self> {
+        Self::load_with_search_path_from(db, schemas, &[]).await
     }
 
     /// Load the cache, resolving functions along `extra_search_path` as well.
@@ -56,8 +114,12 @@ impl SchemaCache {
     /// A computed column's function is reached the way the database reaches
     /// it, which is along the search path -- so it may live in a schema the
     /// API does not expose. The table it reads must still be exposed.
-    pub async fn load_with_search_path(
-        pool: &PgPool,
+    ///
+    /// Every catalog query runs on one transaction, through the same
+    /// interface a request uses, so any driver that can serve requests can
+    /// load the cache.
+    pub async fn load_with_search_path_from<D: Db>(
+        db: &D,
         schemas: &[String],
         extra_search_path: &[String],
     ) -> Result<Self> {
@@ -71,23 +133,26 @@ impl SchemaCache {
             .into_iter()
             .collect();
 
+        let failed = |e: crate::db::DbError| Error::SchemaCacheLoadFailed(e.to_string());
+        let mut tx = db.begin().await.map_err(failed)?;
+
         // Get PostgreSQL version
-        let pg_version = queries::get_pg_version(pool).await?;
+        let pg_version = queries::get_pg_version(&mut tx).await?;
         info!("PostgreSQL version: {}", pg_version);
 
         // Load tables and columns
-        let mut tables = queries::load_tables(pool, schemas).await?;
+        let mut tables = queries::load_tables(&mut tx, schemas).await?;
         info!("Loaded {} tables/views", tables.len());
 
         // Which base-table columns each view carries. Loaded before the
         // relationships, because a view's base table may live in a schema
         // that is not itself exposed -- `private.articles` behind a public
         // view -- and its foreign keys are needed all the same.
-        let view_columns = queries::load_view_columns(pool, schemas).await?;
+        let view_columns = queries::load_view_columns(&mut tx, schemas).await?;
 
         // Functions that read as columns. Attached to the tables they belong
         // to, so resolving a field name has one place to look.
-        for computed in queries::load_computed_columns(pool, schemas, &function_schemas).await? {
+        for computed in queries::load_computed_columns(&mut tx, schemas, &function_schemas).await? {
             if let Some(table) = tables.get_mut(&computed.table) {
                 table.computed_columns.insert(
                     computed.name,
@@ -111,26 +176,26 @@ impl SchemaCache {
         }
 
         // Load relationships
-        let relationships = queries::load_relationships(pool, &relationship_schemas).await?;
+        let relationships = queries::load_relationships(&mut tx, &relationship_schemas).await?;
         info!("Loaded {} relationship sets", relationships.len());
 
         // Load routines
-        let routines = queries::load_routines(pool, schemas).await?;
+        let routines = queries::load_routines(&mut tx, schemas).await?;
         info!("Loaded {} routines", routines.len());
 
         // Load timezone names
-        let timezones = queries::load_timezones(pool).await?;
+        let timezones = queries::load_timezones(&mut tx).await?;
         info!("Loaded {} timezones", timezones.len());
 
         // Junctions first, then views: a many-to-many derived from a
         // junction is itself a relationship a view can carry, and the
         // junction may live in a schema that is not exposed.
-        let primary_keys = queries::load_primary_keys(pool, &relationship_schemas).await?;
+        let primary_keys = queries::load_primary_keys(&mut tx, &relationship_schemas).await?;
 
         // Which uniqueness an upsert resolves against has to be named, and a
         // table may have several.
         let mut tables = tables;
-        for (qi, constraints) in queries::load_unique_constraints(pool, schemas).await? {
+        for (qi, constraints) in queries::load_unique_constraints(&mut tx, schemas).await? {
             if let Some(table) = tables.get_mut(&qi) {
                 table.unique_constraints = constraints;
             }
@@ -147,11 +212,13 @@ impl SchemaCache {
         let view_keys = view_primary_keys(&primary_keys, &view_columns);
         add_junction_relationships(&view_keys, &mut relationships);
 
-        let media_handlers = queries::load_media_handlers(pool, schemas).await?;
+        let media_handlers = queries::load_media_handlers(&mut tx, schemas).await?;
         info!("Loaded {} media type handlers", media_handlers.len());
 
-        let representations = queries::load_representations(pool).await?;
+        let representations = queries::load_representations(&mut tx).await?;
         info!("Loaded {} data representations", representations.len());
+
+        tx.commit().await.map_err(failed)?;
 
         Ok(Self {
             tables,
@@ -1204,7 +1271,8 @@ impl SchemaCacheRef {
     }
 
     /// Load or reload the schema cache.
-    pub async fn load(&self, pool: &PgPool, schemas: &[String]) -> Result<()> {
+    #[cfg(feature = "sqlx")]
+    pub async fn load(&self, pool: &sqlx::PgPool, schemas: &[String]) -> Result<()> {
         let cache = SchemaCache::load(pool, schemas).await?;
         let mut guard = self.0.write().await;
         *guard = Some(cache);

@@ -1,6 +1,6 @@
 {
   "name": "postrust-website",
-  "description": "Postrust is a high-performance, serverless-first automated REST and Graphql API server for PostgreSQL databases, written in Rust.",
+  "description": "Postrust serves a PostgreSQL schema as REST and GraphQL APIs from one Rust binary.",
   "engines": {
     "node": "^18.17.0 || ^20.3.0 || >=21.0.0"
   },

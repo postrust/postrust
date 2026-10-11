@@ -27,6 +27,8 @@ echo ""
 echo "=== Step 3: Publishing postrust-response and postrust-graphql ==="
 echo "Publishing postrust-response..."
 cargo publish -p postrust-response
+echo "Publishing postrust-engine..."
+cargo publish -p postrust-engine
 echo "Publishing postrust-graphql..."
 cargo publish -p postrust-graphql
 

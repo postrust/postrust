@@ -1,0 +1,10 @@
+federation_version: =2.11.2
+subgraphs:
+  catalog:
+    routing_url: http://catalog:3000/v1/graphql
+    schema:
+      subgraph_url: http://catalog:3000/v1/graphql
+  reviews:
+    routing_url: http://reviews:3000/v1/graphql
+    schema:
+      subgraph_url: http://reviews:3000/v1/graphql

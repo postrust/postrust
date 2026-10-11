@@ -93,8 +93,8 @@ Images are published to Docker Hub, in two variants of each build:
 
 | | |
 |---|---|
-| `postrust/postrust:2.2.0` | Debian base |
-| `postrust/postrust:2.2.0-alpine` | Alpine base -- much smaller |
+| `postrust/postrust:2.3.0` | Debian base |
+| `postrust/postrust:2.3.0-alpine` | Alpine base -- much smaller |
 
 `latest` and `latest-alpine` track the newest stable release and never a
 prerelease. `1.0` follows the newest patch of that minor.
@@ -521,13 +521,10 @@ helm upgrade postrust ./charts/postrust --reuse-values
 
 ## Cloudflare Workers
 
-**Not supported yet.** `postrust-worker` is a stub: it answers
-`{"status": "stub"}`, reaches no database, and does not currently compile for
-`wasm32-unknown-unknown`, because the engine it would run depends on a Tokio
-network stack and on sqlx, neither of which exists in WebAssembly. Running
-Postrust on Workers needs the engine split from its database driver and a
-driver that speaks to Hyperdrive over a Workers socket; that work is planned,
-and this section will describe it when it ships.
+The REST API runs in a Worker, reaching PostgreSQL through Hyperdrive, with
+the same request pipeline and the same per-request role and claims as the
+server. GraphQL is not available there. Setup, configuration, the schema cache
+in KV, measured costs and limits are in [workers.md](workers.md).
 
 ## Reverse Proxy
 

@@ -29,6 +29,14 @@ default = []
 graphql = ["postrust-graphql", "async-graphql", "async-graphql-axum"]
 admin-ui = ["graphql", "utoipa"]
 
+# Test only, never shipped: REST requests run through the socket driver a
+# Cloudflare Worker uses (`postrust_core::db::PgSocketDb`) instead of the sqlx
+# pool, over a TCP connection per request. It exists so the conformance suite
+# can prove the two drivers answer alike -- see
+# `CONFORMANCE_EXTRA_FEATURES=pg-socket` in scripts/conformance/conformance.sh.
+# GraphQL and the schema cache stay on sqlx.
+pg-socket = ["postrust-core/pg-socket"]
+
 # Return object keys in the order the columns were selected, as PostgREST does,
 # rather than alphabetically.
 #
@@ -47,7 +55,7 @@ compat-key-order = ["serde_json/preserve_order", "postrust-core/compat-key-order
 
 [dependencies]
 # Async
-tokio.workspace = true
+tokio = { workspace = true, features = ["full"] }
 async-trait.workspace = true
 
 # Web
@@ -75,10 +83,11 @@ tracing-subscriber.workspace = true
 chrono.workspace = true
 
 # Internal
-postrust-core.workspace = true
+postrust-core = { workspace = true, features = ["sqlx"] }
 postrust-sql.workspace = true
 postrust-auth.workspace = true
 postrust-response.workspace = true
+postrust-engine.workspace = true
 
 # Admin UI (optional)
 utoipa = { version = "5", features = ["axum_extras"], optional = true }
@@ -87,6 +96,12 @@ async-graphql = { version = "7", optional = true }
 async-graphql-axum = { version = "7", optional = true }
 
 [dev-dependencies]
+jsonwebtoken.workspace = true
+# tests/drivers_agree.rs runs both database drivers side by side.
+postrust-core = { workspace = true, features = ["sqlx", "pg-socket"] }
+postrust-sql.workspace = true
+tokio-postgres = { version = "0.7.18", default-features = false }
+uuid.workspace = true
 pretty_assertions.workspace = true
 # Parses the workspace manifest in tests/sqlx_tls_feature.rs.
 toml.workspace = true

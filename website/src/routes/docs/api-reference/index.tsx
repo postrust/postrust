@@ -8,7 +8,7 @@ export default component$(() => {
       <div class="bg-gradient-to-b from-neutral-50 to-white border-b border-neutral-200">
         <div class="container-wide py-12">
           <div class="flex items-center gap-2 text-sm text-neutral-500 mb-4">
-            <Link href="/docs" class="hover:text-primary-600">Docs</Link>
+            <Link href="/docs/" class="hover:text-primary-600">Docs</Link>
             <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
               <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 5l7 7-7 7"/>
             </svg>
@@ -30,7 +30,7 @@ export default component$(() => {
               <strong class="text-neutral-900">Note on paths.</strong> By default the REST API
               is served under <code class="font-mono">/api</code> (e.g.{" "}
               <code class="font-mono">GET /api/users</code>). The root-level paths below work
-              as-is when <Link href="/docs/configuration" class="text-primary-600 hover:underline">
+              as-is when <Link href="/docs/configuration/" class="text-primary-600 hover:underline">
               compatibility mode</Link> (<code class="font-mono">PGRST_COMPAT_MODE=true</code>) is
               enabled; otherwise prefix them with <code class="font-mono">/api</code>.
             </div>
@@ -241,9 +241,9 @@ GET /orders?select=*,customer!inner(*)&customer.country=eq.US`}</code>
             <p class="text-neutral-600">
               <code class="font-mono">/v1/graphql</code> is where a Hasura client sends its
               queries and, for most generated clients, the only address they can be told about.
-              See <Link href="/docs/graphql" class="text-primary-600 hover:underline">GraphQL</Link>{" "}
+              See <Link href="/docs/graphql/" class="text-primary-600 hover:underline">GraphQL</Link>{" "}
               for the schema shape, filters and mutations, and{" "}
-              <Link href="/docs/conformance/hasura" class="text-primary-600 hover:underline">
+              <Link href="/docs/conformance/hasura/" class="text-primary-600 hover:underline">
                 Hasura conformance
               </Link>{" "}
               for how closely the two agree, measured.
@@ -253,7 +253,7 @@ GET /orders?select=*,customer!inner(*)&customer.country=eq.US`}</code>
           {/* Next */}
           <div class="flex items-center justify-between pt-8 border-t border-neutral-200">
             <Link
-              href="/docs/getting-started"
+              href="/docs/getting-started/"
               class="flex items-center gap-2 text-neutral-600 hover:text-primary-600"
             >
               <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
@@ -262,7 +262,7 @@ GET /orders?select=*,customer!inner(*)&customer.country=eq.US`}</code>
               Getting Started
             </Link>
             <Link
-              href="/docs/authentication"
+              href="/docs/authentication/"
               class="flex items-center gap-2 text-neutral-600 hover:text-primary-600"
             >
               Authentication

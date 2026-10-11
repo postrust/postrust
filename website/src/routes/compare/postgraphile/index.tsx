@@ -13,7 +13,7 @@ export default component$(() => {
 const title = "Postrust vs PostGraphile: PostgreSQL GraphQL compared";
 const description =
   "How Postrust compares to PostGraphile V5 and its Grafast engine: REST alongside GraphQL, the Hasura dialect on the GraphQL side, and where PostGraphile's extensibility wins.";
-const url = "https://postrust.org/compare/postgraphile";
+const url = "https://postrust.org/compare/postgraphile/";
 
 export const head: DocumentHead = {
   title,

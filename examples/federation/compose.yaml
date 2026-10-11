@@ -1,0 +1,93 @@
+# Two PostgreSQL databases, a Postrust subgraph over each, and Apollo Router
+# in front. `docker compose up --wait`, then send queries to localhost:4000.
+name: postrust-federation-example
+
+x-postrust: &postrust
+  image: ${POSTRUST_IMAGE:-postrust/postrust:2.3.0}
+  healthcheck:
+    test: ["CMD", "curl", "--fail", "--silent", "http://localhost:3000/_/health"]
+    interval: 2s
+    retries: 30
+
+x-environment: &environment
+  PGRST_DB_SCHEMAS: public
+  PGRST_DB_ANON_ROLE: web_anon
+  PGRST_JWT_SECRET: an-example-secret-of-at-least-32-characters
+  PGRST_GRAPHQL_FEDERATION: "true"
+  PGRST_GRAPHQL_METADATA: /config/metadata.json
+  PGRST_SERVER_HOST: 0.0.0.0
+  PGRST_SERVER_PORT: "3000"
+
+x-database: &database
+  image: postgres:16-alpine
+  environment:
+    POSTGRES_PASSWORD: postgres
+  healthcheck:
+    # Ready once the init script has run, not merely once the server answers.
+    test: ["CMD-SHELL", 'pg_isready -U postgres && psql -U postgres -tAc "select 1 from pg_roles where rolname = ''editor''" | grep -q 1']
+    interval: 2s
+    retries: 30
+
+services:
+  catalog-db:
+    <<: *database
+    volumes:
+      - ./catalog.sql:/docker-entrypoint-initdb.d/catalog.sql:ro
+
+  reviews-db:
+    <<: *database
+    volumes:
+      - ./reviews.sql:/docker-entrypoint-initdb.d/reviews.sql:ro
+
+  catalog:
+    <<: *postrust
+    depends_on:
+      catalog-db: { condition: service_healthy }
+    environment:
+      <<: *environment
+      DATABASE_URL: postgres://authenticator:authenticator@catalog-db:5432/postgres
+      PGRST_GRAPHQL_TYPE_PREFIX: catalog
+    volumes:
+      - ./catalog.json:/config/metadata.json:ro
+
+  reviews:
+    <<: *postrust
+    depends_on:
+      reviews-db: { condition: service_healthy }
+    environment:
+      <<: *environment
+      DATABASE_URL: postgres://authenticator:authenticator@reviews-db:5432/postgres
+      PGRST_GRAPHQL_TYPE_PREFIX: reviews
+    volumes:
+      - ./reviews.json:/config/metadata.json:ro
+
+  # Composes the supergraph from the two subgraphs' SDL, then exits.
+  compose:
+    image: node:22
+    depends_on:
+      catalog: { condition: service_healthy }
+      reviews: { condition: service_healthy }
+    working_dir: /work
+    environment:
+      APOLLO_ELV2_LICENSE: accept
+      APOLLO_TELEMETRY_DISABLED: "1"
+    command: >-
+      npx --yes @apollo/rover@0.41.0 supergraph compose
+      --config supergraph.yaml --output out/supergraph.graphql
+    volumes:
+      - ./supergraph.yaml:/work/supergraph.yaml:ro
+      - supergraph:/work/out
+
+  router:
+    image: ghcr.io/apollographql/router:v2.18.0
+    depends_on:
+      compose: { condition: service_completed_successfully }
+    command: ["--config", "/config/router.yaml", "--supergraph", "/supergraph/supergraph.graphql"]
+    ports:
+      - "4000:4000"
+    volumes:
+      - ./router.yaml:/config/router.yaml:ro
+      - supergraph:/supergraph:ro
+
+volumes:
+  supergraph:

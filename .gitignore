@@ -1,6 +1,6 @@
 .DS_Store
-db
-plan
+/db
+/plan
 target
 dist
 .cabal-sandbox
@@ -47,3 +47,9 @@ scripts/autobahn/reports-baseline
 supergraph-compose.yaml
 supergraph-config.yaml
 supergraph.graphql
+
+# The Cloudflare Worker: a deployment's own wrangler.toml and secrets, and
+# wrangler's local state. worker-build ignores its own output.
+crates/postrust-worker/wrangler.toml
+crates/postrust-worker/.dev.vars
+.wrangler/

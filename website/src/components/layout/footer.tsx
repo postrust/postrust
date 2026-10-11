@@ -6,26 +6,27 @@ export const Footer = component$(() => {
 
   const footerLinks = {
     product: [
-      { href: "/features", label: "Features" },
-      { href: "/pricing", label: "Pricing" },
-      { href: "/compare", label: "Compare" },
-      { href: "/enterprise", label: "Enterprise" },
+      { href: "/features/", label: "Features" },
+      { href: "/pricing/", label: "Pricing" },
+      { href: "/compare/", label: "Compare" },
+      { href: "/enterprise/", label: "Enterprise" },
     ],
     resources: [
-      { href: "/docs", label: "Documentation" },
-      { href: "/docs/getting-started", label: "Getting Started" },
-      { href: "/docs/api-reference", label: "API Reference" },
-      { href: "/packages", label: "Packages" },
-      { href: "/docs/benchmarks", label: "Benchmarks" },
-      { href: "/docs/conformance", label: "Conformance" },
-      { href: "/docs/deployment", label: "Deployment" },
-      { href: "/releases", label: "Releases" },
+      { href: "/docs/", label: "Documentation" },
+      { href: "/docs/getting-started/", label: "Getting Started" },
+      { href: "/docs/api-reference/", label: "API Reference" },
+      { href: "/packages/", label: "Packages" },
+      { href: "/docs/benchmarks/", label: "Benchmarks" },
+      { href: "/docs/conformance/", label: "Conformance" },
+      { href: "/docs/deployment/", label: "Deployment" },
+      { href: "/releases/", label: "Releases" },
+      { href: "/blog/", label: "Blog" },
     ],
     community: [
       { href: "https://github.com/postrust/postrust", label: "GitHub", external: true },
       { href: "https://github.com/postrust/postrust/issues", label: "Issues & Features", external: true },
       { href: "https://x.com/postrustorg", label: "Twitter / X", external: true },
-      { href: "/community", label: "Contributing" },
+      { href: "/community/", label: "Contributing" },
     ],
   };
 
@@ -45,7 +46,7 @@ export const Footer = component$(() => {
               <span class="text-xl font-bold text-white">Postrust</span>
             </Link>
             <p class="text-sm text-neutral-400 mb-6 max-w-xs">
-              High-performance PostgreSQL REST & GraphQL API server, written in Rust for serverless environments.
+              PostgreSQL as REST and GraphQL APIs, from one Rust binary — on a server, in a container or on AWS Lambda, and REST in Cloudflare Workers.
             </p>
             {/* Social Links */}
             <div class="flex items-center gap-3">
