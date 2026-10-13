@@ -53,3 +53,6 @@ supergraph.graphql
 crates/postrust-worker/wrangler.toml
 crates/postrust-worker/.dev.vars
 .wrangler/
+
+run_tests.sh
+tarpaulin*
