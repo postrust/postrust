@@ -121,15 +121,13 @@ export default component$(() => {
                 between.
               </p>
 
-              <a
-                href="mailto:founder@postrust.org?subject=Postrust%20enterprise%20support"
-                class="inline-flex items-center gap-2 px-6 py-3 text-base font-semibold text-white bg-neutral-900 hover:bg-neutral-800 rounded-lg transition-colors"
-              >
-                <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                  <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M3 8l7.89 5.26a2 2 0 002.22 0L21 8M5 19h14a2 2 0 002-2V7a2 2 0 00-2-2H5a2 2 0 00-2 2v10a2 2 0 002 2z"/>
-                </svg>
-                founder@postrust.org
-              </a>
+              {/* Raw HTML so the email_off markers reach the response:
+                  without them Cloudflare's Email Obfuscation rewrites the
+                  address into a /cdn-cgi/l/email-protection link that search
+                  engines then index. */}
+              <div
+                dangerouslySetInnerHTML={`<!--email_off--><a href="mailto:founder@postrust.org?subject=Postrust%20enterprise%20support" class="inline-flex items-center gap-2 px-6 py-3 text-base font-semibold text-white bg-neutral-900 hover:bg-neutral-800 rounded-lg transition-colors"><svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M3 8l7.89 5.26a2 2 0 002.22 0L21 8M5 19h14a2 2 0 002-2V7a2 2 0 00-2-2H5a2 2 0 00-2 2v10a2 2 0 002 2z"/></svg>founder@postrust.org</a><!--/email_off-->`}
+              />
 
               <p class="mt-6 text-sm text-neutral-500">
                 It helps to include your team size, what you are running today,
