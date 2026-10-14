@@ -3,6 +3,24 @@
 Notable changes, newest first. This file starts at 1.0.0-alpha.1; earlier
 releases are described by their tags and the pull requests behind them.
 
+## 2.3.2
+
+**Security: rustls 0.23.46 and quinn-proto 0.11.18.** A patch release that
+updates two locked dependencies past seven RustSec advisories published since
+2.3.1. Nothing in Postrust's own code changed.
+
+- rustls 0.23.45 to 0.23.46, which is in every crate's tree:
+  RUSTSEC-2026-0346 (`Debug` on client session values exposed TLS secrets),
+  RUSTSEC-2026-0347, RUSTSEC-2026-0348 and RUSTSEC-2026-0349.
+- quinn-proto 0.11.17 to 0.11.18, which is locked only through `reqwest` in
+  `postrust-proxy`'s health checker: RUSTSEC-2026-0338, RUSTSEC-2026-0340 and
+  RUSTSEC-2026-0343, each a remote peer able to panic the QUIC stack.
+
+The images and the release binaries are built against the new lockfile.
+Library users pick the fixes up with `cargo update -p rustls -p quinn-proto`
+on any 2.x. `postrust-worker` stays at 1.0.0 and `postrust-proxy` at 0.6.0:
+their published manifests already accept the fixed versions.
+
 ## 2.3.1
 
 **`postrust-worker` 1.0.0.** The Cloudflare Workers adapter released in 2.3.0

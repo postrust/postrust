@@ -9,7 +9,7 @@ import {
   hasuraAgreement,
 } from "~/data/hasura-conformance";
 
-const LATEST = "2.3.1";
+const LATEST = "2.3.2";
 const VERSION = "2.3.0";
 
 const minorAdded = [
@@ -96,13 +96,28 @@ export default component$(() => {
             <span class="rounded border border-neutral-200 bg-neutral-100 px-2 py-0.5 text-xs font-semibold text-neutral-800">
               PATCH
             </span>
-            <span class="text-sm text-neutral-500">postrust-worker 1.0.0</span>
+            <span class="text-sm text-neutral-500">security fixes</span>
           </div>
           <h1 class="mb-4 text-4xl font-bold text-neutral-900">
             Postrust {LATEST}
           </h1>
           <p class="mb-4 max-w-2xl text-lg text-neutral-600">
-            The{" "}
+            Updates rustls to 0.23.46 and quinn-proto to 0.11.18, which fix
+            seven RustSec advisories published since 2.3.1, among them a remote
+            peer able to panic quinn-proto and a{" "}
+            <code class="text-base">Debug</code> impl in rustls that printed TLS
+            secrets. Nothing in Postrust&rsquo;s own code changed; the images
+            and binaries are rebuilt against the new lockfile. The{" "}
+            <a
+              href="https://github.com/postrust/postrust/blob/main/CHANGELOG.md"
+              class="text-primary-600 hover:underline"
+            >
+              changelog
+            </a>{" "}
+            lists each advisory.
+          </p>
+          <p class="mb-4 max-w-2xl text-lg text-neutral-600">
+            2.3.1: the{" "}
             <Link
               href="/docs/workers/"
               class="text-primary-600 hover:underline"
@@ -114,7 +129,7 @@ export default component$(() => {
             covers what a deployment sees rather than a Rust API: the variables
             it reads, the bindings it looks for, its endpoints and defaults.
             Nothing else changed; the other crates and the images carry{" "}
-            {VERSION}&rsquo;s code as {LATEST}.
+            {VERSION}&rsquo;s code as 2.3.1.
           </p>
           <p class="max-w-2xl text-lg text-neutral-600">
             {VERSION}: the{" "}
@@ -667,7 +682,7 @@ GRANT web_anon, web_user TO authenticator;`}</code>
                 <span class="text-sm text-neutral-400">bash</span>
               </div>
               <pre class="overflow-x-auto p-4 text-sm">
-                <code class="text-neutral-100">{`docker pull postrust/postrust:${VERSION}`}</code>
+                <code class="text-neutral-100">{`docker pull postrust/postrust:${LATEST}`}</code>
               </pre>
             </div>
             <p class="mt-3 text-sm text-neutral-500">
