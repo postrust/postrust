@@ -83,7 +83,15 @@ export const PostLayout = component$<{ post: Post }>(({ post }) => (
               </svg>
             </div>
             <div class="text-sm leading-tight">
-              <p class="font-semibold text-neutral-900">{post.author}</p>
+              <p class="font-semibold text-neutral-900">
+                <a
+                  href={post.authorUrl}
+                  rel="author"
+                  class="hover:text-primary-700 transition-colors"
+                >
+                  {post.author}
+                </a>
+              </p>
               <p class="mt-1 text-neutral-500">
                 <time dateTime={post.date}>{formatDate(post.date)}</time>
                 <span class="mx-2" aria-hidden="true">
@@ -207,9 +215,9 @@ export const postHead = (post: Post): DocumentHead => {
           description: post.description,
           datePublished: post.date,
           author: {
-            "@type": "Organization",
-            name: "Postrust",
-            url: "https://postrust.org/",
+            "@type": "Person",
+            name: post.author,
+            url: post.authorUrl,
           },
           publisher: {
             "@type": "Organization",
