@@ -14,7 +14,7 @@ members = [
 ]
 
 [workspace.package]
-version = "2.3.1"
+version = "2.3.2"
 edition = "2021"
 # Verified, not assumed: 1.88.0 builds the workspace clean and 1.87.0 is
 # refused outright -- hickory-{net,proto,resolver} 0.26 and time 0.3.55 all
@@ -156,13 +156,13 @@ regex = "1"
 # wasm32) can leave it out; the ones that load a schema cache or decode rows ask
 # for `features = ["sqlx"]`. The crate's own default keeps sqlx on for anybody
 # depending on it from crates.io.
-postrust-core = { version = "2.3.1", path = "crates/postrust-core", default-features = false }
-postrust-sql = { version = "2.3.1", path = "crates/postrust-sql" }
-postrust-auth = { version = "2.3.1", path = "crates/postrust-auth" }
-postrust-response = { version = "2.3.1", path = "crates/postrust-response" }
-postrust-engine = { version = "2.3.1", path = "crates/postrust-engine" }
-postrust-graphql = { version = "2.3.1", path = "crates/postrust-graphql" }
-postrust-server = { version = "2.3.1", path = "crates/postrust-server" }
+postrust-core = { version = "2.3.2", path = "crates/postrust-core", default-features = false }
+postrust-sql = { version = "2.3.2", path = "crates/postrust-sql" }
+postrust-auth = { version = "2.3.2", path = "crates/postrust-auth" }
+postrust-response = { version = "2.3.2", path = "crates/postrust-response" }
+postrust-engine = { version = "2.3.2", path = "crates/postrust-engine" }
+postrust-graphql = { version = "2.3.2", path = "crates/postrust-graphql" }
+postrust-server = { version = "2.3.2", path = "crates/postrust-server" }
 
 [profile.release]
 lto = true
