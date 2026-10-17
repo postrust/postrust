@@ -10,6 +10,10 @@ export default extendConfig(baseConfig, () => {
         input: ["src/entry.cloudflare-pages.tsx", "@qwik-city-plan"],
       },
     },
-    plugins: [cloudflarePagesAdapter()],
+    plugins: [
+      // The adapter writes a sitemap of the pages it pre-renders, which is
+      // none, and that empty file would overwrite public/sitemap.xml.
+      cloudflarePagesAdapter({ ssg: { sitemapOutFile: null } }),
+    ],
   };
 });
