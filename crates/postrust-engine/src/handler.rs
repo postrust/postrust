@@ -1169,20 +1169,20 @@ async fn execute_plan<'s, S: State>(
             }
 
             // The main query. A logged failure names the driver's account of
-            // it, which says more than the response is allowed to.
-            //
-            // Not a queued statement's, which is reported along with the
-            // query but is not its failure: a pre-request function raising to
-            // refuse a request is doing its job, and a log line at error level
-            // for every refusal would bury the failures that are faults. The
-            // statements were run on their own before they were queued, and
-            // their failures went unlogged then too.
+            // it, which says more than the response is allowed to. Only faults
+            // are logged at error level; see `query_error_log`.
             let log = |e: postrust_core::db::DbError| {
-                match e.was_queued() && !e.is_connection() {
-                    true => debug!("Refused before the query: {}", e),
-                    false => error!("Query error: {}", e),
+                let refused_before = e.was_queued() && !e.is_connection();
+                let text = e.to_string();
+                let error = postrust_core::Error::from(e);
+                match query_error_log(&error, refused_before) {
+                    QueryErrorLog::RefusedBefore => debug!("Refused before the query: {}", text),
+                    QueryErrorLog::Refused(status) => {
+                        debug!("Query refused with {}: {}", status.as_u16(), text)
+                    }
+                    QueryErrorLog::Fault => error!("Query error: {}", text),
                 }
-                postrust_core::Error::from(e)
+                error
             };
 
             // A rendered media type is a single value, not a row set: the
@@ -1647,6 +1647,37 @@ async fn execute_plan<'s, S: State>(
                 None,
             ))
         }
+    }
+}
+
+/// How a failed query is logged.
+#[derive(Debug, PartialEq, Eq)]
+enum QueryErrorLog {
+    /// A queued statement refused the request: a pre-request function raising
+    /// to say no. Debug.
+    RefusedBefore,
+    /// The response reports it as the client's (a 4xx): a function raising
+    /// `PT404`, a check constraint, a duplicate key, a missing grant. That is
+    /// the API answering, not the server failing. Debug.
+    Refused(http::StatusCode),
+    /// Anything the response reports as the server's, and every connection
+    /// failure. Error.
+    Fault,
+}
+
+/// Which of [`QueryErrorLog`] a failed query is.
+///
+/// A log line at error level for every refusal buries the failures that are
+/// faults: a schema that answers "not found" by raising `PT404` produced one
+/// for each such request, with nothing to tell it from a broken query.
+fn query_error_log(error: &postrust_core::Error, refused_before: bool) -> QueryErrorLog {
+    let status = error.status_code();
+    if refused_before {
+        QueryErrorLog::RefusedBefore
+    } else if status.is_client_error() {
+        QueryErrorLog::Refused(status)
+    } else {
+        QueryErrorLog::Fault
     }
 }
 
@@ -3768,6 +3799,67 @@ fn sanitize_error_message(error: &postrust_core::Error) -> String {
 
 #[cfg(test)]
 mod tests {
+    use super::{query_error_log, QueryErrorLog};
+
+    fn database(code: &str) -> postrust_core::Error {
+        postrust_core::Error::from(postrust_core::db::DbError::database(
+            "driver message",
+            postrust_core::error::DatabaseError {
+                code: code.into(),
+                message: "message".into(),
+                details: None,
+                hint: None,
+                constraint: None,
+                table: None,
+                column: None,
+            },
+        ))
+    }
+
+    #[test]
+    fn client_errors_from_the_query_are_refusals_not_faults() {
+        use http::StatusCode;
+        // A function answering "not found", a check constraint, a duplicate key.
+        assert_eq!(
+            query_error_log(&database("PT404"), false),
+            QueryErrorLog::Refused(StatusCode::NOT_FOUND)
+        );
+        assert_eq!(
+            query_error_log(&database("23514"), false),
+            QueryErrorLog::Refused(StatusCode::BAD_REQUEST)
+        );
+        assert_eq!(
+            query_error_log(&database("23505"), false),
+            QueryErrorLog::Refused(StatusCode::CONFLICT)
+        );
+    }
+
+    #[test]
+    fn server_errors_and_broken_connections_are_faults() {
+        assert_eq!(
+            query_error_log(&database("XX000"), false),
+            QueryErrorLog::Fault
+        );
+        assert_eq!(
+            query_error_log(&database("PT500"), false),
+            QueryErrorLog::Fault
+        );
+        let broken = postrust_core::Error::from(postrust_core::db::DbError::connection("closed"));
+        assert_eq!(query_error_log(&broken, false), QueryErrorLog::Fault);
+    }
+
+    #[test]
+    fn a_queued_refusal_stays_a_refusal_whatever_its_status() {
+        assert_eq!(
+            query_error_log(&database("XX000"), true),
+            QueryErrorLog::RefusedBefore
+        );
+        assert_eq!(
+            query_error_log(&database("PT403"), true),
+            QueryErrorLog::RefusedBefore
+        );
+    }
+
     /// A data-modifying `WITH` may only appear at the top level, so anything
     /// that wraps the statement has to leave the clause where it is.
     #[test]
