@@ -4,7 +4,7 @@ use super::relationship::{
     Cardinality, MediaHandler, MediaHandlerMap, Relationship, RelationshipsMap,
 };
 use super::routine::{FuncVolatility, RetType, Routine, RoutineMap, RoutineParam};
-use super::table::{Column, ColumnMap, Table, TablesMap};
+use super::table::{Column, ColumnMap, Table, TablesMap, WriteThrough};
 use crate::api_request::QualifiedIdentifier;
 use crate::db::Tx;
 use crate::error::{Error, Result};
@@ -245,6 +245,24 @@ pub async fn load_tables<T: Tx>(tx: &mut T, schemas: &[String]) -> Result<Tables
                 OR EXISTS (SELECT 1 FROM pg_trigger tg
                             WHERE tg.tgrelid = t.oid AND (tg.tgtype::int & 73) = 73)
             ) as deletable,
+            -- The same view halves without the grants, for refusing a write
+            -- the view itself cannot take (`Table::write_through`). A
+            -- materialized view takes none.
+            CASE WHEN t.relkind = 'v' THEN
+                (pg_relation_is_updatable(t.oid, false) & 8) = 8
+                OR EXISTS (SELECT 1 FROM pg_trigger tg
+                            WHERE tg.tgrelid = t.oid AND (tg.tgtype::int & 69) = 69)
+            WHEN t.relkind = 'm' THEN false END as view_insert,
+            CASE WHEN t.relkind = 'v' THEN
+                (pg_relation_is_updatable(t.oid, false) & 20) = 20
+                OR EXISTS (SELECT 1 FROM pg_trigger tg
+                            WHERE tg.tgrelid = t.oid AND (tg.tgtype::int & 81) = 81)
+            WHEN t.relkind = 'm' THEN false END as view_update,
+            CASE WHEN t.relkind = 'v' THEN
+                (pg_relation_is_updatable(t.oid, false) & 20) = 20
+                OR EXISTS (SELECT 1 FROM pg_trigger tg
+                            WHERE tg.tgrelid = t.oid AND (tg.tgtype::int & 73) = 73)
+            WHEN t.relkind = 'm' THEN false END as view_delete,
             t.relkind = 'p' as is_partitioned
         FROM (
             -- A foreign table is a table: it has columns, it can be selected
@@ -307,6 +325,18 @@ pub async fn load_tables<T: Tx>(tx: &mut T, schemas: &[String]) -> Result<Tables
             insertable: row.get("insertable")?,
             updatable: row.get("updatable")?,
             deletable: row.get("deletable")?,
+            write_through: match (
+                row.get::<Option<bool>>("view_insert")?,
+                row.get::<Option<bool>>("view_update")?,
+                row.get::<Option<bool>>("view_delete")?,
+            ) {
+                (Some(insert), Some(update), Some(delete)) => Some(WriteThrough {
+                    insert,
+                    update,
+                    delete,
+                }),
+                _ => None,
+            },
             pk_cols: pk_cols.clone(),
             unique_constraints: Vec::new(),
             columns: load_columns(tx, &schema, &name, &pk_cols).await?,

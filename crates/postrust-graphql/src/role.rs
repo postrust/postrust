@@ -845,6 +845,7 @@ mod tests {
             insertable: true,
             updatable: true,
             deletable: true,
+            write_through: None,
             pk_cols: vec!["id".to_string()],
             unique_constraints: Vec::new(),
             columns: columns

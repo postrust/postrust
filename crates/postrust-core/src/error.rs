@@ -63,6 +63,24 @@ pub enum Error {
     #[error("Unsupported HTTP method: {0}")]
     UnsupportedMethod(String),
 
+    /// A write to a view that PostgreSQL cannot write through and that has no
+    /// `INSTEAD OF` trigger for it.
+    ///
+    /// Refused before the statement is built: the database would refuse it
+    /// for every role, and its error ("cannot update view") is about the
+    /// view's definition rather than the request, so it surfaced as a 500.
+    /// `allow` is what the view does take, for the `Allow` header a 405 must
+    /// carry -- the same answer an `OPTIONS` gives.
+    #[error("Cannot use the {method} method on the view '{view}'")]
+    ViewNotWritable {
+        /// The view, qualified.
+        view: String,
+        /// The method that was refused.
+        method: String,
+        /// The methods the view answers.
+        allow: String,
+    },
+
     /// A method a function cannot be called with.
     ///
     /// A function is invoked with GET, HEAD or POST. The others are refused
@@ -413,9 +431,10 @@ impl Error {
             Self::ColumnNotFound(_) | Self::RelationshipNotFound { .. } => StatusCode::BAD_REQUEST,
 
             // 405 Method Not Allowed
-            Self::UnsupportedMethod(_) | Self::InvalidRpcMethod(_) | Self::InvalidPutFilters => {
-                StatusCode::METHOD_NOT_ALLOWED
-            }
+            Self::UnsupportedMethod(_)
+            | Self::ViewNotWritable { .. }
+            | Self::InvalidRpcMethod(_)
+            | Self::InvalidPutFilters => StatusCode::METHOD_NOT_ALLOWED,
 
             // 406 Not Acceptable
             Self::UnacceptableSchema { .. }
@@ -458,7 +477,8 @@ impl Error {
             // that did not parse, which is what PGRST100 covers.
             Self::InvalidHeader(_) => "PGRST100",
             Self::InvalidBody(_) => "PGRST102",
-            Self::UnsupportedMethod(_) => "PGRST117",
+            // PostgREST's code for a verb the resource does not support.
+            Self::UnsupportedMethod(_) | Self::ViewNotWritable { .. } => "PGRST117",
             Self::InvalidRpcMethod(_) => "PGRST101",
             Self::UnacceptableSchema { .. } => "PGRST106",
             Self::UnknownColumn { .. } => "PGRST204",
@@ -613,6 +633,11 @@ impl Error {
     /// Get a hint for resolving the error.
     pub fn hint(&self) -> Option<String> {
         match self {
+            Self::ViewNotWritable { .. } => Some(
+                "A view takes writes only where PostgreSQL can write through it automatically, or \
+                 where an INSTEAD OF trigger handles them"
+                    .to_string(),
+            ),
             Self::NotAnEmbeddedResource(name) => Some(format!(
                 "Verify that '{}' is included in the 'select' query parameter.",
                 name

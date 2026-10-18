@@ -1682,34 +1682,10 @@ pub async fn allow<S: State>(
     }
 }
 
-/// The methods a relation answers, for the `Allow` of an OPTIONS.
-///
-/// Reading is always offered. Writing follows what the relation can actually
-/// do, which for a view is what its triggers give it: a view with only an
-/// INSERT trigger takes a POST and nothing else.
-///
-/// PUT is the exception that is not simply a permission. It replaces one row
-/// named by its primary key, so a relation without a primary key cannot
-/// answer it however writable it otherwise is -- which is why an auto-updatable
-/// view without a key offers POST, PATCH and DELETE but not PUT.
-///
+/// The methods a relation answers, for the `Allow` of an OPTIONS -- and of
+/// the 405 a write the relation cannot take is refused with (`Table::allow`).
 fn relation_allow(table: &postrust_core::schema_cache::Table) -> String {
-    let mut methods = vec!["OPTIONS", "GET", "HEAD"];
-
-    if table.insertable {
-        methods.push("POST");
-    }
-    if table.insertable && table.updatable && !table.pk_cols.is_empty() {
-        methods.push("PUT");
-    }
-    if table.updatable {
-        methods.push("PATCH");
-    }
-    if table.deletable {
-        methods.push("DELETE");
-    }
-
-    methods.join(",")
+    table.allow()
 }
 
 /// The methods a function answers, for the `Allow` of an OPTIONS.
@@ -3643,6 +3619,11 @@ pub fn error_response(error: postrust_core::Error, verbatim_db_errors: bool) -> 
     // not accepted, the challenge says which -- `invalid_token` with the
     // reason, so a client can tell "your key is wrong" from "your clock is"
     // without parsing the body.
+    // A 405 must say what the resource does take (RFC 9110, section 15.5.6).
+    if let postrust_core::Error::ViewNotWritable { allow, .. } = &error {
+        builder = builder.header("allow", allow.as_str());
+    }
+
     if status == StatusCode::UNAUTHORIZED {
         let challenge = match &error {
             postrust_core::Error::InvalidJwt(_)
@@ -3724,6 +3705,7 @@ fn sanitize_error_message(error: &postrust_core::Error) -> String {
         | Error::InvalidRange(_)
         | Error::InvalidBody(_)
         | Error::UnsupportedMethod(_)
+        | Error::ViewNotWritable { .. }
         | Error::InvalidRpcMethod(_)
         | Error::InvalidPutFilters
         | Error::PutLimitNotAllowed

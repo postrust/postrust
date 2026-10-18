@@ -60,6 +60,32 @@ pub enum MutatePlan {
     },
 }
 
+/// Refuse a write the view itself cannot take, whoever is asking.
+///
+/// Only the view's definition decides this (`Table::write_through`). Grants
+/// do not: a missing one is the database's to report, and may be held per
+/// column, which the relation-level answer cannot see.
+fn refuse_view_write(table: &Table, mutation: &Mutation) -> Result<()> {
+    let Some(w) = table.write_through else {
+        return Ok(());
+    };
+    let (takes, method) = match mutation {
+        Mutation::Create => (w.insert, "POST"),
+        Mutation::Update => (w.update, "PATCH"),
+        Mutation::Delete => (w.delete, "DELETE"),
+        // An upsert inserts the row or updates it, so it needs both.
+        Mutation::SingleUpsert => (w.insert && w.update, "PUT"),
+    };
+    if takes {
+        return Ok(());
+    }
+    Err(Error::ViewNotWritable {
+        view: format!("{}.{}", table.schema, table.name),
+        method: method.to_string(),
+        allow: table.allow(),
+    })
+}
+
 impl MutatePlan {
     /// Create a mutation plan from an API request.
     pub fn from_request(
@@ -69,6 +95,7 @@ impl MutatePlan {
         schema_cache: &crate::schema_cache::SchemaCache,
     ) -> Result<Self> {
         let qi = table.qualified_identifier();
+        refuse_view_write(table, mutation)?;
 
         match mutation {
             Mutation::Create => Self::create_insert(request, table, qi, schema_cache),
@@ -455,6 +482,115 @@ fn build_mutation_where(request: &ApiRequest, table: &Table) -> Result<Vec<Coerc
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::schema_cache::WriteThrough;
+
+    fn relation(write_through: Option<WriteThrough>, granted: bool) -> Table {
+        Table {
+            schema: "api".into(),
+            name: "things".into(),
+            description: None,
+            is_view: write_through.is_some(),
+            is_partitioned: false,
+            insertable: granted && write_through.is_none_or(|w| w.insert),
+            updatable: granted && write_through.is_none_or(|w| w.update),
+            deletable: granted && write_through.is_none_or(|w| w.delete),
+            write_through,
+            pk_cols: vec!["id".into()],
+            unique_constraints: Vec::new(),
+            columns: Default::default(),
+            computed_columns: Default::default(),
+        }
+    }
+
+    const ALL: [Mutation; 4] = [
+        Mutation::Create,
+        Mutation::Update,
+        Mutation::Delete,
+        Mutation::SingleUpsert,
+    ];
+
+    #[test]
+    fn a_view_postgres_cannot_write_through_refuses_every_write() {
+        let view = relation(
+            Some(WriteThrough {
+                insert: false,
+                update: false,
+                delete: false,
+            }),
+            true,
+        );
+        for (mutation, method) in ALL.iter().zip(["POST", "PATCH", "DELETE", "PUT"]) {
+            match refuse_view_write(&view, mutation) {
+                Err(Error::ViewNotWritable {
+                    view,
+                    method: refused,
+                    allow,
+                }) => {
+                    assert_eq!(view, "api.things");
+                    assert_eq!(refused, method);
+                    assert_eq!(allow, "OPTIONS,GET,HEAD");
+                }
+                other => panic!("{method}: expected ViewNotWritable, got {other:?}"),
+            }
+        }
+        let error = refuse_view_write(&view, &Mutation::Update).unwrap_err();
+        assert_eq!(error.status_code(), http::StatusCode::METHOD_NOT_ALLOWED);
+        assert_eq!(error.code(), "PGRST117");
+    }
+
+    #[test]
+    fn a_view_with_one_instead_of_trigger_takes_only_that_write() {
+        let view = relation(
+            Some(WriteThrough {
+                insert: true,
+                update: false,
+                delete: false,
+            }),
+            true,
+        );
+        assert!(refuse_view_write(&view, &Mutation::Create).is_ok());
+        assert!(refuse_view_write(&view, &Mutation::Update).is_err());
+        assert!(refuse_view_write(&view, &Mutation::Delete).is_err());
+        // An upsert may update, so an insert trigger alone is not enough.
+        match refuse_view_write(&view, &Mutation::SingleUpsert) {
+            Err(Error::ViewNotWritable { allow, .. }) => assert_eq!(allow, "OPTIONS,GET,HEAD,POST"),
+            other => panic!("expected ViewNotWritable, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn an_auto_updatable_view_and_a_table_are_left_to_the_database() {
+        let auto = relation(
+            Some(WriteThrough {
+                insert: true,
+                update: true,
+                delete: true,
+            }),
+            true,
+        );
+        let table = relation(None, true);
+        // No grants at relation level (a column grant, or none): still the
+        // database's to answer, with its own permission error.
+        let ungranted_table = relation(None, false);
+        let ungranted_view = relation(
+            Some(WriteThrough {
+                insert: true,
+                update: true,
+                delete: true,
+            }),
+            false,
+        );
+        for t in [&auto, &table, &ungranted_table, &ungranted_view] {
+            for mutation in &ALL {
+                assert!(
+                    refuse_view_write(t, mutation).is_ok(),
+                    "{}.{} {mutation:?}",
+                    t.schema,
+                    t.name
+                );
+            }
+        }
+    }
 
     #[test]
     fn test_mutate_plan_target() {

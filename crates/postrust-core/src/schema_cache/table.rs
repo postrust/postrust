@@ -28,6 +28,18 @@ pub struct Table {
     pub updatable: bool,
     /// Whether DELETE is allowed
     pub deletable: bool,
+    /// What a view's own definition lets PostgreSQL write through, whatever
+    /// anyone has been granted. `None` for a table, which takes any write its
+    /// grants allow.
+    ///
+    /// `insertable`, `updatable` and `deletable` fold this together with the
+    /// grants, which is right for `Allow` but not for refusing a request: a
+    /// missing grant is the database's to report (and may be held per column,
+    /// which a relation's grants do not show), while a view PostgreSQL cannot
+    /// write through will refuse every write, from anyone, with an error that
+    /// says nothing about the request.
+    #[serde(default)]
+    pub write_through: Option<WriteThrough>,
     /// Primary key column names
     pub pk_cols: Vec<String>,
     /// Unique constraints, as `(name, columns)`, the primary key among them.
@@ -48,6 +60,18 @@ pub struct Table {
     /// both work on a table that has no such column.
     #[serde(default)]
     pub computed_columns: HashMap<String, ComputedColumn>,
+}
+
+/// The writes a view can take: automatically, where PostgreSQL can write
+/// through its definition, or by an `INSTEAD OF` trigger for that operation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WriteThrough {
+    /// `INSERT`
+    pub insert: bool,
+    /// `UPDATE`
+    pub update: bool,
+    /// `DELETE`
+    pub delete: bool,
 }
 
 impl Column {
@@ -88,6 +112,34 @@ impl Table {
     /// Check if this is a read-only view.
     pub fn is_readonly(&self) -> bool {
         !self.insertable && !self.updatable && !self.deletable
+    }
+
+    /// The methods this relation answers, as an `Allow` header lists them.
+    ///
+    /// Reading is always offered. Writing follows what the relation can
+    /// actually do, which for a view is what its triggers give it: a view with
+    /// only an INSERT trigger takes a POST and nothing else.
+    ///
+    /// PUT is the exception that is not simply a permission. It replaces one
+    /// row named by its primary key, so a relation without a primary key
+    /// cannot answer it however writable it otherwise is -- which is why an
+    /// auto-updatable view without a key offers POST, PATCH and DELETE but not
+    /// PUT.
+    pub fn allow(&self) -> String {
+        let mut methods = vec!["OPTIONS", "GET", "HEAD"];
+        if self.insertable {
+            methods.push("POST");
+        }
+        if self.insertable && self.updatable && !self.pk_cols.is_empty() {
+            methods.push("PUT");
+        }
+        if self.updatable {
+            methods.push("PATCH");
+        }
+        if self.deletable {
+            methods.push("DELETE");
+        }
+        methods.join(",")
     }
 }
 
@@ -221,6 +273,7 @@ mod tests {
             insertable: true,
             updatable: true,
             deletable: true,
+            write_through: None,
             pk_cols: vec!["id".into()],
             unique_constraints: Vec::new(),
             columns: IndexMap::new(),
@@ -231,6 +284,54 @@ mod tests {
         let qi = table.qualified_identifier();
         assert_eq!(qi.schema, "public");
         assert_eq!(qi.name, "users");
+    }
+
+    fn writable(insertable: bool, updatable: bool, deletable: bool, pk: bool) -> Table {
+        Table {
+            schema: "api".into(),
+            name: "t".into(),
+            description: None,
+            is_view: true,
+            insertable,
+            updatable,
+            deletable,
+            write_through: None,
+            pk_cols: if pk { vec!["id".into()] } else { Vec::new() },
+            unique_constraints: Vec::new(),
+            columns: IndexMap::new(),
+            computed_columns: Default::default(),
+            is_partitioned: false,
+        }
+    }
+
+    #[test]
+    fn allow_lists_what_the_relation_takes() {
+        assert_eq!(
+            writable(false, false, false, true).allow(),
+            "OPTIONS,GET,HEAD"
+        );
+        assert_eq!(
+            writable(true, false, false, true).allow(),
+            "OPTIONS,GET,HEAD,POST"
+        );
+        assert_eq!(
+            writable(true, true, true, true).allow(),
+            "OPTIONS,GET,HEAD,POST,PUT,PATCH,DELETE"
+        );
+        // PUT names a row by its key, so a keyless relation cannot take it.
+        assert_eq!(
+            writable(true, true, true, false).allow(),
+            "OPTIONS,GET,HEAD,POST,PATCH,DELETE"
+        );
+    }
+
+    #[test]
+    fn a_cached_table_without_write_through_reads_as_a_table() {
+        // Schema caches serialised before the field existed.
+        let mut value = serde_json::to_value(writable(true, true, true, true)).unwrap();
+        value.as_object_mut().unwrap().remove("write_through");
+        let table: Table = serde_json::from_value(value).unwrap();
+        assert_eq!(table.write_through, None);
     }
 
     #[test]
