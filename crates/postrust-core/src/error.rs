@@ -884,6 +884,10 @@ impl DatabaseError {
             return StatusCode::INTERNAL_SERVER_ERROR;
         }
 
+        if self.is_unwritable_view() {
+            return StatusCode::METHOD_NOT_ALLOWED;
+        }
+
         match code {
             "23503" | "23505" => StatusCode::CONFLICT,
             // A write attempted inside the read-only transaction a read
@@ -939,8 +943,36 @@ impl DatabaseError {
         }
     }
 
+    /// Whether this is PostgreSQL refusing a write to a view it cannot write
+    /// through: one that is not automatically updatable and has no `INSTEAD
+    /// OF` trigger or rule for the operation, or a materialized view.
+    ///
+    /// That is a method the resource does not take, whoever asks -- a 405,
+    /// not the 500 its SQLSTATE (`55000`, object not in prerequisite state)
+    /// would otherwise be. Read from the message, as `xmlagg` and the missing
+    /// role are, because the SQLSTATE alone covers unrelated faults too; a
+    /// server whose `lc_messages` is not English keeps the 500.
+    pub fn is_unwritable_view(&self) -> bool {
+        let message = self.message.as_str();
+        match self.code.as_str() {
+            "55000" => [
+                "cannot insert into view ",
+                "cannot update view ",
+                "cannot delete from view ",
+            ]
+            .iter()
+            .any(|prefix| message.starts_with(prefix)),
+            "42809" => message.starts_with("cannot change materialized view "),
+            _ => false,
+        }
+    }
+
     /// Get error code for API response.
     pub fn code(&self) -> &'static str {
+        if self.is_unwritable_view() {
+            // PostgREST's code for a verb the resource does not support.
+            return "PGRST117";
+        }
         match self.code.as_str() {
             c if c.starts_with("23") => "PGRST503", // Constraint violation
             c if c.starts_with("42") => "PGRST504", // SQL error
@@ -953,6 +985,43 @@ impl DatabaseError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn database(code: &str, message: &str) -> DatabaseError {
+        DatabaseError {
+            code: code.into(),
+            message: message.into(),
+            details: None,
+            hint: None,
+            constraint: None,
+            table: None,
+            column: None,
+        }
+    }
+
+    /// A view PostgreSQL cannot write through refuses the method for every
+    /// role, which is a 405; it was answered as the 500 its SQLSTATE says.
+    #[test]
+    fn a_write_a_view_cannot_take_is_a_405() {
+        for (code, message) in [
+            ("55000", "cannot insert into view \"j\""),
+            ("55000", "cannot update view \"j\""),
+            ("55000", "cannot delete from view \"j\""),
+            ("42809", "cannot change materialized view \"m\""),
+        ] {
+            let error = Error::Database(database(code, message));
+            assert_eq!(
+                error.status_code(),
+                StatusCode::METHOD_NOT_ALLOWED,
+                "{message}"
+            );
+            assert_eq!(error.code(), "PGRST117", "{message}");
+        }
+        // The same SQLSTATEs about anything else keep their status.
+        let other = Error::Database(database("55000", "lock is not available"));
+        assert_eq!(other.status_code(), StatusCode::INTERNAL_SERVER_ERROR);
+        let other = Error::Database(database("42809", "\"f\" is not a procedure"));
+        assert_eq!(other.status_code(), StatusCode::BAD_REQUEST);
+    }
 
     #[test]
     fn test_error_status_codes() {

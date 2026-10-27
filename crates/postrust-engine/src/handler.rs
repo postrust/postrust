@@ -55,9 +55,41 @@ where
 
     let verbatim_db_errors = state.config().compat_mode;
 
+    // What a 405 needs to say what the resource does take: the address and
+    // the schema it was asked in, which are all `allow` reads. Kept before the
+    // request is consumed; both are cheap to clone.
+    let uri = request.uri().clone();
+    let profiles: Vec<_> = ["accept-profile", "content-profile"]
+        .into_iter()
+        .filter_map(|name| Some((name, request.headers().get(name)?.clone())))
+        .collect();
+
     match process_request(state, request).await {
         Ok(response) => response,
-        Err(e) => error_response(e, verbatim_db_errors),
+        Err(e) => {
+            let mut response = error_response(e, verbatim_db_errors);
+            // A 405 must carry `Allow` (RFC 9110, section 15.5.6), and it is
+            // the answer an OPTIONS on the same resource gives -- whichever
+            // refusal it was: a function called with the wrong method, a PUT
+            // with filters it cannot take, a view that cannot be written.
+            if response.status() == StatusCode::METHOD_NOT_ALLOWED {
+                let mut probe = http::Request::builder()
+                    .method(http::Method::OPTIONS)
+                    .uri(uri);
+                for (name, value) in profiles {
+                    probe = probe.header(name, value);
+                }
+                if let Ok(probe) = probe.body(Bytes::new()) {
+                    if let Ok(Ok(allow)) = allow(state, probe)
+                        .await
+                        .map(|a| http::HeaderValue::from_str(&a))
+                    {
+                        response.headers_mut().insert(http::header::ALLOW, allow);
+                    }
+                }
+            }
+            response
+        }
     }
 }
 
@@ -1697,9 +1729,10 @@ fn query_error_log(e: &postrust_core::db::DbError) -> QueryErrorLog {
         // zero, which is a function's arithmetic rather than its input.
         "22012" => false,
         _ if code.starts_with("22") => status == http::StatusCode::BAD_REQUEST,
-        // A write in the read-only transaction a GET runs in: the method
-        // was the client's choice.
+        // A write in the read-only transaction a GET runs in, or one the
+        // view cannot take: the method was the client's choice.
         "25006" => true,
+        _ if database.is_unwritable_view() => true,
         _ => false,
     };
     match refusal && status.is_client_error() {
@@ -1733,41 +1766,11 @@ pub async fn allow<S: State>(
 
     let schema_cache = state.schema_cache().await;
     match &api_request.action {
-        Action::RelationInfo(qi) => Ok(relation_allow(schema_cache.require_table(qi)?)),
+        Action::RelationInfo(qi) => Ok(schema_cache.require_table(qi)?.allow()),
         Action::RoutineInfo { qi, .. } => Ok(routine_allow(schema_cache.get_routines(qi))),
         // The schema description, which is read and nothing else.
         _ => Ok("OPTIONS,GET,HEAD".to_string()),
     }
-}
-
-/// The methods a relation answers, for the `Allow` of an OPTIONS.
-///
-/// Reading is always offered. Writing follows what the relation can actually
-/// do, which for a view is what its triggers give it: a view with only an
-/// INSERT trigger takes a POST and nothing else.
-///
-/// PUT is the exception that is not simply a permission. It replaces one row
-/// named by its primary key, so a relation without a primary key cannot
-/// answer it however writable it otherwise is -- which is why an auto-updatable
-/// view without a key offers POST, PATCH and DELETE but not PUT.
-///
-fn relation_allow(table: &postrust_core::schema_cache::Table) -> String {
-    let mut methods = vec!["OPTIONS", "GET", "HEAD"];
-
-    if table.insertable {
-        methods.push("POST");
-    }
-    if table.insertable && table.updatable && !table.pk_cols.is_empty() {
-        methods.push("PUT");
-    }
-    if table.updatable {
-        methods.push("PATCH");
-    }
-    if table.deletable {
-        methods.push("DELETE");
-    }
-
-    methods.join(",")
 }
 
 /// The methods a function answers, for the `Allow` of an OPTIONS.
@@ -3755,6 +3758,9 @@ fn sanitize_error_message(error: &postrust_core::Error) -> String {
         Error::UnacceptableSchema { requested, .. } => {
             return format!("Invalid schema: {}", requested)
         }
+        // Names only the view the client addressed and the operation it asked
+        // for, which is what it has to change.
+        Error::Database(db) if db.is_unwritable_view() => return db.message.clone(),
         // The candidate list is the whole point of the message: it names the
         // signatures that could not be told apart.
         Error::AmbiguousFunction { .. } | Error::AmbiguousRelationship { .. } => {
@@ -3830,11 +3836,15 @@ mod tests {
     use http::StatusCode;
 
     fn database(code: &str) -> postrust_core::db::DbError {
+        reported(code, "message")
+    }
+
+    fn reported(code: &str, message: &str) -> postrust_core::db::DbError {
         postrust_core::db::DbError::database(
             "driver message",
             postrust_core::error::DatabaseError {
                 code: code.into(),
-                message: "message".into(),
+                message: message.into(),
                 details: None,
                 hint: None,
                 constraint: None,
@@ -3861,6 +3871,19 @@ mod tests {
                 "{code}"
             );
         }
+    }
+
+    #[test]
+    fn a_write_the_view_cannot_take_is_a_refusal() {
+        assert_eq!(
+            query_error_log(&reported("55000", "cannot update view \"j\"")),
+            QueryErrorLog::Refused(StatusCode::METHOD_NOT_ALLOWED)
+        );
+        // The same SQLSTATE about anything else is the server's.
+        assert_eq!(
+            query_error_log(&reported("55000", "lock is not available")),
+            QueryErrorLog::Fault
+        );
     }
 
     #[test]
