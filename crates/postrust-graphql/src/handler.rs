@@ -387,6 +387,35 @@ impl GraphQLState {
         }
     }
 
+    /// Serve subscriptions on this state from `previous`'s broker, listening
+    /// on whatever channels this schema adds.
+    ///
+    /// For a schema rebuilt under a running server. The broker carries over
+    /// rather than being replaced, so a subscription opened on the previous
+    /// schema keeps receiving notifications. With no broker yet -- start-up
+    /// could not connect one, or there was no previous state -- one is
+    /// started as `init_subscriptions` would.
+    pub async fn continue_subscriptions(
+        &mut self,
+        previous: Option<&GraphQLState>,
+    ) -> Result<(), crate::subscription::BrokerError> {
+        if let Some(previous) = previous {
+            self.broker = Arc::clone(&previous.broker);
+        }
+        if !self.config.enable_subscriptions {
+            return Ok(());
+        }
+        if let Some(broker) = self.broker.read().await.as_ref() {
+            let channels = self
+                .subscription_fields
+                .iter()
+                .map(|f| f.channel_name())
+                .collect();
+            return broker.listen(channels).await;
+        }
+        self.init_subscriptions().await
+    }
+
     /// Get the notification broker.
     pub async fn get_broker(&self) -> Option<Arc<RwLock<Option<NotifyBroker>>>> {
         Some(Arc::clone(&self.broker))

@@ -133,11 +133,15 @@ pub async fn build(config: postrust_core::AppConfig, host: Host) -> Result<App> 
     // schema changed, instead of on a restart. A migration ends with
     // `NOTIFY pgrst, 'reload schema'` and the API picks the new shape up.
     //
-    // This refreshes the REST schema cache. The GraphQL schema is built once
-    // from a snapshot taken at start-up and is not rebuilt here.
+    // The REST cache is swapped here; each reload then bumps `reloaded`, and
+    // the GraphQL schema, built from its own snapshot of the cache, is
+    // rebuilt from the new one when it sees the bump.
+    let (reloaded, schema_reloads) = tokio::sync::watch::channel(0u64);
     if config.db_channel_enabled && host.background_tasks {
-        spawn_schema_reloader(state.clone(), config.db_channel.clone());
+        spawn_schema_reloader(state.clone(), config.db_channel.clone(), reloaded);
     }
+    #[cfg(not(feature = "graphql"))]
+    drop(schema_reloads);
 
     // Build REST API router (under /api prefix)
     let api_router: Router<Arc<AppState>> = Router::new()
@@ -231,56 +235,14 @@ pub async fn build(config: postrust_core::AppConfig, host: Host) -> Result<App> 
         };
 
         // An enum table's members are rows, not schema, so they are read here
-        // rather than reflected. Once, at startup: the values of a set of
-        // allowed values are not expected to change under a running server,
-        // and a GraphQL enum is part of the schema a client generated against.
-        let mut graphql_enum_values: std::collections::HashMap<
-            String,
-            Vec<(String, Option<String>)>,
-        > = std::collections::HashMap::new();
-        {
-            let cache = state.schema_cache.read().await;
-            for (schema, table) in graphql_names.enum_tables() {
-                let qi = postrust_core::api_request::QualifiedIdentifier::new(&schema, &table);
-                let Some(definition) = cache.get_table(&qi) else {
-                    tracing::warn!(
-                        "{}.{} is marked as an enumeration but was not found",
-                        schema,
-                        table
-                    );
-                    continue;
-                };
-                // One column identifies a member. A composite key names no
-                // single value, so there is nothing to call the member.
-                let [key_column] = definition.pk_cols.as_slice() else {
-                    tracing::warn!(
-                        "{}.{} is marked as an enumeration but its primary key is not one column",
-                        schema,
-                        table
-                    );
-                    continue;
-                };
-                // Hasura's convention, and a useful one: a `comment` column
-                // describes each value. Read as a role that may read the
-                // table, which a NOINHERIT authenticator is not by itself.
-                match postrust_core::schema_cache::enum_values(
-                    &state.pool,
-                    &schema,
-                    &table,
-                    key_column,
-                    definition.get_column("comment").is_some(),
-                )
-                .await
-                {
-                    Ok(values) => {
-                        graphql_enum_values.insert(format!("{}.{}", schema, table), values);
-                    }
-                    Err(e) => {
-                        tracing::warn!("cannot read the values of {}.{}: {}", schema, table, e)
-                    }
-                }
-            }
-        }
+        // rather than reflected, and again each time the schema is rebuilt:
+        // a migration that adds a value notifies like one that adds a column.
+        let graphql_enum_values = read_enum_values(
+            &state.pool,
+            &*state.schema_cache.read().await,
+            &graphql_names,
+        )
+        .await;
 
         // How often a live query re-reads itself with nothing having
         // notified it. The notifications do the work; this is the floor
@@ -310,31 +272,51 @@ pub async fn build(config: postrust_core::AppConfig, host: Host) -> Result<App> 
         // not a reason to exit. The REST surface, the admin UI and the health
         // endpoint do not depend on it, and taking the process down with it
         // turns one unrepresentable table into a server that will not start.
-        let built = GraphQLState::new(state.pool.clone(), schema_cache_arc.clone(), graphql_config);
-        if let Err(e) = &built {
-            tracing::error!(
-                "GraphQL schema could not be built, serving without it: {}",
-                e
-            );
-        }
-        if let Ok(graphql_state) = built {
-            let graphql_state = Arc::new(graphql_state);
-
-            // Initialize subscription broker
-            if !host.websockets {
-                info!("GraphQL subscriptions disabled: this host cannot hold a WebSocket");
-            } else if let Err(e) = graphql_state.init_subscriptions().await {
-                tracing::warn!("Failed to initialize subscription broker: {}. Subscriptions may not work until triggers are created.", e);
-            } else {
-                info!("GraphQL subscriptions enabled");
+        // The endpoint is mounted all the same, answering that there is no
+        // schema, so the reload after a migration that fixes the table brings
+        // GraphQL up without a restart.
+        let graphql_state = match GraphQLState::new(
+            state.pool.clone(),
+            schema_cache_arc.clone(),
+            graphql_config.clone(),
+        ) {
+            Ok(graphql_state) => {
+                // Initialize subscription broker
+                if !host.websockets {
+                    info!("GraphQL subscriptions disabled: this host cannot hold a WebSocket");
+                } else if let Err(e) = graphql_state.init_subscriptions().await {
+                    tracing::warn!("Failed to initialize subscription broker: {}. Subscriptions may not work until triggers are created.", e);
+                } else {
+                    info!("GraphQL subscriptions enabled");
+                }
+                info!("GraphQL endpoint enabled at /api/graphql");
+                Some(Arc::new(graphql_state))
             }
-
-            info!("GraphQL endpoint enabled at /api/graphql");
+            Err(e) => {
+                tracing::error!(
+                    "GraphQL schema could not be built, serving without it: {}",
+                    e
+                );
+                None
+            }
+        };
+        {
+            // The schema in use, replaced whole when the database's changes.
+            // A request takes the current one once and keeps it, so an
+            // operation is never answered half from one schema and half from
+            // the next.
+            let current = Arc::new(std::sync::RwLock::new(graphql_state));
+            spawn_graphql_rebuilder(
+                state.clone(),
+                current.clone(),
+                graphql_config,
+                schema_reloads,
+            );
 
             // Combined state for GraphQL routes (includes JWT config for auth)
             #[derive(Clone)]
             struct GraphQLAppState {
-                gql_state: Arc<GraphQLState>,
+                gql_state: Arc<std::sync::RwLock<Option<Arc<GraphQLState>>>>,
                 /// REST's state, for the JWT configuration and the cache of
                 /// verified tokens: one token is verified once, whichever
                 /// surface it is presented to.
@@ -342,8 +324,19 @@ pub async fn build(config: postrust_core::AppConfig, host: Host) -> Result<App> 
                 hasura_auth: postrust_auth::HasuraAuthConfig,
             }
 
+            impl GraphQLAppState {
+                /// The GraphQL state to answer this operation from, if there
+                /// is one yet.
+                fn gql(&self) -> Option<Arc<GraphQLState>> {
+                    self.gql_state
+                        .read()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .clone()
+                }
+            }
+
             let graphql_app_state = GraphQLAppState {
-                gql_state: graphql_state.clone(),
+                gql_state: current,
                 rest: state.clone(),
                 hasura_auth: postrust_auth::HasuraAuthConfig {
                     admin_secret: config.hasura_admin_secret.clone(),
@@ -581,6 +574,11 @@ pub async fn build(config: postrust_core::AppConfig, host: Host) -> Result<App> 
                     elevated,
                     headers,
                 } = identity.clone();
+                let Some(gql) = app_state.gql() else {
+                    return Err(postrust_graphql::hasura::unavailable(
+                        "the GraphQL schema could not be built; see the server log",
+                    ));
+                };
                 let pairs: Vec<(&str, &str)> = headers
                     .iter()
                     .filter_map(|(name, value)| {
@@ -611,7 +609,7 @@ pub async fn build(config: postrust_core::AppConfig, host: Host) -> Result<App> 
                 // decides anything about a row: a role the document does not
                 // name has no schema at all, and is refused here rather than
                 // being answered from someone else's.
-                let Some(schema) = app_state.gql_state.schema_for(
+                let Some(schema) = gql.schema_for(
                     hasura_role.as_deref(),
                     postrust_auth::hasura::backend_only_requested(&pairs[..], elevated),
                 ) else {
@@ -628,7 +626,7 @@ pub async fn build(config: postrust_core::AppConfig, host: Host) -> Result<App> 
                 // up in once something has been asked, and a superset can only
                 // answer the same questions.
                 let schema_cache_ref = postrust_core::schema_cache::SchemaCacheRef::from_static(
-                    (*app_state.gql_state.schema_cache).clone(),
+                    (*gql.schema_cache).clone(),
                 );
 
                 // Every write in this operation goes into one transaction, and
@@ -639,7 +637,7 @@ pub async fn build(config: postrust_core::AppConfig, host: Host) -> Result<App> 
                 let write: postrust_graphql::context::SharedWrite = Arc::default();
 
                 let gql_ctx = postrust_graphql::context::GraphQLContext::new(
-                    app_state.gql_state.pool.clone(),
+                    gql.pool.clone(),
                     schema_cache_ref,
                     auth_result,
                 )
@@ -658,14 +656,10 @@ pub async fn build(config: postrust_core::AppConfig, host: Host) -> Result<App> 
                 // secret is sent beside the role header, and answers it from
                 // that role's own restricted schema. Reading the schema is an
                 // administrator's to do; the permissions still apply to it.
-                let introspection_disabled_for =
-                    hasura_role.as_deref().filter(|_| !elevated).filter(|role| {
-                        app_state
-                            .gql_state
-                            .config
-                            .names
-                            .introspection_disabled(role)
-                    });
+                let introspection_disabled_for = hasura_role
+                    .as_deref()
+                    .filter(|_| !elevated)
+                    .filter(|role| gql.config.names.introspection_disabled(role));
                 let prepared = postrust_graphql::hasura::prepare(
                     Some(schema),
                     req,
@@ -683,8 +677,8 @@ pub async fn build(config: postrust_core::AppConfig, host: Host) -> Result<App> 
                 };
                 let request = request
                     .data(gql_ctx)
-                    .data(app_state.gql_state.pool.clone())
-                    .data(Arc::clone(&app_state.gql_state.broker));
+                    .data(gql.pool.clone())
+                    .data(Arc::clone(&gql.broker));
                 Ok(PreparedOperation {
                     schema: schema.clone(),
                     request,
@@ -1051,7 +1045,11 @@ pub async fn build(config: postrust_core::AppConfig, host: Host) -> Result<App> 
 /// Reconnects on its own: a listening connection is dropped by a restart of
 /// the database or anything between, and a reloader that gives up on the first
 /// error is one that stops working silently partway through a deployment.
-fn spawn_schema_reloader(state: Arc<AppState>, channel: String) {
+fn spawn_schema_reloader(
+    state: Arc<AppState>,
+    channel: String,
+    reloaded: tokio::sync::watch::Sender<u64>,
+) {
     const RETRY: std::time::Duration = std::time::Duration::from_secs(5);
 
     tokio::spawn(async move {
@@ -1082,7 +1080,8 @@ fn spawn_schema_reloader(state: Arc<AppState>, channel: String) {
                                 info!(
                                     "Schema cache reloaded: {}",
                                     state.schema_cache().await.summary()
-                                )
+                                );
+                                reloaded.send_modify(|n| *n += 1);
                             }
                             // The old cache is kept. Serving the previous
                             // schema is better than serving none, and the next
@@ -1098,6 +1097,104 @@ fn spawn_schema_reloader(state: Arc<AppState>, channel: String) {
             }
         }
     });
+}
+
+/// Rebuild the GraphQL schema each time the REST schema cache is reloaded.
+///
+/// The new state is built beside the old one and swapped in only once it is
+/// whole: a schema that cannot be built leaves the previous one serving, as a
+/// failed reload of the REST cache does. Enum tables are read again, since a
+/// migration may add a value; the permission document is kept from start-up,
+/// since it is not part of what a migration notifies about. The subscription
+/// broker carries over to the new state, so a subscription opened on the old
+/// schema keeps receiving notifications, and listens on any table the new
+/// one adds.
+#[cfg(feature = "graphql")]
+fn spawn_graphql_rebuilder(
+    state: Arc<AppState>,
+    current: Arc<std::sync::RwLock<Option<Arc<postrust_graphql::handler::GraphQLState>>>>,
+    mut config: postrust_graphql::schema::SchemaConfig,
+    mut reloads: tokio::sync::watch::Receiver<u64>,
+) {
+    use postrust_graphql::handler::GraphQLState;
+
+    tokio::spawn(async move {
+        while reloads.changed().await.is_ok() {
+            let cache = Arc::new(state.schema_cache().await.clone());
+            config.enum_values = read_enum_values(&state.pool, &cache, &config.names).await;
+            let mut next = match GraphQLState::new(state.pool.clone(), cache, config.clone()) {
+                Ok(next) => next,
+                Err(e) => {
+                    error!(
+                        "GraphQL schema rebuild failed, keeping the previous one: {}",
+                        e
+                    );
+                    continue;
+                }
+            };
+            let previous = current.read().unwrap_or_else(|e| e.into_inner()).clone();
+            if let Err(e) = next.continue_subscriptions(previous.as_deref()).await {
+                // The tables already listened to still are; a new one is
+                // answered by the refresh until the next reload retries it.
+                tracing::warn!("Subscriptions on the rebuilt schema: {}", e);
+            }
+            *current.write().unwrap_or_else(|e| e.into_inner()) = Some(Arc::new(next));
+            info!("GraphQL schema rebuilt");
+        }
+    });
+}
+
+/// The members of every table the GraphQL metadata marks as an enumeration,
+/// keyed "schema.table". A table that cannot be read is left out, with a
+/// warning, and becomes an ordinary table type.
+#[cfg(feature = "graphql")]
+async fn read_enum_values(
+    pool: &sqlx::PgPool,
+    cache: &postrust_core::schema_cache::SchemaCache,
+    names: &postrust_graphql::names::NameOverrides,
+) -> std::collections::HashMap<String, Vec<(String, Option<String>)>> {
+    let mut values_of = std::collections::HashMap::new();
+    for (schema, table) in names.enum_tables() {
+        let qi = postrust_core::api_request::QualifiedIdentifier::new(&schema, &table);
+        let Some(definition) = cache.get_table(&qi) else {
+            tracing::warn!(
+                "{}.{} is marked as an enumeration but was not found",
+                schema,
+                table
+            );
+            continue;
+        };
+        // One column identifies a member. A composite key names no
+        // single value, so there is nothing to call the member.
+        let [key_column] = definition.pk_cols.as_slice() else {
+            tracing::warn!(
+                "{}.{} is marked as an enumeration but its primary key is not one column",
+                schema,
+                table
+            );
+            continue;
+        };
+        // Hasura's convention, and a useful one: a `comment` column
+        // describes each value. Read as a role that may read the
+        // table, which a NOINHERIT authenticator is not by itself.
+        match postrust_core::schema_cache::enum_values(
+            pool,
+            &schema,
+            &table,
+            key_column,
+            definition.get_column("comment").is_some(),
+        )
+        .await
+        {
+            Ok(values) => {
+                values_of.insert(format!("{}.{}", schema, table), values);
+            }
+            Err(e) => {
+                tracing::warn!("cannot read the values of {}.{}: {}", schema, table, e)
+            }
+        }
+    }
+    values_of
 }
 
 /// Mask database URI for logging.

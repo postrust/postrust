@@ -38,8 +38,8 @@ pub struct SchemaConfig {
     /// `(value, comment)`.
     ///
     /// These are rows rather than schema, so they cannot come from the schema
-    /// cache: they are read once at startup, for the tables the configuration
-    /// marks. A table marked as an enum whose values are absent is exposed as
+    /// cache: they are read at startup, and again whenever the schema is
+    /// rebuilt, for the tables the configuration marks. A table marked as an enum whose values are absent is exposed as
     /// an ordinary table -- an empty GraphQL enum is not a legal type, and
     /// refusing to start over a table with no rows in it would be worse.
     pub enum_values: HashMap<String, Vec<(String, Option<String>)>>,

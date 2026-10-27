@@ -6,12 +6,12 @@
 use futures::stream::{Stream, StreamExt};
 use sqlx::postgres::PgListener;
 use sqlx::PgPool;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::pin::Pin;
 use std::sync::Arc;
 use tokio::sync::broadcast;
-use tokio::sync::RwLock;
-use tracing::{debug, error, info, warn};
+use tokio::sync::{watch, RwLock};
+use tracing::{debug, error, info};
 
 /// Default channel capacity for broadcast channels
 const DEFAULT_CHANNEL_CAPACITY: usize = 256;
@@ -37,17 +37,22 @@ pub struct NotifyBroker {
     channel_capacity: usize,
     /// Whether the broker is running
     running: Arc<RwLock<bool>>,
+    /// The channels a PostgreSQL connection is listening on. A channel is
+    /// listened to once however often it is asked for: two listeners on it
+    /// would each deliver every notification.
+    listening: Arc<RwLock<HashSet<String>>>,
+    /// Counts `stop` calls. Each listener waits on it beside its connection
+    /// and exits when it moves past the count it started under, so a stop
+    /// takes effect at once rather than when the next notification happens
+    /// to arrive -- on a quiet table, never. Dropping the broker ends them
+    /// the same way.
+    stops: watch::Sender<u64>,
 }
 
 impl NotifyBroker {
     /// Create a new notification broker.
     pub fn new(pool: PgPool) -> Self {
-        Self {
-            pool,
-            channels: Arc::new(RwLock::new(HashMap::new())),
-            channel_capacity: DEFAULT_CHANNEL_CAPACITY,
-            running: Arc::new(RwLock::new(false)),
-        }
+        Self::with_capacity(pool, DEFAULT_CHANNEL_CAPACITY)
     }
 
     /// Create a new notification broker with custom channel capacity.
@@ -57,6 +62,8 @@ impl NotifyBroker {
             channels: Arc::new(RwLock::new(HashMap::new())),
             channel_capacity: capacity,
             running: Arc::new(RwLock::new(false)),
+            listening: Arc::new(RwLock::new(HashSet::new())),
+            stops: watch::channel(0).0,
         }
     }
 
@@ -65,62 +72,66 @@ impl NotifyBroker {
     /// This spawns a background task that listens for PostgreSQL NOTIFY events
     /// and broadcasts them to all subscribers.
     pub async fn start(&self, listen_channels: Vec<String>) -> Result<(), BrokerError> {
-        // Check if already running
         {
-            let running = self.running.read().await;
+            let mut running = self.running.write().await;
             if *running {
                 return Err(BrokerError::AlreadyRunning);
             }
-        }
-
-        // Mark as running
-        {
-            let mut running = self.running.write().await;
             *running = true;
         }
+        self.listen(listen_channels).await
+    }
 
-        // Create channels for each listen channel
+    /// Listen on whichever of `channels` the broker is not listening on yet,
+    /// over one new connection.
+    ///
+    /// The channels already listened to are left alone, so a subscriber on
+    /// one of them misses nothing while channels are added. On an error none
+    /// of the new channels is recorded, and asking again retries them.
+    pub async fn listen(&self, channels: Vec<String>) -> Result<(), BrokerError> {
+        let mut listening = self.listening.write().await;
+        let mut added = HashSet::new();
+        let new: Vec<String> = channels
+            .into_iter()
+            .filter(|channel| !listening.contains(channel) && added.insert(channel.clone()))
+            .collect();
+        if new.is_empty() {
+            return Ok(());
+        }
+
         {
-            let mut channels = self.channels.write().await;
-            for channel_name in &listen_channels {
-                if !channels.contains_key(channel_name) {
-                    let (tx, _) = broadcast::channel(self.channel_capacity);
-                    channels.insert(channel_name.clone(), tx);
-                }
+            let mut senders = self.channels.write().await;
+            for channel in &new {
+                senders
+                    .entry(channel.clone())
+                    .or_insert_with(|| broadcast::channel(self.channel_capacity).0);
             }
         }
 
-        // Create listener
         let mut listener = PgListener::connect_with(&self.pool)
             .await
             .map_err(BrokerError::Database)?;
-
-        // Subscribe to all channels
-        for channel in &listen_channels {
+        for channel in &new {
             listener
                 .listen(channel)
                 .await
                 .map_err(BrokerError::Database)?;
             info!("Listening on PostgreSQL channel: {}", channel);
         }
+        listening.extend(new);
+        drop(listening);
 
-        // Clone for the spawned task
         let channels = Arc::clone(&self.channels);
-        let running = Arc::clone(&self.running);
+        let mut stops = self.stops.subscribe();
+        let started_under = *stops.borrow_and_update();
 
-        // Spawn listener task
         tokio::spawn(async move {
             loop {
-                // Check if we should stop
-                {
-                    let is_running = running.read().await;
-                    if !*is_running {
-                        info!("Broker stopped, exiting listener loop");
-                        break;
-                    }
-                }
-
-                match listener.try_recv().await {
+                let received = tokio::select! {
+                    _ = stops.wait_for(|stops| *stops != started_under) => break,
+                    received = listener.try_recv() => received,
+                };
+                match received {
                     Ok(Some(notification)) => {
                         let pg_notification = PgNotification {
                             channel: notification.channel().to_string(),
@@ -152,15 +163,17 @@ impl NotifyBroker {
                     }
                 }
             }
+            info!("Broker stopped, exiting listener loop");
         });
 
         Ok(())
     }
 
-    /// Stop the broker.
+    /// Stop the broker, and every connection it is listening on.
     pub async fn stop(&self) {
-        let mut running = self.running.write().await;
-        *running = false;
+        *self.running.write().await = false;
+        self.listening.write().await.clear();
+        self.stops.send_modify(|stops| *stops += 1);
         info!("Broker stop requested");
     }
 
@@ -226,68 +239,7 @@ impl NotifyBroker {
 
     /// Add a new channel to listen on dynamically.
     pub async fn listen_channel(&self, channel: &str) -> Result<(), BrokerError> {
-        // Create a new listener for this channel
-        let mut listener = PgListener::connect_with(&self.pool)
-            .await
-            .map_err(BrokerError::Database)?;
-
-        listener
-            .listen(channel)
-            .await
-            .map_err(BrokerError::Database)?;
-
-        // Ensure broadcast channel exists
-        {
-            let mut channels = self.channels.write().await;
-            if !channels.contains_key(channel) {
-                let (tx, _) = broadcast::channel(self.channel_capacity);
-                channels.insert(channel.to_string(), tx);
-            }
-        }
-
-        let channels = Arc::clone(&self.channels);
-        let running = Arc::clone(&self.running);
-        let channel_name = channel.to_string();
-
-        // Spawn a listener for this channel
-        tokio::spawn(async move {
-            info!("Started dynamic listener for channel: {}", channel_name);
-
-            loop {
-                {
-                    let is_running = running.read().await;
-                    if !*is_running {
-                        break;
-                    }
-                }
-
-                match listener.try_recv().await {
-                    Ok(Some(notification)) => {
-                        let pg_notification = PgNotification {
-                            channel: notification.channel().to_string(),
-                            payload: notification.payload().to_string(),
-                            process_id: notification.process_id(),
-                        };
-
-                        let channels_read = channels.read().await;
-                        if let Some(sender) = channels_read.get(&pg_notification.channel) {
-                            let _ = sender.send(pg_notification);
-                        }
-                    }
-                    Ok(None) => {
-                        tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
-                    }
-                    Err(e) => {
-                        warn!("Error on channel {}: {:?}", channel_name, e);
-                        tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
-                    }
-                }
-            }
-
-            info!("Stopped dynamic listener for channel: {}", channel_name);
-        });
-
-        Ok(())
+        self.listen(vec![channel.to_string()]).await
     }
 
     /// Check if the broker is currently running.
