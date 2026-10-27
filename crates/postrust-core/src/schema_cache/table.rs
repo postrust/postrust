@@ -89,6 +89,34 @@ impl Table {
     pub fn is_readonly(&self) -> bool {
         !self.insertable && !self.updatable && !self.deletable
     }
+
+    /// The methods this relation answers, as an `Allow` header lists them.
+    ///
+    /// Reading is always offered. Writing follows what the relation can
+    /// actually do, which for a view is what its triggers give it: a view with
+    /// only an INSERT trigger takes a POST and nothing else.
+    ///
+    /// PUT is the exception that is not simply a permission. It replaces one
+    /// row named by its primary key, so a relation without a primary key
+    /// cannot answer it however writable it otherwise is -- which is why an
+    /// auto-updatable view without a key offers POST, PATCH and DELETE but not
+    /// PUT.
+    pub fn allow(&self) -> String {
+        let mut methods = vec!["OPTIONS", "GET", "HEAD"];
+        if self.insertable {
+            methods.push("POST");
+        }
+        if self.insertable && self.updatable && !self.pk_cols.is_empty() {
+            methods.push("PUT");
+        }
+        if self.updatable {
+            methods.push("PATCH");
+        }
+        if self.deletable {
+            methods.push("DELETE");
+        }
+        methods.join(",")
+    }
 }
 
 /// A function of the table's row type, read as though it were a column.
@@ -231,6 +259,44 @@ mod tests {
         let qi = table.qualified_identifier();
         assert_eq!(qi.schema, "public");
         assert_eq!(qi.name, "users");
+    }
+
+    fn writable(insertable: bool, updatable: bool, deletable: bool, pk: bool) -> Table {
+        Table {
+            schema: "api".into(),
+            name: "t".into(),
+            description: None,
+            is_view: true,
+            insertable,
+            updatable,
+            deletable,
+            pk_cols: if pk { vec!["id".into()] } else { Vec::new() },
+            unique_constraints: Vec::new(),
+            columns: IndexMap::new(),
+            computed_columns: Default::default(),
+            is_partitioned: false,
+        }
+    }
+
+    #[test]
+    fn allow_lists_what_the_relation_takes() {
+        assert_eq!(
+            writable(false, false, false, true).allow(),
+            "OPTIONS,GET,HEAD"
+        );
+        assert_eq!(
+            writable(true, false, false, true).allow(),
+            "OPTIONS,GET,HEAD,POST"
+        );
+        assert_eq!(
+            writable(true, true, true, true).allow(),
+            "OPTIONS,GET,HEAD,POST,PUT,PATCH,DELETE"
+        );
+        // PUT names a row by its key, so a keyless relation cannot take it.
+        assert_eq!(
+            writable(true, true, true, false).allow(),
+            "OPTIONS,GET,HEAD,POST,PATCH,DELETE"
+        );
     }
 
     #[test]

@@ -55,9 +55,41 @@ where
 
     let verbatim_db_errors = state.config().compat_mode;
 
+    // What a 405 needs to say what the resource does take: the address and
+    // the schema it was asked in, which are all `allow` reads. Kept before the
+    // request is consumed; both are cheap to clone.
+    let uri = request.uri().clone();
+    let profiles: Vec<_> = ["accept-profile", "content-profile"]
+        .into_iter()
+        .filter_map(|name| Some((name, request.headers().get(name)?.clone())))
+        .collect();
+
     match process_request(state, request).await {
         Ok(response) => response,
-        Err(e) => error_response(e, verbatim_db_errors),
+        Err(e) => {
+            let mut response = error_response(e, verbatim_db_errors);
+            // A 405 must carry `Allow` (RFC 9110, section 15.5.6), and it is
+            // the answer an OPTIONS on the same resource gives -- whichever
+            // refusal it was: a function called with the wrong method, a PUT
+            // with filters it cannot take, a view that cannot be written.
+            if response.status() == StatusCode::METHOD_NOT_ALLOWED {
+                let mut probe = http::Request::builder()
+                    .method(http::Method::OPTIONS)
+                    .uri(uri);
+                for (name, value) in profiles {
+                    probe = probe.header(name, value);
+                }
+                if let Ok(probe) = probe.body(Bytes::new()) {
+                    if let Ok(Ok(allow)) = allow(state, probe)
+                        .await
+                        .map(|a| http::HeaderValue::from_str(&a))
+                    {
+                        response.headers_mut().insert(http::header::ALLOW, allow);
+                    }
+                }
+            }
+            response
+        }
     }
 }
 
@@ -1169,18 +1201,15 @@ async fn execute_plan<'s, S: State>(
             }
 
             // The main query. A logged failure names the driver's account of
-            // it, which says more than the response is allowed to.
-            //
-            // Not a queued statement's, which is reported along with the
-            // query but is not its failure: a pre-request function raising to
-            // refuse a request is doing its job, and a log line at error level
-            // for every refusal would bury the failures that are faults. The
-            // statements were run on their own before they were queued, and
-            // their failures went unlogged then too.
+            // it, which says more than the response is allowed to. Only faults
+            // are logged at error level; see `query_error_log`.
             let log = |e: postrust_core::db::DbError| {
-                match e.was_queued() && !e.is_connection() {
-                    true => debug!("Refused before the query: {}", e),
-                    false => error!("Query error: {}", e),
+                match query_error_log(&e) {
+                    QueryErrorLog::RefusedBefore => debug!("Refused before the query: {}", e),
+                    QueryErrorLog::Refused(status) => {
+                        debug!("Query refused with {}: {}", status.as_u16(), e)
+                    }
+                    QueryErrorLog::Fault => error!("Query error: {}", e),
                 }
                 postrust_core::Error::from(e)
             };
@@ -1650,6 +1679,68 @@ async fn execute_plan<'s, S: State>(
     }
 }
 
+/// How a failed query is logged.
+#[derive(Debug, PartialEq, Eq)]
+enum QueryErrorLog {
+    /// A queued statement refused the request: a pre-request function raising
+    /// to say no. Debug.
+    RefusedBefore,
+    /// The schema answering the request on purpose, with a 4xx: a function
+    /// raising a `PT` status or `PGRST`, a constraint, a value that is not of
+    /// its column's type. Debug.
+    Refused(http::StatusCode),
+    /// Everything else, and every connection failure. Error.
+    Fault,
+}
+
+/// Which of [`QueryErrorLog`] a failed query is.
+///
+/// A log line at error level for every refusal buries the failures that are
+/// faults: a schema that answers "not found" by raising `PT404` produced one
+/// for each such request, with nothing to tell it from a broken query.
+///
+/// Decided by SQLSTATE, not by the status the response carries. Many faults
+/// are answered with a 4xx too -- SQL the planner got wrong (`42601`,
+/// `42703`), a table the schema cache still lists after it was dropped
+/// (`42P01`), a missing grant (`42501`), a bare `RAISE EXCEPTION` (`P0001`) or
+/// a division by zero in a function -- and each of those needs someone to
+/// look at it. Only the classes that are the request meeting a rule the
+/// schema states are refusals.
+fn query_error_log(e: &postrust_core::db::DbError) -> QueryErrorLog {
+    if e.is_connection() {
+        return QueryErrorLog::Fault;
+    }
+    if e.was_queued() {
+        return QueryErrorLog::RefusedBefore;
+    }
+    let Some(database) = e.as_database() else {
+        return QueryErrorLog::Fault;
+    };
+    let status = database.status_code();
+    let code = database.code.as_str();
+    let refusal = match code {
+        // Raised on purpose to answer with a status.
+        "PGRST" => true,
+        _ if code.starts_with("PT") => true,
+        // Integrity constraints: a duplicate key, a check, a foreign key.
+        _ if code.starts_with("23") => true,
+        // Data exceptions on what the client sent: a value that is not an
+        // integer, a date out of range, a string too long. Not division by
+        // zero, which is a function's arithmetic rather than its input.
+        "22012" => false,
+        _ if code.starts_with("22") => status == http::StatusCode::BAD_REQUEST,
+        // A write in the read-only transaction a GET runs in, or one the
+        // view cannot take: the method was the client's choice.
+        "25006" => true,
+        _ if database.is_unwritable_view() => true,
+        _ => false,
+    };
+    match refusal && status.is_client_error() {
+        true => QueryErrorLog::Refused(status),
+        false => QueryErrorLog::Fault,
+    }
+}
+
 /// A function's response settings, read back after it ran.
 const RESPONSE_SETTINGS: &str = "SELECT current_setting('response.headers', true), \
                                  current_setting('response.status', true)";
@@ -1675,41 +1766,11 @@ pub async fn allow<S: State>(
 
     let schema_cache = state.schema_cache().await;
     match &api_request.action {
-        Action::RelationInfo(qi) => Ok(relation_allow(schema_cache.require_table(qi)?)),
+        Action::RelationInfo(qi) => Ok(schema_cache.require_table(qi)?.allow()),
         Action::RoutineInfo { qi, .. } => Ok(routine_allow(schema_cache.get_routines(qi))),
         // The schema description, which is read and nothing else.
         _ => Ok("OPTIONS,GET,HEAD".to_string()),
     }
-}
-
-/// The methods a relation answers, for the `Allow` of an OPTIONS.
-///
-/// Reading is always offered. Writing follows what the relation can actually
-/// do, which for a view is what its triggers give it: a view with only an
-/// INSERT trigger takes a POST and nothing else.
-///
-/// PUT is the exception that is not simply a permission. It replaces one row
-/// named by its primary key, so a relation without a primary key cannot
-/// answer it however writable it otherwise is -- which is why an auto-updatable
-/// view without a key offers POST, PATCH and DELETE but not PUT.
-///
-fn relation_allow(table: &postrust_core::schema_cache::Table) -> String {
-    let mut methods = vec!["OPTIONS", "GET", "HEAD"];
-
-    if table.insertable {
-        methods.push("POST");
-    }
-    if table.insertable && table.updatable && !table.pk_cols.is_empty() {
-        methods.push("PUT");
-    }
-    if table.updatable {
-        methods.push("PATCH");
-    }
-    if table.deletable {
-        methods.push("DELETE");
-    }
-
-    methods.join(",")
 }
 
 /// The methods a function answers, for the `Allow` of an OPTIONS.
@@ -3697,6 +3758,9 @@ fn sanitize_error_message(error: &postrust_core::Error) -> String {
         Error::UnacceptableSchema { requested, .. } => {
             return format!("Invalid schema: {}", requested)
         }
+        // Names only the view the client addressed and the operation it asked
+        // for, which is what it has to change.
+        Error::Database(db) if db.is_unwritable_view() => return db.message.clone(),
         // The candidate list is the whole point of the message: it names the
         // signatures that could not be told apart.
         Error::AmbiguousFunction { .. } | Error::AmbiguousRelationship { .. } => {
@@ -3768,6 +3832,110 @@ fn sanitize_error_message(error: &postrust_core::Error) -> String {
 
 #[cfg(test)]
 mod tests {
+    use super::{query_error_log, QueryErrorLog};
+    use http::StatusCode;
+
+    fn database(code: &str) -> postrust_core::db::DbError {
+        reported(code, "message")
+    }
+
+    fn reported(code: &str, message: &str) -> postrust_core::db::DbError {
+        postrust_core::db::DbError::database(
+            "driver message",
+            postrust_core::error::DatabaseError {
+                code: code.into(),
+                message: message.into(),
+                details: None,
+                hint: None,
+                constraint: None,
+                table: None,
+                column: None,
+            },
+        )
+    }
+
+    #[test]
+    fn what_the_schema_answers_on_purpose_is_a_refusal() {
+        for (code, status) in [
+            // A function answering "not found".
+            ("PT404", StatusCode::NOT_FOUND),
+            // A check constraint, a duplicate key.
+            ("23514", StatusCode::BAD_REQUEST),
+            ("23505", StatusCode::CONFLICT),
+            // `id=eq.abc` on an integer column.
+            ("22P02", StatusCode::BAD_REQUEST),
+        ] {
+            assert_eq!(
+                query_error_log(&database(code)),
+                QueryErrorLog::Refused(status),
+                "{code}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_write_the_view_cannot_take_is_a_refusal() {
+        assert_eq!(
+            query_error_log(&reported("55000", "cannot update view \"j\"")),
+            QueryErrorLog::Refused(StatusCode::METHOD_NOT_ALLOWED)
+        );
+        // The same SQLSTATE about anything else is the server's.
+        assert_eq!(
+            query_error_log(&reported("55000", "lock is not available")),
+            QueryErrorLog::Fault
+        );
+    }
+
+    #[test]
+    fn faults_answered_with_a_4xx_are_still_faults() {
+        for code in [
+            "42601", // SQL the planner got wrong
+            "42703", // likewise
+            "42P01", // a dropped table the schema cache still lists
+            "42501", // a missing grant
+            "P0001", // a bare RAISE EXCEPTION
+            "22012", // a function's arithmetic
+        ] {
+            assert!(
+                database(code)
+                    .as_database()
+                    .unwrap()
+                    .status_code()
+                    .is_client_error(),
+                "{code} is not a 4xx, so this case tests nothing"
+            );
+            assert_eq!(
+                query_error_log(&database(code)),
+                QueryErrorLog::Fault,
+                "{code}"
+            );
+        }
+    }
+
+    #[test]
+    fn server_errors_and_broken_connections_are_faults() {
+        for code in ["XX000", "PT500"] {
+            assert_eq!(
+                query_error_log(&database(code)),
+                QueryErrorLog::Fault,
+                "{code}"
+            );
+        }
+        let broken = postrust_core::db::DbError::connection("closed");
+        assert_eq!(query_error_log(&broken), QueryErrorLog::Fault);
+        assert_eq!(query_error_log(&broken.queued()), QueryErrorLog::Fault);
+    }
+
+    #[test]
+    fn a_queued_refusal_stays_a_refusal_whatever_its_status() {
+        for code in ["XX000", "PT403"] {
+            assert_eq!(
+                query_error_log(&database(code).queued()),
+                QueryErrorLog::RefusedBefore
+            );
+        }
+    }
+
     /// A data-modifying `WITH` may only appear at the top level, so anything
     /// that wraps the statement has to leave the clause where it is.
     #[test]
