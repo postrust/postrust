@@ -122,7 +122,7 @@ If you've added custom routes in `crates/postrust-server/src/custom.rs`, build y
 
 ```dockerfile
 # Dockerfile
-FROM rust:1.83-bookworm as builder
+FROM rust:1.88-bookworm AS builder
 
 # Install build dependencies
 RUN apt-get update && apt-get install -y pkg-config libssl-dev

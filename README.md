@@ -385,7 +385,7 @@ Resources:
 ### Docker
 
 ```dockerfile
-FROM rust:1.75 as builder
+FROM rust:1.88-bookworm AS builder
 WORKDIR /app
 COPY . .
 RUN cargo build --release -p postrust-server
@@ -725,7 +725,7 @@ where the two disagree on purpose, and what is still open.
 - [x] OpenAPI 3.0 specification generation (via `admin-ui` feature)
 - [x] GraphQL adapter (queries, mutations, filtering, relationships)
 - [x] Admin UI with Swagger, Scalar, and GraphQL Playground
-- [ ] GraphQL subscriptions (LISTEN/NOTIFY)
+- [x] GraphQL subscriptions (live queries over LISTEN/NOTIFY)
 - [ ] Connection pooling improvements
 - [x] Cloudflare Workers: the REST API over Hyperdrive
 - [ ] GraphQL on Cloudflare Workers
