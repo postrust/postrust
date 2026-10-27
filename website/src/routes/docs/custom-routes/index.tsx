@@ -25,7 +25,7 @@ export default component$(() => {
         <div class="max-w-3xl">
           {/* Overview */}
           <section class="mb-12">
-            <h2 class="text-2xl font-bold text-neutral-900 mb-4">Overview</h2>
+            <h2 class="text-2xl font-bold text-neutral-900 mb-4">How custom routes work</h2>
             <p class="text-neutral-600 mb-4">
               Custom routes allow you to add your own endpoints alongside the auto-generated REST and GraphQL APIs.
               This is useful for:

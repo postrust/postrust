@@ -40,7 +40,7 @@ export default component$(() => (
   </div>
 ));
 
-const title = "Blog | Postrust";
+const title = "Postrust Blog: PostgreSQL, REST, GraphQL and Federation";
 const description =
   "How Postrust works and how to use it: PostgreSQL as REST, GraphQL and Apollo Federation, with every example run before it was written down.";
 const url = "https://postrust.org/blog/";

@@ -107,7 +107,7 @@ export default component$(() => {
         <div class="max-w-3xl">
           {/* Endpoints */}
           <section class="mb-12">
-            <h2 class="text-2xl font-bold text-neutral-900 mb-4">Endpoints</h2>
+            <h2 class="text-2xl font-bold text-neutral-900 mb-4">GraphQL endpoints</h2>
             <div class="space-y-3">
               {endpoints.map((e) => (
                 <div key={e.method + e.path} class="p-4 bg-neutral-50 rounded-lg">
@@ -567,7 +567,7 @@ export const head: DocumentHead = {
     {
       name: "description",
       content:
-        "A GraphQL API generated from your PostgreSQL schema, in the dialect Hasura speaks: queries, mutations, live subscriptions, filtering, Hasura's error envelope, and opt-in Apollo Federation v2 subgraph support.",
+        "A GraphQL API generated from your PostgreSQL schema in Hasura's dialect: queries, mutations, subscriptions, filters and Apollo Federation v2 subgraphs.",
     },
   ],
 };

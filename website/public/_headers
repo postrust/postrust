@@ -3,3 +3,11 @@
 
 /build/*
   Cache-Control: public, max-age=31536000, s-maxage=31536000, immutable
+
+/assets/*
+  Cache-Control: public, max-age=31536000, s-maxage=31536000, immutable
+
+# Not content-hashed, so a changed font must reach returning visitors: a day,
+# not a year.
+/fonts/*
+  Cache-Control: public, max-age=86400

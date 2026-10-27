@@ -8,8 +8,8 @@ import {
   hasuraConformanceMeta,
   hasuraAgreement,
 } from "~/data/hasura-conformance";
+import { LATEST } from "~/data/version";
 
-const LATEST = "2.3.2";
 const VERSION = "2.3.0";
 
 const minorAdded = [
@@ -749,12 +749,12 @@ GRANT web_anon, web_user TO authenticator;`}</code>
 });
 
 export const head: DocumentHead = {
-  title: `Postrust ${VERSION} — the REST API on Cloudflare Workers, and refused writes rolled back`,
+  title: `Postrust ${LATEST} release notes and changelog`,
   links: [{ rel: "canonical", href: "https://postrust.org/releases/" }],
   meta: [
     {
       name: "description",
-      content: `Postrust ${VERSION}: the REST API in a Cloudflare Worker over Hyperdrive, on the server's own request pipeline; a write the response refuses is rolled back; __typename inside a GraphQL relationship works, and a GraphQL token that does not verify is refused.`,
+      content: `Postrust ${LATEST} fixes seven RustSec advisories. ${VERSION} put the REST API in a Cloudflare Worker over Hyperdrive and rolls back refused writes.`,
     },
   ],
 };

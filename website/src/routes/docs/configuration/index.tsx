@@ -30,6 +30,29 @@ const configVars = [
         default: "10",
         desc: "Connection pool size",
       },
+      {
+        name: "PGRST_DB_PRE_REQUEST",
+        required: false,
+        default: "-",
+        desc: "A function (schema-qualified if you like, e.g. auth.check) called before every REST request's query, in the same transaction and after the role and claims are set. Raising an error from it refuses the request. Not called for GraphQL.",
+      },
+    ],
+  },
+  {
+    category: "Schema Reloading",
+    vars: [
+      {
+        name: "PGRST_DB_CHANNEL_ENABLED",
+        required: false,
+        default: "false",
+        desc: "Listen for schema reloads, so a migration that ends with NOTIFY pgrst, 'reload schema' is picked up without a restart. Reloads the REST schema cache and rebuilds the GraphQL schema. Not available on AWS Lambda, which cannot hold a listening connection.",
+      },
+      {
+        name: "PGRST_DB_CHANNEL",
+        required: false,
+        default: "pgrst",
+        desc: "The channel to LISTEN on for schema reloads",
+      },
     ],
   },
   {
@@ -149,6 +172,12 @@ const configVars = [
         required: false,
         default: "-",
         desc: "Prefix generated table types and root fields, so several Postrust subgraphs can be composed without colliding. A shared Federation entity keeps its unprefixed object type; its root fields and helper types still take the prefix.",
+      },
+      {
+        name: "PGRST_SUBSCRIPTION_REFRESH",
+        required: false,
+        default: "30",
+        desc: "Seconds between re-reads of a live subscription when nothing has notified it: the floor under changes a trigger cannot see, such as through a view. A message is sent only when the answer changed. 0 turns the refresh off.",
       },
     ],
   },
@@ -488,7 +517,7 @@ export const head: DocumentHead = {
     {
       name: "description",
       content:
-        "All configuration options and environment variables for Postrust.",
+        "Every Postrust configuration option and environment variable: database connection, JWT secrets and claims, schemas, server, GraphQL and logging.",
     },
   ],
 };

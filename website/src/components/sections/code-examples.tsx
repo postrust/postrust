@@ -1,4 +1,5 @@
 import { component$, useSignal } from "@builder.io/qwik";
+import { emailOff } from "~/components/email-off";
 
 /*
  * EXAMPLES ROADMAP:
@@ -357,9 +358,10 @@ export const CodeExamplesSection = component$(() => {
                 {/* Code */}
                 <div class="p-4 overflow-x-auto">
                   <pre class="text-sm font-mono leading-relaxed">
-                    <code class="text-neutral-100 whitespace-pre">
-                      {example.code}
-                    </code>
+                    <code
+                      class="text-neutral-100 whitespace-pre"
+                      dangerouslySetInnerHTML={emailOff(example.code)}
+                    />
                   </pre>
                 </div>
               </div>

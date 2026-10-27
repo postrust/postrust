@@ -25,7 +25,7 @@ export default component$(() => {
         <div class="max-w-3xl">
           {/* Overview */}
           <section class="mb-12">
-            <h2 class="text-2xl font-bold text-neutral-900 mb-4">Overview</h2>
+            <h2 class="text-2xl font-bold text-neutral-900 mb-4">Vector search through REST and GraphQL</h2>
             <p class="text-neutral-600 mb-4">
               Postrust provides native support for pgvector, enabling vector similarity search directly through
               your REST and GraphQL APIs. Build AI-powered applications with:

@@ -28,7 +28,7 @@ export const head: DocumentHead = {
     {
       name: "description",
       content:
-        "One Rust binary serving a PostgreSQL schema over REST and GraphQL, with a native AWS Lambda adapter. It answers PostgREST's dialect and Hasura's, each measured by replaying that server's own test suite.",
+        "One Rust binary serving PostgreSQL as REST and GraphQL APIs, on Docker, Kubernetes, AWS Lambda or Cloudflare Workers. Tested against PostgREST and Hasura.",
     },
     {
       name: "keywords",

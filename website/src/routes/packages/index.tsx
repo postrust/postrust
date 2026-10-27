@@ -314,7 +314,7 @@ export default component$(() => {
 });
 
 export const head: DocumentHead = {
-  title: "Packages - Postrust",
+  title: "Postrust Packages: Rust crates on crates.io",
   meta: [
     {
       name: "description",

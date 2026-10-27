@@ -5,7 +5,11 @@
 export interface Post {
   slug: string;
   title: string;
+  /** For the <title> when `title` is over 60 characters, which search results cut off. */
+  headTitle?: string;
   description: string;
+  /** For the meta description when `description` is over 155 characters. */
+  headDescription?: string;
   /** ISO date the post was published. */
   date: string;
   author: string;
@@ -21,8 +25,11 @@ export const posts: Post[] = [
     slug: "postgresql-apollo-federation-subgraph",
     title:
       "PostgreSQL as an Apollo Federation subgraph, without writing resolvers",
+    headTitle: "PostgreSQL as an Apollo Federation subgraph, no resolvers",
     description:
       "Two PostgreSQL databases, two generated subgraphs, one Apollo Router: what a resolver-less subgraph has to do, a worked example with row-level security carried through the router, and how the other tools that do this compare as of October 2026.",
+    headDescription:
+      "Two PostgreSQL databases as generated Apollo Federation subgraphs behind one router, with row-level security carried through, and how other tools compare.",
     date: "2026-10-10",
     author: "Bhanu Pratap Chaudhary",
     authorUrl: "https://bhanu.io/",

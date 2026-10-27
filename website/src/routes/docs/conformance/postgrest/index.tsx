@@ -109,7 +109,7 @@ export default component$(() => {
 
           {/* What counts */}
           <section class="mb-12">
-            <h2 class="text-2xl font-bold text-neutral-900 mb-4">What is compared</h2>
+            <h2 class="text-2xl font-bold text-neutral-900 mb-4">What the PostgREST comparison covers</h2>
             <p class="text-neutral-600 mb-4">
               Agreement is reported at four strictness levels, because one systemic gap — a single
               header never emitted — would otherwise sink every case and hide the hundreds that

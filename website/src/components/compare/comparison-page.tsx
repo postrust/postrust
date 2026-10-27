@@ -9,6 +9,7 @@ import {
   postrustImages,
 } from "~/data/measured";
 import type { MeasuredRow } from "~/data/measured";
+import { jsonLd } from "~/components/json-ld";
 
 interface Props {
   comparison: Comparison;
@@ -32,7 +33,7 @@ export const ComparisonPage = component$<Props>(({ comparison: c }) => {
 
   // FAQ structured data. The questions on the page and the questions in the
   // markup are the same list, so they cannot drift apart.
-  const faqJsonLd = JSON.stringify({
+  const faqJsonLd = jsonLd({
     "@context": "https://schema.org",
     "@type": "FAQPage",
     mainEntity: c.faq.map((entry) => ({
@@ -103,7 +104,7 @@ export const ComparisonPage = component$<Props>(({ comparison: c }) => {
         <div class="container-wide">
           <div class="max-w-4xl">
             <h2 class="mb-2 text-3xl font-bold text-neutral-900">
-              Feature comparison
+              Postrust and {c.name}, feature by feature
             </h2>
             <p class="mb-8 text-neutral-600">
               Where a capability has a condition attached, the condition is in
@@ -279,7 +280,7 @@ export const ComparisonPage = component$<Props>(({ comparison: c }) => {
 
             <div class="rounded-xl border border-neutral-200 bg-white p-8">
               <h2 class="mb-4 text-xl font-bold text-neutral-900">
-                When Postrust fits better
+                When Postrust fits better than {c.name}
               </h2>
               <ul class="space-y-3">
                 {c.whenOurs.map((item) => (
@@ -320,7 +321,9 @@ export const ComparisonPage = component$<Props>(({ comparison: c }) => {
       <section class="section-padding">
         <div class="container-wide">
           <div class="max-w-3xl">
-            <h2 class="mb-8 text-3xl font-bold text-neutral-900">Questions</h2>
+            <h2 class="mb-8 text-3xl font-bold text-neutral-900">
+              Postrust or {c.name}: common questions
+            </h2>
             <div class="space-y-8">
               {c.faq.map((entry) => (
                 <div key={entry.q}>

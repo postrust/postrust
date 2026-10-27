@@ -21,6 +21,7 @@ export const Footer = component$(() => {
       { href: "/docs/deployment/", label: "Deployment" },
       { href: "/releases/", label: "Releases" },
       { href: "/blog/", label: "Blog" },
+      { href: "/guides/", label: "Guides" },
     ],
     community: [
       { href: "https://github.com/postrust/postrust", label: "GitHub", external: true },
@@ -46,7 +47,7 @@ export const Footer = component$(() => {
               <span class="text-xl font-bold text-white">Postrust</span>
             </Link>
             <p class="text-sm text-neutral-400 mb-6 max-w-xs">
-              PostgreSQL as REST and GraphQL APIs, from one Rust binary — on a server, in a container or on AWS Lambda, and REST in Cloudflare Workers.
+              PostgreSQL as REST and GraphQL APIs, from one Rust binary — on a server, in a container, on AWS Lambda or on Cloudflare Workers.
             </p>
             {/* Social Links */}
             <div class="flex items-center gap-3">

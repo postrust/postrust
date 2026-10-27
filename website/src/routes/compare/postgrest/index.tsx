@@ -10,9 +10,9 @@ export default component$(() => {
   return <ComparisonPage comparison={comparison} />;
 });
 
-const title = "Postrust vs PostgREST: REST API from PostgreSQL compared";
+const title = "Postrust vs PostgREST: REST from PostgreSQL compared";
 const description =
-  "How Postrust compares to PostgREST: shared query grammar, built-in GraphQL and subscriptions, conformance measured by replaying PostgREST's own test suite, and where PostgREST is the better choice.";
+  "The same query grammar, plus GraphQL and subscriptions: how close Postrust is to PostgREST, measured by its own test suite, and when to pick PostgREST.";
 const url = "https://postrust.org/compare/postgrest/";
 
 export const head: DocumentHead = {
