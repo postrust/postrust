@@ -503,7 +503,7 @@ export const head: DocumentHead = {
     {
       name: "description",
       content:
-        "Postrust's REST API in a Cloudflare Worker over Hyperdrive: what it serves, where its answers differ from the server, conformance, measured costs and what it does not do.",
+        "Postrust's REST API in a Cloudflare Worker over Hyperdrive: what it serves, how it differs from the server, conformance, and measured costs.",
     },
   ],
 };

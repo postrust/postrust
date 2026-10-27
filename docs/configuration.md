@@ -21,9 +21,9 @@ Postrust is configured entirely through environment variables, making it easy to
 | `PGRST_DB_EXTRA_SEARCH_PATH` | Comma-separated schemas appended to each request's `search_path`. Not exposed as endpoints — this is where a function or type that an exposed schema references is allowed to live | `public` |
 | `PGRST_DB_AGGREGATES_ENABLED` | Allow aggregate functions in `select`. Off by default, as in PostgREST: an aggregate over a large table costs far more than the request looks like it asks for | `false` |
 | `PGRST_DB_PREPARED_STATEMENTS` | Use prepared statements. Set `false` behind a connection pooler in transaction mode (PgBouncer), where the connection a statement was prepared on is not the one the next query lands on | `true` |
-| `PGRST_DB_PRE_REQUEST` | Function called on the request's transaction before its own query, after every setting is applied. Anything it raises aborts the request. Schema-qualify it as `auth.check` | (none) |
+| `PGRST_DB_PRE_REQUEST` | Function called on the request's transaction before its own query, after every setting is applied. Anything it raises aborts the request. Schema-qualify it as `auth.check`. REST only; GraphQL does not call it | (none) |
 | `PGRST_DB_CHANNEL` | LISTEN channel for schema cache reloads | `pgrst` |
-| `PGRST_DB_CHANNEL_ENABLED` | Reload the schema cache on `NOTIFY <channel>` instead of on a restart | `false` |
+| `PGRST_DB_CHANNEL_ENABLED` | Reload the schema cache on `NOTIFY <channel>` instead of on a restart, and rebuild the GraphQL schema from it | `false` |
 
 `PGRST_DB_MAX_ROWS` is under [Request Limits](#request-limits).
 

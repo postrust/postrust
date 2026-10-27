@@ -116,6 +116,48 @@ export default component$(() => {
       </section>
 
       {/* Contributing */}
+      {/* Maintainer */}
+      <section id="maintainer" class="pb-16">
+        <div class="container-wide">
+          <div class="max-w-3xl">
+            <h2 class="text-2xl font-bold text-neutral-900 mb-4">
+              Who maintains Postrust
+            </h2>
+            <p class="text-neutral-600">
+              Postrust is written and maintained by{" "}
+              <a
+                href="https://bhanu.io/"
+                target="_blank"
+                rel="noopener noreferrer"
+                class="text-primary-600 hover:text-primary-700"
+              >
+                Bhanu Pratap Chaudhary
+              </a>{" "}
+              (
+              <a
+                href="https://github.com/bhanuc"
+                target="_blank"
+                rel="noopener noreferrer"
+                class="text-primary-600 hover:text-primary-700"
+              >
+                @bhanuc
+              </a>
+              ), with contributions from everyone listed on GitHub. It is MIT
+              licensed, and every release is tagged and published from the{" "}
+              <a
+                href="https://github.com/postrust/postrust"
+                target="_blank"
+                rel="noopener noreferrer"
+                class="text-primary-600 hover:text-primary-700"
+              >
+                public repository
+              </a>
+              .
+            </p>
+          </div>
+        </div>
+      </section>
+
       <section class="section-padding bg-neutral-50">
         <div class="container-wide">
           <div class="max-w-3xl mx-auto text-center mb-12">
@@ -202,7 +244,7 @@ export default component$(() => {
 });
 
 export const head: DocumentHead = {
-  title: "Community - Postrust",
+  title: "Community - Postrust, the open-source PostgreSQL API",
   meta: [
     {
       name: "description",

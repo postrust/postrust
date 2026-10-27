@@ -474,12 +474,12 @@ export default component$(() => {
 });
 
 export const head: DocumentHead = {
-  title: "Compare Postrust with PostgREST, Hasura, PostGraphile and Supabase",
+  title: "Postrust vs PostgREST, Hasura, PostGraphile, Supabase",
   meta: [
     {
       name: "description",
       content:
-        "Feature and measured performance comparisons between Postrust and PostgREST, Hasura, PostGraphile and Supabase, including where each of them is the better choice.",
+        "Feature and measured comparisons of Postrust with PostgREST, Hasura, PostGraphile and Supabase, including where each of them is the better choice.",
     },
   ],
 };

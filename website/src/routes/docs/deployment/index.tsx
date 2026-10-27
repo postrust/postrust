@@ -16,7 +16,10 @@ export default component$(() => {
           </div>
           <h1 class="text-4xl font-bold text-neutral-900 mb-4">Deployment</h1>
           <p class="text-lg text-neutral-600 max-w-2xl">
-            Deploy Postrust to Docker, AWS Lambda, Cloudflare Workers, Kubernetes, and more.
+            Postrust is not tied to one platform. The same server runs as a
+            single binary, in Docker, on Kubernetes (there is a Helm chart), on
+            Fly.io or Railway, and on AWS Lambda through a native adapter. The
+            REST API also runs in a Cloudflare Worker.
           </p>
         </div>
       </div>

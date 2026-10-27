@@ -31,7 +31,9 @@ export const HeroSection = component$(() => {
           {/* Subheadline */}
           <p class="text-lg md:text-xl text-neutral-600 max-w-2xl mx-auto mb-10">
             One Rust binary that serves a PostgreSQL schema over REST and
-            GraphQL, with a native AWS Lambda adapter. It answers{" "}
+            GraphQL, on servers and serverless alike: as a binary, in Docker,
+            on Kubernetes, on AWS Lambda or on Cloudflare Workers. It
+            answers{" "}
             <Link
               href="/docs/conformance/"
               class="underline decoration-neutral-300 underline-offset-4 hover:decoration-primary-600 hover:text-primary-700"

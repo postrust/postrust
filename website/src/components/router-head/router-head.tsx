@@ -1,7 +1,9 @@
 import { component$ } from "@builder.io/qwik";
 import { useDocumentHead, useLocation } from "@builder.io/qwik-city";
+import { isArticle, SITE, structuredData } from "./structured-data";
 
-const SITE = "https://postrust.org";
+/** The card social sites and chat apps show for a link to any page. */
+const OG_IMAGE = `${SITE}/og.png`;
 
 /** The address a path is served at in production, without redirecting. */
 const canonicalFor = (pathname: string) =>
@@ -13,6 +15,33 @@ const canonicalFor = (pathname: string) =>
 export const RouterHead = component$(() => {
   const head = useDocumentHead();
   const loc = useLocation();
+
+  const canonical =
+    head.links.find((l) => l.rel === "canonical")?.href ??
+    canonicalFor(loc.url.pathname);
+  const description = head.meta.find((m) => m.name === "description")?.content;
+
+  // Open Graph and Twitter card tags, from the title and description every
+  // page already has. A page that sets one of its own keeps it.
+  const has = (key: string) =>
+    head.meta.some((m) => m.property === key || m.name === key);
+  const social = [
+    { property: "og:title", content: head.title },
+    { property: "og:description", content: description },
+    {
+      property: "og:type",
+      content: isArticle(loc.url.pathname) ? "article" : "website",
+    },
+    { property: "og:url", content: canonical },
+    { property: "og:site_name", content: "Postrust" },
+    { property: "og:image", content: OG_IMAGE },
+    { property: "og:image:width", content: "1200" },
+    { property: "og:image:height", content: "630" },
+    { name: "twitter:card", content: "summary_large_image" },
+    { name: "twitter:title", content: head.title },
+    { name: "twitter:description", content: description },
+    { name: "twitter:image", content: OG_IMAGE },
+  ].filter((m) => m.content && !has(m.property ?? m.name!));
 
   return (
     <>
@@ -31,6 +60,19 @@ export const RouterHead = component$(() => {
       {head.meta.map((m) => (
         <meta key={m.key} {...m} />
       ))}
+      {social.map((m) => (
+        <meta key={m.property ?? m.name} {...m} />
+      ))}
+
+      <script
+        type="application/ld+json"
+        dangerouslySetInnerHTML={structuredData(
+          loc.url.pathname,
+          head.title,
+          description,
+          canonical,
+        )}
+      />
 
       {head.links.map((l) => (
         <link key={l.key} {...l} />

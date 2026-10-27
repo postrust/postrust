@@ -307,6 +307,24 @@ pub fn malformed(message: &str) -> Value {
     envelope(response)
 }
 
+/// The answer while there is no schema to answer from: start-up could not
+/// build one, and no reload since has.
+///
+/// `unexpected` at `$`, Hasura's code for a fault of the server's rather than
+/// of the request. The request may be fine, and will be answered once a
+/// migration fixes what stopped the schema from being built.
+pub fn unavailable(message: &str) -> Value {
+    let mut error = ServerError::new(message, None);
+    let mut extensions = async_graphql::ErrorExtensionValues::default();
+    extensions.set("code", "unexpected");
+    extensions.set("path", "$");
+    error.extensions = Some(extensions);
+
+    let mut response = Response::new(async_graphql::Value::Null);
+    response.errors = vec![error];
+    envelope(response)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

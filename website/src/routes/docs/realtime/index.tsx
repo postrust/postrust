@@ -25,7 +25,7 @@ export default component$(() => {
         <div class="max-w-3xl">
           {/* Overview */}
           <section class="mb-12">
-            <h2 class="text-2xl font-bold text-neutral-900 mb-4">Overview</h2>
+            <h2 class="text-2xl font-bold text-neutral-900 mb-4">How realtime subscriptions work</h2>
             <p class="text-neutral-600 mb-4">
               Postrust provides realtime data synchronization through GraphQL subscriptions.
               Subscribe to changes on any table or view and receive updates instantly.
@@ -82,25 +82,27 @@ export default component$(() => {
                 <span class="text-sm text-neutral-400">GraphQL</span>
               </div>
               <pre class="p-4 text-sm overflow-x-auto">
-                <code class="text-neutral-100">{`# Subscribe to all changes on a table
+                <code class="text-neutral-100">{`# Every row of a table, again whenever it changes
 subscription {
   users {
     id
     name
-    email
-    updatedAt
+    updated_at
   }
 }
 
-# Subscribe with filters
+# The same arguments a query takes
 subscription {
-  orders(filter: { status: { eq: "pending" } }) {
+  orders(
+    where: { status: { _eq: "pending" } }
+    order_by: [{ created_at: desc }]
+    limit: 20
+  ) {
     id
     total
     status
     customer {
       name
-      email
     }
   }
 }`}</code>
@@ -112,7 +114,10 @@ subscription {
           <section class="mb-12">
             <h2 class="text-2xl font-bold text-neutral-900 mb-4">Subscribe to Views</h2>
             <p class="text-neutral-600 mb-4">
-              Subscribe to PostgreSQL views for computed or aggregated data:
+              Subscribe to PostgreSQL views for computed or aggregated data. A
+              view has no trigger of its own, so a subscription to one is
+              re-read every <code class="font-mono text-sm">PGRST_SUBSCRIPTION_REFRESH</code>{" "}
+              seconds (30 by default) rather than at once:
             </p>
             <div class="bg-neutral-900 rounded-xl overflow-hidden">
               <div class="px-4 py-2 bg-neutral-800 border-b border-neutral-700">
@@ -120,14 +125,10 @@ subscription {
               </div>
               <pre class="p-4 text-sm overflow-x-auto">
                 <code class="text-neutral-100">{`subscription {
-  salesDashboard {
-    totalRevenue
-    orderCount
-    averageOrderValue
-    topProducts {
-      name
-      salesCount
-    }
+  sales_dashboard {
+    total_revenue
+    order_count
+    average_order_value
   }
 }`}</code>
               </pre>
@@ -188,7 +189,7 @@ const unsubscribe = client.subscribe(
 
 const ORDERS_SUBSCRIPTION = gql\`
   subscription OnOrderUpdate {
-    orders(filter: { status: { eq: "pending" } }) {
+    orders(where: { status: { _eq: "pending" } }) {
       id
       total
       status
@@ -221,36 +222,58 @@ function PendingOrders() {
           <section class="mb-12">
             <h2 class="text-2xl font-bold text-neutral-900 mb-4">PostgreSQL Triggers</h2>
             <p class="text-neutral-600 mb-4">
-              Create triggers for fine-grained notifications:
+              A subscription is woken at once by a notification on its table's
+              channel, <code class="font-mono text-sm">postrust_&lt;schema&gt;_&lt;table&gt;</code>;
+              without one it waits for the next refresh. This trigger sends it
+              for <code class="font-mono text-sm">public.orders</code>, and{" "}
+              <code class="font-mono text-sm">postrust_graphql::subscription::create_notify_trigger_sql</code>{" "}
+              generates the same for any table:
             </p>
             <div class="bg-neutral-900 rounded-xl overflow-hidden">
               <div class="px-4 py-2 bg-neutral-800 border-b border-neutral-700">
                 <span class="text-sm text-neutral-400">SQL</span>
               </div>
               <pre class="p-4 text-sm overflow-x-auto">
-                <code class="text-neutral-100">{`-- Notification function
-CREATE OR REPLACE FUNCTION notify_table_change()
+                <code class="text-neutral-100">{`-- The server listens on postrust_<schema>_<table>
+CREATE OR REPLACE FUNCTION public.postrust_notify_public_orders_fn()
 RETURNS TRIGGER AS $$
+DECLARE
+    payload jsonb;
 BEGIN
-  PERFORM pg_notify(
-    'table_change',
-    json_build_object(
-      'table', TG_TABLE_NAME,
-      'operation', TG_OP,
-      'data', CASE
-        WHEN TG_OP = 'DELETE' THEN row_to_json(OLD)
-        ELSE row_to_json(NEW)
-      END
-    )::text
-  );
-  RETURN COALESCE(NEW, OLD);
+    IF TG_OP = 'DELETE' THEN
+        payload := jsonb_build_object(
+            'operation', 'DELETE',
+            'table', TG_TABLE_NAME,
+            'schema', TG_TABLE_SCHEMA,
+            'old', row_to_json(OLD)
+        );
+    ELSIF TG_OP = 'UPDATE' THEN
+        payload := jsonb_build_object(
+            'operation', 'UPDATE',
+            'table', TG_TABLE_NAME,
+            'schema', TG_TABLE_SCHEMA,
+            'old', row_to_json(OLD),
+            'new', row_to_json(NEW)
+        );
+    ELSE
+        payload := jsonb_build_object(
+            'operation', 'INSERT',
+            'table', TG_TABLE_NAME,
+            'schema', TG_TABLE_SCHEMA,
+            'new', row_to_json(NEW)
+        );
+    END IF;
+
+    PERFORM pg_notify('postrust_public_orders', payload::text);
+    RETURN COALESCE(NEW, OLD);
 END;
 $$ LANGUAGE plpgsql;
 
--- Apply to table
-CREATE TRIGGER orders_notify
-  AFTER INSERT OR UPDATE OR DELETE ON orders
-  FOR EACH ROW EXECUTE FUNCTION notify_table_change();`}</code>
+DROP TRIGGER IF EXISTS postrust_notify_public_orders ON public.orders;
+CREATE TRIGGER postrust_notify_public_orders
+    AFTER INSERT OR UPDATE OR DELETE ON public.orders
+    FOR EACH ROW
+    EXECUTE FUNCTION public.postrust_notify_public_orders_fn();`}</code>
               </pre>
             </div>
           </section>

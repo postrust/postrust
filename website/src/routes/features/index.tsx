@@ -235,7 +235,7 @@ export default component$(() => {
         <div class="container-wide">
           <div class="max-w-3xl mx-auto text-center">
             <h1 class="text-4xl md:text-5xl font-bold text-neutral-900 mb-6">
-              Everything you need to build APIs
+              Features: REST, GraphQL and realtime from PostgreSQL
             </h1>
             <p class="text-lg text-neutral-600 mb-8">
               Postrust provides a complete solution for exposing your PostgreSQL database
@@ -322,7 +322,7 @@ export default component$(() => {
 });
 
 export const head: DocumentHead = {
-  title: "Features - Postrust",
+  title: "Postrust Features: REST, GraphQL, Realtime for PostgreSQL",
   meta: [
     {
       name: "description",

@@ -12,7 +12,8 @@ export default extendConfig(baseConfig, () => {
     },
     plugins: [
       // The adapter writes a sitemap of the pages it pre-renders, which is
-      // none, and that empty file would overwrite public/sitemap.xml.
+      // none, and that empty static file would be served in place of the
+      // generated one at src/routes/sitemap.xml.
       cloudflarePagesAdapter({ ssg: { sitemapOutFile: null } }),
     ],
   };

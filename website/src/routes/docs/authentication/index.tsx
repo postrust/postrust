@@ -1,6 +1,7 @@
 import { component$ } from "@builder.io/qwik";
 import type { DocumentHead } from "@builder.io/qwik-city";
 import { Link } from "@builder.io/qwik-city";
+import { emailOff } from "~/components/email-off";
 
 export default component$(() => {
   return (
@@ -34,12 +35,15 @@ export default component$(() => {
                 <span class="text-sm text-neutral-400">JWT Payload</span>
               </div>
               <pre class="p-4 text-sm overflow-x-auto">
-                <code class="text-neutral-100">{`{
+                <code
+                  class="text-neutral-100"
+                  dangerouslySetInnerHTML={emailOff(`{
   "role": "authenticated_user",
   "sub": "user_123",
   "email": "user@example.com",
   "exp": 1704067200
-}`}</code>
+}`)}
+                />
               </pre>
             </div>
             <div class="bg-neutral-900 rounded-xl overflow-hidden">

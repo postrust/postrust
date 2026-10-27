@@ -529,3 +529,170 @@ async fn test_trigger_sql_is_valid() {
         .await
         .expect("Failed to drop table");
 }
+
+/// The listening connections still open on `channel`, other than this one.
+async fn listeners_on(pool: &sqlx::PgPool, channel: &str) -> i64 {
+    sqlx::query_scalar(
+        "SELECT count(*) FROM pg_stat_activity \
+         WHERE pid <> pg_backend_pid() AND query ILIKE 'LISTEN%' AND query LIKE '%' || $1 || '%'",
+    )
+    .bind(channel)
+    .fetch_one(pool)
+    .await
+    .unwrap()
+}
+
+#[tokio::test]
+#[ignore] // Requires running PostgreSQL database
+async fn test_stop_closes_a_quiet_listener() {
+    // A stopped broker used to keep its connection until the next
+    // notification arrived, which on a quiet channel is never.
+    let pool = PgPoolOptions::new()
+        .max_connections(5)
+        .connect(&get_database_url())
+        .await
+        .expect("Failed to connect to database");
+    let channel = unique_table_name();
+
+    let broker = NotifyBroker::new(pool.clone());
+    broker.start(vec![channel.clone()]).await.unwrap();
+    assert_eq!(listeners_on(&pool, &channel).await, 1);
+
+    broker.stop().await;
+    let mut open = 1;
+    for _ in 0..50 {
+        open = listeners_on(&pool, &channel).await;
+        if open == 0 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert_eq!(open, 0, "the listener outlived stop()");
+}
+
+#[tokio::test]
+#[ignore] // Requires running PostgreSQL database
+async fn test_listen_adds_channels_without_doubling_existing_ones() {
+    let pool = PgPoolOptions::new()
+        .max_connections(5)
+        .connect(&get_database_url())
+        .await
+        .expect("Failed to connect to database");
+    let first = unique_table_name();
+    let second = unique_table_name();
+
+    let broker = NotifyBroker::new(pool.clone());
+    broker.start(vec![first.clone()]).await.unwrap();
+    let mut on_first = broker.subscribe_or_create(&first).await;
+
+    broker
+        .listen(vec![first.clone(), second.clone()])
+        .await
+        .unwrap();
+    assert_eq!(listeners_on(&pool, &first).await, 1);
+    let mut on_second = broker.subscribe_or_create(&second).await;
+
+    for channel in [&first, &second] {
+        sqlx::query("SELECT pg_notify($1, 'ping')")
+            .bind(channel)
+            .execute(&pool)
+            .await
+            .unwrap();
+    }
+    for stream in [&mut on_first, &mut on_second] {
+        let notification = timeout(Duration::from_secs(5), stream.next())
+            .await
+            .expect("Timeout waiting for notification")
+            .unwrap();
+        assert_eq!(notification.payload, "ping");
+    }
+    // One listener per channel, so one delivery per notification.
+    assert!(
+        timeout(Duration::from_millis(300), on_first.next())
+            .await
+            .is_err(),
+        "a notification was delivered twice"
+    );
+
+    broker.stop().await;
+}
+
+#[tokio::test]
+#[ignore] // Requires running PostgreSQL database
+async fn test_a_rebuilt_state_keeps_the_broker_and_listens_on_new_tables() {
+    use postrust_core::schema_cache::SchemaCache;
+    use postrust_graphql::handler::GraphQLState;
+    use postrust_graphql::schema::SchemaConfig;
+    use std::sync::Arc;
+
+    let pool = PgPoolOptions::new()
+        .max_connections(5)
+        .connect(&get_database_url())
+        .await
+        .expect("Failed to connect to database");
+    let schema = unique_table_name();
+    pool.execute(format!("CREATE SCHEMA {schema}").as_str())
+        .await
+        .unwrap();
+    let table = |name: &str| {
+        format!(
+            "CREATE TABLE {schema}.{name} (id serial PRIMARY KEY, name text); {}",
+            create_notify_trigger_sql(&schema, name)
+        )
+    };
+    let state_for = |pool: sqlx::PgPool, schema: String| async move {
+        let cache = SchemaCache::load(&pool, std::slice::from_ref(&schema))
+            .await
+            .unwrap();
+        let mut config = SchemaConfig::default();
+        config.exposed_schemas = vec![schema];
+        config.enable_subscriptions = true;
+        GraphQLState::new(pool, Arc::new(cache), config).unwrap()
+    };
+
+    pool.execute(table("before").as_str()).await.unwrap();
+    let mut first = state_for(pool.clone(), schema.clone()).await;
+    first.continue_subscriptions(None).await.unwrap();
+    let mut open = first
+        .broker
+        .read()
+        .await
+        .as_ref()
+        .expect("a broker")
+        .subscribe_or_create(&table_channel_name(&schema, "before"))
+        .await;
+
+    // A migration adds a table; the schema is rebuilt from the new cache.
+    pool.execute(table("after").as_str()).await.unwrap();
+    let mut rebuilt = state_for(pool.clone(), schema.clone()).await;
+    rebuilt.continue_subscriptions(Some(&first)).await.unwrap();
+    assert!(Arc::ptr_eq(&first.broker, &rebuilt.broker));
+    drop(first);
+
+    let mut added = rebuilt
+        .broker
+        .read()
+        .await
+        .as_ref()
+        .unwrap()
+        .subscribe_or_create(&table_channel_name(&schema, "after"))
+        .await;
+    for name in ["before", "after"] {
+        pool.execute(format!("INSERT INTO {schema}.{name} (name) VALUES ('x')").as_str())
+            .await
+            .unwrap();
+    }
+    // The subscription opened before the rebuild still hears its table, and
+    // the table the rebuild added is listened to.
+    for stream in [&mut open, &mut added] {
+        timeout(Duration::from_secs(5), stream.next())
+            .await
+            .expect("Timeout waiting for notification")
+            .unwrap();
+    }
+
+    rebuilt.stop_subscriptions().await;
+    pool.execute(format!("DROP SCHEMA {schema} CASCADE").as_str())
+        .await
+        .unwrap();
+}

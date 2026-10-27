@@ -1,5 +1,8 @@
 import { component$ } from "@builder.io/qwik";
 import type { DocumentHead } from "@builder.io/qwik-city";
+import { Link } from "@builder.io/qwik-city";
+import { emailOff } from "~/components/email-off";
+import { jsonLd } from "~/components/json-ld";
 
 const enterpriseFeatures = [
   {
@@ -33,6 +36,40 @@ const enterpriseFeatures = [
     icon: "sla",
   },
 ];
+
+/** Asked of every open-source API server a team considers for production. */
+const enterpriseFaq = [
+  {
+    q: "Is there commercial support for Postrust?",
+    a: "Yes. Support agreements, security reviews, custom development and consulting are arranged directly with the people who maintain Postrust; write to founder@postrust.org. The server itself is MIT licensed and free, with or without an agreement.",
+  },
+  {
+    q: "Does Postrust have team management and billing?",
+    a: "Not in the API server, which serves your database and nothing else. The open-source Postrust SaaS starter kit adds them on top: teams, invitations and roles, Stripe or LemonSqueezy subscriptions, API keys and audit logs, all enforced by PostgreSQL row-level security.",
+  },
+  {
+    q: "How do teams control who can see which rows?",
+    a: "With PostgreSQL itself. Each request runs as the database role named in its JWT, with the token's claims available to row-level security policies, so tenant and team boundaries hold the same way for REST and GraphQL.",
+  },
+  {
+    q: "Where can Postrust run?",
+    a: "Anywhere you can run a binary or a container: on servers, in Docker, on Kubernetes with the Helm chart, on Fly.io or Railway, and serverless on AWS Lambda and Cloudflare Workers.",
+  },
+  {
+    q: "Can we move from PostgREST or Hasura without rewriting clients?",
+    a: "Mostly, and you can check how far for yourself. Postrust answers PostgREST's REST dialect and Hasura's GraphQL dialect, and replaying each project's own test suite against both agrees on about 97% of cases; the conformance reports list every known difference, so test the queries your clients depend on before you switch.",
+  },
+];
+
+const faqJsonLd = jsonLd({
+  "@context": "https://schema.org",
+  "@type": "FAQPage",
+  mainEntity: enterpriseFaq.map((entry) => ({
+    "@type": "Question",
+    name: entry.q,
+    acceptedAnswer: { "@type": "Answer", text: entry.a },
+  })),
+});
 
 const iconPaths: Record<string, string> = {
   support: "M18.364 5.636l-3.536 3.536m0 5.656l3.536 3.536M9.172 9.172L5.636 5.636m3.536 9.192l-3.536 3.536M21 12a9 9 0 11-18 0 9 9 0 0118 0zm-5 0a4 4 0 11-8 0 4 4 0 018 0z",
@@ -96,6 +133,57 @@ export default component$(() => {
                 </p>
               </div>
             ))}
+          </div>
+        </div>
+      </section>
+
+      {/* FAQ */}
+      <section class="section-padding">
+        <script type="application/ld+json" dangerouslySetInnerHTML={faqJsonLd} />
+        <div class="container-wide">
+          <div class="max-w-3xl mx-auto">
+            <h2 class="text-3xl font-bold text-neutral-900 mb-8">
+              Running Postrust in production: common questions
+            </h2>
+            <div class="space-y-6">
+              {enterpriseFaq.map((entry) => (
+                <div key={entry.q}>
+                  <h3 class="mb-2 text-lg font-semibold text-neutral-900">
+                    {entry.q}
+                  </h3>
+                  <p
+                    class="text-neutral-600"
+                    dangerouslySetInnerHTML={emailOff(entry.a)}
+                  />
+                </div>
+              ))}
+            </div>
+            <p class="mt-8 text-neutral-600">
+              See the{" "}
+              <Link
+                href="/docs/conformance/"
+                class="text-primary-600 hover:text-primary-700"
+              >
+                conformance reports
+              </Link>
+              , the{" "}
+              <a
+                href="https://github.com/postrust/postrust-saas-starter"
+                target="_blank"
+                rel="noopener noreferrer"
+                class="text-primary-600 hover:text-primary-700"
+              >
+                SaaS starter kit
+              </a>{" "}
+              and the{" "}
+              <Link
+                href="/guides/postgresql-row-level-security-api/"
+                class="text-primary-600 hover:text-primary-700"
+              >
+                guide to row-level security behind an API
+              </Link>
+              .
+            </p>
           </div>
         </div>
       </section>
@@ -176,11 +264,11 @@ export default component$(() => {
 });
 
 export const head: DocumentHead = {
-  title: "Enterprise - Postrust",
+  title: "Enterprise support for Postrust, the PostgreSQL API",
   meta: [
     {
       name: "description",
-      content: "Postrust Enterprise - Priority support, security audits, custom development, and expert consulting for your organization.",
+      content: "Paid support for Postrust: priority support, security reviews, custom development and consulting, plus team management and billing via the SaaS starter.",
     },
   ],
 };

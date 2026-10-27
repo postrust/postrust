@@ -25,7 +25,7 @@ export default component$(() => {
         <div class="max-w-3xl">
           {/* Endpoints */}
           <section class="mb-12">
-            <h2 class="text-2xl font-bold text-neutral-900 mb-6">Endpoints</h2>
+            <h2 class="text-2xl font-bold text-neutral-900 mb-6">REST endpoints</h2>
             <div class="mb-6 p-4 bg-neutral-50 border border-neutral-200 rounded-lg text-sm text-neutral-600">
               <strong class="text-neutral-900">Note on paths.</strong> By default the REST API
               is served under <code class="font-mono">/api</code> (e.g.{" "}

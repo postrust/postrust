@@ -195,7 +195,7 @@ export default component$(() => {
 });
 
 export const head: DocumentHead = {
-  title: "Pricing - Postrust",
+  title: "Pricing - Postrust is free and open source (MIT)",
   meta: [
     {
       name: "description",

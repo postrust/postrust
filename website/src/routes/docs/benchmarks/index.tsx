@@ -333,7 +333,7 @@ export const head: DocumentHead = {
     {
       name: "description",
       content:
-        "Postrust measured against PostgREST, Hasura and PostGraphile on dedicated bare metal, with each component pinned to its own cores and a gate that rejects any run the machine drifted under.",
+        "Postrust measured against PostgREST, Hasura and PostGraphile on bare metal, each pinned to its own cores, rejecting any run the machine drifted under.",
     },
   ],
 };
