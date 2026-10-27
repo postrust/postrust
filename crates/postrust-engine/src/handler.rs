@@ -1172,17 +1172,14 @@ async fn execute_plan<'s, S: State>(
             // it, which says more than the response is allowed to. Only faults
             // are logged at error level; see `query_error_log`.
             let log = |e: postrust_core::db::DbError| {
-                let refused_before = e.was_queued() && !e.is_connection();
-                let text = e.to_string();
-                let error = postrust_core::Error::from(e);
-                match query_error_log(&error, refused_before) {
-                    QueryErrorLog::RefusedBefore => debug!("Refused before the query: {}", text),
+                match query_error_log(&e) {
+                    QueryErrorLog::RefusedBefore => debug!("Refused before the query: {}", e),
                     QueryErrorLog::Refused(status) => {
-                        debug!("Query refused with {}: {}", status.as_u16(), text)
+                        debug!("Query refused with {}: {}", status.as_u16(), e)
                     }
-                    QueryErrorLog::Fault => error!("Query error: {}", text),
+                    QueryErrorLog::Fault => error!("Query error: {}", e),
                 }
-                error
+                postrust_core::Error::from(e)
             };
 
             // A rendered media type is a single value, not a row set: the
@@ -1656,12 +1653,11 @@ enum QueryErrorLog {
     /// A queued statement refused the request: a pre-request function raising
     /// to say no. Debug.
     RefusedBefore,
-    /// The response reports it as the client's (a 4xx): a function raising
-    /// `PT404`, a check constraint, a duplicate key, a missing grant. That is
-    /// the API answering, not the server failing. Debug.
+    /// The schema answering the request on purpose, with a 4xx: a function
+    /// raising a `PT` status or `PGRST`, a constraint, a value that is not of
+    /// its column's type. Debug.
     Refused(http::StatusCode),
-    /// Anything the response reports as the server's, and every connection
-    /// failure. Error.
+    /// Everything else, and every connection failure. Error.
     Fault,
 }
 
@@ -1670,14 +1666,45 @@ enum QueryErrorLog {
 /// A log line at error level for every refusal buries the failures that are
 /// faults: a schema that answers "not found" by raising `PT404` produced one
 /// for each such request, with nothing to tell it from a broken query.
-fn query_error_log(error: &postrust_core::Error, refused_before: bool) -> QueryErrorLog {
-    let status = error.status_code();
-    if refused_before {
-        QueryErrorLog::RefusedBefore
-    } else if status.is_client_error() {
-        QueryErrorLog::Refused(status)
-    } else {
-        QueryErrorLog::Fault
+///
+/// Decided by SQLSTATE, not by the status the response carries. Many faults
+/// are answered with a 4xx too -- SQL the planner got wrong (`42601`,
+/// `42703`), a table the schema cache still lists after it was dropped
+/// (`42P01`), a missing grant (`42501`), a bare `RAISE EXCEPTION` (`P0001`) or
+/// a division by zero in a function -- and each of those needs someone to
+/// look at it. Only the classes that are the request meeting a rule the
+/// schema states are refusals.
+fn query_error_log(e: &postrust_core::db::DbError) -> QueryErrorLog {
+    if e.is_connection() {
+        return QueryErrorLog::Fault;
+    }
+    if e.was_queued() {
+        return QueryErrorLog::RefusedBefore;
+    }
+    let Some(database) = e.as_database() else {
+        return QueryErrorLog::Fault;
+    };
+    let status = database.status_code();
+    let code = database.code.as_str();
+    let refusal = match code {
+        // Raised on purpose to answer with a status.
+        "PGRST" => true,
+        _ if code.starts_with("PT") => true,
+        // Integrity constraints: a duplicate key, a check, a foreign key.
+        _ if code.starts_with("23") => true,
+        // Data exceptions on what the client sent: a value that is not an
+        // integer, a date out of range, a string too long. Not division by
+        // zero, which is a function's arithmetic rather than its input.
+        "22012" => false,
+        _ if code.starts_with("22") => status == http::StatusCode::BAD_REQUEST,
+        // A write in the read-only transaction a GET runs in: the method
+        // was the client's choice.
+        "25006" => true,
+        _ => false,
+    };
+    match refusal && status.is_client_error() {
+        true => QueryErrorLog::Refused(status),
+        false => QueryErrorLog::Fault,
     }
 }
 
@@ -3800,9 +3827,10 @@ fn sanitize_error_message(error: &postrust_core::Error) -> String {
 #[cfg(test)]
 mod tests {
     use super::{query_error_log, QueryErrorLog};
+    use http::StatusCode;
 
-    fn database(code: &str) -> postrust_core::Error {
-        postrust_core::Error::from(postrust_core::db::DbError::database(
+    fn database(code: &str) -> postrust_core::db::DbError {
+        postrust_core::db::DbError::database(
             "driver message",
             postrust_core::error::DatabaseError {
                 code: code.into(),
@@ -3813,51 +3841,76 @@ mod tests {
                 table: None,
                 column: None,
             },
-        ))
+        )
     }
 
     #[test]
-    fn client_errors_from_the_query_are_refusals_not_faults() {
-        use http::StatusCode;
-        // A function answering "not found", a check constraint, a duplicate key.
-        assert_eq!(
-            query_error_log(&database("PT404"), false),
-            QueryErrorLog::Refused(StatusCode::NOT_FOUND)
-        );
-        assert_eq!(
-            query_error_log(&database("23514"), false),
-            QueryErrorLog::Refused(StatusCode::BAD_REQUEST)
-        );
-        assert_eq!(
-            query_error_log(&database("23505"), false),
-            QueryErrorLog::Refused(StatusCode::CONFLICT)
-        );
+    fn what_the_schema_answers_on_purpose_is_a_refusal() {
+        for (code, status) in [
+            // A function answering "not found".
+            ("PT404", StatusCode::NOT_FOUND),
+            // A check constraint, a duplicate key.
+            ("23514", StatusCode::BAD_REQUEST),
+            ("23505", StatusCode::CONFLICT),
+            // `id=eq.abc` on an integer column.
+            ("22P02", StatusCode::BAD_REQUEST),
+        ] {
+            assert_eq!(
+                query_error_log(&database(code)),
+                QueryErrorLog::Refused(status),
+                "{code}"
+            );
+        }
+    }
+
+    #[test]
+    fn faults_answered_with_a_4xx_are_still_faults() {
+        for code in [
+            "42601", // SQL the planner got wrong
+            "42703", // likewise
+            "42P01", // a dropped table the schema cache still lists
+            "42501", // a missing grant
+            "P0001", // a bare RAISE EXCEPTION
+            "22012", // a function's arithmetic
+        ] {
+            assert!(
+                database(code)
+                    .as_database()
+                    .unwrap()
+                    .status_code()
+                    .is_client_error(),
+                "{code} is not a 4xx, so this case tests nothing"
+            );
+            assert_eq!(
+                query_error_log(&database(code)),
+                QueryErrorLog::Fault,
+                "{code}"
+            );
+        }
     }
 
     #[test]
     fn server_errors_and_broken_connections_are_faults() {
-        assert_eq!(
-            query_error_log(&database("XX000"), false),
-            QueryErrorLog::Fault
-        );
-        assert_eq!(
-            query_error_log(&database("PT500"), false),
-            QueryErrorLog::Fault
-        );
-        let broken = postrust_core::Error::from(postrust_core::db::DbError::connection("closed"));
-        assert_eq!(query_error_log(&broken, false), QueryErrorLog::Fault);
+        for code in ["XX000", "PT500"] {
+            assert_eq!(
+                query_error_log(&database(code)),
+                QueryErrorLog::Fault,
+                "{code}"
+            );
+        }
+        let broken = postrust_core::db::DbError::connection("closed");
+        assert_eq!(query_error_log(&broken), QueryErrorLog::Fault);
+        assert_eq!(query_error_log(&broken.queued()), QueryErrorLog::Fault);
     }
 
     #[test]
     fn a_queued_refusal_stays_a_refusal_whatever_its_status() {
-        assert_eq!(
-            query_error_log(&database("XX000"), true),
-            QueryErrorLog::RefusedBefore
-        );
-        assert_eq!(
-            query_error_log(&database("PT403"), true),
-            QueryErrorLog::RefusedBefore
-        );
+        for code in ["XX000", "PT403"] {
+            assert_eq!(
+                query_error_log(&database(code).queued()),
+                QueryErrorLog::RefusedBefore
+            );
+        }
     }
 
     /// A data-modifying `WITH` may only appear at the top level, so anything

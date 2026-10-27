@@ -3,8 +3,9 @@
 //! A schema that answers "not found" by raising `PT404` -- or that has a check
 //! constraint, or a unique key -- produced `ERROR Query error: ...` for every
 //! such request, which buries the failures that are faults. Those refusals are
-//! now logged at debug; a query that fails as the server's fault still logs
-//! at error.
+//! now logged at debug. A query that fails as the server's fault still logs
+//! at error -- including the faults answered with a 4xx, such as a missing
+//! grant.
 //!
 //! `DATABASE_URL` must name a superuser on a database with
 //! `scripts/init-db.sql` loaded (for `web_anon`). Run with:
@@ -65,6 +66,8 @@ async fn app() -> Router {
         format!("CREATE TABLE {SCHEMA}.items (id int PRIMARY KEY, n int NOT NULL CHECK (n >= 0))"),
         format!("INSERT INTO {SCHEMA}.items VALUES (1, 0)"),
         format!("GRANT SELECT, INSERT ON {SCHEMA}.items TO web_anon"),
+        // Listed in the schema cache, readable by no one but its owner.
+        format!("CREATE TABLE {SCHEMA}.ungranted (id int PRIMARY KEY)"),
         format!(
             "CREATE FUNCTION {SCHEMA}.missing() RETURNS void LANGUAGE plpgsql AS \
              $$ BEGIN RAISE EXCEPTION 'no such thing' USING ERRCODE = 'PT404'; END $$"
@@ -115,8 +118,17 @@ async fn post(app: &Router, uri: &str, body: &str) -> StatusCode {
     app.clone().oneshot(request).await.unwrap().status()
 }
 
+async fn get(app: &Router, uri: &str) -> StatusCode {
+    let request = Request::builder().uri(uri).body(Body::empty()).unwrap();
+    app.clone().oneshot(request).await.unwrap().status()
+}
+
+/// The query failures logged at error level. Only this handler's own line,
+/// so an unrelated error elsewhere does not change the count.
 fn error_lines(log: &str) -> Vec<&str> {
-    log.lines().filter(|l| l.contains("ERROR")).collect()
+    log.lines()
+        .filter(|l| l.contains("ERROR") && l.contains("Query error:"))
+        .collect()
 }
 
 // A current-thread runtime, so the request runs on the thread whose default
@@ -161,16 +173,22 @@ async fn client_errors_log_at_debug_and_faults_at_error() {
         assert!(log.contains(expected), "missing {expected:?} in:\n{log}");
     }
 
-    // A fault is still an error.
+    // A fault is still an error, and so is one answered with a 4xx: a missing
+    // grant is the deployment's to fix, not the client's.
     assert_eq!(
         post(&app, "/api/rpc/broken", "{}").await,
         StatusCode::INTERNAL_SERVER_ERROR
     );
+    assert!(get(&app, "/api/ungranted").await.is_client_error());
     let log = captured.take();
     let errors = error_lines(&log);
-    assert_eq!(errors.len(), 1, "{log}");
-    assert!(
-        errors[0].contains("Query error:") && errors[0].contains("something broke"),
-        "{log}"
-    );
+    assert_eq!(errors.len(), 2, "{log}");
+    assert!(errors[0].contains("something broke"), "{log}");
+    assert!(errors[1].contains("permission denied"), "{log}");
+
+    let pool = sqlx::PgPool::connect(&database_url()).await.unwrap();
+    sqlx::query(&format!("DROP SCHEMA {SCHEMA} CASCADE"))
+        .execute(&pool)
+        .await
+        .unwrap();
 }
