@@ -3,6 +3,93 @@
 Notable changes, newest first. This file starts at 1.0.0-alpha.1; earlier
 releases are described by their tags and the pull requests behind them.
 
+## 2.4.0
+
+A minor release. GraphQL now follows a schema reload, a write a view cannot
+take is a 405, and query errors the schema answers on purpose leave the error
+log. It also updates five locked dependencies past RustSec advisories
+published since 2.3.2. No breaking change: `cargo semver-checks` against 2.3.2
+reports no semver update required for any stable crate. `postrust-worker`
+stays at 1.0.0 and `postrust-proxy` at 0.6.0: nothing in them changed, and
+their published manifests already accept the new versions.
+
+### Added
+
+- **GraphQL follows `NOTIFY pgrst, 'reload schema'`.** The reload refreshed
+  the REST schema cache only; GraphQL kept the schema it built at start-up,
+  so a table a migration added was missing from GraphQL until a restart.
+  - Each successful reload rebuilds the GraphQL schema beside the old one and
+    swaps it in whole. A rebuild that fails leaves the previous schema serving.
+  - Enum tables are read again on each rebuild, so a value a migration adds
+    reaches the GraphQL enum.
+  - The subscription broker carries over to the rebuilt schema and listens on
+    the tables it adds. Subscriptions opened before a reload keep receiving
+    notifications.
+  - `/v1/graphql` is mounted even when start-up could not build a schema. It
+    answers `unexpected` until a reload builds one, where it was a 404 until a
+    restart.
+  - New API: `GraphQLState::continue_subscriptions`, `NotifyBroker::listen`
+    and `hasura::unavailable` in `postrust-graphql`.
+- **`Allow` on every 405.** RFC 9110 requires it, and it is the answer an
+  `OPTIONS` on the resource gives. A function that writes called with GET and
+  a PUT with filters it cannot take were 405s without one. `Table::allow` is
+  that answer for a relation.
+
+### Fixed
+
+- **A write a view cannot take is a 405, not a 500.** A view PostgreSQL cannot
+  write through, such as a join with no `INSTEAD OF` trigger, refuses every
+  write with `55000 cannot update view`, which was answered `500 PGRST500
+  "Database error"`. It is now `405 PGRST117` with `Allow`, and the message
+  names the view. A write to a materialized view (`42809`) was a 400 and is a
+  405 too. Recognised from PostgreSQL's English message, as the `xmlagg` and
+  missing-role cases are; with another `lc_messages` it stays a 500.
+  `DatabaseError::is_unwritable_view` says which.
+- **Query errors the schema answers on purpose are logged at debug.** Every
+  failed query was logged as `ERROR Query error`, so a schema that answers
+  "not found" by raising `PT404` filled the error log. These are now
+  `DEBUG Query refused with <status>`:
+  - `PT` statuses and `PGRST` raises;
+  - integrity constraints (`23`);
+  - data exceptions on the client's input (`22`, answered 400, except
+    `22012` division by zero);
+  - a write in a GET's read-only transaction (`25006`), and a write the view
+    cannot take.
+
+  Everything else stays at error, including faults answered with a 4xx: SQL
+  the planner got wrong, a table dropped behind the schema cache, a missing
+  grant, a bare `RAISE EXCEPTION`.
+- **A stopped subscription broker releases its connection at once.** Its
+  listener held a database connection until the next notification arrived,
+  which on a quiet table was never.
+
+### Security
+
+- rustls-webpki 0.103.15 to 0.103.16: RUSTSEC-2026-0382 (certificate
+  verification could accept distrusted intermediates).
+- webpki-roots 1.0.5 and webpki-root-certs 1.0.9 to 1.0.11: RUSTSEC-2026-0381
+  and RUSTSEC-2026-0383 (bundled roots trusted distrusted emSign
+  intermediates).
+- ctutils 0.4.3 to 0.4.6: RUSTSEC-2026-0385 (mask generation and `u128`
+  comparisons that were not constant-time).
+- tokio 1.48.0 to 1.54.1: RUSTSEC-2026-0386, an unsoundness in
+  `AsyncFd::new`, which Postrust does not call.
+- RUSTSEC-2026-0387 (crypto-bigint 0.5.5) is ignored in `.cargo/audit.toml`
+  with its reason. No native build compiles it. On wasm32 jsonwebtoken's
+  RustCrypto backend brings it in for ES256/ES384, which Postrust does not
+  accept, and its fix (0.7.6) is a line p256 0.13 cannot take.
+
+### Upgrading
+
+Nothing to change. Three things behave differently:
+
+- A log alert on `Query error` stops firing for refusals such as `PT404`, a
+  duplicate key or a check violation. Faults still log at error.
+- A write to a view that cannot take it is a 405 where it was a 500 (a 400
+  for a materialized view).
+- `/v1/graphql` on a server that could not build its GraphQL schema answers
+  `unexpected` rather than 404.
+
 ## 2.3.2
 
 **Security: rustls 0.23.46 and quinn-proto 0.11.18.** A patch release that

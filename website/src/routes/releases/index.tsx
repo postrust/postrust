@@ -12,6 +12,32 @@ import { LATEST } from "~/data/version";
 
 const VERSION = "2.3.0";
 
+const added240 = [
+  {
+    title: "GraphQL follows a schema reload",
+    body: "NOTIFY pgrst, 'reload schema' refreshed the REST schema cache only, so a table a migration added was missing from GraphQL until a restart. Each reload now rebuilds the GraphQL schema beside the old one and swaps it in whole; a rebuild that fails leaves the previous schema serving. Enum tables are read again, subscriptions opened before the reload keep receiving notifications, and a server that could not build its GraphQL schema at start-up builds it on the next reload.",
+  },
+  {
+    title: "Allow on every 405",
+    body: "A 405 now says what the resource does take, as RFC 9110 requires: the same Allow an OPTIONS gives. A function that writes called with GET, and a PUT with filters it cannot take, were 405s without one.",
+  },
+];
+
+const fixed240 = [
+  {
+    title: "A write a view cannot take is a 405, not a 500",
+    body: 'A view PostgreSQL cannot write through, such as a join with no INSTEAD OF trigger, refuses every write with "cannot update view", and that was answered 500 Database error. It is now 405 PGRST117 with Allow and a message naming the view. A write to a materialized view, a 400 before, is a 405 too.',
+  },
+  {
+    title: "Refusals leave the error log",
+    body: 'Every failed query was logged at error, so a schema answering "not found" by raising PT404 filled the log. PT statuses, constraint violations, bad input values and a write the view cannot take are now logged at debug. Faults stay at error, including those answered with a 4xx: SQL the planner got wrong, a table dropped behind the schema cache, a missing grant, a bare RAISE EXCEPTION.',
+  },
+  {
+    title: "Security: five dependency updates",
+    body: "rustls-webpki 0.103.16, webpki-roots and webpki-root-certs 1.0.11, ctutils 0.4.6 and tokio 1.54.1, past RustSec advisories published since 2.3.2, among them certificate verification that could accept distrusted intermediates. The changelog lists each advisory.",
+  },
+];
+
 const minorAdded = [
   {
     title: "The Cloudflare Workers adapter works",
@@ -94,20 +120,29 @@ export default component$(() => {
         <div class="container-wide py-12">
           <div class="mb-4 flex items-center gap-3">
             <span class="rounded border border-neutral-200 bg-neutral-100 px-2 py-0.5 text-xs font-semibold text-neutral-800">
-              PATCH
+              MINOR
             </span>
-            <span class="text-sm text-neutral-500">security fixes</span>
+            <span class="text-sm text-neutral-500">
+              GraphQL schema reload, 405s, security fixes
+            </span>
           </div>
           <h1 class="mb-4 text-4xl font-bold text-neutral-900">
             Postrust {LATEST}
           </h1>
           <p class="mb-4 max-w-2xl text-lg text-neutral-600">
-            Updates rustls to 0.23.46 and quinn-proto to 0.11.18, which fix
-            seven RustSec advisories published since 2.3.1, among them a remote
-            peer able to panic quinn-proto and a{" "}
-            <code class="text-base">Debug</code> impl in rustls that printed TLS
-            secrets. Nothing in Postrust&rsquo;s own code changed; the images
-            and binaries are rebuilt against the new lockfile. The{" "}
+            GraphQL now picks up a migration when it is announced with{" "}
+            <code class="text-base">NOTIFY pgrst</code>, as REST always has. A
+            write a view cannot take is answered 405 with{" "}
+            <code class="text-base">Allow</code> rather than 500, and errors the
+            schema raises on purpose no longer fill the error log. No breaking
+            change: <code class="text-base">cargo semver-checks</code> against
+            2.3.2 passes for every stable crate.
+          </p>
+          <p class="mb-4 max-w-2xl text-lg text-neutral-600">
+            2.3.2 updated rustls to 0.23.46 and quinn-proto to 0.11.18, which
+            fix seven RustSec advisories, among them a remote peer able to panic
+            quinn-proto and a <code class="text-base">Debug</code> impl in
+            rustls that printed TLS secrets. The{" "}
             <a
               href="https://github.com/postrust/postrust/blob/main/CHANGELOG.md"
               class="text-primary-600 hover:underline"
@@ -160,6 +195,45 @@ export default component$(() => {
 
       <div class="container-wide py-12">
         <div class="max-w-3xl">
+          <h2 class="mb-8 text-3xl font-bold text-neutral-900">
+            Postrust {LATEST}
+          </h2>
+
+          <section class="mb-12">
+            <h2 class="mb-4 text-2xl font-bold text-neutral-900">
+              Added in {LATEST}
+            </h2>
+            <div class="space-y-4">
+              {added240.map((c) => (
+                <div key={c.title} class="rounded-lg bg-neutral-50 p-4">
+                  <h3 class="mb-1 font-semibold text-neutral-900">{c.title}</h3>
+                  <p class="text-sm text-neutral-600">{c.body}</p>
+                </div>
+              ))}
+            </div>
+          </section>
+
+          <section class="mb-12">
+            <h2 class="mb-4 text-2xl font-bold text-neutral-900">
+              Fixed in {LATEST}
+            </h2>
+            <div class="space-y-4">
+              {fixed240.map((c) => (
+                <div key={c.title} class="rounded-lg bg-neutral-50 p-4">
+                  <h3 class="mb-1 font-semibold text-neutral-900">{c.title}</h3>
+                  <p class="text-sm text-neutral-600">{c.body}</p>
+                </div>
+              ))}
+            </div>
+            <p class="mt-4 text-neutral-600">
+              <strong>Upgrading:</strong> nothing to change. A log alert on{" "}
+              <code class="font-mono text-sm">Query error</code> stops firing
+              for refusals such as a{" "}
+              <code class="font-mono text-sm">PT404</code> or a duplicate key;
+              faults still log at error.
+            </p>
+          </section>
+
           <h2 class="mb-8 text-3xl font-bold text-neutral-900">
             Postrust {VERSION}
           </h2>
@@ -754,7 +828,7 @@ export const head: DocumentHead = {
   meta: [
     {
       name: "description",
-      content: `Postrust ${LATEST} fixes seven RustSec advisories. ${VERSION} put the REST API in a Cloudflare Worker over Hyperdrive and rolls back refused writes.`,
+      content: `Postrust ${LATEST} rebuilds GraphQL on a schema reload, answers writes a view cannot take with 405, and updates five dependencies past RustSec advisories.`,
     },
   ],
 };
