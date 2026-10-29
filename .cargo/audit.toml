@@ -42,14 +42,16 @@ ignore = [
     # crypto-bigint 0.5.5 -- timing variability in operations meant to be
     # constant-time.
     #
-    # Not in any native build graph: `cargo tree -i crypto-bigint` prints
-    # nothing. On wasm32 it is compiled, by the same route as rsa above:
-    # jsonwebtoken 10's `rust_crypto` feature brings in p256 and p384 for the
-    # ES256 and ES384 algorithms, and they depend on elliptic-curve 0.13 and
-    # crypto-bigint 0.5. postrust accepts HS256 tokens only, which is HMAC and
-    # uses no big-integer arithmetic, so no affected operation runs. An ECDSA
-    # verification would use only public values -- the key, the signature,
-    # the message -- and the advisory concerns operations on secret integers.
+    # Not in the native build graph of any shipped binary: `cargo tree -i
+    # crypto-bigint` prints nothing. It is compiled by the same routes as rsa
+    # above -- on wasm32, and natively under postrust-auth's test-only
+    # `jwt-rust-crypto` feature: jsonwebtoken 10's `rust_crypto` feature
+    # brings in p256 and p384 for the ES256 and ES384 algorithms, and they
+    # depend on elliptic-curve 0.13 and crypto-bigint 0.5. postrust accepts
+    # HS256 tokens only, which is HMAC and uses no big-integer arithmetic, so
+    # no affected operation runs. An ECDSA verification would use only public
+    # values -- the key, the signature, the message -- and the advisory
+    # concerns operations on secret integers.
     #
     # The fix is in crypto-bigint 0.7.6, which the p256 0.13 line cannot take;
     # jsonwebtoken 11 still depends on p256 0.13. Revisit when jsonwebtoken

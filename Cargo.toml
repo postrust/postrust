@@ -34,8 +34,9 @@ authors = ["Bhanu Pratap Chaudhary"]
 # Only what the request-handling crates need. `full` pulls in mio, which has no
 # networking on wasm32, so the crates that serve or connect (server, Lambda,
 # proxy, GraphQL) ask for it themselves. A Cloudflare Worker builds
-# postrust-core and its siblings without it -- see issue #50.
-tokio = { version = "1.43", default-features = false, features = ["sync", "macros"] }
+# postrust-core and its siblings without it -- see issue #50. At least 1.54.1
+# for RUSTSEC-2026-0386.
+tokio = { version = "1.54.1", default-features = false, features = ["sync", "macros"] }
 async-trait = "0.1"
 futures = "0.3"
 

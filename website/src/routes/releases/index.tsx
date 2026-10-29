@@ -230,7 +230,11 @@ export default component$(() => {
               <code class="font-mono text-sm">Query error</code> stops firing
               for refusals such as a{" "}
               <code class="font-mono text-sm">PT404</code> or a duplicate key;
-              faults still log at error.
+              faults still log at error. A write to a view that cannot take it
+              is a 405 where it was a 500 (a 400 for a materialized view), and{" "}
+              <code class="font-mono text-sm">/v1/graphql</code> on a server
+              that could not build its GraphQL schema answers{" "}
+              <code class="font-mono text-sm">unexpected</code> rather than 404.
             </p>
           </section>
 

@@ -75,9 +75,17 @@ their published manifests already accept the new versions.
 - tokio 1.48.0 to 1.54.1: RUSTSEC-2026-0386, an unsoundness in
   `AsyncFd::new`, which Postrust does not call.
 - RUSTSEC-2026-0387 (crypto-bigint 0.5.5) is ignored in `.cargo/audit.toml`
-  with its reason. No native build compiles it. On wasm32 jsonwebtoken's
-  RustCrypto backend brings it in for ES256/ES384, which Postrust does not
-  accept, and its fix (0.7.6) is a line p256 0.13 cannot take.
+  with its reason. No shipped native binary compiles it. On wasm32, and
+  natively under postrust-auth's test-only `jwt-rust-crypto` feature,
+  jsonwebtoken's RustCrypto backend brings it in for ES256/ES384, which
+  Postrust does not accept, and its fix (0.7.6) is a line p256 0.13 cannot
+  take.
+
+tokio is a direct dependency, and the workspace now requires 1.54.1. The
+others are transitive, so the fixes reach the published binaries and images
+through the lockfile only. A project that depends on the postrust crates from
+crates.io takes them with `cargo update -p rustls-webpki -p webpki-roots -p
+webpki-root-certs -p ctutils`.
 
 ### Upgrading
 
