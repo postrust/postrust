@@ -21,10 +21,37 @@ use std::convert::Infallible;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpListener;
 use tokio::sync::RwLock;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
+
+/// Half-close a failed HTTP/2 connection, then consume bytes the peer already
+/// sent before dropping the socket. On Linux, dropping a socket with unread
+/// input sends RST, which can hide the clean connection close from the peer.
+async fn close_h2_connection_cleanly<T>(io: &mut T)
+where
+    T: AsyncRead + AsyncWrite + Unpin,
+{
+    if io.shutdown().await.is_err() {
+        return;
+    }
+
+    let drain = async {
+        let mut buffer = [0; 1024];
+        loop {
+            match io.read(&mut buffer).await {
+                Ok(0) | Err(_) => break,
+                Ok(_) => {}
+            }
+        }
+    };
+
+    // A well-behaved peer closes after seeing our FIN. Do not let a malformed
+    // client keep the connection task alive if it does not.
+    let _ = tokio::time::timeout(Duration::from_millis(100), drain).await;
+}
 
 /// Proxy service that handles incoming HTTP connections.
 pub struct ProxyService {
@@ -256,7 +283,7 @@ impl ProxyService {
     /// a corrupted HTTP/2 preface there gets an HTTP/1 400 instead of
     /// GOAWAY(PROTOCOL_ERROR): it cannot be told apart from a malformed HTTP/1
     /// request (h2spec 3.5). A listener that only ever speaks HTTP/2 has no
-    /// such ambiguity and answers the way the RFC asks.
+    /// such ambiguity and closes an invalid preface cleanly.
     ///
     /// This is additive. The main port still serves HTTP/1.1 and h2c together;
     /// nothing is given up by enabling it.
@@ -276,7 +303,7 @@ impl ProxyService {
                 }
                 result = listener.accept() => {
                     match result {
-                        Ok((stream, client_addr)) => {
+                        Ok((mut stream, client_addr)) => {
                             if let Err(e) = stream.set_nodelay(true) {
                                 debug!("Could not set TCP_NODELAY on the client socket: {}", e);
                             }
@@ -292,10 +319,11 @@ impl ProxyService {
                                 let mut builder = http2::Builder::new(TokioExecutor::new());
                                 builder.enable_connect_protocol();
                                 if let Err(err) = builder
-                                    .serve_connection(TokioIo::new(stream), service_fn)
+                                    .serve_connection(TokioIo::new(&mut stream), service_fn)
                                     .await
                                 {
                                     debug!("HTTP/2 connection error: {}", err);
+                                    close_h2_connection_cleanly(&mut stream).await;
                                 }
                             });
                         }
@@ -533,5 +561,42 @@ impl ProxyService {
                 )))
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use http_body_util::Empty;
+
+    #[tokio::test]
+    async fn invalid_h2_preface_closes_without_resetting_the_connection() {
+        let (mut server_io, mut client) = tokio::io::duplex(1024);
+
+        let server = tokio::spawn(async move {
+            let service = service_fn(|_| async {
+                Ok::<_, Infallible>(Response::new(Empty::<bytes::Bytes>::new()))
+            });
+            let builder = http2::Builder::new(TokioExecutor::new());
+
+            let result = builder
+                .serve_connection(TokioIo::new(&mut server_io), service)
+                .await;
+            assert!(result.is_err());
+            close_h2_connection_cleanly(&mut server_io).await;
+        });
+
+        client
+            .write_all(b"INVALID CONNECTION PREFACE\r\n\r\n")
+            .await
+            .unwrap();
+
+        let mut received = Vec::new();
+        client.read_to_end(&mut received).await.unwrap();
+        // The server connection preface begins with a SETTINGS frame.
+        assert!(received.len() >= 9);
+        assert_eq!(received[3], 0x4);
+
+        server.await.unwrap();
     }
 }
