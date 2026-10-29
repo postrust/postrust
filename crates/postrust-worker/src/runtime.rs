@@ -2,7 +2,7 @@ use crate::settings::{self, Binding, Settings, Unconfigured};
 use bytes::Bytes;
 use http::{HeaderValue, Method, Response, StatusCode};
 use http_body_util::{BodyExt, Full};
-use postrust_auth::{JwtCache, JwtConfig};
+use postrust_auth::{JwtCache, JwtConfig, JwtKeys};
 use postrust_core::db::tokio_postgres::Config;
 use postrust_core::db::{BoxFuture, Connector, PgSocketDb};
 use postrust_core::{AppConfig, SchemaCache};
@@ -418,6 +418,37 @@ fn database(env: &Env) -> Result<PgSocketDb<Hyperdrive>, postrust_core::Error> {
 struct Isolate {
     schema: Option<Schema>,
     jwt_cache: Option<Rc<JwtCache>>,
+    /// The keys parsed from the secret, and the secret they were parsed from.
+    jwt_keys: Option<(JwtSecret, Option<JwtKeys>)>,
+}
+
+/// `PGRST_JWT_SECRET` and `PGRST_JWT_SECRET_IS_BASE64`, as read.
+type JwtSecret = (Option<String>, bool);
+
+/// The verification keys for this request's configuration.
+///
+/// A Worker has no startup to parse them at: the configuration is read from
+/// the environment on every request. So they are parsed the first time an
+/// isolate sees a secret and kept for as long as the secret stays the same --
+/// a JWKS of RSA keys is not something to decode per request. A secret that
+/// does not parse is answered as the configuration error it is, on every
+/// request, until it is fixed.
+fn jwt_keys(config: &AppConfig) -> Result<Option<JwtKeys>, postrust_core::Error> {
+    let secret: JwtSecret = (config.jwt_secret.clone(), config.jwt_secret_is_base64);
+    let held = ISOLATE.with(|i| {
+        i.borrow()
+            .jwt_keys
+            .as_ref()
+            .filter(|(parsed_from, _)| *parsed_from == secret)
+            .map(|(_, keys)| keys.clone())
+    });
+    if let Some(keys) = held {
+        return Ok(keys);
+    }
+    let keys = JwtKeys::from_config(secret.0.as_deref(), secret.1)
+        .map_err(|e| postrust_core::Error::Config(format!("PGRST_JWT_SECRET: {e}")))?;
+    ISOLATE.with(|i| i.borrow_mut().jwt_keys = Some((secret, keys.clone())));
+    Ok(keys)
 }
 
 /// A schema cache, and when this isolate last made sure it was current.
@@ -576,7 +607,7 @@ impl State {
         let db = database(env)?;
         let schema = schema(env, &settings).await?;
         let config = settings.config;
-        let jwt_config = postrust_engine::jwt_config(&config);
+        let jwt_config = postrust_engine::jwt_config_with_keys(&config, jwt_keys(&config)?);
         let jwt_cache = ISOLATE.with(|i| {
             let mut isolate = i.borrow_mut();
             if isolate.jwt_cache.is_none() {

@@ -35,8 +35,14 @@ jsonwebtoken10 = { package = "jsonwebtoken", version = "10.4", default-features 
 # verifying is done by jsonwebtoken 10's pure-Rust RustCrypto backend instead.
 # Renamed, and aliased back to `jsonwebtoken` in lib.rs: the API this crate
 # uses is the same in both. Not used natively, where the RustCrypto backend
-# would cost the server binary 0.7 MB and aws-lc-rs 2.6 MB. HMAC only, so no
-# `use_pem`: postrust accepts HS256 tokens and nothing else.
+# would cost the server binary 0.7 MB and aws-lc-rs 2.6 MB. No `use_pem`:
+# asymmetric keys come from a JWK, and `DecodingKey::from_*_components` builds
+# them without PEM (true of jsonwebtoken 9 too). `rust_crypto` already pulled
+# in rsa, p256, p384 and ed25519-dalek, and the library's verifier dispatches
+# on the token's algorithm at run time, so they were linked into the Worker
+# even when only HMAC was accepted. Accepting them cost no new crate: the
+# release wasm (before wasm-opt) went from 4,532,688 to 4,569,272 bytes,
+# +36 KB, +11 KB gzipped -- the JWK parsing, not the cryptography.
 jsonwebtoken10 = { package = "jsonwebtoken", version = "10.4", default-features = false, features = [
     "rust_crypto",
 ] }

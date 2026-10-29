@@ -88,7 +88,8 @@ async fn app() -> Router {
         .await
         .expect("schema cache");
     let state = Arc::new({
-        let mut state = AppState::new(pool, schema_cache, config);
+        let mut state =
+            AppState::new(pool, schema_cache, config).expect("the test's JWT secret parses");
         // Uncached, so a test sees each request validated as it was written.
         state.jwt_cache = None;
         state
@@ -227,7 +228,8 @@ async fn a_pool_that_runs_dry_is_logged_at_error() {
         .await
         .expect("schema cache");
     let held = pool.acquire().await.expect("the pool's one connection");
-    let state = Arc::new(AppState::new(pool, schema_cache, config));
+    let state =
+        Arc::new(AppState::new(pool, schema_cache, config).expect("the test's JWT secret parses"));
     let api: Router<Arc<AppState>> = Router::new()
         .route("/", any(handle_request))
         .route("/{*path}", any(handle_request));

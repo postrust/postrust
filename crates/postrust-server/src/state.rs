@@ -1,6 +1,6 @@
 //! Application state.
 
-use postrust_auth::{JwtCache, JwtConfig};
+use postrust_auth::{JwtCache, JwtConfig, JwtKeyError};
 use postrust_core::{AppConfig, SchemaCache};
 use postrust_engine::State;
 use sqlx::PgPool;
@@ -28,15 +28,20 @@ impl AppState {
     /// State for `config`, serving `schema_cache` through `pool`.
     ///
     /// The JWT configuration and token cache are derived from `config`, as
-    /// [`build`](crate::build) derives them.
-    pub fn new(pool: PgPool, schema_cache: SchemaCache, config: AppConfig) -> Self {
-        Self {
+    /// [`build`](crate::build) derives them. Fails when the configured JWT
+    /// secret does not parse; see [`postrust_engine::jwt_config`].
+    pub fn new(
+        pool: PgPool,
+        schema_cache: SchemaCache,
+        config: AppConfig,
+    ) -> Result<Self, JwtKeyError> {
+        Ok(Self {
             pool,
             schema_cache: RwLock::new(schema_cache),
-            jwt_config: postrust_engine::jwt_config(&config),
+            jwt_config: postrust_engine::jwt_config(&config)?,
             jwt_cache: JwtCache::new(config.jwt_cache_enabled, config.jwt_cache_max_lifetime),
             config,
-        }
+        })
     }
 
     /// Get a read lock on the schema cache.

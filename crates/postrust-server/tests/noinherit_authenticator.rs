@@ -248,7 +248,8 @@ async fn a_request_is_answered_through_the_authenticator() {
         .await
         .expect("schema cache as the authenticator");
     let state = Arc::new({
-        let mut state = AppState::new(authenticator, schema_cache, config);
+        let mut state = AppState::new(authenticator, schema_cache, config)
+            .expect("the test's JWT secret parses");
         // Uncached, so a test sees each request validated as it was written.
         state.jwt_cache = None;
         state

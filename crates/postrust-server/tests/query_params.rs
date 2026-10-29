@@ -72,7 +72,8 @@ async fn build_app_with(max_rows: Option<i64>, max_body_size: Option<usize>) -> 
         .expect("failed to load schema cache");
 
     let state = Arc::new({
-        let mut state = AppState::new(pool, schema_cache, config);
+        let mut state =
+            AppState::new(pool, schema_cache, config).expect("the test's JWT secret parses");
         // Uncached, so a test sees each request validated as it was written.
         state.jwt_cache = None;
         state

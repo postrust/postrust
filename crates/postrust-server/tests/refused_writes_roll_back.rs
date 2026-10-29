@@ -97,7 +97,8 @@ async fn state_with(
         .await
         .expect("schema cache");
     Arc::new({
-        let mut state = AppState::new(pool, schema_cache, config);
+        let mut state =
+            AppState::new(pool, schema_cache, config).expect("the test's JWT secret parses");
         // Uncached, so a test sees each request validated as it was written.
         state.jwt_cache = None;
         state

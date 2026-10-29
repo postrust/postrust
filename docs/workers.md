@@ -123,7 +123,7 @@ npx wrangler deploy
 
 The Worker reads the server's own variables, set as Worker variables or
 secrets: `PGRST_DB_SCHEMAS`, `PGRST_DB_ANON_ROLE`, `PGRST_JWT_SECRET`,
-`PGRST_JWT_AUD`, `PGRST_JWT_ROLE_CLAIM_KEY`, `PGRST_DB_EXTRA_SEARCH_PATH`,
+`PGRST_JWT_AUD`, `PGRST_JWT_ISS`, `PGRST_JWT_ROLE_CLAIM_KEY`, `PGRST_DB_EXTRA_SEARCH_PATH`,
 `PGRST_DB_PRE_REQUEST`, `PGRST_APP_SETTINGS_*`, `PGRST_ROLE_SETTINGS`,
 `PGRST_SERVER_CORS_ORIGINS` and the rest. See
 [configuration.md](configuration.md). Settings that only make sense for a

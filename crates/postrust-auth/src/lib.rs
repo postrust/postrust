@@ -14,11 +14,13 @@ mod cache;
 mod claims;
 pub mod hasura;
 mod jwt;
+mod keys;
 
 pub use cache::JwtCache;
 pub use claims::Claims;
 pub use hasura::{HasuraAuthConfig, HasuraIdentity, SecretOutcome, TokenRole};
 pub use jwt::validate_token;
+pub use keys::{JwtKeyError, JwtKeys, KeySet};
 
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -73,12 +75,16 @@ impl AuthResult {
 #[derive(Clone, Debug)]
 #[non_exhaustive]
 pub struct JwtConfig {
-    /// Secret key for HS256/HS384/HS512
-    pub secret: Option<String>,
-    /// Whether secret is base64 encoded
-    pub secret_is_base64: bool,
+    /// The keys tokens are verified with, parsed from `PGRST_JWT_SECRET` by
+    /// [`JwtKeys::from_config`] when the configuration is read. `None` when
+    /// no secret is configured, and every token is then refused with
+    /// [`JwtError::SecretMissing`].
+    pub keys: Option<JwtKeys>,
     /// Required audience claim
     pub audience: Option<String>,
+    /// The issuer a token's `iss` must name (`PGRST_JWT_ISS`). When set, a
+    /// token with no `iss` is refused too.
+    pub issuer: Option<String>,
     /// Claim key containing the role
     pub role_claim_key: String,
     /// Default role for anonymous requests
@@ -88,9 +94,9 @@ pub struct JwtConfig {
 impl Default for JwtConfig {
     fn default() -> Self {
         Self {
-            secret: None,
-            secret_is_base64: false,
+            keys: None,
             audience: None,
+            issuer: None,
             role_claim_key: "role".to_string(),
             anon_role: None,
         }
@@ -122,6 +128,10 @@ pub enum ClaimFault {
     /// `aud` is present and does not list the audience this server accepts.
     #[error("JWT not in audience")]
     NotInAudience,
+
+    /// An issuer is configured and `iss` does not name it, or is absent.
+    #[error("JWT issuer is not the expected one")]
+    UnexpectedIssuer,
 
     /// The payload decoded but is not a JSON object of claims.
     #[error("Parsing claims failed")]

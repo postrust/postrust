@@ -20,7 +20,8 @@ Postrust uses JWT (JSON Web Tokens) for authentication and PostgreSQL's Row-Leve
 
 ### JWT Secret
 
-Set the secret used to sign tokens:
+`PGRST_JWT_SECRET` is read as PostgREST reads `jwt-secret`. A plain string is
+an HMAC secret, and admits HS256 tokens:
 
 ```bash
 # HS256 secret (minimum 32 characters)
@@ -29,6 +30,64 @@ PGRST_JWT_SECRET="your-super-secret-key-at-least-32-characters"
 # Base64 encoded secret
 PGRST_JWT_SECRET_IS_BASE64=true
 PGRST_JWT_SECRET="eW91ci1zZWNyZXQ..."
+```
+
+### Asymmetric keys: JWK and JWKS
+
+A JSON Web Key, or a JSON Web Key Set (`{"keys": [...]}`), is a set of
+verification keys. That is how an identity provider's public keys are given:
+the provider signs with its private key, and Postrust verifies with the public
+one.
+
+```bash
+# One RSA public key
+PGRST_JWT_SECRET='{"kty":"RSA","alg":"RS256","n":"0vx7agoebGcQ...","e":"AQAB"}'
+
+# A JWKS, as an identity provider publishes it at its jwks_uri
+PGRST_JWT_SECRET='{"keys":[{"kid":"2024-01","kty":"EC","crv":"P-256","x":"...","y":"..."},
+                           {"kid":"2024-07","kty":"OKP","crv":"Ed25519","x":"..."}]}'
+```
+
+| `kty` | Algorithms | Notes |
+|-------|------------|-------|
+| `RSA` | RS256, RS384, RS512, PS256, PS384, PS512 | Modulus of at least 2048 bits |
+| `EC` | ES256 (`crv: P-256`), ES384 (`crv: P-384`) | |
+| `OKP` | EdDSA (`crv: Ed25519`) | |
+| `oct` | HS256, HS384, HS512 | `k` is the HMAC secret, base64url |
+
+**The algorithm comes from the key, never from the token.** A key admits the
+algorithm its `alg` names, or, with no `alg`, every algorithm its type can do.
+A token whose header names an algorithm the key does not admit is refused
+before any signature is checked, so neither `alg: none` nor an HS256 token
+"signed" with an RSA public key can get through.
+
+**Choosing the key.** A token with a `kid` is checked against the key with that
+`kid` and no other; an unknown `kid` is refused (`PGRST301`, "No suitable key
+or wrong key type"). A token without a `kid` is tried against every key that
+admits its algorithm, and passes if any of them verifies it. A plain string
+secret has no `kid` to match, and accepts HS256 tokens whatever `kid` they
+carry.
+
+**Keys that cannot verify are set aside.** A key with `"use": "enc"`,
+`key_ops` without `verify`, an encryption `alg` (`RSA-OAEP`, ...), or a type or
+curve not listed above (P-521, X25519, ...) is skipped with a warning, because
+providers' key sets routinely include them. A key that claims to be usable and
+is malformed, or a secret that starts with `{` and is not valid JSON, stops the
+server from starting: it is a mistake, and quietly treating it as an HMAC
+secret would make the public key a signing secret.
+
+The key set is parsed once, when the configuration is read. Fetching a JWKS
+from its URL is not supported yet: give the key set itself.
+
+### Issuer
+
+`PGRST_JWT_ISS` names the one issuer to accept. When it is set, a token's
+`iss` must equal it exactly, and a token with **no** `iss` is refused too —
+unlike `aud`, where an absent claim means "for everybody". Unset, `iss` is not
+looked at. (Not a PostgREST setting.)
+
+```bash
+PGRST_JWT_ISS="https://auth.example.com/"
 ```
 
 ### Anonymous Role
@@ -57,6 +116,7 @@ PGRST_DB_ANON_ROLE="web_anon"
 | `iat` | Issued at timestamp | Optional |
 | `nbf` | Not before timestamp | Optional |
 | `aud` | Audience | Optional |
+| `iss` | Issuer | Required when `PGRST_JWT_ISS` is set |
 | `sub` | Subject (user ID) | Optional |
 
 #### How the claims are checked
@@ -432,7 +492,9 @@ HTTP Status: 401
 ### The token could not be read — `PGRST301`
 
 The signature did not verify, the key was wrong, or the `Authorization`
-header was not a bearer token.
+header was not a bearer token. A token for which the server holds no key at
+all — an unknown `kid`, or an algorithm no configured key admits — is reported
+as `No suitable key or wrong key type`.
 
 ```json
 {
@@ -446,8 +508,9 @@ HTTP Status: 401
 
 The signature verified and the claims were not acceptable. The message names
 which claim: `JWT expired`, `JWT not yet valid`, `JWT issued at future`,
-`JWT not in audience`, `The JWT 'exp' claim must be a number`, or `The JWT
-'aud' claim must be a string or an array of strings`.
+`JWT not in audience`, `JWT issuer is not the expected one`, `The JWT 'exp'
+claim must be a number`, or `The JWT 'aud' claim must be a string or an array
+of strings`.
 
 ```json
 {

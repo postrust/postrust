@@ -125,7 +125,7 @@ pub struct AppConfig {
     // ========================================================================
     // JWT Settings
     // ========================================================================
-    /// JWT secret key (or JWKS URL)
+    /// JWT secret: an HMAC secret, or a JSON Web Key or JWK Set.
     pub jwt_secret: Option<String>,
 
     /// JWT secret as base64
@@ -134,6 +134,10 @@ pub struct AppConfig {
 
     /// JWT audience claim to validate
     pub jwt_aud: Option<String>,
+
+    /// The issuer a token's `iss` claim must name (`PGRST_JWT_ISS`). Unset,
+    /// `iss` is not checked.
+    pub jwt_iss: Option<String>,
 
     /// JWT claim that contains the role
     #[serde(default = "default_jwt_role_claim")]
@@ -271,6 +275,7 @@ impl Default for AppConfig {
             jwt_secret: None,
             jwt_secret_is_base64: false,
             jwt_aud: None,
+            jwt_iss: None,
             jwt_role_claim_key: default_jwt_role_claim(),
             jwt_cache_enabled: true,
             jwt_cache_max_lifetime: default_jwt_cache_max(),
@@ -485,6 +490,13 @@ impl AppConfig {
         }
         if let Ok(aud) = get("PGRST_JWT_AUD") {
             config.jwt_aud = Some(aud);
+        }
+        // Not a PostgREST setting. Empty is read as unset rather than as an
+        // issuer nobody can name, which would refuse every token.
+        if let Ok(iss) = get("PGRST_JWT_ISS") {
+            if !iss.trim().is_empty() {
+                config.jwt_iss = Some(iss);
+            }
         }
         // Both of these reach the JWT layer already -- `JwtConfig` is built
         // from them in every binary. Only the environment read was missing, so
@@ -1184,6 +1196,26 @@ mod tests {
                 "https://a.example".to_string(),
                 "https://b.example".to_string()
             ]
+        );
+    }
+
+    #[test]
+    fn the_jwt_issuer_is_read_and_an_empty_one_is_unset() {
+        let read = |value: &str| {
+            AppConfig::try_from_vars([("PGRST_JWT_ISS", value)])
+                .unwrap()
+                .jwt_iss
+        };
+        assert_eq!(
+            read("https://issuer.example").as_deref(),
+            Some("https://issuer.example")
+        );
+        assert_eq!(read("  "), None);
+        assert_eq!(
+            AppConfig::try_from_vars(Vec::<(String, String)>::new())
+                .unwrap()
+                .jwt_iss,
+            None
         );
     }
 

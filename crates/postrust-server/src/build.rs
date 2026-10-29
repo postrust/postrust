@@ -183,6 +183,12 @@ impl Builder {
     /// Otherwise as [`build`].
     pub async fn build(self) -> Result<App> {
         let nests = mount_points(self.nests)?;
+        // The JWT secret too, for the same reason: a key set that does not
+        // parse is a configuration error, and is better reported before the
+        // database is connected to than after. Parsed again where the state
+        // is made, once, at start-up.
+        postrust_engine::jwt_config(&self.config)
+            .map_err(|e| anyhow::anyhow!("PGRST_JWT_SECRET: {e}"))?;
         let mut app = assemble(self.config, self.host, nests).await?;
         for wrap in self.layers {
             app.router = wrap(app.router);
@@ -328,7 +334,10 @@ async fn assemble(config: postrust_core::AppConfig, host: Host, nests: Nests) ->
     info!("{}", schema_cache.summary());
 
     // Create app state
-    let state = Arc::new(AppState::new(pool, schema_cache, config.clone()));
+    let state = Arc::new(
+        AppState::new(pool, schema_cache, config.clone())
+            .map_err(|e| anyhow::anyhow!("PGRST_JWT_SECRET: {e}"))?,
+    );
 
     // `db_channel_enabled`: reload the schema cache when PostgreSQL says the
     // schema changed, instead of on a restart. A migration ends with

@@ -16,23 +16,50 @@ minimum supported Rust version are unchanged.
   `#[non_exhaustive]`.** 2.0.0 did this for the configuration types and missed
   these two, which asymmetric keys and telemetry both need to extend. Another
   crate can no longer build either with a struct literal.
+- **`JwtConfig.secret` and `secret_is_base64` are replaced by `keys`**, the
+  parsed key set, and `issuer` is added.
+- **A JWT secret that cannot be used is a start-up error.** A `PGRST_JWT_SECRET`
+  that begins with `{` and is not a valid JWK or JWKS, or that is not the
+  base64 `PGRST_JWT_SECRET_IS_BASE64` says it is, stops the server before it
+  connects to the database. Bad base64 was a 401 on every request; a
+  malformed JWK would have been an HMAC secret, which PostgREST still treats
+  it as -- letting anyone who holds the public key sign tokens. On a Worker,
+  which has no start-up, each request is answered PGRST901 until it is fixed.
+- A token whose header does not parse is PGRST301 ("No suitable key or wrong
+  key type"), not PGRST303.
 
 ### Added
 
+- **Asymmetric JWTs.** `PGRST_JWT_SECRET` may be a JWK or a JWKS
+  (`{"keys": [...]}`), as in PostgREST, and tokens signed with RS256/384/512,
+  PS256/384/512, ES256, ES384 or EdDSA are verified with it.
+  - The algorithm comes from the key, never from the token: each key admits
+    the one its JWK `alg` names, or the defaults for its type. `alg: none`,
+    and an HS256 token whose HMAC secret is an RSA public key, are refused
+    before any signature is checked.
+  - A token with a `kid` is checked against that key only; one without is
+    tried against each key that admits its algorithm.
+  - Keys marked for encryption, and of types not supported (P-521, X25519),
+    are set aside with a warning.
+- **`PGRST_JWT_ISS`.** When set, a token's `iss` must name it, and a token
+  with no `iss` is refused (PGRST303, "JWT issuer is not the expected one").
 - `postrust_engine::jwt_config(&AppConfig)`: the JWT configuration an
-  `AppConfig` describes. The server, the Lambda adapter and the Worker each
-  spelled this out by hand, and now all take it from here.
+  `AppConfig` describes, and `jwt_config_with_keys` for keys already parsed.
+  The server, the Lambda adapter and the Worker each spelled this out by
+  hand, and now all take it from here.
 - `AppState::new(pool, schema_cache, config)`, which derives the JWT
   configuration and token cache from `config` the way `build` does.
+- `postrust_auth::{KeySet, JwtKeys, JwtKeyError}`.
 
 ### Upgrading from 2.x
 
 Only code that built `JwtConfig` or `AppState` with a struct literal is
 affected. Replace an `AppState { .. }` with `AppState::new(pool, schema_cache,
-config)` and assign any field that should differ -- a test that wants every
+config)?` and assign any field that should differ -- a test that wants every
 token validated sets `state.jwt_cache = None`. Replace a `JwtConfig { .. }` with
-`postrust_engine::jwt_config(&config)`, or with `JwtConfig::default()` and
-assignments.
+`postrust_engine::jwt_config(&config)?`, or with `JwtConfig::default()` and
+assignments; `secret` is now `keys`, built with `JwtKeys::from_config`. Both
+constructors fail only when the JWT secret does not parse.
 
 ## 2.4.0
 

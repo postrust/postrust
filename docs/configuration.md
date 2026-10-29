@@ -93,9 +93,10 @@ curl http://localhost:3000/users \
 
 | Variable | Description | Default |
 |----------|-------------|---------|
-| `PGRST_JWT_SECRET` | Secret for HS256/HS384/HS512 | (none) |
+| `PGRST_JWT_SECRET` | HMAC secret (HS256), or a JWK / JWK Set of verification keys (RS\*, PS\*, ES256/384, EdDSA, HS\*) | (none) |
 | `PGRST_JWT_SECRET_IS_BASE64` | Is secret base64 encoded? | `false` |
 | `PGRST_JWT_AUD` | Required audience claim | (none) |
+| `PGRST_JWT_ISS` | Required issuer: a token's `iss` must equal it, and must be present | (none) |
 | `PGRST_JWT_ROLE_CLAIM_KEY` | Claim key containing role | `role` |
 | `PGRST_JWT_CACHE_ENABLED` | Cache validated tokens, so a repeated token is not verified again | `true` |
 | `PGRST_JWT_CACHE_MAX_LIFETIME` | How long a cached validation may be reused, in seconds. A token's own `exp` bounds this — the cache never answers with a token past its expiry. `0` turns the cache off | `3600` |
@@ -109,7 +110,14 @@ PGRST_JWT_SECRET="your-super-secret-key-at-least-32-characters"
 # Base64 encoded secret
 PGRST_JWT_SECRET_IS_BASE64=true
 PGRST_JWT_SECRET="eW91ci1zdXBlci1zZWNyZXQta2V5LWF0LWxlYXN0LTMyLWNoYXJhY3RlcnM="
+
+# A JWK or a JWKS (an identity provider's public keys)
+PGRST_JWT_SECRET='{"keys":[{"kid":"k1","kty":"RSA","n":"0vx7agoebGcQ...","e":"AQAB"}]}'
 ```
+
+A JSON value is parsed once at startup, and a malformed one stops the server
+from starting. See [Authentication](authentication.md#asymmetric-keys-jwk-and-jwks)
+for how the key and algorithm are chosen.
 
 ### Custom Role Claim
 
