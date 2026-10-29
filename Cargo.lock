@@ -2876,6 +2876,7 @@ dependencies = [
  "chrono",
  "http",
  "hyper",
+ "indexmap",
  "jsonwebtoken 9.3.1",
  "mimalloc",
  "pin-project-lite",

@@ -17,7 +17,7 @@
 mod handler;
 mod state;
 
-pub use handler::{allow, error_response, handle};
+pub use handler::{allow, authenticate, authorization, error_response, handle};
 pub use state::State;
 
 use postrust_auth::{JwtConfig, JwtKeyError, JwtKeys};

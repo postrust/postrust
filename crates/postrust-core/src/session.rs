@@ -64,6 +64,7 @@ pub struct Session<'a> {
     trace_id: Option<String>,
     timezone: Option<String>,
     extra: Vec<(String, String)>,
+    isolation: Option<IsolationLevel>,
     read_only: bool,
     pre_request: bool,
 }
@@ -90,6 +91,7 @@ impl<'a> Session<'a> {
             trace_id: None,
             timezone: None,
             extra: Vec::new(),
+            isolation: None,
             read_only: false,
             pre_request: true,
         }
@@ -148,6 +150,18 @@ impl<'a> Session<'a> {
         self
     }
 
+    /// The transaction's isolation level, over the role's and the server's.
+    ///
+    /// Without one it is the role's own setting where it has one, and
+    /// `PGRST_DB_TX_ISOLATION` otherwise. For a caller that knows what it
+    /// needs of one transaction -- a hand-written route that reads twice and
+    /// needs both reads to agree. `None` leaves the choice to the
+    /// configuration.
+    pub fn isolation(mut self, isolation: Option<IsolationLevel>) -> Self {
+        self.isolation = isolation;
+        self
+    }
+
     /// Whether the transaction is read-only. See [`Session::statements`].
     pub fn read_only(mut self, read_only: bool) -> Self {
         self.read_only = read_only;
@@ -185,13 +199,16 @@ impl<'a> Session<'a> {
         // Isolation level. `SET TRANSACTION` is only accepted before the
         // first statement of a transaction, so it goes here.
         //
-        // A role's own setting wins over the server-wide
-        // `PGRST_DB_TX_ISOLATION`, and both are closed enums rendered by
-        // `to_sql` -- never caller text. Issued only when it differs from
-        // PostgreSQL's own default, so the common case sends nothing.
+        // One asked for with `isolation` wins, then a role's own setting, then
+        // the server-wide `PGRST_DB_TX_ISOLATION`. All are closed enums
+        // rendered by `to_sql` -- never caller text. Issued only when it
+        // differs from PostgreSQL's own default, so the common case sends
+        // nothing.
         let role_settings = self.config.role_settings.get(&self.role);
-        let isolation = role_settings
-            .and_then(|r| r.isolation_level.as_ref())
+        let isolation = self
+            .isolation
+            .as_ref()
+            .or_else(|| role_settings.and_then(|r| r.isolation_level.as_ref()))
             .unwrap_or(&self.config.db_tx_isolation);
         if *isolation != IsolationLevel::ReadCommitted {
             statements.push(SessionStatement::new(
@@ -526,6 +543,48 @@ mod tests {
         assert_eq!(
             &params[params.len() - 4..],
             &text(&["timezone", "UTC", "hasura.role", "alice"])[..]
+        );
+    }
+
+    /// An isolation level asked for wins over the role's and the server's,
+    /// and asking for PostgreSQL's default sends nothing, as it does when the
+    /// configuration says it.
+    #[test]
+    fn an_isolation_level_asked_for_wins() {
+        let mut config = AppConfig {
+            db_tx_isolation: IsolationLevel::RepeatableRead,
+            ..AppConfig::default()
+        };
+        config.role_settings.insert(
+            "editor".to_string(),
+            RoleSettings {
+                isolation_level: Some(IsolationLevel::Serializable),
+                statement_timeout: None,
+            },
+        );
+        let first = |session: Session| session.statements()[0].sql.clone();
+
+        assert_eq!(
+            first(Session::new(&config, "editor", vec![])),
+            "SET TRANSACTION ISOLATION LEVEL SERIALIZABLE"
+        );
+        assert_eq!(
+            first(
+                Session::new(&config, "editor", vec![])
+                    .isolation(Some(IsolationLevel::RepeatableRead))
+            ),
+            "SET TRANSACTION ISOLATION LEVEL REPEATABLE READ"
+        );
+        assert_eq!(
+            first(
+                Session::new(&config, "editor", vec![])
+                    .isolation(Some(IsolationLevel::ReadCommitted))
+            ),
+            set_config(2)
+        );
+        assert_eq!(
+            first(Session::new(&config, "other", vec![]).isolation(None)),
+            "SET TRANSACTION ISOLATION LEVEL REPEATABLE READ"
         );
     }
 

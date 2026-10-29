@@ -21,16 +21,20 @@
 pub mod app;
 pub mod build;
 pub mod custom;
+mod error;
 pub mod lenient_uri;
 pub mod state;
 pub mod telemetry;
+mod user;
 
 #[cfg(feature = "admin-ui")]
 pub mod admin;
 
 pub use app::handle_request;
 pub use build::{build, App, Builder, Host, RESERVED_PREFIXES};
-pub use state::AppState;
+pub use error::Error;
+pub use state::{AppState, TxOptions};
+pub use user::User;
 
 #[cfg(feature = "admin-ui")]
 pub use admin::admin_router;

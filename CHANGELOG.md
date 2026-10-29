@@ -30,6 +30,26 @@ minimum supported Rust version are unchanged.
 
 ### Added
 
+- **Routes of your own run as their caller.** A route nested with
+  `Builder::nest` takes `postrust_server::User`, an axum extractor that
+  authenticates the request as REST does -- the same token cache, anonymous
+  role and refusals -- and `AppState::begin_as(&user)` begins a sqlx
+  transaction that runs as them, so a row-level security policy written for
+  the API applies to the route's own SQL. Pooled connections were the
+  authenticator's, with no claims set, and the documentation said so.
+  - The transaction is set up by the `Session` REST uses: role, claims,
+    `request.method`, `request.path`, `request.headers`, `request.cookies`,
+    `request.trace_id`, `search_path`, `app.settings.*` and `db_pre_request`,
+    all transaction-local.
+  - `begin_as_with(&user, TxOptions)` makes it read-only, sets its isolation
+    level, or skips `db_pre_request`. `Session::isolation` is the knob
+    beneath it.
+  - `Option<User>` is `None` for a request with no `Authorization` header; a
+    token that does not verify is refused either way.
+  - `postrust_server::Error` answers in PostgREST's error shape, with REST's
+    status for each SQLSTATE, and `?` converts a `sqlx::Error` into it.
+  - `postrust_engine::authenticate` and `authorization`: how REST
+    authenticates a request, for a host's own routes to share.
 - **Asymmetric JWTs.** `PGRST_JWT_SECRET` may be a JWK or a JWKS
   (`{"keys": [...]}`), as in PostgREST, and tokens signed with RS256/384/512,
   PS256/384/512, ES256, ES384 or EdDSA are verified with it.

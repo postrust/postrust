@@ -41,8 +41,8 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-postrust-server = "2.3"                                # features = ["graphql"] or ["admin-ui"] as needed
-postrust-core = "2.3"
+postrust-server = "3"                                  # features = ["graphql"] or ["admin-ui"] as needed
+postrust-core = "3"
 axum = "0.8"
 tokio = { version = "1", features = ["full"] }
 sqlx = { version = "0.8", default-features = false, features = ["postgres"] }
@@ -205,11 +205,11 @@ async fn db_handler(State(state): State<Arc<AppState>>) -> impl IntoResponse {
 ```
 
 **Row-level security.** The pool connects as the authenticator role, and a
-query on it runs as that role: it does not switch to the caller's role or set
-`request.jwt.claims`, so RLS policies written for API roles do not apply. A
-helper for running a query as the caller is planned; until then, keep these
-handlers to what the authenticator may see, or switch role yourself inside a
-transaction.
+query sent on it runs as that role: with every grant the authenticator has,
+and with no `request.jwt.claims` for a policy to read, so RLS policies written
+for the API's roles do not apply. Use the pool directly only for what the
+authenticator may see. For a query that should run as the caller, see
+[Running as the Caller](#running-as-the-caller).
 
 ### With JSON Body
 
@@ -330,25 +330,28 @@ async fn with_headers(headers: HeaderMap) -> impl IntoResponse {
 
 ### Error Handling
 
-```rust
-use axum::http::StatusCode;
+`postrust_server::Error` answers in PostgREST's error shape -- the `code`,
+`message`, `details` and `hint` body and the status that goes with it -- so a
+client of the API reads a route's failures the way it reads the API's. `?`
+converts a `sqlx::Error` into one:
 
+```rust
 async fn fallible_handler(
     State(state): State<Arc<AppState>>,
-) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
-    sqlx::query("SELECT 1")
-        .execute(&state.pool)
-        .await
-        .map_err(|e| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({ "error": e.to_string() })),
-            )
-        })?;
-
+) -> Result<Json<serde_json::Value>, postrust_server::Error> {
+    sqlx::query("SELECT 1").execute(&state.pool).await?;
     Ok(Json(serde_json::json!({ "success": true })))
 }
 ```
+
+A database error is mapped by its SQLSTATE with the table REST uses: a unique
+or foreign-key violation is 409, a missing grant (`42501`) 401, a bare
+`RAISE EXCEPTION` 400, a function's `RAISE sqlstate 'PGRST'` the status,
+headers and body it wrote; a connection that broke mid-statement is 503, and
+one that could not be had from the pool in time is 500 (`PGRST500`). The database's own message, detail and hint are sanitised as
+REST sanitises them, and passed through in compatibility mode -- for the
+routers given to `Builder::nest`, which is where the server can see the
+setting.
 
 ## Accessing Application State
 
@@ -542,28 +545,121 @@ fn webhooks() -> Router<Arc<AppState>> {
 
 ### Authentication
 
-`postrust_auth::authenticate` verifies a bearer token against the server's own
-JWT configuration (add `postrust-auth` to your dependencies), so your routes
-accept the tokens the API accepts. A
-middleware built with `from_fn_with_state` needs the state value, which does
-not exist until the application is built, so check the token in the handler:
+There is no middleware to write: take the caller as a
+[`User`](#running-as-the-caller) in the handler. Because `User` is an
+extractor, a request it refuses never reaches the handler's body.
+
+## Running as the Caller
+
+A route of yours is reached by the API's clients, with the API's tokens, and
+the policies on your tables were written for the role and claims the API runs
+a request as. `postrust_server::User` is the API's answer to who the caller
+is, and `AppState::begin_as` is a transaction that runs as them:
 
 ```rust
-use axum::http::HeaderMap;
+use axum::{extract::State, Json};
+use postrust_server::{AppState, User};
+use serde_json::{json, Value};
+use std::sync::Arc;
 
-async fn admin_stats(
+async fn summary(
+    user: User,
     State(state): State<Arc<AppState>>,
-    headers: HeaderMap,
-) -> Result<Json<serde_json::Value>, StatusCode> {
-    let header = headers.get("authorization").and_then(|v| v.to_str().ok());
-    if header.is_none() {
-        return Err(StatusCode::UNAUTHORIZED);
-    }
-    let auth = postrust_auth::authenticate(header, &state.jwt_config)
-        .map_err(|_| StatusCode::UNAUTHORIZED)?;
-    Ok(Json(serde_json::json!({ "role": auth.role })))
+) -> Result<Json<Value>, postrust_server::Error> {
+    let mut tx = state.begin_as(&user).await?;
+    let n: i64 = sqlx::query_scalar("select count(*) from todos")
+        .fetch_one(&mut *tx)
+        .await?;
+    tx.commit().await?;
+    Ok(Json(json!({ "todos": n })))
 }
 ```
+
+Under a policy such as
+
+```sql
+CREATE POLICY own_todos ON api.todos TO web_user
+    USING (owner = current_setting('request.jwt.claims', true)::json->>'sub');
+```
+
+each caller counts their own rows, exactly as `GET /api/todos` would show
+them. [`examples/custom-routes`](../examples/custom-routes) has this route,
+and the SQL it expects in `todos.sql`.
+
+### `User`
+
+`User` checks the `Authorization` header with the function the REST API checks
+it with: the same JWT configuration, the same token cache, the same anonymous
+role. A request with no token is `PGRST_DB_ANON_ROLE`, or refused with 401
+when none is configured. A token that does not verify is refused with the
+status, body and `WWW-Authenticate` challenge the API gives it, as a
+`postrust_server::Error`.
+
+`user.role()` is the role, `user.claims()` every claim of the token (and
+`user.claim("sub")` one), `user.is_anonymous()` whether the request sent no
+token at all.
+
+`Option<User>` is for a route that treats a caller who has not signed in
+differently, whatever the anonymous role: it is `None` when the request has no
+`Authorization` header, and the token's user when it has one that verifies. A
+token that does not verify is still refused, rather than read as `None`, so a
+client with an expired token is told so instead of being answered as someone
+else.
+
+### `begin_as`
+
+`state.begin_as(&user)` takes a connection from the pool, begins a
+transaction, and sends what REST sends before a request's own query: the role,
+the claims (`request.jwt.claims`), the facts about the request, the
+`search_path` (the default schema, then `db_extra_search_path`), the
+`app.settings.*`, the role's `statement_timeout` and isolation level, and
+`db_pre_request`. What comes back is a plain
+`sqlx::Transaction<'static, Postgres>`; run anything on it with `&mut *tx`.
+
+The request's settings read back as they do in REST:
+`current_setting('request.method')`, `request.path` (the path the client sent,
+prefix included), `request.headers` and `request.cookies` (JSON objects, by
+lowercase header name) and `request.trace_id`. Not read from your request:
+the schema an `Accept-Profile` names and a `Prefer: timezone`, which are REST's
+own request syntax.
+
+Every setting is local to the transaction. Commit it, or drop it -- a dropped
+transaction is rolled back -- and the connection goes back to the pool as the
+authenticator, with nothing set.
+
+`begin_as_with` takes `TxOptions` for what a route may want to differ:
+
+```rust
+use postrust_core::IsolationLevel;
+use postrust_server::TxOptions;
+
+let options = TxOptions::default()
+    .read_only(true)                            // a write is refused: 405, as REST
+    .isolation(IsolationLevel::RepeatableRead)  // over the role's and the server's
+    .run_pre_request(false);                    // skip db_pre_request
+let mut tx = state.begin_as_with(&user, options).await?;
+```
+
+`run_pre_request` is on by default. Turn it off only knowing what the
+deployment's pre-request function checks: it is commonly where a caller is
+refused.
+
+A connection that cannot be had from the pool in time is logged at error and
+answered 500 (`PGRST500`), as REST answers it; a session the database refuses -- a
+pre-request function that raises, a role that does not exist -- is answered
+with the database's error.
+
+### What this does and does not protect
+
+`begin_as` keeps what a request *sends* inside the policy: every statement you
+run on the transaction runs as the caller, so the values a client supplies can
+reach only the rows its role and claims allow.
+
+It does not make your handler untrusted code. The handler runs as the
+authenticator, holds the pool, and could leave the caller's role at any
+time -- `RESET ROLE` on the transaction is enough. Treat a route of yours as
+you would a `SECURITY DEFINER` function: code you wrote and reviewed, never
+SQL a client chose.
 
 ## Organizing Routes
 

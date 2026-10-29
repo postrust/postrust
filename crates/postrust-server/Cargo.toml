@@ -77,6 +77,8 @@ anyhow.workspace = true
 
 # Utilities
 http.workspace = true
+# `request.headers` and `request.cookies` for `User`, the maps `Session` takes.
+indexmap.workspace = true
 bytes.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true

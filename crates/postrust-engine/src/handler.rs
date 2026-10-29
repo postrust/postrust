@@ -5,7 +5,6 @@ use crate::state::State;
 use bytes::Bytes;
 use http::{Response, StatusCode};
 use http_body_util::BodyExt;
-use postrust_auth::authenticate;
 use postrust_core::db::{Db, Tx};
 use postrust_core::{
     create_action_plan, parse_request, ActionPlan, ApiRequest, CallPlan, DbActionPlan,
@@ -103,28 +102,9 @@ where
     B: http_body::Body<Data = Bytes>,
     B::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
 {
-    // Extract auth header
-    let auth_header = request
-        .headers()
-        .get("authorization")
-        .and_then(|v| v.to_str().ok());
-
-    // Authenticate, through the token cache where one is configured.
-    //
-    // The child spans in this function are at debug, beneath the request's
-    // own span at info: with the default filter they are never created, and a
-    // disabled span is a check of a cached flag. Their fields are evaluated
-    // only when something is listening.
-    let auth_span = debug_span!("auth", role = Empty);
-    let auth_result = auth_span
-        .in_scope(|| match state.jwt_cache() {
-            Some(cache) => cache.authenticate(auth_header, state.jwt_config()),
-            None => authenticate(auth_header, state.jwt_config()),
-        })
-        .map_err(jwt_error)?;
-    auth_span.record("role", auth_result.role.as_str());
-    drop(auth_span);
-
+    // Authenticate, before the body is read. The same function serves a
+    // host's own routes, so a token means the same thing to both.
+    let auth_result = authenticate(state, request.headers())?;
     debug!("Authenticated as role: {}", auth_result.role);
 
     // Parse request.
@@ -501,6 +481,43 @@ fn needs_payload(api_request: &ApiRequest) -> bool {
             ..
         })
     )
+}
+
+/// The `Authorization` header a request carries, as authentication reads it.
+///
+/// A value that is not visible ASCII is no header at all: it cannot be a
+/// bearer token, and it is answered as a request that sent none.
+pub fn authorization(headers: &http::HeaderMap) -> Option<&str> {
+    headers
+        .get(http::header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+}
+
+/// Who a request is, from its `Authorization` header.
+///
+/// The one place a request is authenticated: REST calls this, and so does a
+/// host's own route that wants its caller to be who REST would say it is --
+/// the server's `User` extractor. Through the token cache where one is
+/// configured, the anonymous role when no token is sent, and a failure
+/// classified as PostgREST classifies it, for [`error_response`] to answer.
+///
+/// The `auth` span is at debug, beneath the request's own span at info: with
+/// the default filter it is never created, and a disabled span is a check of
+/// a cached flag. Its field is evaluated only when something is listening.
+pub fn authenticate<S: State>(
+    state: &S,
+    headers: &http::HeaderMap,
+) -> Result<postrust_auth::AuthResult, postrust_core::Error> {
+    let header = authorization(headers);
+    let auth_span = debug_span!("auth", role = Empty);
+    let auth_result = auth_span
+        .in_scope(|| match state.jwt_cache() {
+            Some(cache) => cache.authenticate(header, state.jwt_config()),
+            None => postrust_auth::authenticate(header, state.jwt_config()),
+        })
+        .map_err(jwt_error)?;
+    auth_span.record("role", auth_result.role.as_str());
+    Ok(auth_result)
 }
 
 /// Classify a JWT failure the way PostgREST reports it.

@@ -387,6 +387,18 @@ async fn assemble(config: postrust_core::AppConfig, host: Host, nests: Nests) ->
     info!("Custom routes enabled at /_");
     for (prefix, router) in nests {
         info!("Custom routes enabled at {}", prefix);
+        // In compatibility mode a database error is answered in the
+        // database's own words, by REST and so by a route's
+        // `postrust_server::Error` too. The error cannot see the
+        // configuration when `?` makes it, so this renders it again on the
+        // way out; see `crate::error`.
+        let router = match config.compat_mode {
+            true => router.layer(axum::middleware::map_response_with_state(
+                state.clone(),
+                crate::error::render_verbatim,
+            )),
+            false => router,
+        };
         app = app.nest(&prefix, router);
     }
 
