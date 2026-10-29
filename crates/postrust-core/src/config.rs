@@ -188,6 +188,27 @@ pub struct AppConfig {
     #[serde(default = "default_log_level")]
     pub log_level: LogLevel,
 
+    /// How log lines are written: `text` for a person at a terminal, `json`
+    /// for a log shipper. JSON lines carry the fields of every span the event
+    /// happened in, so each one names its `request_id` and `trace_id`.
+    ///
+    /// Like `log_level`, the binaries read the variable themselves before the
+    /// configuration is loaded -- the subscriber has to exist first to report
+    /// what loading it rejects -- and this field is that same value, kept for
+    /// anything that reads the configuration afterwards.
+    #[serde(default)]
+    pub log_format: LogFormat,
+
+    /// Record the SQL of a request's main query on its `db.query` span, as
+    /// OpenTelemetry's `db.query.text`.
+    ///
+    /// Off by default. The statement is parameterized, so the values a client
+    /// sent are not in it -- but the table, column and function names are,
+    /// and whatever collects traces may be read by more people than the
+    /// schema is meant for. Formatting it costs nothing while it is off.
+    #[serde(default)]
+    pub otel_db_statement: bool,
+
     // ========================================================================
     // Role Settings
     // ========================================================================
@@ -258,6 +279,8 @@ impl Default for AppConfig {
             openapi_server_proxy_uri: None,
             openapi_mode: OpenApiMode::FollowPrivileges,
             log_level: default_log_level(),
+            log_format: LogFormat::Text,
+            otel_db_statement: false,
             role_settings: HashMap::new(),
             app_settings: HashMap::new(),
             graphql_federation: false,
@@ -555,6 +578,15 @@ impl AppConfig {
                 ),
             }
         }
+        if let Ok(format) = get("PGRST_LOG_FORMAT") {
+            match LogFormat::parse_config(&format) {
+                Some(f) => config.log_format = f,
+                None => warn_ignored("PGRST_LOG_FORMAT", &format, "one of: text, json"),
+            }
+        }
+        if let Ok(v) = get("PGRST_OTEL_DB_STATEMENT") {
+            config.otel_db_statement = env_bool("PGRST_OTEL_DB_STATEMENT", &v)?;
+        }
         if let Ok(path) = get("PGRST_SERVER_UNIX_SOCKET") {
             if !path.trim().is_empty() {
                 config.server_unix_socket = Some(path.trim().to_string());
@@ -699,6 +731,23 @@ impl<'de> Deserialize<'de> for LogLevel {
     }
 }
 
+impl Serialize for LogFormat {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(self.as_config_str())
+    }
+}
+
+impl<'de> Deserialize<'de> for LogFormat {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let raw = String::deserialize(deserializer)?;
+        Self::parse_config(&raw).ok_or_else(|| {
+            serde::de::Error::custom(format!(
+                "unknown log format {raw:?}: expected one of text, json"
+            ))
+        })
+    }
+}
+
 /// Per-role settings.
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 #[non_exhaustive]
@@ -819,9 +868,11 @@ pub enum LogLevel {
     Error,
     /// Configuration that was ignored, and conditions worth noticing.
     Warn,
-    /// Start-up, schema reloads, and one line per request.
+    /// Start-up and schema reloads. Every line logged while a request is
+    /// being served names its `request_id` and `trace_id`.
     Info,
-    /// The generated SQL and the decisions behind it.
+    /// One line per request with its status and latency, the generated SQL,
+    /// and the decisions behind it.
     Debug,
 }
 
@@ -859,6 +910,37 @@ impl LogLevel {
             Self::Warn => "warn",
             Self::Info => "info",
             Self::Debug => "debug",
+        }
+    }
+}
+
+/// How log lines are written.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum LogFormat {
+    /// One human-readable line per event, with the fields of the spans it
+    /// happened in. The default.
+    #[default]
+    Text,
+    /// One JSON object per line, for a log shipper: the event's fields, and
+    /// the current span and every span above it with their fields.
+    Json,
+}
+
+impl LogFormat {
+    /// Parse the spelling used in configuration. Case-insensitive.
+    pub fn parse_config(s: &str) -> Option<Self> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "text" => Some(Self::Text),
+            "json" => Some(Self::Json),
+            _ => None,
+        }
+    }
+
+    /// The inverse of [`parse_config`](Self::parse_config).
+    pub fn as_config_str(&self) -> &'static str {
+        match self {
+            Self::Text => "text",
+            Self::Json => "json",
         }
     }
 }
@@ -1248,6 +1330,28 @@ mod tests {
             Some("https://api.example.com")
         );
         assert_eq!(config.openapi_mode, OpenApiMode::IgnorePrivileges);
+    }
+
+    #[test]
+    fn tracing_settings_are_read() {
+        let d = AppConfig::default();
+        assert_eq!(d.log_format, LogFormat::Text);
+        assert!(!d.otel_db_statement);
+
+        let config = with_env(&[
+            ("PGRST_LOG_FORMAT", "JSON"),
+            ("PGRST_OTEL_DB_STATEMENT", "on"),
+        ]);
+        assert_eq!(config.log_format, LogFormat::Json);
+        assert!(config.otel_db_statement);
+
+        // A format nobody can write is ignored with a warning; a boolean that
+        // is not one fails, as every boolean setting does.
+        assert_eq!(
+            with_env(&[("PGRST_LOG_FORMAT", "yaml")]).log_format,
+            LogFormat::Text
+        );
+        assert!(with_env_result(&[("PGRST_OTEL_DB_STATEMENT", "maybe")]).is_err());
     }
 
     #[test]

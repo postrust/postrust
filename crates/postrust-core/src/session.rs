@@ -61,6 +61,7 @@ pub struct Session<'a> {
     path: Option<String>,
     headers: Option<String>,
     cookies: Option<String>,
+    trace_id: Option<String>,
     timezone: Option<String>,
     extra: Vec<(String, String)>,
     read_only: bool,
@@ -86,6 +87,7 @@ impl<'a> Session<'a> {
             path: None,
             headers: None,
             cookies: None,
+            trace_id: None,
             timezone: None,
             extra: Vec::new(),
             read_only: false,
@@ -116,6 +118,16 @@ impl<'a> Session<'a> {
     /// The request's cookies, as `request.cookies`.
     pub fn cookies(mut self, cookies: &IndexMap<String, String>) -> Self {
         self.cookies = Some(json_object(cookies));
+        self
+    }
+
+    /// The trace the request belongs to, as `request.trace_id`.
+    ///
+    /// So that a statement seen in `pg_stat_activity` or the server log -- by
+    /// `auto_explain`, or a `log_line_prefix` reading the setting -- can be
+    /// tied back to the trace of the request that sent it. Unset without one.
+    pub fn trace_id(mut self, trace_id: Option<String>) -> Self {
+        self.trace_id = trace_id;
         self
     }
 
@@ -233,6 +245,7 @@ impl<'a> Session<'a> {
             ("request.path", &self.path),
             ("request.headers", &self.headers),
             ("request.cookies", &self.cookies),
+            ("request.trace_id", &self.trace_id),
         ];
         for (name, value) in request {
             if let Some(value) = value {
@@ -514,5 +527,41 @@ mod tests {
             &params[params.len() - 4..],
             &text(&["timezone", "UTC", "hasura.role", "alice"])[..]
         );
+    }
+
+    /// Beside the other facts about the request, and absent without one.
+    #[test]
+    fn a_trace_id_is_a_request_setting() {
+        let config = AppConfig::default();
+        let traced = Session::new(&config, "web_anon", Vec::new())
+            .request("GET", "/items")
+            .trace_id(Some("4bf92f3577b34da6a3ce929d0e0e4736".to_string()))
+            .statements();
+        let untraced = Session::new(&config, "web_anon", Vec::new())
+            .request("GET", "/items")
+            .statements();
+
+        let names = |statements: &[SessionStatement]| -> Vec<String> {
+            statements
+                .iter()
+                .flat_map(|s| s.params.iter())
+                .step_by(2)
+                .map(|p| match p {
+                    SqlParam::Text(name) => name.clone(),
+                    other => panic!("{other:?}"),
+                })
+                .collect()
+        };
+        assert_eq!(
+            names(&traced),
+            [
+                "search_path",
+                "role",
+                "request.method",
+                "request.path",
+                "request.trace_id"
+            ]
+        );
+        assert!(!names(&untraced).contains(&"request.trace_id".to_string()));
     }
 }

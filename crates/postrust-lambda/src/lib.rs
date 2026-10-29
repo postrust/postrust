@@ -37,7 +37,8 @@ pub use postrust_sql;
 /// The error a Lambda handler returns, as the runtime takes it.
 pub use lambda_http::Error;
 
-/// Log as the server does: `RUST_LOG` if set, otherwise `PGRST_LOG_LEVEL`.
+/// Log as the server does: `RUST_LOG` if set, otherwise `PGRST_LOG_LEVEL`,
+/// as text or as JSON lines by `PGRST_LOG_FORMAT`.
 ///
 /// No timestamps, which CloudWatch adds to every line itself. Installs the
 /// global subscriber, so call it once, first.
@@ -49,11 +50,21 @@ pub fn init_tracing() {
             .unwrap_or_else(|| postrust_core::AppConfig::default().log_level);
         format!("postrust={}", level.to_tracing())
     });
-    tracing_subscriber::fmt()
+    // `PGRST_LOG_FORMAT=json` as on the server, which CloudWatch Logs
+    // Insights can query by field. The request span and its `request_id` and
+    // `trace_id` come with the router, which is the server's.
+    let format = std::env::var("PGRST_LOG_FORMAT")
+        .ok()
+        .and_then(|v| postrust_core::LogFormat::parse_config(&v))
+        .unwrap_or_default();
+    let builder = tracing_subscriber::fmt()
         .with_env_filter(tracing_subscriber::EnvFilter::new(filter))
         .with_target(false)
-        .without_time()
-        .init();
+        .without_time();
+    match format {
+        postrust_core::LogFormat::Text => builder.init(),
+        postrust_core::LogFormat::Json => builder.json().init(),
+    }
 }
 
 /// The configuration from the environment, sized for a Lambda sandbox.

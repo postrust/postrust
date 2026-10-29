@@ -11,7 +11,7 @@ use postrust_core::{
     create_action_plan, parse_request, ActionPlan, ApiRequest, CallPlan, DbActionPlan,
 };
 use postrust_response::{format_response, QueryResult, Response as PgrstResponse};
-use tracing::{debug, error};
+use tracing::{debug, debug_span, error, field::Empty, Instrument};
 
 /// Column carrying the parent's whole row, for computed relationships.
 ///
@@ -110,11 +110,20 @@ where
         .and_then(|v| v.to_str().ok());
 
     // Authenticate, through the token cache where one is configured.
-    let auth_result = match state.jwt_cache() {
-        Some(cache) => cache.authenticate(auth_header, state.jwt_config()),
-        None => authenticate(auth_header, state.jwt_config()),
-    }
-    .map_err(jwt_error)?;
+    //
+    // The child spans in this function are at debug, beneath the request's
+    // own span at info: with the default filter they are never created, and a
+    // disabled span is a check of a cached flag. Their fields are evaluated
+    // only when something is listening.
+    let auth_span = debug_span!("auth", role = Empty);
+    let auth_result = auth_span
+        .in_scope(|| match state.jwt_cache() {
+            Some(cache) => cache.authenticate(auth_header, state.jwt_config()),
+            None => authenticate(auth_header, state.jwt_config()),
+        })
+        .map_err(jwt_error)?;
+    auth_span.record("role", auth_result.role.as_str());
+    drop(auth_span);
 
     debug!("Authenticated as role: {}", auth_result.role);
 
@@ -159,6 +168,12 @@ where
         state.schemas(),
         state.config().db_max_rows,
     )?;
+    // For the database's `request.trace_id`. The host put the context in the
+    // extensions; `parse_request` saw a request rebuilt without them.
+    api_request.trace_id = parts
+        .extensions
+        .get::<postrust_core::trace::TraceContext>()
+        .map(|context| context.trace_id);
 
     // Parse payload
     if !body_bytes.is_empty() {
@@ -213,7 +228,7 @@ where
     }
 
     // Create execution plan
-    let plan = create_action_plan(&api_request, &schema_cache)?;
+    let plan = debug_span!("plan").in_scope(|| create_action_plan(&api_request, &schema_cache))?;
 
     // Released before the query runs, not held through it. tokio's `RwLock`
     // queues a reader behind any writer already waiting, so a schema reload
@@ -237,6 +252,7 @@ where
         &auth_result,
         &added_join_columns,
     )
+    .instrument(db_span(&plan))
     .await?;
 
     // A read has nothing for a refusal to undo -- it ran read-only -- so its
@@ -256,7 +272,10 @@ where
     // A singular response the result cannot satisfy is the client's business,
     // not an internal failure: it asked for one object and the query answered
     // with some other number of rows.
-    let response = format_response(&api_request, &result).map_err(|e| match e {
+    let render_span = debug_span!("render");
+    let response = render_span.in_scope(|| format_response(&api_request, &result));
+    drop(render_span);
+    let response = response.map_err(|e| match e {
         postrust_response::FormatError::MultipleRows | postrust_response::FormatError::NotFound => {
             // How many rows there were, not how many were kept: a write the
             // caller wanted no representation from still touched them, and
@@ -284,6 +303,38 @@ where
     }
 
     Ok(build_response(response))
+}
+
+/// The span a plan's database work runs in, named and described as
+/// OpenTelemetry's database conventions have it.
+///
+/// `db.operation.name` and `db.collection.name` rather than the older
+/// `db.operation` and `db.sql.table`: the current conventions, and the names
+/// an exporter added later will expect. A plan that never reaches the
+/// database -- `OPTIONS`, the OpenAPI document -- gets no span.
+///
+/// `db.query.text` is declared empty and filled in by `execute_plan` only when
+/// `otel_db_statement` asks for it.
+fn db_span(plan: &ActionPlan) -> tracing::Span {
+    use postrust_core::plan::MutatePlan;
+
+    let (operation, collection) = match plan {
+        ActionPlan::Info(_) => return tracing::Span::none(),
+        ActionPlan::Db(DbActionPlan::Read(tree)) => ("select", &tree.root.from),
+        ActionPlan::Db(DbActionPlan::MutateRead { mutate, .. }) => match mutate {
+            MutatePlan::Insert { target, .. } => ("insert", target),
+            MutatePlan::Update { target, .. } => ("update", target),
+            MutatePlan::Delete { target, .. } => ("delete", target),
+        },
+        ActionPlan::Db(DbActionPlan::Call { call, .. }) => ("call", &call.function),
+    };
+    debug_span!(
+        "db.query",
+        "db.system" = "postgresql",
+        "db.operation.name" = operation,
+        "db.collection.name" = %collection,
+        "db.query.text" = Empty,
+    )
 }
 
 /// The plan media type a request asked for, when that is all it will accept.
@@ -1030,6 +1081,10 @@ async fn execute_plan<'s, S: State>(
                 debug!("Rendering {} via {}", media_type, aggregate);
             }
 
+            // Onto the `db.query` span this runs in; see `db_span`.
+            if state.config().otel_db_statement {
+                tracing::Span::current().record("db.query.text", sql.as_str());
+            }
             debug!("Executing SQL: {}", sql);
             debug!("With {} parameters", params.len());
 
@@ -1046,11 +1101,19 @@ async fn execute_plan<'s, S: State>(
             // Embedding runs on this same transaction, which also means a
             // parent row and its children come from one snapshot rather than
             // from two separate reads.
-            let mut tx = state
-                .db()
-                .begin()
-                .await
-                .map_err(|e| postrust_core::Error::ConnectionPool(e.to_string()))?;
+            //
+            // A transaction that cannot be begun is logged here, at error,
+            // because nothing later will: the query's own logging below never
+            // runs. It is the pool running dry -- every connection busy for
+            // longer than `db_pool_timeout` -- or the database out of reach,
+            // and either is the operator's to fix, not the client's. The
+            // client is told only that the service is unavailable; the line
+            // carries the cause, and the request's `request_id` and
+            // `trace_id` with it.
+            let mut tx = state.db().begin().await.map_err(|e| {
+                error!("Could not begin a transaction: {}", e);
+                postrust_core::Error::ConnectionPool(e.to_string())
+            })?;
 
             // Make the transaction the caller's: its isolation level, read-only
             // for a read, the role and every setting a policy or function reads
@@ -1065,6 +1128,7 @@ async fn execute_plan<'s, S: State>(
                 .request(api_request.method.clone(), api_request.path.clone())
                 .headers(&api_request.headers)
                 .cookies(&api_request.cookies)
+                .trace_id(api_request.trace_id.map(|t| t.to_string()))
                 .timezone(api_request.preferences.timezone.clone())
                 .read_only(is_read_only(api_request))
                 .apply(&mut tx);

@@ -23,6 +23,7 @@ pub mod build;
 pub mod custom;
 pub mod lenient_uri;
 pub mod state;
+pub mod telemetry;
 
 #[cfg(feature = "admin-ui")]
 pub mod admin;

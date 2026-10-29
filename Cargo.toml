@@ -107,7 +107,9 @@ mime = "0.3"
 url = "2.5"
 percent-encoding = "2.3"
 tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+# `json` for `PGRST_LOG_FORMAT=json`. tracing-serde, which it adds, was
+# already in the tree through the Lambda runtime.
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 # Default features kept: `wasmbind` is one, and gives chrono its clock on
 # wasm32 (a Cloudflare Worker, issue #50).
 chrono = { version = "0.4", features = ["serde"] }

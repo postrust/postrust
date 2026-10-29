@@ -2878,6 +2878,7 @@ dependencies = [
  "hyper",
  "jsonwebtoken 9.3.1",
  "mimalloc",
+ "pin-project-lite",
  "postrust-auth",
  "postrust-core",
  "postrust-engine",

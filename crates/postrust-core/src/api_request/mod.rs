@@ -91,6 +91,9 @@ where
         path: path.to_string(),
         headers,
         cookies,
+        // Set by the caller, which has the request's extensions; this sees
+        // a request rebuilt from the headers.
+        trace_id: None,
     })
 }
 

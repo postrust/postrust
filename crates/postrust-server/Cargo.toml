@@ -81,6 +81,8 @@ bytes.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 chrono.workspace = true
+# The request span's response future; already in the tree through tower.
+pin-project-lite = "0.2"
 
 # Internal
 postrust-core = { workspace = true, features = ["sqlx"] }

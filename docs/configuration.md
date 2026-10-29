@@ -329,6 +329,8 @@ differences.
 |----------|-------------|---------|
 | `PGRST_LOG_LEVEL` | Log level | `info` |
 | `RUST_LOG` | Detailed Rust logging. Wins where both are set | (none) |
+| `PGRST_LOG_FORMAT` | `text`, or `json` for one JSON object per line with the fields of every span the line was logged in -- `request_id` and `trace_id` among them | `text` |
+| `PGRST_OTEL_DB_STATEMENT` | Record each request's main SQL statement on its `db.query` span as `db.query.text`. Parameterized, so request values are not included, but it does reveal table, column and function names | `false` |
 | `PGRST_DEBUG` | Include the database's own error detail, hint and constraint name in error responses. Off in production: those strings describe the schema | `false` |
 
 ### Log Levels
@@ -336,8 +338,13 @@ differences.
 - `crit` - Errors only, as `error` (accepted for PostgREST parity)
 - `error` - Only errors
 - `warn` - Warnings and errors
-- `info` - General information (default)
-- `debug` - Detailed debugging
+- `info` - General information (default). Lines logged while a request is
+  served name its `request_id` and `trace_id`
+- `debug` - Detailed debugging, including one line per request with its status
+  and latency, and the spans of each request's stages
+
+The request id, the trace context and the span fields are described in
+[Tracing and logging](deployment.md#tracing-and-logging).
 
 `RUST_LOG` takes a full [tracing filter](https://docs.rs/tracing-subscriber/latest/tracing_subscriber/filter/struct.EnvFilter.html)
 and can name targets and spans individually, so it overrides `PGRST_LOG_LEVEL`

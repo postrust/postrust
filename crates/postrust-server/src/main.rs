@@ -34,9 +34,27 @@ async fn main() -> Result<()> {
         format!("postrust={}", level.to_tracing())
     });
 
+    // `PGRST_LOG_FORMAT` is read here for the same reason as the level, and
+    // a value `from_env` will warn about falls back to text meanwhile.
+    //
+    // Both layers are written out and one of them is `None`, rather than one
+    // boxed layer chosen at run time: an `Option` of a layer is a layer, and
+    // this way neither is behind a pointer. JSON lines carry the current span
+    // and the spans above it, each with its fields -- which is how every line
+    // logged while serving a request names its `request_id` and `trace_id`.
+    let format = std::env::var("PGRST_LOG_FORMAT")
+        .ok()
+        .and_then(|v| postrust_core::LogFormat::parse_config(&v))
+        .unwrap_or_default();
+    let (text, json) = match format {
+        postrust_core::LogFormat::Text => (Some(tracing_subscriber::fmt::layer()), None),
+        postrust_core::LogFormat::Json => (None, Some(tracing_subscriber::fmt::layer().json())),
+    };
+
     tracing_subscriber::registry()
         .with(tracing_subscriber::EnvFilter::new(filter))
-        .with(tracing_subscriber::fmt::layer())
+        .with(text)
+        .with(json)
         .init();
 
     let config = postrust_core::AppConfig::try_from_env()?;

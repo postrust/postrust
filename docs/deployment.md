@@ -583,19 +583,67 @@ curl http://localhost:3000/
 
 Coming soon: `/metrics` endpoint for Prometheus scraping.
 
-### Logging
+### Tracing and logging
 
-Configure structured JSON logging:
+Every request runs in a span named `request`, whose fields follow
+OpenTelemetry's HTTP server conventions:
+
+| Field | Value |
+|-------|-------|
+| `http.request.method` | `GET`, `POST`, ... |
+| `url.path` | The path asked for, without the query string |
+| `http.route` | The route that matched, not the path: `/api/{*path}` for every REST resource, `/v1/graphql` for GraphQL. Unset when nothing matched |
+| `http.response.status_code` | Recorded when the response is ready |
+| `otel.kind` | `server` |
+| `otel.status_code` | `ERROR` on a 5xx; unset otherwise |
+| `request_id` | See below |
+| `trace_id` | See below |
+
+Every line logged while a request is served carries those fields, so an error
+from deep in the query path says which request it belonged to. REST requests
+open `auth`, `plan`, `db.query` and `render` spans beneath it, at debug. The
+`db.query` span carries `db.system`, `db.operation.name` (`select`, `insert`,
+`update`, `delete`, `call`) and `db.collection.name`; set
+`PGRST_OTEL_DB_STATEMENT=true` to add the main statement as `db.query.text`.
+The statement is parameterized, so request values are not in it, but table,
+column and function names are.
+
+**Request id.** A client's `x-request-id` is used when it is one value of at
+most 128 visible ASCII characters; otherwise the server makes a UUID. Either
+way it is returned in the `x-request-id` response header.
+
+**Trace context.** A W3C `traceparent` header puts the request in the
+caller's trace; `tracestate` is carried with it. A request without one, or
+with one that does not parse (including version `ff`), starts a new trace.
+
+The trace id also reaches the database, as the transaction-local setting
+`request.trace_id` beside `request.method` and `request.path`. A function can
+read it with `current_setting('request.trace_id', true)`, and `auto_explain`
+output or a slow statement in the PostgreSQL log can be tied back to the trace
+of the request that sent it.
+
+**One line per request**, with the status and `latency_ms`, is logged at
+debug. At the default `info` it would be a line for every request, and the
+failures worth seeing are already logged where they happen, with their cause.
+
+**JSON.** `PGRST_LOG_FORMAT=json` writes one JSON object per line, for a log
+shipper. Each object has the event's fields, the current span, and every span
+above it with its fields:
 
 ```bash
-PGRST_LOG_LEVEL=info
-RUST_LOG=postrust=info
+PGRST_LOG_FORMAT=json
+RUST_LOG=postrust=debug,sqlx=warn
 ```
 
-Output:
 ```json
-{"timestamp":"2024-01-15T10:30:00Z","level":"INFO","message":"Request completed","method":"GET","path":"/users","status":200,"duration_ms":15}
+{"timestamp":"2026-10-29T20:12:51.791304Z","level":"DEBUG","fields":{"message":"request finished","status":200,"latency_ms":38.36},"target":"postrust_server::telemetry","span":{"http.request.method":"GET","http.response.status_code":200,"http.route":"/api/{*path}","otel.kind":"server","request_id":"26dfa785-7249-45e2-9045-86565c2ea840","trace_id":"4bf92f3577b34da6a3ce929d0e0e4736","url.path":"/api/users","name":"request"},"spans":[...]}
 ```
+
+The Lambda adapter serves the same router, so it gets the same spans, and
+reads `PGRST_LOG_FORMAT` too. A Cloudflare Worker has the engine's spans but
+no request span or subscriber of its own.
+
+Spans are not yet exported anywhere; they reach the log and nothing else.
 
 ## Fly.io
 

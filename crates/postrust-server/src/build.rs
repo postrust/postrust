@@ -1246,6 +1246,13 @@ async fn assemble(config: postrust_core::AppConfig, host: Host, nests: Nests) ->
             state.clone(),
             app::options_allow,
         ))
+        // Outermost of all, so the request span covers everything above --
+        // an OPTIONS answered by `options_allow`, a preflight answered by
+        // CORS -- and every response, whoever made it, carries the request
+        // id. A `Router::layer`, so the router has matched the route before
+        // this runs and `MatchedPath` is there to name the span's
+        // `http.route`. See `crate::telemetry`.
+        .layer(crate::telemetry::RequestTraceLayer)
         .with_state(state.clone());
 
     Ok(App { router: app, state })
