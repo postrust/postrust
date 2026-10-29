@@ -1,67 +1,163 @@
 # Custom Routes
 
-Postrust allows you to add custom API endpoints alongside the automatic PostgREST-style routes. This is useful for:
+Postrust lets you add API endpoints of your own alongside the automatic
+PostgREST-style routes, without forking it. This is useful for:
 
 - Webhooks (Stripe, GitHub, etc.)
-- Health checks and readiness probes
 - Custom business logic that doesn't fit the REST pattern
 - Integrations with external services
 - Background job triggers
 
+You write a small binary crate that depends on `postrust-server`, builds the
+application with `postrust_server::Builder`, and nests your own
+[axum](https://docs.rs/axum/0.8) routers into it. Everything the `postrust`
+binary serves is still served, configured from the same `PGRST_*` environment
+variables. A complete, compiling example is in
+[`examples/custom-routes`](../examples/custom-routes).
+
 ## Architecture Overview
 
 ```
-┌─────────────────────────────────────────────────────────────┐
-│                     Postrust Server                         │
-├─────────────────────────────────────────────────────────────┤
-│  /           → Server info (version, endpoints)             │
-│  /api/*      → PostgREST-style auto-generated routes        │
-│  /_/*        → Custom routes (health, webhooks, etc.)       │
-│  /admin/*    → Admin UI (if admin-ui feature enabled)       │
-│  /api/graphql → GraphQL endpoint (if admin-ui enabled)      │
-└─────────────────────────────────────────────────────────────┘
+/              → Server info (the REST root, in compatibility mode)
+/api/*         → PostgREST-style auto-generated routes
+/_/health      → Liveness
+/_/ready       → Readiness (checks the database)
+/healthz       → Liveness, under Hasura's name
+/v1/version    → Version
+/v1/graphql    → GraphQL (graphql feature)
+/admin/*       → Admin UI (admin-ui feature)
+/<yours>/*     → Your routes, via Builder::nest
+/_/<yours>/*   → Your routes beneath /_, beside the health checks
 ```
 
 ## Quick Start
 
-Custom routes are defined in `crates/postrust-server/src/custom.rs`. The module is already set up with health check endpoints.
+`Cargo.toml`:
 
-### Adding a New Route
+```toml
+[package]
+name = "my-api"
+version = "0.1.0"
+edition = "2021"
 
-1. Open `crates/postrust-server/src/custom.rs`
-2. Add your handler function
-3. Register the route in `custom_router()`
+[dependencies]
+postrust-server = "2.3"                                # features = ["graphql"] or ["admin-ui"] as needed
+postrust-core = "2.3"
+axum = "0.8"
+tokio = { version = "1", features = ["full"] }
+sqlx = { version = "0.8", default-features = false, features = ["postgres"] }
+serde_json = "1"
+anyhow = "1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+```
+
+`src/main.rs`:
 
 ```rust
-use axum::{
-    extract::State,
-    http::StatusCode,
-    response::{IntoResponse, Json},
-    routing::{get, post},
-    Router,
-};
+use axum::{extract::State, http::StatusCode, routing::post, Router};
+use postrust_server::{AppState, Builder, Host};
 use std::sync::Arc;
-use crate::state::AppState;
 
-pub fn custom_router() -> Router<Arc<AppState>> {
-    Router::new()
-        .route("/health", get(health_check))
-        .route("/ready", get(readiness_check))
-        // Add your custom routes here:
-        .route("/webhooks/stripe", post(handle_stripe_webhook))
-        .route("/notify", post(send_notification))
+fn webhooks() -> Router<Arc<AppState>> {
+    Router::new().route("/stripe", post(handle_stripe_webhook))
 }
 
-async fn handle_stripe_webhook(
-    State(state): State<Arc<AppState>>,
-    body: String,
-) -> impl IntoResponse {
-    // Your webhook logic here
-    (StatusCode::OK, Json(serde_json::json!({ "received": true })))
+async fn handle_stripe_webhook(State(state): State<Arc<AppState>>, body: String) -> StatusCode {
+    // Your webhook logic here, with `state.pool` for the database.
+    StatusCode::OK
+}
+
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
+    tracing_subscriber::fmt()
+        .with_env_filter(tracing_subscriber::EnvFilter::new("info"))
+        .init();
+
+    let config = postrust_core::AppConfig::try_from_env()?;
+    let addr = format!("{}:{}", config.server_host, config.server_port);
+
+    let app = Builder::new(config, Host::SERVER)
+        .nest("/webhooks", webhooks())     // POST /webhooks/stripe
+        .build()
+        .await?;
+
+    let listener = tokio::net::TcpListener::bind(&addr).await?;
+    axum::serve(listener, app.router).await?;
+    Ok(())
 }
 ```
 
+`postrust_server::build(config, host)` is the same as
+`Builder::new(config, host).build()`: the application with nothing added.
+
+### What your routes get
+
+Your routers are added before the server's outer layers, so they are served
+exactly as the API is:
+
+- the CORS policy (`PGRST_SERVER_CORS_ORIGINS`), including preflight answers;
+- the request body limit (`max_body_size`), for handlers that take a body
+  extractor such as `Json` or `String`;
+- `OPTIONS` handling;
+- the shared `Arc<AppState>`: the pool, the schema cache and the configuration.
+
+### Prefixes
+
+`nest` may be called as many times as you like. A prefix is a path: the
+leading slash is added if missing and a trailing one dropped, so `"hooks"`,
+`"/hooks"` and `"/hooks/"` are one prefix. `build()` returns an error -- it
+never panics -- before connecting to anything, when a prefix:
+
+- is empty or `/`;
+- contains a parameter (`{id}`), a wildcard (`*`) or an empty segment;
+- overlaps a path the server serves itself: `/api`, `/healthz`,
+  `/v1/version`, `/v1/graphql`, `/v1alpha1/graphql`, `/admin`, `/_/health`,
+  `/_/ready`, or `/_` itself (the list is
+  `postrust_server::RESERVED_PREFIXES`). These are reserved whether or not the
+  feature serving them is compiled in, so turning a feature on never breaks a
+  binary that built before;
+- overlaps another prefix you nested: `/hooks` and `/hooks/stripe` clash.
+
+"Overlaps" is by whole segments: `/v1` clashes with `/v1/version`, while
+`/v1/other` and `/apis` are fine.
+
+Beneath `/_` is yours: `.nest("/_/hooks", router)` serves next to the built-in
+`/_/health` and `/_/ready`.
+
+### Compatibility mode
+
+With `PGRST_COMPAT_MODE` on, the REST surface is also served at the root. Your
+routes are explicit routes and are matched first, so a table or function that
+shares a prefix's name is shadowed at the root -- `/hooks` answers from your
+router -- and stays reachable under `/api` (`/api/hooks`). Every path no route
+of yours claims still falls through to REST.
+
+## AWS Lambda
+
+`postrust-lambda` is a library as well as a binary. A Lambda function with
+your routes is a binary of its own:
+
+```rust
+use postrust_lambda::postrust_server::{Builder, Host};
+
+#[tokio::main]
+async fn main() -> Result<(), postrust_lambda::Error> {
+    postrust_lambda::init_tracing();
+    // The environment's configuration, with a pool sized for one sandbox.
+    let config = postrust_lambda::config_from_env()?;
+    let app = Builder::new(config, Host::LAMBDA)
+        .nest("/webhooks", webhooks())
+        .build()
+        .await?;
+    postrust_lambda::run(app).await
+}
+```
+
+Build it with `cargo lambda build --release` as you would the stock function.
+
 ## Handler Patterns
+
+In each of these, `AppState` is `postrust_server::AppState`.
 
 ### Basic Handler
 
@@ -94,12 +190,11 @@ async fn json_handler() -> Json<ApiResponse> {
 ### With State (Database Access)
 
 ```rust
-use axum::extract::State;
+use axum::{extract::State, response::{IntoResponse, Json}};
+use postrust_server::AppState;
 use std::sync::Arc;
-use crate::state::AppState;
 
 async fn db_handler(State(state): State<Arc<AppState>>) -> impl IntoResponse {
-    // Access the database pool
     let count: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM users")
         .fetch_one(&state.pool)
         .await
@@ -109,11 +204,19 @@ async fn db_handler(State(state): State<Arc<AppState>>) -> impl IntoResponse {
 }
 ```
 
+**Row-level security.** The pool connects as the authenticator role, and a
+query on it runs as that role: it does not switch to the caller's role or set
+`request.jwt.claims`, so RLS policies written for API roles do not apply. A
+helper for running a query as the caller is planned; until then, keep these
+handlers to what the authenticator may see, or switch role yourself inside a
+transaction.
+
 ### With JSON Body
 
 ```rust
 use axum::Json;
 use serde::Deserialize;
+use sqlx::Row;
 
 #[derive(Deserialize)]
 struct CreateUserRequest {
@@ -125,9 +228,7 @@ async fn create_user(
     State(state): State<Arc<AppState>>,
     Json(payload): Json<CreateUserRequest>,
 ) -> impl IntoResponse {
-    let result = sqlx::query(
-        "INSERT INTO users (email, name) VALUES ($1, $2) RETURNING id"
-    )
+    let result = sqlx::query("INSERT INTO users (email, name) VALUES ($1, $2) RETURNING id")
         .bind(&payload.email)
         .bind(&payload.name)
         .fetch_one(&state.pool)
@@ -140,13 +241,15 @@ async fn create_user(
         }
         Err(e) => (
             StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({ "error": e.to_string() }))
+            Json(serde_json::json!({ "error": e.to_string() })),
         ),
     }
 }
 ```
 
 ### With Path Parameters
+
+axum 0.8 writes a parameter as `{name}`.
 
 ```rust
 use axum::extract::Path;
@@ -155,9 +258,7 @@ async fn get_user(
     State(state): State<Arc<AppState>>,
     Path(user_id): Path<uuid::Uuid>,
 ) -> impl IntoResponse {
-    let user = sqlx::query_as::<_, User>(
-        "SELECT * FROM users WHERE id = $1"
-    )
+    let user = sqlx::query_as::<_, User>("SELECT * FROM users WHERE id = $1")
         .bind(user_id)
         .fetch_optional(&state.pool)
         .await;
@@ -167,14 +268,17 @@ async fn get_user(
         Ok(None) => StatusCode::NOT_FOUND.into_response(),
         Err(e) => (
             StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({ "error": e.to_string() }))
-        ).into_response(),
+            Json(serde_json::json!({ "error": e.to_string() })),
+        )
+            .into_response(),
     }
 }
 
 // Register with path parameter
-.route("/users/:id", get(get_user))
+.route("/users/{id}", get(get_user))
 ```
+
+The parameter goes in a route, not in the prefix given to `nest`.
 
 ### With Query Parameters
 
@@ -192,18 +296,18 @@ async fn list_users(
     State(state): State<Arc<AppState>>,
     Query(params): Query<Pagination>,
 ) -> impl IntoResponse {
-    let page = params.page.unwrap_or(1);
+    let page = params.page.unwrap_or(1).max(1);
     let limit = params.limit.unwrap_or(20).min(100);
     let offset = (page - 1) * limit;
 
     let users = sqlx::query_as::<_, User>(
-        "SELECT * FROM users ORDER BY created_at DESC LIMIT $1 OFFSET $2"
+        "SELECT * FROM users ORDER BY created_at DESC LIMIT $1 OFFSET $2",
     )
-        .bind(limit as i64)
-        .bind(offset as i64)
-        .fetch_all(&state.pool)
-        .await
-        .unwrap_or_default();
+    .bind(limit as i64)
+    .bind(offset as i64)
+    .fetch_all(&state.pool)
+    .await
+    .unwrap_or_default();
 
     Json(users)
 }
@@ -232,13 +336,13 @@ use axum::http::StatusCode;
 async fn fallible_handler(
     State(state): State<Arc<AppState>>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
-    let result = sqlx::query("SELECT 1")
+    sqlx::query("SELECT 1")
         .execute(&state.pool)
         .await
         .map_err(|e| {
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({ "error": e.to_string() }))
+                Json(serde_json::json!({ "error": e.to_string() })),
             )
         })?;
 
@@ -248,28 +352,27 @@ async fn fallible_handler(
 
 ## Accessing Application State
 
-The `AppState` struct provides access to:
+`postrust_server::AppState` provides:
 
 ```rust
 pub struct AppState {
     /// PostgreSQL connection pool
     pub pool: sqlx::PgPool,
-
     /// Cached database schema (tables, columns, relations)
     pub schema_cache: RwLock<SchemaCache>,
-
     /// Application configuration
     pub config: AppConfig,
-
     /// JWT configuration for auth
     pub jwt_config: JwtConfig,
+    /// Cache of validated tokens, when `jwt_cache_enabled` asks for one
+    pub jwt_cache: Option<JwtCache>,
 }
 ```
 
 ### Database Pool
 
 ```rust
-async fn handler(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+async fn handler(State(state): State<Arc<AppState>>) -> Result<(), sqlx::Error> {
     // Execute raw SQL
     let rows = sqlx::query("SELECT * FROM users")
         .fetch_all(&state.pool)
@@ -287,29 +390,31 @@ async fn handler(State(state): State<Arc<AppState>>) -> impl IntoResponse {
         .bind(&user_id)
         .execute(&state.pool)
         .await?;
+    Ok(())
 }
 ```
 
 ### Schema Cache
 
+The cache is reloaded on `NOTIFY` when `db_channel_enabled` is on, so take
+the read lock for as long as you need it and no longer.
+
 ```rust
+use postrust_core::api_request::QualifiedIdentifier;
+
 async fn handler(State(state): State<Arc<AppState>>) -> impl IntoResponse {
-    let cache = state.schema_cache.read().await;
+    let cache = state.schema_cache().await;
 
-    // Get all tables
-    let tables = cache.tables();
+    // Every table and view, keyed by schema and name
+    let count = cache.tables.len();
 
-    // Check if table exists
-    if cache.has_table("users") {
-        // ...
-    }
-
-    // Get table columns
-    if let Some(table) = cache.get_table("users") {
-        for column in &table.columns {
+    // One table's columns
+    if let Some(table) = cache.get_table(&QualifiedIdentifier::new("public", "users")) {
+        for column in table.columns.values() {
             println!("{}: {}", column.name, column.data_type);
         }
     }
+    Json(serde_json::json!({ "tables": count }))
 }
 ```
 
@@ -319,10 +424,9 @@ async fn handler(State(state): State<Arc<AppState>>) -> impl IntoResponse {
 async fn handler(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     let config = &state.config;
 
-    // Access config values
     let schemas = &config.db_schemas;
     let anon_role = &config.db_anon_role;
-    let max_rows = config.max_rows;
+    let max_rows = config.db_max_rows;
 }
 ```
 
@@ -332,39 +436,25 @@ async fn handler(State(state): State<Arc<AppState>>) -> impl IntoResponse {
 
 ```rust
 use axum::http::HeaderMap;
-use hmac::{Hmac, Mac};
-use sha2::Sha256;
 
 async fn stripe_webhook(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
     body: String,
 ) -> impl IntoResponse {
-    // Get Stripe signature
-    let signature = headers
-        .get("stripe-signature")
-        .and_then(|v| v.to_str().ok());
-
-    let Some(sig) = signature else {
+    let Some(signature) = headers.get("stripe-signature").and_then(|v| v.to_str().ok()) else {
         return (
             StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({ "error": "Missing signature" }))
+            Json(serde_json::json!({ "error": "Missing signature" })),
         );
     };
 
-    // Verify signature (simplified - use stripe crate in production)
-    let webhook_secret = std::env::var("STRIPE_WEBHOOK_SECRET")
-        .unwrap_or_default();
+    // Verify the signature against STRIPE_WEBHOOK_SECRET before trusting the
+    // body -- use the stripe crate, or HMAC-SHA256 as Stripe documents.
 
-    // Parse and handle event
-    let event: serde_json::Value = serde_json::from_str(&body)
-        .unwrap_or_default();
-
-    let event_type = event["type"].as_str().unwrap_or("unknown");
-
-    match event_type {
+    let event: serde_json::Value = serde_json::from_str(&body).unwrap_or_default();
+    match event["type"].as_str().unwrap_or("unknown") {
         "checkout.session.completed" => {
-            // Handle checkout completion
             let session = &event["data"]["object"];
             let customer_id = session["customer"].as_str();
             // Update database...
@@ -372,9 +462,7 @@ async fn stripe_webhook(
         "customer.subscription.updated" => {
             // Handle subscription update
         }
-        _ => {
-            tracing::info!("Unhandled event type: {}", event_type);
-        }
+        other => tracing::info!("Unhandled event type: {}", other),
     }
 
     (StatusCode::OK, Json(serde_json::json!({ "received": true })))
@@ -384,17 +472,13 @@ async fn stripe_webhook(
 ### GitHub Webhook
 
 ```rust
-async fn github_webhook(
-    headers: HeaderMap,
-    body: String,
-) -> impl IntoResponse {
+async fn github_webhook(headers: HeaderMap, body: String) -> impl IntoResponse {
     let event_type = headers
         .get("x-github-event")
         .and_then(|v| v.to_str().ok())
         .unwrap_or("unknown");
 
-    let payload: serde_json::Value = serde_json::from_str(&body)
-        .unwrap_or_default();
+    let payload: serde_json::Value = serde_json::from_str(&body).unwrap_or_default();
 
     match event_type {
         "push" => {
@@ -416,120 +500,94 @@ async fn github_webhook(
 
 ## Middleware
 
-### Adding Middleware to Custom Routes
+A layer on your router applies to your routes only, inside the server's own
+layers (so CORS has already been handled by the time it runs).
+
+A layer given to `Builder::layer` wraps the whole application instead -- the
+API, GraphQL, your routes, and the server's own layers too -- so it sees every
+request first, including a CORS preflight and a path nothing serves. Use it for
+what has to cover everything, such as a rate limit or a header every response
+carries. Of several, the one given last is the outermost:
 
 ```rust
-use axum::middleware::{self, Next};
-use axum::http::Request;
+let app = Builder::new(config, Host::SERVER)
+    .nest("/webhooks", webhooks())
+    .layer(middleware::map_response(add_server_header))
+    .build()
+    .await?;
+```
 
-async fn logging_middleware<B>(
-    request: Request<B>,
-    next: Next<B>,
-) -> impl IntoResponse {
+### Logging
+
+```rust
+use axum::{extract::Request, middleware::{self, Next}, response::Response};
+
+async fn logging_middleware(request: Request, next: Next) -> Response {
     let method = request.method().clone();
     let uri = request.uri().clone();
 
     let start = std::time::Instant::now();
     let response = next.run(request).await;
-    let duration = start.elapsed();
 
-    tracing::info!(
-        "{} {} - {:?} - {:?}",
-        method, uri, response.status(), duration
-    );
-
+    tracing::info!("{} {} - {} - {:?}", method, uri, response.status(), start.elapsed());
     response
 }
 
-pub fn custom_router() -> Router<Arc<AppState>> {
+fn webhooks() -> Router<Arc<AppState>> {
     Router::new()
-        .route("/health", get(health_check))
-        .route("/webhooks/stripe", post(stripe_webhook))
+        .route("/stripe", post(stripe_webhook))
         .layer(middleware::from_fn(logging_middleware))
 }
 ```
 
-### Authentication Middleware
+### Authentication
+
+`postrust_auth::authenticate` verifies a bearer token against the server's own
+JWT configuration (add `postrust-auth` to your dependencies), so your routes
+accept the tokens the API accepts. A
+middleware built with `from_fn_with_state` needs the state value, which does
+not exist until the application is built, so check the token in the handler:
 
 ```rust
-use axum::http::Request;
-use axum::middleware::Next;
+use axum::http::HeaderMap;
 
-async fn auth_middleware<B>(
+async fn admin_stats(
     State(state): State<Arc<AppState>>,
-    request: Request<B>,
-    next: Next<B>,
-) -> impl IntoResponse {
-    let auth_header = request
-        .headers()
-        .get("authorization")
-        .and_then(|v| v.to_str().ok());
-
-    match auth_header {
-        Some(token) if token.starts_with("Bearer ") => {
-            let jwt = &token[7..];
-            // Validate JWT using state.jwt_config
-            // If valid, continue
-            next.run(request).await
-        }
-        _ => StatusCode::UNAUTHORIZED.into_response(),
+    headers: HeaderMap,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    let header = headers.get("authorization").and_then(|v| v.to_str().ok());
+    if header.is_none() {
+        return Err(StatusCode::UNAUTHORIZED);
     }
-}
-
-// Apply to specific routes
-pub fn custom_router() -> Router<Arc<AppState>> {
-    let protected = Router::new()
-        .route("/admin/stats", get(admin_stats))
-        .layer(middleware::from_fn_with_state(state.clone(), auth_middleware));
-
-    let public = Router::new()
-        .route("/health", get(health_check));
-
-    public.merge(protected)
+    let auth = postrust_auth::authenticate(header, &state.jwt_config)
+        .map_err(|_| StatusCode::UNAUTHORIZED)?;
+    Ok(Json(serde_json::json!({ "role": auth.role })))
 }
 ```
 
 ## Organizing Routes
 
-For larger applications, split routes into modules:
+For larger applications, split routes into modules of your crate:
 
 ```
-crates/postrust-server/src/
-├── main.rs
-├── state.rs
-├── app.rs
-├── custom/
-│   ├── mod.rs
-│   ├── health.rs
-│   ├── webhooks/
-│   │   ├── mod.rs
-│   │   ├── stripe.rs
-│   │   └── github.rs
-│   └── admin.rs
+my-api/
+├── Cargo.toml
+└── src/
+    ├── main.rs
+    └── webhooks/
+        ├── mod.rs
+        ├── stripe.rs
+        └── github.rs
 ```
 
 ```rust
-// custom/mod.rs
-mod health;
-mod webhooks;
-mod admin;
-
-use axum::Router;
-use std::sync::Arc;
-use crate::state::AppState;
-
-pub fn custom_router() -> Router<Arc<AppState>> {
-    Router::new()
-        .merge(health::router())
-        .nest("/webhooks", webhooks::router())
-        .nest("/admin", admin::router())
-}
-```
-
-```rust
-// custom/webhooks/mod.rs
-mod stripe;
+// src/webhooks/mod.rs
 mod github;
+mod stripe;
+
+use axum::{routing::post, Router};
+use postrust_server::AppState;
+use std::sync::Arc;
 
 pub fn router() -> Router<Arc<AppState>> {
     Router::new()
@@ -538,7 +596,20 @@ pub fn router() -> Router<Arc<AppState>> {
 }
 ```
 
+```rust
+// src/main.rs
+let app = Builder::new(config, Host::SERVER)
+    .nest("/webhooks", webhooks::router())
+    .nest("/_/jobs", jobs::router())
+    .build()
+    .await?;
+```
+
 ## Testing Custom Routes
+
+`app.router` is a plain `axum::Router`, so a test sends it requests with
+`tower::ServiceExt::oneshot`. Building it connects to the database named by
+the configuration.
 
 ```rust
 #[cfg(test)]
@@ -549,20 +620,26 @@ mod tests {
     use tower::ServiceExt;
 
     #[tokio::test]
-    async fn test_health_check() {
-        let app = custom_router().with_state(test_state());
+    async fn stripe_webhook_is_served() {
+        let mut config = postrust_core::AppConfig::default();
+        config.db_uri = std::env::var("DATABASE_URL").unwrap();
+        let app = Builder::new(config, Host::SERVER)
+            .nest("/webhooks", webhooks())
+            .build()
+            .await
+            .unwrap();
 
         let response = app
+            .router
             .oneshot(
-                Request::builder()
-                    .uri("/_/health")
-                    .body(Body::empty())
+                Request::post("/webhooks/stripe")
+                    .body(Body::from("{}"))
                     .unwrap(),
             )
             .await
             .unwrap();
 
-        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST); // no signature
     }
 }
 ```
@@ -579,13 +656,9 @@ GITHUB_WEBHOOK_SECRET=...
 # External service URLs
 EMAIL_SERVICE_URL=https://api.sendgrid.com
 SLACK_WEBHOOK_URL=https://hooks.slack.com/...
-
-# Feature flags
-ENABLE_WEBHOOKS=true
-ENABLE_ADMIN_API=true
 ```
 
-Access in handlers:
+Read them once at startup and keep them in your own state, or per request:
 
 ```rust
 async fn handler() -> impl IntoResponse {
@@ -597,6 +670,6 @@ async fn handler() -> impl IntoResponse {
 
 ## Next Steps
 
-- See [Deployment](./deployment.md) for deploying your customized Postrust
+- See [Deployment](./deployment.md) for building and deploying your own binary
 - See [Authentication](./authentication.md) for JWT configuration
 - See [Configuration](./configuration.md) for all available options

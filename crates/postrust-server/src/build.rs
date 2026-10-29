@@ -15,14 +15,16 @@ use anyhow::Result;
 #[cfg(feature = "graphql")]
 use axum::routing::{get, post};
 use axum::{
-    extract::DefaultBodyLimit,
+    extract::{DefaultBodyLimit, Request},
     http::{HeaderValue, Method},
-    response::Json,
-    routing::any,
+    response::{IntoResponse, Json},
+    routing::{any, Route},
     Router,
 };
 use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
+use std::convert::Infallible;
 use std::sync::Arc;
+use tower::{Layer, Service};
 use tower_http::cors::{AllowOrigin, Any as CorsAny, CorsLayer};
 use tracing::{error, info};
 
@@ -72,7 +74,222 @@ pub struct App {
 /// Fails rather than serving something partial when the database cannot be
 /// reached or a setting cannot be honoured. GraphQL is the exception: a schema
 /// that cannot be built is logged and the rest is served without it.
+///
+/// The application with nothing of the caller's added. [`Builder`] builds the
+/// same with routes of the caller's own beside it.
 pub async fn build(config: postrust_core::AppConfig, host: Host) -> Result<App> {
+    Builder::new(config, host).build().await
+}
+
+/// Builds the application with routes of the caller's own beside the API.
+///
+/// For a binary of your own that depends on this crate rather than a fork of
+/// it: webhooks, an endpoint that does several things in one transaction,
+/// anything that is not a table or a function.
+///
+/// ```no_run
+/// # async fn run() -> anyhow::Result<()> {
+/// use axum::{routing::post, Router};
+/// use postrust_server::{AppState, Builder, Host};
+/// use std::sync::Arc;
+///
+/// let hooks: Router<Arc<AppState>> = Router::new().route("/stripe", post(|| async { "ok" }));
+/// let config = postrust_core::AppConfig::try_from_env()?;
+/// let app = Builder::new(config, Host::SERVER)
+///     .nest("/hooks", hooks)
+///     .build()
+///     .await?;
+/// # let _ = app;
+/// # Ok(())
+/// # }
+/// ```
+///
+/// A nested router is served with everything the API is served with: the
+/// CORS policy, the body limit, the `OPTIONS` handling and the shared
+/// [`AppState`]. Its routes are explicit routes, so in compatibility mode they
+/// are matched before the REST surface served at the root -- a table that
+/// shares a prefix's name is shadowed there, and stays reachable under `/api`.
+///
+/// [`Builder::layer`] is for what has to see every request rather than only
+/// the caller's own: an authentication gate, a rate limit, a header every
+/// response carries.
+#[must_use = "a Builder does nothing until `build` is called"]
+pub struct Builder {
+    config: postrust_core::AppConfig,
+    host: Host,
+    nests: Vec<(String, Router<Arc<AppState>>)>,
+    layers: Vec<Wrap>,
+}
+
+/// A layer given to [`Builder::layer`], held until there is a router for it.
+///
+/// Boxed as the step that applies it rather than as the layer, since each
+/// layer is its own type and only `Router::layer` knows what it needs of one.
+type Wrap = Box<dyn FnOnce(Router) -> Router + Send>;
+
+impl Builder {
+    /// The application `config` asks for, on `host`, with nothing added yet.
+    pub fn new(config: postrust_core::AppConfig, host: Host) -> Self {
+        Builder {
+            config,
+            host,
+            nests: Vec::new(),
+            layers: Vec::new(),
+        }
+    }
+
+    /// Serve `router` under `prefix`. May be called more than once.
+    ///
+    /// The prefix is taken as a path: the leading slash is added if missing
+    /// and a trailing one dropped, so `"hooks"`, `"/hooks"` and `"/hooks/"`
+    /// are one prefix. Nothing is checked until [`Builder::build`], which
+    /// refuses a prefix that is the root, that overlaps a path the server
+    /// serves itself ([`RESERVED_PREFIXES`], and `/_` itself), or that
+    /// overlaps another prefix given here. A prefix beneath `/_`, such as
+    /// `/_/hooks`, is served beside the built-in `/_/health` and `/_/ready`.
+    pub fn nest(mut self, prefix: impl Into<String>, router: Router<Arc<AppState>>) -> Self {
+        self.nests.push((prefix.into(), router));
+        self
+    }
+
+    /// Wrap the whole application in `layer`. May be called more than once.
+    ///
+    /// Outermost, around every route the server serves and around its own
+    /// layers too, so it sees each request first and each response last --
+    /// including a preflight the CORS policy answers itself, and a refusal
+    /// that never reaches a handler. Of several, the one given last is the
+    /// outermost, as with `Router::layer`.
+    ///
+    /// For something only the caller's own routes need, put the layer on the
+    /// router given to [`Builder::nest`] instead.
+    pub fn layer<L>(mut self, layer: L) -> Self
+    where
+        L: Layer<Route> + Clone + Send + Sync + 'static,
+        L::Service: Service<Request> + Clone + Send + Sync + 'static,
+        <L::Service as Service<Request>>::Response: IntoResponse + 'static,
+        <L::Service as Service<Request>>::Error: Into<Infallible> + 'static,
+        <L::Service as Service<Request>>::Future: Send + 'static,
+    {
+        self.layers
+            .push(Box::new(move |router: Router| router.layer(layer)));
+        self
+    }
+
+    /// Connect, load the schema cache and build the router.
+    ///
+    /// The prefixes given to [`Builder::nest`] are checked first, before
+    /// anything is connected to, so a clash is reported as an error rather
+    /// than as a panic from the router -- and without a database to find it.
+    /// Otherwise as [`build`].
+    pub async fn build(self) -> Result<App> {
+        let nests = mount_points(self.nests)?;
+        let mut app = assemble(self.config, self.host, nests).await?;
+        for wrap in self.layers {
+            app.router = wrap(app.router);
+        }
+        Ok(app)
+    }
+}
+
+/// The paths the server serves itself, which a prefix given to
+/// [`Builder::nest`] may neither equal nor sit above or beneath.
+///
+/// Reserved whether or not the feature that serves them is compiled in, so
+/// that a binary which builds today does not start failing when GraphQL or the
+/// admin UI is turned on. `/_` is not in the list: the built-in routes under
+/// it are, and the rest of it is the caller's.
+pub const RESERVED_PREFIXES: &[&str] = &[
+    "/api",
+    "/healthz",
+    "/v1/version",
+    "/v1/graphql",
+    "/v1alpha1/graphql",
+    "/admin",
+    "/_/health",
+    "/_/ready",
+];
+
+/// Where the built-in custom router is mounted.
+const CUSTOM_PREFIX: &str = "/_";
+
+/// The caller's routers, each under its prefix once the prefix is checked.
+type Nests = Vec<(String, Router<Arc<AppState>>)>;
+
+/// Check the prefixes given to [`Builder::nest`], normalizing each.
+fn mount_points(nests: Nests) -> Result<Nests> {
+    let mut checked: Nests = Vec::with_capacity(nests.len());
+    for (given, router) in nests {
+        let taken: Vec<&str> = checked.iter().map(|(prefix, _)| prefix.as_str()).collect();
+        let prefix = check_prefix(&given, &taken)?;
+        checked.push((prefix, router));
+    }
+    Ok(checked)
+}
+
+/// `given` as a prefix to nest at -- one leading slash, no trailing one -- or
+/// why it cannot be nested at beside the server's own paths and the prefixes
+/// already `taken`.
+fn check_prefix(given: &str, taken: &[&str]) -> Result<String> {
+    let trimmed = given.trim().trim_matches('/');
+    if trimmed.is_empty() {
+        // The root is the API's in compatibility mode and the server's own
+        // directory otherwise; a router merged there would take one or the
+        // other.
+        anyhow::bail!("cannot nest routes at {given:?}: a prefix must name a path below /");
+    }
+    // An empty segment matches nothing a client sends, and a parameter or a
+    // wildcard in a nest path is something the router refuses by panicking.
+    // Both are refused here instead, where it can be said why.
+    if trimmed
+        .split('/')
+        .any(|segment| segment.is_empty() || segment.contains(['{', '}', '*']))
+    {
+        anyhow::bail!(
+            "cannot nest routes at {given:?}: a prefix is literal path segments, \
+             without parameters, wildcards or empty segments"
+        );
+    }
+    let prefix = format!("/{trimmed}");
+
+    // Overlap rather than equality. `/v1` is not `/v1/version`, but nesting
+    // at `/v1` claims everything beneath it, and which of the two then
+    // answers `/v1/version` would be settled by the router's matching
+    // priority rather than by anything the caller wrote. A nest at exactly
+    // the same path as another is one the router refuses by panicking.
+    if prefix == CUSTOM_PREFIX {
+        anyhow::bail!(
+            "cannot nest routes at {given:?}: the server serves /_ itself; nest beneath it, \
+             at /_/<name>, instead"
+        );
+    }
+    if let Some(reserved) = RESERVED_PREFIXES
+        .iter()
+        .find(|reserved| overlaps(&prefix, reserved))
+    {
+        anyhow::bail!(
+            "cannot nest routes at {given:?}: it overlaps {reserved}, which the server serves itself"
+        );
+    }
+    if let Some(other) = taken.iter().find(|other| overlaps(&prefix, other)) {
+        anyhow::bail!("cannot nest routes at {given:?}: it overlaps {other}, nested earlier");
+    }
+    Ok(prefix)
+}
+
+/// Whether `path` is `base` or beneath it, segment by segment: `/apis` is not
+/// beneath `/api`.
+fn beneath(path: &str, base: &str) -> bool {
+    path.strip_prefix(base)
+        .is_some_and(|rest| rest.is_empty() || rest.starts_with('/'))
+}
+
+/// Whether nesting at both `a` and `b` would claim a path twice.
+fn overlaps(a: &str, b: &str) -> bool {
+    beneath(a, b) || beneath(b, a)
+}
+
+/// Everything [`Builder::build`] does once the caller's prefixes are checked.
+async fn assemble(config: postrust_core::AppConfig, host: Host, nests: Nests) -> Result<App> {
     info!("Database: {}", mask_db_uri(&config.db_uri));
 
     // Create database pool
@@ -152,8 +369,17 @@ pub async fn build(config: postrust_core::AppConfig, host: Host) -> Result<App> 
         );
 
     // Add custom routes (health checks, webhooks, etc.)
-    app = app.nest("/_", custom::custom_router());
+    //
+    // The caller's own routes go in here too, before any layer is applied, so
+    // they are wrapped in the same CORS policy, body limit and `OPTIONS`
+    // handling as the API. One beneath `/_`, such as `/_/hooks`, sits beside
+    // the nest at `/_`: the more specific path is matched first.
+    app = app.nest(CUSTOM_PREFIX, custom::custom_router());
     info!("Custom routes enabled at /_");
+    for (prefix, router) in nests {
+        info!("Custom routes enabled at {}", prefix);
+        app = app.nest(&prefix, router);
+    }
 
     // Add admin routes and GraphQL endpoint if feature is enabled
     #[cfg(feature = "graphql")]
@@ -924,8 +1150,9 @@ pub async fn build(config: postrust_core::AppConfig, host: Host) -> Result<App> 
 
     // PostgREST compatibility mode: also serve the REST surface at the root so
     // canonical PostgREST paths (`/rpc/<name>`, `/<table>`) work in addition to
-    // the `/api`-prefixed paths. Explicit routes (`/`, `/_`, `/admin`, `/api`)
-    // still take precedence; only otherwise-unmatched paths hit this fallback.
+    // the `/api`-prefixed paths. Explicit routes (`/`, `/_`, `/admin`, `/api`,
+    // and whatever was given to `Builder::nest`) still take precedence; only
+    // otherwise-unmatched paths hit this fallback.
     if config.compat_mode {
         app = app.fallback(handle_request);
         info!("PostgREST compatibility mode enabled: REST surface also served at /");
@@ -1189,4 +1416,117 @@ fn mask_db_uri(uri: &str) -> String {
         }
     }
     uri.to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn routes(prefixes: &[&str]) -> Vec<(String, Router<Arc<AppState>>)> {
+        prefixes
+            .iter()
+            .map(|prefix| (prefix.to_string(), Router::new()))
+            .collect()
+    }
+
+    fn refusal(prefixes: &[&str]) -> String {
+        match mount_points(routes(prefixes)) {
+            Ok(_) => panic!("{prefixes:?} was accepted"),
+            Err(e) => e.to_string(),
+        }
+    }
+
+    #[test]
+    fn a_prefix_is_normalized() {
+        for given in ["hooks", "/hooks", "/hooks/", " /hooks// "] {
+            let nests = mount_points(routes(&[given])).unwrap();
+            assert_eq!(nests[0].0, "/hooks", "{given:?}");
+        }
+    }
+
+    #[test]
+    fn the_root_and_malformed_prefixes_are_refused() {
+        for given in ["", "/", "//", "/a//b", "/{id}", "/files/{*rest}", "/*"] {
+            refusal(&[given]);
+        }
+    }
+
+    #[test]
+    fn a_prefix_overlapping_the_servers_own_paths_is_refused() {
+        for given in [
+            "/api",
+            "/api/hooks",
+            "/healthz",
+            "/v1",
+            "/v1/version",
+            "/v1/graphql/extra",
+            "/v1alpha1",
+            "/admin",
+            "/_",
+            "/_/health",
+            "/_/ready/deep",
+        ] {
+            let refused = refusal(&[given]);
+            assert!(refused.contains("serves"), "{given:?}: {refused}");
+        }
+    }
+
+    #[test]
+    fn a_prefix_sharing_only_characters_with_a_reserved_one_is_accepted() {
+        let nests = mount_points(routes(&[
+            "/apis",
+            "/v1/other",
+            "/administration",
+            "/_/hooks",
+            "/__",
+        ]))
+        .unwrap();
+        assert_eq!(nests.len(), 5);
+    }
+
+    #[test]
+    fn two_prefixes_that_overlap_are_refused() {
+        assert!(refusal(&["/hooks", "hooks/"]).contains("nested earlier"));
+        assert!(refusal(&["/hooks", "/hooks/stripe"]).contains("nested earlier"));
+        assert!(refusal(&["/hooks/stripe", "/hooks"]).contains("nested earlier"));
+        assert!(refusal(&["/_/hooks", "/_/hooks"]).contains("nested earlier"));
+    }
+
+    /// Whatever `mount_points` accepts, the router takes without panicking.
+    /// The built-in routes are laid out as `assemble` lays them out, with
+    /// every feature's paths present whether or not the feature is compiled
+    /// in, and each nested router serving something, since an empty one
+    /// claims no path.
+    #[test]
+    fn what_is_accepted_does_not_panic_the_router() {
+        let stub = || Router::new().route("/", any(|| async {}));
+        let nests = mount_points(
+            [
+                "/_/hooks",
+                "/_/jobs/nightly",
+                "/hooks",
+                "/v1/other",
+                "/apis",
+            ]
+            .into_iter()
+            .map(|prefix| (prefix.to_string(), stub()))
+            .collect(),
+        )
+        .unwrap();
+        let mut app: Router<Arc<AppState>> = Router::new()
+            .nest("/api", Router::new().route("/{*path}", any(|| async {})))
+            .route("/healthz", any(|| async {}))
+            .route("/v1/version", any(|| async {}))
+            .nest(CUSTOM_PREFIX, custom::custom_router());
+        for (prefix, router) in nests {
+            app = app.nest(&prefix, router);
+        }
+        let _ = app
+            .nest("/admin", stub())
+            .nest("/v1/graphql", stub())
+            .nest("/v1alpha1/graphql", stub())
+            .nest("/api/graphql", stub())
+            .route("/", any(|| async {}))
+            .fallback(|| async {});
+    }
 }

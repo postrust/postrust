@@ -57,3 +57,5 @@ admin-ui = ["postrust-server/admin-ui"]
 
 [dev-dependencies]
 pretty_assertions.workspace = true
+# The library's documentation example adds a route.
+axum.workspace = true

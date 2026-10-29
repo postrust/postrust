@@ -40,6 +40,17 @@ jobs:
       - name: Clippy (server, admin-ui feature)
         run: cargo clippy -p postrust-server --features admin-ui --all-targets -- -D warnings
 
+      # Outside the workspace (see `exclude` in Cargo.toml), so neither step
+      # above reaches it. It is the documented way to add routes, and an
+      # example that no longer compiles against the crate is worse than none.
+      # `--target-dir target` shares the workspace's build of the crates it
+      # depends on.
+      - name: Format and clippy (examples/custom-routes)
+        run: |
+          cargo fmt --manifest-path examples/custom-routes/Cargo.toml -- --check
+          cargo clippy --manifest-path examples/custom-routes/Cargo.toml --target-dir target \
+            --all-targets -- -D warnings
+
   msrv:
     name: MSRV (1.88)
     runs-on: ubuntu-latest

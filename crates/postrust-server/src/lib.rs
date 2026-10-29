@@ -28,7 +28,7 @@ pub mod state;
 pub mod admin;
 
 pub use app::handle_request;
-pub use build::{build, App, Host};
+pub use build::{build, App, Builder, Host, RESERVED_PREFIXES};
 pub use state::AppState;
 
 #[cfg(feature = "admin-ui")]

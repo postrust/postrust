@@ -4,12 +4,15 @@ Deploy Postrust to various environments. This guide covers deploying both the st
 
 ## Building with Custom Routes
 
-If you've added [custom routes](./custom-routes.md), build your customized version:
+The stock `postrust` binary is built from this repository as below. If you've
+added [custom routes](./custom-routes.md), you build your own binary crate
+instead -- `cargo build --release` in that crate -- with the same features
+enabled on its `postrust-server` dependency.
 
 ### Standard Build
 
 ```bash
-# Build optimized binary with custom routes
+# Build optimized binary
 cargo build --release -p postrust-server
 
 # Binary location
@@ -27,7 +30,7 @@ cargo build --release -p postrust-server --features admin-ui
 
 | Feature | Description |
 |---------|-------------|
-| `default` | Core REST API with custom routes |
+| `default` | Core REST API |
 | `admin-ui` | Admin dashboard + Swagger + GraphQL playground |
 
 ## Standalone Server
@@ -118,7 +121,7 @@ docker run -d \
 
 ### Building Your Own Image (with Custom Routes)
 
-If you've added custom routes in `crates/postrust-server/src/custom.rs`, build your own image:
+If you've written your own binary with [custom routes](./custom-routes.md), build an image of it. Here the crate is named `my-api`:
 
 ```dockerfile
 # Dockerfile
@@ -129,12 +132,11 @@ RUN apt-get update && apt-get install -y pkg-config libssl-dev
 
 WORKDIR /app
 
-# Copy workspace files
+# Copy your crate
 COPY Cargo.toml Cargo.lock ./
-COPY crates ./crates
+COPY src ./src
 
-# Build with admin-ui feature (optional)
-RUN cargo build --release -p postrust-server --features admin-ui
+RUN cargo build --release
 
 # Runtime stage
 FROM debian:bookworm-slim
@@ -143,7 +145,7 @@ RUN apt-get update && \
     apt-get install -y libssl3 ca-certificates && \
     rm -rf /var/lib/apt/lists/*
 
-COPY --from=builder /app/target/release/postrust /usr/local/bin/
+COPY --from=builder /app/target/release/my-api /usr/local/bin/
 
 # Default environment
 ENV PGRST_SERVER_HOST=0.0.0.0
@@ -155,7 +157,7 @@ EXPOSE 3000
 HEALTHCHECK --interval=30s --timeout=3s --start-period=5s --retries=3 \
     CMD curl -f http://localhost:3000/_/health || exit 1
 
-CMD ["postrust"]
+CMD ["my-api"]
 ```
 
 Build and run:

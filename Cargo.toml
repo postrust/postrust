@@ -12,6 +12,11 @@ members = [
     "crates/postrust-graphql",
     "crates/postrust-proxy",
 ]
+# A crate of its own, depending on postrust-server as a project of yours would.
+# Not a member because every Dockerfile here copies `Cargo.toml` and `crates/`
+# and nothing else, and a member missing from the build context fails the whole
+# build. CI builds and lints it with `--manifest-path`.
+exclude = ["examples/custom-routes"]
 
 [workspace.package]
 version = "2.4.0"

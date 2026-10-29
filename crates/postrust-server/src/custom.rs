@@ -1,7 +1,9 @@
-//! Custom routes extension for Postrust.
+//! The built-in routes under `/_`: health and readiness.
 //!
-//! Add your custom API endpoints here that don't go through the
-//! standard PostgREST-style query processing.
+//! Routes of your own do not belong here. A binary of yours nests them with
+//! [`crate::Builder::nest`], at a prefix of its own or beneath `/_`, without
+//! forking this crate; see docs/custom-routes.md. The handlers at the bottom of
+//! this file are sketches of what such routes look like.
 
 use axum::{
     extract::State,
@@ -20,9 +22,6 @@ pub fn custom_router() -> Router<Arc<AppState>> {
     Router::new()
         .route("/health", get(health_check))
         .route("/ready", get(readiness_check))
-    // Add your custom routes here:
-    // .route("/webhooks/stripe", post(handle_stripe_webhook))
-    // .route("/email/send", post(send_email))
 }
 
 /// Build the router served on `admin_server_port`.
