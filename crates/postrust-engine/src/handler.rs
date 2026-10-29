@@ -355,21 +355,6 @@ fn split_leading_cte(sql: &str) -> (String, &str) {
     (String::new(), sql)
 }
 
-/// Render a map of strings as a JSON object.
-///
-/// PostgreSQL will not accept every header name as a setting name -- a `-` is
-/// not allowed in one from version 14 -- so the whole map goes into a single
-/// setting as JSON and a function picks out what it wants with `->>`.
-fn json_object<'a>(entries: impl IntoIterator<Item = (&'a String, &'a String)>) -> String {
-    serde_json::Value::Object(
-        entries
-            .into_iter()
-            .map(|(name, value)| (name.clone(), serde_json::Value::String(value.clone())))
-            .collect(),
-    )
-    .to_string()
-}
-
 /// The prefix given to primary key columns added only to build `Location`.
 const LOCATION_KEY_PREFIX: &str = "pgrst_location_";
 
@@ -1067,138 +1052,22 @@ async fn execute_plan<'s, S: State>(
                 .await
                 .map_err(|e| postrust_core::Error::ConnectionPool(e.to_string()))?;
 
-            // Isolation level. `SET TRANSACTION` is only accepted before the
-            // first statement of a transaction, so it goes here.
+            // Make the transaction the caller's: its isolation level, read-only
+            // for a read, the role and every setting a policy or function reads
+            // back, and `db_pre_request`. See `Session` for each, and for the
+            // order they have to go in.
             //
-            // A role's own setting wins over the server-wide
-            // `PGRST_DB_TX_ISOLATION`, and both are closed enums rendered by
-            // `to_sql` -- never caller text. Issued only when it differs from
-            // PostgreSQL's own default, so the common case sends nothing.
-            //
-            // This and every statement up to the query are queued rather than
-            // run: they go out with the query, in one flight where the driver
-            // can pipeline, and a failure among them is the query's.
-            let isolation = state
-                .config()
-                .role_settings
-                .get(&auth.role)
-                .and_then(|r| r.isolation_level.as_ref())
-                .unwrap_or(&state.config().db_tx_isolation);
-            if *isolation != postrust_core::IsolationLevel::ReadCommitted {
-                tx.queue(
-                    &format!("SET TRANSACTION ISOLATION LEVEL {}", isolation.to_sql()),
-                    &[],
-                );
-            }
-
-            // A read request runs in a read-only transaction.
-            //
-            // Without this a GET can change data: `GET /rpc/some_volatile_fn`
-            // happily executes whatever the function does. PostgreSQL is the
-            // right place to enforce it, since it covers anything reachable
-            // from the statement -- a volatile function, a trigger, a rule --
-            // rather than only what the planner thought to look at.
-            if is_read_only(api_request) {
-                tx.queue("SET TRANSACTION READ ONLY", &[]);
-            }
-
-            // Everything the request tells the database about itself, in
-            // one statement.
-            //
-            // These are `SET LOCAL` by another spelling -- `set_config(k, v,
-            // true)` -- and a function or an RLS policy reads them back with
-            // `current_setting`. Sent as one `SELECT` rather than one
-            // statement each, which is a round trip per setting otherwise, and
-            // there are eight of them before a request has done any work.
-            //
-            // The order is PostgREST's: the settings a role carries, then the
-            // role, then everything about the request. The role goes on after
-            // its own settings so that a `GRANT SET ON PARAMETER` on the
-            // authenticator still applies when they are set.
-            {
-                let mut path = vec![api_request.schema.clone()];
-                path.extend(state.config().db_extra_search_path.iter().cloned());
-                let search_path = path
-                    .iter()
-                    .map(|s| postrust_sql::escape_ident(s))
-                    .collect::<Vec<_>>()
-                    .join(", ");
-
-                let mut settings: Vec<(String, String)> = Vec::new();
-
-                // The settings a role carries come first, before the `role`
-                // that follows them -- see the note above on
-                // `GRANT SET ON PARAMETER`.
-                if let Some(role_settings) = state.config().role_settings.get(&auth.role) {
-                    if let Some(timeout) = role_settings.statement_timeout {
-                        settings.push(("statement_timeout".to_string(), timeout.to_string()));
-                    }
-                }
-
-                settings.extend([
-                    ("search_path".to_string(), search_path),
-                    ("role".to_string(), auth.role.clone()),
-                    ("request.method".to_string(), api_request.method.clone()),
-                    ("request.path".to_string(), api_request.path.clone()),
-                    (
-                        "request.headers".to_string(),
-                        json_object(&api_request.headers),
-                    ),
-                    (
-                        "request.cookies".to_string(),
-                        json_object(&api_request.cookies),
-                    ),
-                ]);
-                settings.extend(auth.claim_settings());
-
-                // `app_settings`, exposed as PostgREST spells them: a function
-                // or policy reads one back with
-                // `current_setting('app.settings.<key>')`.
-                for (key, value) in &state.config().app_settings {
-                    settings.push((format!("app.settings.{key}"), value.clone()));
-                }
-
-                // `Prefer: timezone` is applied to the session, so every value
-                // the database renders -- and every `now()` a function calls --
-                // sees it. An unknown zone is PostgreSQL's to reject, and it
-                // does, with a message naming the value the client sent.
-                if let Some(timezone) = &api_request.preferences.timezone {
-                    settings.push(("timezone".to_string(), timezone.clone()));
-                }
-
-                let calls = (0..settings.len())
-                    .map(|i| format!("set_config(${}, ${}, true)", i * 2 + 1, i * 2 + 2))
-                    .collect::<Vec<_>>()
-                    .join(", ");
-                let sql = format!("SELECT {}", calls);
-                let params: Vec<postrust_sql::SqlParam> = settings
-                    .into_iter()
-                    .flat_map(|(name, value)| {
-                        [
-                            postrust_sql::SqlParam::Text(name),
-                            postrust_sql::SqlParam::Text(value),
-                        ]
-                    })
-                    .collect();
-                tx.queue(&sql, &params);
-            }
-
-            // `db_pre_request`: a function called before the request's own
-            // query, on the same transaction, so it sees every setting above
-            // and anything it raises aborts the request. PostgREST's use for
-            // it is a custom authorisation check that `RAISE`s to refuse.
-            //
-            // The name is an identifier from the configuration, not from the
-            // request, and is escaped as one -- a schema-qualified name stays
-            // two identifiers so `auth.check` does not become `"auth.check"`.
-            if let Some(pre_request) = &state.config().db_pre_request {
-                let qualified = pre_request
-                    .split('.')
-                    .map(postrust_sql::escape_ident)
-                    .collect::<Vec<_>>()
-                    .join(".");
-                tx.queue(&format!("SELECT {qualified}()"), &[]);
-            }
+            // They are queued rather than run: they go out with the query, in
+            // one flight where the driver can pipeline, and a failure among
+            // them is the query's.
+            postrust_core::Session::new(state.config(), auth.role.clone(), auth.claim_settings())
+                .schema(api_request.schema.clone())
+                .request(api_request.method.clone(), api_request.path.clone())
+                .headers(&api_request.headers)
+                .cookies(&api_request.cookies)
+                .timezone(api_request.preferences.timezone.clone())
+                .read_only(is_read_only(api_request))
+                .apply(&mut tx);
 
             // The main query. A logged failure names the driver's account of
             // it, which says more than the response is allowed to. Only faults
