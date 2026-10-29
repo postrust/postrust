@@ -128,6 +128,30 @@ impl Tx for SqlxTx {
     }
 }
 
+impl crate::session::Session<'_> {
+    /// Run this session's statements on a sqlx connection, in order.
+    ///
+    /// For code that holds a sqlx transaction of its own rather than a
+    /// [`Tx`] -- GraphQL's resolvers, a hand-written route -- and has to make
+    /// it the caller's. Pass the transaction (`&mut *tx`): every setting is
+    /// transaction-local, so it is gone when the transaction ends and the
+    /// connection goes back to the pool as it came. On a connection outside
+    /// a transaction each statement would be its own, and nothing would stay.
+    ///
+    /// Parameters are bound as [`SqlxTx`] binds them, so a session means the
+    /// same thing to both. A failure here is reported as a queued statement's,
+    /// as it is when [`Tx::queue`] runs the same statements.
+    pub async fn apply_sqlx(&self, conn: &mut sqlx::PgConnection) -> Result<(), DbError> {
+        for statement in self.statements() {
+            bind(sqlx::query(&statement.sql), &statement.params)
+                .execute(&mut *conn)
+                .await
+                .map_err(|e| DbError::from(e).queued())?;
+        }
+        Ok(())
+    }
+}
+
 async fn fetch_all(
     tx: &mut sqlx::Transaction<'static, Postgres>,
     sql: &str,
