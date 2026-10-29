@@ -66,7 +66,12 @@ impl AuthResult {
 }
 
 /// JWT configuration.
+///
+/// `#[non_exhaustive]` from 3.0.0, so that verifying keys and claims of new
+/// kinds is a minor release: start from `JwtConfig::default()` and assign, or
+/// take `postrust_engine::jwt_config` for the one an `AppConfig` describes.
 #[derive(Clone, Debug)]
+#[non_exhaustive]
 pub struct JwtConfig {
     /// Secret key for HS256/HS384/HS512
     pub secret: Option<String>,

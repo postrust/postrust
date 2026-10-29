@@ -3,6 +3,37 @@
 Notable changes, newest first. This file starts at 1.0.0-alpha.1; earlier
 releases are described by their tags and the pull requests behind them.
 
+## 3.0.0 (unreleased)
+
+A major release, and a narrow one: two structs that the features in this line
+have to grow are made `#[non_exhaustive]`, so that adding a field to either is
+a minor release from here on. The HTTP surface, configuration keys and the
+minimum supported Rust version are unchanged.
+
+### Changed
+
+- **`postrust_auth::JwtConfig` and `postrust_server::AppState` are
+  `#[non_exhaustive]`.** 2.0.0 did this for the configuration types and missed
+  these two, which asymmetric keys and telemetry both need to extend. Another
+  crate can no longer build either with a struct literal.
+
+### Added
+
+- `postrust_engine::jwt_config(&AppConfig)`: the JWT configuration an
+  `AppConfig` describes. The server, the Lambda adapter and the Worker each
+  spelled this out by hand, and now all take it from here.
+- `AppState::new(pool, schema_cache, config)`, which derives the JWT
+  configuration and token cache from `config` the way `build` does.
+
+### Upgrading from 2.x
+
+Only code that built `JwtConfig` or `AppState` with a struct literal is
+affected. Replace an `AppState { .. }` with `AppState::new(pool, schema_cache,
+config)` and assign any field that should differ -- a test that wants every
+token validated sets `state.jwt_cache = None`. Replace a `JwtConfig { .. }` with
+`postrust_engine::jwt_config(&config)`, or with `JwtConfig::default()` and
+assignments.
+
 ## 2.4.0
 
 A minor release. GraphQL now follows a schema reload, a write a view cannot

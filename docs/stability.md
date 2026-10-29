@@ -97,7 +97,12 @@ Configuration, schema and metadata types that grow with features --
 release, not a major one; the price is that another crate cannot build one with
 a struct literal, and starts from `Default::default()` and assigns the fields it
 needs instead. This is what 2.0.0 changed, so that a feature adding a setting
-does not need 3.0.0.
+does not need a major release.
+
+3.0.0 extends the same rule to two types 2.0.0 missed:
+`postrust_auth::JwtConfig`, which is built with
+`postrust_engine::jwt_config(&AppConfig)` or from `Default::default()`, and
+`postrust_server::AppState`, which is built with `AppState::new`.
 
 Not covered:
 

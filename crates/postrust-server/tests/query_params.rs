@@ -20,7 +20,6 @@ use postrust_server::{handle_request, AppState};
 use serde_json::Value;
 use sqlx::postgres::PgPoolOptions;
 use std::sync::Arc;
-use tokio::sync::RwLock;
 use tower::ServiceExt;
 
 /// The role the fixtures grant read access to.
@@ -72,21 +71,11 @@ async fn build_app_with(max_rows: Option<i64>, max_body_size: Option<usize>) -> 
         .await
         .expect("failed to load schema cache");
 
-    let jwt_config = postrust_auth::JwtConfig {
-        secret: config.jwt_secret.clone(),
-        secret_is_base64: config.jwt_secret_is_base64,
-        audience: config.jwt_aud.clone(),
-        role_claim_key: config.jwt_role_claim_key.clone(),
-        anon_role: config.db_anon_role.clone(),
-    };
-
-    let state = Arc::new(AppState {
-        pool,
-        schema_cache: RwLock::new(schema_cache),
-        config,
-        jwt_config,
+    let state = Arc::new({
+        let mut state = AppState::new(pool, schema_cache, config);
         // Uncached, so a test sees each request validated as it was written.
-        jwt_cache: None,
+        state.jwt_cache = None;
+        state
     });
 
     let api_router: Router<Arc<AppState>> = Router::new()

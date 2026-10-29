@@ -23,7 +23,6 @@ use axum::{
 };
 use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
 use std::sync::Arc;
-use tokio::sync::RwLock;
 use tower_http::cors::{AllowOrigin, Any as CorsAny, CorsLayer};
 use tracing::{error, info};
 
@@ -112,22 +111,7 @@ pub async fn build(config: postrust_core::AppConfig, host: Host) -> Result<App> 
     info!("{}", schema_cache.summary());
 
     // Create app state
-    let state = Arc::new(AppState {
-        pool,
-        schema_cache: RwLock::new(schema_cache),
-        config: config.clone(),
-        jwt_config: postrust_auth::JwtConfig {
-            secret: config.jwt_secret.clone(),
-            secret_is_base64: config.jwt_secret_is_base64,
-            audience: config.jwt_aud.clone(),
-            role_claim_key: config.jwt_role_claim_key.clone(),
-            anon_role: config.db_anon_role.clone(),
-        },
-        jwt_cache: postrust_auth::JwtCache::new(
-            config.jwt_cache_enabled,
-            config.jwt_cache_max_lifetime,
-        ),
-    });
+    let state = Arc::new(AppState::new(pool, schema_cache, config.clone()));
 
     // `db_channel_enabled`: reload the schema cache when PostgreSQL says the
     // schema changed, instead of on a restart. A migration ends with

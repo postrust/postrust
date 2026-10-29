@@ -23,7 +23,6 @@ use postrust_server::{handle_request, AppState};
 use sqlx::postgres::PgPoolOptions;
 use std::io::Write;
 use std::sync::{Arc, Mutex};
-use tokio::sync::RwLock;
 use tower::ServiceExt;
 
 const SCHEMA: &str = "query_error_logging";
@@ -88,19 +87,11 @@ async fn app() -> Router {
     let schema_cache = SchemaCache::load(&pool, &config.db_schemas)
         .await
         .expect("schema cache");
-    let jwt_config = postrust_auth::JwtConfig {
-        secret: config.jwt_secret.clone(),
-        secret_is_base64: config.jwt_secret_is_base64,
-        audience: config.jwt_aud.clone(),
-        role_claim_key: config.jwt_role_claim_key.clone(),
-        anon_role: config.db_anon_role.clone(),
-    };
-    let state = Arc::new(AppState {
-        pool,
-        schema_cache: RwLock::new(schema_cache),
-        config,
-        jwt_config,
-        jwt_cache: None,
+    let state = Arc::new({
+        let mut state = AppState::new(pool, schema_cache, config);
+        // Uncached, so a test sees each request validated as it was written.
+        state.jwt_cache = None;
+        state
     });
     let api: Router<Arc<AppState>> = Router::new()
         .route("/", any(handle_request))

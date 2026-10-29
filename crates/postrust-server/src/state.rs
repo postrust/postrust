@@ -7,6 +7,10 @@ use sqlx::PgPool;
 use tokio::sync::{RwLock, RwLockReadGuard};
 
 /// Shared application state.
+///
+/// `#[non_exhaustive]` from 3.0.0: build one with [`AppState::new`], then
+/// assign any field that should differ from what the configuration says.
+#[non_exhaustive]
 pub struct AppState {
     /// Database connection pool
     pub pool: PgPool,
@@ -21,6 +25,20 @@ pub struct AppState {
 }
 
 impl AppState {
+    /// State for `config`, serving `schema_cache` through `pool`.
+    ///
+    /// The JWT configuration and token cache are derived from `config`, as
+    /// [`build`](crate::build) derives them.
+    pub fn new(pool: PgPool, schema_cache: SchemaCache, config: AppConfig) -> Self {
+        Self {
+            pool,
+            schema_cache: RwLock::new(schema_cache),
+            jwt_config: postrust_engine::jwt_config(&config),
+            jwt_cache: JwtCache::new(config.jwt_cache_enabled, config.jwt_cache_max_lifetime),
+            config,
+        }
+    }
+
     /// Get a read lock on the schema cache.
     pub async fn schema_cache(&self) -> RwLockReadGuard<'_, SchemaCache> {
         self.schema_cache.read().await

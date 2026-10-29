@@ -576,13 +576,7 @@ impl State {
         let db = database(env)?;
         let schema = schema(env, &settings).await?;
         let config = settings.config;
-        let jwt_config = JwtConfig {
-            secret: config.jwt_secret.clone(),
-            secret_is_base64: config.jwt_secret_is_base64,
-            audience: config.jwt_aud.clone(),
-            role_claim_key: config.jwt_role_claim_key.clone(),
-            anon_role: config.db_anon_role.clone(),
-        };
+        let jwt_config = postrust_engine::jwt_config(&config);
         let jwt_cache = ISOLATE.with(|i| {
             let mut isolate = i.borrow_mut();
             if isolate.jwt_cache.is_none() {

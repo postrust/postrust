@@ -35,7 +35,6 @@ use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
 use sqlx::PgPool;
 use std::str::FromStr;
 use std::sync::Arc;
-use tokio::sync::RwLock;
 use tower::ServiceExt;
 
 const NOINHERIT: &str = "postrust_test_noinherit_authenticator";
@@ -248,19 +247,11 @@ async fn a_request_is_answered_through_the_authenticator() {
     let schema_cache = SchemaCache::load(&authenticator, &config.db_schemas)
         .await
         .expect("schema cache as the authenticator");
-    let jwt_config = postrust_auth::JwtConfig {
-        secret: config.jwt_secret.clone(),
-        secret_is_base64: config.jwt_secret_is_base64,
-        audience: config.jwt_aud.clone(),
-        role_claim_key: config.jwt_role_claim_key.clone(),
-        anon_role: config.db_anon_role.clone(),
-    };
-    let state = Arc::new(AppState {
-        pool: authenticator,
-        schema_cache: RwLock::new(schema_cache),
-        config,
-        jwt_config,
-        jwt_cache: None,
+    let state = Arc::new({
+        let mut state = AppState::new(authenticator, schema_cache, config);
+        // Uncached, so a test sees each request validated as it was written.
+        state.jwt_cache = None;
+        state
     });
     // Mounted as the server mounts it: the handler reads the path below `/api`.
     let api: Router<Arc<AppState>> = Router::new()

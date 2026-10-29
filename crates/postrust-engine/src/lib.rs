@@ -19,3 +19,21 @@ mod state;
 
 pub use handler::{allow, error_response, handle};
 pub use state::State;
+
+use postrust_auth::JwtConfig;
+use postrust_core::AppConfig;
+
+/// The JWT configuration an [`AppConfig`] describes.
+///
+/// Every host builds its [`State`] from one `AppConfig`; this is how each of
+/// them derives the JWT half, so the server, Lambda and the Worker cannot read
+/// the same settings differently.
+pub fn jwt_config(config: &AppConfig) -> JwtConfig {
+    let mut jwt = JwtConfig::default();
+    jwt.secret = config.jwt_secret.clone();
+    jwt.secret_is_base64 = config.jwt_secret_is_base64;
+    jwt.audience = config.jwt_aud.clone();
+    jwt.role_claim_key = config.jwt_role_claim_key.clone();
+    jwt.anon_role = config.db_anon_role.clone();
+    jwt
+}
