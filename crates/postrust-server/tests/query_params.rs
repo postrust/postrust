@@ -214,6 +214,30 @@ async fn select_rejects_unknown_column() {
     );
 }
 
+/// A cast names a type and nothing else. Words after the type were written
+/// into the statement as they came: `id::text as rolname` renamed the column,
+/// and longer runs of words reached the database as SQL of the client's.
+#[tokio::test]
+#[ignore = "requires PostgreSQL"]
+async fn select_refuses_a_cast_that_is_not_a_type_name() {
+    for select in [
+        "id::text%20as%20rolname",
+        "id::text%20from%20pg_roles%20where%20true%20or%20true",
+        "count()::text%20as%20n",
+    ] {
+        let (status, body) = get(&format!("/api/products?select={select}")).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{select}: {body}");
+        assert_eq!(body["code"], "PGRST100", "{select}: {body}");
+    }
+
+    // A cast to a type still works, a multi-word one included.
+    let (status, body) = get("/api/products?select=id::text&limit=1").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(body[0]["id"].is_string(), "{body}");
+    let (status, body) = get("/api/products?select=id::double%20precision&limit=1").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+}
+
 // ===========================================================================
 // limit / offset
 //

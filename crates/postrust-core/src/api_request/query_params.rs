@@ -7,11 +7,11 @@ use super::types::*;
 use crate::error::{Error, Result};
 use nom::{
     branch::alt,
-    bytes::complete::{tag, take_while1},
-    character::complete::char,
-    combinator::{opt, value},
+    bytes::complete::{tag, take_while, take_while1},
+    character::complete::{char, satisfy},
+    combinator::{opt, recognize, value},
     multi::{many0, separated_list0},
-    sequence::preceded,
+    sequence::{pair, preceded},
     IResult,
 };
 use percent_encoding::percent_decode_str;
@@ -247,7 +247,7 @@ fn parse_star(input: &str) -> IResult<&str, SelectItem> {
 fn parse_bare_aggregate(input: &str) -> IResult<&str, SelectItem> {
     let (input, alias) = opt(parse_alias_prefix)(input)?;
     let (input, _) = tag("count()")(input)?;
-    let (input, cast) = opt(preceded(tag("::"), parse_identifier))(input)?;
+    let (input, cast) = opt(preceded(tag("::"), parse_cast_type))(input)?;
 
     Ok((
         input,
@@ -375,10 +375,10 @@ fn parse_field_select(input: &str) -> IResult<&str, SelectItem> {
 
     // A cast on the column binds before the aggregate: `key::integer.sum()`
     // sums integers, where `.sum()::text` renders the sum as text.
-    let (input, cast) = opt(preceded(tag("::"), parse_identifier))(input)?;
+    let (input, cast) = opt(preceded(tag("::"), parse_cast_type))(input)?;
     let (input, aggregate) = opt(parse_aggregate_suffix)(input)?;
     let (input, aggregate_cast) = if aggregate.is_some() {
-        let (input, cast) = opt(preceded(tag("::"), parse_identifier))(input)?;
+        let (input, cast) = opt(preceded(tag("::"), parse_cast_type))(input)?;
         (input, cast.map(|s| s.to_string()))
     } else {
         (input, None)
@@ -1203,6 +1203,52 @@ fn parse_modifier_key(key: &str) -> Option<(EmbedPath, Modifier)> {
 /// result trimmed. A space is allowed because a column may genuinely have one
 /// -- `?select=Just A Server Model` -- and trimming is what keeps
 /// `?select=id, name` from asking for a column called `name ` .
+/// The SQL standard's type names that are more than one word.
+///
+/// Longest first, so that `time with time zone` is not read as `time` with
+/// something left over. Each is written into the statement in this spelling,
+/// never in the client's.
+const MULTI_WORD_TYPES: &[&str] = &[
+    "timestamp without time zone",
+    "timestamp with time zone",
+    "time without time zone",
+    "time with time zone",
+    "character varying",
+    "double precision",
+    "bit varying",
+];
+
+/// Parse the type a value is cast to: `id::text`, `amount::double precision`.
+///
+/// The type is written into the statement as it is -- a type name is not a
+/// value, so it cannot be bound, and quoting it would change its meaning
+/// (`::"int"` names no type). So this is the whole of what keeps a cast from
+/// carrying SQL of the client's into the statement: one type name, an
+/// identifier of letters, digits, `_` and `$` that does not start with a
+/// digit, or one of the standard's few multi-word names. Anything else after
+/// `::` is not a cast, and the select it is in is refused as unparsable.
+///
+/// It used to be [`parse_identifier`], which admits spaces -- so that a column
+/// name may contain one -- and with them `id::text as rolname` and any other
+/// run of words.
+fn parse_cast_type(input: &str) -> IResult<&str, &str> {
+    for name in MULTI_WORD_TYPES {
+        let Some(head) = input.get(..name.len()) else {
+            continue;
+        };
+        let rest = &input[name.len()..];
+        let ends_there =
+            !rest.starts_with(|c: char| c.is_ascii_alphanumeric() || c == '_' || c == '$');
+        if head.eq_ignore_ascii_case(name) && ends_there {
+            return Ok((rest, name));
+        }
+    }
+    recognize(pair(
+        satisfy(|c| c.is_ascii_alphabetic() || c == '_'),
+        take_while(|c: char| c.is_ascii_alphanumeric() || c == '_' || c == '$'),
+    ))(input)
+}
+
 fn parse_identifier(input: &str) -> IResult<&str, &str> {
     let (rest, matched) =
         take_while1(|c: char| c.is_alphanumeric() || c == '_' || c == '$' || c == ' ')(input)?;
@@ -1337,6 +1383,63 @@ fn parse_double_arrow(input: &str) -> IResult<&str, JsonOperation> {
 
 #[cfg(test)]
 mod tests {
+
+    /// A cast is one type name. Words after it are not part of the type, and
+    /// a select that carries them is refused rather than written into the
+    /// statement.
+    #[test]
+    fn a_cast_is_a_type_name_and_nothing_more() {
+        for select in [
+            "id::text as rolname",
+            "id::text from pg_roles where true or true",
+            "id::int4 union select",
+            "count()::text as x",
+            "amount.sum()::numeric as x",
+            "id::1text",
+            "id::",
+            "id::text;",
+        ] {
+            assert!(parse_select(select).is_err(), "{select:?} was accepted");
+        }
+    }
+
+    #[test]
+    fn a_cast_names_a_bare_type_or_a_standard_multi_word_one() {
+        let cast_of = |select: &str| match &parse_select(select).unwrap()[0] {
+            SelectItem::Field {
+                cast,
+                aggregate_cast,
+                ..
+            } => cast.clone().or_else(|| aggregate_cast.clone()),
+            other => panic!("{other:?}"),
+        };
+        assert_eq!(cast_of("id::text").as_deref(), Some("text"));
+        assert_eq!(cast_of("id::int4").as_deref(), Some("int4"));
+        assert_eq!(cast_of("id::_text").as_deref(), Some("_text"));
+        assert_eq!(cast_of("id::my$type").as_deref(), Some("my$type"));
+        assert_eq!(cast_of("count()::text").as_deref(), Some("text"));
+        assert_eq!(
+            cast_of("amount::Double Precision").as_deref(),
+            Some("double precision"),
+            "written in the standard's spelling, not the client's"
+        );
+        assert_eq!(
+            cast_of("at::timestamp with time zone").as_deref(),
+            Some("timestamp with time zone")
+        );
+        assert_eq!(
+            cast_of("at::time with time zone").as_deref(),
+            Some("time with time zone")
+        );
+        // `timestamptz` is one word, and not `timestamp` with `tz` left over.
+        assert_eq!(cast_of("at::timestamptz").as_deref(), Some("timestamptz"));
+        // A multi-word name followed by another item.
+        assert_eq!(
+            parse_select("amount::double precision,id").unwrap().len(),
+            2
+        );
+    }
+
     use super::*;
 
     #[test]
