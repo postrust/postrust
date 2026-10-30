@@ -38,9 +38,10 @@ pub struct JwtCache {
     ///
     /// Read and written only while `entries` is locked, so the two change
     /// together; atomic only so that `JwtCache` stays `Sync` without a second
-    /// lock. When the keys change, every entry was verified against a set
-    /// that is no longer in force -- possibly by a key that has just been
-    /// withdrawn -- and they are all forgotten.
+    /// lock. When a later set of keys appears, every entry was verified
+    /// against a set that is no longer in force -- possibly by a key that has
+    /// just been withdrawn -- and they are all forgotten. Only ever moves
+    /// forward: see [`Self::get_under`].
     keys_generation: AtomicU64,
     // How many lookups found a live entry, and how many had to verify. Plain
     // counters rather than a metric, so this crate stays free of any
@@ -203,11 +204,18 @@ impl JwtCache {
         Ok(result)
     }
 
-    /// [`Self::get`], first forgetting everything if the keys are no longer
-    /// those of `generation`.
+    /// [`Self::get`], first forgetting everything if `generation` is a later
+    /// set of keys than the entries were verified under.
+    ///
+    /// An earlier `generation` changes nothing: it was read by a request that
+    /// began before the keys were replaced. Moving the cache back to it would
+    /// let another such request, still verifying against the old set, cache
+    /// what that set -- and perhaps a key just withdrawn from it -- admitted.
+    /// The entries already there were verified under the later set, and
+    /// answer it as well as any.
     fn get_under(&self, token: &str, generation: u64) -> Option<AuthResult> {
         let mut entries = self.entries.lock().unwrap_or_else(|e| e.into_inner());
-        if self.keys_generation.load(Ordering::Relaxed) != generation {
+        if generation > self.keys_generation.load(Ordering::Relaxed) {
             entries.clear();
             self.keys_generation.store(generation, Ordering::Relaxed);
         }
@@ -465,6 +473,44 @@ mod tests {
         // The old method answers alike, and is counted alike.
         assert!(cache.authenticate(Some(&header), &config).is_ok());
         assert_eq!(cache.stats().hits, 2);
+    }
+
+    /// Two requests that read the generation before the keys were replaced,
+    /// interleaved with one that read it after: the first must not put the
+    /// cache back on the old set, or the second -- verified against the old
+    /// set -- would be cached under it.
+    #[test]
+    fn a_request_from_before_a_rotation_cannot_bring_the_old_keys_back() {
+        let cache = JwtCache::new(true, 3600).unwrap();
+        let (old, new) = (1, 2);
+        let ttl = Duration::from_secs(60);
+
+        assert!(cache.get_under("after", new).is_none());
+        cache.insert_under("after".into(), result_with(json!({})), ttl, new);
+
+        // A request that read `old`: it looks up, and finds what `new` cached.
+        assert!(cache.get_under("before", old).is_none());
+        assert!(cache.get_under("after", old).is_some());
+        // Another that read `old` and verified against the old set.
+        cache.insert_under("withdrawn".into(), result_with(json!({})), ttl, old);
+        assert!(cache.get_under("withdrawn", new).is_none());
+        assert!(cache.get_under("after", new).is_some());
+    }
+
+    /// A set made later, by any handle, is a later generation.
+    #[test]
+    fn generations_only_increase() {
+        let a = crate::JwtKeys::from_config(Some("reallyreallyreallyreallyverysafe"), false)
+            .unwrap()
+            .unwrap();
+        let first = a.generation();
+        assert!(first > 0);
+        let b = crate::JwtKeys::from_config(Some("reallyreallyreallyreallyverysafe"), false)
+            .unwrap()
+            .unwrap();
+        assert!(b.generation() > first);
+        a.replace(crate::KeySet::from_secret("anotheranotheranotheranother1234", false).unwrap());
+        assert!(a.generation() > b.generation());
     }
 
     #[test]

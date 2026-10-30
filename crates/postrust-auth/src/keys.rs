@@ -21,6 +21,7 @@
 //! and no others; a token that names none is checked against every key that
 //! admits its algorithm, and passes if any of them verifies it.
 
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 
 use base64::Engine;
@@ -317,10 +318,11 @@ impl KeySet {
 /// out, never across a verification, so readers do not wait on each other in
 /// any way that matters and a writer waits for nothing but those clones.
 ///
-/// Each replacement also counts a generation, under the same lock as the set
-/// itself so the two can never disagree. A [`crate::JwtCache`] remembers the
-/// generation its entries were verified under and forgets them all when it
-/// changes; see [`JwtKeys::generation`].
+/// Each set, the first and every replacement, also gets a generation, under
+/// the same lock as the set itself so the two can never disagree. A
+/// [`crate::JwtCache`] remembers the generation its entries were verified
+/// under and forgets them all when a later one appears; see
+/// [`JwtKeys::generation`].
 #[derive(Clone)]
 pub struct JwtKeys {
     current: Arc<RwLock<(Arc<KeySet>, u64)>>,
@@ -336,7 +338,7 @@ impl JwtKeys {
     /// Hold `set`.
     pub fn new(set: KeySet) -> Self {
         Self {
-            current: Arc::new(RwLock::new((Arc::new(set), 0))),
+            current: Arc::new(RwLock::new((Arc::new(set), next_generation()))),
         }
     }
 
@@ -364,10 +366,17 @@ impl JwtKeys {
             .clone()
     }
 
-    /// How many times the set has been replaced.
+    /// Which set this is: a number no earlier set, of this handle or any
+    /// other in the process, was given, and greater than all of theirs.
     ///
     /// Read before a token is verified and compared after, it says whether
     /// the set the token was verified against is still the one in force.
+    /// Increasing rather than merely different, so that a request which read
+    /// it before a replacement is recognisably behind one that read it after,
+    /// and cannot put a cache back on the old set. Process-wide rather than
+    /// per handle, so that a cache that outlives one `JwtKeys` -- a Worker
+    /// isolate's, when its configuration changes -- sees the next one's sets
+    /// as later too.
     pub fn generation(&self) -> u64 {
         self.current.read().unwrap_or_else(|e| e.into_inner()).1
     }
@@ -382,8 +391,16 @@ impl JwtKeys {
     /// fetched the same set again does not call this.
     pub fn replace(&self, set: KeySet) {
         let mut current = self.current.write().unwrap_or_else(|e| e.into_inner());
-        *current = (Arc::new(set), current.1.wrapping_add(1));
+        *current = (Arc::new(set), next_generation());
     }
+}
+
+/// A generation no set has had yet. Starts at 1, so that 0 -- what a
+/// [`crate::JwtCache`] starts at, and what it is given when there are no
+/// keys -- is earlier than every set.
+fn next_generation() -> u64 {
+    static NEXT: AtomicU64 = AtomicU64::new(1);
+    NEXT.fetch_add(1, Ordering::Relaxed)
 }
 
 /// What one JWK turned out to be.
