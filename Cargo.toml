@@ -19,7 +19,7 @@ members = [
 exclude = ["examples/custom-routes"]
 
 [workspace.package]
-version = "2.4.1"
+version = "3.0.0"
 edition = "2021"
 # Verified, not assumed: 1.94.0 builds the workspace clean, and anything older
 # is refused outright -- sqlx 0.9 declares 1.94, and every crate here that
@@ -188,13 +188,13 @@ regex = "1"
 # wasm32) can leave it out; the ones that load a schema cache or decode rows ask
 # for `features = ["sqlx"]`. The crate's own default keeps sqlx on for anybody
 # depending on it from crates.io.
-postrust-core = { version = "2.4.1", path = "crates/postrust-core", default-features = false }
-postrust-sql = { version = "2.4.1", path = "crates/postrust-sql" }
-postrust-auth = { version = "2.4.1", path = "crates/postrust-auth" }
-postrust-response = { version = "2.4.1", path = "crates/postrust-response" }
-postrust-engine = { version = "2.4.1", path = "crates/postrust-engine" }
-postrust-graphql = { version = "2.4.1", path = "crates/postrust-graphql" }
-postrust-server = { version = "2.4.1", path = "crates/postrust-server" }
+postrust-core = { version = "3.0.0", path = "crates/postrust-core", default-features = false }
+postrust-sql = { version = "3.0.0", path = "crates/postrust-sql" }
+postrust-auth = { version = "3.0.0", path = "crates/postrust-auth" }
+postrust-response = { version = "3.0.0", path = "crates/postrust-response" }
+postrust-engine = { version = "3.0.0", path = "crates/postrust-engine" }
+postrust-graphql = { version = "3.0.0", path = "crates/postrust-graphql" }
+postrust-server = { version = "3.0.0", path = "crates/postrust-server" }
 
 [profile.release]
 lto = true

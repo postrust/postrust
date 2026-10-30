@@ -3,13 +3,28 @@
 Notable changes, newest first. This file starts at 1.0.0-alpha.1; earlier
 releases are described by their tags and the pull requests behind them.
 
-## 3.0.0 (unreleased)
+## 3.0.0
 
-A major release, and a narrow one: two structs that the features in this line
-have to grow are made `#[non_exhaustive]`, so that adding a field to either is
-a minor release from here on, and the database driver moves to sqlx 0.9, which
-raises the minimum supported Rust version to 1.94. The HTTP surface and
-configuration keys are unchanged.
+Asymmetric JWTs and keys fetched from an identity provider, routes of your own
+that run as their caller under row-level security, and OpenTelemetry traces
+and metrics.
+
+It is a major release for the Rust API, not for the HTTP one. Two structs the
+features in this line have to grow are made `#[non_exhaustive]`, so that adding
+a field to either is a minor release from here on, and the database driver
+moves to sqlx 0.9, which raises the minimum supported Rust version to 1.94. A
+deployment that only runs the server or the image upgrades by changing the
+tag: the new keys are off until set, and existing configuration keeps its
+meaning, but for the few edges listed under Changed -- a JWT secret that
+cannot be used now stops start-up, for one. It carries 2.4.1's security fixes.
+
+Released beside it: `postrust-worker` 1.1.0, which gains asymmetric keys,
+`PGRST_JWT_ISS` and `PGRST_JWT_JWKS_URL` with nothing removed, and
+`postrust-proxy` 2.0.0. The proxy's own code is 1.0.0's, but its public API
+takes a sqlx `PgPool` -- `ProxyState::new`, `SaasState`, `CertStore::new`, the
+`saas::db` functions -- so moving it to sqlx 0.9 is a breaking change under its
+semver promise. Code that hands it a pool needs sqlx 0.9 too; nothing else
+changes.
 
 ### Changed
 

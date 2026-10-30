@@ -39,6 +39,8 @@ spec:
               value: {{ .Values.auth.anonRole | quote }}
             - name: PGRST_LOG_LEVEL
               value: {{ .Values.server.logLevel | quote }}
+            - name: PGRST_LOG_FORMAT
+              value: {{ .Values.server.logFormat | quote }}
             {{- if .Values.server.compatMode }}
             - name: PGRST_COMPAT_MODE
               value: "true"
@@ -60,9 +62,21 @@ spec:
                   key: PGRST_JWT_SECRET
                   optional: true
             {{- end }}
+            {{- if .Values.auth.jwksUrl }}
+            - name: PGRST_JWT_JWKS_URL
+              value: {{ .Values.auth.jwksUrl | quote }}
+            {{- end }}
+            {{- if .Values.auth.issuer }}
+            - name: PGRST_JWT_ISS
+              value: {{ .Values.auth.issuer | quote }}
+            {{- end }}
+            {{- with .Values.extraEnv }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
           # Both endpoints come from the built-in custom routes: /_/health
-          # reports the process is up, /_/ready also checks the database, which
-          # is what should gate traffic.
+          # reports the process is up; /_/ready also checks the database and,
+          # with auth.jwksUrl, that the keys have loaded, which is what should
+          # gate traffic.
           livenessProbe:
             httpGet:
               path: /_/health
