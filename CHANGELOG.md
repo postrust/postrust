@@ -3,6 +3,131 @@
 Notable changes, newest first. This file starts at 1.0.0-alpha.1; earlier
 releases are described by their tags and the pull requests behind them.
 
+## Unreleased: `postrust-proxy` 1.0.0
+
+`postrust-proxy` reaches 1.0.0 and joins the stable line on a version of its
+own: from here it follows semver over its Rust API, its configuration, and the
+HTTP API of its SaaS and admin routers (docs/stability.md). This release is
+also a security release for the proxy. Every deployment of it should upgrade.
+Details are in the repository's security advisories
+(https://github.com/postrust/postrust/security/advisories). Nothing outside
+`postrust-proxy` changes.
+
+### Security
+
+The shipped `postrust-proxy` binary:
+
+- **Connections that send nothing, or a header line at a time, are closed.**
+  The header read timeout was configured but never took effect, and there was
+  no idle timeout and no connection limit, so one client could hold every
+  file descriptor. New `[server]` settings: `max_connections` (10000),
+  `header_read_timeout_secs` (30), `idle_timeout_secs` (60, covering the first
+  bytes, the TLS handshake and HTTP/2 connections with no streams),
+  `http2_keepalive_interval_secs`/`_timeout_secs` (20) and
+  `tunnel_idle_timeout_secs` (300) for WebSockets.
+- **A rate limit below one request a second no longer locks clients out for
+  good.** `requests / window_secs` was integer division, so `3` per `60`
+  never refilled. Rates are fractions now.
+- **Rate limits are per route, keyed as configured.** One bucket per client
+  address was shared by every route and sized by the first one hit, so
+  touching a lax route lifted a strict route's limit; the route's `key` was
+  ignored. Buckets are now per route and by `client_ip` (an IPv6 client by its
+  /64), `route` or a header. Refilled buckets are dropped in the background,
+  and `rate_limit.max_tracked_keys` (100000) caps the table; when it is full a
+  new client gets 429.
+- **Only WebSocket upgrades are tunnelled.** Any `Upgrade` was spliced
+  through, `h2c` included, after which requests reached the backend past
+  every route's path and method rules. `server.allowed_upgrade_protocols`
+  defaults to `["websocket"]`; another HTTP/1 upgrade is forwarded as a plain
+  request with the upgrade and `HTTP2-Settings` removed, and another HTTP/2
+  `:protocol` gets 501.
+- **Paths that could step outside their route are refused with 400**: dot
+  segments, literal or percent-encoded, and encoded `/` or `\`. Prefix routes
+  match whole segments.
+- **Forwarding headers are the proxy's own.** `X-Real-IP` was kept from the
+  client, `Forwarded` passed through, and `X-Forwarded-For` appended to what
+  the client sent, so a backend trusting them believed the client. They are
+  now set from the connection, and `Forwarded` is removed;
+  `server.trust_forwarded_headers = true` keeps and extends the chain behind a
+  proxy you control.
+- **Disabled upstreams and backends get no traffic** (503 when nothing is
+  eligible). Their `enabled` flags were ignored.
+- **Certificate keys on disk are owner-only** (`0600`, written atomically, in
+  a `0700` directory; looser keys from earlier versions are tightened at
+  startup), and a file name is only ever built from a lowercase DNS name.
+
+The SaaS router (`saas_router`), for applications that embed it:
+
+- **An API key cannot grant more than it holds.** The API-key endpoints
+  checked no scope, so any key -- read-only, or with no scopes at all -- could
+  create a `*` key. They now need `api_keys:read`/`api_keys:write`; a new
+  key's scopes must be held by its creator, and a key can revoke only keys
+  whose scopes it holds. Unknown scopes are refused.
+- **Every read checks its scope.** Listing and reading domains, routes,
+  upstreams and the tenant checked none; `/tenant` and `/tenant/usage` need
+  the new `tenant:read`.
+- **A domain is one name whatever its case.** Uniqueness was case-sensitive,
+  so a second tenant could register `VICTIM.test` beside `victim.test` and
+  have the proxy answer its verification challenge on the owner's host.
+  Domains are stored normalised (lowercase, no trailing dot, ASCII only -- use
+  the `xn--` form) and unique without regard to case. IP addresses are
+  refused.
+- **Domain verification cannot be aimed inside the network.** It followed
+  redirects to any host and returned what it fetched in its error. It now
+  follows none, refuses private, loopback, link-local and other
+  special-purpose addresses and connects only to the address it checked,
+  reads at most 1 KB, and reports failures without the fetched content. It is
+  throttled (10 s apart, 50 attempts) and honours the challenge's expiry.
+- **A certificate can be uploaded only for a verified domain, and must chain
+  to a trusted root** (`DomainPolicy::upload_trust`, the public web roots by
+  default). A tenant could register the platform's own hostname and upload a
+  self-signed certificate that the binary's TLS listener then served for it.
+  `DomainPolicy::reserved` lists names no tenant may register -- put the
+  platform's own hostnames there -- and an unverified registration stops
+  holding its name after 7 days.
+- **Database and library errors are no longer returned to tenants**; errors
+  carry a stable `code`.
+- **Tenant JWTs need `exp` and `aud`** (`postrust-proxy` by default), and a
+  token without `scopes` has none, where it used to have `*`.
+- **Backend addresses, headers and health-check paths are validated**, with
+  the same address rules as verification.
+
+### Fixed
+
+- Adding a backend to a tenant's upstream always failed: a trigger read a
+  column the table does not have. Creating an upstream with backends is now
+  one transaction.
+- Certificates stored with uppercase letters or a trailing dot were never
+  served.
+- Weighted balancing panicked when every weight was 0, and weighted the wrong
+  backends once one was unhealthy.
+- ACME issuance and renewal skip disabled domains and suspended tenants, and
+  an issued certificate is deleted with its domain.
+- Tenant quotas: `max_routes_per_domain` is enforced, and `max_upstreams`,
+  `max_backends_per_upstream` and `max_api_keys` are new (20 each).
+- The admin UI escapes every value it displays.
+
+### Upgrading
+
+- Apply the new migration (`20261030000001_proxy_control_plane.sql`). If two
+  domains differ only in case, it keeps one -- verified before unverified,
+  then the earlier -- and records the others in `proxy_domain_case_conflicts`.
+- Behind another proxy that sets `X-Forwarded-For`, set
+  `server.trust_forwarded_headers = true`.
+- A prefix route such as `/api/v` no longer matches `/api/v1`.
+- An embedder of `saas_router`: list your own hostnames in
+  `DomainPolicy::reserved`; give existing API keys the scopes they now need;
+  mint tenant JWTs with `exp`, `aud` and explicit `scopes`; configure
+  `UploadTrust::Roots` if tenants upload certificates from a private CA.
+- Rust API: `ServerConfig`, `TlsConfig`, `RateLimitDefaults`,
+  `HealthCheckConfig` and `ProxyConfig` are `#[non_exhaustive]` (build them
+  from `Default` or TOML); `RateLimiter::check_with_config`, the
+  `LoadBalance*::get_ptr` methods and constructors,
+  `ForwarderClient::forward_upgrade`/`forward_h2_websocket`,
+  `MessageHandler::add_forwarding_headers` and `DomainManager::delete_domain`
+  change signature; `MessageHandler::has_ambiguous_framing` is removed;
+  `ApiResponse` gains `code`.
+
 ## 2.4.1
 
 A security release. Every deployment should upgrade. It fixes an SQL

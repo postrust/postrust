@@ -33,20 +33,29 @@ curl -X GET http://localhost:8080/api/v1/domains \
   -H "Authorization: Bearer eyJhbGciOiJIUzI1NiIs..."
 ```
 
-JWT tokens must include:
+JWT tokens are HS256, signed with `SaasOptions::jwt_secret`, and must include:
 - `sub`: User ID (required)
 - `tenant_id`: Tenant UUID (required)
+- `exp`: Expiry (required; a token without one is refused)
+- `aud`: Audience (required), `SaasOptions::jwt_audience`, `postrust-proxy`
+  unless configured otherwise. A token minted for the main Postrust server
+  with the same secret is therefore not accepted here.
+- `iss`: Issuer (required only when `SaasOptions::jwt_issuer` is set)
 - `role`: User role (optional)
-- `scopes`: Array of permission scopes (optional, defaults to `["*"]`)
+- `scopes`: Array of permission scopes (optional). A token without it has no
+  scopes and can do nothing; give `["*"]` explicitly for full access.
 
 ### API Key Authentication
 
 ```bash
 curl -X GET http://localhost:8080/api/v1/domains \
-  -H "Authorization: ApiKey pk_live_abc123..."
+  -H "Authorization: ApiKey pr_live_abc123..."
 ```
 
-API keys are prefixed with `pk_` for identification and can have restricted scopes.
+API keys are prefixed with `pr_live_` for identification and can have restricted scopes.
+
+Every endpoint checks the scope it needs (see [Available Scopes](#available-scopes));
+a credential without it gets `403` with code `insufficient_scope`.
 
 ## API Endpoints
 
@@ -119,7 +128,7 @@ API keys are prefixed with `pk_` for identification and can have restricted scop
 
 ```bash
 curl -X POST http://localhost:8080/api/v1/domains \
-  -H "Authorization: ApiKey pk_live_abc123..." \
+  -H "Authorization: ApiKey pr_live_abc123..." \
   -H "Content-Type: application/json" \
   -d '{
     "domain": "app.example.com",
@@ -151,7 +160,7 @@ _postrust-verification.app.example.com TXT "postrust-verify=abc123def456"
 
 ```bash
 curl -X POST http://localhost:8080/api/v1/domains/550e8400-e29b-41d4-a716-446655440000/verify \
-  -H "Authorization: ApiKey pk_live_abc123..."
+  -H "Authorization: ApiKey pr_live_abc123..."
 ```
 
 ### HTTP Challenge Verification
@@ -160,7 +169,7 @@ curl -X POST http://localhost:8080/api/v1/domains/550e8400-e29b-41d4-a716-446655
 
 ```bash
 curl -X POST http://localhost:8080/api/v1/domains \
-  -H "Authorization: ApiKey pk_live_abc123..." \
+  -H "Authorization: ApiKey pr_live_abc123..." \
   -H "Content-Type: application/json" \
   -d '{
     "domain": "app.example.com",
@@ -178,6 +187,26 @@ It answers only for a challenge that is in the database, unexpired, unresolved,
 and whose domain matches the request's `Host`.
 
 3. Trigger verification (same as DNS method).
+
+The check fetches `https://<domain>/.well-known/postrust-verification/<token>`,
+falling back to `http://`. It resolves the domain itself and refuses to
+connect to any private, loopback, link-local or other special-purpose
+address, connects to the address it checked, follows no redirects, and reads
+at most 1 KB. A failed check says only what failed ("could not connect",
+"content did not match"); the details are in the proxy's log.
+
+### Verification limits
+
+- Attempts for one domain are at least 10 seconds apart and at most 50 per
+  registration (`DomainPolicy::verification_min_interval`,
+  `verification_max_attempts`). Too soon is `429`; past the limit, delete and
+  re-add the domain.
+- An unverified registration holds its name for 7 days
+  (`DomainPolicy::pending_ttl`). After that its challenge has expired, it can
+  no longer be verified, and the next registration of the same name by anyone
+  replaces it. Without this, a tenant could register a name it does not own
+  and keep the real owner out indefinitely.
+- An already-verified domain answers "verified" without checking again.
 
 ### Prefer DNS verification
 
@@ -202,11 +231,11 @@ the HTTP-01 challenge, and stores the certificate. Nothing else to call.
 ```bash
 # Verify. That is the whole trigger.
 curl -X POST http://localhost:8080/api/v1/domains/<id>/verify \
-  -H "Authorization: ApiKey pk_live_abc123..."
+  -H "Authorization: ApiKey pr_live_abc123..."
 
 # Watch ssl_status go pending -> provisioning -> active
 curl http://localhost:8080/api/v1/domains/<id> \
-  -H "Authorization: ApiKey pk_live_abc123..."
+  -H "Authorization: ApiKey pr_live_abc123..."
 ```
 
 Configure the CA in the proxy's TOML:
@@ -243,7 +272,7 @@ has been fixed.
 
 ```bash
 curl -X POST http://localhost:8080/api/v1/domains/<id>/ssl/provision \
-  -H "Authorization: ApiKey pk_live_abc123..."
+  -H "Authorization: ApiKey pr_live_abc123..."
 ```
 
 Returns **202 Accepted**. It sets state and returns; the worker does the work.
@@ -292,7 +321,7 @@ by hand.
 
 ```bash
 curl -X POST http://localhost:8080/api/v1/domains/<id>/ssl/upload \
-  -H "Authorization: ApiKey pk_live_abc123..." \
+  -H "Authorization: ApiKey pr_live_abc123..." \
   -H "Content-Type: application/json" \
   -d '{"cert_pem": "-----BEGIN CERTIFICATE-----\n...", "key_pem": "-----BEGIN PRIVATE KEY-----\n..."}'
 ```
@@ -306,6 +335,8 @@ check failed:
 | **The key matches the chain** | The listener would accept the upload and then fail every TLS handshake, with nothing in the logs pointing at the upload |
 | Not expired | Same, immediately |
 | Covers this domain | A certificate for another name authorises nothing here. Wildcards count, for exactly one label — `*.example.com` covers `api.example.com`, not `example.com` and not `a.b.example.com` |
+| **The domain is verified** | An upload is a claim to serve TLS for the name; until the tenant has shown it controls the name, that claim is not theirs to make |
+| **The chain is trusted** | It must chain to `domains.upload_trust`: the public web roots by default, or roots of your own for an internal CA. A self-signed certificate is refused, since the proxy would present it in place of the one it would otherwise serve for that name |
 
 On success the domain's `ssl_provider` becomes `manual` and its `ssl_status`
 becomes `active`. The stored certificate has `auto_renew` turned off: nothing
@@ -317,7 +348,7 @@ replacement before it expires, or switch the domain to `acme`.
 
 ```bash
 curl -X PUT http://localhost:8080/api/v1/domains/<id> \
-  -H "Authorization: ApiKey pk_live_abc123..." \
+  -H "Authorization: ApiKey pr_live_abc123..." \
   -H "Content-Type: application/json" \
   -d '{"ssl_provider": "acme"}'
 ```
@@ -335,7 +366,7 @@ For custom certificates:
 
 ```bash
 curl -X POST http://localhost:8080/api/v1/domains/<id>/ssl/upload \
-  -H "Authorization: ApiKey pk_live_abc123..." \
+  -H "Authorization: ApiKey pr_live_abc123..." \
   -H "Content-Type: application/json" \
   -d '{
     "certificate": "-----BEGIN CERTIFICATE-----\n...",
@@ -350,7 +381,7 @@ curl -X POST http://localhost:8080/api/v1/domains/<id>/ssl/upload \
 
 ```bash
 curl -X POST http://localhost:8080/api/v1/upstreams \
-  -H "Authorization: ApiKey pk_live_abc123..." \
+  -H "Authorization: ApiKey pr_live_abc123..." \
   -H "Content-Type: application/json" \
   -d '{
     "name": "api-backend",
@@ -364,20 +395,30 @@ curl -X POST http://localhost:8080/api/v1/upstreams \
 
 ```bash
 curl -X POST http://localhost:8080/api/v1/upstreams/<upstream_id>/backends \
-  -H "Authorization: ApiKey pk_live_abc123..." \
+  -H "Authorization: ApiKey pr_live_abc123..." \
   -H "Content-Type: application/json" \
   -d '{
-    "address": "10.0.0.1:8080",
+    "address": "app-1.customer.example:8080",
     "scheme": "http",
     "weight": 100
   }'
 ```
 
+A backend is a tenant's server on the public internet. Its `address` is a
+`host:port` with a public hostname or IP, and `scheme` is `http` or `https`.
+Loopback, private (RFC 1918, ULA), link-local (including `169.254.169.254`),
+CGNAT, multicast, documentation and other special-purpose addresses are
+refused, as are `localhost` and single-label names: a tenant must not be able
+to aim the platform's own network at itself. `add_headers` and `remove_headers`
+must be valid header names and values, and may not touch `Host`,
+`Content-Length`, `Transfer-Encoding` or hop-by-hop headers;
+`health_check_path` starts with `/`.
+
 ### Create Routes
 
 ```bash
 curl -X POST http://localhost:8080/api/v1/domains/<domain_id>/routes \
-  -H "Authorization: ApiKey pk_live_abc123..." \
+  -H "Authorization: ApiKey pr_live_abc123..." \
   -H "Content-Type: application/json" \
   -d '{
     "name": "api-route",
@@ -421,7 +462,7 @@ curl -X POST http://localhost:8080/api/v1/auth/api-keys \
   -d '{
     "name": "Production API Key",
     "scopes": ["domains:read", "domains:write", "routes:write"],
-    "expires_in_days": 365
+    "expires_at": "2027-01-13T00:00:00Z"
   }'
 ```
 
@@ -432,8 +473,8 @@ Response:
   "data": {
     "id": "550e8400-e29b-41d4-a716-446655440000",
     "name": "Production API Key",
-    "key": "pk_live_abc123def456...",
-    "key_prefix": "pk_live_abc",
+    "key": "pr_live_abc123def456...",
+    "key_prefix": "pr_live_",
     "scopes": ["domains:read", "domains:write", "routes:write"],
     "expires_at": "2026-01-13T00:00:00Z"
   },
@@ -452,8 +493,16 @@ Response:
 | `routes:write` | Create/update/delete routes |
 | `upstreams:read` | Read upstreams |
 | `upstreams:write` | Create/update/delete upstreams |
-| `api-keys:read` | Read API keys |
-| `api-keys:write` | Create/revoke API keys |
+| `api_keys:read` | List API keys |
+| `api_keys:write` | Create/revoke API keys |
+| `tenant:read` | `/tenant` and `/tenant/usage` |
+
+Creating a key needs `api_keys:write`, and every scope given to the new key
+must be one the creating credential holds: only a `*` credential can create a
+`*` key. Revoking a key needs `api_keys:write` and every scope the key being
+revoked holds, so a narrow key cannot revoke a broader one. An unknown scope is
+refused with `400`. A key created without `scopes` gets `domains:read` and
+`domains:write`.
 
 ## Database Schema
 
@@ -493,13 +542,49 @@ sqlx migrate run
 
 ## Configuration
 
-### Environment Variables
+### `SaasOptions`
 
-| Variable | Description | Default |
-|----------|-------------|---------|
-| `PROXY_JWT_SECRET` | JWT signing secret | Required for JWT auth |
-| `PROXY_ACME_EMAIL` | Email for ACME registration | Required for auto-SSL |
-| `PROXY_ACME_DIRECTORY` | ACME directory URL | Let's Encrypt production |
+The SaaS router is configured in code, with `SaasState::with_options`:
+
+```rust
+use postrust_proxy::saas::options::SaasOptions;
+use postrust_proxy::saas::validation::ReservedDomains;
+
+let mut options = SaasOptions::default();
+options.jwt_secret = Some(std::env::var("PROXY_JWT_SECRET")?);
+// The platform's own hostnames: no tenant may register these.
+options.domains.reserved = ReservedDomains::default()
+    .with_exact("example.com")
+    .with_suffix("platform.example.com");
+```
+
+| Field | Meaning | Default |
+|-------|---------|---------|
+| `jwt_secret` | HMAC secret for tenant JWTs | none: every JWT is refused |
+| `jwt_audience` | The `aud` a JWT must carry | `postrust-proxy` |
+| `jwt_issuer` | The `iss` a JWT must carry | unchecked |
+| `domains.reserved` | Names no tenant may register | the special-use names (`localhost`, `local`, `internal`, `arpa`, `invalid`, `onion`, `alt`, `localdomain`) |
+| `domains.pending_ttl` | How long an unverified registration holds its name | 7 days |
+| `domains.verification_min_interval` | Shortest gap between verification attempts | 10 s |
+| `domains.verification_max_attempts` | Attempts per registration | 50 |
+| `domains.upload_trust` | What an uploaded chain must chain to: `PublicRoots`, `Roots(store)` or `Unchecked` | `PublicRoots` |
+
+**Reserve your own hostnames.** The defaults know nothing about your platform.
+Until its names are in `domains.reserved`, a tenant can register them.
+
+### Domain names
+
+A domain is stored lowercased, without a trailing dot, and compared without
+regard to case, so `App.Example.com` and `app.example.com` are the same name
+and only one tenant can hold it. Names must be ASCII letters, digits and
+hyphens, in at least two labels; send an internationalised name in its
+punycode (`xn--`) form. IP addresses are not domains and are refused.
+
+### Quotas
+
+Each tenant has `max_domains`, `max_routes_per_domain`, `max_upstreams`,
+`max_backends_per_upstream` and `max_api_keys` (20 each by default for the new
+ones). Going past one is `402` with code `quota_exceeded`.
 
 ### Applying a configuration change
 
@@ -552,9 +637,16 @@ All errors follow a consistent format:
 ```json
 {
   "success": false,
+  "code": "validation_failed",
   "error": "Error message here"
 }
 ```
+
+`code` is stable and is what to branch on: `validation_failed`, `not_found`,
+`conflict`, `quota_exceeded`, `forbidden`, `insufficient_scope`,
+`unauthorized`, `verification_failed`, `tenant_suspended`, `rate_limited`,
+`internal_error`. An internal error never carries database or library text;
+that goes to the proxy's log.
 
 ### HTTP Status Codes
 
@@ -567,7 +659,8 @@ All errors follow a consistent format:
 | `403` | Forbidden (tenant suspended, insufficient scope) |
 | `404` | Resource not found |
 | `409` | Conflict (e.g., domain already exists) |
-| `429` | Rate limited / quota exceeded |
+| `402` | Quota exceeded |
+| `429` | Too many verification attempts |
 | `500` | Internal server error |
 
 ## Example: Complete Domain Setup
