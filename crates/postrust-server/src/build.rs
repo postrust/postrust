@@ -145,7 +145,10 @@ impl Builder {
     /// are one prefix. Nothing is checked until [`Builder::build`], which
     /// refuses a prefix that is the root, that overlaps a path the server
     /// serves itself ([`RESERVED_PREFIXES`], and `/_` itself), or that
-    /// overlaps another prefix given here. A prefix beneath `/_`, such as
+    /// overlaps another prefix given here. In compatibility mode, where REST
+    /// is served at `/` as well, a prefix whose first segment is `rpc` or the
+    /// name of a table or view in an exposed schema takes those paths from
+    /// REST, and a warning says so at start-up. A prefix beneath `/_`, such as
     /// `/_/hooks`, is served beside the built-in `/_/health` and `/_/ready`.
     pub fn nest(mut self, prefix: impl Into<String>, router: Router<Arc<AppState>>) -> Self {
         self.nests.push((prefix.into(), router));
@@ -183,17 +186,12 @@ impl Builder {
     /// Otherwise as [`build`].
     pub async fn build(self) -> Result<App> {
         let nests = mount_points(self.nests)?;
-        // The JWT secret too, for the same reason: a key set that does not
-        // parse is a configuration error, and is better reported before the
-        // database is connected to than after. Parsed again where the state
-        // is made, once, at start-up.
-        postrust_engine::jwt_config(&self.config)
-            .map_err(|e| anyhow::anyhow!("PGRST_JWT_SECRET: {e}"))?;
-        if let Some(url) = &self.config.jwt_jwks_url {
-            postrust_auth::jwks::check_url(url)
-                .map_err(|e| anyhow::anyhow!("PGRST_JWT_JWKS_URL: {e}"))?;
-        }
-        let mut app = assemble(self.config, self.host, nests).await?;
+        // The JWT keys too, for the same reason: a key set that does not
+        // parse, or a JWKS URL that would not be fetched, is a configuration
+        // error, and is better reported before the database is connected to
+        // than after. Made once, here, and handed to the state.
+        let jwt = jwt_config(&self.config)?;
+        let mut app = assemble(self.config, self.host, nests, jwt).await?;
         for wrap in self.layers {
             app.router = wrap(app.router);
         }
@@ -288,6 +286,38 @@ fn check_prefix(given: &str, taken: &[&str]) -> Result<String> {
 
 /// Whether `path` is `base` or beneath it, segment by segment: `/apis` is not
 /// beneath `/api`.
+/// In compatibility mode REST is served at `/` too, beneath every path no
+/// route claims, so a prefix naming a table, a view or `/rpc` takes those
+/// requests from REST. That is allowed -- the route was asked for, and the
+/// table is still served under `/api` -- but said, so it is not found out
+/// from a response. Checked against the schema cache at start-up.
+fn warn_of_shadowing(nests: &Nests, schema_cache: &postrust_core::SchemaCache, schemas: &[String]) {
+    for (prefix, _) in nests {
+        let first = prefix
+            .trim_start_matches('/')
+            .split('/')
+            .next()
+            .unwrap_or_default();
+        if first == "rpc" {
+            tracing::warn!(
+                "compatibility mode: routes nested at {prefix} answer in place of the \
+                 database functions REST serves at /rpc; they are still served at /api/rpc"
+            );
+        }
+        if let Some(table) = schema_cache
+            .tables
+            .keys()
+            .find(|qi| qi.name == first && schemas.contains(&qi.schema))
+        {
+            tracing::warn!(
+                "compatibility mode: routes nested at {prefix} answer in place of {}.{first}, \
+                 which REST would serve at /{first}; it is still served at /api/{first}",
+                table.schema
+            );
+        }
+    }
+}
+
 fn beneath(path: &str, base: &str) -> bool {
     path.strip_prefix(base)
         .is_some_and(|rest| rest.is_empty() || rest.starts_with('/'))
@@ -298,8 +328,23 @@ fn overlaps(a: &str, b: &str) -> bool {
     beneath(a, b) || beneath(b, a)
 }
 
-/// Everything [`Builder::build`] does once the caller's prefixes are checked.
-async fn assemble(config: postrust_core::AppConfig, host: Host, nests: Nests) -> Result<App> {
+/// The keys and claims tokens are verified with: `PGRST_JWT_SECRET`, and the
+/// key set at `PGRST_JWT_JWKS_URL` when there is one (not yet fetched).
+fn jwt_config(config: &postrust_core::AppConfig) -> Result<postrust_auth::JwtConfig> {
+    let jwt = postrust_engine::jwt_config(config)
+        .map_err(|e| anyhow::anyhow!("PGRST_JWT_SECRET: {e}"))?;
+    // Its errors name `PGRST_JWT_JWKS_URL` themselves.
+    crate::jwks::attach(jwt, config).map_err(|e| anyhow::anyhow!("{e}"))
+}
+
+/// Everything [`Builder::build`] does once the caller's prefixes and the JWT
+/// configuration are checked.
+async fn assemble(
+    config: postrust_core::AppConfig,
+    host: Host,
+    nests: Nests,
+    jwt: postrust_auth::JwtConfig,
+) -> Result<App> {
     info!("Database: {}", mask_db_uri(&config.db_uri));
 
     // Create database pool
@@ -336,12 +381,12 @@ async fn assemble(config: postrust_core::AppConfig, host: Host, nests: Nests) ->
     )
     .await?;
     info!("{}", schema_cache.summary());
+    if config.compat_mode {
+        warn_of_shadowing(&nests, &schema_cache, &config.db_schemas);
+    }
 
     // Create app state
-    let state = Arc::new(
-        AppState::new(pool, schema_cache, config.clone())
-            .map_err(|e| anyhow::anyhow!("PGRST_JWT_SECRET: {e}"))?,
-    );
+    let state = Arc::new(AppState::with_jwt(pool, schema_cache, config.clone(), jwt));
 
     // The pool and the token cache, for the metrics read when collected.
     #[cfg(feature = "otel")]

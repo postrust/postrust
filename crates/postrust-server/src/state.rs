@@ -40,13 +40,25 @@ impl AppState {
         schema_cache: SchemaCache,
         config: AppConfig,
     ) -> Result<Self, JwtKeyError> {
-        Ok(Self {
+        let jwt_config = crate::jwks::attach(postrust_engine::jwt_config(&config)?, &config)?;
+        Ok(Self::with_jwt(pool, schema_cache, config, jwt_config))
+    }
+
+    /// [`AppState::new`], with the JWT configuration already made from
+    /// `config`.
+    pub(crate) fn with_jwt(
+        pool: PgPool,
+        schema_cache: SchemaCache,
+        config: AppConfig,
+        jwt_config: JwtConfig,
+    ) -> Self {
+        Self {
             pool,
             schema_cache: RwLock::new(schema_cache),
-            jwt_config: crate::jwks::attach(postrust_engine::jwt_config(&config)?, &config)?,
+            jwt_config,
             jwt_cache: JwtCache::new(config.jwt_cache_enabled, config.jwt_cache_max_lifetime),
             config,
-        })
+        }
     }
 
     /// Get a read lock on the schema cache.

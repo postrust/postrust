@@ -121,6 +121,13 @@ never panics -- before connecting to anything, when a prefix:
 "Overlaps" is by whole segments: `/v1` clashes with `/v1/version`, while
 `/v1/other` and `/apis` are fine.
 
+In compatibility mode (`PGRST_COMPAT_MODE`) REST is also served at `/`, and a
+nested route comes first: `.nest("/orders", ..)` answers `GET /orders` in place
+of the `orders` table, which is still served at `/api/orders`. When a prefix's
+first segment is `rpc` or names a table or view in an exposed schema, `build()`
+logs a warning saying so, so it is not found out from a response. A table
+created later under the same name is not warned about.
+
 Beneath `/_` is yours: `.nest("/_/hooks", router)` serves next to the built-in
 `/_/health` and `/_/ready`.
 
