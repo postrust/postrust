@@ -104,7 +104,7 @@ where
 {
     // Authenticate, before the body is read. The same function serves a
     // host's own routes, so a token means the same thing to both.
-    let auth_result = authenticate(state, request.headers())?;
+    let auth_result = authenticate(state, request.headers()).await?;
     debug!("Authenticated as role: {}", auth_result.role);
 
     // Parse request.
@@ -501,14 +501,19 @@ pub fn authorization(headers: &http::HeaderMap) -> Option<&str> {
 /// configured, the anonymous role when no token is sent, and a failure
 /// classified as PostgREST classifies it, for [`error_response`] to answer.
 ///
+/// Keys fetched from a JWKS URL may need fetching first: the one await in
+/// authenticating, and one that awaits nothing for a token whose key is
+/// already held. See `postrust_auth::jwks`.
+///
 /// The `auth` span is at debug, beneath the request's own span at info: with
 /// the default filter it is never created, and a disabled span is a check of
 /// a cached flag. Its field is evaluated only when something is listening.
-pub fn authenticate<S: State>(
+pub async fn authenticate<S: State>(
     state: &S,
     headers: &http::HeaderMap,
 ) -> Result<postrust_auth::AuthResult, postrust_core::Error> {
     let header = authorization(headers);
+    postrust_auth::ensure_keys(header, state.jwt_config()).await;
     let auth_span = debug_span!("auth", role = Empty);
     let auth_result = auth_span
         .in_scope(|| match state.jwt_cache() {

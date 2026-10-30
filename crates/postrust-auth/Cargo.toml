@@ -14,6 +14,10 @@ keywords = ["jwt", "authentication", "postgres", "rls", "auth"]
 [dependencies]
 async-trait.workspace = true
 base64.workspace = true
+# `futures::lock::Mutex`: one JWKS fetch at a time, awaited by the requests
+# that need its outcome, with no runtime behind it -- the same on a Worker as
+# on tokio. Already in every host's tree.
+futures.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true

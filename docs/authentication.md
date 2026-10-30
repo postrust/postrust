@@ -76,8 +76,136 @@ is malformed, or a secret that starts with `{` and is not valid JSON, stops the
 server from starting: it is a mistake, and quietly treating it as an HMAC
 secret would make the public key a signing secret.
 
-The key set is parsed once, when the configuration is read. Fetching a JWKS
-from its URL is not supported yet: give the key set itself.
+The key set is parsed once, when the configuration is read. To have it
+fetched from the identity provider instead, and kept current as the provider
+rotates its keys, give its URL: see the next section.
+
+### Keys from a JWKS URL
+
+`PGRST_JWT_JWKS_URL` names the URL an identity provider publishes its public
+keys at -- its `jwks_uri`. Postrust fetches the set from there, verifies
+tokens with it exactly as with a JWKS given in `PGRST_JWT_SECRET`, and fetches
+it again as time passes, so a key the provider rotates in is picked up without
+a restart and a key it withdraws stops being accepted.
+
+```bash
+# Supabase Auth (GoTrue), on asymmetric signing keys
+PGRST_JWT_JWKS_URL="https://<project>.supabase.co/auth/v1/.well-known/jwks.json"
+# Auth0
+PGRST_JWT_JWKS_URL="https://<tenant>.auth0.com/.well-known/jwks.json"
+# Clerk
+PGRST_JWT_JWKS_URL="https://<instance>.clerk.accounts.dev/.well-known/jwks.json"
+# Amazon Cognito
+PGRST_JWT_JWKS_URL="https://cognito-idp.<region>.amazonaws.com/<pool-id>/.well-known/jwks.json"
+# Keycloak
+PGRST_JWT_JWKS_URL="https://<host>/realms/<realm>/protocol/openid-connect/certs"
+```
+
+**When it is fetched.**
+
+- **At start-up**, before the server answers anything (it waits at most 5
+  seconds). If the provider cannot be reached the server starts anyway -- see
+  "When the provider is down" below.
+- **Again when the set is due**: after the response's `Cache-Control: max-age`,
+  held to between 60 seconds and a day, or every `PGRST_JWT_JWKS_REFRESH`
+  seconds (default 300) when the response gives no `max-age`. `no-cache` and
+  `no-store` mean 60 seconds. The provider knows how often it rotates; the
+  bounds keep `max-age=0` from becoming a fetch per request, and a year-long
+  `max-age` from keeping a withdrawn key valid for a year.
+- **When a token names a `kid` the set does not hold**: that may be a key the
+  provider has just rotated in, so the set is fetched once more before the
+  token is refused. At most once every 30 seconds -- anybody can mint a token
+  with a made-up `kid`, and without the limit every such request would be a
+  request to the provider. A token whose `kid` is still unknown afterwards is
+  refused with `PGRST301`, "No suitable key or wrong key type". Requests that
+  arrive while that fetch is in flight wait for it rather than starting their
+  own.
+
+A token whose key is already held never waits for any of this: verifying it
+is the same in-memory check as with a fixed key set.
+
+**What may be fetched.**
+
+- `https` only, or `http` to `localhost`, `127.0.0.0/8` or `[::1]` -- a
+  development provider, or a sidecar. A key set fetched over plain HTTP can be
+  replaced by anyone on the path with keys of their own, and then they can sign
+  any token they like. Any other `http` URL, or one that is not an absolute
+  URL, stops the server from starting.
+- The URL is read strictly: user info (`https://a@b/`), percent-encoding or
+  non-ASCII in the host, and backslashes are refused rather than interpreted,
+  so the host checked is always the host connected to.
+- A redirect is followed only to the same host, at most three times. The URL
+  configured names the party trusted to say which keys are valid; a redirect to
+  another host is that trust handed to someone nobody chose.
+- 5 seconds per fetch, and at most 1 MiB of response. Real key sets are a few
+  kilobytes.
+
+**What is done with the answer.** A 200 whose body parses as a JWKS with at
+least one usable key replaces the set in force, whole. Anything else -- another
+status, a body that is not a JWKS, a set of nothing but encryption keys -- is a
+failed fetch. Every change of the set also empties the token cache
+(`PGRST_JWT_CACHE_ENABLED`), so a token verified by a key the provider has
+withdrawn is refused from the next request on, not served from the cache until
+it expires. A fetch that brings the same set again changes nothing.
+
+**When the provider is down.**
+
+- A failed fetch keeps the last set that loaded, logs a warning, and is
+  retried after 1, 2, 4, ... seconds, up to 30. An identity provider's bad
+  minute does not log every user out.
+- If no set has *ever* loaded, every token it would have verified is refused
+  (`PGRST301`) -- the server fails closed -- and `/_/ready`, on the API port
+  and on the admin port, answers `503` with `"jwks": false` and the reason. The
+  server does not exit: an outage that crash-looped every replica would turn a
+  partial outage into a total one. It becomes ready by itself once a retry
+  succeeds. Requests without a token are still served as the anonymous role.
+
+**With `PGRST_JWT_SECRET` as well.** Both may be set, and then a token either
+one verifies is accepted: the keys in force are the secret's and the fetched
+set's together. That is the deployment where a backend mints its own tokens
+with a shared secret -- a service token, or Supabase's legacy `service_role`
+key -- while users arrive with tokens from the identity provider. Neither
+source widens the other: every key still admits only its own algorithms, and a
+token naming a `kid` is still checked only against keys with that `kid`. A
+token the secret verifies is accepted even before the fetched set has loaded.
+
+**On each host.**
+
+| Host | How the set is kept current |
+|---|---|
+| Server | Fetched at start-up, then by a background task whenever it is due. |
+| Lambda | Fetched in the init phase and kept for the life of the sandbox. A sandbox is frozen between invocations, so there is no background task: the request that finds the set due fetches it (one request, at most every refresh interval, pays the fetch). |
+| Worker | Fetched by the first request that needs it, and copied into the `POSTRUST_SCHEMA_CACHE` KV namespace under a key of its own, so a cold isolate reads it there instead of asking the provider. See [workers.md](workers.md#keys-from-a-jwks-url). |
+
+An unknown `kid` is fetched for on every host.
+
+### Supabase Auth (GoTrue)
+
+Supabase Auth signs a user's access token with the project's signing key and
+publishes the public half at `/auth/v1/.well-known/jwks.json`. Its tokens name
+the database role in `role` (`authenticated`, or `anon`), the user's id in
+`sub`, and `authenticated` as their audience -- which is what Postrust reads
+by default, so a Supabase database's policies work unchanged:
+
+```bash
+PGRST_DB_ANON_ROLE=anon
+PGRST_JWT_AUD=authenticated
+PGRST_JWT_JWKS_URL="https://<project>.supabase.co/auth/v1/.well-known/jwks.json"
+# The legacy JWT secret too, while service keys signed with it are in use:
+PGRST_JWT_SECRET="<the project's legacy JWT secret>"
+```
+
+```sql
+-- auth.uid() is this, and Supabase's own policies call it:
+create policy "own notes" on notes for select to authenticated
+  using (owner = (current_setting('request.jwt.claims', true)::json ->> 'sub')::uuid);
+```
+
+A project still on the legacy HS256 secret sets only `PGRST_JWT_SECRET`.
+Self-hosted GoTrue publishes the same endpoint at `/.well-known/jwks.json` once
+`GOTRUE_JWT_KEYS` holds an asymmetric key. `scripts/gotrue/e2e.sh` runs this
+end to end against the `supabase/auth` image -- sign-up, token, RLS by `sub`
+-- in both modes, and CI runs it on every change.
 
 ### Issuer
 
@@ -494,7 +622,8 @@ HTTP Status: 401
 The signature did not verify, the key was wrong, or the `Authorization`
 header was not a bearer token. A token for which the server holds no key at
 all — an unknown `kid`, or an algorithm no configured key admits — is reported
-as `No suitable key or wrong key type`.
+as `No suitable key or wrong key type`. So is every token while keys from
+`PGRST_JWT_JWKS_URL` have never loaded.
 
 ```json
 {

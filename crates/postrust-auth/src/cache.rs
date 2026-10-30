@@ -11,6 +11,7 @@
 //! request either way.
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
 // `std::time` natively; on wasm32, where `Instant::now()` and
 // `SystemTime::now()` panic, the JavaScript host's clock.
@@ -33,6 +34,14 @@ struct Entry {
 pub struct JwtCache {
     entries: Mutex<HashMap<String, Entry>>,
     max_lifetime: Duration,
+    /// The [`crate::JwtKeys::generation`] every entry was verified under.
+    ///
+    /// Read and written only while `entries` is locked, so the two change
+    /// together; atomic only so that `JwtCache` stays `Sync` without a second
+    /// lock. When the keys change, every entry was verified against a set
+    /// that is no longer in force -- possibly by a key that has just been
+    /// withdrawn -- and they are all forgotten.
+    keys_generation: AtomicU64,
 }
 
 impl JwtCache {
@@ -47,7 +56,19 @@ impl JwtCache {
         Some(Self {
             entries: Mutex::new(HashMap::new()),
             max_lifetime: Duration::from_secs(max_lifetime_secs),
+            keys_generation: AtomicU64::new(0),
         })
+    }
+
+    /// Forget every token held.
+    ///
+    /// Done by the cache itself whenever the key set it is used with changes;
+    /// for a host that wants to revoke for some other reason.
+    pub fn clear(&self) {
+        self.entries
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear();
     }
 
     /// Authenticate, consulting the cache.
@@ -65,7 +86,12 @@ impl JwtCache {
         };
         let token = extract_bearer_token(header)?;
 
-        if let Some(hit) = self.get(token) {
+        // Read before the token is verified, and checked again when the entry
+        // is written: a set replaced in between was not the one it was
+        // verified against.
+        let generation = config.keys.as_ref().map_or(0, crate::JwtKeys::generation);
+
+        if let Some(hit) = self.get_under(token, generation) {
             return Ok(hit);
         }
 
@@ -87,12 +113,43 @@ impl JwtCache {
             Expiry::Unreadable => return Ok(result),
         };
 
-        self.insert(token.to_string(), result.clone(), ttl);
+        self.insert_under(token.to_string(), result.clone(), ttl, generation);
         Ok(result)
     }
 
+    /// [`Self::get`], first forgetting everything if the keys are no longer
+    /// those of `generation`.
+    fn get_under(&self, token: &str, generation: u64) -> Option<AuthResult> {
+        let mut entries = self.entries.lock().unwrap_or_else(|e| e.into_inner());
+        if self.keys_generation.load(Ordering::Relaxed) != generation {
+            entries.clear();
+            self.keys_generation.store(generation, Ordering::Relaxed);
+        }
+        Self::lookup(&mut entries, token)
+    }
+
+    /// [`Self::insert`], unless the entries are by now those of another
+    /// generation of keys -- the token was verified against a set that has
+    /// since been replaced, and is verified again next time.
+    ///
+    /// Checked under the same lock the entry is written under, so a request
+    /// that saw the new keys -- and cleared the entries -- cannot have an
+    /// entry from the old ones written after it.
+    fn insert_under(&self, token: String, result: AuthResult, ttl: Duration, generation: u64) {
+        let mut entries = self.entries.lock().unwrap_or_else(|e| e.into_inner());
+        if self.keys_generation.load(Ordering::Relaxed) != generation {
+            return;
+        }
+        Self::store(&mut entries, token, result, ttl);
+    }
+
+    #[cfg(test)]
     fn get(&self, token: &str) -> Option<AuthResult> {
         let mut entries = self.entries.lock().unwrap_or_else(|e| e.into_inner());
+        Self::lookup(&mut entries, token)
+    }
+
+    fn lookup(entries: &mut HashMap<String, Entry>, token: &str) -> Option<AuthResult> {
         let entry = entries.get(token)?;
         if entry.expires > Instant::now() {
             return Some(entry.result.clone());
@@ -101,9 +158,19 @@ impl JwtCache {
         None
     }
 
+    #[cfg(test)]
     fn insert(&self, token: String, result: AuthResult, ttl: Duration) {
-        let now = Instant::now();
         let mut entries = self.entries.lock().unwrap_or_else(|e| e.into_inner());
+        Self::store(&mut entries, token, result, ttl);
+    }
+
+    fn store(
+        entries: &mut HashMap<String, Entry>,
+        token: String,
+        result: AuthResult,
+        ttl: Duration,
+    ) {
+        let now = Instant::now();
 
         if entries.len() >= CAPACITY {
             entries.retain(|_, e| e.expires > now);

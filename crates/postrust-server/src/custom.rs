@@ -51,25 +51,37 @@ async fn health_check() -> Json<HealthResponse> {
 }
 
 async fn readiness_check(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    // Keys from `PGRST_JWT_JWKS_URL` that have never loaded mean every token
+    // they would verify is refused: a replica in that state should not be
+    // sent traffic, though it is alive and will recover by itself.
+    let jwks = state.jwt_config.jwks.as_ref().map(|jwks| jwks.status());
+    let jwks_loaded = jwks.as_ref().map(|status| status.loaded);
+    let jwks_problem = jwks.filter(|status| !status.loaded).map(|status| {
+        format!(
+            "the keys at PGRST_JWT_JWKS_URL have not loaded: {}",
+            status.last_error.as_deref().unwrap_or("not fetched yet")
+        )
+    });
+
     // Check database connectivity
-    match sqlx::query("SELECT 1").execute(&state.pool).await {
-        Ok(_) => (
-            StatusCode::OK,
-            Json(ReadinessResponse {
-                ready: true,
-                database: true,
-                message: None,
-            }),
-        ),
-        Err(e) => (
-            StatusCode::SERVICE_UNAVAILABLE,
-            Json(ReadinessResponse {
-                ready: false,
-                database: false,
-                message: Some(e.to_string()),
-            }),
-        ),
-    }
+    let (database, message) = match sqlx::query("SELECT 1").execute(&state.pool).await {
+        Ok(_) => (true, jwks_problem),
+        Err(e) => (false, Some(e.to_string())),
+    };
+    let ready = database && jwks_loaded != Some(false);
+    (
+        if ready {
+            StatusCode::OK
+        } else {
+            StatusCode::SERVICE_UNAVAILABLE
+        },
+        Json(ReadinessResponse {
+            ready,
+            database,
+            jwks: jwks_loaded,
+            message,
+        }),
+    )
 }
 
 // =============================================================================
@@ -86,6 +98,10 @@ struct HealthResponse {
 struct ReadinessResponse {
     ready: bool,
     database: bool,
+    /// Whether the keys at `PGRST_JWT_JWKS_URL` have loaded; absent when it
+    /// is not set.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    jwks: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     message: Option<String>,
 }

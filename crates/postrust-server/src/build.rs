@@ -189,6 +189,10 @@ impl Builder {
         // is made, once, at start-up.
         postrust_engine::jwt_config(&self.config)
             .map_err(|e| anyhow::anyhow!("PGRST_JWT_SECRET: {e}"))?;
+        if let Some(url) = &self.config.jwt_jwks_url {
+            postrust_auth::jwks::check_url(url)
+                .map_err(|e| anyhow::anyhow!("PGRST_JWT_JWKS_URL: {e}"))?;
+        }
         let mut app = assemble(self.config, self.host, nests).await?;
         for wrap in self.layers {
             app.router = wrap(app.router);
@@ -346,6 +350,11 @@ async fn assemble(config: postrust_core::AppConfig, host: Host, nests: Nests) ->
     // The REST cache is swapped here; each reload then bumps `reloaded`, and
     // the GraphQL schema, built from its own snapshot of the cache, is
     // rebuilt from the new one when it sees the bump.
+    // Keys from `PGRST_JWT_JWKS_URL`: fetched once before serving, then kept
+    // fresh in the background where the host runs background work. A fetch
+    // that fails does not stop the start; see `crate::jwks`.
+    crate::jwks::start(&state, host).await;
+
     let (reloaded, schema_reloads) = tokio::sync::watch::channel(0u64);
     if config.db_channel_enabled && host.background_tasks {
         spawn_schema_reloader(state.clone(), config.db_channel.clone(), reloaded);
@@ -651,6 +660,14 @@ async fn assemble(config: postrust_core::AppConfig, host: Host, nests: Nests) ->
                 write: postrust_graphql::context::SharedWrite,
             }
 
+            /// What [`postrust_auth::ensure_keys`] is to REST: keys from a
+            /// JWKS URL fetched, if the token needs them, before the
+            /// synchronous [`graphql_identity`] verifies it.
+            async fn ensure_keys(app_state: &GraphQLAppState, headers: &HeaderMap) {
+                let auth_header = headers.get("authorization").and_then(|v| v.to_str().ok());
+                postrust_auth::ensure_keys(auth_header, &app_state.rest.jwt_config).await;
+            }
+
             /// The caller's identity, or the Hasura-shaped body refusing it.
             fn graphql_identity(
                 app_state: &GraphQLAppState,
@@ -953,6 +970,7 @@ async fn assemble(config: postrust_core::AppConfig, host: Host, nests: Nests) ->
                 headers: HeaderMap,
                 req: async_graphql::Request,
             ) -> serde_json::Value {
+                ensure_keys(&app_state, &headers).await;
                 let identity = match graphql_identity(&app_state, headers) {
                     Ok(identity) => identity,
                     Err(refusal) => return refusal,
@@ -1122,10 +1140,9 @@ async fn assemble(config: postrust_core::AppConfig, host: Host, nests: Nests) ->
                             protocol,
                         )
                         .on_connection_init(move |payload| async move {
-                            match graphql_identity(
-                                &init_state,
-                                connection_headers(headers, &payload),
-                            ) {
+                            let headers = connection_headers(headers, &payload);
+                            ensure_keys(&init_state, &headers).await;
+                            match graphql_identity(&init_state, headers) {
                                 Ok(identity) => {
                                     let mut data = async_graphql::Data::default();
                                     data.insert(identity);

@@ -85,6 +85,10 @@ tracing-subscriber.workspace = true
 chrono.workspace = true
 # The request span's response future; already in the tree through tower.
 pin-project-lite = "0.2"
+# Fetching `PGRST_JWT_JWKS_URL`. rustls on ring, which sqlx already links, and
+# webpki's roots; reqwest builds its TLS config with its provider named, so it
+# does not depend on (or disturb) a process-wide default.
+reqwest.workspace = true
 
 # Internal
 postrust-core = { workspace = true, features = ["sqlx"] }
@@ -101,6 +105,8 @@ async-graphql-axum = { version = "7", optional = true }
 
 [dev-dependencies]
 jsonwebtoken.workspace = true
+futures.workspace = true
+base64.workspace = true
 # tests/drivers_agree.rs runs both database drivers side by side.
 postrust-core = { workspace = true, features = ["sqlx", "pg-socket"] }
 postrust-sql.workspace = true

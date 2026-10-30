@@ -130,8 +130,8 @@ impl User {
     }
 
     /// The user `parts` authenticates as.
-    fn from_parts(parts: &Parts, state: &AppState) -> Result<Self, Error> {
-        let auth = postrust_engine::authenticate(state, &parts.headers)?;
+    async fn from_parts(parts: &Parts, state: &AppState) -> Result<Self, Error> {
+        let auth = postrust_engine::authenticate(state, &parts.headers).await?;
         // The path the client sent: a nested router sees its own prefix
         // stripped from `parts.uri`, and axum keeps the original beside it.
         let path = parts
@@ -162,7 +162,7 @@ impl FromRequestParts<Arc<AppState>> for User {
         parts: &mut Parts,
         state: &Arc<AppState>,
     ) -> Result<Self, Self::Rejection> {
-        Self::from_parts(parts, state)
+        Self::from_parts(parts, state).await
     }
 }
 
@@ -175,7 +175,7 @@ impl OptionalFromRequestParts<Arc<AppState>> for User {
     ) -> Result<Option<Self>, Self::Rejection> {
         match postrust_engine::authorization(&parts.headers) {
             None => Ok(None),
-            Some(_) => Self::from_parts(parts, state).map(Some),
+            Some(_) => Self::from_parts(parts, state).await.map(Some),
         }
     }
 }

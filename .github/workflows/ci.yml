@@ -237,3 +237,35 @@ jobs:
         run: |
           cargo test -p postrust-server --features pg-socket \
             --lib --bins --tests -- --ignored
+
+  # Supabase Auth (GoTrue) signs users up and Postrust serves them, under RLS
+  # written the way Supabase writes it. Two jobs: a project on asymmetric
+  # signing keys, verified through `PGRST_JWT_JWKS_URL` (with the legacy
+  # secret accepted beside it), and one still on GoTrue's HS256 secret. The
+  # unit and integration tests prove the refresher against a mock provider;
+  # this proves it against the real one, whose JWKS, `kid`s and claims are what
+  # deployments will actually see. The image is pinned so that a GoTrue
+  # release cannot turn this red without a commit.
+  gotrue:
+    name: GoTrue end to end (${{ matrix.mode }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        mode: [jwks, hs256]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust (from rust-toolchain.toml)
+        run: rustup show active-toolchain
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build the server
+        run: cargo build --locked -p postrust-server --bin postrust
+
+      # Starts PostgreSQL and supabase/auth in containers on the host network
+      # and the binary just built beside them; see the script's header.
+      - name: Run scripts/gotrue/e2e.sh ${{ matrix.mode }}
+        run: scripts/gotrue/e2e.sh ${{ matrix.mode }}

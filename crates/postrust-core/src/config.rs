@@ -154,6 +154,19 @@ pub struct AppConfig {
     #[serde(default = "default_jwt_cache_max")]
     pub jwt_cache_max_lifetime: u64,
 
+    /// Where to fetch a JSON Web Key Set from (`PGRST_JWT_JWKS_URL`), and
+    /// keep fetching it as the identity provider rotates its keys.
+    ///
+    /// `https`, or `http` to a loopback host; checked when the server is
+    /// built. With `jwt_secret` also set, a token either one verifies is
+    /// accepted. See docs/authentication.md.
+    pub jwt_jwks_url: Option<String>,
+
+    /// How often to fetch `jwt_jwks_url` again, in seconds, when its response
+    /// carries no `Cache-Control: max-age` (`PGRST_JWT_JWKS_REFRESH`).
+    #[serde(default = "default_jwt_jwks_refresh")]
+    pub jwt_jwks_refresh: u64,
+
     // ========================================================================
     // Hasura Authentication
     // ========================================================================
@@ -279,6 +292,8 @@ impl Default for AppConfig {
             jwt_role_claim_key: default_jwt_role_claim(),
             jwt_cache_enabled: true,
             jwt_cache_max_lifetime: default_jwt_cache_max(),
+            jwt_jwks_url: None,
+            jwt_jwks_refresh: default_jwt_jwks_refresh(),
             hasura_admin_secret: None,
             hasura_unauthorized_role: None,
             openapi_server_proxy_uri: None,
@@ -522,6 +537,22 @@ impl AppConfig {
                     "PGRST_JWT_CACHE_MAX_LIFETIME",
                     &v,
                     "a non-negative integer number of seconds",
+                ),
+            }
+        }
+        // Not PostgREST settings. Empty is unset, as for the issuer.
+        if let Ok(url) = get("PGRST_JWT_JWKS_URL") {
+            if !url.trim().is_empty() {
+                config.jwt_jwks_url = Some(url.trim().to_string());
+            }
+        }
+        if let Ok(secs) = get("PGRST_JWT_JWKS_REFRESH") {
+            match secs.parse::<u64>() {
+                Ok(n) if n > 0 => config.jwt_jwks_refresh = n,
+                _ => warn_ignored(
+                    "PGRST_JWT_JWKS_REFRESH",
+                    &secs,
+                    "a positive integer number of seconds",
                 ),
             }
         }
@@ -1006,6 +1037,10 @@ fn default_jwt_cache_max() -> u64 {
     3600
 }
 
+fn default_jwt_jwks_refresh() -> u64 {
+    300
+}
+
 fn default_openapi_mode() -> OpenApiMode {
     OpenApiMode::FollowPrivileges
 }
@@ -1216,6 +1251,28 @@ mod tests {
                 .unwrap()
                 .jwt_iss,
             None
+        );
+    }
+
+    #[test]
+    fn the_jwks_url_and_its_refresh_interval_are_read() {
+        let read = |vars: &[(&str, &str)]| AppConfig::try_from_vars(vars.to_vec()).unwrap();
+        let config = read(&[
+            ("PGRST_JWT_JWKS_URL", " https://idp.example/jwks "),
+            ("PGRST_JWT_JWKS_REFRESH", "60"),
+        ]);
+        assert_eq!(
+            config.jwt_jwks_url.as_deref(),
+            Some("https://idp.example/jwks")
+        );
+        assert_eq!(config.jwt_jwks_refresh, 60);
+
+        let defaults = read(&[("PGRST_JWT_JWKS_URL", ""), ("PGRST_JWT_JWKS_REFRESH", "0")]);
+        assert_eq!(defaults.jwt_jwks_url, None);
+        assert_eq!(defaults.jwt_jwks_refresh, 300);
+        assert_eq!(
+            read(&[("PGRST_JWT_JWKS_REFRESH", "soon")]).jwt_jwks_refresh,
+            300
         );
     }
 

@@ -31,7 +31,10 @@ impl AppState {
     ///
     /// The JWT configuration and token cache are derived from `config`, as
     /// [`build`](crate::build) derives them. Fails when the configured JWT
-    /// secret does not parse; see [`postrust_engine::jwt_config`].
+    /// secret does not parse; see [`postrust_engine::jwt_config`]. With
+    /// `PGRST_JWT_JWKS_URL` set the keys are fetched when first needed, by
+    /// the request that needs them; [`build`](crate::build) also fetches them
+    /// before serving, and keeps them fresh in the background.
     pub fn new(
         pool: PgPool,
         schema_cache: SchemaCache,
@@ -40,7 +43,7 @@ impl AppState {
         Ok(Self {
             pool,
             schema_cache: RwLock::new(schema_cache),
-            jwt_config: postrust_engine::jwt_config(&config)?,
+            jwt_config: crate::jwks::attach(postrust_engine::jwt_config(&config)?, &config)?,
             jwt_cache: JwtCache::new(config.jwt_cache_enabled, config.jwt_cache_max_lifetime),
             config,
         })

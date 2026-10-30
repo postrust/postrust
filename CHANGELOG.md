@@ -96,6 +96,39 @@ minimum supported Rust version are unchanged.
     are set aside with a warning.
 - **`PGRST_JWT_ISS`.** When set, a token's `iss` must name it, and a token
   with no `iss` is refused (PGRST303, "JWT issuer is not the expected one").
+- **`PGRST_JWT_JWKS_URL`: keys fetched from an identity provider** (Supabase
+  Auth/GoTrue, Auth0, Clerk, Cognito, Keycloak) and kept current as it rotates
+  them, on the server, Lambda and the Worker.
+  - Fetched at start-up, then again after the response's `Cache-Control:
+    max-age` (held to 60 s..1 day) or every `PGRST_JWT_JWKS_REFRESH` seconds
+    (default 300). A token naming an unknown `kid` causes one more fetch, at
+    most every 30 s, before it is refused with PGRST301. A token whose key is
+    held waits for nothing.
+  - `https` only, or `http` to a loopback host; same-host redirects only; 5 s
+    and 1 MiB per fetch. Any other URL stops the server from starting.
+  - A failed fetch keeps the last good set. If none has ever loaded, tokens are
+    refused and `/_/ready` (API and admin port) answers 503 with
+    `"jwks": false`; the server starts regardless, and recovers by itself.
+  - Every change of the set empties the token cache, so a withdrawn key's
+    tokens are refused at once.
+  - With `PGRST_JWT_SECRET` also set, a token either one verifies is accepted.
+  - Server: a background task. Lambda: fetched in the init phase, refreshed by
+    the request that finds the set due. Worker: fetched by the first request
+    that needs it and copied into `POSTRUST_SCHEMA_CACHE` KV for cold isolates;
+    the cron refreshes it. The Worker's release wasm grows by 158 KB (49 KB
+    gzipped), from 4,572,934 to 4,731,391 bytes before wasm-opt; no new crate
+    is linked.
+  - `postrust_auth::jwks` (`Jwks`, the `Fetch` and `JwksStore` traits,
+    `JwksStatus` -- refresh and failure counts, last success, key-set age --
+    for metrics), `postrust_auth::ensure_keys`, which a host awaits before the
+    synchronous check -- `postrust_engine::authenticate` awaits it, so REST,
+    GraphQL and a route's `User` all fetch a rotated-in key --
+    `JwtConfig::{jwks, with_jwks}`, `JwtKeys::generation`,
+    `JwtKeyError::JwksUrl`,
+    `JwtCache::clear`, and `postrust_engine::jwks_builder`.
+  - CI signs users up with the `supabase/auth` image and checks that RLS sees
+    their `sub`, through the JWKS URL and through the legacy HS256 secret
+    (`scripts/gotrue/e2e.sh`).
 - `postrust_engine::jwt_config(&AppConfig)`: the JWT configuration an
   `AppConfig` describes, and `jwt_config_with_keys` for keys already parsed.
   The server, the Lambda adapter and the Worker each spelled this out by

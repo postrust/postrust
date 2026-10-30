@@ -22,6 +22,7 @@ pub mod app;
 pub mod build;
 pub mod custom;
 mod error;
+mod jwks;
 pub mod lenient_uri;
 pub mod state;
 pub mod telemetry;

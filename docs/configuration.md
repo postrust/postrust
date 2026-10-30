@@ -95,6 +95,8 @@ curl http://localhost:3000/users \
 |----------|-------------|---------|
 | `PGRST_JWT_SECRET` | HMAC secret (HS256), or a JWK / JWK Set of verification keys (RS\*, PS\*, ES256/384, EdDSA, HS\*) | (none) |
 | `PGRST_JWT_SECRET_IS_BASE64` | Is secret base64 encoded? | `false` |
+| `PGRST_JWT_JWKS_URL` | Fetch the verification keys from this JWKS URL (an identity provider's `jwks_uri`) and keep them current. `https`, or `http` to a loopback host. With `PGRST_JWT_SECRET` too, a token either verifies is accepted | (none) |
+| `PGRST_JWT_JWKS_REFRESH` | Seconds between fetches of `PGRST_JWT_JWKS_URL` when its response has no `Cache-Control: max-age` (a `max-age` is honoured between 60 s and a day) | `300` |
 | `PGRST_JWT_AUD` | Required audience claim | (none) |
 | `PGRST_JWT_ISS` | Required issuer: a token's `iss` must equal it, and must be present | (none) |
 | `PGRST_JWT_ROLE_CLAIM_KEY` | Claim key containing role | `role` |
@@ -118,6 +120,22 @@ PGRST_JWT_SECRET='{"keys":[{"kid":"k1","kty":"RSA","n":"0vx7agoebGcQ...","e":"AQ
 A JSON value is parsed once at startup, and a malformed one stops the server
 from starting. See [Authentication](authentication.md#asymmetric-keys-jwk-and-jwks)
 for how the key and algorithm are chosen.
+
+### JWKS URL
+
+```bash
+# Keys fetched from the identity provider, refreshed as it rotates them
+PGRST_JWT_JWKS_URL="https://<project>.supabase.co/auth/v1/.well-known/jwks.json"
+# How often, when the provider's response does not say (seconds)
+PGRST_JWT_JWKS_REFRESH=300
+```
+
+A URL that is not `https` (or `http` to `localhost`, `127.0.0.0/8` or `[::1]`)
+stops the server from starting. A provider that cannot be reached does not:
+the server starts, refuses tokens until the keys load, and reports not ready
+on `/_/ready` meanwhile. A `PGRST_JWT_JWKS_REFRESH` that is not a positive
+integer is ignored with a warning. See
+[Authentication](authentication.md#keys-from-a-jwks-url).
 
 ### Custom Role Claim
 

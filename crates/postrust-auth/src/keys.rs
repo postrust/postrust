@@ -88,9 +88,15 @@ pub enum JwtKeyError {
     /// Every key was set aside as unable to verify a signature.
     #[error("no key in the JWT secret can verify a JWT signature ({0})")]
     NoUsableKeys(String),
+
+    /// `PGRST_JWT_JWKS_URL` is not a URL keys may be fetched from; see
+    /// [`crate::jwks::check_url`].
+    #[error("PGRST_JWT_JWKS_URL: {0}")]
+    JwksUrl(String),
 }
 
 /// One key, and what it may verify.
+#[derive(Clone)]
 struct Key {
     /// The JWK `kid`, if it has one.
     kid: Option<String>,
@@ -248,9 +254,39 @@ impl KeySet {
         self.keys.len()
     }
 
-    /// Whether the set holds no keys. Never true of a set this module built.
+    /// Whether the set holds no keys. Never true of a set parsed from a
+    /// secret; true of the set a JWKS URL starts with, before its first fetch.
     pub fn is_empty(&self) -> bool {
         self.keys.is_empty()
+    }
+
+    /// A set with no keys, which verifies nothing: what a server configured
+    /// with only `PGRST_JWT_JWKS_URL` holds until the first fetch succeeds.
+    /// Every token is refused then -- fail closed -- with PGRST301, the same
+    /// answer as a token whose key this server does not have.
+    pub(crate) fn empty() -> Self {
+        Self { keys: Vec::new() }
+    }
+
+    /// The keys of both sets, `first`'s first.
+    ///
+    /// How `PGRST_JWT_SECRET` and `PGRST_JWT_JWKS_URL` combine: a token is
+    /// accepted if either source holds a key that verifies it. Order only
+    /// matters to a token without a `kid`, which is tried against every key
+    /// that admits its algorithm anyway.
+    pub(crate) fn union(first: &KeySet, second: &KeySet) -> Self {
+        Self {
+            keys: first.keys.iter().chain(&second.keys).cloned().collect(),
+        }
+    }
+
+    /// Whether a token with this header has any key to be checked against.
+    ///
+    /// The question a JWKS refresher asks before verifying: "no" is the
+    /// token whose `kid` this server has never seen, which may be a key the
+    /// identity provider rotated in since the set was last fetched.
+    pub(crate) fn selects(&self, kid: Option<&str>, alg: Algorithm) -> bool {
+        self.candidates(kid, alg).next().is_some()
     }
 
     /// The keys a token with this header may be checked against, in the order
@@ -280,9 +316,14 @@ impl KeySet {
 /// A plain `RwLock` around an `Arc`: the lock is held only to clone the `Arc`
 /// out, never across a verification, so readers do not wait on each other in
 /// any way that matters and a writer waits for nothing but those clones.
+///
+/// Each replacement also counts a generation, under the same lock as the set
+/// itself so the two can never disagree. A [`crate::JwtCache`] remembers the
+/// generation its entries were verified under and forgets them all when it
+/// changes; see [`JwtKeys::generation`].
 #[derive(Clone)]
 pub struct JwtKeys {
-    current: Arc<RwLock<Arc<KeySet>>>,
+    current: Arc<RwLock<(Arc<KeySet>, u64)>>,
 }
 
 impl std::fmt::Debug for JwtKeys {
@@ -295,7 +336,7 @@ impl JwtKeys {
     /// Hold `set`.
     pub fn new(set: KeySet) -> Self {
         Self {
-            current: Arc::new(RwLock::new(Arc::new(set))),
+            current: Arc::new(RwLock::new((Arc::new(set), 0))),
         }
     }
 
@@ -319,16 +360,29 @@ impl JwtKeys {
         self.current
             .read()
             .unwrap_or_else(|e| e.into_inner())
+            .0
             .clone()
+    }
+
+    /// How many times the set has been replaced.
+    ///
+    /// Read before a token is verified and compared after, it says whether
+    /// the set the token was verified against is still the one in force.
+    pub fn generation(&self) -> u64 {
+        self.current.read().unwrap_or_else(|e| e.into_inner()).1
     }
 
     /// Replace the set, for every holder of this handle.
     ///
-    /// Tokens already in a [`crate::JwtCache`] are not re-checked: one
-    /// verified by a key that has since been withdrawn is answered from the
-    /// cache until its entry expires.
+    /// A [`crate::JwtCache`] that sees the change forgets every token it
+    /// holds, so a token verified by a key that has since been withdrawn is
+    /// refused from the next request on -- not answered from the cache until
+    /// its entry expires. Replacing a set with an identical one forgets them
+    /// too, which costs one verification per token; a JWKS refresher that
+    /// fetched the same set again does not call this.
     pub fn replace(&self, set: KeySet) {
-        *self.current.write().unwrap_or_else(|e| e.into_inner()) = Arc::new(set);
+        let mut current = self.current.write().unwrap_or_else(|e| e.into_inner());
+        *current = (Arc::new(set), current.1.wrapping_add(1));
     }
 }
 
