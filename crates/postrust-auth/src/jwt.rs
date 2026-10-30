@@ -67,9 +67,16 @@ pub fn validate_token(token: &str, config: &JwtConfig) -> Result<AuthResult, Jwt
 /// created out of a claim that does not name one, so a claim of the wrong
 /// shape is read as a token that named no role at all and falls back the same
 /// way an absent claim does.
+///
+/// So are two strings that are not names either. The role is switched to with
+/// `set_config('role', ..)`, and PostgreSQL reads `none` there as "no role":
+/// the request would run as the connection's own role, the authenticator,
+/// rather than as one the token names. An empty string names no role at all,
+/// and was refused by the database with a 500.
 fn role_of(claims: &HashMap<String, serde_json::Value>, config: &JwtConfig) -> Option<String> {
     lookup_claim(claims, &config.role_claim_key)
         .and_then(serde_json::Value::as_str)
+        .filter(|role| !matches!(*role, "" | "none"))
         .map(str::to_string)
         .or_else(|| config.anon_role.clone())
 }
@@ -238,6 +245,28 @@ mod tests {
         assert_eq!(
             role_with("my_role", serde_json::json!({"my_role": "web_user"})),
             Some("web_user".to_string())
+        );
+    }
+
+    /// `none` would run the request as the authenticator, and `""` names
+    /// nothing: both are read as no role, as a role that is not a string is.
+    #[test]
+    fn a_role_of_none_or_nothing_is_no_role() {
+        for role in ["none", ""] {
+            assert_eq!(role_with("role", serde_json::json!({ "role": role })), None);
+            let anon = JwtConfig {
+                anon_role: Some("web_anon".into()),
+                ..config()
+            };
+            assert_eq!(
+                role_of(&claims(serde_json::json!({ "role": role })), &anon),
+                Some("web_anon".to_string())
+            );
+        }
+        // A role that only looks like it is still a role.
+        assert_eq!(
+            role_with("role", serde_json::json!({"role": "None"})),
+            Some("None".to_string())
         );
     }
 
