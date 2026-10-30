@@ -33,12 +33,18 @@ pub struct Tenant {
     pub email: String,
     /// Whether the tenant may act. A suspended tenant keeps its data.
     pub status: TenantStatus,
-    /// Plan name. Free-form: quotas are the two fields below, not this string.
+    /// Plan name. Free-form: quotas are the fields below, not this string.
     pub plan: String,
     /// How many domains this tenant may register.
     pub max_domains: i32,
     /// How many routes each of its domains may have.
     pub max_routes_per_domain: i32,
+    /// How many upstreams this tenant may define.
+    pub max_upstreams: i32,
+    /// How many backends each of its upstreams may have.
+    pub max_backends_per_upstream: i32,
+    /// How many API keys this tenant may hold, revoked ones included.
+    pub max_api_keys: i32,
     /// Arbitrary per-tenant settings, untouched by the proxy.
     pub settings: serde_json::Value,
     /// When the tenant was created.
@@ -63,6 +69,9 @@ pub(crate) struct TenantRow {
     pub(crate) plan: String,
     pub(crate) max_domains: i32,
     pub(crate) max_routes_per_domain: i32,
+    pub(crate) max_upstreams: i32,
+    pub(crate) max_backends_per_upstream: i32,
+    pub(crate) max_api_keys: i32,
     pub(crate) settings: serde_json::Value,
     pub(crate) created_at: DateTime<Utc>,
     pub(crate) updated_at: DateTime<Utc>,
@@ -83,6 +92,9 @@ impl From<TenantRow> for Tenant {
             plan: row.plan,
             max_domains: row.max_domains,
             max_routes_per_domain: row.max_routes_per_domain,
+            max_upstreams: row.max_upstreams,
+            max_backends_per_upstream: row.max_backends_per_upstream,
+            max_api_keys: row.max_api_keys,
             settings: row.settings,
             created_at: row.created_at,
             updated_at: row.updated_at,
@@ -636,7 +648,10 @@ pub struct UpdateTenantRequest {
 /// Create domain request.
 #[derive(Clone, Debug, Deserialize)]
 pub struct CreateDomainRequest {
-    /// The name to register. Globally unique across tenants.
+    /// The name to register. Globally unique across tenants, compared without
+    /// regard to case, and stored lowercased with any trailing dot removed --
+    /// see [`normalize_domain`](crate::saas::validation::normalize_domain) for
+    /// what is accepted.
     pub domain: String,
     /// How ownership will be proved. Defaults to DNS, which is the sound one:
     /// HTTP verification is answered by this proxy once the domain points at
@@ -936,8 +951,10 @@ fn default_weight() -> i32 {
 pub struct CreateApiKeyRequest {
     /// Label, for telling keys apart later.
     pub name: String,
-    /// What the key may do, as `resource:action` strings. Defaults to reading
-    /// and writing domains.
+    /// What the key may do, as `resource:action` strings from
+    /// [`KNOWN_SCOPES`](crate::saas::auth::KNOWN_SCOPES). Defaults to reading
+    /// and writing domains. Every scope must be one the creating credential
+    /// itself holds.
     #[serde(default = "default_scopes")]
     pub scopes: Vec<String>,
     /// When the key should stop working. `None` means never.
@@ -970,8 +987,16 @@ pub struct TenantUsage {
     pub verified_domains: i64,
     /// Routes across all of them.
     pub routes_count: i64,
+    /// How many routes each domain may have.
+    pub routes_per_domain_limit: i32,
     /// Upstreams defined.
     pub upstreams_count: i64,
+    /// How many upstreams the tenant may define.
+    pub upstreams_limit: i32,
+    /// How many backends each upstream may have.
+    pub backends_per_upstream_limit: i32,
     /// API keys, including revoked ones.
     pub api_keys_count: i64,
+    /// How many API keys the tenant may hold.
+    pub api_keys_limit: i32,
 }

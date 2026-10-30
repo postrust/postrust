@@ -3,6 +3,8 @@
 //! Split out from the handler so it can be tested without a database or a
 //! running listener, which is most of what there is to get wrong here.
 
+use crate::saas::validation::normalize_domain;
+
 /// Whether a request's `Host` header names `domain`.
 ///
 /// The comparison has to be deliberate rather than `==`, because a `Host`
@@ -15,6 +17,11 @@
 /// - it may carry a fully-qualified trailing dot (`example.com.`), which names
 ///   the same host as `example.com`.
 ///
+/// Both sides go through [`normalize_domain`], the function every stored
+/// domain went through on the way in, so the comparison here cannot disagree
+/// with the uniqueness check about whether two spellings are one name. An IP
+/// literal never matches: no registered domain can be one.
+///
 /// Anything that does not parse as a host is not a match. Returning `false` on
 /// doubt is the safe direction: the caller uses this to decide whether to hand
 /// out a challenge secret.
@@ -25,10 +32,10 @@ pub fn host_matches(host_header: Option<&str>, domain: &str) -> bool {
     let Some(name) = strip_port(host.trim()) else {
         return false;
     };
-    if name.is_empty() || domain.is_empty() {
-        return false;
+    match (normalize_domain(name), normalize_domain(domain)) {
+        (Ok(name), Ok(domain)) => name == domain,
+        _ => false,
     }
-    normalize(name) == normalize(domain)
 }
 
 /// Drop a `:port` suffix, leaving the host name.
@@ -62,11 +69,6 @@ fn strip_port(host: &str) -> Option<&str> {
 /// The digits of a port, with the `:` already removed. At least one, all ASCII.
 fn is_port(port: &str) -> bool {
     !port.is_empty() && port.bytes().all(|b| b.is_ascii_digit())
-}
-
-/// Lowercase, and drop one fully-qualified trailing dot.
-fn normalize(name: &str) -> String {
-    name.strip_suffix('.').unwrap_or(name).to_ascii_lowercase()
 }
 
 #[cfg(test)]
@@ -107,9 +109,22 @@ mod tests {
     }
 
     #[test]
-    fn ipv6_literal_keeps_its_brackets() {
-        assert!(host_matches(Some("[::1]:8443"), "[::1]"));
-        assert!(host_matches(Some("[::1]"), "[::1]"));
+    fn ip_literals_never_match() {
+        // No registered domain can be an IP literal, so a Host that is one is
+        // never the host a challenge was issued for -- even if the stored
+        // value somehow were the same literal.
+        assert!(!host_matches(Some("[::1]:8443"), "[::1]"));
+        assert!(!host_matches(Some("[::1]"), "[::1]"));
+        assert!(!host_matches(Some("127.0.0.1"), "127.0.0.1"));
+    }
+
+    #[test]
+    fn a_case_variant_registration_is_the_same_name() {
+        // The finding: tenant B's `VICTIM.test` answering on `victim.test`.
+        // With both normalised the same way, the database refuses B's row
+        // and this agrees they are one name.
+        assert!(host_matches(Some("victim.test"), "VICTIM.test"));
+        assert!(host_matches(Some("VICTIM.TEST."), "victim.test"));
     }
 
     #[test]

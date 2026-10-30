@@ -7,7 +7,7 @@ keywords = ["proxy", "load-balancer", "tls", "acme", "http"]
 # Deliberately NOT `version.workspace = true`. The rest of the workspace is
 # heading for 1.0.0; this crate is not, and a shared version number would
 # promise a stability this crate cannot keep. See docs/stability.md.
-version = "0.6.0"
+version = "1.0.0"
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
@@ -46,6 +46,9 @@ http.workspace = true
 tokio-rustls.workspace = true
 rustls.workspace = true
 rustls-pemfile.workspace = true
+# Trust anchors for checking an uploaded certificate chain. Already in the
+# tree through reqwest; named here because the upload check uses it directly.
+webpki-roots = "1"
 instant-acme = { workspace = true, optional = true }
 x509-parser.workspace = true
 regex.workspace = true

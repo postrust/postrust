@@ -27,6 +27,17 @@ impl ApiKeyService {
         tenant_id: Uuid,
         req: CreateApiKeyRequest,
     ) -> ProxyResult<ApiKey> {
+        // Whether the caller may grant these scopes is the handler's call --
+        // it has the caller's credential. What can be checked without it is
+        // that each scope means something.
+        crate::saas::validation::validate_resource_name("API key", &req.name)?;
+        crate::saas::auth::validate_scopes(&req.scopes)?;
+        if req.expires_at.is_some_and(|at| at <= chrono::Utc::now()) {
+            return Err(ProxyError::Validation(
+                "expires_at must be in the future".into(),
+            ));
+        }
+
         // Generate a secure random key
         let raw_key = generate_api_key();
         let key_hash = hash_api_key(&raw_key);

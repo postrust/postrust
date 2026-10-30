@@ -2799,7 +2799,7 @@ dependencies = [
 
 [[package]]
 name = "postrust-proxy"
-version = "0.6.0"
+version = "1.0.0"
 dependencies = [
  "ahash",
  "anyhow",
@@ -2844,6 +2844,7 @@ dependencies = [
  "tracing-subscriber",
  "url",
  "uuid",
+ "webpki-roots",
  "x509-parser",
 ]
 

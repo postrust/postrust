@@ -43,10 +43,58 @@ pub enum AuthType {
     },
 }
 
+/// Every scope an API key may be given.
+///
+/// `resource:read` and `resource:write`, where write implies read, plus `*` for
+/// everything. A key's scopes are checked against this list when it is
+/// created: a misspelt scope would otherwise be stored, grant nothing, and look
+/// to whoever reads the key's metadata as though it granted something.
+pub const KNOWN_SCOPES: &[&str] = &[
+    "*",
+    "domains:read",
+    "domains:write",
+    "routes:read",
+    "routes:write",
+    "upstreams:read",
+    "upstreams:write",
+    "api_keys:read",
+    "api_keys:write",
+    "tenant:read",
+];
+
+/// Refuse any scope not in [`KNOWN_SCOPES`].
+pub fn validate_scopes(scopes: &[String]) -> crate::error::ProxyResult<()> {
+    match scopes.iter().find(|s| !KNOWN_SCOPES.contains(&s.as_str())) {
+        Some(unknown) => Err(crate::error::ProxyError::Validation(format!(
+            "unknown scope {unknown:?}; known scopes are {}",
+            KNOWN_SCOPES.join(", ")
+        ))),
+        None => Ok(()),
+    }
+}
+
 impl AuthContext {
     /// Check if the context has a specific scope.
     pub fn has_scope(&self, scope: &str) -> bool {
         self.scopes.iter().any(|s| s == scope || s == "*")
+    }
+
+    /// Whether this context holds at least what `scope` would grant.
+    ///
+    /// What decides whether a caller may hand a scope to a new key, or revoke
+    /// a key holding it: nobody may give or take away more than they have.
+    /// `*` is held only by `*`; `x:read` by anything that can read `x`;
+    /// `x:write` by anything that can write it. An unrecognised scope is held
+    /// by nobody but `*`.
+    pub fn grants(&self, scope: &str) -> bool {
+        if self.has_scope("*") {
+            return true;
+        }
+        match scope.rsplit_once(':') {
+            Some((resource, "read")) => self.can_read(resource),
+            Some((resource, "write")) => self.can_write(resource),
+            _ => false,
+        }
     }
 
     /// Check if the context can read a resource.
@@ -67,12 +115,36 @@ impl AuthContext {
 pub struct SaasAuthLayer {
     pool: PgPool,
     jwt_secret: Option<String>,
+    jwt_audience: String,
+    jwt_issuer: Option<String>,
 }
 
 impl SaasAuthLayer {
     /// Create a new SaaS auth layer.
+    ///
+    /// JWTs must carry `aud` = [`DEFAULT_JWT_AUDIENCE`] unless
+    /// [`with_jwt_audience`](Self::with_jwt_audience) says otherwise.
+    ///
+    /// [`DEFAULT_JWT_AUDIENCE`]: crate::saas::options::DEFAULT_JWT_AUDIENCE
     pub fn new(pool: PgPool, jwt_secret: Option<String>) -> Self {
-        Self { pool, jwt_secret }
+        Self {
+            pool,
+            jwt_secret,
+            jwt_audience: crate::saas::options::DEFAULT_JWT_AUDIENCE.to_string(),
+            jwt_issuer: None,
+        }
+    }
+
+    /// Require JWTs to name this audience instead of the default.
+    pub fn with_jwt_audience(mut self, audience: impl Into<String>) -> Self {
+        self.jwt_audience = audience.into();
+        self
+    }
+
+    /// Require JWTs to name this issuer.
+    pub fn with_jwt_issuer(mut self, issuer: Option<String>) -> Self {
+        self.jwt_issuer = issuer;
+        self
     }
 }
 
@@ -128,7 +200,12 @@ async fn validate_jwt(token: &str, auth_layer: &SaasAuthLayer) -> Result<AuthCon
         .as_ref()
         .ok_or(AuthError::JwtNotConfigured)?;
 
-    let claims = decode_jwt(token, secret)?;
+    let claims = decode_jwt(
+        token,
+        secret,
+        &auth_layer.jwt_audience,
+        auth_layer.jwt_issuer.as_deref(),
+    )?;
 
     // Get tenant ID from claims
     let tenant_id = claims
@@ -141,7 +218,9 @@ async fn validate_jwt(token: &str, auth_layer: &SaasAuthLayer) -> Result<AuthCon
             user_id: claims.sub,
             role: claims.role,
         },
-        scopes: claims.scopes.unwrap_or_else(|| vec!["*".to_string()]),
+        // No `scopes` claim means no scopes. Defaulting to `*` made every token
+        // minted without thinking about scopes an all-powerful one.
+        scopes: claims.scopes.unwrap_or_default(),
     })
 }
 
@@ -182,21 +261,33 @@ struct JwtClaims {
     tenant_id: Option<Uuid>,
     /// User role
     role: Option<String>,
-    /// Scopes
+    /// Scopes. Absent means none.
     scopes: Option<Vec<String>>,
-    /// Expiration time
-    exp: Option<i64>,
 }
 
-/// Decode and validate a JWT token (HMAC-SHA256 signature, then expiry).
-fn decode_jwt(token: &str, secret: &str) -> Result<JwtClaims, AuthError> {
+/// Decode and validate a JWT: HMAC-SHA256 signature, then `exp`, `aud` and,
+/// when configured, `iss`.
+///
+/// `exp` and `aud` are required, and `iss` when an issuer is configured. A
+/// token without `exp` never expires, so a leaked one is good for ever. A token without the right `aud` may have been
+/// minted for something else that shares the secret -- the main Postrust
+/// server, typically -- and must not open this API.
+fn decode_jwt(
+    token: &str,
+    secret: &str,
+    audience: &str,
+    issuer: Option<&str>,
+) -> Result<JwtClaims, AuthError> {
     use jsonwebtoken::{decode, Algorithm, DecodingKey, Validation};
 
     let mut validation = Validation::new(Algorithm::HS256);
-    // `exp` is optional for these tokens: don't require it, and check it
-    // manually below when present so absence isn't an error.
-    validation.required_spec_claims.clear();
-    validation.validate_exp = false;
+    validation.set_required_spec_claims(&["exp", "aud"]);
+    validation.validate_exp = true;
+    validation.set_audience(&[audience]);
+    if let Some(issuer) = issuer {
+        validation.set_issuer(&[issuer]);
+        validation.required_spec_claims.insert("iss".to_string());
+    }
 
     let token_data = decode::<JwtClaims>(
         token,
@@ -208,17 +299,7 @@ fn decode_jwt(token: &str, secret: &str) -> Result<JwtClaims, AuthError> {
         _ => AuthError::InvalidToken(e.to_string()),
     })?;
 
-    let claims = token_data.claims;
-
-    // Check expiration
-    if let Some(exp) = claims.exp {
-        let now = chrono::Utc::now().timestamp();
-        if exp < now {
-            return Err(AuthError::TokenExpired);
-        }
-    }
-
-    Ok(claims)
+    Ok(token_data.claims)
 }
 
 /// Authentication errors.
@@ -250,6 +331,8 @@ pub enum AuthError {
     /// The lookup itself failed. Ours, not the caller's -- reported as a 500
     /// rather than a 401, so an outage does not read as a bad credential.
     Database(sqlx::Error),
+    /// Some other failure of ours. Logged; the caller sees a generic 500.
+    Internal(String),
 }
 
 impl From<sqlx::Error> for AuthError {
@@ -262,13 +345,28 @@ impl From<crate::error::ProxyError> for AuthError {
     fn from(err: crate::error::ProxyError) -> Self {
         match err {
             crate::error::ProxyError::Database(e) => AuthError::Database(e),
-            _ => AuthError::InvalidToken(err.to_string()),
+            // Anything else reaching here is a failure of ours, from a lookup.
+            // It used to be reported as an invalid token, with its text.
+            other => AuthError::Internal(other.to_string()),
         }
     }
 }
 
 impl IntoResponse for AuthError {
     fn into_response(self) -> Response {
+        match &self {
+            AuthError::Database(error) => {
+                tracing::error!(%error, "authentication lookup failed");
+            }
+            AuthError::Internal(error) => {
+                tracing::error!(%error, "authentication failed internally");
+            }
+            AuthError::InvalidToken(reason) => {
+                tracing::debug!(%reason, "refused a JWT");
+            }
+            _ => {}
+        }
+
         let (status, message) = match self {
             AuthError::MissingHeader => (
                 StatusCode::UNAUTHORIZED,
@@ -278,9 +376,9 @@ impl IntoResponse for AuthError {
                 StatusCode::UNAUTHORIZED,
                 "Invalid Authorization header format".to_string(),
             ),
-            AuthError::InvalidToken(msg) => {
-                (StatusCode::UNAUTHORIZED, format!("Invalid token: {}", msg))
-            }
+            // The reason is logged, not returned: it is the library's text,
+            // and says which check a forger has yet to get past.
+            AuthError::InvalidToken(_) => (StatusCode::UNAUTHORIZED, "Invalid token".to_string()),
             AuthError::TokenExpired => (StatusCode::UNAUTHORIZED, "Token has expired".to_string()),
             AuthError::MissingClaim(claim) => (
                 StatusCode::UNAUTHORIZED,
@@ -305,7 +403,7 @@ impl IntoResponse for AuthError {
                 StatusCode::UNAUTHORIZED,
                 "Unsupported authentication method".to_string(),
             ),
-            AuthError::Database(_) => (
+            AuthError::Database(_) | AuthError::Internal(_) => (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "Internal server error".to_string(),
             ),
@@ -370,8 +468,15 @@ mod tests {
             "tenant_id": TENANT_ID,
             "role": "admin",
             "scopes": ["domains:read"],
+            "aud": AUDIENCE,
             "exp": chrono::Utc::now().timestamp() + 3600,
         })
+    }
+
+    const AUDIENCE: &str = "postrust-proxy";
+
+    fn decode(token: &str, secret: &str) -> Result<JwtClaims, AuthError> {
+        decode_jwt(token, secret, AUDIENCE, None)
     }
 
     fn b64url(data: &[u8]) -> String {
@@ -381,7 +486,7 @@ mod tests {
     #[test]
     fn valid_token_decodes() {
         let token = sign(&valid_claims(), SECRET);
-        let claims = decode_jwt(&token, SECRET).unwrap();
+        let claims = decode(&token, SECRET).unwrap();
         assert_eq!(claims.sub, "user-1");
         assert_eq!(claims.tenant_id, Some(TENANT_ID.parse().unwrap()));
         assert_eq!(claims.role.as_deref(), Some("admin"));
@@ -389,18 +494,116 @@ mod tests {
     }
 
     #[test]
-    fn token_without_exp_is_accepted() {
+    fn token_without_exp_is_rejected() {
+        // It would never expire, so a leaked one would be good for ever.
         let mut claims = valid_claims();
         claims.as_object_mut().unwrap().remove("exp");
         let token = sign(&claims, SECRET);
-        assert!(decode_jwt(&token, SECRET).is_ok());
+        assert!(matches!(
+            decode(&token, SECRET),
+            Err(AuthError::InvalidToken(_))
+        ));
+    }
+
+    #[test]
+    fn token_without_an_audience_is_rejected() {
+        let mut claims = valid_claims();
+        claims.as_object_mut().unwrap().remove("aud");
+        let token = sign(&claims, SECRET);
+        assert!(matches!(
+            decode(&token, SECRET),
+            Err(AuthError::InvalidToken(_))
+        ));
+    }
+
+    #[test]
+    fn token_for_another_audience_is_rejected() {
+        // What the main Postrust server would mint with the same secret.
+        let mut claims = valid_claims();
+        claims["aud"] = serde_json::json!("postrust");
+        let token = sign(&claims, SECRET);
+        assert!(matches!(
+            decode(&token, SECRET),
+            Err(AuthError::InvalidToken(_))
+        ));
+
+        // A configured audience replaces the default rather than adding to it.
+        let token = sign(&valid_claims(), SECRET);
+        assert!(decode_jwt(&token, SECRET, "elsewhere", None).is_err());
+    }
+
+    #[test]
+    fn a_configured_issuer_is_required() {
+        let token = sign(&valid_claims(), SECRET);
+        assert!(
+            decode_jwt(&token, SECRET, AUDIENCE, Some("https://id.example")).is_err(),
+            "a token with no iss passed an issuer check"
+        );
+
+        let mut claims = valid_claims();
+        claims["iss"] = serde_json::json!("https://id.example");
+        let token = sign(&claims, SECRET);
+        assert!(decode_jwt(&token, SECRET, AUDIENCE, Some("https://id.example")).is_ok());
+        assert!(decode_jwt(&token, SECRET, AUDIENCE, Some("https://other.example")).is_err());
+    }
+
+    #[tokio::test]
+    async fn a_token_without_scopes_has_none() {
+        let mut claims = valid_claims();
+        claims.as_object_mut().unwrap().remove("scopes");
+        let token = sign(&claims, SECRET);
+
+        // Never connects: validate_jwt does not touch the database.
+        let pool = PgPool::connect_lazy("postgres://localhost/unused").unwrap();
+        let layer = SaasAuthLayer::new(pool, Some(SECRET.to_string()));
+        let context = validate_jwt(&token, &layer).await.expect("valid token");
+        assert!(context.scopes.is_empty(), "got {:?}", context.scopes);
+        assert!(!context.can_read("domains"));
+    }
+
+    fn context(scopes: &[&str]) -> AuthContext {
+        AuthContext {
+            tenant_id: Uuid::nil(),
+            auth_type: AuthType::ApiKey {
+                key_id: Uuid::nil(),
+            },
+            scopes: scopes.iter().map(|s| s.to_string()).collect(),
+        }
+    }
+
+    #[test]
+    fn only_a_wildcard_grants_a_wildcard() {
+        assert!(context(&["*"]).grants("*"));
+        assert!(!context(&["domains:write", "api_keys:write"]).grants("*"));
+        assert!(!context(&[]).grants("domains:read"));
+    }
+
+    #[test]
+    fn write_grants_read_but_not_the_reverse() {
+        let writer = context(&["domains:write"]);
+        assert!(writer.grants("domains:read"));
+        assert!(writer.grants("domains:write"));
+        assert!(!writer.grants("routes:read"));
+
+        let reader = context(&["domains:read"]);
+        assert!(reader.grants("domains:read"));
+        assert!(!reader.grants("domains:write"));
+        assert!(!reader.grants("bogus"));
+    }
+
+    #[test]
+    fn unknown_scopes_are_refused() {
+        assert!(validate_scopes(&["domains:read".into(), "tenant:read".into()]).is_ok());
+        assert!(validate_scopes(&["domain:read".into()]).is_err());
+        assert!(validate_scopes(&["domains:admin".into()]).is_err());
+        assert!(validate_scopes(&["".into()]).is_err());
     }
 
     #[test]
     fn token_signed_with_wrong_secret_is_rejected() {
         let token = sign(&valid_claims(), "some-other-secret");
         assert!(matches!(
-            decode_jwt(&token, SECRET),
+            decode(&token, SECRET),
             Err(AuthError::InvalidToken(_))
         ));
     }
@@ -418,7 +621,7 @@ mod tests {
 
         let forged = format!("{}.{}.{}", parts[0], forged_payload, parts[2]);
         assert!(matches!(
-            decode_jwt(&forged, SECRET),
+            decode(&forged, SECRET),
             Err(AuthError::InvalidToken(_))
         ));
     }
@@ -435,7 +638,7 @@ mod tests {
             format!("{header}.{payload}"),
         ] {
             assert!(
-                matches!(decode_jwt(&token, SECRET), Err(AuthError::InvalidToken(_))),
+                matches!(decode(&token, SECRET), Err(AuthError::InvalidToken(_))),
                 "token {token:?} should be rejected"
             );
         }
@@ -444,10 +647,11 @@ mod tests {
     #[test]
     fn expired_token_is_rejected() {
         let mut claims = valid_claims();
-        claims["exp"] = serde_json::json!(chrono::Utc::now().timestamp() - 60);
+        // Past the library's default sixty-second leeway for clock skew.
+        claims["exp"] = serde_json::json!(chrono::Utc::now().timestamp() - 3600);
         let token = sign(&claims, SECRET);
         assert!(matches!(
-            decode_jwt(&token, SECRET),
+            decode(&token, SECRET),
             Err(AuthError::TokenExpired)
         ));
     }
@@ -455,7 +659,7 @@ mod tests {
     #[test]
     fn malformed_token_is_rejected() {
         assert!(matches!(
-            decode_jwt("not-a-jwt", SECRET),
+            decode("not-a-jwt", SECRET),
             Err(AuthError::InvalidToken(_))
         ));
     }

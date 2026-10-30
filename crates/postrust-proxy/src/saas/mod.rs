@@ -35,14 +35,18 @@ pub mod auth;
 pub(crate) mod db;
 pub mod handlers;
 pub mod manager;
+pub mod options;
 #[cfg(feature = "acme")]
 pub mod ssl;
 pub mod types;
+pub mod validation;
 pub mod verification;
 pub mod wellknown_host;
 
 pub use api_keys::ApiKeyService;
 pub use auth::{AuthContext, AuthType, SaasAuthLayer};
 pub use manager::DomainManager;
+pub use options::{DomainPolicy, SaasOptions, UploadTrust};
 pub use types::*;
+pub use validation::ReservedDomains;
 pub use verification::DomainVerificationService;

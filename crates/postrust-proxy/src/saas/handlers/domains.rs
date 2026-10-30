@@ -2,7 +2,7 @@
 
 use crate::admin::api::ApiResponse;
 use crate::saas::auth::Auth;
-use crate::saas::handlers::{error_response, SaasState};
+use crate::saas::handlers::{error_response, require_scope, SaasState};
 use crate::saas::types::{CreateDomainRequest, UpdateDomainRequest, UploadCertificateRequest};
 use axum::{
     extract::{Path, State},
@@ -14,6 +14,10 @@ use uuid::Uuid;
 
 /// List all domains for the authenticated tenant.
 pub async fn list_domains(State(state): State<SaasState>, Auth(auth): Auth) -> impl IntoResponse {
+    if let Err(refusal) = require_scope(&auth, "domains:read") {
+        return refusal;
+    }
+
     match state.domain_manager.list_domains(auth.tenant_id).await {
         Ok(domains) => Json(ApiResponse::success(domains)).into_response(),
         Err(e) => error_response(e).into_response(),
@@ -26,12 +30,8 @@ pub async fn create_domain(
     Auth(auth): Auth,
     Json(req): Json<CreateDomainRequest>,
 ) -> impl IntoResponse {
-    if !auth.can_write("domains") {
-        return (
-            StatusCode::FORBIDDEN,
-            Json(ApiResponse::<()>::error("Insufficient permissions")),
-        )
-            .into_response();
+    if let Err(refusal) = require_scope(&auth, "domains:write") {
+        return refusal;
     }
 
     match state
@@ -54,11 +54,18 @@ pub async fn get_domain(
     Auth(auth): Auth,
     Path(id): Path<Uuid>,
 ) -> impl IntoResponse {
+    if let Err(refusal) = require_scope(&auth, "domains:read") {
+        return refusal;
+    }
+
     match state.domain_manager.get_domain(id, auth.tenant_id).await {
         Ok(Some(domain)) => Json(ApiResponse::success(domain)).into_response(),
         Ok(None) => (
             StatusCode::NOT_FOUND,
-            Json(ApiResponse::<()>::error("Domain not found")),
+            Json(ApiResponse::<()>::error_with_code(
+                "not_found",
+                "Domain not found",
+            )),
         )
             .into_response(),
         Err(e) => error_response(e).into_response(),
@@ -71,19 +78,22 @@ pub async fn delete_domain(
     Auth(auth): Auth,
     Path(id): Path<Uuid>,
 ) -> impl IntoResponse {
-    if !auth.can_write("domains") {
-        return (
-            StatusCode::FORBIDDEN,
-            Json(ApiResponse::<()>::error("Insufficient permissions")),
-        )
-            .into_response();
+    if let Err(refusal) = require_scope(&auth, "domains:write") {
+        return refusal;
     }
 
-    match state.domain_manager.delete_domain(id, auth.tenant_id).await {
+    match state
+        .domain_manager
+        .delete_domain(id, auth.tenant_id, &state.cert_store)
+        .await
+    {
         Ok(true) => Json(ApiResponse::success(())).into_response(),
         Ok(false) => (
             StatusCode::NOT_FOUND,
-            Json(ApiResponse::<()>::error("Domain not found")),
+            Json(ApiResponse::<()>::error_with_code(
+                "not_found",
+                "Domain not found",
+            )),
         )
             .into_response(),
         Err(e) => error_response(e).into_response(),
@@ -96,12 +106,8 @@ pub async fn verify_domain(
     Auth(auth): Auth,
     Path(id): Path<Uuid>,
 ) -> impl IntoResponse {
-    if !auth.can_write("domains") {
-        return (
-            StatusCode::FORBIDDEN,
-            Json(ApiResponse::<()>::error("Insufficient permissions")),
-        )
-            .into_response();
+    if let Err(refusal) = require_scope(&auth, "domains:write") {
+        return refusal;
     }
 
     match state.domain_manager.verify_domain(id, auth.tenant_id).await {
@@ -116,20 +122,19 @@ pub async fn enable_domain(
     Auth(auth): Auth,
     Path(id): Path<Uuid>,
 ) -> impl IntoResponse {
-    if !auth.can_write("domains") {
-        return (
-            StatusCode::FORBIDDEN,
-            Json(ApiResponse::<()>::error("Insufficient permissions")),
-        )
-            .into_response();
+    if let Err(refusal) = require_scope(&auth, "domains:write") {
+        return refusal;
     }
 
     match state.domain_manager.enable_domain(id, auth.tenant_id).await {
         Ok(true) => Json(ApiResponse::success(())).into_response(),
+        // The manager has already refused an unverified domain with a
+        // validation error; `false` here means the row went away in between.
         Ok(false) => (
-            StatusCode::BAD_REQUEST,
-            Json(ApiResponse::<()>::error(
-                "Could not enable domain. Is it verified?",
+            StatusCode::NOT_FOUND,
+            Json(ApiResponse::<()>::error_with_code(
+                "not_found",
+                "Domain not found",
             )),
         )
             .into_response(),
@@ -143,12 +148,8 @@ pub async fn disable_domain(
     Auth(auth): Auth,
     Path(id): Path<Uuid>,
 ) -> impl IntoResponse {
-    if !auth.can_write("domains") {
-        return (
-            StatusCode::FORBIDDEN,
-            Json(ApiResponse::<()>::error("Insufficient permissions")),
-        )
-            .into_response();
+    if let Err(refusal) = require_scope(&auth, "domains:write") {
+        return refusal;
     }
 
     match state
@@ -159,7 +160,10 @@ pub async fn disable_domain(
         Ok(true) => Json(ApiResponse::success(())).into_response(),
         Ok(false) => (
             StatusCode::NOT_FOUND,
-            Json(ApiResponse::<()>::error("Domain not found")),
+            Json(ApiResponse::<()>::error_with_code(
+                "not_found",
+                "Domain not found",
+            )),
         )
             .into_response(),
         Err(e) => error_response(e).into_response(),
@@ -179,12 +183,8 @@ pub async fn update_domain(
     Path(id): Path<Uuid>,
     Json(req): Json<UpdateDomainRequest>,
 ) -> impl IntoResponse {
-    if !auth.can_write("domains") {
-        return (
-            StatusCode::FORBIDDEN,
-            Json(ApiResponse::<()>::error("Insufficient permissions")),
-        )
-            .into_response();
+    if let Err(refusal) = require_scope(&auth, "domains:write") {
+        return refusal;
     }
 
     match state
@@ -218,12 +218,8 @@ pub async fn upload_certificate(
     Path(id): Path<Uuid>,
     Json(req): Json<UploadCertificateRequest>,
 ) -> impl IntoResponse {
-    if !auth.can_write("domains") {
-        return (
-            StatusCode::FORBIDDEN,
-            Json(ApiResponse::<()>::error("Insufficient permissions")),
-        )
-            .into_response();
+    if let Err(refusal) = require_scope(&auth, "domains:write") {
+        return refusal;
     }
 
     match state
@@ -260,12 +256,8 @@ pub async fn provision_ssl(
     Auth(auth): Auth,
     Path(id): Path<Uuid>,
 ) -> impl IntoResponse {
-    if !auth.can_write("domains") {
-        return (
-            StatusCode::FORBIDDEN,
-            Json(ApiResponse::<()>::error("Insufficient permissions")),
-        )
-            .into_response();
+    if let Err(refusal) = require_scope(&auth, "domains:write") {
+        return refusal;
     }
 
     match state

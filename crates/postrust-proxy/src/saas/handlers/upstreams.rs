@@ -2,7 +2,7 @@
 
 use crate::admin::api::ApiResponse;
 use crate::saas::auth::Auth;
-use crate::saas::handlers::{error_response, SaasState};
+use crate::saas::handlers::{error_response, require_scope, SaasState};
 use crate::saas::types::{CreateBackendRequest, CreateUpstreamRequest, UpdateUpstreamRequest};
 use axum::{
     extract::{Path, State},
@@ -14,6 +14,10 @@ use uuid::Uuid;
 
 /// List upstreams for the authenticated tenant.
 pub async fn list_upstreams(State(state): State<SaasState>, Auth(auth): Auth) -> impl IntoResponse {
+    if let Err(refusal) = require_scope(&auth, "upstreams:read") {
+        return refusal;
+    }
+
     match state.domain_manager.list_upstreams(auth.tenant_id).await {
         Ok(upstreams) => Json(ApiResponse::success(upstreams)).into_response(),
         Err(e) => error_response(e).into_response(),
@@ -26,12 +30,8 @@ pub async fn create_upstream(
     Auth(auth): Auth,
     Json(req): Json<CreateUpstreamRequest>,
 ) -> impl IntoResponse {
-    if !auth.can_write("upstreams") {
-        return (
-            StatusCode::FORBIDDEN,
-            Json(ApiResponse::<()>::error("Insufficient permissions")),
-        )
-            .into_response();
+    if let Err(refusal) = require_scope(&auth, "upstreams:write") {
+        return refusal;
     }
 
     match state
@@ -50,11 +50,18 @@ pub async fn get_upstream(
     Auth(auth): Auth,
     Path(id): Path<Uuid>,
 ) -> impl IntoResponse {
+    if let Err(refusal) = require_scope(&auth, "upstreams:read") {
+        return refusal;
+    }
+
     match state.domain_manager.get_upstream(id, auth.tenant_id).await {
         Ok(Some(upstream)) => Json(ApiResponse::success(upstream)).into_response(),
         Ok(None) => (
             StatusCode::NOT_FOUND,
-            Json(ApiResponse::<()>::error("Upstream not found")),
+            Json(ApiResponse::<()>::error_with_code(
+                "not_found",
+                "Upstream not found",
+            )),
         )
             .into_response(),
         Err(e) => error_response(e).into_response(),
@@ -68,12 +75,8 @@ pub async fn update_upstream(
     Path(id): Path<Uuid>,
     Json(req): Json<UpdateUpstreamRequest>,
 ) -> impl IntoResponse {
-    if !auth.can_write("upstreams") {
-        return (
-            StatusCode::FORBIDDEN,
-            Json(ApiResponse::<()>::error("Insufficient permissions")),
-        )
-            .into_response();
+    if let Err(refusal) = require_scope(&auth, "upstreams:write") {
+        return refusal;
     }
 
     match state
@@ -84,7 +87,10 @@ pub async fn update_upstream(
         Ok(Some(upstream)) => Json(ApiResponse::success(upstream)).into_response(),
         Ok(None) => (
             StatusCode::NOT_FOUND,
-            Json(ApiResponse::<()>::error("Upstream not found")),
+            Json(ApiResponse::<()>::error_with_code(
+                "not_found",
+                "Upstream not found",
+            )),
         )
             .into_response(),
         Err(e) => error_response(e).into_response(),
@@ -97,12 +103,8 @@ pub async fn delete_upstream(
     Auth(auth): Auth,
     Path(id): Path<Uuid>,
 ) -> impl IntoResponse {
-    if !auth.can_write("upstreams") {
-        return (
-            StatusCode::FORBIDDEN,
-            Json(ApiResponse::<()>::error("Insufficient permissions")),
-        )
-            .into_response();
+    if let Err(refusal) = require_scope(&auth, "upstreams:write") {
+        return refusal;
     }
 
     match state
@@ -113,7 +115,10 @@ pub async fn delete_upstream(
         Ok(true) => Json(ApiResponse::success(())).into_response(),
         Ok(false) => (
             StatusCode::NOT_FOUND,
-            Json(ApiResponse::<()>::error("Upstream not found")),
+            Json(ApiResponse::<()>::error_with_code(
+                "not_found",
+                "Upstream not found",
+            )),
         )
             .into_response(),
         Err(e) => error_response(e).into_response(),
@@ -127,12 +132,8 @@ pub async fn add_backend(
     Path(upstream_id): Path<Uuid>,
     Json(req): Json<CreateBackendRequest>,
 ) -> impl IntoResponse {
-    if !auth.can_write("upstreams") {
-        return (
-            StatusCode::FORBIDDEN,
-            Json(ApiResponse::<()>::error("Insufficient permissions")),
-        )
-            .into_response();
+    if let Err(refusal) = require_scope(&auth, "upstreams:write") {
+        return refusal;
     }
 
     match state
@@ -151,12 +152,8 @@ pub async fn remove_backend(
     Auth(auth): Auth,
     Path((upstream_id, backend_id)): Path<(Uuid, Uuid)>,
 ) -> impl IntoResponse {
-    if !auth.can_write("upstreams") {
-        return (
-            StatusCode::FORBIDDEN,
-            Json(ApiResponse::<()>::error("Insufficient permissions")),
-        )
-            .into_response();
+    if let Err(refusal) = require_scope(&auth, "upstreams:write") {
+        return refusal;
     }
 
     match state
@@ -167,7 +164,10 @@ pub async fn remove_backend(
         Ok(true) => Json(ApiResponse::success(())).into_response(),
         Ok(false) => (
             StatusCode::NOT_FOUND,
-            Json(ApiResponse::<()>::error("Backend not found")),
+            Json(ApiResponse::<()>::error_with_code(
+                "not_found",
+                "Backend not found",
+            )),
         )
             .into_response(),
         Err(e) => error_response(e).into_response(),

@@ -26,6 +26,12 @@ pub struct ApiResponse<T> {
     /// What went wrong, on failure.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+    /// A stable, machine-readable name for what went wrong, on failure.
+    ///
+    /// `error` is prose and may be reworded; this is what a client should
+    /// match on. Absent on success, and on the few failures that predate it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub code: Option<&'static str>,
 }
 
 impl<T: Serialize> ApiResponse<T> {
@@ -35,6 +41,7 @@ impl<T: Serialize> ApiResponse<T> {
             success: true,
             data: Some(data),
             error: None,
+            code: None,
         }
     }
 
@@ -48,6 +55,17 @@ impl<T: Serialize> ApiResponse<T> {
             success: false,
             data: None,
             error: Some(message.into()),
+            code: None,
+        }
+    }
+
+    /// A failure response carrying a stable `code` as well as `message`.
+    pub fn error_with_code(code: &'static str, message: impl Into<String>) -> ApiResponse<()> {
+        ApiResponse {
+            success: false,
+            data: None,
+            error: Some(message.into()),
+            code: Some(code),
         }
     }
 }
@@ -57,15 +75,44 @@ impl<T: Serialize> ApiResponse<T> {
 /// The distinction from a 404 matters: "the database refused this" and "there
 /// is no such route" are different answers, and returning success for either
 /// is what this module used to do.
+///
+/// The error itself is logged and not returned. It is usually a `sqlx::Error`,
+/// whose text names tables, constraints and sometimes values -- detail for the
+/// operator's log, not for whoever is on the other end of the request.
 fn persistence_failed(error: crate::error::ProxyError) -> axum::response::Response {
     tracing::error!(%error, "admin API could not persist a configuration change");
     (
         StatusCode::INTERNAL_SERVER_ERROR,
-        Json(ApiResponse::<()>::error(format!(
-            "could not persist the change: {error}"
-        ))),
+        Json(ApiResponse::<()>::error_with_code(
+            "persistence_failed",
+            "could not persist the change; see the proxy's log",
+        )),
     )
         .into_response()
+}
+
+/// A 400 for a backend this proxy could not use.
+///
+/// Checked before anything is stored or applied. The tables refuse an unknown
+/// scheme with a CHECK constraint, but that only runs when the change is
+/// persisted -- with `database_config` off, the backend went straight into the
+/// running config.
+fn invalid_backend(req: &BackendRequest) -> Option<axum::response::Response> {
+    let scheme = req.scheme.as_deref().unwrap_or("http");
+    let error = crate::saas::validation::validate_scheme(scheme).err()?;
+    Some(
+        (
+            StatusCode::BAD_REQUEST,
+            Json(ApiResponse::<()>::error_with_code(
+                "validation_failed",
+                match error {
+                    crate::error::ProxyError::Validation(message) => message,
+                    other => other.to_string(),
+                },
+            )),
+        )
+            .into_response(),
+    )
 }
 
 /// Whether edits go to the database as well as to the running config.
@@ -348,6 +395,10 @@ async fn create_upstream(
     State(state): State<Arc<ProxyState>>,
     Json(req): Json<CreateUpstreamRequest>,
 ) -> impl IntoResponse {
+    if let Some(refusal) = req.backends.iter().find_map(invalid_backend) {
+        return refusal;
+    }
+
     let backends: Vec<Backend> = req
         .backends
         .into_iter()
@@ -494,6 +545,10 @@ async fn add_backend(
     Path(upstream_id): Path<Uuid>,
     Json(req): Json<BackendRequest>,
 ) -> impl IntoResponse {
+    if let Some(refusal) = invalid_backend(&req) {
+        return refusal;
+    }
+
     let Some(mut updated) = state
         .config
         .read()

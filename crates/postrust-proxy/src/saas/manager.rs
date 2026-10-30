@@ -4,7 +4,9 @@
 
 use crate::error::{ProxyError, ProxyResult};
 use crate::saas::db;
+use crate::saas::options::{DomainPolicy, UploadTrust};
 use crate::saas::types::*;
+use crate::saas::validation;
 use crate::saas::verification::DomainVerificationService;
 use rand::Rng;
 use sqlx::PgPool;
@@ -15,14 +17,25 @@ use uuid::Uuid;
 pub struct DomainManager {
     pool: PgPool,
     verification_service: Arc<DomainVerificationService>,
+    policy: DomainPolicy,
 }
 
 impl DomainManager {
-    /// Create a new domain manager.
+    /// Create a new domain manager with the default [`DomainPolicy`].
     pub fn new(pool: PgPool, verification_service: Arc<DomainVerificationService>) -> Self {
+        Self::with_policy(pool, verification_service, DomainPolicy::default())
+    }
+
+    /// Create a domain manager with an explicit policy.
+    pub fn with_policy(
+        pool: PgPool,
+        verification_service: Arc<DomainVerificationService>,
+        policy: DomainPolicy,
+    ) -> Self {
         Self {
             pool,
             verification_service,
+            policy,
         }
     }
 
@@ -31,47 +44,33 @@ impl DomainManager {
     // =========================================================================
 
     /// Create a new domain for a tenant.
+    ///
+    /// The name is normalised first and stored in that form, so that the
+    /// uniqueness check, the Host-header match and the certificate all see one
+    /// spelling. A reserved name is refused outright.
     pub async fn create_domain(
         &self,
         tenant_id: Uuid,
-        req: CreateDomainRequest,
+        mut req: CreateDomainRequest,
     ) -> ProxyResult<DomainResponse> {
-        // Validate domain format
-        self.validate_domain_format(&req.domain)?;
-
-        // Check tenant quota
-        let (current, max) = db::check_domain_quota(&self.pool, tenant_id).await?;
-        if current >= max as i64 {
-            return Err(ProxyError::QuotaExceeded(format!(
-                "Domain limit reached ({}/{})",
-                current, max
+        req.domain = validation::normalize_domain(&req.domain)?;
+        if self.policy.reserved.is_reserved(&req.domain) {
+            return Err(ProxyError::Validation(format!(
+                "{} is reserved and cannot be registered",
+                req.domain
             )));
         }
 
-        // Check if domain already exists
-        if db::domain_exists(&self.pool, &req.domain).await? {
-            return Err(ProxyError::Conflict("Domain already registered".into()));
-        }
-
-        // Generate verification token
         let verification_token = generate_verification_token();
-
-        // Create domain
-        let domain =
-            db::create_domain(&self.pool, tenant_id, req.clone(), &verification_token).await?;
-
-        // Create verification challenge
         let expected_value = format!("postrust-verify={}", verification_token);
-        let challenge_type = match req.verification_method {
-            VerificationMethod::Dns => "dns",
-            VerificationMethod::Http => "http",
-        };
-        db::create_verification_challenge(
+
+        let domain = db::register_domain(
             &self.pool,
-            domain.id,
-            challenge_type,
+            tenant_id,
+            &req,
             &verification_token,
             &expected_value,
+            self.policy.pending_ttl,
         )
         .await?;
 
@@ -120,23 +119,77 @@ impl DomainManager {
         db::list_domains(&self.pool, tenant_id).await
     }
 
-    /// Delete a domain.
-    pub async fn delete_domain(&self, id: Uuid, tenant_id: Uuid) -> ProxyResult<bool> {
-        db::delete_domain(&self.pool, id, tenant_id).await
+    /// Delete a domain, and every certificate linked to it.
+    ///
+    /// The certificate rows go with the domain row; `cert_store` is told as
+    /// well, so its files and its memory cache do not go on holding a private
+    /// key for a domain that no longer exists. A certificate is only removed
+    /// if it is *linked* to this domain: a row for the same name with no
+    /// domain is the operator's, and is left alone.
+    pub async fn delete_domain(
+        &self,
+        id: Uuid,
+        tenant_id: Uuid,
+        cert_store: &crate::tls::CertificateStore,
+    ) -> ProxyResult<bool> {
+        let Some(certificates) = db::delete_domain(&self.pool, id, tenant_id).await? else {
+            return Ok(false);
+        };
+        for name in certificates {
+            if let Err(error) = cert_store.remove(&name).await {
+                // The row is already gone with the domain; what is left is a
+                // cached file. Worth a warning, not worth failing a delete
+                // that has happened.
+                tracing::warn!(domain = %name, %error, "could not clear a cached certificate");
+            }
+        }
+        Ok(true)
     }
 
     /// Verify a domain.
+    ///
+    /// Throttled per domain: one attempt per
+    /// [`verification_min_interval`](DomainPolicy::verification_min_interval),
+    /// and at most
+    /// [`verification_max_attempts`](DomainPolicy::verification_max_attempts)
+    /// in all. Refused once the challenge or the registration has expired. An
+    /// already-verified domain answers `verified` without checking again.
     pub async fn verify_domain(
         &self,
         id: Uuid,
         tenant_id: Uuid,
     ) -> ProxyResult<VerificationResult> {
-        let domain = db::get_domain_for_tenant(&self.pool, id, tenant_id)
-            .await?
-            .ok_or_else(|| ProxyError::NotFound("Domain not found".into()))?;
-
-        // Record verification attempt
-        db::record_verification_attempt(&self.pool, id).await?;
+        let domain = match db::start_verification_attempt(
+            &self.pool,
+            id,
+            tenant_id,
+            self.policy.verification_min_interval,
+            self.policy.verification_max_attempts,
+            self.policy.pending_ttl,
+        )
+        .await?
+        {
+            db::AttemptStart::Started(domain) => domain,
+            db::AttemptStart::AlreadyVerified => return Ok(VerificationResult::Verified),
+            db::AttemptStart::NotFound => {
+                return Err(ProxyError::NotFound("Domain not found".into()))
+            }
+            db::AttemptStart::TooSoon => return Err(ProxyError::RateLimitExceeded),
+            db::AttemptStart::Exhausted => {
+                return Ok(VerificationResult::Failed {
+                    reason: "This domain has used all its verification attempts; \
+                             delete it and add it again"
+                        .into(),
+                })
+            }
+            db::AttemptStart::Expired => {
+                return Ok(VerificationResult::Failed {
+                    reason: "The verification challenge has expired; \
+                             delete the domain and add it again"
+                        .into(),
+                })
+            }
+        };
 
         // Perform verification based on method
         let result = match domain.verification_method {
@@ -154,10 +207,6 @@ impl DomainManager {
 
         match &result {
             VerificationResult::Verified => {
-                // Update domain status
-                db::update_verification_status(&self.pool, id, VerificationStatus::Verified)
-                    .await?;
-
                 // A domain asking for ACME is queued, not marked
                 // `provisioning`.
                 //
@@ -167,14 +216,7 @@ impl DomainManager {
                 // here would claim work was under way before anything had
                 // started, and would take the row out of the worker's own
                 // claim query -- so it would sit mid-issuance for ever.
-                if domain.ssl_provider == SslProvider::Acme {
-                    tracing::info!(
-                        domain = %domain.domain,
-                        "queued for ACME certificate issuance"
-                    );
-                    db::update_ssl_status(&self.pool, id, SslStatus::Pending, None).await?;
-                }
-
+                db::mark_verified(&self.pool, id).await?;
                 tracing::info!(domain = %domain.domain, "Domain verified successfully");
             }
             VerificationResult::Failed { reason } => {
@@ -226,6 +268,12 @@ impl DomainManager {
     /// not match the chain, the certificate may be expired, or it may be for
     /// another domain entirely. All three are refused here, with a message
     /// saying which.
+    ///
+    /// And the domain must be verified. What is stored here is served by the
+    /// TLS listener for that name, to everyone; before this check, a tenant
+    /// could register any name -- the platform's own included -- and have its
+    /// certificate served for it without proving anything. The chain must also
+    /// be trusted according to [`DomainPolicy::upload_trust`].
     pub async fn upload_certificate(
         &self,
         id: Uuid,
@@ -237,10 +285,21 @@ impl DomainManager {
             .await?
             .ok_or_else(|| ProxyError::NotFound("Domain not found".into()))?;
 
+        if domain.verification_status != VerificationStatus::Verified {
+            return Err(ProxyError::Validation(
+                "Domain must be verified before a certificate can be uploaded".into(),
+            ));
+        }
+
         let facts = crate::tls::validate_for_domain(
             &domain.domain,
             req.cert_pem.as_bytes(),
             req.key_pem.as_bytes(),
+        )?;
+        verify_chain(
+            &self.policy.upload_trust,
+            &domain.domain,
+            req.cert_pem.as_bytes(),
         )?;
 
         cert_store
@@ -252,9 +311,22 @@ impl DomainManager {
             })
             .await?;
 
-        let updated = db::record_uploaded_certificate(&self.pool, id, tenant_id, facts.expires_at)
-            .await?
-            .ok_or_else(|| ProxyError::NotFound("Domain not found".into()))?;
+        // The verified condition is in this statement too: the domain may have
+        // been deleted since it was read. If it has, the certificate just
+        // saved belongs to nobody, and is unlinked -- nothing would ever
+        // remove it, and the TLS listener would serve it. Take it back out.
+        let Some(updated) =
+            db::record_uploaded_certificate(&self.pool, id, tenant_id, facts.expires_at).await?
+        else {
+            if let Err(error) = cert_store.remove(&domain.domain).await {
+                tracing::error!(
+                    domain = %domain.domain,
+                    %error,
+                    "could not remove a certificate uploaded for a domain deleted mid-upload"
+                );
+            }
+            return Err(ProxyError::NotFound("Domain not found".into()));
+        };
 
         tracing::info!(
             domain = %updated.domain,
@@ -298,40 +370,36 @@ impl DomainManager {
             ));
         }
 
-        db::enable_domain(&self.pool, id).await
+        db::enable_domain(&self.pool, id, tenant_id).await
     }
 
     /// Disable a domain.
     pub async fn disable_domain(&self, id: Uuid, tenant_id: Uuid) -> ProxyResult<bool> {
-        // Verify ownership
-        db::get_domain_for_tenant(&self.pool, id, tenant_id)
-            .await?
-            .ok_or_else(|| ProxyError::NotFound("Domain not found".into()))?;
-
-        db::disable_domain(&self.pool, id).await
+        db::disable_domain(&self.pool, id, tenant_id).await
     }
 
     // =========================================================================
     // Route Management
     // =========================================================================
 
-    /// Create a route for a domain.
+    /// Create a route for a verified domain, within the per-domain quota.
     pub async fn create_route(
         &self,
         domain_id: Uuid,
         tenant_id: Uuid,
         req: CreateDomainRouteRequest,
     ) -> ProxyResult<DomainRoute> {
-        // Verify domain belongs to tenant
-        let _domain = db::get_domain_for_tenant(&self.pool, domain_id, tenant_id)
-            .await?
-            .ok_or_else(|| ProxyError::NotFound("Domain not found".into()))?;
+        validation::validate_resource_name("Route", &req.name)?;
+        validation::validate_route_match(
+            &req.path_pattern,
+            &req.path_type,
+            req.methods.as_deref(),
+        )?;
+        validation::validate_add_headers(&req.add_headers)?;
+        validation::validate_remove_headers(&req.remove_headers)?;
 
-        // Verify upstream belongs to tenant
-        db::get_upstream_for_tenant(&self.pool, req.upstream_id, tenant_id)
-            .await?
-            .ok_or_else(|| ProxyError::NotFound("Upstream not found".into()))?;
-
+        // Ownership of the domain and the upstream, verification and the quota
+        // are all checked inside the insert's transaction.
         db::create_route(&self.pool, domain_id, tenant_id, req).await
     }
 
@@ -361,6 +429,28 @@ impl DomainManager {
         tenant_id: Uuid,
         req: UpdateDomainRouteRequest,
     ) -> ProxyResult<Option<DomainRoute>> {
+        if let Some(name) = &req.name {
+            validation::validate_resource_name("Route", name)?;
+        }
+        if req.path_pattern.is_some() || req.path_type.is_some() || req.methods.is_some() {
+            // The pattern is checked against the type it will have after the
+            // update, which may be the stored one.
+            let current = db::get_route_for_tenant(&self.pool, id, tenant_id)
+                .await?
+                .ok_or_else(|| ProxyError::NotFound("Route not found".into()))?;
+            validation::validate_route_match(
+                req.path_pattern.as_deref().unwrap_or(&current.path_pattern),
+                req.path_type.as_ref().unwrap_or(&current.path_type),
+                req.methods.as_deref(),
+            )?;
+        }
+        if let Some(headers) = &req.add_headers {
+            validation::validate_add_headers(headers)?;
+        }
+        if let Some(headers) = &req.remove_headers {
+            validation::validate_remove_headers(headers)?;
+        }
+
         // If upstream_id is being updated, verify it belongs to tenant
         if let Some(upstream_id) = req.upstream_id {
             db::get_upstream_for_tenant(&self.pool, upstream_id, tenant_id)
@@ -380,12 +470,20 @@ impl DomainManager {
     // Upstream Management
     // =========================================================================
 
-    /// Create an upstream for a tenant.
+    /// Create an upstream for a tenant, with any backends given inline.
+    ///
+    /// All or nothing: either the upstream and every backend are stored, or
+    /// none of them is.
     pub async fn create_upstream(
         &self,
         tenant_id: Uuid,
-        req: CreateUpstreamRequest,
+        mut req: CreateUpstreamRequest,
     ) -> ProxyResult<DomainUpstream> {
+        validation::validate_resource_name("Upstream", &req.name)?;
+        validation::validate_health_check_path(&req.health_check_path)?;
+        for backend in &mut req.backends {
+            check_backend(backend)?;
+        }
         db::create_upstream(&self.pool, tenant_id, req).await
     }
 
@@ -410,6 +508,12 @@ impl DomainManager {
         tenant_id: Uuid,
         req: UpdateUpstreamRequest,
     ) -> ProxyResult<Option<DomainUpstream>> {
+        if let Some(name) = &req.name {
+            validation::validate_resource_name("Upstream", name)?;
+        }
+        if let Some(path) = &req.health_check_path {
+            validation::validate_health_check_path(path)?;
+        }
         db::update_upstream(&self.pool, id, tenant_id, req).await
     }
 
@@ -418,19 +522,15 @@ impl DomainManager {
         db::delete_upstream(&self.pool, id, tenant_id).await
     }
 
-    /// Add a backend to an upstream.
+    /// Add a backend to an upstream, within the per-upstream quota.
     pub async fn add_backend(
         &self,
         upstream_id: Uuid,
         tenant_id: Uuid,
-        req: CreateBackendRequest,
+        mut req: CreateBackendRequest,
     ) -> ProxyResult<DomainBackend> {
-        // Verify upstream belongs to tenant
-        db::get_upstream_for_tenant(&self.pool, upstream_id, tenant_id)
-            .await?
-            .ok_or_else(|| ProxyError::NotFound("Upstream not found".into()))?;
-
-        db::create_backend(&self.pool, upstream_id, req).await
+        check_backend(&mut req)?;
+        db::create_backend(&self.pool, upstream_id, tenant_id, req).await
     }
 
     /// Remove a backend from an upstream.
@@ -451,53 +551,71 @@ impl DomainManager {
     pub async fn get_tenant_usage(&self, tenant_id: Uuid) -> ProxyResult<TenantUsage> {
         db::get_tenant_usage(&self.pool, tenant_id).await
     }
+}
 
-    // =========================================================================
-    // Validation Helpers
-    // =========================================================================
-
-    /// Validate domain format.
-    fn validate_domain_format(&self, domain: &str) -> ProxyResult<()> {
-        // Check length
-        if domain.is_empty() || domain.len() > 253 {
-            return Err(ProxyError::Validation("Invalid domain length".into()));
-        }
-
-        // Must have at least one dot
-        if !domain.contains('.') {
-            return Err(ProxyError::Validation(
-                "Domain must have at least one dot".into(),
-            ));
-        }
-
-        // Check each label
-        for label in domain.split('.') {
-            if label.is_empty() || label.len() > 63 {
-                return Err(ProxyError::Validation("Invalid domain label length".into()));
-            }
-
-            // Check first and last characters
-            let chars: Vec<char> = label.chars().collect();
-            if chars.first().is_none_or(|c| !c.is_alphanumeric())
-                || chars.last().is_none_or(|c| !c.is_alphanumeric())
-            {
-                return Err(ProxyError::Validation(
-                    "Domain labels must start and end with alphanumeric characters".into(),
-                ));
-            }
-
-            // Check all characters
-            for c in label.chars() {
-                if !c.is_alphanumeric() && c != '-' {
-                    return Err(ProxyError::Validation(
-                        "Domain labels can only contain alphanumeric characters and hyphens".into(),
-                    ));
-                }
-            }
-        }
-
-        Ok(())
+/// Check a backend and put its address in canonical form.
+///
+/// Nothing reads `proxy_domain_backends` yet, but something will, and an
+/// address stored now is one connected to then. See
+/// [`validate_backend_address`](validation::validate_backend_address) for what
+/// is refused, and for the check the eventual consumer still has to make.
+fn check_backend(backend: &mut CreateBackendRequest) -> ProxyResult<()> {
+    validation::validate_scheme(&backend.scheme)?;
+    backend.address = validation::validate_backend_address(&backend.address)?;
+    if !(1..=10_000).contains(&backend.weight) {
+        return Err(ProxyError::Validation(
+            "backend weight must be from 1 to 10000".into(),
+        ));
     }
+    Ok(())
+}
+
+/// Check that an uploaded chain leads to a trusted root, for `domain`.
+///
+/// The leaf's name, expiry and key have already been checked by
+/// `tls::validate_for_domain`; this adds the one thing it does not -- whether
+/// anyone but the uploader vouches for the certificate. The verifier is
+/// rustls's own, the one a client would run, so a chain passes here exactly
+/// when a client with these roots would accept it.
+fn verify_chain(trust: &UploadTrust, domain: &str, cert_pem: &[u8]) -> ProxyResult<()> {
+    use rustls::client::danger::ServerCertVerifier;
+    use rustls::pki_types::{ServerName, UnixTime};
+
+    let roots = match trust {
+        UploadTrust::Unchecked => return Ok(()),
+        UploadTrust::PublicRoots => Arc::new(rustls::RootCertStore {
+            roots: webpki_roots::TLS_SERVER_ROOTS.to_vec(),
+        }),
+        UploadTrust::Roots(roots) => roots.clone(),
+    };
+
+    let chain: Vec<_> = rustls_pemfile::certs(&mut &cert_pem[..])
+        .collect::<Result<_, _>>()
+        .map_err(|_| ProxyError::Validation("could not parse the certificate chain".into()))?;
+    let (leaf, intermediates) = chain
+        .split_first()
+        .ok_or_else(|| ProxyError::Validation("the certificate chain is empty".into()))?;
+    let name = ServerName::try_from(domain.to_string())
+        .map_err(|_| ProxyError::Validation("the domain is not a valid server name".into()))?;
+
+    let verifier = rustls::client::WebPkiServerVerifier::builder_with_provider(
+        roots,
+        Arc::new(rustls::crypto::aws_lc_rs::default_provider()),
+    )
+    .build()
+    .map_err(|e| ProxyError::Tls(format!("could not build a certificate verifier: {e}")))?;
+
+    verifier
+        .verify_server_cert(leaf, intermediates, &name, &[], UnixTime::now())
+        .map_err(|error| {
+            tracing::info!(%domain, %error, "refused an uploaded certificate chain");
+            ProxyError::Validation(
+                "the certificate chain is not trusted: it must be issued by a trusted \
+                 certificate authority and include any intermediate certificates"
+                    .into(),
+            )
+        })?;
+    Ok(())
 }
 
 /// Generate a secure verification token.
@@ -517,10 +635,8 @@ fn generate_verification_token() -> String {
 mod tests {
     use super::*;
 
-    // Note: `validate_domain_format` is exercised via integration tests that
-    // build a real `DomainManager` (it needs a live pool). A previous unit test
-    // here constructed the manager from `std::mem::zeroed()`, which is undefined
-    // behavior and crashed on drop, so it was removed.
+    // Domain-name rules are tested in `validation`, and the manager's use of
+    // them through the router in tests/control_plane.rs.
 
     #[test]
     fn test_generate_verification_token() {
