@@ -196,6 +196,11 @@ async fn client_errors_log_at_debug_and_faults_at_error() {
 /// acquiring another times out. Before, nothing logged this at any level: the
 /// query's own logging is never reached when there is no transaction to run
 /// it in.
+///
+/// Not built with `pg-socket`: REST then runs on the Worker's driver, which
+/// opens a socket of its own per request and never draws on the pool held
+/// here, so the request is answered 200 -- there is no pool to run dry.
+#[cfg(not(feature = "pg-socket"))]
 #[tokio::test(flavor = "current_thread")]
 #[ignore = "requires PostgreSQL"]
 async fn a_pool_that_runs_dry_is_logged_at_error() {
