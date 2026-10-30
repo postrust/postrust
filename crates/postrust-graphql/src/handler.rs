@@ -2755,6 +2755,8 @@ fn live<'a>(
         started: bool,
         /// An error has been sent, and the subscription ends after it.
         failed: bool,
+        /// Counts this subscription as open for as long as its stream lives.
+        _active: crate::subscription::ActiveSubscription,
     }
 
     futures::stream::unfold(
@@ -2765,6 +2767,7 @@ fn live<'a>(
             sent: None,
             started: false,
             failed: false,
+            _active: crate::subscription::ActiveSubscription::open(),
         },
         |mut live: Live<'a>| async move {
             if live.failed {

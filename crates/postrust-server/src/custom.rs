@@ -32,11 +32,19 @@ pub fn custom_router() -> Router<Arc<AppState>> {
 ///
 /// `/live` and `/ready` are the names PostgREST's admin server uses; `/health`
 /// is the same answer as `/live` under the name the main API already serves.
+///
+/// With the `otel` feature, `/metrics` too: the server's metrics as
+/// Prometheus text. Here and never on the API's port, for the same reason as
+/// the rest -- what the pool and the token cache are doing is the operator's
+/// business, not every client's.
 pub fn admin_router() -> Router<Arc<AppState>> {
-    Router::new()
+    let router = Router::new()
         .route("/live", get(health_check))
         .route("/health", get(health_check))
-        .route("/ready", get(readiness_check))
+        .route("/ready", get(readiness_check));
+    #[cfg(feature = "otel")]
+    let router = router.route("/metrics", get(crate::otel::metrics_handler));
+    router
 }
 
 // =============================================================================

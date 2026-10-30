@@ -7,8 +7,10 @@ WORKDIR /app
 COPY Cargo.toml Cargo.lock ./
 COPY crates ./crates
 
-# Build release binary with admin-ui feature
-RUN cargo build --release -p postrust-server --features admin-ui
+# Build release binary with the admin UI and OpenTelemetry. `otel` is
+# inactive until OTEL_EXPORTER_OTLP_ENDPOINT or PGRST_ADMIN_SERVER_PORT is set;
+# see docs/observability.md.
+RUN cargo build --release -p postrust-server --features admin-ui,otel
 
 # Runtime stage
 FROM debian:bookworm-slim

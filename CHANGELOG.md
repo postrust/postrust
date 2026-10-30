@@ -136,6 +136,32 @@ minimum supported Rust version are unchanged.
 - `AppState::new(pool, schema_cache, config)`, which derives the JWT
   configuration and token cache from `config` the way `build` does.
 - `postrust_auth::{KeySet, JwtKeys, JwtKeyError}`.
+- **OpenTelemetry and Prometheus metrics**, in a new `otel` feature that the
+  published images are built with. Inactive until configured: with nothing
+  set, nothing is exported or measured. See docs/observability.md.
+  - **Traces over OTLP** (HTTP/protobuf) when `OTEL_EXPORTER_OTLP_ENDPOINT`
+    is set, following the standard `OTEL_*` variables; `service.name` is
+    `postrust` unless `OTEL_SERVICE_NAME` says otherwise. The request span
+    joins the caller's `traceparent`, and its exported trace id is the
+    `trace_id` the log and `request.trace_id` already carry. It is named
+    `{method} {route}`. The debug-level stage spans are exported without
+    the log becoming any noisier.
+  - **Finer database spans:** `db.count` for `Prefer: count`, `db.embed` for
+    an embed fetched by its own query, and `db.commit` for a `COMMIT` sent on
+    its own. The `auth` span says whether the token cache answered
+    (`jwt.cache`: `hit`, `miss` or `bypassed`), and GraphQL operations get a
+    `graphql` span.
+  - **Metrics**, over OTLP and as Prometheus text at `GET /metrics` on the
+    admin port (`PGRST_ADMIN_SERVER_PORT`), never on the API port:
+    `http.server.request.duration`, `http.server.active_requests`, the pool's
+    connections, maximum and wait, token cache hits and misses, JWKS fetches
+    and the key set's age, schema reloads, and open GraphQL subscriptions.
+  - **Lambda:** with `--features postrust-lambda/otel`, telemetry is flushed
+    to the collector (the ADOT layer) at the end of every invocation.
+  - New API: `postrust_server::otel`; `JwtCache::authenticate_with_outcome`,
+    `JwtCache::stats`, `CacheOutcome` and `CacheStats` in `postrust-auth`;
+    `postrust_engine::observe`; `subscription::active_subscriptions` in
+    `postrust-graphql`; `postrust_lambda::FlushLayer`.
 
 ### Upgrading from 2.x
 

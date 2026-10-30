@@ -17,7 +17,7 @@ pub mod jwks;
 mod jwt;
 mod keys;
 
-pub use cache::JwtCache;
+pub use cache::{CacheOutcome, CacheStats, JwtCache};
 pub use claims::Claims;
 pub use hasura::{HasuraAuthConfig, HasuraIdentity, SecretOutcome, TokenRole};
 pub use jwks::Jwks;

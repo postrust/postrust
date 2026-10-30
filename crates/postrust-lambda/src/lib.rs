@@ -57,6 +57,39 @@ pub fn init_tracing() {
         .ok()
         .and_then(|v| postrust_core::LogFormat::parse_config(&v))
         .unwrap_or_default();
+
+    // With the `otel` feature and an OTLP endpoint -- the ADOT collector
+    // extension, usually -- spans are exported beside the log. The log's
+    // filter then moves onto its own layer, as on the server, so the
+    // request's debug-level spans can be exported while the log stays at its
+    // level. Without one the subscriber is exactly what it always was.
+    #[cfg(feature = "otel")]
+    if let Some(otel) = postrust_server::otel::layer() {
+        use tracing_subscriber::layer::SubscriberExt as _;
+        use tracing_subscriber::util::SubscriberInitExt as _;
+        use tracing_subscriber::Layer as _;
+        let filter = match std::env::var_os("RUST_LOG") {
+            Some(_) => filter,
+            None => format!("{filter},opentelemetry=warn,opentelemetry_sdk=warn"),
+        };
+        let log = tracing_subscriber::fmt::layer()
+            .with_target(false)
+            .without_time();
+        let (text, json) = match format {
+            postrust_core::LogFormat::Text => (Some(log), None),
+            postrust_core::LogFormat::Json => (None, Some(log.json())),
+        };
+        tracing_subscriber::registry()
+            .with(
+                text.with_filter(tracing_subscriber::EnvFilter::new(&filter))
+                    .and_then(json.with_filter(tracing_subscriber::EnvFilter::new(&filter))),
+            )
+            .with(otel)
+            .init();
+        postrust_server::otel::log_startup();
+        return;
+    }
+
     let builder = tracing_subscriber::fmt()
         .with_env_filter(tracing_subscriber::EnvFilter::new(filter))
         .with_target(false)
@@ -65,6 +98,8 @@ pub fn init_tracing() {
         postrust_core::LogFormat::Text => builder.init(),
         postrust_core::LogFormat::Json => builder.json().init(),
     }
+    #[cfg(feature = "otel")]
+    postrust_server::otel::log_startup();
 }
 
 /// The configuration from the environment, sized for a Lambda sandbox.
@@ -87,6 +122,93 @@ pub fn config_from_env() -> Result<postrust_core::AppConfig, Error> {
 }
 
 /// Serve `app` to the Lambda runtime until the sandbox is shut down.
+///
+/// With the `otel` feature, metrics are started here (over OTLP, if it is
+/// configured; a function has no admin port to serve `/metrics` on), and
+/// whatever was recorded during an invocation is exported before its response
+/// goes back. See [`flush_after_each_invocation`].
 pub async fn run(app: postrust_server::App) -> Result<(), Error> {
+    #[cfg(feature = "otel")]
+    {
+        postrust_server::otel::init_metrics(false);
+        if postrust_server::otel::exporting() {
+            let router = app.router.layer(FlushLayer);
+            return lambda_http::run(router).await;
+        }
+    }
     lambda_http::run(app.router).await
+}
+
+/// Lambda freezes a sandbox the moment an invocation's response is handed
+/// back, and may never thaw it. The SDK exports in batches from a thread of
+/// its own, on a timer, so whatever an invocation recorded would sit in a
+/// frozen buffer -- for minutes, or for ever. So each invocation flushes
+/// before it answers: spans and metrics go to the collector (the ADOT
+/// extension, on localhost) first, and the response after.
+///
+/// That puts the export on the invocation's latency: a round trip to a
+/// collector in the same sandbox, a millisecond or two. It is the price the
+/// ADOT documentation describes, and the only way not to lose the data.
+///
+/// The request span closes before the flush -- it belongs to the router
+/// inside this layer -- so the invocation's own trace is in what is sent.
+#[cfg(feature = "otel")]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct FlushLayer;
+
+#[cfg(feature = "otel")]
+impl<S> tower::Layer<S> for FlushLayer {
+    type Service = FlushAfter<S>;
+
+    fn layer(&self, inner: S) -> Self::Service {
+        FlushAfter { inner }
+    }
+}
+
+/// The service [`FlushLayer`] produces.
+#[cfg(feature = "otel")]
+#[derive(Clone, Debug)]
+pub struct FlushAfter<S> {
+    inner: S,
+}
+
+#[cfg(feature = "otel")]
+impl<S, R> tower::Service<R> for FlushAfter<S>
+where
+    S: tower::Service<R>,
+    S::Future: Send + 'static,
+    S::Response: Send + 'static,
+    S::Error: Send + 'static,
+{
+    type Response = S::Response;
+    type Error = S::Error;
+    type Future =
+        std::pin::Pin<Box<dyn std::future::Future<Output = Result<S::Response, S::Error>> + Send>>;
+
+    fn poll_ready(
+        &mut self,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Result<(), Self::Error>> {
+        self.inner.poll_ready(cx)
+    }
+
+    fn call(&mut self, request: R) -> Self::Future {
+        let answer = self.inner.call(request);
+        Box::pin(async move {
+            // Awaited to completion and dropped before the flush, and with
+            // it the request's span.
+            let response = answer.await;
+            postrust_server::otel::flush().await;
+            response
+        })
+    }
+}
+
+/// Whether [`run`] flushes after each invocation: the `otel` feature is
+/// built in and something is exporting. For a binary that serves the
+/// router itself, through `lambda_http::run`, and wants the same: wrap the
+/// router in [`FlushLayer`] when this is true.
+#[cfg(feature = "otel")]
+pub fn flush_after_each_invocation() -> bool {
+    postrust_server::otel::exporting()
 }

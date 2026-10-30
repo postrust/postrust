@@ -39,6 +39,38 @@ pub use broker::{
 
 use crate::schema::GeneratedSchema;
 use postrust_core::schema_cache::SchemaCache;
+use std::sync::atomic::{AtomicI64, Ordering};
+
+/// Live queries open right now, across every schema this process has built.
+///
+/// Process-wide because a subscription outlives the schema it was opened on:
+/// a reload swaps the schema and the subscription carries on, so a count kept
+/// on the state would lose it. One increment when a subscription opens and
+/// one decrement when its stream is dropped, however it ends -- the client
+/// closing, an error, the connection going -- so it is never on a request's
+/// path.
+static ACTIVE_SUBSCRIPTIONS: AtomicI64 = AtomicI64::new(0);
+
+/// How many GraphQL subscriptions are open, for a host's metrics.
+pub fn active_subscriptions() -> i64 {
+    ACTIVE_SUBSCRIPTIONS.load(Ordering::Relaxed)
+}
+
+/// Held by an open subscription; dropping it closes the count.
+pub(crate) struct ActiveSubscription(());
+
+impl ActiveSubscription {
+    pub(crate) fn open() -> Self {
+        ACTIVE_SUBSCRIPTIONS.fetch_add(1, Ordering::Relaxed);
+        Self(())
+    }
+}
+
+impl Drop for ActiveSubscription {
+    fn drop(&mut self) {
+        ACTIVE_SUBSCRIPTIONS.fetch_sub(1, Ordering::Relaxed);
+    }
+}
 
 /// A subscription field in the GraphQL schema.
 #[derive(Debug, Clone)]

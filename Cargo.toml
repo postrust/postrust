@@ -126,6 +126,19 @@ tokio-rustls = "0.26"
 rustls = { version = "0.23", default-features = false, features = ["std", "aws_lc_rs"] }
 rustls-pemfile = "2"
 
+# OpenTelemetry: traces and metrics over OTLP, and metrics as Prometheus text.
+# Only the `otel` feature of postrust-server (and postrust-lambda) pulls these
+# in; see that feature's comment for why each is what it is. `gzip-http` for
+# `OTEL_EXPORTER_OTLP_COMPRESSION=gzip`: flate2 is already in the server
+# through tower-http's response compression.
+opentelemetry = { version = "0.33.1", default-features = false, features = ["trace", "metrics"] }
+opentelemetry_sdk = { version = "0.33.1", default-features = false, features = ["trace", "metrics"] }
+opentelemetry-otlp = { version = "0.33.1", default-features = false, features = ["http-proto", "gzip-http", "trace", "metrics", "internal-logs"] }
+opentelemetry-http = { version = "0.33.1", default-features = false }
+tracing-opentelemetry = { version = "0.34.0", default-features = false, features = ["metrics"] }
+opentelemetry-prometheus = { version = "0.33.1", default-features = false }
+prometheus = { version = "0.14", default-features = false }
+
 # HTTP client
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
 

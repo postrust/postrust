@@ -47,6 +47,25 @@ use tower::{Layer, Service};
 use tracing::field::Empty;
 use tracing::Span;
 
+#[cfg(feature = "otel")]
+use crate::otel::RequestMeter;
+
+/// Without the `otel` feature there are no metrics to record, and this is
+/// nothing at all.
+#[cfg(not(feature = "otel"))]
+struct RequestMeter;
+
+#[cfg(not(feature = "otel"))]
+impl RequestMeter {
+    #[inline(always)]
+    fn start(_: &http::Method, _: Option<&str>) -> Self {
+        RequestMeter
+    }
+
+    #[inline(always)]
+    fn finish(&self, _: http::StatusCode, _: Instant) {}
+}
+
 /// The header a request id travels in, both ways.
 pub const REQUEST_ID_HEADER: &str = "x-request-id";
 
@@ -98,6 +117,9 @@ where
             "http.response.status_code" = Empty,
             "otel.kind" = "server",
             "otel.status_code" = Empty,
+            // `{method} {route}`, the name an exporter gives the span; only
+            // recorded when one is exporting. See `otel::name_request_span`.
+            "otel.name" = Empty,
             // Visible ASCII, checked or generated, so `to_str` cannot fail.
             request_id = request_id.to_str().unwrap_or_default(),
             trace_id = %trace.trace_id,
@@ -107,8 +129,21 @@ where
         // rows rather than one per table and id. Absent where nothing matched
         // -- a 404, or the compatibility-mode fallback -- and then left unset
         // rather than guessed, as the conventions ask.
-        if let Some(route) = request.extensions().get::<MatchedPath>() {
+        let route = request.extensions().get::<MatchedPath>();
+        if let Some(route) = route {
             span.record("http.route", route.as_str());
+        }
+        let meter = RequestMeter::start(request.method(), route.map(MatchedPath::as_str));
+
+        // With the `otel` feature and an exporter, the exported span is
+        // named as the conventions name it, and joins the caller's trace --
+        // or starts one under this trace id. Neither does anything otherwise.
+        // In that order: starting a trace here starts the exported span, and
+        // a span already started keeps the name it started with.
+        #[cfg(feature = "otel")]
+        {
+            crate::otel::name_request_span(&span, request.method(), route.map(MatchedPath::as_str));
+            crate::otel::join_trace(&span, &trace);
         }
 
         request.extensions_mut().insert(trace);
@@ -122,6 +157,7 @@ where
             span,
             request_id: Some(request_id),
             start,
+            meter,
         }
     }
 }
@@ -134,6 +170,9 @@ pin_project! {
         span: Span,
         request_id: Option<HeaderValue>,
         start: Instant,
+        // Counts the request as active until this future is dropped, however
+        // it ends -- a client that goes away mid-request included.
+        meter: RequestMeter,
     }
 }
 
@@ -160,6 +199,7 @@ where
         if status.is_server_error() {
             this.span.record("otel.status_code", "ERROR");
         }
+        this.meter.finish(status, *this.start);
         tracing::debug!(
             status = status.as_u16(),
             latency_ms = this.start.elapsed().as_secs_f64() * 1000.0,

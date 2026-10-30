@@ -343,6 +343,10 @@ async fn assemble(config: postrust_core::AppConfig, host: Host, nests: Nests) ->
             .map_err(|e| anyhow::anyhow!("PGRST_JWT_SECRET: {e}"))?,
     );
 
+    // The pool and the token cache, for the metrics read when collected.
+    #[cfg(feature = "otel")]
+    crate::otel::observe(&state);
+
     // `db_channel_enabled`: reload the schema cache when PostgreSQL says the
     // schema changed, instead of on a restart. A migration ends with
     // `NOTIFY pgrst, 'reload schema'` and the API picks the new shape up.
@@ -983,7 +987,16 @@ async fn assemble(config: postrust_core::AppConfig, host: Host, nests: Nests) ->
                     Ok(operation) => operation,
                     Err(refusal) => return refusal,
                 };
-                let mut response = schema.execute(request).await;
+                // One span for the operation, beneath the request's, named by
+                // the operation as the GraphQL conventions have it. A span
+                // and not async-graphql's OpenTelemetry extension: that is
+                // built against opentelemetry 0.27, and this against 0.33.
+                use tracing::Instrument as _;
+                let span = tracing::debug_span!(
+                    "graphql",
+                    "graphql.operation.name" = request.operation_name.as_deref(),
+                );
+                let mut response = schema.execute(request).instrument(span).await;
                 settle_write(&write, &mut response).await;
                 postrust_graphql::hasura::envelope(response)
             }
@@ -1345,11 +1358,17 @@ fn spawn_schema_reloader(
                                     state.schema_cache().await.summary()
                                 );
                                 reloaded.send_modify(|n| *n += 1);
+                                #[cfg(feature = "otel")]
+                                crate::otel::schema_reloaded(true);
                             }
                             // The old cache is kept. Serving the previous
                             // schema is better than serving none, and the next
                             // notification tries again.
-                            Err(e) => error!("Schema cache reload failed: {}", e),
+                            Err(e) => {
+                                error!("Schema cache reload failed: {}", e);
+                                #[cfg(feature = "otel")]
+                                crate::otel::schema_reloaded(false);
+                            }
                         }
                     }
                     Err(e) => {

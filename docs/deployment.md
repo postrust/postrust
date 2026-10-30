@@ -581,7 +581,10 @@ curl http://localhost:3000/
 
 ### Prometheus Metrics
 
-Coming soon: `/metrics` endpoint for Prometheus scraping.
+With `PGRST_ADMIN_SERVER_PORT` set, the published images serve Prometheus
+metrics at `/metrics` on the admin port -- request durations, the pool, the
+token cache, schema reloads -- and never on the API port. Traces and metrics
+can also be exported over OTLP. See [Observability](./observability.md).
 
 ### Tracing and logging
 
@@ -643,7 +646,11 @@ The Lambda adapter serves the same router, so it gets the same spans, and
 reads `PGRST_LOG_FORMAT` too. A Cloudflare Worker has the engine's spans but
 no request span or subscriber of its own.
 
-Spans are not yet exported anywhere; they reach the log and nothing else.
+Built with the `otel` feature, as the published images are, the spans are
+exported over OTLP when `OTEL_EXPORTER_OTLP_ENDPOINT` is set, with the
+caller's trace id and the `trace_id` above as the exported trace's; see
+[Observability](./observability.md). Otherwise they reach the log and nothing
+else.
 
 ## Fly.io
 

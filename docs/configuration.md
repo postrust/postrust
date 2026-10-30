@@ -263,7 +263,7 @@ tried to be an administrator and failed is not then treated as a stranger.
 | `PGRST_SERVER_PORT` | Server port | `3000` |
 | `PGRST_SERVER_CORS_ORIGINS` | Allowed CORS origins | `*` |
 | `PGRST_SERVER_UNIX_SOCKET` | Listen on a Unix domain socket instead of host and port. A stale socket file left by a previous run is removed; anything at the path that is not a socket is refused | (none) |
-| `PGRST_ADMIN_SERVER_PORT` | Serve `/live`, `/ready` and `/health` on a second port, so a probe does not need to reach the API | (none) |
+| `PGRST_ADMIN_SERVER_PORT` | Serve `/live`, `/ready` and `/health` on a second port, so a probe does not need to reach the API. With the `otel` feature (the published images), `/metrics` too; see [Observability](./observability.md) | (none) |
 
 ### CORS Configuration
 
@@ -356,7 +356,8 @@ differences.
 | `PGRST_LOG_LEVEL` | Log level | `info` |
 | `RUST_LOG` | Detailed Rust logging. Wins where both are set | (none) |
 | `PGRST_LOG_FORMAT` | `text`, or `json` for one JSON object per line with the fields of every span the line was logged in -- `request_id` and `trace_id` among them | `text` |
-| `PGRST_OTEL_DB_STATEMENT` | Record each request's main SQL statement on its `db.query` span as `db.query.text`. Parameterized, so request values are not included, but it does reveal table, column and function names | `false` |
+| `PGRST_OTEL_DB_STATEMENT` | Record each request's SQL statements on their spans as `db.query.text`: the main one on `db.query`, a count on `db.count`, a separately fetched embed on `db.embed`. Parameterized, so request values are not included, but it does reveal table, column and function names | `false` |
+| `OTEL_EXPORTER_OTLP_ENDPOINT` | With the `otel` feature (the published images): export traces and metrics over OTLP/HTTP to this collector, e.g. `http://otel-collector:4318`. The other standard `OTEL_*` variables apply; see [Observability](./observability.md) | (none) |
 | `PGRST_DEBUG` | Include the database's own error detail, hint and constraint name in error responses. Off in production: those strings describe the schema | `false` |
 
 ### Log Levels

@@ -21,6 +21,8 @@ http-body.workspace = true
 http-body-util.workspace = true
 bytes.workspace = true
 tracing.workspace = true
+# The clock `observe` times a transaction's wait with; `std::time` natively.
+web-time.workspace = true
 
 # Internal
 postrust-core.workspace = true

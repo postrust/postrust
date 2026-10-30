@@ -242,7 +242,10 @@ where
     // embeds fetched by a second query, a rendered media type.
     let tx = match tx {
         Some(tx) if is_read_only(&api_request) => {
-            tx.commit().await.map_err(postrust_core::Error::from)?;
+            tx.commit()
+                .instrument(commit_span())
+                .await
+                .map_err(postrust_core::Error::from)?;
             None
         }
         tx => tx,
@@ -279,10 +282,64 @@ where
     // a deferred foreign key is a 409 like an immediate one. Only a
     // connection that broke is reported as the database being unavailable.
     if let Some(tx) = tx {
-        tx.commit().await.map_err(postrust_core::Error::from)?;
+        tx.commit()
+            .instrument(commit_span())
+            .await
+            .map_err(postrust_core::Error::from)?;
     }
 
     Ok(build_response(response))
+}
+
+/// The span a `COMMIT` sent on its own runs in.
+///
+/// A sibling of `db.query` beneath the request, not a child of it: the
+/// commit happens after the plan's statements are done -- for a write, after
+/// the response is rendered, so that a refusal can still roll it back -- and
+/// a `db.query` kept open until then would claim the rendering's time as the
+/// database's. A read whose transaction ends with its query commits in the
+/// same flight, and has no span of its own for it.
+fn commit_span() -> tracing::Span {
+    debug_span!(
+        "db.commit",
+        "db.system" = "postgresql",
+        "db.operation.name" = "COMMIT",
+    )
+}
+
+/// The span the count `Prefer: count` asks for runs in, beneath the plan's
+/// `db.query`. Its own span, apart from the main statement's, so a trace
+/// shows which of the request's round trips took the time -- an exact count
+/// over a large table is often most of it.
+///
+/// `db.operation.name` says how it was counted: `count` for `exact`,
+/// `explain` for `planned`; `estimated` may run both, and opens one span for
+/// each.
+fn count_span(operation: &'static str) -> tracing::Span {
+    debug_span!(
+        "db.count",
+        "db.system" = "postgresql",
+        "db.operation.name" = operation,
+        "db.query.text" = Empty,
+    )
+}
+
+/// The span the query fetching one embedded relation runs in, beneath the
+/// plan's `db.query`: one per relation per level, for the embeds the main
+/// statement could not carry. `db.collection.name` is the table the
+/// relation reads.
+fn embed_span(
+    relation: &str,
+    collection: &postrust_core::api_request::QualifiedIdentifier,
+) -> tracing::Span {
+    debug_span!(
+        "db.embed",
+        "db.system" = "postgresql",
+        "db.operation.name" = "select",
+        "db.collection.name" = %collection,
+        "postrust.embed.relation" = relation,
+        "db.query.text" = Empty,
+    )
 }
 
 /// The span a plan's database work runs in, named and described as
@@ -507,17 +564,25 @@ pub fn authorization(headers: &http::HeaderMap) -> Option<&str> {
 ///
 /// The `auth` span is at debug, beneath the request's own span at info: with
 /// the default filter it is never created, and a disabled span is a check of
-/// a cached flag. Its field is evaluated only when something is listening.
+/// a cached flag. Its fields are evaluated only when something is listening.
+/// `jwt.cache` says whether the token cache answered: `hit`, `miss`, or
+/// `bypassed` for a request with no token to look up. Absent where no cache
+/// is configured. The cache counts the same outcomes for a metric; see
+/// `JwtCache::stats`.
 pub async fn authenticate<S: State>(
     state: &S,
     headers: &http::HeaderMap,
 ) -> Result<postrust_auth::AuthResult, postrust_core::Error> {
     let header = authorization(headers);
     postrust_auth::ensure_keys(header, state.jwt_config()).await;
-    let auth_span = debug_span!("auth", role = Empty);
+    let auth_span = debug_span!("auth", role = Empty, "jwt.cache" = Empty);
     let auth_result = auth_span
         .in_scope(|| match state.jwt_cache() {
-            Some(cache) => cache.authenticate(header, state.jwt_config()),
+            Some(cache) => {
+                let (result, outcome) = cache.authenticate_with_outcome(header, state.jwt_config());
+                auth_span.record("jwt.cache", outcome.as_str());
+                result
+            }
             None => postrust_auth::authenticate(header, state.jwt_config()),
         })
         .map_err(jwt_error)?;
@@ -1128,7 +1193,14 @@ async fn execute_plan<'s, S: State>(
             // client is told only that the service is unavailable; the line
             // carries the cause, and the request's `request_id` and
             // `trace_id` with it.
-            let mut tx = state.db().begin().await.map_err(|e| {
+            //
+            // Timed for the pool's wait metric when a host is measuring it;
+            // see `crate::observe`. A failure is timed too: a wait that ended
+            // in `db_pool_timeout` is the one most worth seeing.
+            let begin_timer = crate::observe::begin_timer();
+            let begun = state.db().begin().await;
+            crate::observe::transaction_begun(begin_timer);
+            let mut tx = begun.map_err(|e| {
                 error!("Could not begin a transaction: {}", e);
                 postrust_core::Error::ConnectionPool(e.to_string())
             })?;
@@ -1219,6 +1291,7 @@ async fn execute_plan<'s, S: State>(
                             count_sql,
                             &params,
                             api_request.max_rows,
+                            state.config().otel_db_statement,
                         )
                         .await?
                     }
@@ -1381,7 +1454,15 @@ async fn execute_plan<'s, S: State>(
             // snapshot as the page it describes.
             let total = match (&api_request.preferences.count, &count_sql, tx.as_mut()) {
                 (Some(preference), Some(count_sql), Some(tx)) => {
-                    resolve_count(tx, preference, count_sql, &params, api_request.max_rows).await?
+                    resolve_count(
+                        tx,
+                        preference,
+                        count_sql,
+                        &params,
+                        api_request.max_rows,
+                        state.config().otel_db_statement,
+                    )
+                    .await?
                 }
                 _ => None,
             };
@@ -2130,31 +2211,42 @@ async fn resolve_count<T: Tx>(
     count_sql: &str,
     params: &[postrust_sql::SqlParam],
     max_rows: Option<i64>,
+    record_statement: bool,
 ) -> Result<Option<i64>, postrust_core::Error> {
     use postrust_core::api_request::PreferCount;
 
+    let text = record_statement;
     match preference {
-        PreferCount::Exact => exact_count(tx, count_sql, params).await,
-        PreferCount::Planned => planned_count(tx, count_sql, params).await,
-        PreferCount::Estimated => match (exact_count(tx, count_sql, params).await?, max_rows) {
+        PreferCount::Exact => exact_count(tx, count_sql, params, text).await,
+        PreferCount::Planned => planned_count(tx, count_sql, params, text).await,
+        PreferCount::Estimated => match (exact_count(tx, count_sql, params, text).await?, max_rows)
+        {
             (Some(exact), Some(ceiling)) if exact <= ceiling => Ok(Some(exact)),
             (Some(exact), _) => {
-                let planned = planned_count(tx, count_sql, params).await?;
+                let planned = planned_count(tx, count_sql, params, text).await?;
                 Ok(Some(exact.max(planned.unwrap_or(exact))))
             }
-            (None, _) => planned_count(tx, count_sql, params).await,
+            (None, _) => planned_count(tx, count_sql, params, text).await,
         },
     }
 }
 
 /// The number of rows the filters match.
+///
+/// `record_statement` is `otel_db_statement`: whether the statement goes on
+/// its span as `db.query.text`, as the main one does on `db.query`.
 async fn exact_count<T: Tx>(
     tx: &mut T,
     count_sql: &str,
     params: &[postrust_sql::SqlParam],
+    record_statement: bool,
 ) -> Result<Option<i64>, postrust_core::Error> {
     let sql = format!("SELECT count(*) FROM ({}) AS pgrst_count", count_sql);
-    let row = first_row(tx.fetch_values(&sql, params).await?)?;
+    let span = count_span("count");
+    if record_statement {
+        span.record("db.query.text", sql.as_str());
+    }
+    let row = first_row(tx.fetch_values(&sql, params).instrument(span).await?)?;
     Ok(row.first().and_then(serde_json::Value::as_i64))
 }
 
@@ -2163,9 +2255,14 @@ async fn planned_count<T: Tx>(
     tx: &mut T,
     count_sql: &str,
     params: &[postrust_sql::SqlParam],
+    record_statement: bool,
 ) -> Result<Option<i64>, postrust_core::Error> {
     let sql = format!("EXPLAIN (FORMAT JSON) {}", count_sql);
-    let plan = first_row(tx.fetch_values(&sql, params).await?)?
+    let span = count_span("explain");
+    if record_statement {
+        span.record("db.query.text", sql.as_str());
+    }
+    let plan = first_row(tx.fetch_values(&sql, params).instrument(span).await?)?
         .into_iter()
         .next()
         .unwrap_or(serde_json::Value::Null);
@@ -3413,7 +3510,11 @@ async fn embed_relations<S: State, T: Tx>(
             let keys = postrust_sql::SqlParam::Array(
                 keys.into_iter().map(postrust_sql::SqlParam::Text).collect(),
             );
-            let fetched = conn.fetch_values(&sql, &[keys]).await?;
+            let span = embed_span(relation, &child_qi);
+            if state.config().otel_db_statement {
+                span.record("db.query.text", sql.as_str());
+            }
+            let fetched = conn.fetch_values(&sql, &[keys]).instrument(span).await?;
 
             // The query returns the join key and a JSON array of that
             // key's children, so the values are read straight out of the

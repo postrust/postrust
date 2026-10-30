@@ -15,6 +15,7 @@
 #![allow(clippy::result_large_err)]
 
 mod handler;
+pub mod observe;
 mod state;
 
 pub use handler::{allow, authenticate, authorization, error_response, handle};

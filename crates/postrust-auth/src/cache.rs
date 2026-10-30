@@ -42,6 +42,50 @@ pub struct JwtCache {
     /// that is no longer in force -- possibly by a key that has just been
     /// withdrawn -- and they are all forgotten.
     keys_generation: AtomicU64,
+    // How many lookups found a live entry, and how many had to verify. Plain
+    // counters rather than a metric, so this crate stays free of any
+    // telemetry dependency and builds for a Worker as before; a host that
+    // exports metrics reads them with `stats`. Relaxed increments beside a
+    // mutex every lookup already takes: the cost is lost in the lock's.
+    hits: AtomicU64,
+    misses: AtomicU64,
+}
+
+/// Whether a lookup in a [`JwtCache`] was answered from it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum CacheOutcome {
+    /// A live entry for the token answered, and no signature was checked.
+    Hit,
+    /// The token was verified, whatever the verdict, and cached if it could
+    /// be.
+    Miss,
+    /// Nothing to look up: the request carried no token, or its
+    /// `Authorization` header was not a bearer token at all. Not counted as
+    /// either of the others, so a server mostly answering anonymous requests
+    /// does not read as one whose cache never hits.
+    Bypassed,
+}
+
+impl CacheOutcome {
+    /// `hit`, `miss` or `bypassed`: the value a span or a metric records.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            CacheOutcome::Hit => "hit",
+            CacheOutcome::Miss => "miss",
+            CacheOutcome::Bypassed => "bypassed",
+        }
+    }
+}
+
+/// How many lookups a [`JwtCache`] has answered, since it was made.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct CacheStats {
+    /// Answered from the cache.
+    pub hits: u64,
+    /// Verified, because nothing live was cached for the token.
+    pub misses: u64,
 }
 
 impl JwtCache {
@@ -57,6 +101,8 @@ impl JwtCache {
             entries: Mutex::new(HashMap::new()),
             max_lifetime: Duration::from_secs(max_lifetime_secs),
             keys_generation: AtomicU64::new(0),
+            hits: AtomicU64::new(0),
+            misses: AtomicU64::new(0),
         })
     }
 
@@ -71,6 +117,14 @@ impl JwtCache {
             .clear();
     }
 
+    /// The lookups answered so far, for a host to export as a metric.
+    pub fn stats(&self) -> CacheStats {
+        CacheStats {
+            hits: self.hits.load(Ordering::Relaxed),
+            misses: self.misses.load(Ordering::Relaxed),
+        }
+    }
+
     /// Authenticate, consulting the cache.
     ///
     /// Falls through to [`crate::authenticate`] for anything not cacheable: a
@@ -81,10 +135,27 @@ impl JwtCache {
         auth_header: Option<&str>,
         config: &JwtConfig,
     ) -> Result<AuthResult, JwtError> {
+        self.authenticate_with_outcome(auth_header, config).0
+    }
+
+    /// [`authenticate`](Self::authenticate), saying whether the cache
+    /// answered.
+    ///
+    /// A separate method rather than a change to that one's return type, so
+    /// that every caller of it builds unchanged. The verdict is the same
+    /// either way; the outcome is for a span or a metric to record.
+    pub fn authenticate_with_outcome(
+        &self,
+        auth_header: Option<&str>,
+        config: &JwtConfig,
+    ) -> (Result<AuthResult, JwtError>, CacheOutcome) {
         let Some(header) = auth_header else {
-            return crate::authenticate(None, config);
+            return (crate::authenticate(None, config), CacheOutcome::Bypassed);
         };
-        let token = extract_bearer_token(header)?;
+        let token = match extract_bearer_token(header) {
+            Ok(token) => token,
+            Err(e) => return (Err(e), CacheOutcome::Bypassed),
+        };
 
         // Read before the token is verified, and checked again when the entry
         // is written: a set replaced in between was not the one it was
@@ -92,9 +163,24 @@ impl JwtCache {
         let generation = config.keys.as_ref().map_or(0, crate::JwtKeys::generation);
 
         if let Some(hit) = self.get_under(token, generation) {
-            return Ok(hit);
+            self.hits.fetch_add(1, Ordering::Relaxed);
+            return (Ok(hit), CacheOutcome::Hit);
         }
+        self.misses.fetch_add(1, Ordering::Relaxed);
+        (
+            self.verify_and_store(token, config, generation),
+            CacheOutcome::Miss,
+        )
+    }
 
+    /// Verify a token nothing live was cached for, and cache the result if
+    /// it may be, unless the keys have moved on from `generation` meanwhile.
+    fn verify_and_store(
+        &self,
+        token: &str,
+        config: &JwtConfig,
+        generation: u64,
+    ) -> Result<AuthResult, JwtError> {
         let result = validate_token(token, config)?;
 
         // Never hold an entry past the token's own expiry: doing so would keep
@@ -341,6 +427,44 @@ mod tests {
         // is verified again rather than served from a stale entry.
         assert!(cache.get("tok").is_none());
         assert!(cache.entries.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_lookup_says_whether_the_cache_answered() {
+        let config = JwtConfig {
+            keys: crate::JwtKeys::from_config(Some("reallyreallyreallyreallyverysafe"), false)
+                .unwrap(),
+            ..JwtConfig::default()
+        };
+        let token = jsonwebtoken::encode(
+            &jsonwebtoken::Header::default(),
+            &json!({"role": "web_user", "exp": now_secs() + 600}),
+            &jsonwebtoken::EncodingKey::from_secret(b"reallyreallyreallyreallyverysafe"),
+        )
+        .unwrap();
+        let header = format!("Bearer {token}");
+        let cache = JwtCache::new(true, 3600).unwrap();
+
+        let (first, outcome) = cache.authenticate_with_outcome(Some(&header), &config);
+        assert_eq!(first.unwrap().role, "web_user");
+        assert_eq!(outcome, CacheOutcome::Miss);
+        let (second, outcome) = cache.authenticate_with_outcome(Some(&header), &config);
+        assert_eq!(second.unwrap().role, "web_user");
+        assert_eq!(outcome, CacheOutcome::Hit);
+
+        // No token is neither: there was nothing to look up.
+        let (_, outcome) = cache.authenticate_with_outcome(None, &config);
+        assert_eq!(outcome, CacheOutcome::Bypassed);
+
+        // A refused token is a miss too -- it was looked up and verified.
+        let (refused, outcome) = cache.authenticate_with_outcome(Some("Bearer nope"), &config);
+        assert!(refused.is_err());
+        assert_eq!(outcome, CacheOutcome::Miss);
+
+        assert_eq!(cache.stats(), CacheStats { hits: 1, misses: 2 });
+        // The old method answers alike, and is counted alike.
+        assert!(cache.authenticate(Some(&header), &config).is_ok());
+        assert_eq!(cache.stats().hits, 2);
     }
 
     #[test]
