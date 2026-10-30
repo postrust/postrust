@@ -62,7 +62,7 @@ const configVars = [
         name: "PGRST_JWT_SECRET",
         required: false,
         default: "-",
-        desc: "JWT signing secret",
+        desc: "An HMAC secret (HS256), or a JWK or JWKS of public keys (RS, PS, ES, EdDSA)",
       },
       {
         name: "PGRST_JWT_SECRET_IS_BASE64",
@@ -75,6 +75,24 @@ const configVars = [
         required: false,
         default: "-",
         desc: "Required JWT audience claim",
+      },
+      {
+        name: "PGRST_JWT_ISS",
+        required: false,
+        default: "-",
+        desc: "Required issuer: a token's iss must equal it, and must be present",
+      },
+      {
+        name: "PGRST_JWT_JWKS_URL",
+        required: false,
+        default: "-",
+        desc: "Fetch the verification keys from an identity provider's JWKS URL (https) and keep them current",
+      },
+      {
+        name: "PGRST_JWT_JWKS_REFRESH",
+        required: false,
+        default: "300",
+        desc: "Seconds between JWKS fetches when the response has no Cache-Control max-age",
       },
       {
         name: "PGRST_JWT_ROLE_CLAIM_KEY",
@@ -159,7 +177,7 @@ const configVars = [
         name: "PGRST_GRAPHQL_METADATA",
         required: false,
         default: "-",
-        desc: "Names for tables, columns, root fields, relationships and computed fields that the schema cannot supply; which root a function is exposed on; what each role may do with each table; column_types, which exposes a text, integer or UUID column as GraphQL ID without changing its database type; and Apollo Federation table metadata, such as \"federation\": {\"shared\": true}. A JSON document, or a path to a file holding one. Unset means every name is derived and there is no permission layer. Also read as PGRST_GRAPHQL_NAMES, which is what it was called when names were all it carried.",
+        desc: 'Names for tables, columns, root fields, relationships and computed fields that the schema cannot supply; which root a function is exposed on; what each role may do with each table; column_types, which exposes a text, integer or UUID column as GraphQL ID without changing its database type; and Apollo Federation table metadata, such as "federation": {"shared": true}. A JSON document, or a path to a file holding one. Unset means every name is derived and there is no permission layer. Also read as PGRST_GRAPHQL_NAMES, which is what it was called when names were all it carried.',
       },
       {
         name: "PGRST_GRAPHQL_FEDERATION",
@@ -195,6 +213,41 @@ const configVars = [
         required: false,
         default: "-",
         desc: "Detailed tracing configuration",
+      },
+      {
+        name: "PGRST_LOG_FORMAT",
+        required: false,
+        default: "text",
+        desc: "text, or json for one JSON object per line, with request_id and trace_id",
+      },
+    ],
+  },
+  {
+    category: "Observability",
+    vars: [
+      {
+        name: "OTEL_EXPORTER_OTLP_ENDPOINT",
+        required: false,
+        default: "-",
+        desc: "OpenTelemetry collector (OTLP over HTTP, usually port 4318); turns on traces and metrics",
+      },
+      {
+        name: "OTEL_SERVICE_NAME",
+        required: false,
+        default: "postrust",
+        desc: "The service.name traces and metrics are reported under",
+      },
+      {
+        name: "PGRST_ADMIN_SERVER_PORT",
+        required: false,
+        default: "-",
+        desc: "Admin port: health checks, and Prometheus metrics at /metrics",
+      },
+      {
+        name: "PGRST_OTEL_DB_STATEMENT",
+        required: false,
+        default: "false",
+        desc: "Record each request's parameterized SQL on its spans as db.query.text",
       },
     ],
   },
@@ -362,14 +415,15 @@ curl 'localhost:3000/api/users?select=status,name,id&limit=1'
               Hasura authentication
             </h2>
             <p class="mb-4 text-neutral-600">
-              The GraphQL surface reads Hasura&rsquo;s headers, so a deployment migrating from
-              Hasura keeps sending what it already sends. Both spellings of each variable are
-              read, so an existing <code class="font-mono">HASURA_GRAPHQL_*</code> environment
-              needs no renaming.
+              The GraphQL surface reads Hasura&rsquo;s headers, so a deployment
+              migrating from Hasura keeps sending what it already sends. Both
+              spellings of each variable are read, so an existing{" "}
+              <code class="font-mono">HASURA_GRAPHQL_*</code> environment needs
+              no renaming.
             </p>
             <p class="mb-4 text-neutral-600">
-              Set the secret, and a caller that holds it is an administrator — and an
-              administrator may ask to be treated as someone else:
+              Set the secret, and a caller that holds it is an administrator —
+              and an administrator may ask to be treated as someone else:
             </p>
             <div class="mb-4 overflow-hidden rounded-xl bg-neutral-900">
               <div class="border-b border-neutral-700 bg-neutral-800 px-4 py-2">
@@ -384,44 +438,55 @@ curl 'localhost:3000/api/users?select=status,name,id&limit=1'
               </pre>
             </div>
             <p class="mb-4 text-neutral-600">
-              That request is answered as <code class="font-mono">user</code>, and{" "}
-              <code class="font-mono">x-hasura-user-id</code> becomes a session variable a
-              row-level policy reads as{" "}
-              <code class="font-mono">current_setting(&#39;hasura.user_id&#39;)</code> — or that a
-              function taking <code class="font-mono">hasura_session json</code> receives whole.
-              A Hasura role is not a database role: <code class="font-mono">Artist</code> and{" "}
-              <code class="font-mono">anonymous</code> need not exist in any catalogue.
+              That request is answered as <code class="font-mono">user</code>,
+              and <code class="font-mono">x-hasura-user-id</code> becomes a
+              session variable a row-level policy reads as{" "}
+              <code class="font-mono">
+                current_setting(&#39;hasura.user_id&#39;)
+              </code>{" "}
+              — or that a function taking{" "}
+              <code class="font-mono">hasura_session json</code> receives whole.
+              A Hasura role is not a database role:{" "}
+              <code class="font-mono">Artist</code> and{" "}
+              <code class="font-mono">anonymous</code> need not exist in any
+              catalogue.
             </p>
 
-            <h3 class="mb-2 mt-6 text-lg font-semibold text-neutral-900">
+            <h3 class="mt-6 mb-2 text-lg font-semibold text-neutral-900">
               Choosing a role with a token
             </h3>
             <p class="mb-4 text-neutral-600">
               A token that allows more than one identity carries{" "}
-              <code class="font-mono">x-hasura-default-role</code> — who the caller is when it asks
-              for nothing — beside <code class="font-mono">x-hasura-allowed-roles</code>, the list
-              it may ask for instead. The asking is done with an{" "}
-              <code class="font-mono">X-Hasura-Role</code> header, and no admin secret is needed
-              for it. That list sits inside the signature, so a caller may choose among the
-              identities it was issued and cannot add one. Asking for a role the token does not
-              list is refused. A token carrying no list allows only the role it already names.
+              <code class="font-mono">x-hasura-default-role</code> — who the
+              caller is when it asks for nothing — beside{" "}
+              <code class="font-mono">x-hasura-allowed-roles</code>, the list it
+              may ask for instead. The asking is done with an{" "}
+              <code class="font-mono">X-Hasura-Role</code> header, and no admin
+              secret is needed for it. That list sits inside the signature, so a
+              caller may choose among the identities it was issued and cannot
+              add one. Asking for a role the token does not list is refused. A
+              token carrying no list allows only the role it already names.
             </p>
 
-            <h3 class="mb-2 mt-6 text-lg font-semibold text-neutral-900">
+            <h3 class="mt-6 mb-2 text-lg font-semibold text-neutral-900">
               One place this deliberately differs from Hasura
             </h3>
             <p class="mb-4 text-neutral-600">
-              Hasura with no admin secret configured treats every caller as an administrator —
-              which also means an unsecured deployment lets any caller name its own role and its
-              own identity. Postrust does not: with no secret configured,{" "}
-              <code class="font-mono">x-hasura-*</code> headers carry no weight and session
-              variables come only from a verified token. A policy reading a value the caller chose
-              is not a policy, and the failure is silent — the query succeeds, against the wrong
-              rows.
+              Hasura with no admin secret configured treats every caller as an
+              administrator — which also means an unsecured deployment lets any
+              caller name its own role and its own identity. Postrust does not:
+              with no secret configured,{" "}
+              <code class="font-mono">x-hasura-*</code> headers carry no weight
+              and session variables come only from a verified token. A policy
+              reading a value the caller chose is not a policy, and the failure
+              is silent — the query succeeds, against the wrong rows.
             </p>
             <p class="text-neutral-600">
               See{" "}
-              <Link href="/docs/conformance/hasura/" class="text-primary-600 hover:underline">
+              <Link
+                href="/docs/conformance/hasura/"
+                class="text-primary-600 hover:underline"
+              >
                 Hasura conformance
               </Link>{" "}
               for how much of the dialect this covers, measured.
@@ -459,7 +524,15 @@ PGRST_SERVER_CORS_ORIGINS=https://myapp.com
 
 # Limits
 PGRST_MAX_ROWS=100
-PGRST_LOG_LEVEL=info`}</code>
+PGRST_LOG_LEVEL=info
+
+# Keys from an identity provider instead of a shared secret (optional)
+# PGRST_JWT_JWKS_URL=https://<tenant>.auth0.com/.well-known/jwks.json
+# PGRST_JWT_ISS=https://<tenant>.auth0.com/
+
+# OpenTelemetry traces and metrics (optional; in the published images)
+# OTEL_EXPORTER_OTLP_ENDPOINT=http://otel-collector:4318
+# PGRST_LOG_FORMAT=json`}</code>
               </pre>
             </div>
           </section>
