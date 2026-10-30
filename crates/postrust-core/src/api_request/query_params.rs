@@ -93,6 +93,7 @@ pub fn parse_query_params(query: &str, is_rpc: bool) -> Result<QueryParams> {
                     range.offset_explicit = true;
                 }
                 Modifier::Logic(op, negated) => {
+                    check_nesting(&decoded_value)?;
                     params
                         .logic
                         .push((path, parse_logic_param(op, negated, &decoded_value)?));
@@ -202,6 +203,8 @@ pub fn parse_select(input: &str) -> Result<Vec<SelectItem>> {
         return Ok(vec![]);
     }
 
+    check_nesting(input)?;
+
     // Anything left over is a parse failure, not something to ignore. Left
     // ignored, one unparsable item silently discarded every item after it --
     // `select=id, name, billing(address)` returned the id alone.
@@ -209,6 +212,50 @@ pub fn parse_select(input: &str) -> Result<Vec<SelectItem>> {
         Ok(("", items)) => Ok(items),
         _ => Err(Error::InvalidQueryParam(format!("select={}", input))),
     }
+}
+
+/// How deeply a `select` or a logic tree may nest its parentheses.
+///
+/// Both are parsed by recursion, one level per parenthesis, and so are the
+/// plans and statements built from them. Unbounded, a few thousand levels --
+/// some 15 KB of query string -- overflowed a worker thread's stack, and a
+/// stack overflow aborts the process rather than failing the request. No
+/// embedding or condition a client means to send comes near this.
+const MAX_NESTING: usize = 64;
+
+/// Refuse a value nested deeper than [`MAX_NESTING`], before parsing it.
+///
+/// Parentheses inside a double-quoted value are the value's, not structure,
+/// and are not counted: `or=(name.eq."((((")` nests once.
+fn check_nesting(input: &str) -> Result<()> {
+    let mut depth = 0usize;
+    let mut quoted = false;
+    let mut escaped = false;
+    for ch in input.chars() {
+        if quoted {
+            match ch {
+                _ if escaped => escaped = false,
+                '\\' => escaped = true,
+                '"' => quoted = false,
+                _ => {}
+            }
+            continue;
+        }
+        match ch {
+            '"' => quoted = true,
+            '(' => {
+                depth += 1;
+                if depth > MAX_NESTING {
+                    return Err(Error::InvalidQueryParam(format!(
+                        "nested more than {MAX_NESTING} levels deep"
+                    )));
+                }
+            }
+            ')' => depth = depth.saturating_sub(1),
+            _ => {}
+        }
+    }
+    Ok(())
 }
 
 fn parse_select_items(input: &str) -> IResult<&str, Vec<SelectItem>> {
@@ -1387,6 +1434,31 @@ mod tests {
     /// A cast is one type name. Words after it are not part of the type, and
     /// a select that carries them is refused rather than written into the
     /// statement.
+    /// Nesting is bounded before anything recurses over it, so a deep
+    /// `select` or logic tree is refused rather than overflowing the stack.
+    #[test]
+    fn nesting_is_bounded() {
+        let select = |depth: usize| format!("{}id{}", "a(".repeat(depth), ")".repeat(depth));
+        let or = |depth: usize| format!("or=({}a.eq.1{})", "or(".repeat(depth), ")".repeat(depth));
+
+        assert!(parse_select(&select(MAX_NESTING)).is_ok());
+        assert!(parse_query_params(&or(MAX_NESTING - 1), false).is_ok());
+        for depth in [MAX_NESTING + 1, 100_000] {
+            assert!(matches!(
+                parse_select(&select(depth)),
+                Err(Error::InvalidQueryParam(_))
+            ));
+            assert!(matches!(
+                parse_query_params(&or(depth), false),
+                Err(Error::InvalidQueryParam(_))
+            ));
+        }
+
+        // A quoted value's parentheses are its own.
+        let quoted = format!("or=(name.eq.\"{}\")", "(".repeat(1_000));
+        assert!(parse_query_params(&quoted, false).is_ok());
+    }
+
     #[test]
     fn a_cast_is_a_type_name_and_nothing_more() {
         for select in [

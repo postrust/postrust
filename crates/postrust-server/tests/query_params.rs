@@ -238,6 +238,31 @@ async fn select_refuses_a_cast_that_is_not_a_type_name() {
     assert_eq!(status, StatusCode::OK, "{body}");
 }
 
+/// A `select` or logic tree nested thousands deep is refused. Each level was
+/// a level of recursion, and a few thousand of them -- some 15 KB of query
+/// string, from anyone -- overflowed the stack and aborted the server.
+#[tokio::test]
+#[ignore = "requires PostgreSQL"]
+async fn deep_nesting_is_refused_rather_than_overflowing_the_stack() {
+    let depth = 5_000;
+    for uri in [
+        format!(
+            "/api/products?select={}id{}",
+            "a(".repeat(depth),
+            ")".repeat(depth)
+        ),
+        format!(
+            "/api/products?or=({}id.eq.1{})",
+            "or(".repeat(depth),
+            ")".repeat(depth)
+        ),
+    ] {
+        let (status, body) = get(&uri).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        assert_eq!(body["code"], "PGRST100", "{body}");
+    }
+}
+
 // ===========================================================================
 // limit / offset
 //
