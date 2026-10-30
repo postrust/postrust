@@ -1,0 +1,94 @@
+name: Release postrust-proxy
+
+# `postrust-proxy` is versioned on a line of its own (docs/stability.md), so it
+# can be released on its own: a `postrust-proxy-v1.2.3` tag publishes that
+# crate and nothing else. A workspace `v*` tag still publishes it too, through
+# release.yml, whenever its version is not on crates.io yet.
+#
+# The workspace release's other jobs have nothing to do here: the proxy is not
+# in the container image, and republishing nine unchanged crates under a new
+# workspace number would announce a release of everything that is a release
+# of one thing.
+
+on:
+  push:
+    tags:
+      - "postrust-proxy-v*"
+  # Can also be dispatched manually against an existing tag ref from the Actions UI.
+  workflow_dispatch:
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  crate:
+    name: Publish postrust-proxy to crates.io
+    if: github.ref_type == 'tag' && startsWith(github.ref_name, 'postrust-proxy-v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust (stable)
+        uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Publish
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        run: |
+          set -euo pipefail
+          version=$(cargo metadata --no-deps --format-version 1 \
+            | jq -r '.packages[] | select(.name == "postrust-proxy") | .version')
+
+          # The tag is the source of truth, as for the workspace: refuse to
+          # publish a version the tag does not name.
+          tag_version="${GITHUB_REF_NAME#postrust-proxy-v}"
+          if [ "${tag_version}" != "${version}" ]; then
+            echo "::error::Tag ${GITHUB_REF_NAME} does not match postrust-proxy's version ${version}." \
+                 "Bump version in crates/postrust-proxy/Cargo.toml before tagging."
+            exit 1
+          fi
+
+          # Its postrust-* dependencies have to be on crates.io already: they
+          # are published by workspace releases, never by this one.
+          if curl -fsS -A "postrust-release-workflow (github.com/${GITHUB_REPOSITORY})" \
+               "https://crates.io/api/v1/crates/postrust-proxy/${version}" >/dev/null 2>&1; then
+            echo "postrust-proxy ${version} already on crates.io, skipping"
+            exit 0
+          fi
+          cargo publish -p postrust-proxy --locked
+
+  release:
+    name: GitHub Release
+    needs: crate
+    if: github.ref_type == 'tag' && startsWith(github.ref_name, 'postrust-proxy-v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Version from the tag
+        id: version
+        run: echo "version=${GITHUB_REF_NAME#postrust-proxy-v}" >> "$GITHUB_OUTPUT"
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          name: postrust-proxy ${{ steps.version.outputs.version }}
+          generate_release_notes: true
+          # A semver prerelease carries a hyphen after the version.
+          prerelease: ${{ contains(steps.version.outputs.version, '-') }}
+          # Never `Latest`: that is what `releases/latest` returns and what the
+          # repository's front page offers, and it should stay the newest
+          # release of the server, not of the proxy.
+          make_latest: false
+          body: |
+            A release of `postrust-proxy` alone; the rest of Postrust is
+            unchanged. See CHANGELOG.md for what changed and how to upgrade.
+
+            ```
+            cargo add postrust-proxy@${{ steps.version.outputs.version }}
+            ```

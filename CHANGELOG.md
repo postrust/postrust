@@ -3,7 +3,10 @@
 Notable changes, newest first. This file starts at 1.0.0-alpha.1; earlier
 releases are described by their tags and the pull requests behind them.
 
-## Unreleased: `postrust-proxy` 1.0.0
+## postrust-proxy 1.0.0
+
+Released on its own, as the `postrust-proxy-v1.0.0` tag. The rest of Postrust
+stays at 2.4.1.
 
 `postrust-proxy` reaches 1.0.0 and joins the stable line on a version of its
 own: from here it follows semver over its Rust API, its configuration, and the
