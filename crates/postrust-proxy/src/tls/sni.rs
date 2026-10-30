@@ -91,7 +91,7 @@ impl SniCertResolver {
         for cert in certificates {
             match Self::certified_key(&cert.cert_pem, &cert.key_pem) {
                 Ok(key) => {
-                    fresh.insert(cert.domain, key);
+                    fresh.insert(normalise(&cert.domain), key);
                 }
                 Err(e) => tracing::warn!("Certificate for {} will not load: {}", cert.domain, e),
             }
@@ -107,8 +107,9 @@ impl SniCertResolver {
     fn lookup(&self, name: &str) -> Option<Arc<CertifiedKey>> {
         let keys = self.keys.read().unwrap_or_else(|e| e.into_inner());
         // SNI is case-insensitive; a certificate may have been stored either
-        // way, so both sides are lowered before comparing.
-        let name = name.to_ascii_lowercase();
+        // way, so both sides are normalised the same way -- here, and in
+        // `refresh` as the table is built.
+        let name = normalise(name);
         if let Some(key) = keys.get(&name) {
             return Some(key.clone());
         }
@@ -122,6 +123,15 @@ impl SniCertResolver {
         }
         None
     }
+}
+
+/// The form names are compared in: lowercase, without a trailing dot.
+///
+/// Applied to both sides. The lookup used to lower the client's name but not
+/// the stored one, so a certificate stored under `Example.com` was never
+/// served to anyone.
+fn normalise(name: &str) -> String {
+    name.trim_end_matches('.').to_ascii_lowercase()
 }
 
 impl ResolvesServerCert for SniCertResolver {
@@ -161,9 +171,10 @@ mod tests {
     fn resolver_with(domains: &[&str]) -> SniCertResolver {
         let resolver = SniCertResolver::new(None);
         let key = SniCertResolver::certified_key(CERT, KEY).unwrap();
+        // Through `normalise`, as `refresh` builds the table.
         let keys = domains
             .iter()
-            .map(|d| (d.to_string(), key.clone()))
+            .map(|d| (normalise(d), key.clone()))
             .collect();
         *resolver.keys.write().unwrap() = keys;
         resolver
@@ -180,6 +191,18 @@ mod tests {
     fn sni_is_matched_case_insensitively() {
         let resolver = resolver_with(&["a.example.com"]);
         assert!(resolver.lookup("A.Example.COM").is_some());
+    }
+
+    #[test]
+    fn a_certificate_stored_with_uppercase_or_a_trailing_dot_is_served() {
+        // Stored verbatim and looked up lowercased, `Example.COM` was never
+        // matched by anything.
+        let resolver = resolver_with(&["A.Example.COM", "b.example.com.", "*.Wild.Example.com"]);
+        assert!(resolver.lookup("a.example.com").is_some());
+        assert!(resolver.lookup("A.EXAMPLE.COM").is_some());
+        assert!(resolver.lookup("b.example.com").is_some());
+        assert!(resolver.lookup("b.example.com.").is_some());
+        assert!(resolver.lookup("x.wild.example.com").is_some());
     }
 
     #[test]

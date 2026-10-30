@@ -135,7 +135,7 @@ async fn tick(pool: &PgPool, issuer: &AcmeIssuer) -> ProxyResult<()> {
     while let Some(claim) = claim_next(pool).await? {
         match issuer.issue(&claim.domain).await {
             Ok(certificate) => {
-                mark_active(pool, claim.id, certificate.expires_at).await?;
+                mark_active(pool, claim.id, &claim.domain, certificate.expires_at).await?;
                 tracing::info!(
                     domain = %claim.domain,
                     expires_at = ?certificate.expires_at,
@@ -183,7 +183,14 @@ async fn tick(pool: &PgPool, issuer: &AcmeIssuer) -> ProxyResult<()> {
 /// LEAST(base * 2 ^ attempts, cap)
 /// ```
 ///
-/// which mirrors [`backoff`]. It has to be one statement. An earlier version
+/// which mirrors [`backoff`]. It has to be one statement.
+///
+/// Only a domain that is enabled, of a tenant that is active, is claimed. A
+/// disabled domain is one its tenant has taken out of service, and a
+/// suspended tenant is one the operator has; neither should go on spending
+/// the CA's rate limit, or acquire a fresh certificate the TLS listener would
+/// then serve. A domain enabled later is still `pending`, and is picked up
+/// then. An earlier version
 /// claimed the row (setting `ssl_last_attempt_at = NOW()`) and then checked the
 /// backoff in a second query -- against the timestamp it had just overwritten,
 /// so every row with a failure behind it compared `NOW() < NOW() - wait`, was
@@ -199,6 +206,10 @@ async fn claim_next(pool: &PgPool) -> ProxyResult<Option<Claim>> {
              WHERE verification_status = 'verified' \
                AND ssl_provider = 'acme' \
                AND ssl_status = 'pending' \
+               AND enabled \
+               AND EXISTS ( \
+                   SELECT 1 FROM proxy_tenants t \
+                   WHERE t.id = proxy_domains.tenant_id AND t.status = 'active') \
                AND ssl_attempts < $1 \
                AND ( \
                    ssl_last_attempt_at IS NULL \
@@ -226,12 +237,24 @@ async fn claim_next(pool: &PgPool) -> ProxyResult<Option<Claim>> {
     }))
 }
 
+/// Record a successful issuance, and tie the certificate to its domain.
+///
+/// The issuer stores the certificate keyed only by name. Linking it here --
+/// `domain_id` and `tenant_id` -- is what makes deleting the domain delete the
+/// certificate and its key; unlinked, they outlived the domain and the TLS
+/// listener went on serving them.
+///
+/// If the domain was deleted while the order was in flight, there is nothing
+/// to link to, and the certificate just stored is for a name nobody holds any
+/// more. It is removed rather than left for the listener to serve.
 async fn mark_active(
     pool: &PgPool,
     id: Uuid,
+    domain: &str,
     expires_at: Option<DateTime<Utc>>,
 ) -> ProxyResult<()> {
-    sqlx::query(
+    let mut tx = pool.begin().await?;
+    let updated = sqlx::query(
         "UPDATE proxy_domains SET \
              ssl_status = 'active', \
              ssl_expires_at = $2, \
@@ -242,8 +265,36 @@ async fn mark_active(
     )
     .bind(id)
     .bind(expires_at)
-    .execute(pool)
+    .execute(&mut *tx)
     .await?;
+
+    if updated.rows_affected() == 0 {
+        sqlx::query("DELETE FROM proxy_certificates WHERE domain = $1 AND domain_id IS NULL")
+            .bind(domain)
+            .execute(&mut *tx)
+            .await?;
+        tx.commit().await?;
+        tracing::warn!(
+            %domain,
+            "the domain was deleted during issuance; removed the certificate issued for it"
+        );
+        return Ok(());
+    }
+
+    sqlx::query(
+        "UPDATE proxy_certificates c SET \
+             domain_id = d.id, \
+             tenant_id = d.tenant_id, \
+             provider = 'acme', \
+             auto_renew = true, \
+             updated_at = NOW() \
+         FROM proxy_domains d \
+         WHERE d.id = $1 AND c.domain = d.domain",
+    )
+    .bind(id)
+    .execute(&mut *tx)
+    .await?;
+    tx.commit().await?;
     Ok(())
 }
 
@@ -307,6 +358,9 @@ async fn reclaim_abandoned(pool: &PgPool) -> ProxyResult<u64> {
 /// Returns how many. Driven off `proxy_certificates.expires_at` rather than
 /// `proxy_domains.ssl_expires_at` so that a certificate replaced out of band --
 /// uploaded by hand, say -- is still renewed on its real expiry.
+///
+/// Disabled domains and suspended tenants are not renewed, for the reasons
+/// [`claim_next`] does not issue for them.
 async fn mark_renewals(pool: &PgPool) -> ProxyResult<u64> {
     let deadline = Utc::now() + RENEW_WITHIN;
 
@@ -318,6 +372,10 @@ async fn mark_renewals(pool: &PgPool) -> ProxyResult<u64> {
          WHERE d.ssl_status = 'active' \
            AND d.ssl_provider = 'acme' \
            AND d.verification_status = 'verified' \
+           AND d.enabled \
+           AND EXISTS ( \
+               SELECT 1 FROM proxy_tenants t \
+               WHERE t.id = d.tenant_id AND t.status = 'active') \
            AND EXISTS ( \
                SELECT 1 FROM proxy_certificates c \
                WHERE c.domain = d.domain \
@@ -405,10 +463,11 @@ mod db_tests {
     use super::*;
     use sqlx::Executor;
 
-    const MIGRATIONS: [&str; 3] = [
+    const MIGRATIONS: [&str; 4] = [
         include_str!("../../migrations/20240115000001_saas_domains.sql"),
         include_str!("../../migrations/20260901000001_proxy_config.sql"),
         include_str!("../../migrations/20260901000002_proxy_acme.sql"),
+        include_str!("../../migrations/20261030000001_proxy_control_plane.sql"),
     ];
 
     /// See `tests/config_persistence.rs` for why the migration is locked.
@@ -489,7 +548,7 @@ mod db_tests {
         .expect("insert tenant")
     }
 
-    /// A verified ACME domain with a given attempt history.
+    /// A verified, enabled ACME domain with a given attempt history.
     async fn domain(
         pool: &PgPool,
         tenant_id: Uuid,
@@ -502,10 +561,10 @@ mod db_tests {
             "INSERT INTO proxy_domains \
                 (tenant_id, domain, verification_status, verification_method, \
                  verification_token, ssl_status, ssl_provider, ssl_attempts, \
-                 ssl_last_attempt_at) \
+                 ssl_last_attempt_at, enabled) \
              VALUES ($1, $2, 'verified', 'dns', 'tok', $3, 'acme', $4, \
                  CASE WHEN $5::bigint IS NULL THEN NULL \
-                      ELSE NOW() - make_interval(secs => $5::bigint) END) \
+                      ELSE NOW() - make_interval(secs => $5::bigint) END, true) \
              RETURNING id",
         )
         .bind(tenant_id)
@@ -911,8 +970,8 @@ mod db_tests {
         let id: Uuid = sqlx::query_scalar(
             "INSERT INTO proxy_domains \
                 (tenant_id, domain, verification_status, verification_token, \
-                 ssl_status, ssl_provider, ssl_attempts, ssl_error) \
-             VALUES ($1, $2, 'verified', 'tok', 'active', 'manual', 4, 'old') \
+                 ssl_status, ssl_provider, ssl_attempts, ssl_error, enabled) \
+             VALUES ($1, $2, 'verified', 'tok', 'active', 'manual', 4, 'old', true) \
              RETURNING id",
         )
         .bind(t)
@@ -1083,5 +1142,152 @@ mod db_tests {
 
         let others = drain(&pool).await;
         assert!(!others.contains(&id), "the same domain was claimed twice");
+    }
+
+    #[tokio::test]
+    #[ignore = "requires PostgreSQL"]
+    async fn a_disabled_domain_is_not_claimed() {
+        let pool = pool().await;
+        let _exclusive = exclusive().await;
+        let t = tenant(&pool).await;
+        let (id, _) = domain(&pool, t, "pending", 0, None).await;
+        sqlx::query("UPDATE proxy_domains SET enabled = false WHERE id = $1")
+            .bind(id)
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        assert!(
+            !claims_include(&pool, id).await,
+            "a domain its tenant has disabled was claimed for issuance"
+        );
+
+        // Enabling it again is enough: it is still pending.
+        sqlx::query("UPDATE proxy_domains SET enabled = true WHERE id = $1")
+            .bind(id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        assert!(claims_include(&pool, id).await);
+    }
+
+    #[tokio::test]
+    #[ignore = "requires PostgreSQL"]
+    async fn a_suspended_tenants_domain_is_not_claimed_or_renewed() {
+        let pool = pool().await;
+        let _exclusive = exclusive().await;
+        let t = tenant(&pool).await;
+        let (pending, _) = domain(&pool, t, "pending", 0, None).await;
+        let (active, name) = domain(&pool, t, "active", 0, None).await;
+        sqlx::query(
+            "INSERT INTO proxy_certificates (domain, cert_pem, key_pem, expires_at, domain_id) \
+             VALUES ($1, 'c', 'k', NOW() + INTERVAL '1 day', $2)",
+        )
+        .bind(&name)
+        .bind(active)
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query("UPDATE proxy_tenants SET status = 'suspended' WHERE id = $1")
+            .bind(t)
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        assert!(
+            !claims_include(&pool, pending).await,
+            "a suspended tenant's domain was claimed for issuance"
+        );
+        mark_renewals(&pool).await.expect("renewals");
+        let status: String =
+            sqlx::query_scalar("SELECT ssl_status FROM proxy_domains WHERE id = $1")
+                .bind(active)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            status, "active",
+            "a suspended tenant's certificate was queued for renewal"
+        );
+    }
+
+    #[tokio::test]
+    #[ignore = "requires PostgreSQL"]
+    async fn an_issued_certificate_is_linked_to_its_domain_and_goes_with_it() {
+        let pool = pool().await;
+        let _exclusive = exclusive().await;
+        let t = tenant(&pool).await;
+        let (id, name) = domain(&pool, t, "provisioning", 0, Some(1)).await;
+
+        // What `AcmeIssuer::issue` leaves behind: a row keyed only by name.
+        sqlx::query(
+            "INSERT INTO proxy_certificates (domain, cert_pem, key_pem) VALUES ($1, 'c', 'k')",
+        )
+        .bind(&name)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        mark_active(&pool, id, &name, None)
+            .await
+            .expect("mark active");
+
+        let (domain_id, tenant_id): (Option<Uuid>, Option<Uuid>) =
+            sqlx::query_as("SELECT domain_id, tenant_id FROM proxy_certificates WHERE domain = $1")
+                .bind(&name)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(domain_id, Some(id));
+        assert_eq!(tenant_id, Some(t));
+
+        sqlx::query("DELETE FROM proxy_domains WHERE id = $1")
+            .bind(id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        let left: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM proxy_certificates WHERE domain = $1")
+                .bind(&name)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(left, 0, "the certificate outlived its domain");
+    }
+
+    #[tokio::test]
+    #[ignore = "requires PostgreSQL"]
+    async fn a_certificate_issued_for_a_domain_deleted_mid_order_is_removed() {
+        let pool = pool().await;
+        let _exclusive = exclusive().await;
+        let t = tenant(&pool).await;
+        let (id, name) = domain(&pool, t, "provisioning", 0, Some(1)).await;
+        sqlx::query("DELETE FROM proxy_domains WHERE id = $1")
+            .bind(id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query(
+            "INSERT INTO proxy_certificates (domain, cert_pem, key_pem) VALUES ($1, 'c', 'k')",
+        )
+        .bind(&name)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        mark_active(&pool, id, &name, None)
+            .await
+            .expect("mark active");
+
+        let left: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM proxy_certificates WHERE domain = $1")
+                .bind(&name)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            left, 0,
+            "a certificate for a deleted domain was left to be served"
+        );
     }
 }

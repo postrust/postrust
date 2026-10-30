@@ -5,10 +5,10 @@
 //! (`query`/`query_as`) rather than the compile-time-checked macros so the
 //! crate builds without a live database connection.
 
-use crate::error::ProxyResult;
+use crate::error::{ProxyError, ProxyResult};
 use crate::saas::types::*;
-use chrono::{DateTime, Utc};
-use sqlx::{PgPool, Row};
+use sqlx::{PgConnection, PgPool, Row};
+use std::time::Duration;
 use uuid::Uuid;
 
 // ============================================================================
@@ -18,29 +18,10 @@ use uuid::Uuid;
 // canonical string form directly and let the `From<*Row>` impls decode back.
 // ============================================================================
 
-fn verification_status_str(status: &VerificationStatus) -> &'static str {
-    match status {
-        VerificationStatus::Pending => "pending",
-        VerificationStatus::Verified => "verified",
-        VerificationStatus::Failed => "failed",
-        VerificationStatus::Expired => "expired",
-    }
-}
-
 fn verification_method_str(method: &VerificationMethod) -> &'static str {
     match method {
         VerificationMethod::Dns => "dns",
         VerificationMethod::Http => "http",
-    }
-}
-
-fn ssl_status_str(status: &SslStatus) -> &'static str {
-    match status {
-        SslStatus::Pending => "pending",
-        SslStatus::Provisioning => "provisioning",
-        SslStatus::Active => "active",
-        SslStatus::Failed => "failed",
-        SslStatus::Expired => "expired",
     }
 }
 
@@ -74,37 +55,121 @@ fn lb_strategy_str(strategy: &DomainLoadBalanceStrategy) -> &'static str {
 // Domains
 // ============================================================================
 
-/// Return `(current_domain_count, max_domains)` for a tenant.
-pub async fn check_domain_quota(pool: &PgPool, tenant_id: Uuid) -> ProxyResult<(i64, i32)> {
+/// A tenant's limits, read with the tenant row locked.
+///
+/// Every quota check takes this lock first and holds it until the insert
+/// commits. Counting and then inserting without it lets two concurrent
+/// requests both see room for one more, and both insert.
+pub(crate) struct TenantLimits {
+    pub(crate) max_domains: i32,
+    pub(crate) max_routes_per_domain: i32,
+    pub(crate) max_upstreams: i32,
+    pub(crate) max_backends_per_upstream: i32,
+    pub(crate) max_api_keys: i32,
+}
+
+pub(crate) async fn lock_tenant_limits(
+    conn: &mut PgConnection,
+    tenant_id: Uuid,
+) -> ProxyResult<TenantLimits> {
     let row = sqlx::query(
-        "SELECT \
-            (SELECT COUNT(*) FROM proxy_domains WHERE tenant_id = $1) AS current, \
-            COALESCE((SELECT max_domains FROM proxy_tenants WHERE id = $1), 0) AS max",
+        "SELECT COALESCE(max_domains, 0) AS max_domains, \
+                COALESCE(max_routes_per_domain, 0) AS max_routes_per_domain, \
+                max_upstreams, max_backends_per_upstream, max_api_keys \
+         FROM proxy_tenants WHERE id = $1 FOR UPDATE",
     )
     .bind(tenant_id)
-    .fetch_one(pool)
-    .await?;
+    .fetch_optional(&mut *conn)
+    .await?
+    .ok_or_else(|| ProxyError::NotFound("Tenant not found".into()))?;
 
-    Ok((row.get::<i64, _>("current"), row.get::<i32, _>("max")))
+    Ok(TenantLimits {
+        max_domains: row.try_get("max_domains")?,
+        max_routes_per_domain: row.try_get("max_routes_per_domain")?,
+        max_upstreams: row.try_get("max_upstreams")?,
+        max_backends_per_upstream: row.try_get("max_backends_per_upstream")?,
+        max_api_keys: row.try_get("max_api_keys")?,
+    })
 }
 
-/// Check whether a domain is already registered (globally unique).
-pub async fn domain_exists(pool: &PgPool, domain: &str) -> ProxyResult<bool> {
-    let row =
-        sqlx::query("SELECT EXISTS(SELECT 1 FROM proxy_domains WHERE domain = $1) AS present")
-            .bind(domain)
-            .fetch_one(pool)
-            .await?;
-    Ok(row.get::<bool, _>("present"))
+/// Refuse when `current` has reached `max`.
+fn within_quota(current: i64, max: i32, what: &str) -> ProxyResult<()> {
+    if current >= i64::from(max) {
+        return Err(ProxyError::QuotaExceeded(format!(
+            "{what} limit reached ({current}/{max})"
+        )));
+    }
+    Ok(())
 }
 
-/// Insert a new domain and return it.
-pub async fn create_domain(
+/// Register a domain for a tenant, with its verification challenge.
+///
+/// `req.domain` must already be in [`normalize_domain`] form. Names are
+/// compared on `lower(domain)`, which is what the unique index is on: rows
+/// written before names were normalised may still be mixed case, and must
+/// still collide.
+///
+/// [`normalize_domain`]: crate::saas::validation::normalize_domain
+///
+/// One transaction, with the tenant
+/// row locked for the quota check, and in this order:
+///
+/// 1. A registration of the same name that is still unverified after
+///    `pending_ttl` is deleted, whoever holds it. That is what stops a pending
+///    row squatting a name for ever: past its time it no longer blocks
+///    anybody, and the next registration of the name clears it.
+/// 2. The quota is checked.
+/// 3. A live registration of the name by anyone is a conflict. The unique
+///    index on `lower(domain)` backs this up against a concurrent insert.
+/// 4. The domain and its challenge are inserted. The challenge expires when
+///    the registration does.
+pub(crate) async fn register_domain(
     pool: &PgPool,
     tenant_id: Uuid,
-    req: CreateDomainRequest,
+    req: &CreateDomainRequest,
     verification_token: &str,
+    expected_value: &str,
+    pending_ttl: Duration,
 ) -> ProxyResult<Domain> {
+    let ttl_secs = pending_ttl.as_secs_f64();
+    let mut tx = pool.begin().await?;
+
+    let limits = lock_tenant_limits(&mut tx, tenant_id).await?;
+
+    let expired = sqlx::query(
+        "DELETE FROM proxy_domains \
+         WHERE lower(domain) = lower($1) \
+           AND verification_status <> 'verified' \
+           AND created_at < NOW() - make_interval(secs => $2)",
+    )
+    .bind(&req.domain)
+    .bind(ttl_secs)
+    .execute(&mut *tx)
+    .await?;
+    if expired.rows_affected() > 0 {
+        tracing::info!(
+            domain = %req.domain,
+            "removed an unverified registration that had outlived its time"
+        );
+    }
+
+    let current: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM proxy_domains WHERE tenant_id = $1")
+            .bind(tenant_id)
+            .fetch_one(&mut *tx)
+            .await?;
+    within_quota(current, limits.max_domains, "Domain")?;
+
+    let taken: bool = sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM proxy_domains WHERE lower(domain) = lower($1))",
+    )
+    .bind(&req.domain)
+    .fetch_one(&mut *tx)
+    .await?;
+    if taken {
+        return Err(ProxyError::Conflict("Domain already registered".into()));
+    }
+
     let row = sqlx::query_as::<_, DomainRow>(
         "INSERT INTO proxy_domains \
             (tenant_id, domain, verification_method, verification_token, ssl_provider) \
@@ -116,32 +181,24 @@ pub async fn create_domain(
     .bind(verification_method_str(&req.verification_method))
     .bind(verification_token)
     .bind(ssl_provider_str(&req.ssl_provider))
-    .fetch_one(pool)
+    .fetch_one(&mut *tx)
     .await?;
 
-    Ok(Domain::from(row))
-}
-
-/// Record a verification challenge for a domain.
-pub async fn create_verification_challenge(
-    pool: &PgPool,
-    domain_id: Uuid,
-    challenge_type: &str,
-    token: &str,
-    expected_value: &str,
-) -> ProxyResult<()> {
     sqlx::query(
         "INSERT INTO proxy_verification_challenges \
-            (domain_id, challenge_type, token, expected_value) \
-         VALUES ($1, $2, $3, $4)",
+            (domain_id, challenge_type, token, expected_value, expires_at) \
+         VALUES ($1, $2, $3, $4, NOW() + make_interval(secs => $5))",
     )
-    .bind(domain_id)
-    .bind(challenge_type)
-    .bind(token)
+    .bind(row.id)
+    .bind(verification_method_str(&req.verification_method))
+    .bind(verification_token)
     .bind(expected_value)
-    .execute(pool)
+    .bind(ttl_secs)
+    .execute(&mut *tx)
     .await?;
-    Ok(())
+
+    tx.commit().await?;
+    Ok(Domain::from(row))
 }
 
 /// A live HTTP verification challenge, with the domain it was issued for.
@@ -218,6 +275,7 @@ pub async fn update_domain(
     ssl_provider: Option<&SslProvider>,
 ) -> ProxyResult<Option<Domain>> {
     let queue_for_acme = matches!(ssl_provider, Some(SslProvider::Acme));
+    let mut tx = pool.begin().await?;
 
     let row = sqlx::query_as::<_, DomainRow>(
         "UPDATE proxy_domains SET \
@@ -244,9 +302,24 @@ pub async fn update_domain(
     .bind(verification_method.map(verification_method_str))
     .bind(ssl_provider.map(ssl_provider_str))
     .bind(queue_for_acme)
-    .fetch_optional(pool)
+    .fetch_optional(&mut *tx)
     .await?;
 
+    // The live challenge follows the method. The well-known endpoint serves
+    // only `http` challenges, so a domain switched from DNS to HTTP would
+    // otherwise have nothing to answer with.
+    if let (Some(row), Some(method)) = (&row, verification_method) {
+        sqlx::query(
+            "UPDATE proxy_verification_challenges SET challenge_type = $2 \
+             WHERE domain_id = $1 AND status IN ('pending', 'checking')",
+        )
+        .bind(row.id)
+        .bind(verification_method_str(method))
+        .execute(&mut *tx)
+        .await?;
+    }
+
+    tx.commit().await?;
     Ok(row.map(Domain::from))
 }
 
@@ -273,7 +346,7 @@ pub async fn record_uploaded_certificate(
              ssl_error = NULL, \
              ssl_attempts = 0, \
              updated_at = NOW() \
-         WHERE id = $1 AND tenant_id = $2 \
+         WHERE id = $1 AND tenant_id = $2 AND verification_status = 'verified' \
          RETURNING *",
     )
     .bind(id)
@@ -345,89 +418,198 @@ pub async fn list_domains(pool: &PgPool, tenant_id: Uuid) -> ProxyResult<Vec<Dom
     Ok(rows.into_iter().map(Domain::from).collect())
 }
 
-/// Delete a domain scoped to a tenant. Returns whether a row was removed.
-pub async fn delete_domain(pool: &PgPool, id: Uuid, tenant_id: Uuid) -> ProxyResult<bool> {
+/// Delete a domain scoped to a tenant.
+///
+/// Returns `None` when there was no such domain, and otherwise the names of
+/// the certificates that were linked to it. Their rows go with the domain, by
+/// the foreign key's cascade; the names are returned so the caller can clear
+/// the certificate store's file and memory caches too, which the database
+/// cannot reach.
+pub async fn delete_domain(
+    pool: &PgPool,
+    id: Uuid,
+    tenant_id: Uuid,
+) -> ProxyResult<Option<Vec<String>>> {
+    let mut tx = pool.begin().await?;
+
+    let certificates: Vec<String> = sqlx::query_scalar(
+        "SELECT c.domain FROM proxy_certificates c \
+         JOIN proxy_domains d ON d.id = c.domain_id \
+         WHERE d.id = $1 AND d.tenant_id = $2",
+    )
+    .bind(id)
+    .bind(tenant_id)
+    .fetch_all(&mut *tx)
+    .await?;
+
     let result = sqlx::query("DELETE FROM proxy_domains WHERE id = $1 AND tenant_id = $2")
         .bind(id)
         .bind(tenant_id)
-        .execute(pool)
+        .execute(&mut *tx)
         .await?;
-    Ok(result.rows_affected() > 0)
+    tx.commit().await?;
+
+    Ok((result.rows_affected() > 0).then_some(certificates))
 }
 
-/// Increment the verification attempt counter and stamp the attempt time.
-pub async fn record_verification_attempt(pool: &PgPool, id: Uuid) -> ProxyResult<()> {
-    sqlx::query(
-        "UPDATE proxy_domains \
-         SET verification_attempts = verification_attempts + 1, \
+/// What became of a request to start a verification attempt.
+pub(crate) enum AttemptStart {
+    /// The attempt is recorded; go ahead and check.
+    Started(Domain),
+    /// Already verified. Nothing to check.
+    AlreadyVerified,
+    /// Too soon after the last attempt.
+    TooSoon,
+    /// The registration has used all its attempts.
+    Exhausted,
+    /// The registration, or its challenge, has outlived its time. The domain
+    /// has been marked `expired`.
+    Expired,
+    /// No such domain for this tenant.
+    NotFound,
+}
+
+/// Record a verification attempt, if one is allowed now.
+///
+/// The checks and the increment are one `UPDATE`, so two requests arriving
+/// together cannot both pass the interval check. Each attempt makes outbound
+/// DNS or HTTP requests on the tenant's say-so; unthrottled, the verify
+/// endpoint is a way to make this proxy fetch a URL as often as asked.
+pub(crate) async fn start_verification_attempt(
+    pool: &PgPool,
+    id: Uuid,
+    tenant_id: Uuid,
+    min_interval: Duration,
+    max_attempts: i32,
+    pending_ttl: Duration,
+) -> ProxyResult<AttemptStart> {
+    let started = sqlx::query_as::<_, DomainRow>(
+        "UPDATE proxy_domains d SET \
+             verification_attempts = d.verification_attempts + 1, \
              last_verification_attempt = NOW(), \
              updated_at = NOW() \
-         WHERE id = $1",
+         WHERE d.id = $1 AND d.tenant_id = $2 \
+           AND d.verification_status <> 'verified' \
+           AND d.verification_attempts < $3 \
+           AND (d.last_verification_attempt IS NULL \
+                OR d.last_verification_attempt <= NOW() - make_interval(secs => $4)) \
+           AND d.created_at >= NOW() - make_interval(secs => $5) \
+           AND EXISTS ( \
+               SELECT 1 FROM proxy_verification_challenges c \
+               WHERE c.domain_id = d.id \
+                 AND c.status IN ('pending', 'checking') \
+                 AND c.expires_at > NOW()) \
+         RETURNING d.*",
     )
     .bind(id)
-    .execute(pool)
+    .bind(tenant_id)
+    .bind(max_attempts)
+    .bind(min_interval.as_secs_f64())
+    .bind(pending_ttl.as_secs_f64())
+    .fetch_optional(pool)
     .await?;
-    Ok(())
+
+    if let Some(row) = started {
+        return Ok(AttemptStart::Started(Domain::from(row)));
+    }
+
+    // Refused: work out why, for the caller. Not race-free, and it does not
+    // need to be -- the decision has already been made, atomically, above.
+    let Some(domain) = get_domain_for_tenant(pool, id, tenant_id).await? else {
+        return Ok(AttemptStart::NotFound);
+    };
+    if domain.verification_status == VerificationStatus::Verified {
+        return Ok(AttemptStart::AlreadyVerified);
+    }
+    if domain.verification_attempts >= max_attempts {
+        return Ok(AttemptStart::Exhausted);
+    }
+
+    let live_challenge: bool = sqlx::query_scalar(
+        "SELECT EXISTS ( \
+             SELECT 1 FROM proxy_verification_challenges c \
+             JOIN proxy_domains d ON d.id = c.domain_id \
+             WHERE c.domain_id = $1 \
+               AND c.status IN ('pending', 'checking') \
+               AND c.expires_at > NOW() \
+               AND d.created_at >= NOW() - make_interval(secs => $2))",
+    )
+    .bind(id)
+    .bind(pending_ttl.as_secs_f64())
+    .fetch_one(pool)
+    .await?;
+    if !live_challenge {
+        sqlx::query(
+            "UPDATE proxy_domains SET verification_status = 'expired', updated_at = NOW() \
+             WHERE id = $1 AND verification_status <> 'verified'",
+        )
+        .bind(id)
+        .execute(pool)
+        .await?;
+        return Ok(AttemptStart::Expired);
+    }
+
+    Ok(AttemptStart::TooSoon)
 }
 
-/// Update a domain's verification status (stamping `verified_at` on success).
-pub async fn update_verification_status(
-    pool: &PgPool,
-    id: Uuid,
-    status: VerificationStatus,
-) -> ProxyResult<()> {
-    let status_str = verification_status_str(&status);
+/// Mark a domain verified, and its challenge resolved.
+///
+/// Resolving the challenge is what stops the well-known endpoint answering for
+/// it: an unresolved challenge on a verified domain is a token anyone can
+/// still fetch. A domain asking for ACME is queued for issuance in the same
+/// transaction.
+pub(crate) async fn mark_verified(pool: &PgPool, id: Uuid) -> ProxyResult<()> {
+    let mut tx = pool.begin().await?;
     sqlx::query(
-        "UPDATE proxy_domains \
-         SET verification_status = $2, \
-             verified_at = CASE WHEN $2 = 'verified' THEN NOW() ELSE verified_at END, \
+        "UPDATE proxy_domains SET \
+             verification_status = 'verified', \
+             verified_at = NOW(), \
+             ssl_status = CASE WHEN ssl_provider = 'acme' THEN 'pending' ELSE ssl_status END, \
              updated_at = NOW() \
          WHERE id = $1",
     )
     .bind(id)
-    .bind(status_str)
-    .execute(pool)
+    .execute(&mut *tx)
     .await?;
-    Ok(())
-}
-
-/// Update a domain's SSL status and optional expiry.
-pub async fn update_ssl_status(
-    pool: &PgPool,
-    id: Uuid,
-    status: SslStatus,
-    expires_at: Option<DateTime<Utc>>,
-) -> ProxyResult<()> {
     sqlx::query(
-        "UPDATE proxy_domains \
-         SET ssl_status = $2, ssl_expires_at = $3, updated_at = NOW() \
-         WHERE id = $1",
+        "UPDATE proxy_verification_challenges \
+         SET status = 'verified', verified_at = NOW() \
+         WHERE domain_id = $1 AND status IN ('pending', 'checking')",
     )
     .bind(id)
-    .bind(ssl_status_str(&status))
-    .bind(expires_at)
-    .execute(pool)
+    .execute(&mut *tx)
     .await?;
+    tx.commit().await?;
     Ok(())
 }
 
-/// Enable a domain.
-pub async fn enable_domain(pool: &PgPool, id: Uuid) -> ProxyResult<bool> {
-    let result =
-        sqlx::query("UPDATE proxy_domains SET enabled = true, updated_at = NOW() WHERE id = $1")
-            .bind(id)
-            .execute(pool)
-            .await?;
+/// Enable a verified domain, scoped to a tenant.
+///
+/// The verification condition is in the statement, not only in the caller, so
+/// that nothing can enable a domain that is not verified at the moment of the
+/// write.
+pub async fn enable_domain(pool: &PgPool, id: Uuid, tenant_id: Uuid) -> ProxyResult<bool> {
+    let result = sqlx::query(
+        "UPDATE proxy_domains SET enabled = true, updated_at = NOW() \
+         WHERE id = $1 AND tenant_id = $2 AND verification_status = 'verified'",
+    )
+    .bind(id)
+    .bind(tenant_id)
+    .execute(pool)
+    .await?;
     Ok(result.rows_affected() > 0)
 }
 
-/// Disable a domain.
-pub async fn disable_domain(pool: &PgPool, id: Uuid) -> ProxyResult<bool> {
-    let result =
-        sqlx::query("UPDATE proxy_domains SET enabled = false, updated_at = NOW() WHERE id = $1")
-            .bind(id)
-            .execute(pool)
-            .await?;
+/// Disable a domain, scoped to a tenant.
+pub async fn disable_domain(pool: &PgPool, id: Uuid, tenant_id: Uuid) -> ProxyResult<bool> {
+    let result = sqlx::query(
+        "UPDATE proxy_domains SET enabled = false, updated_at = NOW() \
+         WHERE id = $1 AND tenant_id = $2",
+    )
+    .bind(id)
+    .bind(tenant_id)
+    .execute(pool)
+    .await?;
     Ok(result.rows_affected() > 0)
 }
 
@@ -436,6 +618,12 @@ pub async fn disable_domain(pool: &PgPool, id: Uuid) -> ProxyResult<bool> {
 // ============================================================================
 
 /// Create a route for a domain.
+///
+/// In one transaction with the tenant row locked: the domain must belong to
+/// the tenant and be verified, the upstream must belong to the tenant, and the
+/// domain must have room under `max_routes_per_domain`. A route on an
+/// unverified domain would be traffic configuration for a name nobody has
+/// proved control of.
 pub async fn create_route(
     pool: &PgPool,
     domain_id: Uuid,
@@ -443,6 +631,44 @@ pub async fn create_route(
     req: CreateDomainRouteRequest,
 ) -> ProxyResult<DomainRoute> {
     let add_headers = serde_json::to_value(&req.add_headers).unwrap_or_default();
+    let mut tx = pool.begin().await?;
+
+    let limits = lock_tenant_limits(&mut tx, tenant_id).await?;
+
+    let status: Option<String> = sqlx::query_scalar(
+        "SELECT verification_status FROM proxy_domains WHERE id = $1 AND tenant_id = $2",
+    )
+    .bind(domain_id)
+    .bind(tenant_id)
+    .fetch_optional(&mut *tx)
+    .await?;
+    match status.as_deref() {
+        None => return Err(ProxyError::NotFound("Domain not found".into())),
+        Some("verified") => {}
+        Some(_) => {
+            return Err(ProxyError::Validation(
+                "Domain must be verified before routes can be added".into(),
+            ))
+        }
+    }
+
+    let upstream_owned: bool = sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM proxy_domain_upstreams WHERE id = $1 AND tenant_id = $2)",
+    )
+    .bind(req.upstream_id)
+    .bind(tenant_id)
+    .fetch_one(&mut *tx)
+    .await?;
+    if !upstream_owned {
+        return Err(ProxyError::NotFound("Upstream not found".into()));
+    }
+
+    let current: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM proxy_domain_routes WHERE domain_id = $1")
+            .bind(domain_id)
+            .fetch_one(&mut *tx)
+            .await?;
+    within_quota(current, limits.max_routes_per_domain, "Route")?;
 
     let row = sqlx::query_as::<_, DomainRouteRow>(
         "INSERT INTO proxy_domain_routes \
@@ -466,9 +692,10 @@ pub async fn create_route(
     .bind(req.rate_limit_requests)
     .bind(req.rate_limit_window_secs)
     .bind(req.timeout_secs)
-    .fetch_one(pool)
+    .fetch_one(&mut *tx)
     .await?;
 
+    tx.commit().await?;
     Ok(DomainRoute::from(row))
 }
 
@@ -574,22 +801,45 @@ pub async fn delete_route(pool: &PgPool, id: Uuid, tenant_id: Uuid) -> ProxyResu
 // ============================================================================
 
 /// Load the backends belonging to an upstream.
-async fn load_backends(pool: &PgPool, upstream_id: Uuid) -> ProxyResult<Vec<DomainBackend>> {
+async fn load_backends<'c, E>(executor: E, upstream_id: Uuid) -> ProxyResult<Vec<DomainBackend>>
+where
+    E: sqlx::Executor<'c, Database = sqlx::Postgres>,
+{
     let backends = sqlx::query_as::<_, DomainBackend>(
         "SELECT * FROM proxy_domain_backends WHERE upstream_id = $1 ORDER BY created_at",
     )
     .bind(upstream_id)
-    .fetch_all(pool)
+    .fetch_all(executor)
     .await?;
     Ok(backends)
 }
 
-/// Create an upstream (and any backends supplied inline).
+/// Create an upstream and any backends supplied inline, all or nothing.
+///
+/// One transaction. It used to insert the upstream, then each backend, each
+/// on its own -- so a backend that failed left the upstream behind, and the
+/// caller got a 500 for a request that had half happened.
 pub async fn create_upstream(
     pool: &PgPool,
     tenant_id: Uuid,
     req: CreateUpstreamRequest,
 ) -> ProxyResult<DomainUpstream> {
+    let mut tx = pool.begin().await?;
+
+    let limits = lock_tenant_limits(&mut tx, tenant_id).await?;
+    let current: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM proxy_domain_upstreams WHERE tenant_id = $1")
+            .bind(tenant_id)
+            .fetch_one(&mut *tx)
+            .await?;
+    within_quota(current, limits.max_upstreams, "Upstream")?;
+    if req.backends.len() > limits.max_backends_per_upstream.max(0) as usize {
+        return Err(ProxyError::QuotaExceeded(format!(
+            "Backend limit per upstream is {}",
+            limits.max_backends_per_upstream
+        )));
+    }
+
     let row = sqlx::query_as::<_, DomainUpstreamRow>(
         "INSERT INTO proxy_domain_upstreams \
             (tenant_id, name, lb_strategy, health_check_enabled, health_check_path, \
@@ -607,16 +857,17 @@ pub async fn create_upstream(
     .bind(req.health_check_timeout_secs)
     .bind(req.healthy_threshold)
     .bind(req.unhealthy_threshold)
-    .fetch_one(pool)
+    .fetch_one(&mut *tx)
     .await?;
 
     let mut upstream = DomainUpstream::from(row);
 
-    for backend in req.backends {
-        create_backend(pool, upstream.id, backend).await?;
+    for backend in &req.backends {
+        insert_backend(&mut tx, upstream.id, backend).await?;
     }
-    upstream.backends = load_backends(pool, upstream.id).await?;
+    upstream.backends = load_backends(&mut *tx, upstream.id).await?;
 
+    tx.commit().await?;
     Ok(upstream)
 }
 
@@ -720,11 +971,10 @@ pub async fn delete_upstream(pool: &PgPool, id: Uuid, tenant_id: Uuid) -> ProxyR
     Ok(result.rows_affected() > 0)
 }
 
-/// Add a backend to an upstream.
-pub async fn create_backend(
-    pool: &PgPool,
+async fn insert_backend(
+    conn: &mut PgConnection,
     upstream_id: Uuid,
-    req: CreateBackendRequest,
+    req: &CreateBackendRequest,
 ) -> ProxyResult<DomainBackend> {
     let backend = sqlx::query_as::<_, DomainBackend>(
         "INSERT INTO proxy_domain_backends (upstream_id, address, scheme, weight) \
@@ -735,8 +985,41 @@ pub async fn create_backend(
     .bind(&req.address)
     .bind(&req.scheme)
     .bind(req.weight)
-    .fetch_one(pool)
+    .fetch_one(&mut *conn)
     .await?;
+    Ok(backend)
+}
+
+/// Add a backend to one of the tenant's upstreams, within its quota.
+pub async fn create_backend(
+    pool: &PgPool,
+    upstream_id: Uuid,
+    tenant_id: Uuid,
+    req: CreateBackendRequest,
+) -> ProxyResult<DomainBackend> {
+    let mut tx = pool.begin().await?;
+
+    let limits = lock_tenant_limits(&mut tx, tenant_id).await?;
+    let owned: bool = sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM proxy_domain_upstreams WHERE id = $1 AND tenant_id = $2)",
+    )
+    .bind(upstream_id)
+    .bind(tenant_id)
+    .fetch_one(&mut *tx)
+    .await?;
+    if !owned {
+        return Err(ProxyError::NotFound("Upstream not found".into()));
+    }
+
+    let current: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM proxy_domain_backends WHERE upstream_id = $1")
+            .bind(upstream_id)
+            .fetch_one(&mut *tx)
+            .await?;
+    within_quota(current, limits.max_backends_per_upstream, "Backend")?;
+
+    let backend = insert_backend(&mut tx, upstream_id, &req).await?;
+    tx.commit().await?;
     Ok(backend)
 }
 
@@ -764,7 +1047,8 @@ pub async fn delete_backend(
 // API keys
 // ============================================================================
 
-/// Insert a new API key row (the raw key is never stored, only its hash).
+/// Insert a new API key row (the raw key is never stored, only its hash),
+/// within the tenant's `max_api_keys`.
 pub async fn create_api_key(
     pool: &PgPool,
     tenant_id: Uuid,
@@ -772,6 +1056,15 @@ pub async fn create_api_key(
     key_hash: &str,
     key_prefix: &str,
 ) -> ProxyResult<ApiKeyRow> {
+    let mut tx = pool.begin().await?;
+    let limits = lock_tenant_limits(&mut tx, tenant_id).await?;
+    let current: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM proxy_api_keys WHERE tenant_id = $1")
+            .bind(tenant_id)
+            .fetch_one(&mut *tx)
+            .await?;
+    within_quota(current, limits.max_api_keys, "API key")?;
+
     let row = sqlx::query_as::<_, ApiKeyRow>(
         "INSERT INTO proxy_api_keys (tenant_id, name, key_hash, key_prefix, scopes, expires_at) \
          VALUES ($1, $2, $3, $4, $5, $6) \
@@ -783,8 +1076,9 @@ pub async fn create_api_key(
     .bind(key_prefix)
     .bind(&req.scopes)
     .bind(req.expires_at)
-    .fetch_one(pool)
+    .fetch_one(&mut *tx)
     .await?;
+    tx.commit().await?;
     Ok(row)
 }
 
@@ -894,8 +1188,12 @@ pub async fn get_tenant_usage(pool: &PgPool, tenant_id: Uuid) -> ProxyResult<Ten
             COALESCE((SELECT max_domains FROM proxy_tenants WHERE id = $1), 0) AS domains_limit, \
             (SELECT COUNT(*) FROM proxy_domains WHERE tenant_id = $1 AND verification_status = 'verified') AS verified_domains, \
             (SELECT COUNT(*) FROM proxy_domain_routes WHERE tenant_id = $1) AS routes_count, \
+            COALESCE((SELECT max_routes_per_domain FROM proxy_tenants WHERE id = $1), 0) AS routes_per_domain_limit, \
             (SELECT COUNT(*) FROM proxy_domain_upstreams WHERE tenant_id = $1) AS upstreams_count, \
-            (SELECT COUNT(*) FROM proxy_api_keys WHERE tenant_id = $1) AS api_keys_count",
+            COALESCE((SELECT max_upstreams FROM proxy_tenants WHERE id = $1), 0) AS upstreams_limit, \
+            COALESCE((SELECT max_backends_per_upstream FROM proxy_tenants WHERE id = $1), 0) AS backends_per_upstream_limit, \
+            (SELECT COUNT(*) FROM proxy_api_keys WHERE tenant_id = $1) AS api_keys_count, \
+            COALESCE((SELECT max_api_keys FROM proxy_tenants WHERE id = $1), 0) AS api_keys_limit",
     )
     .bind(tenant_id)
     .fetch_one(pool)
@@ -906,7 +1204,11 @@ pub async fn get_tenant_usage(pool: &PgPool, tenant_id: Uuid) -> ProxyResult<Ten
         domains_limit: row.get::<i32, _>("domains_limit"),
         verified_domains: row.get::<i64, _>("verified_domains"),
         routes_count: row.get::<i64, _>("routes_count"),
+        routes_per_domain_limit: row.get::<i32, _>("routes_per_domain_limit"),
         upstreams_count: row.get::<i64, _>("upstreams_count"),
+        upstreams_limit: row.get::<i32, _>("upstreams_limit"),
+        backends_per_upstream_limit: row.get::<i32, _>("backends_per_upstream_limit"),
         api_keys_count: row.get::<i64, _>("api_keys_count"),
+        api_keys_limit: row.get::<i32, _>("api_keys_limit"),
     })
 }

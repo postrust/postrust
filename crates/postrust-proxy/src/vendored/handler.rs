@@ -7,12 +7,10 @@
 
 use crate::config::Route;
 use crate::vendored::hyper_ext::{empty_body, string_body, ProxyBody};
-use hyper::header::{
-    HeaderName, HeaderValue, CONNECTION, CONTENT_LENGTH, HOST, TRANSFER_ENCODING, UPGRADE,
-};
+use hyper::header::{HeaderName, HeaderValue, CONNECTION, FORWARDED, HOST, UPGRADE};
 use hyper::{Method, Version};
 use hyper::{Request, Response, StatusCode};
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 
 /// Standard X-Forwarded headers.
 pub mod headers {
@@ -40,6 +38,14 @@ const HOP_BY_HOP_HEADERS: &[&str] = &[
     "trailer",
     "transfer-encoding",
     "upgrade",
+    // Connection-specific by definition (RFC 9113 section 3.2.1 retired it,
+    // RFC 7540 required it to be named in `Connection`). Listed rather than
+    // left to the `Connection` tokens because a client need not name it, and
+    // an `h2c` upgrade the proxy has declined must not reach the backend
+    // carrying half its handshake.
+    "http2-settings",
+    // Never standard, still sent, and some servers still act on it.
+    "proxy-connection",
 ];
 
 /// Headers a `Connection` token may not remove.
@@ -133,20 +139,58 @@ impl MessageHandler {
         }
     }
 
-    /// Whether the request's body framing is ambiguous.
+    /// Whether `protocol`, as returned by [`Self::upgrade_protocol`] or
+    /// [`Self::h2_connect_protocol`], is one the proxy may tunnel.
     ///
-    /// RFC 9112 section 6.1: a message carrying both `Content-Length` and
-    /// `Transfer-Encoding` is either a smuggling attempt or a broken client.
-    /// `Transfer-Encoding` wins per the spec, but a proxy that quietly
-    /// normalises the disagreement is how a smuggling chain starts, so reject
-    /// it -- which is also how hyper's own parser already treats a duplicate
-    /// `Content-Length`.
+    /// An exact, case-insensitive match against `allowed` -- so a request for
+    /// several protocols at once (`Upgrade: websocket, h2c`) is not a match
+    /// for any of them, and is declined.
+    pub fn upgrade_allowed(protocol: &str, allowed: &[String]) -> bool {
+        allowed
+            .iter()
+            .any(|p| p.trim().eq_ignore_ascii_case(protocol))
+    }
+
+    // There is no check here for a request carrying both `Content-Length` and
+    // `Transfer-Encoding`. There was one, and it could never fire: hyper's
+    // HTTP/1 parser refuses a `Transfer-Encoding` whose last coding is not
+    // `chunked`, and when both are present it frames the body by
+    // `Transfer-Encoding` and drops `Content-Length` before the request
+    // reaches us (RFC 9112 section 6.3). The body is re-framed on the way to
+    // the upstream, and `Transfer-Encoding` is stripped below as hop-by-hop,
+    // so the two can never disagree downstream either.
+
+    /// Why a request path cannot be routed safely, if it cannot.
     ///
-    /// Must be called *before* [`Self::strip_hop_by_hop_headers`], which
-    /// removes the `Transfer-Encoding` this inspects.
-    pub fn has_ambiguous_framing(request: &Request<ProxyBody>) -> bool {
-        let headers = request.headers();
-        headers.contains_key(CONTENT_LENGTH) && headers.contains_key(TRANSFER_ENCODING)
+    /// Routes match the path as sent, and a backend resolves it after
+    /// decoding and normalising -- so any path the two would read differently
+    /// is a way past a route's path rules. `/public/../admin` matched the
+    /// `/public` route and was forwarded verbatim, to a backend that served
+    /// `/admin`. Refused:
+    ///
+    /// - dot-segments (`.` and `..`), literal or percent-encoded in any case,
+    ///   and with a `;parameter` after them, which Tomcat-style servers strip
+    ///   before resolving;
+    /// - an encoded slash or backslash (`%2f`, `%5c`), which a backend may
+    ///   decode into a separator the route never saw;
+    /// - a literal backslash, which some servers treat as a separator.
+    ///
+    /// Refusing rather than normalising: a client that sends these is either
+    /// probing or broken, and normalising would mean the proxy and the
+    /// backend each have to agree with a third reading of the path.
+    pub fn unsafe_path_reason(path: &str) -> Option<&'static str> {
+        let lower = path.to_ascii_lowercase();
+        if lower.contains("%2f") || lower.contains("%5c") || path.contains('\\') {
+            return Some("Encoded or backslash path separators are not allowed");
+        }
+        for segment in lower.split('/') {
+            let segment = segment.split(';').next().unwrap_or("");
+            let decoded = segment.replace("%2e", ".");
+            if decoded == "." || decoded == ".." {
+                return Some("Dot-segments are not allowed in the request path");
+            }
+        }
+        None
     }
 
     /// Remove hop-by-hop headers before forwarding, per RFC 9110 section 7.6.1.
@@ -187,48 +231,102 @@ impl MessageHandler {
     }
 
     /// Add X-Forwarded-* headers to a request.
+    ///
+    /// A backend uses these to decide who the client is -- for its logs, its
+    /// own rate limits, its IP allow-lists -- so a value the client wrote is a
+    /// value the client chose. Unless `trust_client` is set
+    /// (`server.trust_forwarded_headers`), everything the client sent is
+    /// replaced with what the proxy saw: `X-Forwarded-For` and `X-Real-IP`
+    /// become the socket's peer address, and `Forwarded` is removed. It used
+    /// to be appended to, set only if absent, and passed through, which let
+    /// any client claim any address.
+    ///
+    /// With `trust_client`, the client is another proxy: its chain is kept and
+    /// this hop appended to `X-Forwarded-For` and `Forwarded`, and the
+    /// `X-Forwarded-Proto` and `X-Forwarded-Host` it set are left as they
+    /// are, since they describe the original request better than this hop
+    /// can. `X-Real-IP` is still the peer address: it names one address, and
+    /// the one this proxy saw is the one it can vouch for.
     pub fn add_forwarding_headers(
         request: &mut Request<ProxyBody>,
         client_addr: SocketAddr,
         proto: &str,
+        trust_client: bool,
     ) {
         let authority = request.uri().authority().map(|a| a.to_string());
         let headers = request.headers_mut();
-        let client_ip = client_addr.ip().to_string();
+        let client_ip = client_addr.ip().to_canonical();
+        let client_ip_text = client_ip.to_string();
 
-        // X-Forwarded-For: append client IP
-        if let Some(existing) = headers.get(&headers::X_FORWARDED_FOR) {
-            let mut new_value = existing.to_str().unwrap_or("").to_string();
-            new_value.push_str(", ");
-            new_value.push_str(&client_ip);
-            if let Ok(value) = HeaderValue::from_str(&new_value) {
-                headers.insert(headers::X_FORWARDED_FOR.clone(), value);
+        // X-Forwarded-For. Every line the client sent is part of the chain
+        // when it is trusted; none of it is when it is not.
+        let mut chain: Vec<String> = Vec::new();
+        if trust_client {
+            for value in headers.get_all(&headers::X_FORWARDED_FOR).iter() {
+                if let Ok(value) = value.to_str() {
+                    let value = value.trim();
+                    if !value.is_empty() {
+                        chain.push(value.to_string());
+                    }
+                }
             }
-        } else if let Ok(value) = HeaderValue::from_str(&client_ip) {
+        }
+        chain.push(client_ip_text.clone());
+        headers.remove(&headers::X_FORWARDED_FOR);
+        if let Ok(value) = HeaderValue::from_str(&chain.join(", ")) {
             headers.insert(headers::X_FORWARDED_FOR.clone(), value);
         }
 
-        // X-Real-IP: set if not present
-        if !headers.contains_key(&headers::X_REAL_IP) {
-            if let Ok(value) = HeaderValue::from_str(&client_ip) {
-                headers.insert(headers::X_REAL_IP.clone(), value);
+        // X-Real-IP: always the peer.
+        if let Ok(value) = HeaderValue::from_str(&client_ip_text) {
+            headers.insert(headers::X_REAL_IP.clone(), value);
+        }
+
+        // Forwarded (RFC 7239). Rewritten only to extend a trusted chain;
+        // otherwise dropped, since the backend may well read it in preference
+        // to X-Forwarded-For.
+        let mut forwarded: Vec<String> = Vec::new();
+        if trust_client {
+            for value in headers.get_all(FORWARDED).iter() {
+                if let Ok(value) = value.to_str() {
+                    let value = value.trim();
+                    if !value.is_empty() {
+                        forwarded.push(value.to_string());
+                    }
+                }
+            }
+        }
+        headers.remove(FORWARDED);
+        if trust_client {
+            forwarded.push(format!("for={};proto={}", forwarded_node(client_ip), proto));
+            if let Ok(value) = HeaderValue::from_str(&forwarded.join(", ")) {
+                headers.insert(FORWARDED, value);
             }
         }
 
         // X-Forwarded-Proto
-        if let Ok(value) = HeaderValue::from_str(proto) {
-            headers.insert(headers::X_FORWARDED_PROTO.clone(), value);
+        if !(trust_client && headers.contains_key(&headers::X_FORWARDED_PROTO)) {
+            if let Ok(value) = HeaderValue::from_str(proto) {
+                headers.insert(headers::X_FORWARDED_PROTO.clone(), value);
+            }
         }
 
         // X-Forwarded-Host: preserve the original authority. HTTP/2 carries it in
         // the :authority pseudo-header rather than Host, which reaches us on the
         // URI, so fall back to that before giving up.
-        let original_host = headers
-            .get(HOST)
-            .cloned()
-            .or_else(|| authority.and_then(|a| HeaderValue::from_str(&a).ok()));
-        if let Some(host) = original_host {
-            headers.insert(headers::X_FORWARDED_HOST.clone(), host);
+        if !(trust_client && headers.contains_key(&headers::X_FORWARDED_HOST)) {
+            let original_host = headers
+                .get(HOST)
+                .cloned()
+                .or_else(|| authority.and_then(|a| HeaderValue::from_str(&a).ok()));
+            match original_host {
+                Some(host) => {
+                    headers.insert(headers::X_FORWARDED_HOST.clone(), host);
+                }
+                None => {
+                    headers.remove(&headers::X_FORWARDED_HOST);
+                }
+            }
         }
     }
 
@@ -240,10 +338,17 @@ impl MessageHandler {
     }
 
     /// Strip path prefix from request URI.
+    ///
+    /// Only on a segment boundary, by the same rule routes match with
+    /// ([`crate::config::path_has_prefix`]): `/api` comes off `/api/users`
+    /// but not off `/apis`.
     pub fn strip_path_prefix(request: &mut Request<ProxyBody>, prefix: &str) {
         let uri = request.uri();
         let path = uri.path();
 
+        if !crate::config::path_has_prefix(path, prefix) {
+            return;
+        }
         if let Some(new_path) = path.strip_prefix(prefix) {
             let new_path = if new_path.is_empty() || !new_path.starts_with('/') {
                 format!("/{}", new_path.trim_start_matches('/'))
@@ -299,7 +404,7 @@ impl MessageHandler {
             })
     }
 
-    /// Create a 502 Bad Gateway response.
+    /// Create a 400 Bad Request response.
     pub fn bad_request(message: &str) -> Response<ProxyBody> {
         Self::error_response(StatusCode::BAD_REQUEST, message)
     }
@@ -356,6 +461,20 @@ impl MessageHandler {
     /// Create a 404 Not Found response.
     pub fn not_found() -> Response<ProxyBody> {
         Self::error_response(StatusCode::NOT_FOUND, "Not Found")
+    }
+
+    /// Create a 501 Not Implemented response.
+    pub fn not_implemented(message: &str) -> Response<ProxyBody> {
+        Self::error_response(StatusCode::NOT_IMPLEMENTED, message)
+    }
+}
+
+/// An address as an RFC 7239 node: IPv6 is bracketed and quoted, since `:` and
+/// `[` are not allowed in a bare token.
+fn forwarded_node(ip: IpAddr) -> String {
+    match ip {
+        IpAddr::V4(v4) => v4.to_string(),
+        IpAddr::V6(v6) => format!("\"[{v6}]\""),
     }
 }
 
@@ -593,46 +712,6 @@ mod tests {
     }
 
     #[test]
-    fn test_ambiguous_framing_detected() {
-        // Regression: stripping Transfer-Encoding leaves a stale Content-Length
-        // describing a body hyper has already re-framed, so this must be
-        // rejected up front rather than forwarded.
-        let request = Request::builder()
-            .uri("/test")
-            .header("host", "a")
-            .header("content-length", "6")
-            .header("transfer-encoding", "chunked")
-            .body(empty_body())
-            .unwrap();
-
-        assert!(MessageHandler::has_ambiguous_framing(&request));
-    }
-
-    #[test]
-    fn test_content_length_alone_is_not_ambiguous() {
-        let request = Request::builder()
-            .uri("/test")
-            .header("host", "a")
-            .header("content-length", "6")
-            .body(empty_body())
-            .unwrap();
-
-        assert!(!MessageHandler::has_ambiguous_framing(&request));
-    }
-
-    #[test]
-    fn test_transfer_encoding_alone_is_not_ambiguous() {
-        let request = Request::builder()
-            .uri("/test")
-            .header("host", "a")
-            .header("transfer-encoding", "chunked")
-            .body(empty_body())
-            .unwrap();
-
-        assert!(!MessageHandler::has_ambiguous_framing(&request));
-    }
-
-    #[test]
     fn test_strips_each_hop_by_hop_header() {
         // One assertion per header in the RFC 9110 section 7.6.1 set.
         for name in HOP_BY_HOP_HEADERS {
@@ -722,7 +801,7 @@ mod tests {
 
         MessageHandler::strip_hop_by_hop_headers(&mut request);
         let client_addr: SocketAddr = "192.168.1.100:12345".parse().unwrap();
-        MessageHandler::add_forwarding_headers(&mut request, client_addr, "http");
+        MessageHandler::add_forwarding_headers(&mut request, client_addr, "http", false);
 
         assert_eq!(
             request.headers().get("x-forwarded-for").unwrap(),
@@ -753,7 +832,7 @@ mod tests {
             .unwrap();
 
         let client_addr: SocketAddr = "192.168.1.100:12345".parse().unwrap();
-        MessageHandler::add_forwarding_headers(&mut request, client_addr, "https");
+        MessageHandler::add_forwarding_headers(&mut request, client_addr, "https", false);
 
         assert_eq!(
             request.headers().get("x-forwarded-for").unwrap(),
@@ -764,5 +843,178 @@ mod tests {
             request.headers().get("x-forwarded-host").unwrap(),
             "example.com"
         );
+    }
+
+    fn forwarded_request(headers: &[(&str, &str)]) -> Request<ProxyBody> {
+        let mut request = request_with(headers, "/test");
+        let client_addr: SocketAddr = "192.0.2.7:4000".parse().unwrap();
+        MessageHandler::add_forwarding_headers(&mut request, client_addr, "https", false);
+        request
+    }
+
+    #[test]
+    fn client_forwarding_headers_are_overwritten_by_default() {
+        // Each of these was a way for a client to choose the address the
+        // backend saw: X-Real-IP was set only if absent, X-Forwarded-For was
+        // appended to, and Forwarded passed straight through.
+        let request = forwarded_request(&[
+            ("host", "example.com"),
+            ("x-real-ip", "10.0.0.1"),
+            ("x-forwarded-for", "10.0.0.1"),
+            ("x-forwarded-for", "10.0.0.2"),
+            ("forwarded", "for=10.0.0.1;proto=https"),
+            ("x-forwarded-proto", "https-spoofed"),
+            ("x-forwarded-host", "spoofed.test"),
+        ]);
+        let h = request.headers();
+        assert_eq!(h.get("x-real-ip").unwrap(), "192.0.2.7");
+        assert_eq!(h.get_all("x-forwarded-for").iter().count(), 1);
+        assert_eq!(h.get("x-forwarded-for").unwrap(), "192.0.2.7");
+        assert!(!h.contains_key("forwarded"));
+        assert_eq!(h.get("x-forwarded-proto").unwrap(), "https");
+        assert_eq!(h.get("x-forwarded-host").unwrap(), "example.com");
+    }
+
+    #[test]
+    fn a_trusted_chain_is_kept_and_extended() {
+        let mut request = request_with(
+            &[
+                ("host", "internal.test"),
+                ("x-real-ip", "10.0.0.1"),
+                ("x-forwarded-for", "198.51.100.1, 10.0.0.1"),
+                ("forwarded", "for=198.51.100.1;proto=https"),
+                ("x-forwarded-proto", "https"),
+                ("x-forwarded-host", "public.example.com"),
+            ],
+            "/test",
+        );
+        let peer: SocketAddr = "[2001:db8::5]:4000".parse().unwrap();
+        MessageHandler::add_forwarding_headers(&mut request, peer, "http", true);
+
+        let h = request.headers();
+        assert_eq!(
+            h.get("x-forwarded-for").unwrap(),
+            "198.51.100.1, 10.0.0.1, 2001:db8::5"
+        );
+        assert_eq!(
+            h.get("forwarded").unwrap(),
+            "for=198.51.100.1;proto=https, for=\"[2001:db8::5]\";proto=http"
+        );
+        // What the first proxy saw describes the original request better than
+        // this hop can.
+        assert_eq!(h.get("x-forwarded-proto").unwrap(), "https");
+        assert_eq!(h.get("x-forwarded-host").unwrap(), "public.example.com");
+        // X-Real-IP names one address, and it is the one this proxy saw.
+        assert_eq!(h.get("x-real-ip").unwrap(), "2001:db8::5");
+    }
+
+    #[test]
+    fn a_mapped_ipv4_peer_is_reported_as_ipv4() {
+        let mut request = request_with(&[("host", "a")], "/");
+        let peer: SocketAddr = "[::ffff:192.0.2.9]:1".parse().unwrap();
+        MessageHandler::add_forwarding_headers(&mut request, peer, "http", false);
+        assert_eq!(
+            request.headers().get("x-forwarded-for").unwrap(),
+            "192.0.2.9"
+        );
+    }
+
+    #[test]
+    fn dot_segments_and_encoded_separators_are_refused() {
+        for path in [
+            "/public/../admin",
+            "/public/./admin",
+            "/public/..",
+            "/..",
+            "/public/%2e%2e/admin",
+            "/public/%2E%2E/admin",
+            "/public/.%2e/admin",
+            "/public/%2e./admin",
+            "/public/%2e/admin",
+            "/public%2f..%2fadmin",
+            "/public%2F..%2Fadmin",
+            "/public/..%2fadmin",
+            "/public%5c..%5cadmin",
+            "/public/..;/admin",
+            "/public/..;jsessionid=x/admin",
+        ] {
+            assert!(
+                MessageHandler::unsafe_path_reason(path).is_some(),
+                "{path} should be refused"
+            );
+        }
+    }
+
+    #[test]
+    fn ordinary_paths_are_allowed() {
+        for path in [
+            "/",
+            "/public",
+            "/public/",
+            "/public/a.b",
+            "/public/...",
+            "/public/.well-known/x",
+            "/public/..x",
+            "/public/x..",
+            "/public/%2e%2e%2e",
+            "/public/a%20b",
+            "/public//double",
+            "",
+        ] {
+            assert!(
+                MessageHandler::unsafe_path_reason(path).is_none(),
+                "{path} should be allowed"
+            );
+        }
+    }
+
+    #[test]
+    fn a_prefix_is_stripped_only_on_a_segment_boundary() {
+        let mut request = request_with(&[], "/apis/x?q=1");
+        MessageHandler::strip_path_prefix(&mut request, "/api");
+        assert_eq!(request.uri().path(), "/apis/x");
+
+        let mut request = request_with(&[], "/api/x?q=1");
+        MessageHandler::strip_path_prefix(&mut request, "/api");
+        assert_eq!(request.uri().path(), "/x");
+        assert_eq!(request.uri().query(), Some("q=1"));
+
+        // A trailing-slash prefix keeps a leading slash on what is left.
+        let mut request = request_with(&[], "/api/x");
+        MessageHandler::strip_path_prefix(&mut request, "/api/");
+        assert_eq!(request.uri().path(), "/x");
+    }
+
+    #[test]
+    fn only_allowed_protocols_may_be_upgraded_to() {
+        let allowed = vec!["websocket".to_string()];
+        assert!(MessageHandler::upgrade_allowed("websocket", &allowed));
+        assert!(MessageHandler::upgrade_allowed("WebSocket", &allowed));
+        // The smuggling case: an h2c tunnel lets the client send the backend
+        // arbitrary requests past every route rule.
+        assert!(!MessageHandler::upgrade_allowed("h2c", &allowed));
+        assert!(!MessageHandler::upgrade_allowed("websocket, h2c", &allowed));
+        assert!(!MessageHandler::upgrade_allowed("websocket", &[]));
+    }
+
+    #[test]
+    fn an_h2c_upgrade_leaves_nothing_behind_when_stripped() {
+        // Declined upgrades are forwarded as ordinary requests, so none of the
+        // handshake may survive -- HTTP2-Settings included, even when the
+        // client did not name it in Connection.
+        let mut request = request_with(
+            &[
+                ("host", "a"),
+                ("connection", "Upgrade"),
+                ("upgrade", "h2c"),
+                ("http2-settings", "AAMAAABkAAQCAAAAAAIAAAAA"),
+            ],
+            "/",
+        );
+        MessageHandler::strip_hop_by_hop_headers(&mut request);
+        let h = request.headers();
+        assert!(!h.contains_key("upgrade"));
+        assert!(!h.contains_key("connection"));
+        assert!(!h.contains_key("http2-settings"));
     }
 }

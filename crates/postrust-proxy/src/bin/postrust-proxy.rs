@@ -139,6 +139,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         None
     };
 
+    // Its cleanup task -- which forgets clients whose buckets have refilled --
+    // is started by the service when the first listener comes up.
     let rate_limiter = Arc::new(RateLimiter::new(config.rate_limit.clone()));
     let health_checker = Arc::new(HealthChecker::new());
     let service = Arc::new(ProxyService::new(

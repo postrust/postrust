@@ -2,7 +2,7 @@
 
 use crate::admin::api::ApiResponse;
 use crate::saas::auth::Auth;
-use crate::saas::handlers::{error_response, SaasState};
+use crate::saas::handlers::{error_response, require_scope, SaasState};
 use crate::saas::types::{CreateDomainRouteRequest, UpdateDomainRouteRequest};
 use axum::{
     extract::{Path, State},
@@ -18,6 +18,10 @@ pub async fn list_routes(
     Auth(auth): Auth,
     Path(domain_id): Path<Uuid>,
 ) -> impl IntoResponse {
+    if let Err(refusal) = require_scope(&auth, "routes:read") {
+        return refusal;
+    }
+
     match state
         .domain_manager
         .list_routes_for_domain(domain_id, auth.tenant_id)
@@ -35,12 +39,8 @@ pub async fn create_route(
     Path(domain_id): Path<Uuid>,
     Json(req): Json<CreateDomainRouteRequest>,
 ) -> impl IntoResponse {
-    if !auth.can_write("routes") {
-        return (
-            StatusCode::FORBIDDEN,
-            Json(ApiResponse::<()>::error("Insufficient permissions")),
-        )
-            .into_response();
+    if let Err(refusal) = require_scope(&auth, "routes:write") {
+        return refusal;
     }
 
     match state
@@ -59,13 +59,20 @@ pub async fn get_route(
     Auth(auth): Auth,
     Path((domain_id, id)): Path<(Uuid, Uuid)>,
 ) -> impl IntoResponse {
+    if let Err(refusal) = require_scope(&auth, "routes:read") {
+        return refusal;
+    }
+
     match state.domain_manager.get_route(id, auth.tenant_id).await {
         Ok(Some(route)) => {
             // Verify route belongs to the specified domain
             if route.domain_id != domain_id {
                 return (
                     StatusCode::NOT_FOUND,
-                    Json(ApiResponse::<()>::error("Route not found")),
+                    Json(ApiResponse::<()>::error_with_code(
+                        "not_found",
+                        "Route not found",
+                    )),
                 )
                     .into_response();
             }
@@ -73,7 +80,10 @@ pub async fn get_route(
         }
         Ok(None) => (
             StatusCode::NOT_FOUND,
-            Json(ApiResponse::<()>::error("Route not found")),
+            Json(ApiResponse::<()>::error_with_code(
+                "not_found",
+                "Route not found",
+            )),
         )
             .into_response(),
         Err(e) => error_response(e).into_response(),
@@ -87,12 +97,8 @@ pub async fn update_route(
     Path((domain_id, id)): Path<(Uuid, Uuid)>,
     Json(req): Json<UpdateDomainRouteRequest>,
 ) -> impl IntoResponse {
-    if !auth.can_write("routes") {
-        return (
-            StatusCode::FORBIDDEN,
-            Json(ApiResponse::<()>::error("Insufficient permissions")),
-        )
-            .into_response();
+    if let Err(refusal) = require_scope(&auth, "routes:write") {
+        return refusal;
     }
 
     // First check if route exists and belongs to the domain
@@ -101,7 +107,10 @@ pub async fn update_route(
             if route.domain_id != domain_id {
                 return (
                     StatusCode::NOT_FOUND,
-                    Json(ApiResponse::<()>::error("Route not found")),
+                    Json(ApiResponse::<()>::error_with_code(
+                        "not_found",
+                        "Route not found",
+                    )),
                 )
                     .into_response();
             }
@@ -109,7 +118,10 @@ pub async fn update_route(
         Ok(None) => {
             return (
                 StatusCode::NOT_FOUND,
-                Json(ApiResponse::<()>::error("Route not found")),
+                Json(ApiResponse::<()>::error_with_code(
+                    "not_found",
+                    "Route not found",
+                )),
             )
                 .into_response();
         }
@@ -124,7 +136,10 @@ pub async fn update_route(
         Ok(Some(route)) => Json(ApiResponse::success(route)).into_response(),
         Ok(None) => (
             StatusCode::NOT_FOUND,
-            Json(ApiResponse::<()>::error("Route not found")),
+            Json(ApiResponse::<()>::error_with_code(
+                "not_found",
+                "Route not found",
+            )),
         )
             .into_response(),
         Err(e) => error_response(e).into_response(),
@@ -137,12 +152,8 @@ pub async fn delete_route(
     Auth(auth): Auth,
     Path((domain_id, id)): Path<(Uuid, Uuid)>,
 ) -> impl IntoResponse {
-    if !auth.can_write("routes") {
-        return (
-            StatusCode::FORBIDDEN,
-            Json(ApiResponse::<()>::error("Insufficient permissions")),
-        )
-            .into_response();
+    if let Err(refusal) = require_scope(&auth, "routes:write") {
+        return refusal;
     }
 
     // First check if route exists and belongs to the domain
@@ -151,7 +162,10 @@ pub async fn delete_route(
             if route.domain_id != domain_id {
                 return (
                     StatusCode::NOT_FOUND,
-                    Json(ApiResponse::<()>::error("Route not found")),
+                    Json(ApiResponse::<()>::error_with_code(
+                        "not_found",
+                        "Route not found",
+                    )),
                 )
                     .into_response();
             }
@@ -159,7 +173,10 @@ pub async fn delete_route(
         Ok(None) => {
             return (
                 StatusCode::NOT_FOUND,
-                Json(ApiResponse::<()>::error("Route not found")),
+                Json(ApiResponse::<()>::error_with_code(
+                    "not_found",
+                    "Route not found",
+                )),
             )
                 .into_response();
         }
@@ -170,7 +187,10 @@ pub async fn delete_route(
         Ok(true) => Json(ApiResponse::success(())).into_response(),
         Ok(false) => (
             StatusCode::NOT_FOUND,
-            Json(ApiResponse::<()>::error("Route not found")),
+            Json(ApiResponse::<()>::error_with_code(
+                "not_found",
+                "Route not found",
+            )),
         )
             .into_response(),
         Err(e) => error_response(e).into_response(),

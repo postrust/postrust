@@ -55,14 +55,13 @@ jobs:
           fi
 
           # Each crate is published at the version *it* declares, not at the
-          # workspace version: postrust-proxy sets its own, on a 0.x line that
-          # carries no stability promise (see docs/stability.md). A tag ships
-          # whatever every crate currently declares and skips what is already
-          # published, so the proxy releases on the same tags without being
-          # dragged along to 1.0.0.
+          # workspace version: postrust-worker and postrust-proxy each keep a
+          # line of their own (see docs/stability.md). A tag ships whatever
+          # every crate currently declares and skips what is already
+          # published, so they release on the same tags without being moved
+          # to the workspace's number.
           #
-          # Dependency order: leaves first. Nothing depends on postrust-proxy,
-          # so no 1.0.0 crate carries a 0.x dependency.
+          # Dependency order: leaves first. Nothing depends on postrust-proxy.
           for crate in postrust-sql postrust-auth postrust-core postrust-response \
                        postrust-engine postrust-graphql postrust-server postrust-lambda postrust-worker \
                        postrust-proxy; do

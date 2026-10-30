@@ -33,10 +33,11 @@ use postrust_proxy::saas::handlers::{saas_router, SaasState};
 use postrust_proxy::tls::{AcmeIssuer, CertificateStore};
 use sqlx::{Executor, PgPool};
 
-const MIGRATIONS: [&str; 3] = [
+const MIGRATIONS: [&str; 4] = [
     include_str!("../migrations/20240115000001_saas_domains.sql"),
     include_str!("../migrations/20260901000001_proxy_config.sql"),
     include_str!("../migrations/20260901000002_proxy_acme.sql"),
+    include_str!("../migrations/20261030000001_proxy_control_plane.sql"),
 ];
 
 /// See `tests/config_persistence.rs` for why this is locked.

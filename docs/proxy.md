@@ -89,6 +89,27 @@ HTTP/1 request. Measured directly:
 | `PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n` | HTTP/2 `SETTINGS` |
 | `PRI * HTTP/2.0\r\n\r\nXX\r\n\r\n` | `HTTP/1.1 400`, then close |
 
+### Connection limits and timeouts
+
+Every listener -- the main port, the HTTP/2-only port and TLS -- shares these
+`[server]` settings:
+
+```toml
+[server]
+max_connections = 10000            # open connections; past it, new ones wait in the backlog
+header_read_timeout_secs = 30      # to read a request head, and to wait for the next one
+idle_timeout_secs = 60             # with no request in flight: before the first bytes,
+                                   # during a TLS handshake, or an HTTP/2 connection with no streams
+http2_keepalive_interval_secs = 20 # PING an idle HTTP/2 connection; 0 turns it off
+http2_keepalive_timeout_secs = 20  # close it if the PING is not answered
+tunnel_idle_timeout_secs = 300     # a WebSocket with no bytes either way
+```
+
+Without them a client that opens connections and sends nothing, or trickles
+a header line at a time, holds them open for as long as it likes. A timeout
+of 0 is read as 1 second. An upgraded tunnel keeps its connection slot while
+it is open.
+
 ### An HTTP/2-only port
 
 ```toml
@@ -136,6 +157,15 @@ does a `DATABASE_URL`. Keeping routes in PostgreSQL is not a request to
 terminate TLS, and treating it as one opened `0.0.0.0:8443` on proxies that had
 no certificate to answer a handshake with.
 
+Domain names are compared without regard to case or a trailing dot, so a
+certificate stored as `App.Example.com.` is served for `app.example.com`.
+
+**Private keys on disk are owner-only.** The certificate cache writes each
+key as `0600`, atomically, in a directory it creates `0700`; a key left
+readable by an earlier version is tightened at startup. A file name is built
+only from a lowercase DNS name, so no stored domain can name a path outside
+the cache.
+
 New certificates are picked up within a minute without a restart; the resolver
 re-reads the store on a timer, from the database rather than from a cache, so a
 renewal by another instance is seen too.
@@ -167,11 +197,26 @@ Adding a criterion can only narrow a route, never widen it.
 
 - `path_type = "exact"` means exactly that: a route on `/health` does **not**
   catch `/health-internal`.
+- `path_type = "prefix"` matches whole segments: `/v1` matches `/v1` and
+  `/v1/users`, not `/v1beta`. A prefix that ends in `/` keeps its literal
+  meaning. `strip_path` removes the matched segments, so `/v1/users` is
+  forwarded as `/users`.
+- **A path that could step outside its route is refused with 400** before any
+  route is matched: a `.` or `..` segment, literal or percent-encoded in any
+  case (`%2e%2e`, `..;x`), an encoded `/` or `\` (`%2f`, `%5c`), or a literal
+  `\`. Matching the raw text would forward `/public/../admin` under the
+  `/public` route to a backend that may well resolve it to `/admin`.
 - `path_type = "regex"` compiles the path as a regex. One that does not compile
   matches *nothing*, and logs why — treating it as a prefix, or as a match-all,
   would turn a typo into a route that catches traffic it was never meant to.
 - A `*.example.com` host covers exactly one label: `api.example.com`, but not
   `example.com` and not `a.b.example.com`.
+
+A route on a disabled upstream gets **503**, and a disabled backend gets no
+traffic. When every enabled backend of an upstream is failing its health
+check, requests are still spread over the enabled ones rather than refused: a
+wrong health check should not become an outage, and a backend that really is
+down answers 502 anyway. A disabled backend is never the fallback.
 
 `timeout_secs` is honoured: an upstream that does not answer in time gets a
 **504**, distinct from the 502 an upstream that refuses gets, because an
@@ -196,9 +241,13 @@ unhealthy_threshold = 3
 [[upstreams.backends]]
 address = "10.0.0.1:8080"
 scheme = "http"               # http | https
-weight = 1
+weight = 1                    # share under `weighted`; 0 drains it
 enabled = true
 ```
+
+Under `weighted`, shares are computed over the backends that are eligible at
+that moment. A backend with weight 0 next to others gets nothing; if every
+weight is 0 they are treated as equal.
 
 ### Rate limiting
 
@@ -209,12 +258,25 @@ Defaults apply to everything; a route can override them.
 requests = 1000
 window_secs = 60
 burst = 50
+max_tracked_keys = 100000     # clients tracked at once, across routes
 
 [routes.rate_limit]
 requests = 100
 window_secs = 60
 key = "client_ip"             # client_ip | route | { header = "x-api-key" }
 ```
+
+- The rate is `requests / window_secs` as a fraction, so `requests = 3,
+  window_secs = 60` refills one request every 20 seconds.
+- Each route counts on its own: a client's requests to one route do not use
+  up, or set the size of, its allowance on another.
+- `key` says what a bucket belongs to: `client_ip` (the connecting address,
+  with an IPv6 client counted by its /64), `route` (one bucket for the whole
+  route), or a header's value (stored as a digest; a request without the
+  header is counted by its address).
+- Buckets that have refilled completely are dropped in the background. If
+  `max_tracked_keys` are in use and none can be dropped, a new client gets 429
+  rather than going unlimited.
 
 ## What it does to requests
 
@@ -224,14 +286,34 @@ key = "client_ip"             # client_ip | route | { header = "x-api-key" }
 `Connection` header names. Both halves matter. Forwarding `Connection` itself
 was letting a client smuggle arbitrary headers past the proxy.
 
-**A request carrying both `Content-Length` and `Transfer-Encoding` is rejected
-with 400.** RFC 9112 §6.1 gives `Transfer-Encoding` precedence, but a proxy that
-quietly resolves the disagreement is how a request-smuggling chain starts. The
-two ends have to agree before anything is forwarded.
+**A request's framing is the proxy's, not the client's.** The HTTP/1 parser
+refuses a duplicate or disagreeing `Content-Length` and a `Transfer-Encoding`
+that does not end in `chunked`; given both `Content-Length` and
+`Transfer-Encoding: chunked`, it reads the chunked body and drops the length,
+as RFC 9112 §6.3 requires. The body is then re-framed for the upstream, so
+the backend never sees the client's framing headers at all.
 
-**Forwarding headers are added**: `x-forwarded-for`, `x-forwarded-proto`,
-`x-forwarded-host`. Under HTTP/2 there is no `Host` header, so the host falls
-back to the `:authority` pseudo-header.
+**Forwarding headers are the proxy's own.** By default `x-forwarded-for` and
+`x-real-ip` are set to the connecting address, `x-forwarded-proto` and
+`x-forwarded-host` to what the proxy saw, and a client's `forwarded` header is
+removed: anything a client sends in these is replaced, since a backend that
+trusts them would otherwise believe whatever the client claimed. Under HTTP/2
+there is no `Host` header, so the host falls back to the `:authority`
+pseudo-header.
+
+Behind another proxy you control, set `server.trust_forwarded_headers = true`:
+the incoming `x-forwarded-for` and `forwarded` chains are kept and this hop is
+appended, and `x-forwarded-proto`/`-host` are passed on. `x-real-ip` is still
+the connecting address. Rate limiting by `client_ip` always uses the
+connecting address.
+
+**Only WebSocket upgrades are tunnelled.** `server.allowed_upgrade_protocols`
+(default `["websocket"]`) lists the protocols an HTTP/1 `Upgrade` or an
+HTTP/2 extended `CONNECT` may ask for. Any other HTTP/1 upgrade -- `h2c`
+above all -- is forwarded as an ordinary request with the upgrade removed, and
+`HTTP2-Settings` is stripped; another HTTP/2 `:protocol` gets 501. A tunnel to
+a backend that accepted `h2c` would carry requests the proxy never saw, past
+every route's path and method rules.
 
 **`TCP_NODELAY` is set** on the accepted socket, the upgraded socket, and the
 pooled upstream connector. Without it Nagle batches small writes and adds

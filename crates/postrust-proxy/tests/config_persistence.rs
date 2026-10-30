@@ -286,14 +286,13 @@ async fn an_upstream_and_its_backends_come_back_together() {
     let mut saved = upstream(&name);
     saved.description = Some("two backends".into());
     saved.lb_strategy = LoadBalanceStrategy::LeastConnections;
-    saved.health_check = HealthCheckConfig {
-        enabled: false,
-        path: "/healthz".into(),
-        interval_secs: 15,
-        timeout_secs: 3,
-        healthy_threshold: 4,
-        unhealthy_threshold: 5,
-    };
+    saved.health_check = HealthCheckConfig::default();
+    saved.health_check.enabled = false;
+    saved.health_check.path = "/healthz".into();
+    saved.health_check.interval_secs = 15;
+    saved.health_check.timeout_secs = 3;
+    saved.health_check.healthy_threshold = 4;
+    saved.health_check.unhealthy_threshold = 5;
     saved.backends = vec![
         Backend {
             id: Some(Uuid::new_v4()),

@@ -12,10 +12,8 @@ honestly describe both.
 | --- | --- | --- |
 | **Stable** | `postrust-core`, `postrust-sql`, `postrust-auth`, `postrust-response`, `postrust-engine`, `postrust-graphql`, `postrust-server`, `postrust-lambda` | Semver. A breaking change to the public Rust API needs a major bump. |
 | **Stable, versioned on its own** | `postrust-worker` (from 1.0.0) | Semver, over its configuration and behaviour rather than a Rust API. See below. |
-| **Unstable** | `postrust-proxy` | None. On its own `0.x`, where a minor bump may break anything. |
+| **Stable, versioned on its own** | `postrust-proxy` (from 1.0.0) | Semver, over its Rust API, its configuration, and the HTTP API of its SaaS and admin routers. See below. |
 
-Nothing in the stable line depends on the unstable crate, so no crate that
-makes a semver promise carries a dependency that cannot keep one.
 `postrust-proxy` depends on `postrust-core`, not the other way round, and
 `postrust-worker` is built as a `cdylib`, which cannot be a Rust library
 dependency at all.
@@ -28,8 +26,8 @@ keeps a number of its own.
 One wrinkle from the transition: both `postrust-proxy` and `postrust-worker`
 were published at `1.0.0-alpha.1` and `1.0.0-alpha.2` before the split. Those
 are prereleases, so Cargo does not select them by default, and they predate
-the split. For the proxy, that `1.0.0` line will never get a stable successor;
-`cargo add postrust-proxy` resolves to the newest `0.x`. The worker's stable
+the split. The proxy's stable `1.0.0` follows `0.6.0`; the prereleases came
+before the split and share nothing with it but a name. The worker's stable
 `1.0.0` is not those prereleases' successor either: it is the Workers adapter
 released in 2.3.0 as `0.7.0`, and shares nothing with them but a name.
 
@@ -54,31 +52,30 @@ the worker's and `postrust-core`'s versions and are rebuilt from the database
 when they do not match, and the `worker` crate it builds against, which is
 itself `0.x` and does not appear in the Worker's surface.
 
-## Why the proxy is held back
+## What the proxy promises
 
-Not caution for its own sake. Three specific things:
+From 1.0.0, `postrust-proxy` follows semver on a line of its own. A breaking
+change to any of these needs a major version:
 
-**It has not been lived with.** The documentation gap is closed --
-`missing_docs` and `dead_code` are on and clean, where they used to be blanket
-`allow`s hiding 306 and 4 warnings -- but nobody outside this repository has
-depended on the API, and the surface is wide: routing, TLS, ACME, an admin API
-and a multi-tenant module. Freezing it now would be guessing at what people
-need.
+- **Its Rust API**: the public types, traits and functions of the crate, as
+  for the stable line. Configuration types that grow with features
+  (`ServerConfig`, `RateLimitDefaults`, `SaasOptions`, `DomainPolicy` and
+  their neighbours) are `#[non_exhaustive]` where adding a field should be a
+  minor release.
+- **Its configuration**: the TOML keys and database tables it reads, what each
+  means, and their defaults.
+- **The HTTP API of `saas_router` and the admin routers**: routes, request and
+  response shapes, status codes, and the `code` an error carries.
+- **Its migrations**: a new release adds migrations; it never edits one that
+  shipped.
 
-**There is no configuration reload.** Changing the config needs a restart. What
-was there -- a `ConfigReloader` whose channel nobody read, a
-`server.watch_config_file` that watched nothing, and a `POST /config/reload`
-that answered "Configuration reload requested" without reloading -- is removed
-rather than left to be believed.
-
-**It has only just grown its transport layer.** TLS, HTTP/2, WebSocket and
-RFC 8441 extended CONNECT all landed in `1.0.0-alpha.2`. They are measured, by
-h2spec and Autobahn and the HTTP Garden differential fuzzer — see
-`scripts/h2spec/`, `scripts/autobahn/` and `scripts/http-garden/` — but
-measured is not the same as lived with.
-
-The crate is useful and it is tested. It is not finished, and its version
-number says so.
+It reached 1.0.0 by being audited rather than by being lived with: the
+transport layer is measured by h2spec, Autobahn and the HTTP Garden
+differential fuzzer (`scripts/h2spec/`, `scripts/autobahn/`,
+`scripts/http-garden/`), and 1.0.0 closes what a security review of the data
+plane and the multi-tenant module found. Two limits stay documented rather
+than promised away: there is no configuration reload, so a change needs a
+restart, and a route's `retry_count` is still unread (see docs/proxy.md).
 
 ## What semver covers in the stable line
 
@@ -106,8 +103,8 @@ does not need a major release.
 
 Not covered:
 
-- `postrust-proxy`, entirely, and `postrust-worker`'s Rust items: it is
-  promised as a Worker (above), not as a library.
+- `postrust-worker`'s Rust items: it is promised as a Worker (above), not as
+  a library.
 - Anything reachable only through a `#[doc(hidden)]` item or a private module.
 - The exact wording of error messages, and log output.
 - Behaviour under configurations the documentation calls unsupported.

@@ -69,7 +69,12 @@ pub struct ProxyState {
     pub config: std::sync::Arc<tokio::sync::RwLock<ProxyConfig>>,
     /// Health checker instance
     pub health_checker: std::sync::Arc<HealthChecker>,
-    /// Rate limiter instance
+    /// Rate limiter instance.
+    ///
+    /// Its cleanup task is not started here. [`vendored::ProxyService`]
+    /// starts it for the limiter it is given when it begins serving; a limiter
+    /// used anywhere else needs [`RateLimiter::start_cleanup`] spawned, or
+    /// the clients it has seen are never forgotten.
     pub rate_limiter: std::sync::Arc<RateLimiter>,
 }
 

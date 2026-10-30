@@ -4,6 +4,28 @@ use crate::ProxyState;
 use axum::{extract::State, response::Html, routing::get, Router};
 use std::sync::Arc;
 
+/// Escape text for an HTML element body or a quoted attribute value.
+///
+/// Every value interpolated into these pages goes through this. Route and
+/// upstream names, hosts, paths and backend addresses all come from the API --
+/// and so from whoever can reach it -- and a name like
+/// `<script>...</script>` would otherwise run in the browser of the operator
+/// viewing the dashboard, with the operator's access.
+fn esc(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    for c in text.chars() {
+        match c {
+            '&' => out.push_str("&amp;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            '"' => out.push_str("&quot;"),
+            '\'' => out.push_str("&#39;"),
+            c => out.push(c),
+        }
+    }
+    out
+}
+
 /// Create the admin UI router.
 pub fn admin_ui_router() -> Router<Arc<ProxyState>> {
     Router::new()
@@ -89,9 +111,9 @@ async fn routes_page(State(state): State<Arc<ProxyState>>) -> Html<String> {
                 <td>{}</td>
             </tr>"#,
                 r.id.map(|id| id.to_string()).unwrap_or_default(),
-                r.name,
-                r.match_.host.as_deref().unwrap_or("*"),
-                r.match_.path.as_deref().unwrap_or("/"),
+                esc(&r.name),
+                esc(r.match_.host.as_deref().unwrap_or("*")),
+                esc(r.match_.path.as_deref().unwrap_or("/")),
                 r.priority,
             )
         })
@@ -156,12 +178,12 @@ async fn upstreams_page(State(state): State<Arc<ProxyState>>) -> Html<String> {
                 r#"<tr>
                 <td>{}</td>
                 <td>{}</td>
-                <td>{:?}</td>
+                <td>{}</td>
                 <td>{}</td>
             </tr>"#,
                 u.id.map(|id| id.to_string()).unwrap_or_default(),
-                u.name,
-                u.lb_strategy,
+                esc(&u.name),
+                esc(&format!("{:?}", u.lb_strategy)),
                 u.backends.len(),
             )
         })
@@ -237,7 +259,11 @@ async fn health_page(State(state): State<Arc<ProxyState>>) -> Html<String> {
                     <td>{}</td>
                     <td class="{}">{}</td>
                 </tr>"#,
-                upstream.name, backend.address, backend.scheme, status_class, status,
+                esc(&upstream.name),
+                esc(&backend.address),
+                esc(&backend.scheme),
+                status_class,
+                status,
             ));
         }
     }
@@ -325,4 +351,18 @@ async fn certificates_page(State(_state): State<Arc<ProxyState>>) -> Html<String
 </html>"#;
 
     Html(html.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn markup_is_escaped() {
+        assert_eq!(
+            esc(r#"<script>alert("x")</script> & 'y'"#),
+            "&lt;script&gt;alert(&quot;x&quot;)&lt;/script&gt; &amp; &#39;y&#39;"
+        );
+        assert_eq!(esc("plain-name_1"), "plain-name_1");
+    }
 }

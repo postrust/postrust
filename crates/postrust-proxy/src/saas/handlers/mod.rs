@@ -9,11 +9,13 @@ pub mod wellknown;
 use crate::admin::api::ApiResponse;
 use crate::error::{ProxyError, ProxyResult};
 use crate::saas::api_keys::ApiKeyService;
-use crate::saas::auth::SaasAuthLayer;
+use crate::saas::auth::{AuthContext, SaasAuthLayer};
 use crate::saas::manager::DomainManager;
+use crate::saas::options::SaasOptions;
 use crate::saas::verification::DomainVerificationService;
 use crate::tls::CertificateStore;
 use axum::{
+    http::StatusCode,
     middleware,
     routing::{delete, get, post, put},
     Router,
@@ -45,22 +47,47 @@ pub struct SaasState {
 }
 
 impl SaasState {
-    /// Create new SaaS state.
-    /// Build the state.
+    /// Build the state with default [`SaasOptions`] and this JWT secret.
     ///
     /// `cert_dir` is where certificates are cached on disk. A parameter rather
     /// than a default, because a proxy that silently writes private keys to a
     /// directory nobody chose is worse than one that makes you say where.
+    ///
+    /// The defaults reserve no platform hostnames. A deployment that serves
+    /// its own names from the same proxy should use
+    /// [`with_options`](Self::with_options) and list them in
+    /// [`DomainPolicy::reserved`](crate::saas::DomainPolicy::reserved).
     pub async fn new(
         pool: PgPool,
         jwt_secret: Option<String>,
         cert_dir: impl AsRef<std::path::Path>,
     ) -> ProxyResult<Self> {
+        let options = SaasOptions {
+            jwt_secret,
+            ..SaasOptions::default()
+        };
+        Self::with_options(pool, options, cert_dir).await
+    }
+
+    /// Build the state from explicit options.
+    pub async fn with_options(
+        pool: PgPool,
+        options: SaasOptions,
+        cert_dir: impl AsRef<std::path::Path>,
+    ) -> ProxyResult<Self> {
         let verification_service = Arc::new(DomainVerificationService::new());
-        let domain_manager = Arc::new(DomainManager::new(pool.clone(), verification_service));
+        let domain_manager = Arc::new(DomainManager::with_policy(
+            pool.clone(),
+            verification_service,
+            options.domains,
+        ));
         let api_key_service = Arc::new(ApiKeyService::new(pool.clone()));
         let pool_for_handlers = pool.clone();
-        let auth_layer = Arc::new(SaasAuthLayer::new(pool, jwt_secret));
+        let auth_layer = Arc::new(
+            SaasAuthLayer::new(pool, options.jwt_secret)
+                .with_jwt_audience(options.jwt_audience)
+                .with_jwt_issuer(options.jwt_issuer),
+        );
 
         let cert_store =
             Arc::new(CertificateStore::new(pool_for_handlers.clone(), cert_dir).await?);
@@ -161,9 +188,163 @@ pub fn saas_router(state: SaasState) -> Router {
         .nest("/api/v1", protected_routes)
 }
 
-/// Helper to convert ProxyError to API response.
-pub fn error_response(error: ProxyError) -> (axum::http::StatusCode, axum::Json<ApiResponse<()>>) {
-    let status = error.status_code();
-    let response = ApiResponse::<()>::error(error.to_string());
-    (status, axum::Json(response))
+/// Turn an error into the response a tenant sees.
+///
+/// Errors that are about the request -- validation, not found, conflict, quota
+/// -- carry a message written for the caller, and it is returned. Everything
+/// else is ours: a database error, an I/O error, a TLS library's complaint.
+/// Those are logged in full and answered with a fixed message, because their
+/// text is written for an operator and says things about the deployment --
+/// table and constraint names, file paths, sometimes the offending value --
+/// that a tenant has no business reading.
+///
+/// Every response carries a stable `code` to match on.
+pub fn error_response(error: ProxyError) -> (StatusCode, axum::Json<ApiResponse<()>>) {
+    let (status, code, message) = match error {
+        ProxyError::Validation(message) => (StatusCode::BAD_REQUEST, "validation_failed", message),
+        ProxyError::NotFound(message) => (StatusCode::NOT_FOUND, "not_found", message),
+        ProxyError::Conflict(message) => (StatusCode::CONFLICT, "conflict", message),
+        ProxyError::QuotaExceeded(message) => {
+            (StatusCode::PAYMENT_REQUIRED, "quota_exceeded", message)
+        }
+        ProxyError::Forbidden(message) => (StatusCode::FORBIDDEN, "forbidden", message),
+        ProxyError::Auth(message) => (StatusCode::UNAUTHORIZED, "unauthorized", message),
+        ProxyError::Verification(message) => {
+            (StatusCode::BAD_REQUEST, "verification_failed", message)
+        }
+        ProxyError::TenantSuspended => (
+            StatusCode::FORBIDDEN,
+            "tenant_suspended",
+            "Tenant account is suspended".to_string(),
+        ),
+        ProxyError::RateLimitExceeded => (
+            StatusCode::TOO_MANY_REQUESTS,
+            "rate_limited",
+            "Too many attempts; try again later".to_string(),
+        ),
+        ProxyError::Database(error) => return database_error(error),
+        other => {
+            tracing::error!(error = %other, "SaaS API request failed");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "internal_error",
+                "Internal server error".to_string(),
+            )
+        }
+    };
+    (
+        status,
+        axum::Json(ApiResponse::<()>::error_with_code(code, message)),
+    )
+}
+
+/// A database error, as a tenant sees it.
+///
+/// A constraint violation is the caller's -- two routes on one path, two
+/// upstreams of one name, a value out of range -- and gets a 4xx, but still a
+/// fixed message: the constraint's name and the duplicated value are in the
+/// error text, and the duplicated value may be someone else's. Anything else is
+/// a 500.
+fn database_error(error: sqlx::Error) -> (StatusCode, axum::Json<ApiResponse<()>>) {
+    let kind = error.as_database_error().map(|e| e.kind());
+    let (status, code, message) = match kind {
+        Some(sqlx::error::ErrorKind::UniqueViolation) => (
+            StatusCode::CONFLICT,
+            "conflict",
+            "A resource with these values already exists",
+        ),
+        Some(sqlx::error::ErrorKind::ForeignKeyViolation) => (
+            StatusCode::CONFLICT,
+            "conflict",
+            "The request refers to a resource that does not exist or is still in use",
+        ),
+        Some(sqlx::error::ErrorKind::CheckViolation | sqlx::error::ErrorKind::NotNullViolation) => {
+            (
+                StatusCode::BAD_REQUEST,
+                "validation_failed",
+                "A value in the request is not allowed",
+            )
+        }
+        _ => {
+            tracing::error!(%error, "SaaS API database error");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "internal_error",
+                "Internal server error",
+            )
+        }
+    };
+    if status.is_client_error() {
+        tracing::debug!(%error, "SaaS API request refused by a constraint");
+    }
+    (
+        status,
+        axum::Json(ApiResponse::<()>::error_with_code(code, message)),
+    )
+}
+
+/// Refuse a request whose credential lacks `scope`.
+///
+/// Every handler calls this first, reads included. Reads were unchecked for a
+/// long time, and a key created with no scopes at all could list every domain
+/// with its verification token.
+pub(crate) fn require_scope(
+    auth: &AuthContext,
+    scope: &str,
+) -> Result<(), axum::response::Response> {
+    use axum::response::IntoResponse;
+
+    if auth.grants(scope) {
+        return Ok(());
+    }
+    Err((
+        StatusCode::FORBIDDEN,
+        axum::Json(ApiResponse::<()>::error_with_code(
+            "insufficient_scope",
+            format!("Insufficient permissions: this requires the {scope} scope"),
+        )),
+    )
+        .into_response())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn render(error: ProxyError) -> (StatusCode, serde_json::Value) {
+        let (status, axum::Json(body)) = error_response(error);
+        (status, serde_json::to_value(body).unwrap())
+    }
+
+    #[test]
+    fn errors_of_ours_are_not_described() {
+        for error in [
+            ProxyError::Database(sqlx::Error::PoolTimedOut),
+            ProxyError::Database(sqlx::Error::Protocol(
+                "relation \"proxy_domains\" does not exist".into(),
+            )),
+            ProxyError::Io(std::io::Error::other(
+                "/var/lib/postrust/certs: permission denied",
+            )),
+            ProxyError::Tls("bad key".into()),
+            ProxyError::Internal("secret detail".into()),
+        ] {
+            let (status, body) = render(error);
+            assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+            assert_eq!(body["code"], "internal_error");
+            assert_eq!(body["error"], "Internal server error");
+        }
+    }
+
+    #[test]
+    fn errors_about_the_request_keep_their_message() {
+        let (status, body) = render(ProxyError::Validation("the domain is empty".into()));
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(body["code"], "validation_failed");
+        assert_eq!(body["error"], "the domain is empty");
+
+        let (status, body) = render(ProxyError::RateLimitExceeded);
+        assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(body["code"], "rate_limited");
+    }
 }

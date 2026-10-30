@@ -11,6 +11,7 @@
 //! Licensed under MIT License.
 
 mod backend;
+mod conn;
 mod forwarder;
 mod handler;
 mod hyper_ext;
