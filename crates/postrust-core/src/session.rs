@@ -67,6 +67,7 @@ pub struct Session<'a> {
     isolation: Option<IsolationLevel>,
     read_only: bool,
     pre_request: bool,
+    set_search_path: bool,
 }
 
 impl<'a> Session<'a> {
@@ -94,6 +95,7 @@ impl<'a> Session<'a> {
             isolation: None,
             read_only: false,
             pre_request: true,
+            set_search_path: true,
         }
     }
 
@@ -165,6 +167,18 @@ impl<'a> Session<'a> {
     /// Whether the transaction is read-only. See [`Session::statements`].
     pub fn read_only(mut self, read_only: bool) -> Self {
         self.read_only = read_only;
+        self
+    }
+
+    /// Whether to set `search_path` to the schema and `db_extra_search_path`.
+    /// On unless turned off.
+    ///
+    /// Off for SQL that qualifies every name it means to come from the
+    /// API's schemas, and should otherwise resolve names as the role and the
+    /// database normally would -- GraphQL's, which calls extension functions
+    /// such as PostGIS's unqualified, wherever the database installed them.
+    pub fn set_search_path(mut self, set_search_path: bool) -> Self {
+        self.set_search_path = set_search_path;
         self
     }
 
@@ -255,7 +269,9 @@ impl<'a> Session<'a> {
             settings.push(("statement_timeout".to_string(), timeout.to_string()));
         }
 
-        settings.push(("search_path".to_string(), self.search_path()));
+        if self.set_search_path {
+            settings.push(("search_path".to_string(), self.search_path()));
+        }
         settings.push(("role".to_string(), self.role.clone()));
         let request = [
             ("request.method", &self.method),
@@ -622,5 +638,31 @@ mod tests {
             ]
         );
         assert!(!names(&untraced).contains(&"request.trace_id".to_string()));
+    }
+
+    /// Turned off, the `search_path` is left as the role and the database
+    /// set it, and nothing else changes.
+    #[test]
+    fn the_search_path_can_be_left_alone() {
+        let config = AppConfig::default();
+        let set = Session::new(&config, "web_anon", claims()).statements();
+        let left = Session::new(&config, "web_anon", claims())
+            .set_search_path(false)
+            .statements();
+        assert_eq!(
+            left,
+            vec![SessionStatement::new(
+                set_config(3),
+                text(&[
+                    "role",
+                    "web_anon",
+                    "request.jwt.claims",
+                    r#"{"role":"web_anon"}"#,
+                    "request.jwt.claims.role",
+                    "web_anon",
+                ]),
+            )]
+        );
+        assert_eq!(set[0].params[0], SqlParam::Text("search_path".into()));
     }
 }

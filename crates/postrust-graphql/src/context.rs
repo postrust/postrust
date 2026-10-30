@@ -123,8 +123,7 @@ pub struct GraphQLContext {
     pub write: SharedWrite,
     /// The server's configuration, which a transaction is set up from.
     ///
-    /// What [`Self::session`] reads beyond the caller: the `search_path`, a
-    /// role's own `statement_timeout` and isolation level, the server-wide
+    /// What [`Self::session`] reads beyond the caller: a role's own `statement_timeout` and isolation level, the server-wide
     /// isolation level and `app_settings`. The same configuration REST's
     /// transactions are set up from, so a function or a policy sees the same
     /// thing whichever of the two called it.
@@ -149,7 +148,7 @@ impl GraphQLContext {
     /// Set up this request's transactions from `config`.
     ///
     /// Without it they are set up from [`AppConfig::default`]: PostgREST's
-    /// defaults, a `search_path` of `public`, and no role settings.
+    /// defaults, and no role settings.
     pub fn with_config(mut self, config: Arc<AppConfig>) -> Self {
         self.config = config;
         self
@@ -202,7 +201,7 @@ impl GraphQLContext {
     ///
     /// The same [`Session`] a REST request's transaction is set up by, so the
     /// two cannot drift apart: one `SELECT set_config(...)` carrying the
-    /// role's own `statement_timeout`, the `search_path`, the database role,
+    /// role's own `statement_timeout`, the database role,
     /// the verified JWT as `request.jwt.claims` and `request.jwt.claims.<name>`,
     /// and the `app.settings.*` -- and then, last, the `hasura.*` session
     /// variables, which no REST request has. Ahead of it, the isolation level
@@ -213,16 +212,16 @@ impl GraphQLContext {
     /// a caller speaks as -- which exists in no catalogue and goes in only as
     /// `hasura.role` and inside `hasura.session`.
     ///
-    /// The `search_path` is the configuration's default schema then
-    /// `db_extra_search_path`, which is what REST sets for a request to the
-    /// default schema. An operation may touch every exposed schema, and the
-    /// SQL generated for one names each table it reads with its schema, so
-    /// the path decides nothing about which table a field reads; what it
-    /// decides is what an unqualified name inside a function or a policy
-    /// resolves to, and what PostGIS's functions are found by. Taking REST's
-    /// means a function answers the same over both, and that an extension
-    /// installed outside `public` is found where `db_extra_search_path` says
-    /// it is, as it is for REST.
+    /// Unlike REST, the `search_path` is left as the role and the database
+    /// set it, as GraphQL has always left it and as Hasura does. An operation
+    /// may touch every exposed schema, and the SQL generated for one names
+    /// each table it reads with its schema, so the path decides nothing about
+    /// which table a field reads. What it does decide is where the
+    /// unqualified calls in that SQL -- PostGIS's `ST_AsGeoJSON` among them
+    /// -- are found. Setting REST's path would stop finding an extension
+    /// installed outside `db_extra_search_path` (in `extensions`, say, as
+    /// Supabase installs them) that the role's own path finds, and a GraphQL
+    /// query that worked would stop working.
     ///
     /// Nothing about the HTTP request goes in. `request.headers` would carry
     /// the admin secret, which [`postrust_auth::hasura`] keeps out of every
@@ -243,7 +242,8 @@ impl GraphQLContext {
             .into_iter()
             .fold(
                 Session::new(&self.config, self.role(), self.auth.claim_settings())
-                    .pre_request(false),
+                    .pre_request(false)
+                    .set_search_path(false),
                 |session, (name, value)| session.setting(name, value),
             )
     }
@@ -432,14 +432,14 @@ mod tests {
 
         let settings = sent_settings(&ctx);
         let names: Vec<&str> = settings.iter().map(|(name, _)| name.as_str()).collect();
-        assert_eq!(names[..3], ["statement_timeout", "search_path", "role"]);
+        assert_eq!(names[..2], ["statement_timeout", "role"]);
         assert_eq!(
             names[names.len() - 3..],
             ["hasura.user_id", "hasura.session", "hasura.role"]
         );
         // The claims and the app settings between them, in whichever order
         // the claims come.
-        let mut middle = names[3..names.len() - 3].to_vec();
+        let mut middle = names[2..names.len() - 3].to_vec();
         middle.sort_unstable();
         assert_eq!(
             middle,
@@ -451,10 +451,8 @@ mod tests {
             ]
         );
         assert_eq!(setting(&settings, "statement_timeout"), Some("250"));
-        assert_eq!(
-            setting(&settings, "search_path"),
-            Some(r#""api", "public", "extensions""#)
-        );
+        // Left as the role and the database set it: see `session`.
+        assert_eq!(setting(&settings, "search_path"), None);
         assert_eq!(setting(&settings, "role"), Some("authenticated"));
         assert_eq!(setting(&settings, "hasura.role"), Some("Artist"));
     }

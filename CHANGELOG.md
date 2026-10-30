@@ -40,16 +40,12 @@ configuration keys are unchanged.
     `PGRST_ROLE_SETTINGS`, and the server-wide `PGRST_DB_TX_ISOLATION`. A
     GraphQL operation as a role limited to 5 seconds is cancelled after 5
     seconds, as a REST request is;
-  - a `search_path` of the default schema then `PGRST_DB_EXTRA_SEARCH_PATH`,
-    where it used to run with whatever the connection had -- usually
-    `"$user", public` from the database's own default. Every table GraphQL
-    reads it names with its schema, so this decides only what an unqualified
-    name inside a function or a policy resolves to, and where PostGIS is
-    found: an extension installed outside `public` has to be in
-    `PGRST_DB_EXTRA_SEARCH_PATH`, as it already had to be for REST;
   - `app.settings.*` from `PGRST_APP_SETTINGS_<NAME>`.
 
-  Unchanged: GraphQL does not call `PGRST_DB_PRE_REQUEST`, sets no
+  Unchanged: GraphQL leaves the `search_path` as the role and the database
+  set it, so PostGIS and other extensions are found wherever they were
+  before (`Session::set_search_path(false)`); it does not call
+  `PGRST_DB_PRE_REQUEST`, sets no
   `request.method`, `request.path`, `request.headers` or `request.cookies`,
   and does not run a query in a read-only transaction.
 - **`postrust_core::query::build_query` takes the plan alone**, and
@@ -185,10 +181,7 @@ token validated sets `state.jwt_cache = None`. Replace a `JwtConfig { .. }` with
 assignments; `secret` is now `keys`, built with `JwtKeys::from_config`. Both
 constructors fail only when the JWT secret does not parse.
 
-A GraphQL deployment that relied on the connection's own `search_path` --
-PostGIS or another extension in a schema that is neither `public` nor in
-`PGRST_DB_EXTRA_SEARCH_PATH` -- should add that schema to
-`PGRST_DB_EXTRA_SEARCH_PATH`. A role in `PGRST_ROLE_SETTINGS` whose
+A role in `PGRST_ROLE_SETTINGS` whose
 `statement_timeout` was written with only REST in mind now limits its GraphQL
 operations too. Code that called `build_query(&plan, role)` drops the role;
 code embedding the GraphQL handler passes its configuration with
