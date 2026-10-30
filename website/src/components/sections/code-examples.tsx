@@ -244,39 +244,45 @@ curl "localhost:3000/rpc/search_similar" \\
     label: "Custom Routes",
     examples: [
       {
-        title: "Rust Handler Definition",
-        code: `// crates/postrust-server/src/custom.rs
-use axum::{extract::State, Json, routing::post};
+        title: "Routes of Your Own",
+        code: `// src/main.rs -- a crate depending on postrust-server, not a fork
+use postrust_server::{AppState, Builder, Host, User};
 
-pub fn custom_router() -> Router<Arc<AppState>> {
-    Router::new()
-        .route("/webhooks/stripe", post(handle_stripe))
-        .route("/ai/embed", post(generate_embedding))
+async fn handle_stripe(Json(event): Json<Value>) -> Json<Value> {
+    Json(json!({ "received": true }))
 }
 
-async fn handle_stripe(
+// Runs as the caller: their role, their claims, row-level security
+async fn my_orders(
+    user: User,
     State(state): State<Arc<AppState>>,
-    body: String,
-) -> impl IntoResponse {
-    // Full access to database pool, config, JWT
-    let result = sqlx::query("UPDATE subscriptions...")
-        .execute(&state.pool).await;
-    Json(json!({ "received": true }))
-}`,
+) -> Result<Json<Value>, postrust_server::Error> {
+    let mut tx = state.begin_as(&user).await?;
+    let (n,): (i64,) = sqlx::query_as("SELECT count(*) FROM orders")
+        .fetch_one(&mut *tx).await?;
+    tx.commit().await?;
+    Ok(Json(json!({ "orders": n })))
+}
+
+let app = Builder::new(AppConfig::try_from_env()?, Host::SERVER)
+    .nest("/hooks", Router::new()
+        .route("/stripe", post(handle_stripe))
+        .route("/orders", get(my_orders)))
+    .build()
+    .await?;`,
       },
       {
         title: "Custom Middleware",
-        code: `// Add rate limiting, logging, or custom auth
+        code: `// Wrap everything Postrust serves, its own API included
 use axum::middleware;
 
-pub fn custom_router() -> Router<Arc<AppState>> {
-    Router::new()
-        .route("/api/expensive", post(expensive_operation))
-        .layer(middleware::from_fn(rate_limit))
-        .layer(middleware::from_fn(custom_auth))
-}
+let app = Builder::new(config, Host::SERVER)
+    .nest("/hooks", hooks())
+    .layer(middleware::from_fn(rate_limit))
+    .build()
+    .await?;
 
-async fn rate_limit<B>(req: Request<B>, next: Next<B>) -> Response {
+async fn rate_limit(req: Request, next: Next) -> Response {
     // Check rate limits, return 429 if exceeded
     next.run(req).await
 }`,
@@ -292,30 +298,41 @@ export const CodeExamplesSection = component$(() => {
     <section class="section-padding bg-white">
       <div class="container-wide">
         {/* Section Header */}
-        <div class="text-center max-w-3xl mx-auto mb-12">
-          <div class="inline-flex items-center gap-2 px-3 py-1 bg-accent-100 text-accent-700 rounded-full text-sm font-medium mb-4">
-            <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-              <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M10 20l4-16m4 4l4 4-4 4M6 16l-4-4 4-4"/>
+        <div class="mx-auto mb-12 max-w-3xl text-center">
+          <div class="bg-accent-100 text-accent-700 mb-4 inline-flex items-center gap-2 rounded-full px-3 py-1 text-sm font-medium">
+            <svg
+              class="h-4 w-4"
+              fill="none"
+              stroke="currentColor"
+              viewBox="0 0 24 24"
+            >
+              <path
+                stroke-linecap="round"
+                stroke-linejoin="round"
+                stroke-width="2"
+                d="M10 20l4-16m4 4l4 4-4 4M6 16l-4-4 4-4"
+              />
             </svg>
             Developer Experience
           </div>
-          <h2 class="text-3xl md:text-4xl font-bold text-neutral-900 mb-4">
+          <h2 class="mb-4 text-3xl font-bold text-neutral-900 md:text-4xl">
             Intuitive API, powerful results
           </h2>
           <p class="text-lg text-neutral-600">
             Whether you prefer REST or GraphQL, Postrust provides a clean,
-            consistent API that's easy to use and powerful enough for production.
+            consistent API that's easy to use and powerful enough for
+            production.
           </p>
         </div>
 
         {/* Tab Navigation */}
-        <div class="flex justify-center mb-8">
-          <div class="inline-flex p-1 bg-neutral-100 rounded-lg">
+        <div class="mb-8 flex justify-center">
+          <div class="inline-flex rounded-lg bg-neutral-100 p-1">
             {codeExamples.map((tab) => (
               <button
                 key={tab.id}
-                onClick$={() => activeTab.value = tab.id}
-                class={`px-6 py-2.5 text-sm font-medium rounded-md transition-all ${
+                onClick$={() => (activeTab.value = tab.id)}
+                class={`rounded-md px-6 py-2.5 text-sm font-medium transition-all ${
                   activeTab.value === tab.id
                     ? "bg-white text-neutral-900 shadow-sm"
                     : "text-neutral-600 hover:text-neutral-900"
@@ -331,35 +348,45 @@ export const CodeExamplesSection = component$(() => {
         {codeExamples.map((tab) => (
           <div
             key={tab.id}
-            class={`grid md:grid-cols-2 gap-6 ${
+            class={`grid gap-6 md:grid-cols-2 ${
               activeTab.value === tab.id ? "block" : "hidden"
             }`}
           >
             {tab.examples.map((example) => (
               <div
                 key={example.title}
-                class="bg-neutral-900 rounded-xl overflow-hidden"
+                class="overflow-hidden rounded-xl bg-neutral-900"
               >
                 {/* Header */}
-                <div class="flex items-center justify-between px-4 py-3 bg-neutral-800 border-b border-neutral-700">
+                <div class="flex items-center justify-between border-b border-neutral-700 bg-neutral-800 px-4 py-3">
                   <span class="text-sm font-medium text-neutral-300">
                     {example.title}
                   </span>
                   <button
                     type="button"
-                    class="p-1.5 text-neutral-400 hover:text-white hover:bg-neutral-700 rounded transition-colors"
+                    class="rounded p-1.5 text-neutral-400 transition-colors hover:bg-neutral-700 hover:text-white"
                     aria-label="Copy code"
                   >
-                    <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                      <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8 16H6a2 2 0 01-2-2V6a2 2 0 012-2h8a2 2 0 012 2v2m-6 12h8a2 2 0 002-2v-8a2 2 0 00-2-2h-8a2 2 0 00-2 2v8a2 2 0 002 2z"/>
+                    <svg
+                      class="h-4 w-4"
+                      fill="none"
+                      stroke="currentColor"
+                      viewBox="0 0 24 24"
+                    >
+                      <path
+                        stroke-linecap="round"
+                        stroke-linejoin="round"
+                        stroke-width="2"
+                        d="M8 16H6a2 2 0 01-2-2V6a2 2 0 012-2h8a2 2 0 012 2v2m-6 12h8a2 2 0 002-2v-8a2 2 0 00-2-2h-8a2 2 0 00-2 2v8a2 2 0 002 2z"
+                      />
                     </svg>
                   </button>
                 </div>
                 {/* Code */}
-                <div class="p-4 overflow-x-auto">
-                  <pre class="text-sm font-mono leading-relaxed">
+                <div class="overflow-x-auto p-4">
+                  <pre class="font-mono text-sm leading-relaxed">
                     <code
-                      class="text-neutral-100 whitespace-pre"
+                      class="whitespace-pre text-neutral-100"
                       dangerouslySetInnerHTML={emailOff(example.code)}
                     />
                   </pre>
@@ -373,11 +400,21 @@ export const CodeExamplesSection = component$(() => {
         <div class="mt-12 text-center">
           <a
             href="/docs/api-reference/"
-            class="inline-flex items-center gap-2 text-primary-600 hover:text-primary-700 font-medium"
+            class="text-primary-600 hover:text-primary-700 inline-flex items-center gap-2 font-medium"
           >
             View full API reference
-            <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-              <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M13 7l5 5m0 0l-5 5m5-5H6"/>
+            <svg
+              class="h-4 w-4"
+              fill="none"
+              stroke="currentColor"
+              viewBox="0 0 24 24"
+            >
+              <path
+                stroke-linecap="round"
+                stroke-linejoin="round"
+                stroke-width="2"
+                d="M13 7l5 5m0 0l-5 5m5-5H6"
+              />
             </svg>
           </a>
         </div>

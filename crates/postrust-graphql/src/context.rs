@@ -2,6 +2,7 @@
 
 use postrust_auth::AuthResult;
 use postrust_core::schema_cache::SchemaCacheRef;
+use postrust_core::{AppConfig, Session};
 use sqlx::PgPool;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -20,7 +21,7 @@ use std::sync::Arc;
 /// query never touches it.
 pub type SharedWrite = Arc<tokio::sync::Mutex<Option<sqlx::Transaction<'static, sqlx::Postgres>>>>;
 
-/// The `SET LOCAL` settings a request's session variables and role need.
+/// The `hasura.*` settings a request's session variables and role need.
 ///
 /// Free of the context so it can be read on its own, which is also the only
 /// way to test it: a [`GraphQLContext`] needs a connection pool and none of
@@ -120,6 +121,13 @@ pub struct GraphQLContext {
     pub elevated: bool,
     /// The transaction every write in this operation shares. See [`SharedWrite`].
     pub write: SharedWrite,
+    /// The server's configuration, which a transaction is set up from.
+    ///
+    /// What [`Self::session`] reads beyond the caller: a role's own `statement_timeout` and isolation level, the server-wide
+    /// isolation level and `app_settings`. The same configuration REST's
+    /// transactions are set up from, so a function or a policy sees the same
+    /// thing whichever of the two called it.
+    pub config: Arc<AppConfig>,
 }
 
 impl GraphQLContext {
@@ -133,7 +141,17 @@ impl GraphQLContext {
             hasura_role: None,
             elevated: false,
             write: Arc::new(tokio::sync::Mutex::new(None)),
+            config: Arc::new(AppConfig::default()),
         }
+    }
+
+    /// Set up this request's transactions from `config`.
+    ///
+    /// Without it they are set up from [`AppConfig::default`]: PostgREST's
+    /// defaults, and no role settings.
+    pub fn with_config(mut self, config: Arc<AppConfig>) -> Self {
+        self.config = config;
+        self
     }
 
     /// Record who the caller is in Hasura's sense, and whether it proved it.
@@ -178,15 +196,56 @@ impl GraphQLContext {
         self
     }
 
-    /// The transaction-local settings this request's identity needs.
+    /// What makes a transaction this request's: the statements that turn a
+    /// pooled connection into the caller.
     ///
-    /// Hasura session variables retain their existing representation, while
-    /// the verified JWT is exposed as both `request.jwt.claims` JSON and
-    /// individual `request.jwt.claims.<name>` settings.
-    pub fn session_settings(&self) -> Vec<(String, String)> {
-        let mut settings = session_settings_for(&self.session, self.acting_role());
-        settings.extend(self.auth.claim_settings());
-        settings
+    /// The same [`Session`] a REST request's transaction is set up by, so the
+    /// two cannot drift apart: one `SELECT set_config(...)` carrying the
+    /// role's own `statement_timeout`, the database role,
+    /// the verified JWT as `request.jwt.claims` and `request.jwt.claims.<name>`,
+    /// and the `app.settings.*` -- and then, last, the `hasura.*` session
+    /// variables, which no REST request has. Ahead of it, the isolation level
+    /// where the role's setting or `PGRST_DB_TX_ISOLATION` asks for one other
+    /// than PostgreSQL's default.
+    ///
+    /// The role is [`Self::role`], the database role, never the Hasura role
+    /// a caller speaks as -- which exists in no catalogue and goes in only as
+    /// `hasura.role` and inside `hasura.session`.
+    ///
+    /// Unlike REST, the `search_path` is left as the role and the database
+    /// set it, as GraphQL has always left it and as Hasura does. An operation
+    /// may touch every exposed schema, and the SQL generated for one names
+    /// each table it reads with its schema, so the path decides nothing about
+    /// which table a field reads. What it does decide is where the
+    /// unqualified calls in that SQL -- PostGIS's `ST_AsGeoJSON` among them
+    /// -- are found. Setting REST's path would stop finding an extension
+    /// installed outside `db_extra_search_path` (in `extensions`, say, as
+    /// Supabase installs them) that the role's own path finds, and a GraphQL
+    /// query that worked would stop working.
+    ///
+    /// Nothing about the HTTP request goes in. `request.headers` would carry
+    /// the admin secret, which [`postrust_auth::hasura`] keeps out of every
+    /// setting a function can read; `request.method` and `request.path` are
+    /// the same for every operation and tell a function nothing. And
+    /// `db_pre_request` is not called: it is a hook on REST requests, written
+    /// against the `request.*` settings it would find missing here, and GraphQL
+    /// has never run it.
+    ///
+    /// Read-write, as a GraphQL transaction always has been, for a query as
+    /// for a mutation. A query's SQL is a `SELECT`, and the query root serves
+    /// no volatile function, so `SET TRANSACTION READ ONLY` would refuse
+    /// little -- but whatever it did refuse, a volatile function a computed
+    /// field calls say, is an answer that changes, and that is a change of its
+    /// own to make and measure rather than one to carry in with this.
+    pub fn session(&self) -> Session<'_> {
+        session_settings_for(&self.session, self.acting_role())
+            .into_iter()
+            .fold(
+                Session::new(&self.config, self.role(), self.auth.claim_settings())
+                    .pre_request(false)
+                    .set_search_path(false),
+                |session, (name, value)| session.setting(name, value),
+            )
     }
 
     /// The session as a function reading `hasura_session` expects it.
@@ -206,9 +265,9 @@ impl GraphQLContext {
 
     /// The database role this request's transaction runs as.
     ///
-    /// Not [`Self::acting_role`], which is who the caller says it is. `SET
-    /// LOCAL ROLE` takes this one, because it is the only one of the two that
-    /// has to exist in the catalogue.
+    /// Not [`Self::acting_role`], which is who the caller says it is. The
+    /// session's `role` setting takes this one, because it is the only one of
+    /// the two that has to exist in the catalogue.
     pub fn role(&self) -> &str {
         &self.auth.role
     }
@@ -288,15 +347,39 @@ mod tests {
         assert_eq!(document["x-hasura-role"], serde_json::json!("Artist"));
     }
 
-    #[tokio::test]
-    async fn graphql_transactions_receive_the_verified_jwt_claims_document() {
-        let ctx = GraphQLContext::new(
+    fn context(auth: AuthResult) -> GraphQLContext {
+        GraphQLContext::new(
             PgPool::connect_lazy("postgres://localhost/test").expect("valid test URL"),
             SchemaCacheRef::default(),
-            create_test_auth(),
-        );
+            auth,
+        )
+    }
 
-        let settings = ctx.session_settings();
+    /// Every setting a session sends, in the order it sends them, from the
+    /// one `SELECT set_config(...)` that carries them.
+    fn sent_settings(ctx: &GraphQLContext) -> Vec<(String, String)> {
+        let statements = ctx.session().statements();
+        let carrying = statements
+            .iter()
+            .find(|s| s.sql.starts_with("SELECT set_config("))
+            .expect("one statement carries the settings");
+        carrying
+            .params
+            .chunks(2)
+            .map(|pair| match pair {
+                [postrust_sql::SqlParam::Text(name), postrust_sql::SqlParam::Text(value)] => {
+                    (name.clone(), value.clone())
+                }
+                other => panic!("{other:?}"),
+            })
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn graphql_transactions_receive_the_verified_jwt_claims_document() {
+        let ctx = context(create_test_auth());
+
+        let settings = sent_settings(&ctx);
         let claims: serde_json::Value =
             serde_json::from_str(setting(&settings, "request.jwt.claims").unwrap()).unwrap();
 
@@ -310,6 +393,68 @@ mod tests {
             setting(&settings, "request.jwt.claims.role"),
             Some("authenticated")
         );
+    }
+
+    /// The database role is what the transaction runs as, and the Hasura role
+    /// goes in only as `hasura.*`. The role's own settings go before it, the
+    /// `hasura.*` variables after everything REST sends, and nothing about an
+    /// HTTP request goes in at all.
+    #[tokio::test]
+    async fn a_graphql_session_runs_as_the_database_role_with_the_hasura_variables_last() {
+        let mut config = AppConfig::default();
+        config.db_schemas = vec!["api".to_string(), "other".to_string()];
+        config.db_extra_search_path = vec!["public".to_string(), "extensions".to_string()];
+        config.db_pre_request = Some("check_request".to_string());
+        let mut role = postrust_core::config::RoleSettings::default();
+        role.isolation_level = Some(postrust_core::config::IsolationLevel::RepeatableRead);
+        role.statement_timeout = Some(250);
+        config
+            .role_settings
+            .insert("authenticated".to_string(), role);
+        config
+            .app_settings
+            .insert("tenant".to_string(), "acme".to_string());
+        let ctx = context(create_test_auth())
+            .with_config(Arc::new(config))
+            .with_session(session(&[("user_id", "7")]))
+            .with_identity(Some("Artist".to_string()), false);
+
+        let statements = ctx.session().statements();
+        assert_eq!(
+            statements[0].sql, "SET TRANSACTION ISOLATION LEVEL REPEATABLE READ",
+            "the role's isolation level"
+        );
+        assert_eq!(
+            statements.len(),
+            2,
+            "neither read-only nor db_pre_request: {statements:?}"
+        );
+
+        let settings = sent_settings(&ctx);
+        let names: Vec<&str> = settings.iter().map(|(name, _)| name.as_str()).collect();
+        assert_eq!(names[..2], ["statement_timeout", "role"]);
+        assert_eq!(
+            names[names.len() - 3..],
+            ["hasura.user_id", "hasura.session", "hasura.role"]
+        );
+        // The claims and the app settings between them, in whichever order
+        // the claims come.
+        let mut middle = names[2..names.len() - 3].to_vec();
+        middle.sort_unstable();
+        assert_eq!(
+            middle,
+            [
+                "app.settings.tenant",
+                "request.jwt.claims",
+                "request.jwt.claims.role",
+                "request.jwt.claims.user_id",
+            ]
+        );
+        assert_eq!(setting(&settings, "statement_timeout"), Some("250"));
+        // Left as the role and the database set it: see `session`.
+        assert_eq!(setting(&settings, "search_path"), None);
+        assert_eq!(setting(&settings, "role"), Some("authenticated"));
+        assert_eq!(setting(&settings, "hasura.role"), Some("Artist"));
     }
 
     #[test]

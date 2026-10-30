@@ -29,6 +29,32 @@ default = []
 graphql = ["postrust-graphql", "async-graphql", "async-graphql-axum"]
 admin-ui = ["graphql", "utoipa"]
 
+# OpenTelemetry: traces and metrics exported over OTLP, and the metrics as
+# Prometheus text at `GET /metrics` on the admin port. Compiled into the
+# published images, and inactive until configured: with no
+# `OTEL_EXPORTER_OTLP_ENDPOINT` no exporter runs, and with no admin port either
+# nothing is measured at all. See docs/observability.md.
+#
+# - OTLP over HTTP/protobuf only, so tonic and its gRPC stack are not pulled
+#   in. No client feature of opentelemetry-otlp either: each of its clients is
+#   reqwest 0.13 or a hyper client of its own, a second HTTP stack beside the
+#   reqwest 0.12 the server already has for `PGRST_JWT_JWKS_URL`.
+#   `otel::client` is that reqwest, behind the exporter's `HttpClient` trait.
+# - tracing-opentelemetry turns the spans the server already opens into OTel
+#   spans, so nothing is instrumented twice.
+# - opentelemetry-prometheus renders the same meters as the exposition format.
+#   Maintained in the opentelemetry-rust repository again since 0.32, and its
+#   `prometheus` dependency no longer brings protobuf (RUSTSEC-2024-0437).
+otel = [
+    "dep:opentelemetry",
+    "dep:opentelemetry_sdk",
+    "dep:opentelemetry-otlp",
+    "dep:opentelemetry-http",
+    "dep:tracing-opentelemetry",
+    "dep:opentelemetry-prometheus",
+    "dep:prometheus",
+]
+
 # Test only, never shipped: REST requests run through the socket driver a
 # Cloudflare Worker uses (`postrust_core::db::PgSocketDb`) instead of the sqlx
 # pool, over a TCP connection per request. It exists so the conformance suite
@@ -77,10 +103,18 @@ anyhow.workspace = true
 
 # Utilities
 http.workspace = true
+# `request.headers` and `request.cookies` for `User`, the maps `Session` takes.
+indexmap.workspace = true
 bytes.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 chrono.workspace = true
+# The request span's response future; already in the tree through tower.
+pin-project-lite = "0.2"
+# Fetching `PGRST_JWT_JWKS_URL`. rustls on ring, which sqlx already links, and
+# webpki's roots; reqwest builds its TLS config with its provider named, so it
+# does not depend on (or disturb) a process-wide default.
+reqwest.workspace = true
 
 # Internal
 postrust-core = { workspace = true, features = ["sqlx"] }
@@ -95,8 +129,22 @@ postrust-graphql = { workspace = true, optional = true }
 async-graphql = { version = "7", optional = true }
 async-graphql-axum = { version = "7", optional = true }
 
+# OpenTelemetry (optional; the `otel` feature)
+opentelemetry = { workspace = true, optional = true }
+opentelemetry_sdk = { workspace = true, optional = true }
+opentelemetry-otlp = { workspace = true, optional = true }
+opentelemetry-http = { workspace = true, optional = true }
+tracing-opentelemetry = { workspace = true, optional = true }
+opentelemetry-prometheus = { workspace = true, optional = true }
+prometheus = { workspace = true, optional = true }
+
 [dev-dependencies]
 jsonwebtoken.workspace = true
+futures.workspace = true
+base64.workspace = true
+# tests/otel.rs exports spans to memory rather than to a collector.
+opentelemetry_sdk = { workspace = true, features = ["testing"] }
+opentelemetry.workspace = true
 # tests/drivers_agree.rs runs both database drivers side by side.
 postrust-core = { workspace = true, features = ["sqlx", "pg-socket"] }
 postrust-sql.workspace = true

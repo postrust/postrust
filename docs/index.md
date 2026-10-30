@@ -14,6 +14,7 @@ Welcome to the Postrust documentation. Postrust serves a PostgreSQL schema as a 
 - [Reverse Proxy](./proxy.md) - Routing, TLS, HTTP/2 and WebSocket at the front door
 - [SaaS Domain Management](./saas-domains.md) - Multi-tenant custom domains with automatic SSL (Beta)
 - [Deployment](./deployment.md) - Deploy to various platforms
+- [Observability](./observability.md) - OpenTelemetry traces and metrics, and Prometheus `/metrics`
 - [Stability and Versioning](./stability.md) - What a version number promises, and which crates it covers
 - [Benchmarking](./benchmarking.md) - The method, and why the throughput figures are currently withdrawn
 - [PostgREST Conformance](./postgrest-conformance.md) - How closely the two agree, measured against PostgREST itself

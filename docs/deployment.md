@@ -4,12 +4,15 @@ Deploy Postrust to various environments. This guide covers deploying both the st
 
 ## Building with Custom Routes
 
-If you've added [custom routes](./custom-routes.md), build your customized version:
+The stock `postrust` binary is built from this repository as below. If you've
+added [custom routes](./custom-routes.md), you build your own binary crate
+instead -- `cargo build --release` in that crate -- with the same features
+enabled on its `postrust-server` dependency.
 
 ### Standard Build
 
 ```bash
-# Build optimized binary with custom routes
+# Build optimized binary
 cargo build --release -p postrust-server
 
 # Binary location
@@ -27,7 +30,7 @@ cargo build --release -p postrust-server --features admin-ui
 
 | Feature | Description |
 |---------|-------------|
-| `default` | Core REST API with custom routes |
+| `default` | Core REST API |
 | `admin-ui` | Admin dashboard + Swagger + GraphQL playground |
 
 ## Standalone Server
@@ -93,8 +96,8 @@ Images are published to Docker Hub, in two variants of each build:
 
 | | |
 |---|---|
-| `postrust/postrust:2.4.1` | Debian base |
-| `postrust/postrust:2.4.1-alpine` | Alpine base -- much smaller |
+| `postrust/postrust:3.0.0` | Debian base |
+| `postrust/postrust:3.0.0-alpine` | Alpine base -- much smaller |
 
 `latest` and `latest-alpine` track the newest stable release and never a
 prerelease. `1.0` follows the newest patch of that minor.
@@ -118,23 +121,22 @@ docker run -d \
 
 ### Building Your Own Image (with Custom Routes)
 
-If you've added custom routes in `crates/postrust-server/src/custom.rs`, build your own image:
+If you've written your own binary with [custom routes](./custom-routes.md), build an image of it. Here the crate is named `my-api`:
 
 ```dockerfile
 # Dockerfile
-FROM rust:1.88-bookworm AS builder
+FROM rust:1.94-bookworm AS builder
 
 # Install build dependencies
 RUN apt-get update && apt-get install -y pkg-config libssl-dev
 
 WORKDIR /app
 
-# Copy workspace files
+# Copy your crate
 COPY Cargo.toml Cargo.lock ./
-COPY crates ./crates
+COPY src ./src
 
-# Build with admin-ui feature (optional)
-RUN cargo build --release -p postrust-server --features admin-ui
+RUN cargo build --release
 
 # Runtime stage
 FROM debian:bookworm-slim
@@ -143,7 +145,7 @@ RUN apt-get update && \
     apt-get install -y libssl3 ca-certificates && \
     rm -rf /var/lib/apt/lists/*
 
-COPY --from=builder /app/target/release/postrust /usr/local/bin/
+COPY --from=builder /app/target/release/my-api /usr/local/bin/
 
 # Default environment
 ENV PGRST_SERVER_HOST=0.0.0.0
@@ -155,7 +157,7 @@ EXPOSE 3000
 HEALTHCHECK --interval=30s --timeout=3s --start-period=5s --retries=3 \
     CMD curl -f http://localhost:3000/_/health || exit 1
 
-CMD ["postrust"]
+CMD ["my-api"]
 ```
 
 Build and run:
@@ -579,21 +581,76 @@ curl http://localhost:3000/
 
 ### Prometheus Metrics
 
-Coming soon: `/metrics` endpoint for Prometheus scraping.
+With `PGRST_ADMIN_SERVER_PORT` set, the published images serve Prometheus
+metrics at `/metrics` on the admin port -- request durations, the pool, the
+token cache, schema reloads -- and never on the API port. Traces and metrics
+can also be exported over OTLP. See [Observability](./observability.md).
 
-### Logging
+### Tracing and logging
 
-Configure structured JSON logging:
+Every request runs in a span named `request`, whose fields follow
+OpenTelemetry's HTTP server conventions:
+
+| Field | Value |
+|-------|-------|
+| `http.request.method` | `GET`, `POST`, ... |
+| `url.path` | The path asked for, without the query string |
+| `http.route` | The route that matched, not the path: `/api/{*path}` for every REST resource, `/v1/graphql` for GraphQL. Unset when nothing matched |
+| `http.response.status_code` | Recorded when the response is ready |
+| `otel.kind` | `server` |
+| `otel.status_code` | `ERROR` on a 5xx; unset otherwise |
+| `request_id` | See below |
+| `trace_id` | See below |
+
+Every line logged while a request is served carries those fields, so an error
+from deep in the query path says which request it belonged to. REST requests
+open `auth`, `plan`, `db.query` and `render` spans beneath it, at debug. The
+`db.query` span carries `db.system`, `db.operation.name` (`select`, `insert`,
+`update`, `delete`, `call`) and `db.collection.name`; set
+`PGRST_OTEL_DB_STATEMENT=true` to add the main statement as `db.query.text`.
+The statement is parameterized, so request values are not in it, but table,
+column and function names are.
+
+**Request id.** A client's `x-request-id` is used when it is one value of at
+most 128 visible ASCII characters; otherwise the server makes a UUID. Either
+way it is returned in the `x-request-id` response header.
+
+**Trace context.** A W3C `traceparent` header puts the request in the
+caller's trace; `tracestate` is carried with it. A request without one, or
+with one that does not parse (including version `ff`), starts a new trace.
+
+The trace id also reaches the database, as the transaction-local setting
+`request.trace_id` beside `request.method` and `request.path`. A function can
+read it with `current_setting('request.trace_id', true)`, and `auto_explain`
+output or a slow statement in the PostgreSQL log can be tied back to the trace
+of the request that sent it.
+
+**One line per request**, with the status and `latency_ms`, is logged at
+debug. At the default `info` it would be a line for every request, and the
+failures worth seeing are already logged where they happen, with their cause.
+
+**JSON.** `PGRST_LOG_FORMAT=json` writes one JSON object per line, for a log
+shipper. Each object has the event's fields, the current span, and every span
+above it with its fields:
 
 ```bash
-PGRST_LOG_LEVEL=info
-RUST_LOG=postrust=info
+PGRST_LOG_FORMAT=json
+RUST_LOG=postrust=debug,sqlx=warn
 ```
 
-Output:
 ```json
-{"timestamp":"2024-01-15T10:30:00Z","level":"INFO","message":"Request completed","method":"GET","path":"/users","status":200,"duration_ms":15}
+{"timestamp":"2026-10-29T20:12:51.791304Z","level":"DEBUG","fields":{"message":"request finished","status":200,"latency_ms":38.36},"target":"postrust_server::telemetry","span":{"http.request.method":"GET","http.response.status_code":200,"http.route":"/api/{*path}","otel.kind":"server","request_id":"26dfa785-7249-45e2-9045-86565c2ea840","trace_id":"4bf92f3577b34da6a3ce929d0e0e4736","url.path":"/api/users","name":"request"},"spans":[...]}
 ```
+
+The Lambda adapter serves the same router, so it gets the same spans, and
+reads `PGRST_LOG_FORMAT` too. A Cloudflare Worker has the engine's spans but
+no request span or subscriber of its own.
+
+Built with the `otel` feature, as the published images are, the spans are
+exported over OTLP when `OTEL_EXPORTER_OTLP_ENDPOINT` is set, with the
+caller's trace id and the `trace_id` above as the exported trace's; see
+[Observability](./observability.md). Otherwise they reach the log and nothing
+else.
 
 ## Fly.io
 

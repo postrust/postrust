@@ -40,6 +40,8 @@ bytes.workspace = true
 http.workspace = true
 
 anyhow.workspace = true
+# `FlushLayer`, with the `otel` feature; already in the tree through axum.
+tower = { workspace = true, optional = true }
 
 # Internal
 postrust-server = { workspace = true, features = ["graphql"] }
@@ -54,6 +56,13 @@ default = []
 # default: a function is billed for its size on every cold start, and the UI is
 # a development tool.
 admin-ui = ["postrust-server/admin-ui"]
+# Traces and metrics over OTLP, flushed at the end of every invocation so a
+# sandbox frozen between invocations does not sit on them. Point
+# `OTEL_EXPORTER_OTLP_ENDPOINT` at the ADOT collector extension
+# (`http://localhost:4318`). See docs/observability.md.
+otel = ["postrust-server/otel", "dep:tower"]
 
 [dev-dependencies]
 pretty_assertions.workspace = true
+# The library's documentation example adds a route.
+axum.workspace = true

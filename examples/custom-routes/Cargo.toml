@@ -1,0 +1,25 @@
+[package]
+name = "postrust-example-custom-routes"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.94"
+license = "MIT"
+publish = false
+description = "A server of your own: Postrust's API with routes you add beside it"
+
+# Not a member of the repository's workspace -- see `exclude` in ../../Cargo.toml.
+# This is what a project of yours looks like: a crate that depends on
+# postrust-server rather than a fork of it. In your own Cargo.toml, replace each
+# `path` with the version from crates.io, e.g. `postrust-server = "3"`.
+
+[dependencies]
+postrust-server = { path = "../../crates/postrust-server" }
+postrust-core = { path = "../../crates/postrust-core" }
+
+axum = "0.8"
+tokio = { version = "1.43", features = ["full"] }
+sqlx = { version = "0.9", default-features = false, features = ["postgres"] }
+serde_json = "1.0"
+anyhow = "1.0"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }

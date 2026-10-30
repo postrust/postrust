@@ -27,9 +27,9 @@ use axum::Router;
 use postrust_core::{AppConfig, SchemaCache};
 use postrust_server::{handle_request, AppState};
 use sqlx::postgres::PgPoolOptions;
+use sqlx::AssertSqlSafe;
 use sqlx::PgPool;
 use std::sync::Arc;
-use tokio::sync::RwLock;
 use tower::ServiceExt;
 
 /// Each test's own schema, named after its table. One shared schema made
@@ -58,7 +58,10 @@ async fn table(pool: &PgPool, name: &str) {
         format!("INSERT INTO {schema}.{name} SELECT g, 0 FROM generate_series(1, 5) g"),
         format!("GRANT SELECT, UPDATE ON {schema}.{name} TO web_anon"),
     ] {
-        sqlx::query(&statement).execute(pool).await.unwrap();
+        sqlx::query(AssertSqlSafe(statement))
+            .execute(pool)
+            .await
+            .unwrap();
     }
 }
 
@@ -67,7 +70,7 @@ async fn table(pool: &PgPool, name: &str) {
 async fn run(pool: &PgPool, table: &str, statements: &[&str]) {
     let schema = schema(table);
     for statement in statements {
-        sqlx::query(&statement.replace("{schema}", &schema))
+        sqlx::query(AssertSqlSafe(statement.replace("{schema}", &schema)))
             .execute(pool)
             .await
             .unwrap();
@@ -97,19 +100,12 @@ async fn state_with(
     let schema_cache = SchemaCache::load(&pool, &config.db_schemas)
         .await
         .expect("schema cache");
-    let jwt_config = postrust_auth::JwtConfig {
-        secret: config.jwt_secret.clone(),
-        secret_is_base64: config.jwt_secret_is_base64,
-        audience: config.jwt_aud.clone(),
-        role_claim_key: config.jwt_role_claim_key.clone(),
-        anon_role: config.db_anon_role.clone(),
-    };
-    Arc::new(AppState {
-        pool,
-        schema_cache: RwLock::new(schema_cache),
-        config,
-        jwt_config,
-        jwt_cache: None,
+    Arc::new({
+        let mut state =
+            AppState::new(pool, schema_cache, config).expect("the test's JWT secret parses");
+        // Uncached, so a test sees each request validated as it was written.
+        state.jwt_cache = None;
+        state
     })
 }
 
@@ -163,9 +159,9 @@ async fn send(
 
 async fn changed(pool: &PgPool, table: &str) -> i64 {
     let schema = schema(table);
-    sqlx::query_scalar(&format!(
+    sqlx::query_scalar(AssertSqlSafe(format!(
         "SELECT count(*) FROM {schema}.{table} WHERE n = 1"
-    ))
+    )))
     .fetch_one(pool)
     .await
     .unwrap()

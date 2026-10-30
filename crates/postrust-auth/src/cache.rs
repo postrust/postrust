@@ -11,6 +11,7 @@
 //! request either way.
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
 // `std::time` natively; on wasm32, where `Instant::now()` and
 // `SystemTime::now()` panic, the JavaScript host's clock.
@@ -33,6 +34,59 @@ struct Entry {
 pub struct JwtCache {
     entries: Mutex<HashMap<String, Entry>>,
     max_lifetime: Duration,
+    /// The [`crate::JwtKeys::generation`] every entry was verified under.
+    ///
+    /// Read and written only while `entries` is locked, so the two change
+    /// together; atomic only so that `JwtCache` stays `Sync` without a second
+    /// lock. When a later set of keys appears, every entry was verified
+    /// against a set that is no longer in force -- possibly by a key that has
+    /// just been withdrawn -- and they are all forgotten. Only ever moves
+    /// forward: see [`Self::get_under`].
+    keys_generation: AtomicU64,
+    // How many lookups found a live entry, and how many had to verify. Plain
+    // counters rather than a metric, so this crate stays free of any
+    // telemetry dependency and builds for a Worker as before; a host that
+    // exports metrics reads them with `stats`. Relaxed increments beside a
+    // mutex every lookup already takes: the cost is lost in the lock's.
+    hits: AtomicU64,
+    misses: AtomicU64,
+}
+
+/// Whether a lookup in a [`JwtCache`] was answered from it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum CacheOutcome {
+    /// A live entry for the token answered, and no signature was checked.
+    Hit,
+    /// The token was verified, whatever the verdict, and cached if it could
+    /// be.
+    Miss,
+    /// Nothing to look up: the request carried no token, or its
+    /// `Authorization` header was not a bearer token at all. Not counted as
+    /// either of the others, so a server mostly answering anonymous requests
+    /// does not read as one whose cache never hits.
+    Bypassed,
+}
+
+impl CacheOutcome {
+    /// `hit`, `miss` or `bypassed`: the value a span or a metric records.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            CacheOutcome::Hit => "hit",
+            CacheOutcome::Miss => "miss",
+            CacheOutcome::Bypassed => "bypassed",
+        }
+    }
+}
+
+/// How many lookups a [`JwtCache`] has answered, since it was made.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct CacheStats {
+    /// Answered from the cache.
+    pub hits: u64,
+    /// Verified, because nothing live was cached for the token.
+    pub misses: u64,
 }
 
 impl JwtCache {
@@ -47,7 +101,29 @@ impl JwtCache {
         Some(Self {
             entries: Mutex::new(HashMap::new()),
             max_lifetime: Duration::from_secs(max_lifetime_secs),
+            keys_generation: AtomicU64::new(0),
+            hits: AtomicU64::new(0),
+            misses: AtomicU64::new(0),
         })
+    }
+
+    /// Forget every token held.
+    ///
+    /// Done by the cache itself whenever the key set it is used with changes;
+    /// for a host that wants to revoke for some other reason.
+    pub fn clear(&self) {
+        self.entries
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear();
+    }
+
+    /// The lookups answered so far, for a host to export as a metric.
+    pub fn stats(&self) -> CacheStats {
+        CacheStats {
+            hits: self.hits.load(Ordering::Relaxed),
+            misses: self.misses.load(Ordering::Relaxed),
+        }
     }
 
     /// Authenticate, consulting the cache.
@@ -60,15 +136,52 @@ impl JwtCache {
         auth_header: Option<&str>,
         config: &JwtConfig,
     ) -> Result<AuthResult, JwtError> {
+        self.authenticate_with_outcome(auth_header, config).0
+    }
+
+    /// [`authenticate`](Self::authenticate), saying whether the cache
+    /// answered.
+    ///
+    /// A separate method rather than a change to that one's return type, so
+    /// that every caller of it builds unchanged. The verdict is the same
+    /// either way; the outcome is for a span or a metric to record.
+    pub fn authenticate_with_outcome(
+        &self,
+        auth_header: Option<&str>,
+        config: &JwtConfig,
+    ) -> (Result<AuthResult, JwtError>, CacheOutcome) {
         let Some(header) = auth_header else {
-            return crate::authenticate(None, config);
+            return (crate::authenticate(None, config), CacheOutcome::Bypassed);
         };
-        let token = extract_bearer_token(header)?;
+        let token = match extract_bearer_token(header) {
+            Ok(token) => token,
+            Err(e) => return (Err(e), CacheOutcome::Bypassed),
+        };
 
-        if let Some(hit) = self.get(token) {
-            return Ok(hit);
+        // Read before the token is verified, and checked again when the entry
+        // is written: a set replaced in between was not the one it was
+        // verified against.
+        let generation = config.keys.as_ref().map_or(0, crate::JwtKeys::generation);
+
+        if let Some(hit) = self.get_under(token, generation) {
+            self.hits.fetch_add(1, Ordering::Relaxed);
+            return (Ok(hit), CacheOutcome::Hit);
         }
+        self.misses.fetch_add(1, Ordering::Relaxed);
+        (
+            self.verify_and_store(token, config, generation),
+            CacheOutcome::Miss,
+        )
+    }
 
+    /// Verify a token nothing live was cached for, and cache the result if
+    /// it may be, unless the keys have moved on from `generation` meanwhile.
+    fn verify_and_store(
+        &self,
+        token: &str,
+        config: &JwtConfig,
+        generation: u64,
+    ) -> Result<AuthResult, JwtError> {
         let result = validate_token(token, config)?;
 
         // Never hold an entry past the token's own expiry: doing so would keep
@@ -87,12 +200,50 @@ impl JwtCache {
             Expiry::Unreadable => return Ok(result),
         };
 
-        self.insert(token.to_string(), result.clone(), ttl);
+        self.insert_under(token.to_string(), result.clone(), ttl, generation);
         Ok(result)
     }
 
+    /// [`Self::get`], first forgetting everything if `generation` is a later
+    /// set of keys than the entries were verified under.
+    ///
+    /// An earlier `generation` changes nothing: it was read by a request that
+    /// began before the keys were replaced. Moving the cache back to it would
+    /// let another such request, still verifying against the old set, cache
+    /// what that set -- and perhaps a key just withdrawn from it -- admitted.
+    /// The entries already there were verified under the later set, and
+    /// answer it as well as any.
+    fn get_under(&self, token: &str, generation: u64) -> Option<AuthResult> {
+        let mut entries = self.entries.lock().unwrap_or_else(|e| e.into_inner());
+        if generation > self.keys_generation.load(Ordering::Relaxed) {
+            entries.clear();
+            self.keys_generation.store(generation, Ordering::Relaxed);
+        }
+        Self::lookup(&mut entries, token)
+    }
+
+    /// [`Self::insert`], unless the entries are by now those of another
+    /// generation of keys -- the token was verified against a set that has
+    /// since been replaced, and is verified again next time.
+    ///
+    /// Checked under the same lock the entry is written under, so a request
+    /// that saw the new keys -- and cleared the entries -- cannot have an
+    /// entry from the old ones written after it.
+    fn insert_under(&self, token: String, result: AuthResult, ttl: Duration, generation: u64) {
+        let mut entries = self.entries.lock().unwrap_or_else(|e| e.into_inner());
+        if self.keys_generation.load(Ordering::Relaxed) != generation {
+            return;
+        }
+        Self::store(&mut entries, token, result, ttl);
+    }
+
+    #[cfg(test)]
     fn get(&self, token: &str) -> Option<AuthResult> {
         let mut entries = self.entries.lock().unwrap_or_else(|e| e.into_inner());
+        Self::lookup(&mut entries, token)
+    }
+
+    fn lookup(entries: &mut HashMap<String, Entry>, token: &str) -> Option<AuthResult> {
         let entry = entries.get(token)?;
         if entry.expires > Instant::now() {
             return Some(entry.result.clone());
@@ -101,9 +252,19 @@ impl JwtCache {
         None
     }
 
+    #[cfg(test)]
     fn insert(&self, token: String, result: AuthResult, ttl: Duration) {
-        let now = Instant::now();
         let mut entries = self.entries.lock().unwrap_or_else(|e| e.into_inner());
+        Self::store(&mut entries, token, result, ttl);
+    }
+
+    fn store(
+        entries: &mut HashMap<String, Entry>,
+        token: String,
+        result: AuthResult,
+        ttl: Duration,
+    ) {
+        let now = Instant::now();
 
         if entries.len() >= CAPACITY {
             entries.retain(|_, e| e.expires > now);
@@ -274,6 +435,82 @@ mod tests {
         // is verified again rather than served from a stale entry.
         assert!(cache.get("tok").is_none());
         assert!(cache.entries.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_lookup_says_whether_the_cache_answered() {
+        let config = JwtConfig {
+            keys: crate::JwtKeys::from_config(Some("reallyreallyreallyreallyverysafe"), false)
+                .unwrap(),
+            ..JwtConfig::default()
+        };
+        let token = jsonwebtoken::encode(
+            &jsonwebtoken::Header::default(),
+            &json!({"role": "web_user", "exp": now_secs() + 600}),
+            &jsonwebtoken::EncodingKey::from_secret(b"reallyreallyreallyreallyverysafe"),
+        )
+        .unwrap();
+        let header = format!("Bearer {token}");
+        let cache = JwtCache::new(true, 3600).unwrap();
+
+        let (first, outcome) = cache.authenticate_with_outcome(Some(&header), &config);
+        assert_eq!(first.unwrap().role, "web_user");
+        assert_eq!(outcome, CacheOutcome::Miss);
+        let (second, outcome) = cache.authenticate_with_outcome(Some(&header), &config);
+        assert_eq!(second.unwrap().role, "web_user");
+        assert_eq!(outcome, CacheOutcome::Hit);
+
+        // No token is neither: there was nothing to look up.
+        let (_, outcome) = cache.authenticate_with_outcome(None, &config);
+        assert_eq!(outcome, CacheOutcome::Bypassed);
+
+        // A refused token is a miss too -- it was looked up and verified.
+        let (refused, outcome) = cache.authenticate_with_outcome(Some("Bearer nope"), &config);
+        assert!(refused.is_err());
+        assert_eq!(outcome, CacheOutcome::Miss);
+
+        assert_eq!(cache.stats(), CacheStats { hits: 1, misses: 2 });
+        // The old method answers alike, and is counted alike.
+        assert!(cache.authenticate(Some(&header), &config).is_ok());
+        assert_eq!(cache.stats().hits, 2);
+    }
+
+    /// Two requests that read the generation before the keys were replaced,
+    /// interleaved with one that read it after: the first must not put the
+    /// cache back on the old set, or the second -- verified against the old
+    /// set -- would be cached under it.
+    #[test]
+    fn a_request_from_before_a_rotation_cannot_bring_the_old_keys_back() {
+        let cache = JwtCache::new(true, 3600).unwrap();
+        let (old, new) = (1, 2);
+        let ttl = Duration::from_secs(60);
+
+        assert!(cache.get_under("after", new).is_none());
+        cache.insert_under("after".into(), result_with(json!({})), ttl, new);
+
+        // A request that read `old`: it looks up, and finds what `new` cached.
+        assert!(cache.get_under("before", old).is_none());
+        assert!(cache.get_under("after", old).is_some());
+        // Another that read `old` and verified against the old set.
+        cache.insert_under("withdrawn".into(), result_with(json!({})), ttl, old);
+        assert!(cache.get_under("withdrawn", new).is_none());
+        assert!(cache.get_under("after", new).is_some());
+    }
+
+    /// A set made later, by any handle, is a later generation.
+    #[test]
+    fn generations_only_increase() {
+        let a = crate::JwtKeys::from_config(Some("reallyreallyreallyreallyverysafe"), false)
+            .unwrap()
+            .unwrap();
+        let first = a.generation();
+        assert!(first > 0);
+        let b = crate::JwtKeys::from_config(Some("reallyreallyreallyreallyverysafe"), false)
+            .unwrap()
+            .unwrap();
+        assert!(b.generation() > first);
+        a.replace(crate::KeySet::from_secret("anotheranotheranotheranother1234", false).unwrap());
+        assert!(a.generation() > b.generation());
     }
 
     #[test]

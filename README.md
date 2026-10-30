@@ -4,7 +4,7 @@
 
 **A PostgREST-inspired REST API for PostgreSQL, written in Rust**
 
-[![Rust](https://img.shields.io/badge/rust-1.88%2B-orange.svg)](https://www.rust-lang.org/)
+[![Rust](https://img.shields.io/badge/rust-1.94%2B-orange.svg)](https://www.rust-lang.org/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![Build Status](https://img.shields.io/github/actions/workflow/status/postrust/postrust/ci.yml?branch=main)](https://github.com/postrust/postrust/actions)
 
@@ -66,7 +66,7 @@ Postrust is one Rust binary that serves a PostgreSQL schema as a REST API in Pos
 
 ### Prerequisites
 
-- Rust 1.88+ (`curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh`)
+- Rust 1.94+ (`curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh`)
 - PostgreSQL 12+ (or use Docker)
 
 ### Installation
@@ -107,7 +107,7 @@ DATABASE_URL=postgres://user:pass@localhost:5432/mydb
 # Optional
 PGRST_DB_SCHEMAS=public,api          # Exposed schemas (default: public)
 PGRST_DB_ANON_ROLE=web_anon          # Anonymous role
-PGRST_JWT_SECRET=your-secret-key     # JWT secret for authentication
+PGRST_JWT_SECRET=your-secret-key     # HMAC secret, or a JWK/JWKS of public keys
 PGRST_JWT_SECRET_IS_BASE64=false     # Set true if secret is base64 encoded
 PGRST_SERVER_PORT=3000               # Server port (default: 3000)
 PGRST_SERVER_HOST=0.0.0.0            # Server host (default: 127.0.0.1)
@@ -385,7 +385,7 @@ Resources:
 ### Docker
 
 ```dockerfile
-FROM rust:1.88-bookworm AS builder
+FROM rust:1.94-bookworm AS builder
 WORKDIR /app
 COPY . .
 RUN cargo build --release -p postrust-server
@@ -676,6 +676,8 @@ the rest are documented here so you don't assume bit-for-bit compatibility.
 | Object key order | Select order | Alphabetical, or select order with the `compat-key-order` build feature | Unchanged — it is a build-time choice |
 | `Prefer: tx=rollback` | Honoured | Not implemented, and not reported as applied | — |
 | JWT `exp` / `nbf` | All checked to the second | `exp` to the second; 30s clock skew on `nbf` and `iat` | — |
+| JWT secret starting with `{` that is not a valid JWK/JWKS | Used as an HMAC secret | Refused at startup | — |
+| HS256 token with a `kid`, plain-string secret | Refused (the secret's key has no `kid`) | Accepted | — |
 
 The differences that are deliberate — including cases where PostgREST is the
 one that is wrong — are listed with their evidence in

@@ -22,9 +22,9 @@ use axum::Router;
 use postrust_core::{AppConfig, SchemaCache};
 use postrust_server::{handle_request, AppState};
 use sqlx::postgres::PgPoolOptions;
+use sqlx::AssertSqlSafe;
 use sqlx::PgPool;
 use std::sync::Arc;
-use tokio::sync::RwLock;
 use tower::ServiceExt;
 
 const SCHEMA: &str = "either_driver";
@@ -45,7 +45,7 @@ async fn pool(url: &str) -> PgPool {
 /// Made under a lock, since the tests here run at the same time, and only
 /// when the marker on the schema names an older version of it.
 async fn fixture(pool: &PgPool) {
-    sqlx::query(&format!(
+    sqlx::query(AssertSqlSafe(format!(
         "DO $$ BEGIN
            PERFORM pg_advisory_xact_lock(hashtext('{SCHEMA}'));
            IF obj_description(to_regnamespace('{SCHEMA}'), 'pg_namespace')
@@ -64,7 +64,7 @@ async fn fixture(pool: &PgPool) {
            END $f$;
            COMMENT ON SCHEMA {SCHEMA} IS 'fixture v1';
          END $$"
-    ))
+    )))
     .execute(pool)
     .await
     .expect("the fixture");
@@ -83,19 +83,12 @@ async fn app(url: &str, configure: impl FnOnce(&mut AppConfig)) -> Router {
     let schema_cache = SchemaCache::load(&direct, &config.db_schemas)
         .await
         .expect("schema cache");
-    let jwt_config = postrust_auth::JwtConfig {
-        secret: config.jwt_secret.clone(),
-        secret_is_base64: config.jwt_secret_is_base64,
-        audience: config.jwt_aud.clone(),
-        role_claim_key: config.jwt_role_claim_key.clone(),
-        anon_role: config.db_anon_role.clone(),
-    };
-    let state = Arc::new(AppState {
-        pool: pool(url).await,
-        schema_cache: RwLock::new(schema_cache),
-        config,
-        jwt_config,
-        jwt_cache: None,
+    let state = Arc::new({
+        let mut state = AppState::new(pool(url).await, schema_cache, config)
+            .expect("the test's JWT secret parses");
+        // Uncached, so a test sees each request validated as it was written.
+        state.jwt_cache = None;
+        state
     });
     let api: Router<Arc<AppState>> = Router::new()
         .route("/", any(handle_request))

@@ -27,9 +27,9 @@ use axum::Router;
 use postrust_core::{AppConfig, SchemaCache};
 use postrust_server::{handle_request, AppState};
 use sqlx::postgres::PgPoolOptions;
+use sqlx::AssertSqlSafe;
 use sqlx::PgPool;
 use std::sync::Arc;
-use tokio::sync::RwLock;
 use tower::ServiceExt;
 
 /// Each test's own schema, so tests can run at the same time.
@@ -67,7 +67,10 @@ async fn setup(pool: &PgPool, test: &str, statements: &[&str]) {
     ];
     all.extend(statements.iter().map(|s| s.replace("{schema}", &schema)));
     for statement in all {
-        sqlx::query(&statement).execute(pool).await.unwrap();
+        sqlx::query(AssertSqlSafe(statement))
+            .execute(pool)
+            .await
+            .unwrap();
     }
 }
 
@@ -79,19 +82,12 @@ async fn app(pool: PgPool, test: &str) -> Router {
     let schema_cache = SchemaCache::load(&pool, &config.db_schemas)
         .await
         .expect("schema cache");
-    let jwt_config = postrust_auth::JwtConfig {
-        secret: config.jwt_secret.clone(),
-        secret_is_base64: config.jwt_secret_is_base64,
-        audience: config.jwt_aud.clone(),
-        role_claim_key: config.jwt_role_claim_key.clone(),
-        anon_role: config.db_anon_role.clone(),
-    };
-    let state = Arc::new(AppState {
-        pool,
-        schema_cache: RwLock::new(schema_cache),
-        config,
-        jwt_config,
-        jwt_cache: None,
+    let state = Arc::new({
+        let mut state =
+            AppState::new(pool, schema_cache, config).expect("the test's JWT secret parses");
+        // Uncached, so a test sees each request validated as it was written.
+        state.jwt_cache = None;
+        state
     });
     let api: Router<Arc<AppState>> = Router::new()
         .route("/", any(handle_request))
@@ -135,7 +131,7 @@ async fn send(app: &Router, method: &str, uri: &str, body: &str) -> Answer {
     }
 }
 
-async fn count(pool: &PgPool, sql: &str) -> i64 {
+async fn count(pool: &PgPool, sql: &'static str) -> i64 {
     sqlx::query_scalar(sql).fetch_one(pool).await.unwrap()
 }
 

@@ -1580,10 +1580,10 @@ pub async fn enum_values(
     // No role can read it: read as the connection anyway, so the error says
     // what PostgreSQL says rather than something invented here.
     if let Some(reader) = reader.filter(|reader| *reader != current) {
-        sqlx::query(&format!(
+        sqlx::query(sqlx::AssertSqlSafe(format!(
             "SET LOCAL ROLE {}",
             postrust_sql::escape_ident(&reader)
-        ))
+        )))
         .execute(&mut *tx)
         .await
         .map_err(failed)?;
@@ -1600,7 +1600,7 @@ pub async fn enum_values(
         postrust_sql::escape_ident(schema),
         postrust_sql::escape_ident(table)
     );
-    let rows: Vec<(Option<String>, Option<String>)> = sqlx::query_as(&sql)
+    let rows: Vec<(Option<String>, Option<String>)> = sqlx::query_as(sqlx::AssertSqlSafe(sql))
         .fetch_all(&mut *tx)
         .await
         .map_err(failed)?;

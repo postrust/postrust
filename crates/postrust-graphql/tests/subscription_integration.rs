@@ -11,6 +11,7 @@ use postrust_graphql::subscription::{
     TableChangePayload,
 };
 use sqlx::postgres::PgPoolOptions;
+use sqlx::AssertSqlSafe;
 use sqlx::Executor;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Duration;
@@ -41,19 +42,15 @@ fn unique_table_name() -> String {
 /// Setup test table and trigger.
 async fn setup_test_table(pool: &sqlx::PgPool, table_name: &str) -> Result<(), sqlx::Error> {
     // Drop existing table if exists
-    pool.execute(
-        format!(
-            "DROP TABLE IF EXISTS {}.{} CASCADE",
-            TEST_SCHEMA, table_name
-        )
-        .as_str(),
-    )
+    pool.execute(AssertSqlSafe(format!(
+        "DROP TABLE IF EXISTS {}.{} CASCADE",
+        TEST_SCHEMA, table_name
+    )))
     .await?;
 
     // Create test table
-    pool.execute(
-        format!(
-            r#"
+    pool.execute(AssertSqlSafe(format!(
+        r#"
             CREATE TABLE {}.{} (
                 id SERIAL PRIMARY KEY,
                 name TEXT NOT NULL,
@@ -61,15 +58,13 @@ async fn setup_test_table(pool: &sqlx::PgPool, table_name: &str) -> Result<(), s
                 created_at TIMESTAMPTZ DEFAULT NOW()
             )
             "#,
-            TEST_SCHEMA, table_name
-        )
-        .as_str(),
-    )
+        TEST_SCHEMA, table_name
+    )))
     .await?;
 
     // Create notify trigger
     let trigger_sql = create_notify_trigger_sql(TEST_SCHEMA, table_name);
-    pool.execute(trigger_sql.as_str()).await?;
+    pool.execute(AssertSqlSafe(trigger_sql)).await?;
 
     Ok(())
 }
@@ -77,15 +72,12 @@ async fn setup_test_table(pool: &sqlx::PgPool, table_name: &str) -> Result<(), s
 /// Cleanup test table and trigger.
 async fn cleanup_test_table(pool: &sqlx::PgPool, table_name: &str) -> Result<(), sqlx::Error> {
     let drop_trigger_sql = drop_notify_trigger_sql(TEST_SCHEMA, table_name);
-    pool.execute(drop_trigger_sql.as_str()).await?;
+    pool.execute(AssertSqlSafe(drop_trigger_sql)).await?;
 
-    pool.execute(
-        format!(
-            "DROP TABLE IF EXISTS {}.{} CASCADE",
-            TEST_SCHEMA, table_name
-        )
-        .as_str(),
-    )
+    pool.execute(AssertSqlSafe(format!(
+        "DROP TABLE IF EXISTS {}.{} CASCADE",
+        TEST_SCHEMA, table_name
+    )))
     .await?;
 
     Ok(())
@@ -126,10 +118,10 @@ async fn test_notify_broker_receives_insert() {
         .expect("Failed to subscribe");
 
     // Insert a row (this should trigger a notification)
-    sqlx::query(&format!(
+    sqlx::query(AssertSqlSafe(format!(
         "INSERT INTO {}.{} (name, value) VALUES ($1, $2)",
         TEST_SCHEMA, test_table
-    ))
+    )))
     .bind("test_user")
     .bind(42)
     .execute(&pool)
@@ -196,10 +188,10 @@ async fn test_notify_broker_receives_update() {
         .expect("Failed to subscribe");
 
     // Insert a row
-    let row: (i32,) = sqlx::query_as(&format!(
+    let row: (i32,) = sqlx::query_as(AssertSqlSafe(format!(
         "INSERT INTO {}.{} (name, value) VALUES ($1, $2) RETURNING id",
         TEST_SCHEMA, test_table
-    ))
+    )))
     .bind("update_test")
     .bind(10)
     .fetch_one(&pool)
@@ -217,10 +209,10 @@ async fn test_notify_broker_receives_update() {
     assert_eq!(insert_payload.operation, "INSERT");
 
     // Update the row
-    sqlx::query(&format!(
+    sqlx::query(AssertSqlSafe(format!(
         "UPDATE {}.{} SET value = $1 WHERE id = $2",
         TEST_SCHEMA, test_table
-    ))
+    )))
     .bind(100)
     .bind(inserted_id)
     .execute(&pool)
@@ -283,10 +275,10 @@ async fn test_notify_broker_receives_delete() {
         .expect("Failed to subscribe");
 
     // Insert a row
-    let row: (i32,) = sqlx::query_as(&format!(
+    let row: (i32,) = sqlx::query_as(AssertSqlSafe(format!(
         "INSERT INTO {}.{} (name, value) VALUES ($1, $2) RETURNING id",
         TEST_SCHEMA, test_table
-    ))
+    )))
     .bind("delete_test")
     .bind(999)
     .fetch_one(&pool)
@@ -304,10 +296,10 @@ async fn test_notify_broker_receives_delete() {
     assert_eq!(insert_payload.operation, "INSERT");
 
     // Delete the row
-    sqlx::query(&format!(
+    sqlx::query(AssertSqlSafe(format!(
         "DELETE FROM {}.{} WHERE id = $1",
         TEST_SCHEMA, test_table
-    ))
+    )))
     .bind(inserted_id)
     .execute(&pool)
     .await
@@ -372,10 +364,10 @@ async fn test_notify_broker_multiple_subscribers() {
         .expect("Failed to subscribe 2");
 
     // Insert a row
-    sqlx::query(&format!(
+    sqlx::query(AssertSqlSafe(format!(
         "INSERT INTO {}.{} (name, value) VALUES ($1, $2)",
         TEST_SCHEMA, test_table
-    ))
+    )))
     .bind("multi_sub_test")
     .bind(123)
     .execute(&pool)
@@ -437,10 +429,10 @@ async fn test_notify_broker_dynamic_channel() {
     let mut stream = broker.subscribe_or_create(&channel).await;
 
     // Insert a row
-    sqlx::query(&format!(
+    sqlx::query(AssertSqlSafe(format!(
         "INSERT INTO {}.{} (name, value) VALUES ($1, $2)",
         TEST_SCHEMA, test_table
-    ))
+    )))
     .bind("dynamic_test")
     .bind(456)
     .execute(&pool)
@@ -473,23 +465,23 @@ async fn test_trigger_sql_is_valid() {
         .expect("Failed to connect to database");
 
     // Create a simple test table
-    pool.execute(format!("DROP TABLE IF EXISTS {}.trigger_test CASCADE", TEST_SCHEMA).as_str())
-        .await
-        .expect("Failed to drop table");
+    pool.execute(AssertSqlSafe(format!(
+        "DROP TABLE IF EXISTS {}.trigger_test CASCADE",
+        TEST_SCHEMA
+    )))
+    .await
+    .expect("Failed to drop table");
 
-    pool.execute(
-        format!(
-            "CREATE TABLE {}.trigger_test (id SERIAL PRIMARY KEY, data TEXT)",
-            TEST_SCHEMA
-        )
-        .as_str(),
-    )
+    pool.execute(AssertSqlSafe(format!(
+        "CREATE TABLE {}.trigger_test (id SERIAL PRIMARY KEY, data TEXT)",
+        TEST_SCHEMA
+    )))
     .await
     .expect("Failed to create table");
 
     // Apply trigger SQL - this verifies the SQL is syntactically correct
     let trigger_sql = create_notify_trigger_sql(TEST_SCHEMA, "trigger_test");
-    pool.execute(trigger_sql.as_str())
+    pool.execute(AssertSqlSafe(trigger_sql))
         .await
         .expect("Failed to create trigger - SQL is invalid");
 
@@ -521,13 +513,16 @@ async fn test_trigger_sql_is_valid() {
 
     // Cleanup
     let drop_sql = drop_notify_trigger_sql(TEST_SCHEMA, "trigger_test");
-    pool.execute(drop_sql.as_str())
+    pool.execute(AssertSqlSafe(drop_sql))
         .await
         .expect("Failed to drop trigger");
 
-    pool.execute(format!("DROP TABLE {}.trigger_test CASCADE", TEST_SCHEMA).as_str())
-        .await
-        .expect("Failed to drop table");
+    pool.execute(AssertSqlSafe(format!(
+        "DROP TABLE {}.trigger_test CASCADE",
+        TEST_SCHEMA
+    )))
+    .await
+    .expect("Failed to drop table");
 }
 
 /// The listening connections still open on `channel`, other than this one.
@@ -631,7 +626,7 @@ async fn test_a_rebuilt_state_keeps_the_broker_and_listens_on_new_tables() {
         .await
         .expect("Failed to connect to database");
     let schema = unique_table_name();
-    pool.execute(format!("CREATE SCHEMA {schema}").as_str())
+    pool.execute(AssertSqlSafe(format!("CREATE SCHEMA {schema}")))
         .await
         .unwrap();
     let table = |name: &str| {
@@ -650,7 +645,7 @@ async fn test_a_rebuilt_state_keeps_the_broker_and_listens_on_new_tables() {
         GraphQLState::new(pool, Arc::new(cache), config).unwrap()
     };
 
-    pool.execute(table("before").as_str()).await.unwrap();
+    pool.execute(AssertSqlSafe(table("before"))).await.unwrap();
     let mut first = state_for(pool.clone(), schema.clone()).await;
     first.continue_subscriptions(None).await.unwrap();
     let mut open = first
@@ -663,7 +658,7 @@ async fn test_a_rebuilt_state_keeps_the_broker_and_listens_on_new_tables() {
         .await;
 
     // A migration adds a table; the schema is rebuilt from the new cache.
-    pool.execute(table("after").as_str()).await.unwrap();
+    pool.execute(AssertSqlSafe(table("after"))).await.unwrap();
     let mut rebuilt = state_for(pool.clone(), schema.clone()).await;
     rebuilt.continue_subscriptions(Some(&first)).await.unwrap();
     assert!(Arc::ptr_eq(&first.broker, &rebuilt.broker));
@@ -678,9 +673,11 @@ async fn test_a_rebuilt_state_keeps_the_broker_and_listens_on_new_tables() {
         .subscribe_or_create(&table_channel_name(&schema, "after"))
         .await;
     for name in ["before", "after"] {
-        pool.execute(format!("INSERT INTO {schema}.{name} (name) VALUES ('x')").as_str())
-            .await
-            .unwrap();
+        pool.execute(AssertSqlSafe(format!(
+            "INSERT INTO {schema}.{name} (name) VALUES ('x')"
+        )))
+        .await
+        .unwrap();
     }
     // The subscription opened before the rebuild still hears its table, and
     // the table the rebuild added is listened to.
@@ -692,7 +689,7 @@ async fn test_a_rebuilt_state_keeps_the_broker_and_listens_on_new_tables() {
     }
 
     rebuilt.stop_subscriptions().await;
-    pool.execute(format!("DROP SCHEMA {schema} CASCADE").as_str())
+    pool.execute(AssertSqlSafe(format!("DROP SCHEMA {schema} CASCADE")))
         .await
         .unwrap();
 }

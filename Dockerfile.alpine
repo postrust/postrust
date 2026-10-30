@@ -17,7 +17,9 @@ WORKDIR /app
 COPY Cargo.toml Cargo.lock ./
 COPY crates ./crates
 
-RUN cargo build --release -p postrust-server --features admin-ui
+# `otel` is inactive until OTEL_EXPORTER_OTLP_ENDPOINT or
+# PGRST_ADMIN_SERVER_PORT is set; see docs/observability.md.
+RUN cargo build --release -p postrust-server --features admin-ui,otel
 
 # Runtime stage
 FROM alpine:3.22

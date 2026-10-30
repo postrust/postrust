@@ -12,17 +12,24 @@ members = [
     "crates/postrust-graphql",
     "crates/postrust-proxy",
 ]
+# A crate of its own, depending on postrust-server as a project of yours would.
+# Not a member because every Dockerfile here copies `Cargo.toml` and `crates/`
+# and nothing else, and a member missing from the build context fails the whole
+# build. CI builds and lints it with `--manifest-path`.
+exclude = ["examples/custom-routes"]
 
 [workspace.package]
-version = "2.4.1"
+version = "3.0.0"
 edition = "2021"
-# Verified, not assumed: 1.88.0 builds the workspace clean and 1.87.0 is
-# refused outright -- hickory-{net,proto,resolver} 0.26 and time 0.3.55 all
-# declare 1.88. Both arrived with security updates, and the floor moved from
-# 1.86 to 1.88 as a result; the advisories were worth more than the two
-# releases. The README claimed 1.78, and the docs 1.75, before this was
-# declared anywhere at all.
-rust-version = "1.88"
+# Verified, not assumed: 1.94.0 builds the workspace clean, and anything older
+# is refused outright -- sqlx 0.9 declares 1.94, and every crate here that
+# reaches a database (the server, the Lambda adapter, GraphQL, the proxy, and
+# postrust-core with its default `sqlx` feature) depends on it. The floor moved
+# from 1.88 to 1.94 in 3.0 with the move to sqlx 0.9; before that it was
+# hickory-{net,proto,resolver} 0.26 and time 0.3.55, both at 1.88 and both
+# arriving with security updates, that moved it up from 1.86. The README
+# claimed 1.78, and the docs 1.75, before this was declared anywhere at all.
+rust-version = "1.94"
 license = "MIT"
 repository = "https://github.com/postrust/postrust"
 homepage = "https://postrust.org/"
@@ -50,12 +57,21 @@ hyper = { version = "1.5", features = ["full"] }
 #
 # `tls-rustls-ring-native-roots` and not an aws-lc-rs variant, which would
 # otherwise match the provider the rest of the tree is pinned to. The choice is
-# forced: sqlx 0.8 wires the system trust store only to the ring feature
-# (`_tls-rustls-ring-native-roots` -> `certs_from_native_store()`), while
-# `tls-rustls-aws-lc-rs` gets webpki's bundled roots and nothing else. Native
-# roots is the one that works for a database behind a private or
-# organisation-issued CA, and both runtime images already ship
-# `ca-certificates` (see ./Dockerfile and ./Dockerfile.alpine).
+# forced, and sqlx 0.9 kept it so: its rustls connector reads the system trust
+# store only when the optional `rustls-native-certs` dependency is compiled in
+# (`import_root_certs()` in sqlx-core's src/net/tls/tls_rustls.rs is gated on
+# it), and the only feature that turns that on is this one, by way of
+# `sqlx-core/_tls-rustls-ring-native-roots`. `tls-rustls-aws-lc-rs` gets
+# webpki's bundled roots and nothing else, as does `tls-rustls`, which is now
+# an alias for `tls-rustls-ring-webpki`. Native roots is the one that works for
+# a database behind a private or organisation-issued CA, and both runtime images
+# already ship `ca-certificates` (see ./Dockerfile and ./Dockerfile.alpine).
+# The trust store is what `sslmode=verify-ca` and `verify-full` check against;
+# `require` encrypts without verifying, so it works whatever the store holds.
+#
+# 0.9 also deleted the old combined features (`runtime-tokio-rustls` and the
+# like). The runtime and the TLS stack were already named separately here, so
+# nothing else had to move.
 #
 # This costs nothing and risks nothing. `ring` was already compiled in --
 # reqwest pulls it, so rustls has had both features on for as long as the proxy
@@ -67,7 +83,7 @@ hyper = { version = "1.5", features = ["full"] }
 # Without a TLS feature sqlx does not merely lack the option: `sslmode=require`
 # fails outright with "SQLx was built without TLS support enabled", and the
 # default `sslmode=prefer` silently connects in cleartext.
-sqlx = { version = "0.8", features = ["runtime-tokio", "tls-rustls-ring-native-roots", "postgres", "json", "chrono", "uuid", "bigdecimal"] }
+sqlx = { version = "0.9", features = ["runtime-tokio", "tls-rustls-ring-native-roots", "postgres", "json", "chrono", "uuid", "bigdecimal"] }
 deadpool-postgres = "0.14"
 tokio-postgres = "0.7"
 
@@ -102,7 +118,9 @@ mime = "0.3"
 url = "2.5"
 percent-encoding = "2.3"
 tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+# `json` for `PGRST_LOG_FORMAT=json`. tracing-serde, which it adds, was
+# already in the tree through the Lambda runtime.
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 # Default features kept: `wasmbind` is one, and gives chrono its clock on
 # wasm32 (a Cloudflare Worker, issue #50).
 chrono = { version = "0.4", features = ["serde"] }
@@ -118,6 +136,19 @@ pretty_assertions = "1.4"
 tokio-rustls = "0.26"
 rustls = { version = "0.23", default-features = false, features = ["std", "aws_lc_rs"] }
 rustls-pemfile = "2"
+
+# OpenTelemetry: traces and metrics over OTLP, and metrics as Prometheus text.
+# Only the `otel` feature of postrust-server (and postrust-lambda) pulls these
+# in; see that feature's comment for why each is what it is. `gzip-http` for
+# `OTEL_EXPORTER_OTLP_COMPRESSION=gzip`: flate2 is already in the server
+# through tower-http's response compression.
+opentelemetry = { version = "0.33.1", default-features = false, features = ["trace", "metrics"] }
+opentelemetry_sdk = { version = "0.33.1", default-features = false, features = ["trace", "metrics"] }
+opentelemetry-otlp = { version = "0.33.1", default-features = false, features = ["http-proto", "gzip-http", "trace", "metrics", "internal-logs"] }
+opentelemetry-http = { version = "0.33.1", default-features = false }
+tracing-opentelemetry = { version = "0.34.0", default-features = false, features = ["metrics"] }
+opentelemetry-prometheus = { version = "0.33.1", default-features = false }
+prometheus = { version = "0.14", default-features = false }
 
 # HTTP client
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
@@ -157,13 +188,13 @@ regex = "1"
 # wasm32) can leave it out; the ones that load a schema cache or decode rows ask
 # for `features = ["sqlx"]`. The crate's own default keeps sqlx on for anybody
 # depending on it from crates.io.
-postrust-core = { version = "2.4.1", path = "crates/postrust-core", default-features = false }
-postrust-sql = { version = "2.4.1", path = "crates/postrust-sql" }
-postrust-auth = { version = "2.4.1", path = "crates/postrust-auth" }
-postrust-response = { version = "2.4.1", path = "crates/postrust-response" }
-postrust-engine = { version = "2.4.1", path = "crates/postrust-engine" }
-postrust-graphql = { version = "2.4.1", path = "crates/postrust-graphql" }
-postrust-server = { version = "2.4.1", path = "crates/postrust-server" }
+postrust-core = { version = "3.0.0", path = "crates/postrust-core", default-features = false }
+postrust-sql = { version = "3.0.0", path = "crates/postrust-sql" }
+postrust-auth = { version = "3.0.0", path = "crates/postrust-auth" }
+postrust-response = { version = "3.0.0", path = "crates/postrust-response" }
+postrust-engine = { version = "3.0.0", path = "crates/postrust-engine" }
+postrust-graphql = { version = "3.0.0", path = "crates/postrust-graphql" }
+postrust-server = { version = "3.0.0", path = "crates/postrust-server" }
 
 [profile.release]
 lto = true

@@ -30,12 +30,16 @@ helm install postrust ./charts/postrust --set database.existingSecret=postrust-d
 | `image.tag` | chart `appVersion` | |
 | `database.url` | — | Required unless `database.existingSecret` is set |
 | `database.existingSecret` | `""` | Secret holding `DATABASE_URL`, optionally `PGRST_JWT_SECRET` |
-| `auth.jwtSecret` | `""` | Enables JWT verification when set |
+| `auth.jwtSecret` | `""` | Enables JWT verification when set: an HMAC secret, or a JWK/JWKS |
+| `auth.jwksUrl` | `""` | Fetch the keys from an identity provider's JWKS URL and keep them current |
+| `auth.issuer` | `""` | Required `iss` claim |
 | `auth.anonRole` | `web_anon` | Role for requests without a token |
 | `server.port` | `3000` | |
+| `server.logFormat` | `text` | `json` for one JSON object per line |
 | `server.schemas` | `public` | |
 | `server.compatMode` | `false` | Also serve the REST surface at the root |
 | `server.maxRows` | `""` | Cap on rows per request; empty means none |
+| `extraEnv` | `[]` | More environment variables, e.g. `OTEL_EXPORTER_OTLP_ENDPOINT` |
 | `service.type` | `ClusterIP` | |
 | `service.port` | `80` | |
 
@@ -46,7 +50,8 @@ helm install postrust ./charts/postrust --set database.existingSecret=postrust-d
 nothing.
 
 The readiness probe uses `/_/ready`, which checks database connectivity, so a
-pod that cannot reach PostgreSQL is kept out of the Service. Liveness uses
+pod that cannot reach PostgreSQL -- or, with `auth.jwksUrl`, has not loaded the
+identity provider's keys -- is kept out of the Service. Liveness uses
 `/_/health`, which only reports that the process is up.
 
 Verify changes without a cluster:

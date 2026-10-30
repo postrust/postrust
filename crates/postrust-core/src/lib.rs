@@ -46,6 +46,8 @@ pub mod query;
 #[cfg(feature = "sqlx")]
 pub mod row_json;
 pub mod schema_cache;
+pub mod session;
+pub mod trace;
 
 // Re-export main types
 pub use api_request::{
@@ -53,11 +55,12 @@ pub use api_request::{
     Payload, PreferRepresentation, Preferences, QualifiedIdentifier, QueryParams, Range, Resource,
     SelectItem,
 };
-pub use config::{AppConfig, ConfigError, IsolationLevel, LogLevel, OpenApiMode};
+pub use config::{AppConfig, ConfigError, IsolationLevel, LogFormat, LogLevel, OpenApiMode};
 pub use embed::EmbedRendering;
 pub use error::{Error, Result};
 pub use plan::{create_action_plan, ActionPlan, CallPlan, DbActionPlan, MutatePlan, ReadPlan};
 pub use schema_cache::{Column, Relationship, Routine, SchemaCache, SchemaCacheRef, Table};
+pub use session::{Session, SessionStatement};
 
 /// This crate's version. A schema cache serialized by one version may not
 /// read back, or may not mean the same, in another, so a copy kept outside

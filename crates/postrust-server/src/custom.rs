@@ -1,7 +1,9 @@
-//! Custom routes extension for Postrust.
+//! The built-in routes under `/_`: health and readiness.
 //!
-//! Add your custom API endpoints here that don't go through the
-//! standard PostgREST-style query processing.
+//! Routes of your own do not belong here. A binary of yours nests them with
+//! [`crate::Builder::nest`], at a prefix of its own or beneath `/_`, without
+//! forking this crate; see docs/custom-routes.md. The handlers at the bottom of
+//! this file are sketches of what such routes look like.
 
 use axum::{
     extract::State,
@@ -20,9 +22,6 @@ pub fn custom_router() -> Router<Arc<AppState>> {
     Router::new()
         .route("/health", get(health_check))
         .route("/ready", get(readiness_check))
-    // Add your custom routes here:
-    // .route("/webhooks/stripe", post(handle_stripe_webhook))
-    // .route("/email/send", post(send_email))
 }
 
 /// Build the router served on `admin_server_port`.
@@ -33,11 +32,19 @@ pub fn custom_router() -> Router<Arc<AppState>> {
 ///
 /// `/live` and `/ready` are the names PostgREST's admin server uses; `/health`
 /// is the same answer as `/live` under the name the main API already serves.
+///
+/// With the `otel` feature, `/metrics` too: the server's metrics as
+/// Prometheus text. Here and never on the API's port, for the same reason as
+/// the rest -- what the pool and the token cache are doing is the operator's
+/// business, not every client's.
 pub fn admin_router() -> Router<Arc<AppState>> {
-    Router::new()
+    let router = Router::new()
         .route("/live", get(health_check))
         .route("/health", get(health_check))
-        .route("/ready", get(readiness_check))
+        .route("/ready", get(readiness_check));
+    #[cfg(feature = "otel")]
+    let router = router.route("/metrics", get(crate::otel::metrics_handler));
+    router
 }
 
 // =============================================================================
@@ -52,25 +59,37 @@ async fn health_check() -> Json<HealthResponse> {
 }
 
 async fn readiness_check(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    // Keys from `PGRST_JWT_JWKS_URL` that have never loaded mean every token
+    // they would verify is refused: a replica in that state should not be
+    // sent traffic, though it is alive and will recover by itself.
+    let jwks = state.jwt_config.jwks.as_ref().map(|jwks| jwks.status());
+    let jwks_loaded = jwks.as_ref().map(|status| status.loaded);
+    let jwks_problem = jwks.filter(|status| !status.loaded).map(|status| {
+        format!(
+            "the keys at PGRST_JWT_JWKS_URL have not loaded: {}",
+            status.last_error.as_deref().unwrap_or("not fetched yet")
+        )
+    });
+
     // Check database connectivity
-    match sqlx::query("SELECT 1").execute(&state.pool).await {
-        Ok(_) => (
-            StatusCode::OK,
-            Json(ReadinessResponse {
-                ready: true,
-                database: true,
-                message: None,
-            }),
-        ),
-        Err(e) => (
-            StatusCode::SERVICE_UNAVAILABLE,
-            Json(ReadinessResponse {
-                ready: false,
-                database: false,
-                message: Some(e.to_string()),
-            }),
-        ),
-    }
+    let (database, message) = match sqlx::query("SELECT 1").execute(&state.pool).await {
+        Ok(_) => (true, jwks_problem),
+        Err(e) => (false, Some(e.to_string())),
+    };
+    let ready = database && jwks_loaded != Some(false);
+    (
+        if ready {
+            StatusCode::OK
+        } else {
+            StatusCode::SERVICE_UNAVAILABLE
+        },
+        Json(ReadinessResponse {
+            ready,
+            database,
+            jwks: jwks_loaded,
+            message,
+        }),
+    )
 }
 
 // =============================================================================
@@ -87,6 +106,10 @@ struct HealthResponse {
 struct ReadinessResponse {
     ready: bool,
     database: bool,
+    /// Whether the keys at `PGRST_JWT_JWKS_URL` have loaded; absent when it
+    /// is not set.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    jwks: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     message: Option<String>,
 }

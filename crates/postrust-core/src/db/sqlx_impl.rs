@@ -6,7 +6,7 @@ use crate::row_json::{row_to_json, row_to_values};
 use postrust_sql::SqlParam;
 use sqlx::postgres::{PgArguments, PgPool, PgRow};
 use sqlx::query::Query;
-use sqlx::{Postgres, Row, ValueRef};
+use sqlx::{AssertSqlSafe, Postgres, Row, ValueRef};
 
 /// A transaction on a pooled connection, which goes back to the pool when this
 /// is committed or dropped.
@@ -34,7 +34,7 @@ impl SqlxTx {
     /// Run what was queued, in order.
     async fn flush(&mut self) -> Result<(), DbError> {
         for (sql, params) in std::mem::take(&mut self.queued) {
-            bind(sqlx::query(&sql), &params)
+            query(&sql, &params)
                 .execute(&mut *self.tx)
                 .await
                 .map_err(|e| DbError::from(e).queued())?;
@@ -46,7 +46,7 @@ impl SqlxTx {
 impl Tx for SqlxTx {
     async fn execute(&mut self, sql: &str, params: &[SqlParam]) -> Result<u64, DbError> {
         self.flush().await?;
-        Ok(bind(sqlx::query(sql), params)
+        Ok(query(sql, params)
             .execute(&mut *self.tx)
             .await?
             .rows_affected())
@@ -128,20 +128,59 @@ impl Tx for SqlxTx {
     }
 }
 
+impl crate::session::Session<'_> {
+    /// Run this session's statements on a sqlx connection, in order.
+    ///
+    /// For code that holds a sqlx transaction of its own rather than a
+    /// [`Tx`] -- GraphQL's resolvers, a hand-written route -- and has to make
+    /// it the caller's. Pass the transaction (`&mut *tx`): every setting is
+    /// transaction-local, so it is gone when the transaction ends and the
+    /// connection goes back to the pool as it came. On a connection outside
+    /// a transaction each statement would be its own, and nothing would stay.
+    ///
+    /// Parameters are bound as [`SqlxTx`] binds them, so a session means the
+    /// same thing to both. A failure here is reported as a queued statement's,
+    /// as it is when [`Tx::queue`] runs the same statements.
+    pub async fn apply_sqlx(&self, conn: &mut sqlx::PgConnection) -> Result<(), DbError> {
+        for statement in self.statements() {
+            query(&statement.sql, &statement.params)
+                .execute(&mut *conn)
+                .await
+                .map_err(|e| DbError::from(e).queued())?;
+        }
+        Ok(())
+    }
+}
+
 async fn fetch_all(
     tx: &mut sqlx::Transaction<'static, Postgres>,
     sql: &str,
     params: &[SqlParam],
 ) -> Result<Vec<PgRow>, sqlx::Error> {
-    bind(sqlx::query(sql), params).fetch_all(&mut **tx).await
+    query(sql, params).fetch_all(&mut **tx).await
 }
 
-/// Bind each parameter with the type sqlx gives its Rust value, and let the
-/// SQL's own casts decide the rest.
-fn bind<'q>(
-    mut query: Query<'q, Postgres, PgArguments>,
-    params: &'q [SqlParam],
-) -> Query<'q, Postgres, PgArguments> {
+/// The statement to run: `sql`, with each parameter bound with the type sqlx
+/// gives its Rust value, and the SQL's own casts deciding the rest.
+///
+/// Every statement this driver runs comes through here, which is why the
+/// driver wraps its SQL in `AssertSqlSafe` here and nowhere else. sqlx 0.9
+/// accepts only a `&'static str` as SQL unless told otherwise, as a speed bump
+/// against `format!`-ing user input into a query. The query builder in
+/// `crate::query` assembles statements at runtime, but every value a request
+/// carries arrives in `params` and is bound, never spliced in. What is spliced
+/// in is SQL the builder wrote itself; identifiers, each quoted by
+/// `postrust_sql::escape_ident`; literals the builder quotes itself, by
+/// `postrust_sql::quote_literal`; and the type name of a `::` cast in a
+/// select, which the parser admits only as a single type name -- letters,
+/// digits, `_` and `$` -- or one of the SQL standard's multi-word names, in
+/// the standard's spelling (see `parse_cast_type` in
+/// `crate::api_request::query_params`). The assertion is that, and nothing
+/// more. The schema cache's two runtime statements, in
+/// `schema_cache::queries::enum_values`, quote their identifiers the same way
+/// and make the same assertion for themselves.
+fn query(sql: &str, params: &[SqlParam]) -> Query<'static, Postgres, PgArguments> {
+    let mut query = sqlx::query(AssertSqlSafe(sql));
     for param in params {
         query = match param {
             SqlParam::Null => query.bind(None::<String>),
@@ -177,6 +216,14 @@ impl From<sqlx::Error> for DbError {
         let message = e.to_string();
         match e {
             sqlx::Error::Database(db_err) => {
+                // Phrased here rather than taken from sqlx's `Display`, which
+                // from 0.9 appends " at line N" -- the line of PostgreSQL's
+                // own C source that raised the error (its `L` field), not a
+                // line of the statement. It means nothing to whoever reads the
+                // message, differs between PostgreSQL builds, and is not what
+                // the socket driver says. This is the 0.8 wording, word for
+                // word.
+                let message = format!("error returned from database: {}", db_err.message());
                 // Try to downcast to Postgres-specific error for additional details
                 let (details, hint) = db_err
                     .try_downcast_ref::<sqlx::postgres::PgDatabaseError>()

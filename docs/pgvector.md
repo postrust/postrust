@@ -188,7 +188,7 @@ curl -X POST "localhost:3000/rpc/semantic_search" \
 Add a custom route for the complete RAG pipeline:
 
 ```rust
-// crates/postrust-server/src/custom.rs
+// In your own binary crate, nested with `postrust_server::Builder::nest`; see custom-routes.md
 use axum::{extract::State, Json, routing::post};
 
 #[derive(Deserialize)]

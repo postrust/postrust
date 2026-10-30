@@ -8,6 +8,9 @@
 //!   contract, subscriptions and Apollo Federation.
 //! - `admin-ui` - Implies `graphql`, and enables the admin UI with OpenAPI documentation,
 //!   Swagger UI, Scalar, and GraphQL Playground at `/admin`.
+//! - `otel` - OpenTelemetry: traces and metrics exported over OTLP, and the
+//!   metrics as Prometheus text at `/metrics` on the admin port. Inactive
+//!   until configured; see [`otel`] and docs/observability.md.
 
 #![warn(missing_docs)]
 // Every fallible function in this crate returns `postrust_core::Error`, which
@@ -21,15 +24,23 @@
 pub mod app;
 pub mod build;
 pub mod custom;
+mod error;
+mod jwks;
 pub mod lenient_uri;
+#[cfg(feature = "otel")]
+pub mod otel;
 pub mod state;
+pub mod telemetry;
+mod user;
 
 #[cfg(feature = "admin-ui")]
 pub mod admin;
 
 pub use app::handle_request;
-pub use build::{build, App, Host};
-pub use state::AppState;
+pub use build::{build, App, Builder, Host, RESERVED_PREFIXES};
+pub use error::Error;
+pub use state::{AppState, TxOptions};
+pub use user::User;
 
 #[cfg(feature = "admin-ui")]
 pub use admin::admin_router;

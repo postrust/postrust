@@ -11,9 +11,14 @@ use crate::plan::{ActionPlan, DbActionPlan};
 use postrust_sql::{SqlFragment, SqlParam};
 
 /// Build SQL from an action plan.
-pub fn build_query(plan: &ActionPlan, role: Option<&str>) -> Result<MainQuery> {
+///
+/// The SQL only: who it runs as is not part of it. The role, the claims and
+/// the rest of what makes a transaction the caller's are a
+/// [`Session`](crate::Session)'s, applied to the transaction before this
+/// runs on it.
+pub fn build_query(plan: &ActionPlan) -> Result<MainQuery> {
     match plan {
-        ActionPlan::Db(db_plan) => build_db_query(db_plan, role),
+        ActionPlan::Db(db_plan) => build_db_query(db_plan),
         ActionPlan::Info(_) => Ok(MainQuery::empty()),
     }
 }
@@ -22,16 +27,8 @@ pub fn build_query(plan: &ActionPlan, role: Option<&str>) -> Result<MainQuery> {
 pub const MUTATION_RESULT: &str = "pgrst_mutation_result";
 
 /// Build SQL from a database action plan.
-fn build_db_query(plan: &DbActionPlan, role: Option<&str>) -> Result<MainQuery> {
+fn build_db_query(plan: &DbActionPlan) -> Result<MainQuery> {
     let mut query = MainQuery::new();
-
-    // Add role switch if specified
-    if let Some(role) = role {
-        query.pre_statements.push(format!(
-            "SET LOCAL ROLE {}",
-            postrust_sql::escape_ident(role)
-        ));
-    }
 
     match plan {
         DbActionPlan::Read(read_tree) => {
@@ -71,8 +68,6 @@ fn build_db_query(plan: &DbActionPlan, role: Option<&str>) -> Result<MainQuery> 
 /// A complete query with setup and main statement.
 #[derive(Clone, Debug, Default)]
 pub struct MainQuery {
-    /// Pre-query statements (SET commands)
-    pub pre_statements: Vec<String>,
     /// Main query
     pub main: SqlFragment,
     /// Read query (for mutations with RETURNING)
@@ -146,7 +141,7 @@ mod tests {
             mutate,
             read: Some(ReadPlanTree::leaf(read)),
         });
-        let (sql, _) = build_query(&plan, None).unwrap().build_main();
+        let (sql, _) = build_query(&plan).unwrap().build_main();
 
         assert_eq!(
             sql,

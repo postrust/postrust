@@ -165,6 +165,21 @@ pub(crate) fn schema_key(config: &AppConfig) -> String {
     )
 }
 
+/// The KV key for the copy of the JWKS at `url`, beside the schema cache's
+/// in the same namespace and never mistaken for it. Hashed because a URL can
+/// be longer than the 512 bytes KV allows a key, and versioned like the schema
+/// cache's so that another build's record is not read as this one's.
+pub(crate) fn jwks_key(url: &str) -> String {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    url.hash(&mut hasher);
+    format!(
+        "postrust/{}/jwks/{:016x}",
+        env!("CARGO_PKG_VERSION"),
+        hasher.finish()
+    )
+}
+
 /// Whether a schema cache for `key`, loaded from the catalog at `loaded_at`,
 /// should replace the one an isolate holds. One for another key always does;
 /// one for the same key only when it is strictly newer, so a slower request
@@ -344,6 +359,17 @@ mod tests {
         assert_eq!(kv_expiration_secs(60.0), 60);
         assert_eq!(kv_expiration_secs(90.5), 91);
         assert_eq!(kv_expiration_secs(3600.0), 3600);
+    }
+
+    #[test]
+    fn the_jwks_key_is_its_own_and_one_per_url() {
+        let a = jwks_key("https://a.example/.well-known/jwks.json");
+        assert!(a.starts_with(&format!("postrust/{}/jwks/", env!("CARGO_PKG_VERSION"))));
+        assert_eq!(a, jwks_key("https://a.example/.well-known/jwks.json"));
+        assert_ne!(a, jwks_key("https://b.example/.well-known/jwks.json"));
+        let config = settings(vars(&[])).unwrap().config;
+        assert_ne!(a, schema_key(&config));
+        assert!(jwks_key(&"x".repeat(4096)).len() < 512);
     }
 
     #[test]

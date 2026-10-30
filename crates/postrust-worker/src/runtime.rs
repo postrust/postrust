@@ -2,7 +2,7 @@ use crate::settings::{self, Binding, Settings, Unconfigured};
 use bytes::Bytes;
 use http::{HeaderValue, Method, Response, StatusCode};
 use http_body_util::{BodyExt, Full};
-use postrust_auth::{JwtCache, JwtConfig};
+use postrust_auth::{Jwks, JwtCache, JwtConfig, JwtKeys};
 use postrust_core::db::tokio_postgres::Config;
 use postrust_core::db::{BoxFuture, Connector, PgSocketDb};
 use postrust_core::{AppConfig, SchemaCache};
@@ -106,6 +106,15 @@ async fn scheduled(_event: ScheduledEvent, env: Env, _ctx: ScheduleContext) {
         Ok(settings) => {
             if let Err(e) = refresh(&env, &settings).await {
                 worker::console_error!("postrust: scheduled schema reload failed: {e}");
+            }
+            // The keys too, so that the KV copy cold isolates read is never
+            // older than the schedule.
+            if let Ok((_, Some(jwks))) = jwt_keys(&env, &settings.config) {
+                if let Err(e) = jwks.refresh().await {
+                    worker::console_error!(
+                        "postrust: scheduled refresh of PGRST_JWT_JWKS_URL failed: {e}"
+                    );
+                }
             }
         }
         Err(unconfigured) => worker::console_error!(
@@ -418,6 +427,65 @@ fn database(env: &Env) -> Result<PgSocketDb<Hyperdrive>, postrust_core::Error> {
 struct Isolate {
     schema: Option<Schema>,
     jwt_cache: Option<Rc<JwtCache>>,
+    /// The keys parsed from the secret, the JWKS fetched beside them, and
+    /// the settings they were made from.
+    jwt_keys: Option<(JwtSource, Keys)>,
+}
+
+/// `PGRST_JWT_SECRET`, `PGRST_JWT_SECRET_IS_BASE64`, `PGRST_JWT_JWKS_URL`
+/// and `PGRST_JWT_JWKS_REFRESH`, as read.
+type JwtSource = (Option<String>, bool, Option<String>, u64);
+
+/// The keys a request verifies with: from the secret, and from a JWKS URL.
+type Keys = (Option<JwtKeys>, Option<Jwks>);
+
+/// The verification keys for this request's configuration.
+///
+/// A Worker has no startup to parse them at: the configuration is read from
+/// the environment on every request. So they are parsed the first time an
+/// isolate sees a secret and kept for as long as the secret stays the same --
+/// a JWKS of RSA keys is not something to decode per request. A secret that
+/// does not parse is answered as the configuration error it is, on every
+/// request, until it is fixed.
+///
+/// Keys from `PGRST_JWT_JWKS_URL` are kept the same way, so that what one
+/// request fetched serves the next; they are fetched by the first request
+/// that needs them (see `crate::jwks`), not here.
+fn jwt_keys(env: &Env, config: &AppConfig) -> Result<Keys, postrust_core::Error> {
+    let source: JwtSource = (
+        config.jwt_secret.clone(),
+        config.jwt_secret_is_base64,
+        config.jwt_jwks_url.clone(),
+        config.jwt_jwks_refresh,
+    );
+    let held = ISOLATE.with(|i| {
+        i.borrow()
+            .jwt_keys
+            .as_ref()
+            .filter(|(made_from, _)| *made_from == source)
+            .map(|(_, keys)| keys.clone())
+    });
+    if let Some(keys) = held {
+        return Ok(keys);
+    }
+    let keys = JwtKeys::from_config(source.0.as_deref(), source.1)
+        .map_err(|e| postrust_core::Error::Config(format!("PGRST_JWT_SECRET: {e}")))?;
+    let jwks =
+        match postrust_engine::jwks_builder(config, keys.as_ref(), crate::jwks::WorkerFetch) {
+            None => None,
+            Some(builder) => {
+                let builder = match env.kv(SCHEMA_KV) {
+                    Ok(kv) => builder.store(crate::jwks::KvJwks(kv)),
+                    Err(_) => builder,
+                };
+                Some(builder.build().map_err(|e| {
+                    postrust_core::Error::Config(format!("PGRST_JWT_JWKS_URL: {e}"))
+                })?)
+            }
+        };
+    let keys = (keys, jwks);
+    ISOLATE.with(|i| i.borrow_mut().jwt_keys = Some((source, keys.clone())));
+    Ok(keys)
 }
 
 /// A schema cache, and when this isolate last made sure it was current.
@@ -576,13 +644,11 @@ impl State {
         let db = database(env)?;
         let schema = schema(env, &settings).await?;
         let config = settings.config;
-        let jwt_config = JwtConfig {
-            secret: config.jwt_secret.clone(),
-            secret_is_base64: config.jwt_secret_is_base64,
-            audience: config.jwt_aud.clone(),
-            role_claim_key: config.jwt_role_claim_key.clone(),
-            anon_role: config.db_anon_role.clone(),
-        };
+        let (keys, jwks) = jwt_keys(env, &config)?;
+        let mut jwt_config = postrust_engine::jwt_config_with_keys(&config, keys);
+        if let Some(jwks) = jwks {
+            jwt_config = jwt_config.with_jwks(jwks);
+        }
         let jwt_cache = ISOLATE.with(|i| {
             let mut isolate = i.borrow_mut();
             if isolate.jwt_cache.is_none() {

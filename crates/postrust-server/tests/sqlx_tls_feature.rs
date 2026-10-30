@@ -17,6 +17,10 @@ use std::{fs, path::Path};
 /// Any of these keeps `sslmode=require` working. The workspace picks one of
 /// them for reasons recorded in `Cargo.toml`; this test only cares that it
 /// picks one at all, so re-evaluating that choice does not fail the build.
+///
+/// sqlx 0.9's list. It deleted the combined runtime-and-TLS features
+/// (`runtime-tokio-rustls`, `runtime-tokio-native-tls`), so naming one of those
+/// no longer resolves at all, and `tls-none` is deliberately absent.
 const TLS_FEATURES: &[&str] = &[
     "tls-rustls",
     "tls-rustls-ring",
@@ -24,8 +28,6 @@ const TLS_FEATURES: &[&str] = &[
     "tls-rustls-ring-native-roots",
     "tls-rustls-aws-lc-rs",
     "tls-native-tls",
-    "runtime-tokio-rustls",
-    "runtime-tokio-native-tls",
 ];
 
 #[test]

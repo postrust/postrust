@@ -123,7 +123,8 @@ npx wrangler deploy
 
 The Worker reads the server's own variables, set as Worker variables or
 secrets: `PGRST_DB_SCHEMAS`, `PGRST_DB_ANON_ROLE`, `PGRST_JWT_SECRET`,
-`PGRST_JWT_AUD`, `PGRST_JWT_ROLE_CLAIM_KEY`, `PGRST_DB_EXTRA_SEARCH_PATH`,
+`PGRST_JWT_JWKS_URL`, `PGRST_JWT_JWKS_REFRESH`,
+`PGRST_JWT_AUD`, `PGRST_JWT_ISS`, `PGRST_JWT_ROLE_CLAIM_KEY`, `PGRST_DB_EXTRA_SEARCH_PATH`,
 `PGRST_DB_PRE_REQUEST`, `PGRST_APP_SETTINGS_*`, `PGRST_ROLE_SETTINGS`,
 `PGRST_SERVER_CORS_ORIGINS` and the rest. See
 [configuration.md](configuration.md). Settings that only make sense for a
@@ -170,6 +171,38 @@ key that names the exposed schemas and the versions of `postrust-worker` and
 Without a KV binding everything still works, but each new isolate loads the
 catalog itself, and each isolate loads it again every
 `PGRST_WORKER_SCHEMA_TTL` seconds.
+
+## Keys from a JWKS URL
+
+With `PGRST_JWT_JWKS_URL` set, the keys are fetched with the Workers Fetch API
+and handled as on the server (see
+[authentication.md](authentication.md#keys-from-a-jwks-url)) -- the same URL
+rules, limits, refresh schedule and fail-closed behaviour -- with these
+differences, because a Worker has no start-up and no background task:
+
+- **The first request that needs the keys fetches them**, and its isolate
+  keeps them for the requests after it. A request whose token's key is already
+  held waits for nothing.
+- **They are copied into KV**, in the `POSTRUST_SCHEMA_CACHE` namespace under
+  a key of their own (`postrust/<version>/jwks/<hash of the URL>`), with the
+  time until which they are fresh. An isolate that has no keys yet, or finds
+  its keys due, reads the KV copy first and asks the provider only when the
+  copy is missing or stale; every fetch from the provider writes the copy. So
+  a burst of cold isolates costs the provider one fetch, not one each. The copy
+  expires when it stops being fresh (at least 60 seconds, KV's minimum).
+- **An unknown `kid` always goes to the provider**, never to the copy, which
+  is exactly what may be out of date. At most once every 30 seconds per
+  isolate.
+- **The cron trigger fetches them too**, and writes the copy, so the copy cold
+  isolates read is never older than the schedule.
+- **A request does not wait for another request's fetch.** Each request is its
+  own I/O context in Workers, and one woken by another's I/O would carry on in
+  the wrong context; a request that needs keys while another is fetching them
+  fetches (or reads KV) itself.
+
+There is no readiness endpoint on a Worker; a provider that has never answered
+shows as `PGRST301` on every token, and a failed fetch is logged by the cron.
+Without a KV binding every isolate fetches from the provider itself.
 
 ## What it costs
 

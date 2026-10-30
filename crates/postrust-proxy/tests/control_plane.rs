@@ -23,7 +23,7 @@ use postrust_proxy::saas::api_keys::hash_api_key;
 use postrust_proxy::saas::handlers::{saas_router, SaasState};
 use postrust_proxy::saas::{ReservedDomains, SaasOptions, UploadTrust};
 use serde_json::{json, Value};
-use sqlx::{Executor, PgPool};
+use sqlx::{AssertSqlSafe, Executor, PgPool};
 use std::sync::Arc;
 use tower::ServiceExt;
 use uuid::Uuid;
@@ -634,9 +634,11 @@ async fn the_migration_keeps_the_verified_row_of_a_case_collision() {
     let mut conn = sqlx::PgConnection::connect(&url).await.unwrap();
     let schema = format!("cp_{}", Uuid::new_v4().simple());
 
-    conn.execute(format!("CREATE SCHEMA {schema}; SET search_path TO {schema}").as_str())
-        .await
-        .unwrap();
+    conn.execute(AssertSqlSafe(format!(
+        "CREATE SCHEMA {schema}; SET search_path TO {schema}"
+    )))
+    .await
+    .unwrap();
     // The first migration alters proxy_certificates if a table of that name
     // exists anywhere; give it one here, shaped as a pre-ACME install had it.
     conn.execute(
@@ -714,7 +716,7 @@ async fn the_migration_keeps_the_verified_row_of_a_case_collision() {
         "the index does not refuse a case duplicate"
     );
 
-    conn.execute(format!("DROP SCHEMA {schema} CASCADE").as_str())
+    conn.execute(AssertSqlSafe(format!("DROP SCHEMA {schema} CASCADE")))
         .await
         .unwrap();
 }

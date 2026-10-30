@@ -6,8 +6,8 @@
 //! to be told which. A library that folds both into "invalid token" answers a
 //! question nobody asked.
 
-use super::{AuthResult, ClaimFault, JwtConfig, JwtError};
-use jsonwebtoken::{decode, Algorithm, DecodingKey, Validation};
+use super::{AuthResult, ClaimFault, JwtConfig, JwtError, KeySet};
+use jsonwebtoken::{decode, decode_header, Header, Validation};
 use std::collections::HashMap;
 
 /// How far ahead of the server a token's clock may be.
@@ -26,30 +26,18 @@ const ALLOWED_SKEW: i64 = 30;
 
 /// Validate a JWT token and extract claims.
 pub fn validate_token(token: &str, config: &JwtConfig) -> Result<AuthResult, JwtError> {
-    let secret = config.secret.as_ref().ok_or(JwtError::SecretMissing)?;
+    let keys = config.keys.as_ref().ok_or(JwtError::SecretMissing)?;
 
-    // Decode secret
-    let key_bytes = if config.secret_is_base64 {
-        base64_decode(secret)?
-    } else {
-        secret.as_bytes().to_vec()
-    };
+    // Read unverified, and used for one thing only: choosing which keys to try.
+    // Nothing in it is believed -- its `alg` must be one the chosen key admits,
+    // and the key, not the header, is what the signature is checked against.
+    // A header that does not parse, `alg: none` among them, names no key.
+    let header = decode_header(token).map_err(|e| match map_jwt_error(e) {
+        JwtError::Claim(ClaimFault::Unparsable) => JwtError::NoSuitableKey,
+        other => other,
+    })?;
 
-    let key = DecodingKey::from_secret(&key_bytes);
-
-    // Signature only. Every claim the library could check here, it checks
-    // differently from the way this API's contract says to -- a missing `exp`
-    // is not an error, an `aud` that is not a string has a code of its own --
-    // so all of it is done below, where the answers can be the right ones.
-    let mut validation = Validation::new(Algorithm::HS256);
-    validation.validate_exp = false;
-    validation.validate_nbf = false;
-    validation.validate_aud = false;
-    validation.required_spec_claims.clear();
-
-    let token_data = decode::<HashMap<String, serde_json::Value>>(token, &key, &validation)
-        .map_err(map_jwt_error)?;
-    let claims = token_data.claims;
+    let claims = verify(token, &header, &keys.current())?;
 
     check_claims(&claims, config, now())?;
 
@@ -58,6 +46,53 @@ pub fn validate_token(token: &str, config: &JwtConfig) -> Result<AuthResult, Jwt
     let role = role_of(&claims, config).ok_or(JwtError::NoIdentity)?;
 
     Ok(AuthResult { role, claims })
+}
+
+/// Check the signature against the keys the header selects.
+///
+/// No candidate at all -- an unknown `kid`, or an `alg` no key admits -- is a
+/// token this server holds no key for, which PostgREST reports as "No
+/// suitable key or wrong key type". Candidates that all refuse it is a
+/// signature that does not verify. A token without a `kid` is tried against
+/// every candidate in turn and passes on the first that verifies it, as in
+/// PostgREST.
+fn verify(
+    token: &str,
+    header: &Header,
+    keys: &KeySet,
+) -> Result<HashMap<String, serde_json::Value>, JwtError> {
+    // Signature only, and only the header's algorithm, which every candidate
+    // is already known to admit. Every claim the library could check here, it
+    // checks differently from the way this API's contract says to -- a
+    // missing `exp` is not an error, an `aud` that is not a string has a code
+    // of its own -- so all of it is done in `check_claims`, where the answers
+    // can be the right ones.
+    let mut validation = Validation::new(header.alg);
+    validation.validate_exp = false;
+    validation.validate_nbf = false;
+    validation.validate_aud = false;
+    validation.required_spec_claims.clear();
+
+    let mut failure = JwtError::NoSuitableKey;
+    for key in keys.candidates(header.kid.as_deref(), header.alg) {
+        match decode::<HashMap<String, serde_json::Value>>(token, key, &validation) {
+            Ok(data) => return Ok(data.claims),
+            // The signature verified and the payload is not claims. Another
+            // key cannot change what the payload says.
+            Err(e) if matches!(e.kind(), jsonwebtoken::errors::ErrorKind::Json(_)) => {
+                return Err(JwtError::Claim(ClaimFault::Unparsable))
+            }
+            // A signature that failed under one candidate is the more useful
+            // thing to report than a later candidate's key that could not be
+            // used at all.
+            Err(e) => {
+                if !matches!(failure, JwtError::InvalidSignature) {
+                    failure = map_jwt_error(e);
+                }
+            }
+        }
+    }
+    Err(failure)
 }
 
 /// The role a token names, or the anonymous one where it names none.
@@ -179,6 +214,22 @@ fn check_claims(
         Some(_) => return Err(JwtError::Claim(ClaimFault::AudienceNotStrings)),
     }
 
+    // Unlike `aud`, an absent `iss` is not admitted. A token without an `aud`
+    // says it is meant for everyone, which is how PostgREST reads it; a token
+    // without an `iss` says nothing about who minted it, and naming the one
+    // issuer to accept is the whole of what this setting is for. It matters
+    // most where it is most likely to be set: an identity provider whose
+    // signing keys are shared across tenants, where the `iss` is the only
+    // thing that tells one tenant's tokens from another's. And unlike `aud`,
+    // nothing is checked when no issuer is configured -- PostgREST does not
+    // look at `iss` at all, so a token it accepts must not be refused here
+    // over the shape of a claim nobody asked about.
+    if let Some(wanted) = &config.issuer {
+        if claims.get("iss").and_then(serde_json::Value::as_str) != Some(wanted.as_str()) {
+            return Err(JwtError::Claim(ClaimFault::UnexpectedIssuer));
+        }
+    }
+
     Ok(())
 }
 
@@ -189,12 +240,6 @@ fn now() -> i64 {
         .duration_since(web_time::UNIX_EPOCH)
         .map(|elapsed| elapsed.as_secs() as i64)
         .unwrap_or_default()
-}
-
-/// Decode base64 secret.
-fn base64_decode(s: &str) -> Result<Vec<u8>, JwtError> {
-    use base64::{engine::general_purpose::STANDARD, Engine};
-    STANDARD.decode(s).map_err(|_| JwtError::NoSuitableKey)
 }
 
 /// Map jsonwebtoken error to JwtError.
@@ -216,7 +261,8 @@ mod tests {
 
     fn config() -> JwtConfig {
         JwtConfig {
-            secret: Some("reallyreallyreallyreallyverysafe".into()),
+            keys: crate::JwtKeys::from_config(Some("reallyreallyreallyreallyverysafe"), false)
+                .unwrap(),
             ..JwtConfig::default()
         }
     }
@@ -440,6 +486,55 @@ mod tests {
         let mut named = HashMap::new();
         named.insert("role".to_string(), serde_json::json!("web_user"));
         assert_eq!(role_of(&named, &configured), Some("web_user".to_string()));
+    }
+
+    /// Configured, the issuer must be named, and named exactly.
+    #[test]
+    fn a_configured_issuer_must_be_the_tokens() {
+        let configured = JwtConfig {
+            issuer: Some("https://issuer.example".into()),
+            ..config()
+        };
+        assert!(check_claims(
+            &claims(serde_json::json!({"iss": "https://issuer.example"})),
+            &configured,
+            0
+        )
+        .is_ok());
+        for token in [
+            serde_json::json!({"iss": "https://issuer.example/"}),
+            serde_json::json!({"iss": null}),
+            serde_json::json!({}),
+        ] {
+            assert!(
+                matches!(
+                    check_claims(&claims(token.clone()), &configured, 0),
+                    Err(JwtError::Claim(ClaimFault::UnexpectedIssuer))
+                ),
+                "{token}"
+            );
+        }
+    }
+
+    /// Unconfigured, `iss` is not looked at, whatever shape it has.
+    #[test]
+    fn no_issuer_configured_means_iss_is_not_checked() {
+        for iss in [serde_json::json!("anyone"), serde_json::json!(42)] {
+            assert!(check_claims(&claims(serde_json::json!({"iss": iss})), &config(), 0).is_ok());
+        }
+    }
+
+    /// An expired token is reported as expired before its issuer is.
+    #[test]
+    fn expiry_is_reported_before_the_issuer() {
+        let configured = JwtConfig {
+            issuer: Some("https://issuer.example".into()),
+            ..config()
+        };
+        assert!(matches!(
+            check_claims(&claims(serde_json::json!({"exp": 1})), &configured, 9_000),
+            Err(JwtError::Claim(ClaimFault::Expired))
+        ));
     }
 
     /// The first thing wrong with the token is what the client is told.

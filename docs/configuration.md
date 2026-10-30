@@ -93,9 +93,12 @@ curl http://localhost:3000/users \
 
 | Variable | Description | Default |
 |----------|-------------|---------|
-| `PGRST_JWT_SECRET` | Secret for HS256/HS384/HS512 | (none) |
+| `PGRST_JWT_SECRET` | HMAC secret (HS256), or a JWK / JWK Set of verification keys (RS\*, PS\*, ES256/384, EdDSA, HS\*) | (none) |
 | `PGRST_JWT_SECRET_IS_BASE64` | Is secret base64 encoded? | `false` |
+| `PGRST_JWT_JWKS_URL` | Fetch the verification keys from this JWKS URL (an identity provider's `jwks_uri`) and keep them current. `https`, or `http` to a loopback host. With `PGRST_JWT_SECRET` too, a token either verifies is accepted | (none) |
+| `PGRST_JWT_JWKS_REFRESH` | Seconds between fetches of `PGRST_JWT_JWKS_URL` when its response has no `Cache-Control: max-age` (a `max-age` is honoured between 60 s and a day) | `300` |
 | `PGRST_JWT_AUD` | Required audience claim | (none) |
+| `PGRST_JWT_ISS` | Required issuer: a token's `iss` must equal it, and must be present | (none) |
 | `PGRST_JWT_ROLE_CLAIM_KEY` | Claim key containing role | `role` |
 | `PGRST_JWT_CACHE_ENABLED` | Cache validated tokens, so a repeated token is not verified again | `true` |
 | `PGRST_JWT_CACHE_MAX_LIFETIME` | How long a cached validation may be reused, in seconds. A token's own `exp` bounds this — the cache never answers with a token past its expiry. `0` turns the cache off | `3600` |
@@ -109,7 +112,30 @@ PGRST_JWT_SECRET="your-super-secret-key-at-least-32-characters"
 # Base64 encoded secret
 PGRST_JWT_SECRET_IS_BASE64=true
 PGRST_JWT_SECRET="eW91ci1zdXBlci1zZWNyZXQta2V5LWF0LWxlYXN0LTMyLWNoYXJhY3RlcnM="
+
+# A JWK or a JWKS (an identity provider's public keys)
+PGRST_JWT_SECRET='{"keys":[{"kid":"k1","kty":"RSA","n":"0vx7agoebGcQ...","e":"AQAB"}]}'
 ```
+
+A JSON value is parsed once at startup, and a malformed one stops the server
+from starting. See [Authentication](authentication.md#asymmetric-keys-jwk-and-jwks)
+for how the key and algorithm are chosen.
+
+### JWKS URL
+
+```bash
+# Keys fetched from the identity provider, refreshed as it rotates them
+PGRST_JWT_JWKS_URL="https://<project>.supabase.co/auth/v1/.well-known/jwks.json"
+# How often, when the provider's response does not say (seconds)
+PGRST_JWT_JWKS_REFRESH=300
+```
+
+A URL that is not `https` (or `http` to `localhost`, `127.0.0.0/8` or `[::1]`)
+stops the server from starting. A provider that cannot be reached does not:
+the server starts, refuses tokens until the keys load, and reports not ready
+on `/_/ready` meanwhile. A `PGRST_JWT_JWKS_REFRESH` that is not a positive
+integer is ignored with a warning. See
+[Authentication](authentication.md#keys-from-a-jwks-url).
 
 ### Custom Role Claim
 
@@ -237,7 +263,7 @@ tried to be an administrator and failed is not then treated as a stranger.
 | `PGRST_SERVER_PORT` | Server port | `3000` |
 | `PGRST_SERVER_CORS_ORIGINS` | Allowed CORS origins | `*` |
 | `PGRST_SERVER_UNIX_SOCKET` | Listen on a Unix domain socket instead of host and port. A stale socket file left by a previous run is removed; anything at the path that is not a socket is refused | (none) |
-| `PGRST_ADMIN_SERVER_PORT` | Serve `/live`, `/ready` and `/health` on a second port, so a probe does not need to reach the API | (none) |
+| `PGRST_ADMIN_SERVER_PORT` | Serve `/live`, `/ready` and `/health` on a second port, so a probe does not need to reach the API. With the `otel` feature (the published images), `/metrics` too; see [Observability](./observability.md) | (none) |
 
 ### CORS Configuration
 
@@ -329,6 +355,9 @@ differences.
 |----------|-------------|---------|
 | `PGRST_LOG_LEVEL` | Log level | `info` |
 | `RUST_LOG` | Detailed Rust logging. Wins where both are set | (none) |
+| `PGRST_LOG_FORMAT` | `text`, or `json` for one JSON object per line with the fields of every span the line was logged in -- `request_id` and `trace_id` among them | `text` |
+| `PGRST_OTEL_DB_STATEMENT` | Record each request's SQL statements on their spans as `db.query.text`: the main one on `db.query`, a count on `db.count`, a separately fetched embed on `db.embed`. Parameterized, so request values are not included, but it does reveal table, column and function names | `false` |
+| `OTEL_EXPORTER_OTLP_ENDPOINT` | With the `otel` feature (the published images): export traces and metrics over OTLP/HTTP to this collector, e.g. `http://otel-collector:4318`. The other standard `OTEL_*` variables apply; see [Observability](./observability.md) | (none) |
 | `PGRST_DEBUG` | Include the database's own error detail, hint and constraint name in error responses. Off in production: those strings describe the schema | `false` |
 
 ### Log Levels
@@ -336,8 +365,13 @@ differences.
 - `crit` - Errors only, as `error` (accepted for PostgREST parity)
 - `error` - Only errors
 - `warn` - Warnings and errors
-- `info` - General information (default)
-- `debug` - Detailed debugging
+- `info` - General information (default). Lines logged while a request is
+  served name its `request_id` and `trace_id`
+- `debug` - Detailed debugging, including one line per request with its status
+  and latency, and the spans of each request's stages
+
+The request id, the trace context and the span fields are described in
+[Tracing and logging](deployment.md#tracing-and-logging).
 
 `RUST_LOG` takes a full [tracing filter](https://docs.rs/tracing-subscriber/latest/tracing_subscriber/filter/struct.EnvFilter.html)
 and can name targets and spans individually, so it overrides `PGRST_LOG_LEVEL`
@@ -396,7 +430,9 @@ PGRST_ROLE_SETTINGS='{"web_user":{"isolation_level":"serializable","statement_ti
 
 `isolation_level` takes the same spellings as `PGRST_DB_TX_ISOLATION` and
 overrides it for that role. `statement_timeout` is in milliseconds and is
-applied as a `SET LOCAL` on the request's transaction.
+applied as a `SET LOCAL` on the request's transaction. Both apply to GraphQL
+operations as they do to REST requests: a GraphQL transaction is set up the
+same way, from the token's database role.
 
 JSON rather than one variable per role, because a PostgreSQL role name may hold
 characters an environment variable name cannot. A value that does not parse is

@@ -125,7 +125,7 @@ pub struct AppConfig {
     // ========================================================================
     // JWT Settings
     // ========================================================================
-    /// JWT secret key (or JWKS URL)
+    /// JWT secret: an HMAC secret, or a JSON Web Key or JWK Set.
     pub jwt_secret: Option<String>,
 
     /// JWT secret as base64
@@ -134,6 +134,10 @@ pub struct AppConfig {
 
     /// JWT audience claim to validate
     pub jwt_aud: Option<String>,
+
+    /// The issuer a token's `iss` claim must name (`PGRST_JWT_ISS`). Unset,
+    /// `iss` is not checked.
+    pub jwt_iss: Option<String>,
 
     /// JWT claim that contains the role
     #[serde(default = "default_jwt_role_claim")]
@@ -149,6 +153,19 @@ pub struct AppConfig {
     /// past its expiry. `0` turns the cache off, as in PostgREST.
     #[serde(default = "default_jwt_cache_max")]
     pub jwt_cache_max_lifetime: u64,
+
+    /// Where to fetch a JSON Web Key Set from (`PGRST_JWT_JWKS_URL`), and
+    /// keep fetching it as the identity provider rotates its keys.
+    ///
+    /// `https`, or `http` to a loopback host; checked when the server is
+    /// built. With `jwt_secret` also set, a token either one verifies is
+    /// accepted. See docs/authentication.md.
+    pub jwt_jwks_url: Option<String>,
+
+    /// How often to fetch `jwt_jwks_url` again, in seconds, when its response
+    /// carries no `Cache-Control: max-age` (`PGRST_JWT_JWKS_REFRESH`).
+    #[serde(default = "default_jwt_jwks_refresh")]
+    pub jwt_jwks_refresh: u64,
 
     // ========================================================================
     // Hasura Authentication
@@ -187,6 +204,27 @@ pub struct AppConfig {
     /// Log level: crit, error, warn, info, debug
     #[serde(default = "default_log_level")]
     pub log_level: LogLevel,
+
+    /// How log lines are written: `text` for a person at a terminal, `json`
+    /// for a log shipper. JSON lines carry the fields of every span the event
+    /// happened in, so each one names its `request_id` and `trace_id`.
+    ///
+    /// Like `log_level`, the binaries read the variable themselves before the
+    /// configuration is loaded -- the subscriber has to exist first to report
+    /// what loading it rejects -- and this field is that same value, kept for
+    /// anything that reads the configuration afterwards.
+    #[serde(default)]
+    pub log_format: LogFormat,
+
+    /// Record the SQL of a request's main query on its `db.query` span, as
+    /// OpenTelemetry's `db.query.text`.
+    ///
+    /// Off by default. The statement is parameterized, so the values a client
+    /// sent are not in it -- but the table, column and function names are,
+    /// and whatever collects traces may be read by more people than the
+    /// schema is meant for. Formatting it costs nothing while it is off.
+    #[serde(default)]
+    pub otel_db_statement: bool,
 
     // ========================================================================
     // Role Settings
@@ -250,14 +288,19 @@ impl Default for AppConfig {
             jwt_secret: None,
             jwt_secret_is_base64: false,
             jwt_aud: None,
+            jwt_iss: None,
             jwt_role_claim_key: default_jwt_role_claim(),
             jwt_cache_enabled: true,
             jwt_cache_max_lifetime: default_jwt_cache_max(),
+            jwt_jwks_url: None,
+            jwt_jwks_refresh: default_jwt_jwks_refresh(),
             hasura_admin_secret: None,
             hasura_unauthorized_role: None,
             openapi_server_proxy_uri: None,
             openapi_mode: OpenApiMode::FollowPrivileges,
             log_level: default_log_level(),
+            log_format: LogFormat::Text,
+            otel_db_statement: false,
             role_settings: HashMap::new(),
             app_settings: HashMap::new(),
             graphql_federation: false,
@@ -463,6 +506,13 @@ impl AppConfig {
         if let Ok(aud) = get("PGRST_JWT_AUD") {
             config.jwt_aud = Some(aud);
         }
+        // Not a PostgREST setting. Empty is read as unset rather than as an
+        // issuer nobody can name, which would refuse every token.
+        if let Ok(iss) = get("PGRST_JWT_ISS") {
+            if !iss.trim().is_empty() {
+                config.jwt_iss = Some(iss);
+            }
+        }
         // Both of these reach the JWT layer already -- `JwtConfig` is built
         // from them in every binary. Only the environment read was missing, so
         // a base64 secret was verified against its own text and a role claim
@@ -487,6 +537,22 @@ impl AppConfig {
                     "PGRST_JWT_CACHE_MAX_LIFETIME",
                     &v,
                     "a non-negative integer number of seconds",
+                ),
+            }
+        }
+        // Not PostgREST settings. Empty is unset, as for the issuer.
+        if let Ok(url) = get("PGRST_JWT_JWKS_URL") {
+            if !url.trim().is_empty() {
+                config.jwt_jwks_url = Some(url.trim().to_string());
+            }
+        }
+        if let Ok(secs) = get("PGRST_JWT_JWKS_REFRESH") {
+            match secs.parse::<u64>() {
+                Ok(n) if n > 0 => config.jwt_jwks_refresh = n,
+                _ => warn_ignored(
+                    "PGRST_JWT_JWKS_REFRESH",
+                    &secs,
+                    "a positive integer number of seconds",
                 ),
             }
         }
@@ -554,6 +620,15 @@ impl AppConfig {
                     "one of: crit, error, warn, info, debug",
                 ),
             }
+        }
+        if let Ok(format) = get("PGRST_LOG_FORMAT") {
+            match LogFormat::parse_config(&format) {
+                Some(f) => config.log_format = f,
+                None => warn_ignored("PGRST_LOG_FORMAT", &format, "one of: text, json"),
+            }
+        }
+        if let Ok(v) = get("PGRST_OTEL_DB_STATEMENT") {
+            config.otel_db_statement = env_bool("PGRST_OTEL_DB_STATEMENT", &v)?;
         }
         if let Ok(path) = get("PGRST_SERVER_UNIX_SOCKET") {
             if !path.trim().is_empty() {
@@ -699,6 +774,23 @@ impl<'de> Deserialize<'de> for LogLevel {
     }
 }
 
+impl Serialize for LogFormat {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(self.as_config_str())
+    }
+}
+
+impl<'de> Deserialize<'de> for LogFormat {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let raw = String::deserialize(deserializer)?;
+        Self::parse_config(&raw).ok_or_else(|| {
+            serde::de::Error::custom(format!(
+                "unknown log format {raw:?}: expected one of text, json"
+            ))
+        })
+    }
+}
+
 /// Per-role settings.
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 #[non_exhaustive]
@@ -819,9 +911,11 @@ pub enum LogLevel {
     Error,
     /// Configuration that was ignored, and conditions worth noticing.
     Warn,
-    /// Start-up, schema reloads, and one line per request.
+    /// Start-up and schema reloads. Every line logged while a request is
+    /// being served names its `request_id` and `trace_id`.
     Info,
-    /// The generated SQL and the decisions behind it.
+    /// One line per request with its status and latency, the generated SQL,
+    /// and the decisions behind it.
     Debug,
 }
 
@@ -859,6 +953,37 @@ impl LogLevel {
             Self::Warn => "warn",
             Self::Info => "info",
             Self::Debug => "debug",
+        }
+    }
+}
+
+/// How log lines are written.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum LogFormat {
+    /// One human-readable line per event, with the fields of the spans it
+    /// happened in. The default.
+    #[default]
+    Text,
+    /// One JSON object per line, for a log shipper: the event's fields, and
+    /// the current span and every span above it with their fields.
+    Json,
+}
+
+impl LogFormat {
+    /// Parse the spelling used in configuration. Case-insensitive.
+    pub fn parse_config(s: &str) -> Option<Self> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "text" => Some(Self::Text),
+            "json" => Some(Self::Json),
+            _ => None,
+        }
+    }
+
+    /// The inverse of [`parse_config`](Self::parse_config).
+    pub fn as_config_str(&self) -> &'static str {
+        match self {
+            Self::Text => "text",
+            Self::Json => "json",
         }
     }
 }
@@ -910,6 +1035,10 @@ fn default_jwt_role_claim() -> String {
 
 fn default_jwt_cache_max() -> u64 {
     3600
+}
+
+fn default_jwt_jwks_refresh() -> u64 {
+    300
 }
 
 fn default_openapi_mode() -> OpenApiMode {
@@ -1106,6 +1235,48 @@ mod tests {
     }
 
     #[test]
+    fn the_jwt_issuer_is_read_and_an_empty_one_is_unset() {
+        let read = |value: &str| {
+            AppConfig::try_from_vars([("PGRST_JWT_ISS", value)])
+                .unwrap()
+                .jwt_iss
+        };
+        assert_eq!(
+            read("https://issuer.example").as_deref(),
+            Some("https://issuer.example")
+        );
+        assert_eq!(read("  "), None);
+        assert_eq!(
+            AppConfig::try_from_vars(Vec::<(String, String)>::new())
+                .unwrap()
+                .jwt_iss,
+            None
+        );
+    }
+
+    #[test]
+    fn the_jwks_url_and_its_refresh_interval_are_read() {
+        let read = |vars: &[(&str, &str)]| AppConfig::try_from_vars(vars.to_vec()).unwrap();
+        let config = read(&[
+            ("PGRST_JWT_JWKS_URL", " https://idp.example/jwks "),
+            ("PGRST_JWT_JWKS_REFRESH", "60"),
+        ]);
+        assert_eq!(
+            config.jwt_jwks_url.as_deref(),
+            Some("https://idp.example/jwks")
+        );
+        assert_eq!(config.jwt_jwks_refresh, 60);
+
+        let defaults = read(&[("PGRST_JWT_JWKS_URL", ""), ("PGRST_JWT_JWKS_REFRESH", "0")]);
+        assert_eq!(defaults.jwt_jwks_url, None);
+        assert_eq!(defaults.jwt_jwks_refresh, 300);
+        assert_eq!(
+            read(&[("PGRST_JWT_JWKS_REFRESH", "soon")]).jwt_jwks_refresh,
+            300
+        );
+    }
+
+    #[test]
     fn variables_can_come_from_somewhere_other_than_the_environment() {
         // What a Cloudflare Worker does with its bindings: nothing here is in
         // the process environment, and the app settings, which are found by
@@ -1248,6 +1419,28 @@ mod tests {
             Some("https://api.example.com")
         );
         assert_eq!(config.openapi_mode, OpenApiMode::IgnorePrivileges);
+    }
+
+    #[test]
+    fn tracing_settings_are_read() {
+        let d = AppConfig::default();
+        assert_eq!(d.log_format, LogFormat::Text);
+        assert!(!d.otel_db_statement);
+
+        let config = with_env(&[
+            ("PGRST_LOG_FORMAT", "JSON"),
+            ("PGRST_OTEL_DB_STATEMENT", "on"),
+        ]);
+        assert_eq!(config.log_format, LogFormat::Json);
+        assert!(config.otel_db_statement);
+
+        // A format nobody can write is ignored with a warning; a boolean that
+        // is not one fails, as every boolean setting does.
+        assert_eq!(
+            with_env(&[("PGRST_LOG_FORMAT", "yaml")]).log_format,
+            LogFormat::Text
+        );
+        assert!(with_env_result(&[("PGRST_OTEL_DB_STATEMENT", "maybe")]).is_err());
     }
 
     #[test]

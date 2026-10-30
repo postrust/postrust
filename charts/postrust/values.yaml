@@ -19,19 +19,37 @@ database:
   existingSecret: ""
 
 auth:
-  # Optional. Enables JWT verification when set.
+  # Optional. Enables JWT verification when set: an HMAC secret, or a JWK or
+  # JWKS of an identity provider's public keys.
   jwtSecret: ""
+  # Optional. Fetch the verification keys from an identity provider's JWKS
+  # URL (https) and keep them current, e.g.
+  # https://<tenant>.auth0.com/.well-known/jwks.json. /_/ready answers 503
+  # until they have loaded.
+  jwksUrl: ""
+  # Optional. When set, a token's iss must equal it.
+  issuer: ""
   # Role used for requests that arrive without a token.
   anonRole: web_anon
 
 server:
   port: 3000
   logLevel: info
+  # text, or json for one JSON object per line.
+  logFormat: text
   schemas: public
   # Serve the REST surface at the root as well as under /api.
   compatMode: false
   # Cap on rows returned by one request. Empty means no cap.
   maxRows: ""
+
+# More environment variables for the container, as a list of EnvVar. For
+# OpenTelemetry, for example (the image is built with it, and it is off until
+# an endpoint is set):
+#   extraEnv:
+#     - name: OTEL_EXPORTER_OTLP_ENDPOINT
+#       value: http://otel-collector:4318
+extraEnv: []
 
 service:
   type: ClusterIP

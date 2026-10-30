@@ -1126,6 +1126,15 @@ pub struct ApiRequest {
     pub headers: IndexMap<String, String>,
     /// Request cookies
     pub cookies: IndexMap<String, String>,
+    /// The trace the request belongs to, when the host said which -- from the
+    /// `TraceContext` it put in the request's extensions. Meant for the
+    /// database as `request.trace_id`, so a statement in `pg_stat_activity`
+    /// or the server log can be tied back to the request that sent it.
+    ///
+    /// Not serialized: it describes this one request's journey, not what it
+    /// asked for.
+    #[serde(skip)]
+    pub trace_id: Option<crate::trace::TraceId>,
 }
 
 impl Default for ApiRequest {
@@ -1147,6 +1156,7 @@ impl Default for ApiRequest {
             path: String::new(),
             headers: IndexMap::new(),
             cookies: IndexMap::new(),
+            trace_id: None,
         }
     }
 }

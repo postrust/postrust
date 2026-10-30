@@ -22,6 +22,7 @@ use postrust_graphql::context::GraphQLContext;
 use postrust_graphql::handler::GraphQLState;
 use postrust_graphql::schema::SchemaConfig;
 use sqlx::postgres::PgPoolOptions;
+use sqlx::AssertSqlSafe;
 use sqlx::{Executor, PgPool};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -58,16 +59,18 @@ async fn connect() -> PgPool {
 /// Create a dedicated schema holding a `widgets` table with a mix of column
 /// types, so type coercion is exercised too.
 async fn create_widgets_schema(pool: &PgPool, schema: &str) {
-    pool.execute(format!("DROP SCHEMA IF EXISTS {} CASCADE", schema).as_str())
-        .await
-        .expect("drop schema failed");
-    pool.execute(format!("CREATE SCHEMA {}", schema).as_str())
+    pool.execute(AssertSqlSafe(format!(
+        "DROP SCHEMA IF EXISTS {} CASCADE",
+        schema
+    )))
+    .await
+    .expect("drop schema failed");
+    pool.execute(AssertSqlSafe(format!("CREATE SCHEMA {}", schema)))
         .await
         .expect("create schema failed");
 
-    pool.execute(
-        format!(
-            r#"
+    pool.execute(AssertSqlSafe(format!(
+        r#"
             CREATE TABLE {}.widgets (
                 id SERIAL PRIMARY KEY,
                 name TEXT NOT NULL,
@@ -77,35 +80,29 @@ async fn create_widgets_schema(pool: &PgPool, schema: &str) {
                 is_active BOOLEAN NOT NULL DEFAULT true
             )
             "#,
-            schema
-        )
-        .as_str(),
-    )
+        schema
+    )))
     .await
     .expect("create failed");
 
-    pool.execute(
-        format!(
-            r#"
+    pool.execute(AssertSqlSafe(format!(
+        r#"
             INSERT INTO {}.widgets (name, category, price, stock, is_active) VALUES
                 ('alpha', 'books', 10.50, 5, true),
                 ('bravo', 'tools', 20.00, 0, true),
                 ('charlie', 'books', 30.25, 12, false),
                 ('delta', 'tools', 40.75, 7, true)
             "#,
-            schema
-        )
-        .as_str(),
-    )
+        schema
+    )))
     .await
     .expect("seed failed");
 }
 
 async fn create_widgets_schema_with_computed_field(pool: &PgPool, schema: &str) {
     create_widgets_schema(pool, schema).await;
-    pool.execute(
-        format!(
-            r#"
+    pool.execute(AssertSqlSafe(format!(
+        r#"
             CREATE FUNCTION {schema}.widget_label(widget_row {schema}.widgets)
             RETURNS TEXT
             LANGUAGE SQL
@@ -114,24 +111,24 @@ async fn create_widgets_schema_with_computed_field(pool: &PgPool, schema: &str) 
                 SELECT widget_row.name || ':' || widget_row.category
             $$
             "#
-        )
-        .as_str(),
-    )
+    )))
     .await
     .expect("create computed field failed");
 }
 
 async fn create_composite_key_schema(pool: &PgPool, schema: &str) {
-    pool.execute(format!("DROP SCHEMA IF EXISTS {} CASCADE", schema).as_str())
-        .await
-        .expect("drop schema failed");
-    pool.execute(format!("CREATE SCHEMA {}", schema).as_str())
+    pool.execute(AssertSqlSafe(format!(
+        "DROP SCHEMA IF EXISTS {} CASCADE",
+        schema
+    )))
+    .await
+    .expect("drop schema failed");
+    pool.execute(AssertSqlSafe(format!("CREATE SCHEMA {}", schema)))
         .await
         .expect("create schema failed");
 
-    pool.execute(
-        format!(
-            r#"
+    pool.execute(AssertSqlSafe(format!(
+        r#"
             CREATE TABLE {}.inventory (
                 warehouse_id INTEGER NOT NULL,
                 sku TEXT NOT NULL,
@@ -143,10 +140,8 @@ async fn create_composite_key_schema(pool: &PgPool, schema: &str) {
                 (1, 'bravo', 10),
                 (2, 'alpha', 15)
             "#,
-            schema, schema
-        )
-        .as_str(),
-    )
+        schema, schema
+    )))
     .await
     .expect("create composite key fixture failed");
 }
@@ -155,16 +150,17 @@ async fn create_equivalent_entity_keys_schema(pool: &PgPool, schema: &str) {
     pool.execute("CREATE EXTENSION IF NOT EXISTS citext")
         .await
         .expect("create citext extension failed");
-    pool.execute(format!("DROP SCHEMA IF EXISTS {schema} CASCADE").as_str())
-        .await
-        .expect("drop schema failed");
-    pool.execute(format!("CREATE SCHEMA {schema}").as_str())
+    pool.execute(AssertSqlSafe(format!(
+        "DROP SCHEMA IF EXISTS {schema} CASCADE"
+    )))
+    .await
+    .expect("drop schema failed");
+    pool.execute(AssertSqlSafe(format!("CREATE SCHEMA {schema}")))
         .await
         .expect("create schema failed");
 
-    pool.execute(
-        format!(
-            r#"
+    pool.execute(AssertSqlSafe(format!(
+        r#"
             CREATE TABLE {schema}.uuid_entities (
                 id UUID PRIMARY KEY,
                 label TEXT NOT NULL
@@ -183,23 +179,22 @@ async fn create_equivalent_entity_keys_schema(pool: &PgPool, schema: &str) {
             INSERT INTO {schema}.timestamptz_entities VALUES
                 ('2024-01-01T00:00:00+00:00', 'timestamptz row')
             "#
-        )
-        .as_str(),
-    )
+    )))
     .await
     .expect("create equivalent entity key fixture failed");
 }
 
 async fn create_decimal_entity_keys_schema(pool: &PgPool, schema: &str) {
-    pool.execute(format!("DROP SCHEMA IF EXISTS {schema} CASCADE").as_str())
-        .await
-        .expect("drop schema failed");
-    pool.execute(format!("CREATE SCHEMA {schema}").as_str())
+    pool.execute(AssertSqlSafe(format!(
+        "DROP SCHEMA IF EXISTS {schema} CASCADE"
+    )))
+    .await
+    .expect("drop schema failed");
+    pool.execute(AssertSqlSafe(format!("CREATE SCHEMA {schema}")))
         .await
         .expect("create schema failed");
-    pool.execute(
-        format!(
-            r#"
+    pool.execute(AssertSqlSafe(format!(
+        r#"
             CREATE TABLE {schema}.bigint_entities (
                 id BIGINT PRIMARY KEY,
                 label TEXT NOT NULL
@@ -214,18 +209,19 @@ async fn create_decimal_entity_keys_schema(pool: &PgPool, schema: &str) {
             INSERT INTO {schema}.numeric_entities VALUES
                 (9007199254740993.123456789, 'exact decimal')
             "#
-        )
-        .as_str(),
-    )
+    )))
     .await
     .expect("create decimal entity key fixture failed");
 }
 
 async fn create_mixed_entity_schema(pool: &PgPool, schema: &str) {
-    pool.execute(format!("DROP SCHEMA IF EXISTS {} CASCADE", schema).as_str())
-        .await
-        .expect("drop schema failed");
-    pool.execute(format!("CREATE SCHEMA {}", schema).as_str())
+    pool.execute(AssertSqlSafe(format!(
+        "DROP SCHEMA IF EXISTS {} CASCADE",
+        schema
+    )))
+    .await
+    .expect("drop schema failed");
+    pool.execute(AssertSqlSafe(format!("CREATE SCHEMA {}", schema)))
         .await
         .expect("create schema failed");
 
@@ -250,7 +246,7 @@ async fn create_mixed_entity_schema(pool: &PgPool, schema: &str) {
         format!("INSERT INTO {schema}.shops (code) VALUES ('shop-code')"),
         format!("INSERT INTO {schema}.shop_items (sku, shop_id) VALUES ('sku-1', 1)"),
     ] {
-        pool.execute(statement.as_str())
+        pool.execute(AssertSqlSafe(statement))
             .await
             .expect("create mixed entity fixture failed");
     }
@@ -258,7 +254,10 @@ async fn create_mixed_entity_schema(pool: &PgPool, schema: &str) {
 
 async fn drop_schema(pool: &PgPool, schema: &str) {
     let _ = pool
-        .execute(format!("DROP SCHEMA IF EXISTS {} CASCADE", schema).as_str())
+        .execute(AssertSqlSafe(format!(
+            "DROP SCHEMA IF EXISTS {} CASCADE",
+            schema
+        )))
         .await;
 }
 
@@ -1344,10 +1343,13 @@ async fn order_by_rejects_an_unknown_column() {
     );
 
     // The table must still be intact.
-    let remaining: i64 = sqlx::query_scalar(&format!("SELECT count(*) FROM {}.widgets", schema))
-        .fetch_one(&pool)
-        .await
-        .expect("count failed");
+    let remaining: i64 = sqlx::query_scalar(AssertSqlSafe(format!(
+        "SELECT count(*) FROM {}.widgets",
+        schema
+    )))
+    .fetch_one(&pool)
+    .await
+    .expect("count failed");
     assert_eq!(remaining, 4);
 
     drop_schema(&pool, &schema).await;
@@ -1474,10 +1476,13 @@ async fn insert_mutation_creates_a_row() {
     assert_eq!(rows.len(), 1);
     assert_eq!(rows[0].get("name").and_then(|v| v.as_str()), Some("echo"));
 
-    let total: i64 = sqlx::query_scalar(&format!("SELECT count(*) FROM {}.widgets", schema))
-        .fetch_one(&pool)
-        .await
-        .expect("count failed");
+    let total: i64 = sqlx::query_scalar(AssertSqlSafe(format!(
+        "SELECT count(*) FROM {}.widgets",
+        schema
+    )))
+    .fetch_one(&pool)
+    .await
+    .expect("count failed");
     assert_eq!(total, 5);
 
     drop_schema(&pool, &schema).await;
@@ -1500,10 +1505,10 @@ async fn update_mutation_with_where_changes_only_matching_rows() {
     )
     .await;
 
-    let renamed: i64 = sqlx::query_scalar(&format!(
+    let renamed: i64 = sqlx::query_scalar(AssertSqlSafe(format!(
         "SELECT count(*) FROM {}.widgets WHERE name = 'renamed'",
         schema
-    ))
+    )))
     .fetch_one(&pool)
     .await
     .expect("count failed");
@@ -1537,10 +1542,10 @@ async fn update_mutation_without_where_is_refused() {
         errors
     );
 
-    let clobbered: i64 = sqlx::query_scalar(&format!(
+    let clobbered: i64 = sqlx::query_scalar(AssertSqlSafe(format!(
         "SELECT count(*) FROM {}.widgets WHERE name = 'clobbered'",
         schema
-    ))
+    )))
     .fetch_one(&pool)
     .await
     .expect("count failed");
@@ -1566,10 +1571,13 @@ async fn delete_mutation_with_where_removes_only_matching_rows() {
     )
     .await;
 
-    let remaining: i64 = sqlx::query_scalar(&format!("SELECT count(*) FROM {}.widgets", schema))
-        .fetch_one(&pool)
-        .await
-        .expect("count failed");
+    let remaining: i64 = sqlx::query_scalar(AssertSqlSafe(format!(
+        "SELECT count(*) FROM {}.widgets",
+        schema
+    )))
+    .fetch_one(&pool)
+    .await
+    .expect("count failed");
     assert_eq!(remaining, 2, "only the two 'books' rows should be gone");
 
     drop_schema(&pool, &schema).await;
@@ -1600,10 +1608,13 @@ async fn delete_mutation_without_where_is_refused() {
         errors
     );
 
-    let remaining: i64 = sqlx::query_scalar(&format!("SELECT count(*) FROM {}.widgets", schema))
-        .fetch_one(&pool)
-        .await
-        .expect("count failed");
+    let remaining: i64 = sqlx::query_scalar(AssertSqlSafe(format!(
+        "SELECT count(*) FROM {}.widgets",
+        schema
+    )))
+    .fetch_one(&pool)
+    .await
+    .expect("count failed");
     assert_eq!(remaining, 4, "the table must be untouched");
 
     drop_schema(&pool, &schema).await;
@@ -1626,10 +1637,13 @@ async fn mutation_value_is_not_interpreted_as_sql() {
     )
     .await;
 
-    let remaining: i64 = sqlx::query_scalar(&format!("SELECT count(*) FROM {}.widgets", schema))
-        .fetch_one(&pool)
-        .await
-        .expect("table should still exist");
+    let remaining: i64 = sqlx::query_scalar(AssertSqlSafe(format!(
+        "SELECT count(*) FROM {}.widgets",
+        schema
+    )))
+    .fetch_one(&pool)
+    .await
+    .expect("table should still exist");
     assert_eq!(remaining, 4);
 
     drop_schema(&pool, &schema).await;
@@ -1729,27 +1743,24 @@ async fn schema_exposes_read_and_write_fields_for_each_table() {
 /// Create a schema holding a `widgets` table with a single identifying row.
 async fn create_marker_schema(pool: &PgPool, schema: &str, marker: &str) {
     let _ = pool
-        .execute(format!("DROP SCHEMA IF EXISTS {} CASCADE", schema).as_str())
+        .execute(AssertSqlSafe(format!(
+            "DROP SCHEMA IF EXISTS {} CASCADE",
+            schema
+        )))
         .await;
-    pool.execute(format!("CREATE SCHEMA {}", schema).as_str())
+    pool.execute(AssertSqlSafe(format!("CREATE SCHEMA {}", schema)))
         .await
         .expect("create schema failed");
-    pool.execute(
-        format!(
-            "CREATE TABLE {}.widgets (id SERIAL PRIMARY KEY, marker TEXT NOT NULL)",
-            schema
-        )
-        .as_str(),
-    )
+    pool.execute(AssertSqlSafe(format!(
+        "CREATE TABLE {}.widgets (id SERIAL PRIMARY KEY, marker TEXT NOT NULL)",
+        schema
+    )))
     .await
     .expect("create table failed");
-    pool.execute(
-        format!(
-            "INSERT INTO {}.widgets (marker) VALUES ('{}')",
-            schema, marker
-        )
-        .as_str(),
-    )
+    pool.execute(AssertSqlSafe(format!(
+        "INSERT INTO {}.widgets (marker) VALUES ('{}')",
+        schema, marker
+    )))
     .await
     .expect("seed failed");
 }
@@ -1885,12 +1896,18 @@ async fn filter_is_null_operator_accepts_camel_case() {
     create_widgets_schema(&pool, &schema).await;
     // Two statements, issued separately: sqlx prepares each query, and a
     // prepared statement cannot carry multiple commands.
-    pool.execute(format!("ALTER TABLE {}.widgets ADD COLUMN note TEXT", schema).as_str())
-        .await
-        .expect("alter failed");
-    pool.execute(format!("UPDATE {}.widgets SET note = 'x' WHERE id = 1", schema).as_str())
-        .await
-        .expect("update failed");
+    pool.execute(AssertSqlSafe(format!(
+        "ALTER TABLE {}.widgets ADD COLUMN note TEXT",
+        schema
+    )))
+    .await
+    .expect("alter failed");
+    pool.execute(AssertSqlSafe(format!(
+        "UPDATE {}.widgets SET note = 'x' WHERE id = 1",
+        schema
+    )))
+    .await
+    .expect("update failed");
 
     let state = build_state(&pool, &schema, None, false).await;
 
@@ -1964,10 +1981,13 @@ async fn mutation_with_unsupported_where_operator_is_refused() {
         errors
     );
 
-    let remaining: i64 = sqlx::query_scalar(&format!("SELECT count(*) FROM {}.widgets", schema))
-        .fetch_one(&pool)
-        .await
-        .expect("count failed");
+    let remaining: i64 = sqlx::query_scalar(AssertSqlSafe(format!(
+        "SELECT count(*) FROM {}.widgets",
+        schema
+    )))
+    .fetch_one(&pool)
+    .await
+    .expect("count failed");
     assert_eq!(remaining, 4, "the table must be untouched");
 
     drop_schema(&pool, &schema).await;
@@ -2001,10 +2021,10 @@ async fn update_by_pk_targets_exactly_one_row() {
     assert_eq!(row.get("id").and_then(|v| v.as_i64()), Some(2));
     assert_eq!(row.get("name").and_then(|v| v.as_str()), Some("renamed"));
 
-    let renamed: i64 = sqlx::query_scalar(&format!(
+    let renamed: i64 = sqlx::query_scalar(AssertSqlSafe(format!(
         "SELECT count(*) FROM {}.widgets WHERE name = 'renamed'",
         schema
-    ))
+    )))
     .fetch_one(&pool)
     .await
     .expect("count failed");
@@ -2032,10 +2052,13 @@ async fn delete_by_pk_removes_exactly_one_row() {
     let row = data.get("delete_widgets_by_pk").expect("missing result");
     assert_eq!(row.get("id").and_then(|v| v.as_i64()), Some(3));
 
-    let remaining: i64 = sqlx::query_scalar(&format!("SELECT count(*) FROM {}.widgets", schema))
-        .fetch_one(&pool)
-        .await
-        .expect("count failed");
+    let remaining: i64 = sqlx::query_scalar(AssertSqlSafe(format!(
+        "SELECT count(*) FROM {}.widgets",
+        schema
+    )))
+    .fetch_one(&pool)
+    .await
+    .expect("count failed");
     assert_eq!(remaining, 3, "a by-PK delete must remove exactly one row");
 
     drop_schema(&pool, &schema).await;
@@ -2077,10 +2100,13 @@ async fn by_pk_mutations_require_the_key_and_reject_where() {
         rejected
     );
 
-    let remaining: i64 = sqlx::query_scalar(&format!("SELECT count(*) FROM {}.widgets", schema))
-        .fetch_one(&pool)
-        .await
-        .expect("count failed");
+    let remaining: i64 = sqlx::query_scalar(AssertSqlSafe(format!(
+        "SELECT count(*) FROM {}.widgets",
+        schema
+    )))
+    .fetch_one(&pool)
+    .await
+    .expect("count failed");
     assert_eq!(remaining, 4, "nothing should have been deleted");
 
     drop_schema(&pool, &schema).await;
@@ -2108,10 +2134,13 @@ async fn by_pk_mutation_with_an_unknown_key_affects_nothing() {
         "a key that matches nothing must resolve to null"
     );
 
-    let remaining: i64 = sqlx::query_scalar(&format!("SELECT count(*) FROM {}.widgets", schema))
-        .fetch_one(&pool)
-        .await
-        .expect("count failed");
+    let remaining: i64 = sqlx::query_scalar(AssertSqlSafe(format!(
+        "SELECT count(*) FROM {}.widgets",
+        schema
+    )))
+    .fetch_one(&pool)
+    .await
+    .expect("count failed");
     assert_eq!(remaining, 4);
 
     drop_schema(&pool, &schema).await;
@@ -2127,9 +2156,12 @@ async fn by_pk_mutation_with_an_unknown_key_affects_nothing() {
 /// A schema with a parent/child pair joined by a foreign key.
 async fn create_related_schema(pool: &PgPool, schema: &str) {
     let _ = pool
-        .execute(format!("DROP SCHEMA IF EXISTS {} CASCADE", schema).as_str())
+        .execute(AssertSqlSafe(format!(
+            "DROP SCHEMA IF EXISTS {} CASCADE",
+            schema
+        )))
         .await;
-    pool.execute(format!("CREATE SCHEMA {}", schema).as_str())
+    pool.execute(AssertSqlSafe(format!("CREATE SCHEMA {}", schema)))
         .await
         .expect("create schema failed");
 
@@ -2164,7 +2196,9 @@ async fn create_related_schema(pool: &PgPool, schema: &str) {
             schema
         ),
     ] {
-        pool.execute(stmt.as_str()).await.expect("setup failed");
+        pool.execute(AssertSqlSafe(stmt))
+            .await
+            .expect("setup failed");
     }
 }
 
@@ -2712,14 +2746,11 @@ async fn a_subscription_is_a_live_query() {
 
     // A row the subscription does not select is a wake and not a message: the
     // refresh reads the query again, sees the same answer, and sends nothing.
-    pool.execute(
-        format!(
-            "INSERT INTO {}.widgets (name, category, price, stock) \
+    pool.execute(AssertSqlSafe(format!(
+        "INSERT INTO {}.widgets (name, category, price, stock) \
              VALUES ('echo', 'tools', 1, 1)",
-            schema
-        )
-        .as_str(),
-    )
+        schema
+    )))
     .await
     .expect("insert failed");
     let quiet = tokio::time::timeout(std::time::Duration::from_secs(3), stream.next()).await;
@@ -2730,14 +2761,11 @@ async fn a_subscription_is_a_live_query() {
     );
 
     // One it does select is answered again.
-    pool.execute(
-        format!(
-            "INSERT INTO {}.widgets (name, category, price, stock) \
+    pool.execute(AssertSqlSafe(format!(
+        "INSERT INTO {}.widgets (name, category, price, stock) \
              VALUES ('foxtrot', 'books', 2, 2)",
-            schema
-        )
-        .as_str(),
-    )
+        schema
+    )))
     .await
     .expect("insert failed");
 
@@ -2847,18 +2875,23 @@ async fn verified_jwt_claims_are_available_to_graphql_rls_without_leaking() {
     let reader_role = format!("{}_reader", schema);
 
     drop_schema(&pool, &schema).await;
-    pool.execute(format!("DROP ROLE IF EXISTS {}", reader_role).as_str())
-        .await
-        .expect("failed to drop stale reader role");
-    pool.execute(format!("CREATE ROLE {} NOLOGIN", reader_role).as_str())
-        .await
-        .expect("failed to create reader role");
-    pool.execute(format!("CREATE SCHEMA {}", schema).as_str())
+    pool.execute(AssertSqlSafe(format!(
+        "DROP ROLE IF EXISTS {}",
+        reader_role
+    )))
+    .await
+    .expect("failed to drop stale reader role");
+    pool.execute(AssertSqlSafe(format!(
+        "CREATE ROLE {} NOLOGIN",
+        reader_role
+    )))
+    .await
+    .expect("failed to create reader role");
+    pool.execute(AssertSqlSafe(format!("CREATE SCHEMA {}", schema)))
         .await
         .expect("failed to create schema");
-    pool.execute(
-        format!(
-            "CREATE TABLE {schema}.documents (
+    pool.execute(AssertSqlSafe(format!(
+        "CREATE TABLE {schema}.documents (
                  id integer PRIMARY KEY,
                  owner_id text NOT NULL,
                  title text NOT NULL
@@ -2876,9 +2909,7 @@ async fn verified_jwt_claims_are_available_to_graphql_rls_without_leaking() {
                  );
              GRANT USAGE ON SCHEMA {schema} TO {reader_role};
              GRANT SELECT ON {schema}.documents TO {reader_role};"
-        )
-        .as_str(),
-    )
+    )))
     .await
     .expect("failed to create JWT RLS fixture");
 
@@ -2902,7 +2933,7 @@ async fn verified_jwt_claims_are_available_to_graphql_rls_without_leaking() {
 
     drop(state);
     drop_schema(&pool, &schema).await;
-    pool.execute(format!("DROP ROLE {}", reader_role).as_str())
+    pool.execute(AssertSqlSafe(format!("DROP ROLE {}", reader_role)))
         .await
         .expect("failed to drop reader role");
 
@@ -2925,12 +2956,11 @@ async fn verified_jwt_claims_are_available_to_graphql_rls_without_leaking() {
 /// Two tables, one key between them, and the columns a comparison needs.
 async fn create_permission_schema(pool: &PgPool, schema: &str) {
     drop_schema(pool, schema).await;
-    pool.execute(format!("CREATE SCHEMA {}", schema).as_str())
+    pool.execute(AssertSqlSafe(format!("CREATE SCHEMA {}", schema)))
         .await
         .expect("failed to create schema");
-    pool.execute(
-        format!(
-            "CREATE TABLE {schema}.artist (
+    pool.execute(AssertSqlSafe(format!(
+        "CREATE TABLE {schema}.artist (
                  id integer PRIMARY KEY,
                  rank integer NOT NULL
              );
@@ -2959,9 +2989,7 @@ async fn create_permission_schema(pool: &PgPool, schema: &str) {
                  (3, 1, 1, 3,  9, 10),
                  (4, 2, 1, 3, 10, 10),
                  (5, 1, 2, 9, 10, 10);"
-        )
-        .as_str(),
-    )
+    )))
     .await
     .expect("failed to create the permission fixture");
 }
@@ -3048,4 +3076,312 @@ async fn execute_as_err(
         .map(|e| e.message.clone())
         .collect::<Vec<_>>()
         .join("; ")
+}
+
+/// Execute a GraphQL document on `pool` in a context of the caller's making,
+/// settling its writes as the server does.
+async fn execute_in(
+    state: &Arc<GraphQLState>,
+    pool: &PgPool,
+    ctx: GraphQLContext,
+    query: &str,
+) -> async_graphql::Response {
+    let write: postrust_graphql::context::SharedWrite = Default::default();
+    let ctx = ctx.with_write(Arc::clone(&write));
+    let response = state
+        .schema
+        .execute(Request::new(query).data(ctx).data(pool.clone()))
+        .await;
+    if let Some(tx) = write.lock().await.take() {
+        if response.errors.is_empty() {
+            tx.commit().await.expect("the write could not be committed");
+        } else {
+            tx.rollback().await.expect("the write could not be undone");
+        }
+    }
+    response
+}
+
+/// A role's own `statement_timeout` holds for a GraphQL query, as it does for
+/// a REST request: the transaction is set up by the same `Session`. It did
+/// not before -- GraphQL set the role and the session variables and nothing
+/// else -- so a role an operator had limited could run as long as it liked
+/// here.
+///
+/// The same query, under the same configuration, as a role with no setting
+/// of its own, is the control: what stops the query is the role's setting
+/// and not the query.
+#[tokio::test]
+#[ignore = "requires PostgreSQL"]
+async fn a_roles_statement_timeout_applies_to_a_graphql_query() {
+    let pool = connect().await;
+    let schema = unique_schema_name("roletimeout");
+    let limited = format!("{schema}_limited");
+
+    drop_schema(&pool, &schema).await;
+    pool.execute(AssertSqlSafe(format!("DROP ROLE IF EXISTS {limited}")))
+        .await
+        .expect("failed to drop a stale role");
+    pool.execute(AssertSqlSafe(format!(
+        "CREATE ROLE {limited} NOLOGIN;
+             CREATE SCHEMA {schema};
+             CREATE TABLE {schema}.ticks (id integer PRIMARY KEY);
+             INSERT INTO {schema}.ticks VALUES (1);
+             -- Half a second of sleep, once, whoever reads it.
+             CREATE VIEW {schema}.slow_ticks AS
+                 SELECT id FROM {schema}.ticks WHERE (SELECT true FROM pg_sleep(0.5));
+             GRANT USAGE ON SCHEMA {schema} TO {limited};
+             GRANT SELECT ON ALL TABLES IN SCHEMA {schema} TO {limited};"
+    )))
+    .await
+    .expect("failed to create the timeout fixture");
+
+    let state = build_state(&pool, &schema, None, false).await;
+    let mut config = postrust_core::AppConfig::default();
+    let mut settings = postrust_core::config::RoleSettings::default();
+    settings.statement_timeout = Some(50);
+    config.role_settings.insert(limited.clone(), settings);
+    let config = Arc::new(config);
+
+    let run_as = |role: &str| {
+        let role = role.to_string();
+        let state = Arc::clone(&state);
+        let pool = pool.clone();
+        let config = Arc::clone(&config);
+        let schema = schema.clone();
+        async move {
+            let cache = SchemaCache::load(&pool, &[schema])
+                .await
+                .expect("failed to load schema cache");
+            let ctx = GraphQLContext::new(
+                pool.clone(),
+                SchemaCacheRef::from_static(cache),
+                AuthResult {
+                    role,
+                    claims: HashMap::new(),
+                },
+            )
+            .with_config(config);
+            execute_in(&state, &pool, ctx, "{ slow_ticks { id } }").await
+        }
+    };
+    let limited_response = run_as(&limited).await;
+    let unlimited_response = run_as(TEST_ROLE).await;
+
+    drop(state);
+    drop_schema(&pool, &schema).await;
+    pool.execute(AssertSqlSafe(format!("DROP ROLE {limited}")))
+        .await
+        .expect("failed to drop the role");
+
+    let messages = limited_response
+        .errors
+        .iter()
+        .map(|e| e.message.clone())
+        .collect::<Vec<_>>()
+        .join("; ");
+    assert!(
+        messages.contains("statement timeout"),
+        "the role's statement_timeout did not stop the query: {messages:?}, data {:?}",
+        limited_response.data
+    );
+    assert!(
+        unlimited_response.errors.is_empty(),
+        "a role with no timeout of its own was stopped: {:?}",
+        unlimited_response.errors
+    );
+    assert_eq!(
+        serde_json::to_value(unlimited_response.data).unwrap(),
+        serde_json::json!({"slow_ticks": [{"id": 1}]})
+    );
+}
+
+/// Through a `NOINHERIT` authenticator -- the setup PostgREST recommends,
+/// where the login role holds nothing until it becomes another -- a query and
+/// a mutation each run as the token's database role, never as the Hasura role
+/// the caller speaks as, and both a policy and a function read the `hasura.*`
+/// session variables and the verified claims.
+///
+/// The session now sets the role inside its one `set_config` statement,
+/// before the claims and the `hasura.*` variables rather than after them as
+/// `SET LOCAL ROLE` used to come. This is what says that order still works
+/// for a role that may do nothing but become another: every setting after
+/// the role is one any role may set on itself. And once the operation is
+/// over, the authenticator's pooled connection is its own again.
+#[tokio::test]
+#[ignore = "requires PostgreSQL"]
+async fn the_session_reaches_policies_and_functions_through_a_noinherit_authenticator() {
+    use sqlx::postgres::PgConnectOptions;
+    use std::str::FromStr;
+
+    let admin = connect().await;
+    let schema = unique_schema_name("gqlsession");
+    let reader = format!("{schema}_reader");
+    let authenticator = format!("{schema}_auth");
+    let password = "postrust_test_gql_session";
+
+    drop_schema(&admin, &schema).await;
+    for role in [&authenticator, &reader] {
+        admin
+            .execute(AssertSqlSafe(format!("DROP ROLE IF EXISTS {role}")))
+            .await
+            .expect("failed to drop a stale role");
+    }
+    admin
+        .execute(AssertSqlSafe(format!(
+            "CREATE ROLE {reader} NOLOGIN;
+                 CREATE ROLE {authenticator} LOGIN NOINHERIT PASSWORD '{password}';
+                 GRANT {reader} TO {authenticator};
+                 CREATE SCHEMA {schema};
+                 CREATE TABLE {schema}.notes (
+                     id integer PRIMARY KEY,
+                     owner text NOT NULL,
+                     body text NOT NULL
+                 );
+                 INSERT INTO {schema}.notes VALUES
+                     (1, 'user-one', 'mine'),
+                     (2, 'user-two', 'theirs');
+                 ALTER TABLE {schema}.notes ENABLE ROW LEVEL SECURITY;
+                 CREATE POLICY notes_owner ON {schema}.notes TO {reader}
+                     USING (owner = current_setting('hasura.user_id', true))
+                     WITH CHECK (owner = current_setting('hasura.user_id', true));
+                 -- A computed field, so the function runs inside the
+                 -- transaction the session set up.
+                 CREATE FUNCTION {schema}.seen_as(note_row {schema}.notes)
+                 RETURNS text LANGUAGE sql STABLE AS $$
+                     SELECT concat_ws('|',
+                         current_user,
+                         current_setting('hasura.user_id', true),
+                         current_setting('hasura.role', true),
+                         current_setting('hasura.session', true)::json->>'x-hasura-user-id',
+                         current_setting('request.jwt.claims', true)::json->>'sub',
+                         current_setting('request.jwt.claims.sub', true))
+                 $$;
+                 GRANT USAGE ON SCHEMA {schema} TO {reader};
+                 GRANT SELECT, INSERT ON {schema}.notes TO {reader};"
+        )))
+        .await
+        .expect("failed to create the session fixture");
+
+    // The schema is read by the superuser; the operations go through the
+    // authenticator, on one connection so the last check below is on the
+    // connection the operations used.
+    let state = build_state(&admin, &schema, None, false).await;
+    let options = PgConnectOptions::from_str(&database_url())
+        .expect("DATABASE_URL parses")
+        .username(&authenticator)
+        .password(password);
+    let through = PgPoolOptions::new()
+        .max_connections(1)
+        .connect_with(options)
+        .await
+        .expect("the authenticator could not log in");
+
+    let context = || {
+        let schema = schema.clone();
+        let admin = admin.clone();
+        let through = through.clone();
+        let reader = reader.clone();
+        async move {
+            let cache = SchemaCache::load(&admin, &[schema])
+                .await
+                .expect("failed to load schema cache");
+            let mut claims = HashMap::new();
+            claims.insert("role".to_string(), serde_json::json!(reader));
+            claims.insert("sub".to_string(), serde_json::json!("alice"));
+            let mut session = HashMap::new();
+            session.insert("user_id".to_string(), "user-one".to_string());
+            GraphQLContext::new(
+                through,
+                SchemaCacheRef::from_static(cache),
+                AuthResult {
+                    role: reader,
+                    claims,
+                },
+            )
+            .with_session(session)
+            // An administrator asking to be answered with the session
+            // above: `admin` is a Hasura role, not a database one, and has to
+            // reach the function as `hasura.role` while the transaction runs
+            // as the token's role.
+            .with_identity(Some("admin".to_string()), true)
+        }
+    };
+
+    let read = execute_in(
+        &state,
+        &through,
+        context().await,
+        "{ notes(order_by: [{id: asc}]) { id seen_as } }",
+    )
+    .await;
+    let written = execute_in(
+        &state,
+        &through,
+        context().await,
+        "mutation { insert_notes_one(object: {id: 3, owner: \"user-one\", body: \"new\"}) \
+         { id seen_as } }",
+    )
+    .await;
+    let refused = execute_in(
+        &state,
+        &through,
+        context().await,
+        "mutation { insert_notes_one(object: {id: 4, owner: \"user-two\", body: \"no\"}) \
+         { id } }",
+    )
+    .await;
+    let (user, left_behind): (String, Option<String>) = sqlx::query_as(
+        "SELECT current_user::text, nullif(current_setting('hasura.user_id', true), '')",
+    )
+    .fetch_one(&through)
+    .await
+    .expect("the authenticator's connection answers");
+    let stored: Vec<i32> = sqlx::query_scalar(AssertSqlSafe(format!(
+        "SELECT id FROM {schema}.notes ORDER BY id"
+    )))
+    .fetch_all(&admin)
+    .await
+    .expect("the notes can be read");
+
+    through.close().await;
+    drop(state);
+    drop_schema(&admin, &schema).await;
+    for role in [&authenticator, &reader] {
+        admin
+            .execute(AssertSqlSafe(format!("DROP ROLE {role}")))
+            .await
+            .expect("failed to drop a role");
+    }
+
+    let seen = format!("{reader}|user-one|admin|user-one|alice|alice");
+    assert!(read.errors.is_empty(), "{:?}", read.errors);
+    assert_eq!(
+        serde_json::to_value(read.data).unwrap(),
+        serde_json::json!({"notes": [{"id": 1, "seen_as": seen}]}),
+        "the policy narrows to the session's user, and the function sees the database \
+         role, the hasura.* variables and the claims"
+    );
+    assert!(written.errors.is_empty(), "{:?}", written.errors);
+    assert_eq!(
+        serde_json::to_value(written.data).unwrap(),
+        serde_json::json!({"insert_notes_one": {"id": 3, "seen_as": seen}}),
+        "a mutation's shared transaction is set up the same way"
+    );
+    let refusal = refused
+        .errors
+        .iter()
+        .map(|e| e.message.clone())
+        .collect::<Vec<_>>()
+        .join("; ");
+    assert!(
+        refusal.contains("row-level security"),
+        "the policy's check reads hasura.user_id inside the write: {refusal:?}"
+    );
+    assert_eq!(stored, vec![1, 2, 3], "the refused row was not written");
+    assert_eq!(
+        (user.as_str(), left_behind),
+        (authenticator.as_str(), None),
+        "the role and the session variables ended with their transactions"
+    );
 }

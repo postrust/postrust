@@ -40,21 +40,32 @@ jobs:
       - name: Clippy (server, admin-ui feature)
         run: cargo clippy -p postrust-server --features admin-ui --all-targets -- -D warnings
 
+      # Outside the workspace (see `exclude` in Cargo.toml), so neither step
+      # above reaches it. It is the documented way to add routes, and an
+      # example that no longer compiles against the crate is worse than none.
+      # `--target-dir target` shares the workspace's build of the crates it
+      # depends on.
+      - name: Format and clippy (examples/custom-routes)
+        run: |
+          cargo fmt --manifest-path examples/custom-routes/Cargo.toml -- --check
+          cargo clippy --manifest-path examples/custom-routes/Cargo.toml --target-dir target \
+            --all-targets -- -D warnings
+
   msrv:
-    name: MSRV (1.88)
+    name: MSRV (1.94)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
 
       # The version here must match [workspace.package] rust-version. It is
-      # verified rather than aspirational: 1.87.0 is refused outright, because
-      # hickory 0.26 and time 0.3.55 declare 1.88. Without this job the
-      # declared MSRV is a comment -- the README claimed 1.78, the docs 1.75,
-      # and nothing caught either.
-      - name: Install Rust 1.88
+      # verified rather than aspirational: 1.93 is refused outright, because
+      # sqlx 0.9 declares 1.94. Without this job the declared MSRV is a
+      # comment -- the README claimed 1.78, the docs 1.75, and nothing caught
+      # either.
+      - name: Install Rust 1.94
         uses: dtolnay/rust-toolchain@master
         with:
-          toolchain: "1.88"
+          toolchain: "1.94"
 
       - uses: Swatinem/rust-cache@v2
         with:
@@ -63,7 +74,7 @@ jobs:
       # --locked: an MSRV check that lets cargo pick newer dependencies is
       # checking a different dependency set than the one that ships.
       - name: Check (workspace)
-        run: cargo +1.88 check --workspace --all-targets --locked
+        run: cargo +1.94 check --workspace --all-targets --locked
 
   wasm32:
     name: wasm32 (Cloudflare Workers)
@@ -226,3 +237,35 @@ jobs:
         run: |
           cargo test -p postrust-server --features pg-socket \
             --lib --bins --tests -- --ignored
+
+  # Supabase Auth (GoTrue) signs users up and Postrust serves them, under RLS
+  # written the way Supabase writes it. Two jobs: a project on asymmetric
+  # signing keys, verified through `PGRST_JWT_JWKS_URL` (with the legacy
+  # secret accepted beside it), and one still on GoTrue's HS256 secret. The
+  # unit and integration tests prove the refresher against a mock provider;
+  # this proves it against the real one, whose JWKS, `kid`s and claims are what
+  # deployments will actually see. The image is pinned so that a GoTrue
+  # release cannot turn this red without a commit.
+  gotrue:
+    name: GoTrue end to end (${{ matrix.mode }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        mode: [jwks, hs256]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust (from rust-toolchain.toml)
+        run: rustup show active-toolchain
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build the server
+        run: cargo build --locked -p postrust-server --bin postrust
+
+      # Starts PostgreSQL and supabase/auth in containers on the host network
+      # and the binary just built beside them; see the script's header.
+      - name: Run scripts/gotrue/e2e.sh ${{ matrix.mode }}
+        run: scripts/gotrue/e2e.sh ${{ matrix.mode }}

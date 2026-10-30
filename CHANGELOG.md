@@ -3,6 +3,216 @@
 Notable changes, newest first. This file starts at 1.0.0-alpha.1; earlier
 releases are described by their tags and the pull requests behind them.
 
+## 3.0.0
+
+Asymmetric JWTs and keys fetched from an identity provider, routes of your own
+that run as their caller under row-level security, and OpenTelemetry traces
+and metrics.
+
+It is a major release for the Rust API, not for the HTTP one. Two structs the
+features in this line have to grow are made `#[non_exhaustive]`, so that adding
+a field to either is a minor release from here on, and the database driver
+moves to sqlx 0.9, which raises the minimum supported Rust version to 1.94. A
+deployment that only runs the server or the image upgrades by changing the
+tag: the new keys are off until set, and existing configuration keeps its
+meaning, but for the few edges listed under Changed -- a JWT secret that
+cannot be used now stops start-up, for one. It carries 2.4.1's security fixes.
+
+Released beside it: `postrust-worker` 1.1.0, which gains asymmetric keys,
+`PGRST_JWT_ISS` and `PGRST_JWT_JWKS_URL` with nothing removed, and
+`postrust-proxy` 2.0.0. The proxy's own code is 1.0.0's, but its public API
+takes a sqlx `PgPool` -- `ProxyState::new`, `SaasState`, `CertStore::new`, the
+`saas::db` functions -- so moving it to sqlx 0.9 is a breaking change under its
+semver promise. Code that hands it a pool needs sqlx 0.9 too; nothing else
+changes.
+
+### Changed
+
+- **`postrust_auth::JwtConfig` and `postrust_server::AppState` are
+  `#[non_exhaustive]`.** 2.0.0 did this for the configuration types and missed
+  these two, which asymmetric keys and telemetry both need to extend. Another
+  crate can no longer build either with a struct literal.
+- **`JwtConfig.secret` and `secret_is_base64` are replaced by `keys`**, the
+  parsed key set, and `issuer` is added.
+- **A JWT secret that cannot be used is a start-up error.** A `PGRST_JWT_SECRET`
+  that begins with `{` and is not a valid JWK or JWKS, or that is not the
+  base64 `PGRST_JWT_SECRET_IS_BASE64` says it is, stops the server before it
+  connects to the database. Bad base64 was a 401 on every request; a
+  malformed JWK would have been an HMAC secret, which PostgREST still treats
+  it as -- letting anyone who holds the public key sign tokens. On a Worker,
+  which has no start-up, each request is answered PGRST901 until it is fixed.
+- A token whose header does not parse is PGRST301 ("No suitable key or wrong
+  key type"), not PGRST303.
+- **GraphQL transactions are set up as REST's are.** Each one -- a query, an
+  aggregate, a federated entity lookup, a subscription's re-read, and the
+  transaction a mutation's writes share -- now starts with the same
+  `postrust_core::Session` statements a REST request does, rather than with
+  GraphQL's own `set_config` and `SET LOCAL ROLE`. The role is still the
+  token's database role, never the Hasura role, and the `hasura.*` session
+  variables and `request.jwt.claims*` are still set. What GraphQL now gets
+  that it did not:
+  - a role's own `statement_timeout` and isolation level from
+    `PGRST_ROLE_SETTINGS`, and the server-wide `PGRST_DB_TX_ISOLATION`. A
+    GraphQL operation as a role limited to 5 seconds is cancelled after 5
+    seconds, as a REST request is;
+  - `app.settings.*` from `PGRST_APP_SETTINGS_<NAME>`.
+
+  Unchanged: GraphQL leaves the `search_path` as the role and the database
+  set it, so PostGIS and other extensions are found wherever they were
+  before (`Session::set_search_path(false)`); it does not call
+  `PGRST_DB_PRE_REQUEST`, sets no
+  `request.method`, `request.path`, `request.headers` or `request.cookies`,
+  and does not run a query in a read-only transaction.
+- **`postrust_core::query::build_query` takes the plan alone**, and
+  `MainQuery.pre_statements` is gone. It held a `SET LOCAL ROLE` that nothing
+  had sent since the role moved into the session's `set_config`; the role is
+  a `Session`'s now and nowhere else.
+- **`GraphQLContext::session_settings` is replaced by
+  `GraphQLContext::session`**, which returns the `Session` its transactions
+  are set up by, and `GraphQLContext` has a `config` field, set with
+  `with_config`. A context built without one is set up from
+  `AppConfig::default()`.
+- **sqlx 0.9, from 0.8.** sqlx's types are part of the public API --
+  `AppState::pool` is a `sqlx::PgPool`, and a route of your own is handed it --
+  so a crate that embeds `postrust-server` has to move to sqlx 0.9 with it: a
+  pool from sqlx 0.9 is a different type to code written against 0.8. Nothing
+  a request can reach behaves differently. The TLS feature is still
+  `tls-rustls-ring-native-roots`: in 0.9, as in 0.8, it is the only one that
+  reads the host trust store, so a database behind a private CA still verifies
+  under `sslmode=verify-full`.
+- **The minimum supported Rust version is 1.94, from 1.88.** sqlx 0.9 declares
+  1.94, and every crate that talks to a database depends on it. CI's `msrv` job
+  checks the workspace on 1.94 `--locked`, and 1.93 is refused.
+
+### Added
+
+- **Routes of your own run as their caller.** A route nested with
+  `Builder::nest` takes `postrust_server::User`, an axum extractor that
+  authenticates the request as REST does -- the same token cache, anonymous
+  role and refusals -- and `AppState::begin_as(&user)` begins a sqlx
+  transaction that runs as them, so a row-level security policy written for
+  the API applies to the route's own SQL. Pooled connections were the
+  authenticator's, with no claims set, and the documentation said so.
+  - The transaction is set up by the `Session` REST uses: role, claims,
+    `request.method`, `request.path`, `request.headers`, `request.cookies`,
+    `request.trace_id`, `search_path`, `app.settings.*` and `db_pre_request`,
+    all transaction-local.
+  - `begin_as_with(&user, TxOptions)` makes it read-only, sets its isolation
+    level, or skips `db_pre_request`. `Session::isolation` is the knob
+    beneath it.
+  - `Option<User>` is `None` for a request with no `Authorization` header; a
+    token that does not verify is refused either way.
+  - `postrust_server::Error` answers in PostgREST's error shape, with REST's
+    status for each SQLSTATE, and `?` converts a `sqlx::Error` into it.
+  - `postrust_engine::authenticate` and `authorization`: how REST
+    authenticates a request, for a host's own routes to share.
+- **Asymmetric JWTs.** `PGRST_JWT_SECRET` may be a JWK or a JWKS
+  (`{"keys": [...]}`), as in PostgREST, and tokens signed with RS256/384/512,
+  PS256/384/512, ES256, ES384 or EdDSA are verified with it.
+  - The algorithm comes from the key, never from the token: each key admits
+    the one its JWK `alg` names, or the defaults for its type. `alg: none`,
+    and an HS256 token whose HMAC secret is an RSA public key, are refused
+    before any signature is checked.
+  - A token with a `kid` is checked against that key only; one without is
+    tried against each key that admits its algorithm.
+  - Keys marked for encryption, and of types not supported (P-521, X25519),
+    are set aside with a warning.
+- **`PGRST_JWT_ISS`.** When set, a token's `iss` must name it, and a token
+  with no `iss` is refused (PGRST303, "JWT issuer is not the expected one").
+- **`PGRST_JWT_JWKS_URL`: keys fetched from an identity provider** (Supabase
+  Auth/GoTrue, Auth0, Clerk, Cognito, Keycloak) and kept current as it rotates
+  them, on the server, Lambda and the Worker.
+  - Fetched at start-up, then again after the response's `Cache-Control:
+    max-age` (held to 60 s..1 day) or every `PGRST_JWT_JWKS_REFRESH` seconds
+    (default 300). A token naming an unknown `kid` causes one more fetch, at
+    most every 30 s, before it is refused with PGRST301. A token whose key is
+    held waits for nothing.
+  - `https` only, or `http` to a loopback host; same-host redirects only; 5 s
+    and 1 MiB per fetch. Any other URL stops the server from starting.
+  - A failed fetch keeps the last good set. If none has ever loaded, tokens are
+    refused and `/_/ready` (API and admin port) answers 503 with
+    `"jwks": false`; the server starts regardless, and recovers by itself.
+  - Every change of the set empties the token cache, so a withdrawn key's
+    tokens are refused at once.
+  - With `PGRST_JWT_SECRET` also set, a token either one verifies is accepted.
+  - Server: a background task. Lambda: fetched in the init phase, refreshed by
+    the request that finds the set due. Worker: fetched by the first request
+    that needs it and copied into `POSTRUST_SCHEMA_CACHE` KV for cold isolates;
+    the cron refreshes it. The Worker's release wasm grows by 158 KB (49 KB
+    gzipped), from 4,572,934 to 4,731,391 bytes before wasm-opt; no new crate
+    is linked.
+  - `postrust_auth::jwks` (`Jwks`, the `Fetch` and `JwksStore` traits,
+    `JwksStatus` -- refresh and failure counts, last success, key-set age --
+    for metrics), `postrust_auth::ensure_keys`, which a host awaits before the
+    synchronous check -- `postrust_engine::authenticate` awaits it, so REST,
+    GraphQL and a route's `User` all fetch a rotated-in key --
+    `JwtConfig::{jwks, with_jwks}`, `JwtKeys::generation`,
+    `JwtKeyError::JwksUrl`,
+    `JwtCache::clear`, and `postrust_engine::jwks_builder`.
+  - CI signs users up with the `supabase/auth` image and checks that RLS sees
+    their `sub`, through the JWKS URL and through the legacy HS256 secret
+    (`scripts/gotrue/e2e.sh`).
+- `postrust_engine::jwt_config(&AppConfig)`: the JWT configuration an
+  `AppConfig` describes, and `jwt_config_with_keys` for keys already parsed.
+  The server, the Lambda adapter and the Worker each spelled this out by
+  hand, and now all take it from here.
+- `AppState::new(pool, schema_cache, config)`, which derives the JWT
+  configuration and token cache from `config` the way `build` does.
+- `postrust_auth::{KeySet, JwtKeys, JwtKeyError}`.
+- **OpenTelemetry and Prometheus metrics**, in a new `otel` feature that the
+  published images are built with. Inactive until configured: with nothing
+  set, nothing is exported or measured. See docs/observability.md.
+  - **Traces over OTLP** (HTTP/protobuf) when `OTEL_EXPORTER_OTLP_ENDPOINT`
+    is set, following the standard `OTEL_*` variables; `service.name` is
+    `postrust` unless `OTEL_SERVICE_NAME` says otherwise. The request span
+    joins the caller's `traceparent`, and its exported trace id is the
+    `trace_id` the log and `request.trace_id` already carry. It is named
+    `{method} {route}`. The debug-level stage spans are exported without
+    the log becoming any noisier.
+  - **Finer database spans:** `db.count` for `Prefer: count`, `db.embed` for
+    an embed fetched by its own query, and `db.commit` for a `COMMIT` sent on
+    its own. The `auth` span says whether the token cache answered
+    (`jwt.cache`: `hit`, `miss` or `bypassed`), and GraphQL operations get a
+    `graphql` span.
+  - **Metrics**, over OTLP and as Prometheus text at `GET /metrics` on the
+    admin port (`PGRST_ADMIN_SERVER_PORT`), never on the API port:
+    `http.server.request.duration`, `http.server.active_requests`, the pool's
+    connections, maximum and wait, token cache hits and misses, JWKS fetches
+    and the key set's age, schema reloads, and open GraphQL subscriptions.
+  - **Lambda:** with `--features postrust-lambda/otel`, telemetry is flushed
+    to the collector (the ADOT layer) at the end of every invocation.
+  - New API: `postrust_server::otel`; `JwtCache::authenticate_with_outcome`,
+    `JwtCache::stats`, `CacheOutcome` and `CacheStats` in `postrust-auth`;
+    `postrust_engine::observe`; `subscription::active_subscriptions` in
+    `postrust-graphql`; `postrust_lambda::FlushLayer`.
+
+### Upgrading from 2.x
+
+Of the two structs, only code that built `JwtConfig` or `AppState` with a
+struct literal is affected. Replace an `AppState { .. }` with `AppState::new(pool, schema_cache,
+config)?` and assign any field that should differ -- a test that wants every
+token validated sets `state.jwt_cache = None`. Replace a `JwtConfig { .. }` with
+`postrust_engine::jwt_config(&config)?`, or with `JwtConfig::default()` and
+assignments; `secret` is now `keys`, built with `JwtKeys::from_config`. Both
+constructors fail only when the JWT secret does not parse.
+
+A role in `PGRST_ROLE_SETTINGS` whose
+`statement_timeout` was written with only REST in mind now limits its GraphQL
+operations too. Code that called `build_query(&plan, role)` drops the role;
+code embedding the GraphQL handler passes its configuration with
+`GraphQLContext::with_config`.
+
+A crate built on `postrust-server` or `postrust-core` needs a Rust toolchain of
+1.94 or later and, if it uses sqlx itself -- a route of your own handed
+`AppState::pool`, say -- sqlx 0.9 in its own `Cargo.toml`. sqlx 0.9 accepts
+only a `&'static str` as SQL, so SQL your own code builds at runtime -- a
+`format!` naming a schema, say -- no longer compiles as an argument to
+`sqlx::query` and its siblings, or to `Executor::execute`. Wrap it in
+`sqlx::AssertSqlSafe(...)` once you have checked that every value in it is a
+bound parameter and every identifier is quoted; a string literal needs nothing.
+The rest of sqlx's 0.9 changes are in
+[its changelog](https://github.com/launchbadge/sqlx/blob/main/CHANGELOG.md).
+
 ## postrust-proxy 1.0.0
 
 Released on its own, as the `postrust-proxy-v1.0.0` tag. The rest of Postrust
@@ -130,6 +340,7 @@ The SaaS router (`saas_router`), for applications that embed it:
   `MessageHandler::add_forwarding_headers` and `DomainManager::delete_domain`
   change signature; `MessageHandler::has_ambiguous_framing` is removed;
   `ApiResponse` gains `code`.
+
 
 ## 2.4.1
 

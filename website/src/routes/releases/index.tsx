@@ -12,6 +12,44 @@ import { LATEST } from "~/data/version";
 
 const VERSION = "2.3.0";
 
+const added300 = [
+  {
+    title: "Asymmetric JWTs",
+    body: "PGRST_JWT_SECRET may be a JWK or a JWKS: RS256/384/512, PS256/384/512, ES256, ES384 and EdDSA, beside HMAC. The algorithm comes from the key, never from the token, so neither alg: none nor an HS256 token signed with an RSA public key gets through.",
+  },
+  {
+    title: "Keys from your identity provider",
+    body: "PGRST_JWT_JWKS_URL fetches the key set from Supabase Auth, Auth0, Clerk, Cognito or Keycloak and keeps it current: on its Cache-Control max-age, and once more when a token names a kid not yet held, so a rotated-in key works without a restart and a withdrawn one stops working. If no set has ever loaded, tokens are refused and /_/ready answers 503. PGRST_JWT_ISS pins the issuer.",
+  },
+  {
+    title: "Routes of your own, as the caller",
+    body: "postrust_server::Builder nests your own axum routers beside the API in a crate of your own, no fork. A User extractor authenticates as REST does, and AppState::begin_as starts a transaction as that caller -- the role, the claims, the request settings -- so your SQL runs under the same row-level security policies.",
+  },
+  {
+    title: "OpenTelemetry and Prometheus",
+    body: "A span per request with child spans for authentication, planning, each statement and rendering; W3C traceparent in and x-request-id out; PGRST_LOG_FORMAT=json. With the otel feature, in the published images, traces and metrics export over OTLP, and /metrics serves Prometheus text on the admin port.",
+  },
+];
+
+const changed300 = [
+  {
+    title: "sqlx 0.9 and Rust 1.94",
+    body: "The database driver moves to sqlx 0.9, whose types are part of the Rust API, and the minimum supported Rust version to 1.94. SQL built at runtime in your own code needs sqlx::AssertSqlSafe.",
+  },
+  {
+    title: "JwtConfig and AppState are non-exhaustive",
+    body: "So that adding a field is a minor release from here on. Build them with postrust_engine::jwt_config and AppState::new instead of struct literals.",
+  },
+  {
+    title: "A JWT secret that cannot be used stops start-up",
+    body: "A secret that starts with { and is not a usable JWK or JWKS, or an http JWKS URL to a host that is not loopback, is a configuration error rather than a server that refuses every token.",
+  },
+  {
+    title: "GraphQL transactions are set up as REST's are",
+    body: "A role's statement_timeout and isolation level from PGRST_ROLE_SETTINGS, and app.settings.*, now apply to GraphQL operations too. The search_path is left as before.",
+  },
+];
+
 const security241 = [
   {
     title: "SQL injection through a cast in select",
@@ -135,16 +173,29 @@ export default component$(() => {
         <div class="container-wide py-12">
           <div class="mb-4 flex items-center gap-3">
             <span class="rounded border border-neutral-200 bg-neutral-100 px-2 py-0.5 text-xs font-semibold text-neutral-800">
-              PATCH
+              MAJOR
             </span>
-            <span class="text-sm text-neutral-500">Security release</span>
+            <span class="text-sm text-neutral-500">
+              Rust API major &middot; HTTP API unchanged
+            </span>
           </div>
           <h1 class="mb-4 text-4xl font-bold text-neutral-900">
             Postrust {LATEST}
           </h1>
           <p class="mb-4 max-w-2xl text-lg text-neutral-600">
-            A security release, and every deployment should upgrade. It fixes an
-            SQL injection through a cast in{" "}
+            Asymmetric JWTs and keys fetched from your identity provider, routes
+            of your own that run as their caller under row-level security, and
+            OpenTelemetry traces and metrics. A major release for the Rust API
+            -- sqlx 0.9, Rust 1.94 -- not for the HTTP one: a deployment that
+            runs the server or the image upgrades by changing the tag. It
+            carries 2.4.1&rsquo;s security fixes. Released beside it:{" "}
+            <code class="text-base">postrust-worker</code> 1.1.0 and{" "}
+            <code class="text-base">postrust-proxy</code> 2.0.0, whose API takes
+            a sqlx pool.
+          </p>
+          <p class="mb-4 max-w-2xl text-lg text-neutral-600">
+            2.4.1: a security release, and every deployment should upgrade. It
+            fixes an SQL injection through a cast in{" "}
             <code class="text-base">select</code> and a deeply nested request
             that crashes the server, both reachable without a token, and hardens
             two related places. The{" "}
@@ -230,7 +281,51 @@ export default component$(() => {
 
           <section class="mb-12">
             <h2 class="mb-4 text-2xl font-bold text-neutral-900">
-              Security fixes in {LATEST}
+              Added in {LATEST}
+            </h2>
+            <div class="space-y-4">
+              {added300.map((c) => (
+                <div key={c.title} class="rounded-lg bg-neutral-50 p-4">
+                  <h3 class="mb-1 font-semibold text-neutral-900">{c.title}</h3>
+                  <p class="text-sm text-neutral-600">{c.body}</p>
+                </div>
+              ))}
+            </div>
+          </section>
+
+          <section class="mb-12">
+            <h2 class="mb-4 text-2xl font-bold text-neutral-900">
+              Changed in {LATEST}
+            </h2>
+            <div class="space-y-4">
+              {changed300.map((c) => (
+                <div key={c.title} class="rounded-lg bg-neutral-50 p-4">
+                  <h3 class="mb-1 font-semibold text-neutral-900">{c.title}</h3>
+                  <p class="text-sm text-neutral-600">{c.body}</p>
+                </div>
+              ))}
+            </div>
+            <p class="mt-4 text-neutral-600">
+              <strong>Upgrading:</strong> the server and the image need nothing
+              but the new tag. Code built on the crates needs Rust 1.94 and, if
+              it uses sqlx itself, sqlx 0.9. The{" "}
+              <a
+                href="https://github.com/postrust/postrust/blob/main/CHANGELOG.md"
+                class="text-primary-600 hover:underline"
+              >
+                changelog
+              </a>{" "}
+              has the full upgrade note.
+            </p>
+          </section>
+
+          <h2 class="mb-8 text-3xl font-bold text-neutral-900">
+            Postrust 2.4.1
+          </h2>
+
+          <section class="mb-12">
+            <h2 class="mb-4 text-2xl font-bold text-neutral-900">
+              Security fixes in 2.4.1
             </h2>
             <div class="space-y-4">
               {security241.map((c) => (
@@ -888,7 +983,7 @@ export const head: DocumentHead = {
   meta: [
     {
       name: "description",
-      content: `Postrust ${LATEST} is a security release: it fixes an SQL injection through a cast in select and a deeply nested request that crashed the server.`,
+      content: `Postrust ${LATEST}: asymmetric JWTs and JWKS from your identity provider, routes of your own under row-level security, and OpenTelemetry.`,
     },
   ],
 };

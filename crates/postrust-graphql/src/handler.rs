@@ -21,7 +21,7 @@ use async_graphql_axum::{GraphQLRequest, GraphQLResponse};
 use axum::extract::State;
 use axum::response::IntoResponse;
 use postrust_core::schema_cache::SchemaCache;
-use sqlx::PgPool;
+use sqlx::{AssertSqlSafe, PgPool};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
 use tokio::sync::RwLock;
@@ -2755,6 +2755,8 @@ fn live<'a>(
         started: bool,
         /// An error has been sent, and the subscription ends after it.
         failed: bool,
+        /// Counts this subscription as open for as long as its stream lives.
+        _active: crate::subscription::ActiveSubscription,
     }
 
     futures::stream::unfold(
@@ -2765,6 +2767,7 @@ fn live<'a>(
             sent: None,
             started: false,
             failed: false,
+            _active: crate::subscription::ActiveSubscription::open(),
         },
         |mut live: Live<'a>| async move {
             if live.failed {
@@ -3233,7 +3236,7 @@ async fn resolve_entity_group(
         representations_sql,
         projected_rows,
     );
-    let mut tx = begin_with_session(pool, gql_ctx.role(), &gql_ctx.session_settings()).await?;
+    let mut tx = begin_with_session(pool, gql_ctx).await?;
     let rows = execute_query_on(&mut tx, &sql, &bound_values).await?;
     tx.commit().await?;
 
@@ -3931,8 +3934,7 @@ async fn aggregate_value(
             parts.join(", "),
             counted
         );
-        let mut conn =
-            begin_with_session(pool, gql_ctx.role(), &gql_ctx.session_settings()).await?;
+        let mut conn = begin_with_session(pool, gql_ctx).await?;
         let rows = execute_query_on(&mut conn, &sql, &bound_values).await?;
         conn.commit().await?;
         if let Some(first) = rows.into_iter().next() {
@@ -4028,8 +4030,7 @@ async fn aggregate_value(
             projection,
             inner
         );
-        let mut conn =
-            begin_with_session(pool, gql_ctx.role(), &gql_ctx.session_settings()).await?;
+        let mut conn = begin_with_session(pool, gql_ctx).await?;
         let rows = execute_query_on(&mut conn, &sql, &node_values).await?;
         conn.commit().await?;
         result.insert(
@@ -4426,7 +4427,7 @@ async fn query_rows(
     // One transaction for the query and any embeds hanging off it, so the role
     // applies to all of them and the parent and child rows come from a single
     // snapshot.
-    let mut tx = begin_with_session(pool, gql_ctx.role(), &gql_ctx.session_settings()).await?;
+    let mut tx = begin_with_session(pool, gql_ctx).await?;
 
     // Execute query - returns Vec<serde_json::Value>
     let mut result = execute_query_on(&mut tx, &sql, &bound_values).await?;
@@ -4795,51 +4796,33 @@ async fn write_tx<'a>(
 > {
     let mut guard = gql_ctx.write.lock().await;
     if guard.is_none() {
-        *guard = Some(begin_with_session(pool, gql_ctx.role(), &gql_ctx.session_settings()).await?);
+        *guard = Some(begin_with_session(pool, gql_ctx).await?);
     }
     Ok(guard)
 }
 
-/// Begin a transaction with the request's role and session variables applied.
+/// Begin a transaction that runs as this request's caller.
 ///
-/// The settings go in before the role does. A role with fewer privileges may
-/// not be allowed to call `set_config` at all, and a policy that reads a
-/// setting the caller could then change is not a policy.
+/// Every transaction GraphQL opens starts here -- a query's, an aggregate's,
+/// a federated entity lookup's, a subscription's re-read, and the one a
+/// mutation's writes share -- and each is set up by the request's
+/// [`postrust_core::Session`], the same statements REST's transactions start
+/// with. See [`GraphQLContext::session`] for what goes in and why.
+///
+/// This used to be written out here: the settings in one `set_config`, then
+/// `SET LOCAL ROLE`. It differed from REST in what it left out -- a role's own
+/// `statement_timeout` and isolation level, `PGRST_DB_TX_ISOLATION`, the
+/// `search_path`, `app.settings.*` -- and in the order, which put the role
+/// last. The session sets the role inside the one statement, after the
+/// settings PostgREST puts before it and before the claims and the `hasura.*`
+/// variables; every one of those is a setting any role may set on itself, so
+/// they are set as the caller as readily as they were as the authenticator.
 async fn begin_with_session(
     pool: &PgPool,
-    role: &str,
-    settings: &[(String, String)],
+    gql_ctx: &GraphQLContext,
 ) -> Result<sqlx::Transaction<'static, sqlx::Postgres>, async_graphql::Error> {
     let mut tx = pool.begin().await?;
-
-    // One statement for all of them, which is what the REST path does. A loop
-    // here costs a round trip per session variable, and there is always at
-    // least one: `hasura.session` and `hasura.role` are set on every request,
-    // so even an anonymous read paid two. An authenticated caller with six
-    // `x-hasura-*` variables paid eight.
-    //
-    // The values stay bound rather than interpolated. `set_config` takes both
-    // as arguments, where `SET LOCAL` would need the value written into the
-    // statement text.
-    if !settings.is_empty() {
-        let calls = (0..settings.len())
-            .map(|i| format!("set_config(${}, ${}, true)", i * 2 + 1, i * 2 + 2))
-            .collect::<Vec<_>>()
-            .join(", ");
-        let sql = format!("SELECT {calls}");
-        let mut query = sqlx::query_scalar::<_, String>(&sql);
-        for (name, value) in settings {
-            query = query.bind(name).bind(value);
-        }
-        query.fetch_optional(&mut *tx).await?;
-    }
-
-    sqlx::query(&format!(
-        "SET LOCAL ROLE {}",
-        postrust_sql::escape_ident(role)
-    ))
-    .execute(&mut *tx)
-    .await?;
+    gql_ctx.session().apply_sqlx(&mut tx).await?;
     Ok(tx)
 }
 
@@ -4898,7 +4881,7 @@ async fn execute_query_on(
     trace!("Executing SQL: {}", sql);
 
     // Execute query
-    let mut query = sqlx::query(sql);
+    let mut query = sqlx::query(AssertSqlSafe(sql));
     for param in params {
         query = bind_json_value(query, param);
     }
@@ -5045,7 +5028,8 @@ fn computed_call(
 
 /// What a `hasura_session` argument is given.
 ///
-/// The session document, read from the setting `begin_with_session` writes.
+/// The session document, read from the setting [`GraphQLContext::session`]
+/// writes.
 /// `current_setting`'s second argument makes a missing setting null rather than
 /// an error, which is the case of a request with no session at all.
 const SESSION_ARGUMENT: &str = "coalesce(current_setting('hasura.session', true), '{}')::json";
@@ -5631,7 +5615,7 @@ fn insert_row<'life>(
                 row_json(&qualified_table, &column_types),
                 check_sql
             );
-            let mut query = sqlx::query(&sql);
+            let mut query = sqlx::query(AssertSqlSafe(sql));
             for value in &conflict_values {
                 query = bind_json_value(query, value);
             }
@@ -5672,7 +5656,7 @@ fn insert_row<'life>(
                 check_sql
             );
             trace!("Executing INSERT SQL: {}", sql);
-            let mut query = sqlx::query(&sql);
+            let mut query = sqlx::query(AssertSqlSafe(sql));
             for column in &names {
                 if let Some(value) = columns.get(*column) {
                     query = bind_json_value(query, &write_operand(&column_types, column, value));
@@ -6044,6 +6028,16 @@ fn mutation_result<'a>(rows: Vec<Value>, affected: usize, by_key: bool) -> Optio
 }
 
 /// Bind a JSON value to a sqlx query.
+///
+/// Every value a GraphQL request carries reaches the database through here, as
+/// a bound parameter, and that is what makes the `AssertSqlSafe` around each
+/// statement in this module true rather than hopeful. sqlx 0.9 takes only a
+/// `&'static str` as SQL unless told otherwise, and the statements here are
+/// built at runtime because their shape follows the request -- which columns,
+/// which tables, how many rows. What is spliced in comes from the schema cache
+/// or from this module, never from the request: identifiers, each quoted with
+/// `postrust_sql::escape_ident` first, the catalog's type names, and SQL
+/// written here.
 fn bind_json_value<'q>(
     query: sqlx::query::Query<'q, sqlx::Postgres, sqlx::postgres::PgArguments>,
     value: &serde_json::Value,
@@ -6272,7 +6266,7 @@ async fn execute_update(
     trace!("Executing UPDATE SQL: {}", sql);
 
     // Build query with parameters
-    let mut query = sqlx::query(&sql);
+    let mut query = sqlx::query(AssertSqlSafe(sql));
 
     // Bind SET values
     for val in &set_values {
@@ -6502,7 +6496,7 @@ async fn execute_delete(
 
     trace!("Executing DELETE SQL: {}", sql);
 
-    let mut query = sqlx::query(&sql);
+    let mut query = sqlx::query(AssertSqlSafe(sql));
     for val in &values {
         query = bind_json_value(query, val);
     }
@@ -9590,7 +9584,7 @@ fn embed_relationships<'f>(
                     .children_grouped_sql(ctx.max_rows, &child_columns)
                     .map_err(|e| async_graphql::Error::new(e.to_string()))?;
 
-                let fetched = sqlx::query(&sql)
+                let fetched = sqlx::query(AssertSqlSafe(sql))
                     .bind(&keys)
                     .fetch_all(&mut *conn)
                     .await

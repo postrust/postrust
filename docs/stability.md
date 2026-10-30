@@ -69,6 +69,11 @@ change to any of these needs a major version:
 - **Its migrations**: a new release adds migrations; it never edits one that
   shipped.
 
+The crates its Rust API exposes count as part of it: its constructors and
+`saas::db` take a sqlx `PgPool`. That is why it is 2.0.0 beside Postrust
+3.0.0 -- the move to sqlx 0.9 changed nothing in the proxy's own code, and is
+a major version of it all the same.
+
 It reached 1.0.0 by being audited rather than by being lived with: the
 transport layer is measured by h2spec, Autobahn and the HTTP Garden
 differential fuzzer (`scripts/h2spec/`, `scripts/autobahn/`,
@@ -94,7 +99,12 @@ Configuration, schema and metadata types that grow with features --
 release, not a major one; the price is that another crate cannot build one with
 a struct literal, and starts from `Default::default()` and assigns the fields it
 needs instead. This is what 2.0.0 changed, so that a feature adding a setting
-does not need 3.0.0.
+does not need a major release.
+
+3.0.0 extends the same rule to two types 2.0.0 missed:
+`postrust_auth::JwtConfig`, which is built with
+`postrust_engine::jwt_config(&AppConfig)` or from `Default::default()`, and
+`postrust_server::AppState`, which is built with `AppState::new`.
 
 Not covered:
 

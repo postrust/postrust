@@ -13,12 +13,16 @@ extern crate jsonwebtoken10 as jsonwebtoken;
 mod cache;
 mod claims;
 pub mod hasura;
+pub mod jwks;
 mod jwt;
+mod keys;
 
-pub use cache::JwtCache;
+pub use cache::{CacheOutcome, CacheStats, JwtCache};
 pub use claims::Claims;
 pub use hasura::{HasuraAuthConfig, HasuraIdentity, SecretOutcome, TokenRole};
+pub use jwks::Jwks;
 pub use jwt::validate_token;
+pub use keys::{JwtKeyError, JwtKeys, KeySet};
 
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -66,30 +70,77 @@ impl AuthResult {
 }
 
 /// JWT configuration.
+///
+/// `#[non_exhaustive]` from 3.0.0, so that verifying keys and claims of new
+/// kinds is a minor release: start from `JwtConfig::default()` and assign, or
+/// take `postrust_engine::jwt_config` for the one an `AppConfig` describes.
 #[derive(Clone, Debug)]
+#[non_exhaustive]
 pub struct JwtConfig {
-    /// Secret key for HS256/HS384/HS512
-    pub secret: Option<String>,
-    /// Whether secret is base64 encoded
-    pub secret_is_base64: bool,
+    /// The keys tokens are verified with, parsed from `PGRST_JWT_SECRET` by
+    /// [`JwtKeys::from_config`] when the configuration is read. `None` when
+    /// no secret is configured, and every token is then refused with
+    /// [`JwtError::SecretMissing`].
+    pub keys: Option<JwtKeys>,
     /// Required audience claim
     pub audience: Option<String>,
+    /// The issuer a token's `iss` must name (`PGRST_JWT_ISS`). When set, a
+    /// token with no `iss` is refused too.
+    pub issuer: Option<String>,
     /// Claim key containing the role
     pub role_claim_key: String,
     /// Default role for anonymous requests
     pub anon_role: Option<String>,
+    /// Where `keys` are fetched from and kept current, when
+    /// `PGRST_JWT_JWKS_URL` is set. Set it with [`JwtConfig::with_jwks`],
+    /// which points `keys` at the same set; a host then awaits
+    /// [`ensure_keys`] before verifying.
+    pub jwks: Option<Jwks>,
 }
 
 impl Default for JwtConfig {
     fn default() -> Self {
         Self {
-            secret: None,
-            secret_is_base64: false,
+            keys: None,
             audience: None,
+            issuer: None,
             role_claim_key: "role".to_string(),
             anon_role: None,
+            jwks: None,
         }
     }
+}
+
+impl JwtConfig {
+    /// Verify with the keys `jwks` keeps, which already include whatever
+    /// `keys` held when it was built ([`jwks::JwksBuilder::fixed`]).
+    pub fn with_jwks(mut self, jwks: Jwks) -> Self {
+        self.keys = Some(jwks.keys().clone());
+        self.jwks = Some(jwks);
+        self
+    }
+}
+
+/// Make sure the keys the request's token needs are loaded, before the
+/// synchronous [`authenticate`] (or [`JwtCache::authenticate`]) runs.
+///
+/// The one asynchronous step in verifying a token, and a no-op unless keys
+/// come from a JWKS URL ([`JwtConfig::jwks`]). Even then it awaits nothing
+/// for a token whose key is already held, which is every request but the few
+/// after the identity provider rotates a key. See [`jwks`] for when it
+/// fetches. Never fails: a token it could not find a key for is refused by
+/// the check that follows, as it would have been without it.
+///
+/// Every place a token is verified awaits this first: the REST pipeline, and
+/// the server's GraphQL handlers.
+pub async fn ensure_keys(auth_header: Option<&str>, config: &JwtConfig) {
+    let Some(jwks) = &config.jwks else {
+        return;
+    };
+    let Some(Ok(token)) = auth_header.map(extract_bearer_token) else {
+        return;
+    };
+    jwks.ensure_for_token(token).await;
 }
 
 /// What was wrong with a token's claims.
@@ -117,6 +168,10 @@ pub enum ClaimFault {
     /// `aud` is present and does not list the audience this server accepts.
     #[error("JWT not in audience")]
     NotInAudience,
+
+    /// An issuer is configured and `iss` does not name it, or is absent.
+    #[error("JWT issuer is not the expected one")]
+    UnexpectedIssuer,
 
     /// The payload decoded but is not a JSON object of claims.
     #[error("Parsing claims failed")]

@@ -22,6 +22,10 @@
 //! * **Rows are capped** at `PGRST_DB_MAX_ROWS`, 1000 unless set, because an
 //!   isolate has 128 MB. `unlimited`, under that name or `PGRST_MAX_ROWS`,
 //!   lifts the cap.
+//! * **Keys from `PGRST_JWT_JWKS_URL` are fetched when first needed** and
+//!   copied into the same KV namespace, under a key of their own, so a cold
+//!   isolate reads them there rather than asking the identity provider. The
+//!   Cron Trigger fetches them again too.
 //! * **REST only.** No GraphQL, no subscriptions, no `LISTEN`.
 //!
 //! The REST API answers at the root, as PostgREST does: `/todos`, `/rpc/f`.
@@ -38,5 +42,7 @@
 #[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
 mod settings;
 
+#[cfg(target_arch = "wasm32")]
+mod jwks;
 #[cfg(target_arch = "wasm32")]
 mod runtime;

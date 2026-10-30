@@ -5,13 +5,12 @@ use crate::state::State;
 use bytes::Bytes;
 use http::{Response, StatusCode};
 use http_body_util::BodyExt;
-use postrust_auth::authenticate;
 use postrust_core::db::{Db, Tx};
 use postrust_core::{
     create_action_plan, parse_request, ActionPlan, ApiRequest, CallPlan, DbActionPlan,
 };
 use postrust_response::{format_response, QueryResult, Response as PgrstResponse};
-use tracing::{debug, error};
+use tracing::{debug, debug_span, error, field::Empty, Instrument};
 
 /// Column carrying the parent's whole row, for computed relationships.
 ///
@@ -103,19 +102,9 @@ where
     B: http_body::Body<Data = Bytes>,
     B::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
 {
-    // Extract auth header
-    let auth_header = request
-        .headers()
-        .get("authorization")
-        .and_then(|v| v.to_str().ok());
-
-    // Authenticate, through the token cache where one is configured.
-    let auth_result = match state.jwt_cache() {
-        Some(cache) => cache.authenticate(auth_header, state.jwt_config()),
-        None => authenticate(auth_header, state.jwt_config()),
-    }
-    .map_err(jwt_error)?;
-
+    // Authenticate, before the body is read. The same function serves a
+    // host's own routes, so a token means the same thing to both.
+    let auth_result = authenticate(state, request.headers()).await?;
     debug!("Authenticated as role: {}", auth_result.role);
 
     // Parse request.
@@ -159,6 +148,12 @@ where
         state.schemas(),
         state.config().db_max_rows,
     )?;
+    // For the database's `request.trace_id`. The host put the context in the
+    // extensions; `parse_request` saw a request rebuilt without them.
+    api_request.trace_id = parts
+        .extensions
+        .get::<postrust_core::trace::TraceContext>()
+        .map(|context| context.trace_id);
 
     // Parse payload
     if !body_bytes.is_empty() {
@@ -213,7 +208,7 @@ where
     }
 
     // Create execution plan
-    let plan = create_action_plan(&api_request, &schema_cache)?;
+    let plan = debug_span!("plan").in_scope(|| create_action_plan(&api_request, &schema_cache))?;
 
     // Released before the query runs, not held through it. tokio's `RwLock`
     // queues a reader behind any writer already waiting, so a schema reload
@@ -237,6 +232,7 @@ where
         &auth_result,
         &added_join_columns,
     )
+    .instrument(db_span(&plan))
     .await?;
 
     // A read has nothing for a refusal to undo -- it ran read-only -- so its
@@ -246,7 +242,10 @@ where
     // embeds fetched by a second query, a rendered media type.
     let tx = match tx {
         Some(tx) if is_read_only(&api_request) => {
-            tx.commit().await.map_err(postrust_core::Error::from)?;
+            tx.commit()
+                .instrument(commit_span())
+                .await
+                .map_err(postrust_core::Error::from)?;
             None
         }
         tx => tx,
@@ -256,7 +255,10 @@ where
     // A singular response the result cannot satisfy is the client's business,
     // not an internal failure: it asked for one object and the query answered
     // with some other number of rows.
-    let response = format_response(&api_request, &result).map_err(|e| match e {
+    let render_span = debug_span!("render");
+    let response = render_span.in_scope(|| format_response(&api_request, &result));
+    drop(render_span);
+    let response = response.map_err(|e| match e {
         postrust_response::FormatError::MultipleRows | postrust_response::FormatError::NotFound => {
             // How many rows there were, not how many were kept: a write the
             // caller wanted no representation from still touched them, and
@@ -280,10 +282,96 @@ where
     // a deferred foreign key is a 409 like an immediate one. Only a
     // connection that broke is reported as the database being unavailable.
     if let Some(tx) = tx {
-        tx.commit().await.map_err(postrust_core::Error::from)?;
+        tx.commit()
+            .instrument(commit_span())
+            .await
+            .map_err(postrust_core::Error::from)?;
     }
 
     Ok(build_response(response))
+}
+
+/// The span a `COMMIT` sent on its own runs in.
+///
+/// A sibling of `db.query` beneath the request, not a child of it: the
+/// commit happens after the plan's statements are done -- for a write, after
+/// the response is rendered, so that a refusal can still roll it back -- and
+/// a `db.query` kept open until then would claim the rendering's time as the
+/// database's. A read whose transaction ends with its query commits in the
+/// same flight, and has no span of its own for it.
+fn commit_span() -> tracing::Span {
+    debug_span!(
+        "db.commit",
+        "db.system" = "postgresql",
+        "db.operation.name" = "COMMIT",
+    )
+}
+
+/// The span the count `Prefer: count` asks for runs in, beneath the plan's
+/// `db.query`. Its own span, apart from the main statement's, so a trace
+/// shows which of the request's round trips took the time -- an exact count
+/// over a large table is often most of it.
+///
+/// `db.operation.name` says how it was counted: `count` for `exact`,
+/// `explain` for `planned`; `estimated` may run both, and opens one span for
+/// each.
+fn count_span(operation: &'static str) -> tracing::Span {
+    debug_span!(
+        "db.count",
+        "db.system" = "postgresql",
+        "db.operation.name" = operation,
+        "db.query.text" = Empty,
+    )
+}
+
+/// The span the query fetching one embedded relation runs in, beneath the
+/// plan's `db.query`: one per relation per level, for the embeds the main
+/// statement could not carry. `db.collection.name` is the table the
+/// relation reads.
+fn embed_span(
+    relation: &str,
+    collection: &postrust_core::api_request::QualifiedIdentifier,
+) -> tracing::Span {
+    debug_span!(
+        "db.embed",
+        "db.system" = "postgresql",
+        "db.operation.name" = "select",
+        "db.collection.name" = %collection,
+        "postrust.embed.relation" = relation,
+        "db.query.text" = Empty,
+    )
+}
+
+/// The span a plan's database work runs in, named and described as
+/// OpenTelemetry's database conventions have it.
+///
+/// `db.operation.name` and `db.collection.name` rather than the older
+/// `db.operation` and `db.sql.table`: the current conventions, and the names
+/// an exporter added later will expect. A plan that never reaches the
+/// database -- `OPTIONS`, the OpenAPI document -- gets no span.
+///
+/// `db.query.text` is declared empty and filled in by `execute_plan` only when
+/// `otel_db_statement` asks for it.
+fn db_span(plan: &ActionPlan) -> tracing::Span {
+    use postrust_core::plan::MutatePlan;
+
+    let (operation, collection) = match plan {
+        ActionPlan::Info(_) => return tracing::Span::none(),
+        ActionPlan::Db(DbActionPlan::Read(tree)) => ("select", &tree.root.from),
+        ActionPlan::Db(DbActionPlan::MutateRead { mutate, .. }) => match mutate {
+            MutatePlan::Insert { target, .. } => ("insert", target),
+            MutatePlan::Update { target, .. } => ("update", target),
+            MutatePlan::Delete { target, .. } => ("delete", target),
+        },
+        ActionPlan::Db(DbActionPlan::Call { call, .. }) => ("call", &call.function),
+    };
+    debug_span!(
+        "db.query",
+        "db.system" = "postgresql",
+        "db.operation.name" = operation,
+        "db.collection.name" = %collection,
+        "db.query.text" = Empty,
+    )
 }
 
 /// The plan media type a request asked for, when that is all it will accept.
@@ -353,21 +441,6 @@ fn split_leading_cte(sql: &str) -> (String, &str) {
     }
 
     (String::new(), sql)
-}
-
-/// Render a map of strings as a JSON object.
-///
-/// PostgreSQL will not accept every header name as a setting name -- a `-` is
-/// not allowed in one from version 14 -- so the whole map goes into a single
-/// setting as JSON and a function picks out what it wants with `->>`.
-fn json_object<'a>(entries: impl IntoIterator<Item = (&'a String, &'a String)>) -> String {
-    serde_json::Value::Object(
-        entries
-            .into_iter()
-            .map(|(name, value)| (name.clone(), serde_json::Value::String(value.clone())))
-            .collect(),
-    )
-    .to_string()
 }
 
 /// The prefix given to primary key columns added only to build `Location`.
@@ -465,6 +538,56 @@ fn needs_payload(api_request: &ApiRequest) -> bool {
             ..
         })
     )
+}
+
+/// The `Authorization` header a request carries, as authentication reads it.
+///
+/// A value that is not visible ASCII is no header at all: it cannot be a
+/// bearer token, and it is answered as a request that sent none.
+pub fn authorization(headers: &http::HeaderMap) -> Option<&str> {
+    headers
+        .get(http::header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+}
+
+/// Who a request is, from its `Authorization` header.
+///
+/// The one place a request is authenticated: REST calls this, and so does a
+/// host's own route that wants its caller to be who REST would say it is --
+/// the server's `User` extractor. Through the token cache where one is
+/// configured, the anonymous role when no token is sent, and a failure
+/// classified as PostgREST classifies it, for [`error_response`] to answer.
+///
+/// Keys fetched from a JWKS URL may need fetching first: the one await in
+/// authenticating, and one that awaits nothing for a token whose key is
+/// already held. See `postrust_auth::jwks`.
+///
+/// The `auth` span is at debug, beneath the request's own span at info: with
+/// the default filter it is never created, and a disabled span is a check of
+/// a cached flag. Its fields are evaluated only when something is listening.
+/// `jwt.cache` says whether the token cache answered: `hit`, `miss`, or
+/// `bypassed` for a request with no token to look up. Absent where no cache
+/// is configured. The cache counts the same outcomes for a metric; see
+/// `JwtCache::stats`.
+pub async fn authenticate<S: State>(
+    state: &S,
+    headers: &http::HeaderMap,
+) -> Result<postrust_auth::AuthResult, postrust_core::Error> {
+    let header = authorization(headers);
+    postrust_auth::ensure_keys(header, state.jwt_config()).await;
+    let auth_span = debug_span!("auth", role = Empty, "jwt.cache" = Empty);
+    let auth_result = auth_span
+        .in_scope(|| match state.jwt_cache() {
+            Some(cache) => {
+                let (result, outcome) = cache.authenticate_with_outcome(header, state.jwt_config());
+                auth_span.record("jwt.cache", outcome.as_str());
+                result
+            }
+            None => postrust_auth::authenticate(header, state.jwt_config()),
+        })
+        .map_err(jwt_error)?;
+    auth_span.record("role", auth_result.role.as_str());
+    Ok(auth_result)
 }
 
 /// Classify a JWT failure the way PostgREST reports it.
@@ -732,10 +855,7 @@ async fn execute_plan<'s, S: State>(
             };
 
             // Build SQL
-            let query = postrust_core::query::build_query(
-                &ActionPlan::Db(db_plan.clone()),
-                Some(&auth.role),
-            )?;
+            let query = postrust_core::query::build_query(&ActionPlan::Db(db_plan.clone()))?;
 
             if !query.has_main() {
                 return Ok((QueryResult::default(), None));
@@ -749,7 +869,7 @@ async fn execute_plan<'s, S: State>(
             // placeholders and their numbering untouched and the count query
             // can be bound with the very same parameters.
             let mut count_sql = match api_request.preferences.count {
-                Some(_) => unpaged_sql(db_plan, &auth.role)?,
+                Some(_) => unpaged_sql(db_plan)?,
                 None => None,
             };
 
@@ -874,10 +994,9 @@ async fn execute_plan<'s, S: State>(
                     if let DbActionPlan::Read(tree) = db_plan {
                         let mut unpaged = tree.clone();
                         page = Some(std::mem::take(&mut unpaged.root.range));
-                        sql = postrust_core::query::build_query(
-                            &ActionPlan::Db(DbActionPlan::Read(unpaged)),
-                            Some(&auth.role),
-                        )?
+                        sql = postrust_core::query::build_query(&ActionPlan::Db(
+                            DbActionPlan::Read(unpaged),
+                        ))?
                         .build_main()
                         .0;
                     }
@@ -1045,6 +1164,10 @@ async fn execute_plan<'s, S: State>(
                 debug!("Rendering {} via {}", media_type, aggregate);
             }
 
+            // Onto the `db.query` span this runs in; see `db_span`.
+            if state.config().otel_db_statement {
+                tracing::Span::current().record("db.query.text", sql.as_str());
+            }
             debug!("Executing SQL: {}", sql);
             debug!("With {} parameters", params.len());
 
@@ -1061,144 +1184,44 @@ async fn execute_plan<'s, S: State>(
             // Embedding runs on this same transaction, which also means a
             // parent row and its children come from one snapshot rather than
             // from two separate reads.
-            let mut tx = state
-                .db()
-                .begin()
-                .await
-                .map_err(|e| postrust_core::Error::ConnectionPool(e.to_string()))?;
-
-            // Isolation level. `SET TRANSACTION` is only accepted before the
-            // first statement of a transaction, so it goes here.
             //
-            // A role's own setting wins over the server-wide
-            // `PGRST_DB_TX_ISOLATION`, and both are closed enums rendered by
-            // `to_sql` -- never caller text. Issued only when it differs from
-            // PostgreSQL's own default, so the common case sends nothing.
+            // A transaction that cannot be begun is logged here, at error,
+            // because nothing later will: the query's own logging below never
+            // runs. It is the pool running dry -- every connection busy for
+            // longer than `db_pool_timeout` -- or the database out of reach,
+            // and either is the operator's to fix, not the client's. The
+            // client is told only that the service is unavailable; the line
+            // carries the cause, and the request's `request_id` and
+            // `trace_id` with it.
             //
-            // This and every statement up to the query are queued rather than
-            // run: they go out with the query, in one flight where the driver
-            // can pipeline, and a failure among them is the query's.
-            let isolation = state
-                .config()
-                .role_settings
-                .get(&auth.role)
-                .and_then(|r| r.isolation_level.as_ref())
-                .unwrap_or(&state.config().db_tx_isolation);
-            if *isolation != postrust_core::IsolationLevel::ReadCommitted {
-                tx.queue(
-                    &format!("SET TRANSACTION ISOLATION LEVEL {}", isolation.to_sql()),
-                    &[],
-                );
-            }
+            // Timed for the pool's wait metric when a host is measuring it;
+            // see `crate::observe`. A failure is timed too: a wait that ended
+            // in `db_pool_timeout` is the one most worth seeing.
+            let begin_timer = crate::observe::begin_timer();
+            let begun = state.db().begin().await;
+            crate::observe::transaction_begun(begin_timer);
+            let mut tx = begun.map_err(|e| {
+                error!("Could not begin a transaction: {}", e);
+                postrust_core::Error::ConnectionPool(e.to_string())
+            })?;
 
-            // A read request runs in a read-only transaction.
+            // Make the transaction the caller's: its isolation level, read-only
+            // for a read, the role and every setting a policy or function reads
+            // back, and `db_pre_request`. See `Session` for each, and for the
+            // order they have to go in.
             //
-            // Without this a GET can change data: `GET /rpc/some_volatile_fn`
-            // happily executes whatever the function does. PostgreSQL is the
-            // right place to enforce it, since it covers anything reachable
-            // from the statement -- a volatile function, a trigger, a rule --
-            // rather than only what the planner thought to look at.
-            if is_read_only(api_request) {
-                tx.queue("SET TRANSACTION READ ONLY", &[]);
-            }
-
-            // Everything the request tells the database about itself, in
-            // one statement.
-            //
-            // These are `SET LOCAL` by another spelling -- `set_config(k, v,
-            // true)` -- and a function or an RLS policy reads them back with
-            // `current_setting`. Sent as one `SELECT` rather than one
-            // statement each, which is a round trip per setting otherwise, and
-            // there are eight of them before a request has done any work.
-            //
-            // The order is PostgREST's: the settings a role carries, then the
-            // role, then everything about the request. The role goes on after
-            // its own settings so that a `GRANT SET ON PARAMETER` on the
-            // authenticator still applies when they are set.
-            {
-                let mut path = vec![api_request.schema.clone()];
-                path.extend(state.config().db_extra_search_path.iter().cloned());
-                let search_path = path
-                    .iter()
-                    .map(|s| postrust_sql::escape_ident(s))
-                    .collect::<Vec<_>>()
-                    .join(", ");
-
-                let mut settings: Vec<(String, String)> = Vec::new();
-
-                // The settings a role carries come first, before the `role`
-                // that follows them -- see the note above on
-                // `GRANT SET ON PARAMETER`.
-                if let Some(role_settings) = state.config().role_settings.get(&auth.role) {
-                    if let Some(timeout) = role_settings.statement_timeout {
-                        settings.push(("statement_timeout".to_string(), timeout.to_string()));
-                    }
-                }
-
-                settings.extend([
-                    ("search_path".to_string(), search_path),
-                    ("role".to_string(), auth.role.clone()),
-                    ("request.method".to_string(), api_request.method.clone()),
-                    ("request.path".to_string(), api_request.path.clone()),
-                    (
-                        "request.headers".to_string(),
-                        json_object(&api_request.headers),
-                    ),
-                    (
-                        "request.cookies".to_string(),
-                        json_object(&api_request.cookies),
-                    ),
-                ]);
-                settings.extend(auth.claim_settings());
-
-                // `app_settings`, exposed as PostgREST spells them: a function
-                // or policy reads one back with
-                // `current_setting('app.settings.<key>')`.
-                for (key, value) in &state.config().app_settings {
-                    settings.push((format!("app.settings.{key}"), value.clone()));
-                }
-
-                // `Prefer: timezone` is applied to the session, so every value
-                // the database renders -- and every `now()` a function calls --
-                // sees it. An unknown zone is PostgreSQL's to reject, and it
-                // does, with a message naming the value the client sent.
-                if let Some(timezone) = &api_request.preferences.timezone {
-                    settings.push(("timezone".to_string(), timezone.clone()));
-                }
-
-                let calls = (0..settings.len())
-                    .map(|i| format!("set_config(${}, ${}, true)", i * 2 + 1, i * 2 + 2))
-                    .collect::<Vec<_>>()
-                    .join(", ");
-                let sql = format!("SELECT {}", calls);
-                let params: Vec<postrust_sql::SqlParam> = settings
-                    .into_iter()
-                    .flat_map(|(name, value)| {
-                        [
-                            postrust_sql::SqlParam::Text(name),
-                            postrust_sql::SqlParam::Text(value),
-                        ]
-                    })
-                    .collect();
-                tx.queue(&sql, &params);
-            }
-
-            // `db_pre_request`: a function called before the request's own
-            // query, on the same transaction, so it sees every setting above
-            // and anything it raises aborts the request. PostgREST's use for
-            // it is a custom authorisation check that `RAISE`s to refuse.
-            //
-            // The name is an identifier from the configuration, not from the
-            // request, and is escaped as one -- a schema-qualified name stays
-            // two identifiers so `auth.check` does not become `"auth.check"`.
-            if let Some(pre_request) = &state.config().db_pre_request {
-                let qualified = pre_request
-                    .split('.')
-                    .map(postrust_sql::escape_ident)
-                    .collect::<Vec<_>>()
-                    .join(".");
-                tx.queue(&format!("SELECT {qualified}()"), &[]);
-            }
+            // They are queued rather than run: they go out with the query, in
+            // one flight where the driver can pipeline, and a failure among
+            // them is the query's.
+            postrust_core::Session::new(state.config(), auth.role.clone(), auth.claim_settings())
+                .schema(api_request.schema.clone())
+                .request(api_request.method.clone(), api_request.path.clone())
+                .headers(&api_request.headers)
+                .cookies(&api_request.cookies)
+                .trace_id(api_request.trace_id.map(|t| t.to_string()))
+                .timezone(api_request.preferences.timezone.clone())
+                .read_only(is_read_only(api_request))
+                .apply(&mut tx);
 
             // The main query. A logged failure names the driver's account of
             // it, which says more than the response is allowed to. Only faults
@@ -1268,6 +1291,7 @@ async fn execute_plan<'s, S: State>(
                             count_sql,
                             &params,
                             api_request.max_rows,
+                            state.config().otel_db_statement,
                         )
                         .await?
                     }
@@ -1430,7 +1454,15 @@ async fn execute_plan<'s, S: State>(
             // snapshot as the page it describes.
             let total = match (&api_request.preferences.count, &count_sql, tx.as_mut()) {
                 (Some(preference), Some(count_sql), Some(tx)) => {
-                    resolve_count(tx, preference, count_sql, &params, api_request.max_rows).await?
+                    resolve_count(
+                        tx,
+                        preference,
+                        count_sql,
+                        &params,
+                        api_request.max_rows,
+                        state.config().otel_db_statement,
+                    )
+                    .await?
                 }
                 _ => None,
             };
@@ -2138,7 +2170,6 @@ fn is_read_only(api_request: &ApiRequest) -> bool {
 /// rows it affected, which is the result set itself.
 fn unpaged_sql(
     db_plan: &postrust_core::plan::DbActionPlan,
-    role: &str,
 ) -> Result<Option<String>, postrust_core::Error> {
     use postrust_core::plan::{ActionPlan, DbActionPlan};
 
@@ -2162,7 +2193,7 @@ fn unpaged_sql(
         DbActionPlan::MutateRead { .. } => return Ok(None),
     };
 
-    let query = postrust_core::query::build_query(&ActionPlan::Db(unpaged), Some(role))?;
+    let query = postrust_core::query::build_query(&ActionPlan::Db(unpaged))?;
     Ok(query.has_main().then(|| query.build_main().0))
 }
 
@@ -2180,31 +2211,42 @@ async fn resolve_count<T: Tx>(
     count_sql: &str,
     params: &[postrust_sql::SqlParam],
     max_rows: Option<i64>,
+    record_statement: bool,
 ) -> Result<Option<i64>, postrust_core::Error> {
     use postrust_core::api_request::PreferCount;
 
+    let text = record_statement;
     match preference {
-        PreferCount::Exact => exact_count(tx, count_sql, params).await,
-        PreferCount::Planned => planned_count(tx, count_sql, params).await,
-        PreferCount::Estimated => match (exact_count(tx, count_sql, params).await?, max_rows) {
+        PreferCount::Exact => exact_count(tx, count_sql, params, text).await,
+        PreferCount::Planned => planned_count(tx, count_sql, params, text).await,
+        PreferCount::Estimated => match (exact_count(tx, count_sql, params, text).await?, max_rows)
+        {
             (Some(exact), Some(ceiling)) if exact <= ceiling => Ok(Some(exact)),
             (Some(exact), _) => {
-                let planned = planned_count(tx, count_sql, params).await?;
+                let planned = planned_count(tx, count_sql, params, text).await?;
                 Ok(Some(exact.max(planned.unwrap_or(exact))))
             }
-            (None, _) => planned_count(tx, count_sql, params).await,
+            (None, _) => planned_count(tx, count_sql, params, text).await,
         },
     }
 }
 
 /// The number of rows the filters match.
+///
+/// `record_statement` is `otel_db_statement`: whether the statement goes on
+/// its span as `db.query.text`, as the main one does on `db.query`.
 async fn exact_count<T: Tx>(
     tx: &mut T,
     count_sql: &str,
     params: &[postrust_sql::SqlParam],
+    record_statement: bool,
 ) -> Result<Option<i64>, postrust_core::Error> {
     let sql = format!("SELECT count(*) FROM ({}) AS pgrst_count", count_sql);
-    let row = first_row(tx.fetch_values(&sql, params).await?)?;
+    let span = count_span("count");
+    if record_statement {
+        span.record("db.query.text", sql.as_str());
+    }
+    let row = first_row(tx.fetch_values(&sql, params).instrument(span).await?)?;
     Ok(row.first().and_then(serde_json::Value::as_i64))
 }
 
@@ -2213,9 +2255,14 @@ async fn planned_count<T: Tx>(
     tx: &mut T,
     count_sql: &str,
     params: &[postrust_sql::SqlParam],
+    record_statement: bool,
 ) -> Result<Option<i64>, postrust_core::Error> {
     let sql = format!("EXPLAIN (FORMAT JSON) {}", count_sql);
-    let plan = first_row(tx.fetch_values(&sql, params).await?)?
+    let span = count_span("explain");
+    if record_statement {
+        span.record("db.query.text", sql.as_str());
+    }
+    let plan = first_row(tx.fetch_values(&sql, params).instrument(span).await?)?
         .into_iter()
         .next()
         .unwrap_or(serde_json::Value::Null);
@@ -3463,7 +3510,11 @@ async fn embed_relations<S: State, T: Tx>(
             let keys = postrust_sql::SqlParam::Array(
                 keys.into_iter().map(postrust_sql::SqlParam::Text).collect(),
             );
-            let fetched = conn.fetch_values(&sql, &[keys]).await?;
+            let span = embed_span(relation, &child_qi);
+            if state.config().otel_db_statement {
+                span.record("db.query.text", sql.as_str());
+            }
+            let fetched = conn.fetch_values(&sql, &[keys]).instrument(span).await?;
 
             // The query returns the join key and a JSON array of that
             // key's children, so the values are read straight out of the

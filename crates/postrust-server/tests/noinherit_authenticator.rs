@@ -32,10 +32,10 @@ use axum::Router;
 use postrust_core::{AppConfig, SchemaCache};
 use postrust_server::{handle_request, AppState};
 use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
+use sqlx::AssertSqlSafe;
 use sqlx::PgPool;
 use std::str::FromStr;
 use std::sync::Arc;
-use tokio::sync::RwLock;
 use tower::ServiceExt;
 
 const NOINHERIT: &str = "postrust_test_noinherit_authenticator";
@@ -147,7 +147,7 @@ async fn authenticators() -> (PgPool, PgPool) {
     // `duplicate_object` an existence check would catch. Taken in turn, and
     // made what this file needs whatever an earlier run left behind.
     for (role, inherit) in [(NOINHERIT, "NOINHERIT"), (INHERIT, "INHERIT")] {
-        sqlx::query(&format!(
+        sqlx::query(AssertSqlSafe(format!(
             "DO $$ BEGIN \
                PERFORM pg_advisory_xact_lock(hashtext('{role}')); \
                IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = '{role}') THEN \
@@ -156,7 +156,7 @@ async fn authenticators() -> (PgPool, PgPool) {
                ALTER ROLE {role} LOGIN {inherit} PASSWORD '{PASSWORD}'; \
                GRANT web_anon, web_user, web_admin TO {role}; \
              END $$"
-        ))
+        )))
         .execute(&admin)
         .await
         .expect("failed to create an authenticator");
@@ -248,19 +248,12 @@ async fn a_request_is_answered_through_the_authenticator() {
     let schema_cache = SchemaCache::load(&authenticator, &config.db_schemas)
         .await
         .expect("schema cache as the authenticator");
-    let jwt_config = postrust_auth::JwtConfig {
-        secret: config.jwt_secret.clone(),
-        secret_is_base64: config.jwt_secret_is_base64,
-        audience: config.jwt_aud.clone(),
-        role_claim_key: config.jwt_role_claim_key.clone(),
-        anon_role: config.db_anon_role.clone(),
-    };
-    let state = Arc::new(AppState {
-        pool: authenticator,
-        schema_cache: RwLock::new(schema_cache),
-        config,
-        jwt_config,
-        jwt_cache: None,
+    let state = Arc::new({
+        let mut state = AppState::new(authenticator, schema_cache, config)
+            .expect("the test's JWT secret parses");
+        // Uncached, so a test sees each request validated as it was written.
+        state.jwt_cache = None;
+        state
     });
     // Mounted as the server mounts it: the handler reads the path below `/api`.
     let api: Router<Arc<AppState>> = Router::new()
@@ -376,7 +369,7 @@ async fn a_member_of_pg_read_all_data_sees_every_table() {
         eprintln!("pg_read_all_data needs PostgreSQL 14 or later; skipped");
         return;
     }
-    sqlx::query(&format!(
+    sqlx::query(AssertSqlSafe(format!(
         "DO $$ BEGIN \
            PERFORM pg_advisory_xact_lock(hashtext('{READER}')); \
            IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = '{READER}') THEN \
@@ -385,7 +378,7 @@ async fn a_member_of_pg_read_all_data_sees_every_table() {
            ALTER ROLE {READER} LOGIN INHERIT PASSWORD '{PASSWORD}'; \
            GRANT pg_read_all_data TO {READER}; \
          END $$"
-    ))
+    )))
     .execute(&admin)
     .await
     .expect("failed to create the reader");

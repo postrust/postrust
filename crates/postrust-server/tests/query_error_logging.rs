@@ -21,9 +21,9 @@ use axum::Router;
 use postrust_core::{AppConfig, SchemaCache};
 use postrust_server::{handle_request, AppState};
 use sqlx::postgres::PgPoolOptions;
+use sqlx::AssertSqlSafe;
 use std::io::Write;
 use std::sync::{Arc, Mutex};
-use tokio::sync::RwLock;
 use tower::ServiceExt;
 
 const SCHEMA: &str = "query_error_logging";
@@ -78,7 +78,10 @@ async fn app() -> Router {
         ),
         format!("GRANT EXECUTE ON ALL FUNCTIONS IN SCHEMA {SCHEMA} TO web_anon"),
     ] {
-        sqlx::query(&statement).execute(&pool).await.unwrap();
+        sqlx::query(AssertSqlSafe(statement))
+            .execute(&pool)
+            .await
+            .unwrap();
     }
 
     let mut config = AppConfig::default();
@@ -88,19 +91,12 @@ async fn app() -> Router {
     let schema_cache = SchemaCache::load(&pool, &config.db_schemas)
         .await
         .expect("schema cache");
-    let jwt_config = postrust_auth::JwtConfig {
-        secret: config.jwt_secret.clone(),
-        secret_is_base64: config.jwt_secret_is_base64,
-        audience: config.jwt_aud.clone(),
-        role_claim_key: config.jwt_role_claim_key.clone(),
-        anon_role: config.db_anon_role.clone(),
-    };
-    let state = Arc::new(AppState {
-        pool,
-        schema_cache: RwLock::new(schema_cache),
-        config,
-        jwt_config,
-        jwt_cache: None,
+    let state = Arc::new({
+        let mut state =
+            AppState::new(pool, schema_cache, config).expect("the test's JWT secret parses");
+        // Uncached, so a test sees each request validated as it was written.
+        state.jwt_cache = None;
+        state
     });
     let api: Router<Arc<AppState>> = Router::new()
         .route("/", any(handle_request))
@@ -187,8 +183,98 @@ async fn client_errors_log_at_debug_and_faults_at_error() {
     assert!(errors[1].contains("permission denied"), "{log}");
 
     let pool = sqlx::PgPool::connect(&database_url()).await.unwrap();
-    sqlx::query(&format!("DROP SCHEMA {SCHEMA} CASCADE"))
+    sqlx::query(AssertSqlSafe(format!("DROP SCHEMA {SCHEMA} CASCADE")))
         .execute(&pool)
+        .await
+        .unwrap();
+}
+
+/// A transaction that cannot be begun is answered as the server's fault, and
+/// the operator is told why.
+///
+/// The pool's one connection is held for the length of the request, so
+/// acquiring another times out. Before, nothing logged this at any level: the
+/// query's own logging is never reached when there is no transaction to run
+/// it in.
+///
+/// Not built with `pg-socket`: REST then runs on the Worker's driver, which
+/// opens a socket of its own per request and never draws on the pool held
+/// here, so the request is answered 200 -- there is no pool to run dry.
+#[cfg(not(feature = "pg-socket"))]
+#[tokio::test(flavor = "current_thread")]
+#[ignore = "requires PostgreSQL"]
+async fn a_pool_that_runs_dry_is_logged_at_error() {
+    // A schema of its own: the tests in this file run at once, and the other
+    // one drops and recreates its schema as it starts.
+    const DRY: &str = "query_error_logging_pool";
+    let setup = PgPoolOptions::new()
+        .max_connections(1)
+        .connect(&database_url())
+        .await
+        .expect("failed to connect to test database");
+    for statement in [
+        format!("DROP SCHEMA IF EXISTS {DRY} CASCADE"),
+        format!("CREATE SCHEMA {DRY}"),
+        format!("GRANT USAGE ON SCHEMA {DRY} TO web_anon"),
+        format!("CREATE TABLE {DRY}.items (id int PRIMARY KEY)"),
+        format!("GRANT SELECT ON {DRY}.items TO web_anon"),
+    ] {
+        sqlx::query(AssertSqlSafe(statement))
+            .execute(&setup)
+            .await
+            .unwrap();
+    }
+    setup.close().await;
+
+    let pool = PgPoolOptions::new()
+        .max_connections(1)
+        .acquire_timeout(std::time::Duration::from_millis(300))
+        .connect(&database_url())
+        .await
+        .expect("failed to connect to test database");
+    let mut config = AppConfig::default();
+    config.db_uri = database_url();
+    config.db_schemas = vec![DRY.to_string()];
+    config.db_anon_role = Some("web_anon".to_string());
+    let schema_cache = SchemaCache::load(&pool, &config.db_schemas)
+        .await
+        .expect("schema cache");
+    let held = pool.acquire().await.expect("the pool's one connection");
+    let state =
+        Arc::new(AppState::new(pool, schema_cache, config).expect("the test's JWT secret parses"));
+    let api: Router<Arc<AppState>> = Router::new()
+        .route("/", any(handle_request))
+        .route("/{*path}", any(handle_request));
+    let app = Router::new().nest("/api", api).with_state(state);
+
+    let captured = Captured::default();
+    let writer = captured.clone();
+    let subscriber = tracing_subscriber::fmt()
+        .with_max_level(tracing::Level::DEBUG)
+        .with_ansi(false)
+        .with_writer(move || writer.clone())
+        .finish();
+    let _guard = tracing::subscriber::set_default(subscriber);
+
+    assert_eq!(
+        get(&app, "/api/items").await,
+        StatusCode::INTERNAL_SERVER_ERROR
+    );
+    let log = captured.take();
+    let lines: Vec<&str> = log
+        .lines()
+        .filter(|l| l.contains("ERROR") && l.contains("Could not begin a transaction"))
+        .collect();
+    assert_eq!(lines.len(), 1, "{log}");
+
+    drop(held);
+    let cleanup = PgPoolOptions::new()
+        .max_connections(1)
+        .connect(&database_url())
+        .await
+        .expect("failed to connect to test database");
+    sqlx::query(AssertSqlSafe(format!("DROP SCHEMA {DRY} CASCADE")))
+        .execute(&cleanup)
         .await
         .unwrap();
 }
