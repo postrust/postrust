@@ -3,6 +3,51 @@
 Notable changes, newest first. This file starts at 1.0.0-alpha.1; earlier
 releases are described by their tags and the pull requests behind them.
 
+## 2.4.1
+
+A security release. Every deployment should upgrade. It fixes an SQL
+injection and a request that crashes the server, both reachable without a
+token, and hardens two related places. Details are in the repository's
+security advisories (https://github.com/postrust/postrust/security/advisories).
+No API change. `postrust-worker` moves to 1.0.1 for the same fixes.
+`postrust-proxy` is not part of this release and stays at 0.6.0.
+
+2.4.0 reached Docker Hub but not crates.io, because its publish step failed.
+For crates.io users this release therefore also brings everything listed under
+2.4.0.
+
+### Security
+
+- **A cast in `select` is a type name, and nothing more.** The type after
+  `::` (`?select=price::text`, `count()::text`, `amount.sum()::text`) was
+  written into the statement as the client sent it, and the parser accepted
+  spaces there. So words a client appended reached the database as SQL, run
+  as the request's role. A cast is now one type name -- letters, digits, `_`
+  and `$` -- or one of the SQL standard's multi-word names (`double
+  precision`, `character varying`, `bit varying`, `time[stamp] with[out] time
+  zone`), written in the standard's spelling. Anything else after `::` is
+  refused with 400 PGRST100. Every cast PostgREST accepts is still accepted.
+- **A `select` or logic filter nested more than 64 levels deep is refused.**
+  Both were parsed recursively with no limit, and one request nested a few
+  thousand levels deep, about 15 KB of query string, overflowed the stack. A
+  stack overflow aborts the whole process. Such a request is now refused with
+  400 PGRST100 before it is parsed. A parenthesis inside a quoted filter value
+  is not counted.
+- **Hand-quoted string literals no longer depend on
+  `standard_conforming_strings`.** JSON path keys (`data->key`) and the keys
+  GraphQL writes into `json_build_object` were quoted only by doubling `'`.
+  With `standard_conforming_strings = off`, set on a database, role or server,
+  a backslash in a key could end the literal early. `postrust_sql::quote_literal`,
+  which they now all use, writes a string that contains a backslash as
+  `E'...'`. Not exploitable on PostgreSQL's default settings.
+- **A role claim of `"none"` or `""` names no role.** The role is switched to
+  with `set_config('role', ...)`, and PostgreSQL reads `none` there as "no
+  role", so such a token ran its request as the authenticator. An empty role
+  was a 500. Both now fall back to the anonymous role, as a role claim that
+  is not a string already does, or are refused where there is no anonymous
+  role. This needs a validly signed token. A role actually named `None` or
+  `NONE` is unaffected.
+
 ## 2.4.0
 
 A minor release. GraphQL now follows a schema reload, a write a view cannot
