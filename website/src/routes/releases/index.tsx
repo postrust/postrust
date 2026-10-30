@@ -12,6 +12,21 @@ import { LATEST } from "~/data/version";
 
 const VERSION = "2.3.0";
 
+const security241 = [
+  {
+    title: "SQL injection through a cast in select",
+    body: "The type after :: in a select (?select=price::text) was written into the statement as the client sent it, and the parser accepted spaces there, so words a client appended reached the database as SQL, run as the request's role. A cast is now one type name, or one of the SQL standard's multi-word names such as double precision; anything else is a 400 PGRST100. Every cast PostgREST accepts is still accepted.",
+  },
+  {
+    title: "A deeply nested request no longer crashes the server",
+    body: "A select or an or=/and= filter nested a few thousand levels deep, about 15 KB of query string, overflowed the stack, and a stack overflow aborts the whole process. Nesting past 64 levels is now refused with 400 PGRST100 before it is parsed.",
+  },
+  {
+    title: "Hardening: string literals and the none role",
+    body: "JSON path keys, and the keys GraphQL writes into json_build_object, are written as E'...' when they contain a backslash, so they stay one literal even where standard_conforming_strings is off. A token whose role claim is \"none\" or empty names no role: PostgreSQL reads none as no role at all, which ran the request as the authenticator. Neither is reachable on default settings or without a signed token.",
+  },
+];
+
 const added240 = [
   {
     title: "GraphQL follows a schema reload",
@@ -120,17 +135,31 @@ export default component$(() => {
         <div class="container-wide py-12">
           <div class="mb-4 flex items-center gap-3">
             <span class="rounded border border-neutral-200 bg-neutral-100 px-2 py-0.5 text-xs font-semibold text-neutral-800">
-              MINOR
+              PATCH
             </span>
-            <span class="text-sm text-neutral-500">
-              GraphQL schema reload, 405s, security fixes
-            </span>
+            <span class="text-sm text-neutral-500">Security release</span>
           </div>
           <h1 class="mb-4 text-4xl font-bold text-neutral-900">
             Postrust {LATEST}
           </h1>
           <p class="mb-4 max-w-2xl text-lg text-neutral-600">
-            GraphQL now picks up a migration when it is announced with{" "}
+            A security release, and every deployment should upgrade. It fixes an
+            SQL injection through a cast in{" "}
+            <code class="text-base">select</code> and a deeply nested request
+            that crashes the server, both reachable without a token, and hardens
+            two related places. The{" "}
+            <a
+              href="https://github.com/postrust/postrust/security/advisories"
+              class="text-primary-600 hover:underline"
+            >
+              security advisories
+            </a>{" "}
+            have the details. No API change; the Cloudflare Workers adapter
+            moves to <code class="text-base">postrust-worker</code> 1.0.1 with
+            the same fixes.
+          </p>
+          <p class="mb-4 max-w-2xl text-lg text-neutral-600">
+            2.4.0: GraphQL now picks up a migration when it is announced with{" "}
             <code class="text-base">NOTIFY pgrst</code>, as REST always has. A
             write a view cannot take is answered 405 with{" "}
             <code class="text-base">Allow</code> rather than 500, and errors the
@@ -201,7 +230,34 @@ export default component$(() => {
 
           <section class="mb-12">
             <h2 class="mb-4 text-2xl font-bold text-neutral-900">
-              Added in {LATEST}
+              Security fixes in {LATEST}
+            </h2>
+            <div class="space-y-4">
+              {security241.map((c) => (
+                <div key={c.title} class="rounded-lg bg-neutral-50 p-4">
+                  <h3 class="mb-1 font-semibold text-neutral-900">{c.title}</h3>
+                  <p class="text-sm text-neutral-600">{c.body}</p>
+                </div>
+              ))}
+            </div>
+            <p class="mt-4 text-neutral-600">
+              <strong>Upgrading:</strong> nothing to change. A{" "}
+              <code class="font-mono text-sm">select</code> that casts to
+              something other than a type name, or nests more than 64 levels, is
+              now a 400. A token whose role is{" "}
+              <code class="font-mono text-sm">"none"</code> or empty runs as the
+              anonymous role. 2.4.0 never reached crates.io, so crates.io users
+              get its changes, below, with this release.
+            </p>
+          </section>
+
+          <h2 class="mb-8 text-3xl font-bold text-neutral-900">
+            Postrust 2.4.0
+          </h2>
+
+          <section class="mb-12">
+            <h2 class="mb-4 text-2xl font-bold text-neutral-900">
+              Added in 2.4.0
             </h2>
             <div class="space-y-4">
               {added240.map((c) => (
@@ -215,7 +271,7 @@ export default component$(() => {
 
           <section class="mb-12">
             <h2 class="mb-4 text-2xl font-bold text-neutral-900">
-              Fixed in {LATEST}
+              Fixed in 2.4.0
             </h2>
             <div class="space-y-4">
               {fixed240.map((c) => (
@@ -832,7 +888,7 @@ export const head: DocumentHead = {
   meta: [
     {
       name: "description",
-      content: `Postrust ${LATEST} rebuilds GraphQL on a schema reload, answers writes a view cannot take with 405, and updates five dependencies past RustSec advisories.`,
+      content: `Postrust ${LATEST} is a security release: it fixes an SQL injection through a cast in select and a deeply nested request that crashed the server.`,
     },
   ],
 };

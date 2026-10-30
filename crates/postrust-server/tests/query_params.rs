@@ -50,13 +50,20 @@ async fn build_app(max_rows: Option<i64>) -> Router {
 }
 
 async fn build_app_with(max_rows: Option<i64>, max_body_size: Option<usize>) -> Router {
-    let db_uri = database_url();
-
     let pool = PgPoolOptions::new()
         .max_connections(2)
-        .connect(&db_uri)
+        .connect(&database_url())
         .await
         .expect("failed to connect to test database");
+    build_app_on(pool, max_rows, max_body_size).await
+}
+
+async fn build_app_on(
+    pool: sqlx::PgPool,
+    max_rows: Option<i64>,
+    max_body_size: Option<usize>,
+) -> Router {
+    let db_uri = database_url();
 
     let mut config = AppConfig::default();
     config.db_uri = db_uri;
@@ -202,6 +209,92 @@ async fn select_rejects_unknown_column() {
         status,
         body
     );
+}
+
+/// A cast names a type and nothing else. Words after the type were written
+/// into the statement as they came: `id::text as rolname` renamed the column,
+/// and longer runs of words reached the database as SQL of the client's.
+#[tokio::test]
+#[ignore = "requires PostgreSQL"]
+async fn select_refuses_a_cast_that_is_not_a_type_name() {
+    for select in [
+        "id::text%20as%20rolname",
+        "id::text%20from%20pg_roles%20where%20true%20or%20true",
+        "count()::text%20as%20n",
+    ] {
+        let (status, body) = get(&format!("/api/products?select={select}")).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{select}: {body}");
+        assert_eq!(body["code"], "PGRST100", "{select}: {body}");
+    }
+
+    // A cast to a type still works, a multi-word one included.
+    let (status, body) = get("/api/products?select=id::text&limit=1").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(body[0]["id"].is_string(), "{body}");
+    let (status, body) = get("/api/products?select=id::double%20precision&limit=1").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+}
+
+/// A `select` or logic tree nested thousands deep is refused. Each level was
+/// a level of recursion, and a few thousand of them -- some 15 KB of query
+/// string, from anyone -- overflowed the stack and aborted the server.
+#[tokio::test]
+#[ignore = "requires PostgreSQL"]
+async fn deep_nesting_is_refused_rather_than_overflowing_the_stack() {
+    let depth = 5_000;
+    for uri in [
+        format!(
+            "/api/products?select={}id{}",
+            "a(".repeat(depth),
+            ")".repeat(depth)
+        ),
+        format!(
+            "/api/products?or=({}id.eq.1{})",
+            "or(".repeat(depth),
+            ")".repeat(depth)
+        ),
+    ] {
+        let (status, body) = get(&uri).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        assert_eq!(body["code"], "PGRST100", "{body}");
+    }
+}
+
+/// A JSON key is one string literal, even on a connection that reads `\'` as
+/// a quote. Without `standard_conforming_strings` the key below closed its
+/// literal early, and `--` commented out the rest of the statement.
+#[tokio::test]
+#[ignore = "requires PostgreSQL"]
+async fn a_json_key_stays_one_literal_without_standard_conforming_strings() {
+    let pool = PgPoolOptions::new()
+        .max_connections(2)
+        .after_connect(|conn, _| {
+            Box::pin(async move {
+                sqlx::query("SET standard_conforming_strings = off")
+                    .execute(&mut *conn)
+                    .await?;
+                Ok(())
+            })
+        })
+        .connect(&database_url())
+        .await
+        .unwrap();
+    let app = build_app_on(pool, None, None).await;
+
+    for uri in [
+        "/api/products?select=k:metadata-%3E%3Ea%5C%27%20OR%20true%20--&order=id&limit=1",
+        "/api/products?select=id&metadata-%3E%3Ea%5C%27%20OR%20true%20--=is.null&order=id&limit=1",
+    ] {
+        let request = Request::builder().uri(uri).body(Body::empty()).unwrap();
+        let response = app.clone().oneshot(request).await.unwrap();
+        let status = response.status();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body: Value = serde_json::from_slice(&body).unwrap_or(Value::Null);
+        assert_eq!(status, StatusCode::OK, "{uri}: {body}");
+        assert_eq!(body.as_array().map(Vec::len), Some(1), "{uri}: {body}");
+    }
 }
 
 // ===========================================================================
