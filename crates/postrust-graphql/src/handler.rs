@@ -3886,7 +3886,11 @@ async fn aggregate_value(
             false => vec!["'count', count(*)".to_string()],
         };
         for (key, expression) in &counts {
-            parts.push(format!("'{}', {}", key.replace('\'', "''"), expression));
+            parts.push(format!(
+                "{}, {}",
+                postrust_sql::quote_literal(key),
+                expression
+            ));
         }
         for (function, columns) in &wanted {
             // The function name comes from the schema, not from the request:
@@ -3908,8 +3912,8 @@ async fn aggregate_value(
                         .column_source(&spec.schema_name, &spec.table_name, field)
                         .unwrap_or(field);
                     format!(
-                        "'{}', {}({})",
-                        field.replace('\'', "''"),
+                        "{}, {}({})",
+                        postrust_sql::quote_literal(field),
                         sql_function,
                         postrust_sql::escape_ident(source)
                     )
@@ -4868,8 +4872,8 @@ fn row_json(expr: &str, column_types: &HashMap<String, String>) -> String {
                 // which a client round-tripping a shape needs in order to
                 // write it back where it came from. PostGIS emits it only
                 // where the geometry has an SRID to report.
-                "'{}', ST_AsGeoJSON({}.{}, 9, 4)::jsonb",
-                name.replace('\'', "''"),
+                "{}, ST_AsGeoJSON({}.{}, 9, 4)::jsonb",
+                postrust_sql::quote_literal(name),
                 expr,
                 postrust_sql::escape_ident(name)
             )
@@ -8753,7 +8757,11 @@ fn nested_aggregate_select(
                     false => vec!["'count', count(*)".to_string()],
                 };
                 for (key, expression) in &counts {
-                    fields.push(format!("'{}', {}", key.replace('\'', "''"), expression));
+                    fields.push(format!(
+                        "{}, {}",
+                        postrust_sql::quote_literal(key),
+                        expression
+                    ));
                 }
                 for (sql_function, named) in &wanted {
                     let columns: Vec<String> = named
@@ -8763,8 +8771,8 @@ fn nested_aggregate_select(
                                 .map(|table| table_column_for(names, table, column))
                                 .unwrap_or(column.as_str());
                             format!(
-                                "'{}', {}({}.{})",
-                                column.replace('\'', "''"),
+                                "{}, {}({}.{})",
+                                postrust_sql::quote_literal(column),
                                 sql_function,
                                 postrust_sql::escape_ident(child_alias),
                                 postrust_sql::escape_ident(source)
@@ -8810,13 +8818,17 @@ fn nested_aggregate_select(
                         continue;
                     }
                     columns.push(format!(
-                        "'{}', {}",
-                        name.replace('\'', "''"),
+                        "{}, {}",
+                        postrust_sql::quote_literal(name),
                         column_expression(child_table, child_alias, name, names)
                     ));
                 }
                 for (field, expression) in &embeds {
-                    columns.push(format!("'{}', {}", field.replace('\'', "''"), expression));
+                    columns.push(format!(
+                        "{}, {}",
+                        postrust_sql::quote_literal(field),
+                        expression
+                    ));
                 }
                 let row = if columns.is_empty() {
                     format!("row_to_json({})", postrust_sql::escape_ident(child_alias))

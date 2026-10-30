@@ -51,13 +51,20 @@ async fn build_app(max_rows: Option<i64>) -> Router {
 }
 
 async fn build_app_with(max_rows: Option<i64>, max_body_size: Option<usize>) -> Router {
-    let db_uri = database_url();
-
     let pool = PgPoolOptions::new()
         .max_connections(2)
-        .connect(&db_uri)
+        .connect(&database_url())
         .await
         .expect("failed to connect to test database");
+    build_app_on(pool, max_rows, max_body_size).await
+}
+
+async fn build_app_on(
+    pool: sqlx::PgPool,
+    max_rows: Option<i64>,
+    max_body_size: Option<usize>,
+) -> Router {
+    let db_uri = database_url();
 
     let mut config = AppConfig::default();
     config.db_uri = db_uri;
@@ -260,6 +267,43 @@ async fn deep_nesting_is_refused_rather_than_overflowing_the_stack() {
         let (status, body) = get(&uri).await;
         assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
         assert_eq!(body["code"], "PGRST100", "{body}");
+    }
+}
+
+/// A JSON key is one string literal, even on a connection that reads `\'` as
+/// a quote. Without `standard_conforming_strings` the key below closed its
+/// literal early, and `--` commented out the rest of the statement.
+#[tokio::test]
+#[ignore = "requires PostgreSQL"]
+async fn a_json_key_stays_one_literal_without_standard_conforming_strings() {
+    let pool = PgPoolOptions::new()
+        .max_connections(2)
+        .after_connect(|conn, _| {
+            Box::pin(async move {
+                sqlx::query("SET standard_conforming_strings = off")
+                    .execute(&mut *conn)
+                    .await?;
+                Ok(())
+            })
+        })
+        .connect(&database_url())
+        .await
+        .unwrap();
+    let app = build_app_on(pool, None, None).await;
+
+    for uri in [
+        "/api/products?select=k:metadata-%3E%3Ea%5C%27%20OR%20true%20--&order=id&limit=1",
+        "/api/products?select=id&metadata-%3E%3Ea%5C%27%20OR%20true%20--=is.null&order=id&limit=1",
+    ] {
+        let request = Request::builder().uri(uri).body(Body::empty()).unwrap();
+        let response = app.clone().oneshot(request).await.unwrap();
+        let status = response.status();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body: Value = serde_json::from_slice(&body).unwrap_or(Value::Null);
+        assert_eq!(status, StatusCode::OK, "{uri}: {body}");
+        assert_eq!(body.as_array().map(Vec::len), Some(1), "{uri}: {body}");
     }
 }
 

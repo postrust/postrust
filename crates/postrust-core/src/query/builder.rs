@@ -965,12 +965,6 @@ impl QueryBuilder {
 /// `character varying(255)`, or the `ARRAY`/`USER-DEFINED` placeholders that
 /// `information_schema` reports) yields `None` and the value is bound
 /// uncast, preserving the previous behaviour.
-/// Append a JSON path to a column reference: `"data" -> 'a' ->> 'b'`.
-///
-/// Keys are emitted as string literals and indices as bare integers, which is
-/// what distinguishes `data->'1'` from `data->1` in PostgreSQL. Operands reach
-/// us already restricted to alphanumerics and underscores by the parser; the
-/// quote doubling is belt-and-braces so this stays safe if that ever loosens.
 /// The column that says whether a row was created or merged into.
 pub const INSERTED_COLUMN: &str = "pgrst_inserted";
 
@@ -1234,6 +1228,13 @@ fn json_path_result_cast(path: &crate::api_request::JsonPath) -> Option<&'static
     }
 }
 
+/// Append a JSON path to a column reference: `"data" -> 'a' ->> 'b'`.
+///
+/// Keys are emitted as string literals and indices as bare integers, which is
+/// what distinguishes `data->'1'` from `data->1` in PostgreSQL. A key is
+/// whatever the client wrote up to the next `,`, `(`, `)`, `:` or arrow --
+/// quotes and backslashes included -- so it is written by `quote_literal`,
+/// which keeps it one literal whatever `standard_conforming_strings` is.
 fn push_json_path(frag: &mut SqlFragment, path: &crate::api_request::JsonPath) {
     use crate::api_request::{JsonOperand, JsonOperation};
 
@@ -1249,7 +1250,7 @@ fn push_json_path(frag: &mut SqlFragment, path: &crate::api_request::JsonPath) {
 
         match operand {
             JsonOperand::Key(key) => {
-                frag.push(&format!("'{}'", key.replace('\'', "''")));
+                frag.push(&postrust_sql::quote_literal(key));
             }
             JsonOperand::Idx(index) => {
                 frag.push(&index.to_string());

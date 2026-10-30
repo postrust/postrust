@@ -40,9 +40,21 @@ pub fn escape_ident(name: &str) -> String {
 ///
 /// assert_eq!(quote_literal("hello"), "'hello'");
 /// assert_eq!(quote_literal("it's"), "'it''s'");
+/// assert_eq!(quote_literal(r"a\b"), r"E'a\\b'");
 /// ```
+///
+/// A string with a backslash in it is written as an escape string, `E'...'`,
+/// with the backslash doubled. A plain `'...'` literal reads a backslash as
+/// itself only while `standard_conforming_strings` is on: a database, role or
+/// server that turns it off reads `\'` as a quote inside the literal, and the
+/// doubled quote after it ends the literal early. An escape string means the
+/// same under either setting.
 pub fn quote_literal(s: &str) -> String {
-    format!("'{}'", s.replace('\'', "''"))
+    let doubled = s.replace('\'', "''");
+    match s.contains('\\') {
+        true => format!("E'{}'", doubled.replace('\\', "\\\\")),
+        false => format!("'{}'", doubled),
+    }
 }
 
 /// Qualified identifier (schema.name).
@@ -208,6 +220,9 @@ mod tests {
         assert_eq!(quote_literal("hello"), "'hello'");
         assert_eq!(quote_literal("it's"), "'it''s'");
         assert_eq!(quote_literal(""), "''");
+        // Whatever `standard_conforming_strings` is.
+        assert_eq!(quote_literal(r"\"), r"E'\\'");
+        assert_eq!(quote_literal(r"\' OR true --"), r"E'\\'' OR true --'");
     }
 
     #[test]
