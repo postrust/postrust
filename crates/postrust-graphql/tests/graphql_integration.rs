@@ -3049,3 +3049,316 @@ async fn execute_as_err(
         .collect::<Vec<_>>()
         .join("; ")
 }
+
+/// Execute a GraphQL document on `pool` in a context of the caller's making,
+/// settling its writes as the server does.
+async fn execute_in(
+    state: &Arc<GraphQLState>,
+    pool: &PgPool,
+    ctx: GraphQLContext,
+    query: &str,
+) -> async_graphql::Response {
+    let write: postrust_graphql::context::SharedWrite = Default::default();
+    let ctx = ctx.with_write(Arc::clone(&write));
+    let response = state
+        .schema
+        .execute(Request::new(query).data(ctx).data(pool.clone()))
+        .await;
+    if let Some(tx) = write.lock().await.take() {
+        if response.errors.is_empty() {
+            tx.commit().await.expect("the write could not be committed");
+        } else {
+            tx.rollback().await.expect("the write could not be undone");
+        }
+    }
+    response
+}
+
+/// A role's own `statement_timeout` holds for a GraphQL query, as it does for
+/// a REST request: the transaction is set up by the same `Session`. It did
+/// not before -- GraphQL set the role and the session variables and nothing
+/// else -- so a role an operator had limited could run as long as it liked
+/// here.
+///
+/// The same query, under the same configuration, as a role with no setting
+/// of its own, is the control: what stops the query is the role's setting
+/// and not the query.
+#[tokio::test]
+#[ignore = "requires PostgreSQL"]
+async fn a_roles_statement_timeout_applies_to_a_graphql_query() {
+    let pool = connect().await;
+    let schema = unique_schema_name("roletimeout");
+    let limited = format!("{schema}_limited");
+
+    drop_schema(&pool, &schema).await;
+    pool.execute(format!("DROP ROLE IF EXISTS {limited}").as_str())
+        .await
+        .expect("failed to drop a stale role");
+    pool.execute(
+        format!(
+            "CREATE ROLE {limited} NOLOGIN;
+             CREATE SCHEMA {schema};
+             CREATE TABLE {schema}.ticks (id integer PRIMARY KEY);
+             INSERT INTO {schema}.ticks VALUES (1);
+             -- Half a second of sleep, once, whoever reads it.
+             CREATE VIEW {schema}.slow_ticks AS
+                 SELECT id FROM {schema}.ticks WHERE (SELECT true FROM pg_sleep(0.5));
+             GRANT USAGE ON SCHEMA {schema} TO {limited};
+             GRANT SELECT ON ALL TABLES IN SCHEMA {schema} TO {limited};"
+        )
+        .as_str(),
+    )
+    .await
+    .expect("failed to create the timeout fixture");
+
+    let state = build_state(&pool, &schema, None, false).await;
+    let mut config = postrust_core::AppConfig::default();
+    let mut settings = postrust_core::config::RoleSettings::default();
+    settings.statement_timeout = Some(50);
+    config.role_settings.insert(limited.clone(), settings);
+    let config = Arc::new(config);
+
+    let run_as = |role: &str| {
+        let role = role.to_string();
+        let state = Arc::clone(&state);
+        let pool = pool.clone();
+        let config = Arc::clone(&config);
+        let schema = schema.clone();
+        async move {
+            let cache = SchemaCache::load(&pool, &[schema])
+                .await
+                .expect("failed to load schema cache");
+            let ctx = GraphQLContext::new(
+                pool.clone(),
+                SchemaCacheRef::from_static(cache),
+                AuthResult {
+                    role,
+                    claims: HashMap::new(),
+                },
+            )
+            .with_config(config);
+            execute_in(&state, &pool, ctx, "{ slow_ticks { id } }").await
+        }
+    };
+    let limited_response = run_as(&limited).await;
+    let unlimited_response = run_as(TEST_ROLE).await;
+
+    drop(state);
+    drop_schema(&pool, &schema).await;
+    pool.execute(format!("DROP ROLE {limited}").as_str())
+        .await
+        .expect("failed to drop the role");
+
+    let messages = limited_response
+        .errors
+        .iter()
+        .map(|e| e.message.clone())
+        .collect::<Vec<_>>()
+        .join("; ");
+    assert!(
+        messages.contains("statement timeout"),
+        "the role's statement_timeout did not stop the query: {messages:?}, data {:?}",
+        limited_response.data
+    );
+    assert!(
+        unlimited_response.errors.is_empty(),
+        "a role with no timeout of its own was stopped: {:?}",
+        unlimited_response.errors
+    );
+    assert_eq!(
+        serde_json::to_value(unlimited_response.data).unwrap(),
+        serde_json::json!({"slow_ticks": [{"id": 1}]})
+    );
+}
+
+/// Through a `NOINHERIT` authenticator -- the setup PostgREST recommends,
+/// where the login role holds nothing until it becomes another -- a query and
+/// a mutation each run as the token's database role, never as the Hasura role
+/// the caller speaks as, and both a policy and a function read the `hasura.*`
+/// session variables and the verified claims.
+///
+/// The session now sets the role inside its one `set_config` statement,
+/// before the claims and the `hasura.*` variables rather than after them as
+/// `SET LOCAL ROLE` used to come. This is what says that order still works
+/// for a role that may do nothing but become another: every setting after
+/// the role is one any role may set on itself. And once the operation is
+/// over, the authenticator's pooled connection is its own again.
+#[tokio::test]
+#[ignore = "requires PostgreSQL"]
+async fn the_session_reaches_policies_and_functions_through_a_noinherit_authenticator() {
+    use sqlx::postgres::PgConnectOptions;
+    use std::str::FromStr;
+
+    let admin = connect().await;
+    let schema = unique_schema_name("gqlsession");
+    let reader = format!("{schema}_reader");
+    let authenticator = format!("{schema}_auth");
+    let password = "postrust_test_gql_session";
+
+    drop_schema(&admin, &schema).await;
+    for role in [&authenticator, &reader] {
+        admin
+            .execute(format!("DROP ROLE IF EXISTS {role}").as_str())
+            .await
+            .expect("failed to drop a stale role");
+    }
+    admin
+        .execute(
+            format!(
+                "CREATE ROLE {reader} NOLOGIN;
+                 CREATE ROLE {authenticator} LOGIN NOINHERIT PASSWORD '{password}';
+                 GRANT {reader} TO {authenticator};
+                 CREATE SCHEMA {schema};
+                 CREATE TABLE {schema}.notes (
+                     id integer PRIMARY KEY,
+                     owner text NOT NULL,
+                     body text NOT NULL
+                 );
+                 INSERT INTO {schema}.notes VALUES
+                     (1, 'user-one', 'mine'),
+                     (2, 'user-two', 'theirs');
+                 ALTER TABLE {schema}.notes ENABLE ROW LEVEL SECURITY;
+                 CREATE POLICY notes_owner ON {schema}.notes TO {reader}
+                     USING (owner = current_setting('hasura.user_id', true))
+                     WITH CHECK (owner = current_setting('hasura.user_id', true));
+                 -- A computed field, so the function runs inside the
+                 -- transaction the session set up.
+                 CREATE FUNCTION {schema}.seen_as(note_row {schema}.notes)
+                 RETURNS text LANGUAGE sql STABLE AS $$
+                     SELECT concat_ws('|',
+                         current_user,
+                         current_setting('hasura.user_id', true),
+                         current_setting('hasura.role', true),
+                         current_setting('hasura.session', true)::json->>'x-hasura-user-id',
+                         current_setting('request.jwt.claims', true)::json->>'sub',
+                         current_setting('request.jwt.claims.sub', true))
+                 $$;
+                 GRANT USAGE ON SCHEMA {schema} TO {reader};
+                 GRANT SELECT, INSERT ON {schema}.notes TO {reader};"
+            )
+            .as_str(),
+        )
+        .await
+        .expect("failed to create the session fixture");
+
+    // The schema is read by the superuser; the operations go through the
+    // authenticator, on one connection so the last check below is on the
+    // connection the operations used.
+    let state = build_state(&admin, &schema, None, false).await;
+    let options = PgConnectOptions::from_str(&database_url())
+        .expect("DATABASE_URL parses")
+        .username(&authenticator)
+        .password(password);
+    let through = PgPoolOptions::new()
+        .max_connections(1)
+        .connect_with(options)
+        .await
+        .expect("the authenticator could not log in");
+
+    let context = || {
+        let schema = schema.clone();
+        let admin = admin.clone();
+        let through = through.clone();
+        let reader = reader.clone();
+        async move {
+            let cache = SchemaCache::load(&admin, &[schema])
+                .await
+                .expect("failed to load schema cache");
+            let mut claims = HashMap::new();
+            claims.insert("role".to_string(), serde_json::json!(reader));
+            claims.insert("sub".to_string(), serde_json::json!("alice"));
+            let mut session = HashMap::new();
+            session.insert("user_id".to_string(), "user-one".to_string());
+            GraphQLContext::new(
+                through,
+                SchemaCacheRef::from_static(cache),
+                AuthResult {
+                    role: reader,
+                    claims,
+                },
+            )
+            .with_session(session)
+            // An administrator asking to be answered with the session
+            // above: `admin` is a Hasura role, not a database one, and has to
+            // reach the function as `hasura.role` while the transaction runs
+            // as the token's role.
+            .with_identity(Some("admin".to_string()), true)
+        }
+    };
+
+    let read = execute_in(
+        &state,
+        &through,
+        context().await,
+        "{ notes(order_by: [{id: asc}]) { id seen_as } }",
+    )
+    .await;
+    let written = execute_in(
+        &state,
+        &through,
+        context().await,
+        "mutation { insert_notes_one(object: {id: 3, owner: \"user-one\", body: \"new\"}) \
+         { id seen_as } }",
+    )
+    .await;
+    let refused = execute_in(
+        &state,
+        &through,
+        context().await,
+        "mutation { insert_notes_one(object: {id: 4, owner: \"user-two\", body: \"no\"}) \
+         { id } }",
+    )
+    .await;
+    let (user, left_behind): (String, Option<String>) = sqlx::query_as(
+        "SELECT current_user::text, nullif(current_setting('hasura.user_id', true), '')",
+    )
+    .fetch_one(&through)
+    .await
+    .expect("the authenticator's connection answers");
+    let stored: Vec<i32> =
+        sqlx::query_scalar(&format!("SELECT id FROM {schema}.notes ORDER BY id"))
+            .fetch_all(&admin)
+            .await
+            .expect("the notes can be read");
+
+    through.close().await;
+    drop(state);
+    drop_schema(&admin, &schema).await;
+    for role in [&authenticator, &reader] {
+        admin
+            .execute(format!("DROP ROLE {role}").as_str())
+            .await
+            .expect("failed to drop a role");
+    }
+
+    let seen = format!("{reader}|user-one|admin|user-one|alice|alice");
+    assert!(read.errors.is_empty(), "{:?}", read.errors);
+    assert_eq!(
+        serde_json::to_value(read.data).unwrap(),
+        serde_json::json!({"notes": [{"id": 1, "seen_as": seen}]}),
+        "the policy narrows to the session's user, and the function sees the database \
+         role, the hasura.* variables and the claims"
+    );
+    assert!(written.errors.is_empty(), "{:?}", written.errors);
+    assert_eq!(
+        serde_json::to_value(written.data).unwrap(),
+        serde_json::json!({"insert_notes_one": {"id": 3, "seen_as": seen}}),
+        "a mutation's shared transaction is set up the same way"
+    );
+    let refusal = refused
+        .errors
+        .iter()
+        .map(|e| e.message.clone())
+        .collect::<Vec<_>>()
+        .join("; ");
+    assert!(
+        refusal.contains("row-level security"),
+        "the policy's check reads hasura.user_id inside the write: {refusal:?}"
+    );
+    assert_eq!(stored, vec![1, 2, 3], "the refused row was not written");
+    assert_eq!(
+        (user.as_str(), left_behind),
+        (authenticator.as_str(), None),
+        "the role and the session variables ended with their transactions"
+    );
+}

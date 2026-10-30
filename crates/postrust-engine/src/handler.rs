@@ -785,10 +785,7 @@ async fn execute_plan<'s, S: State>(
             };
 
             // Build SQL
-            let query = postrust_core::query::build_query(
-                &ActionPlan::Db(db_plan.clone()),
-                Some(&auth.role),
-            )?;
+            let query = postrust_core::query::build_query(&ActionPlan::Db(db_plan.clone()))?;
 
             if !query.has_main() {
                 return Ok((QueryResult::default(), None));
@@ -802,7 +799,7 @@ async fn execute_plan<'s, S: State>(
             // placeholders and their numbering untouched and the count query
             // can be bound with the very same parameters.
             let mut count_sql = match api_request.preferences.count {
-                Some(_) => unpaged_sql(db_plan, &auth.role)?,
+                Some(_) => unpaged_sql(db_plan)?,
                 None => None,
             };
 
@@ -927,10 +924,9 @@ async fn execute_plan<'s, S: State>(
                     if let DbActionPlan::Read(tree) = db_plan {
                         let mut unpaged = tree.clone();
                         page = Some(std::mem::take(&mut unpaged.root.range));
-                        sql = postrust_core::query::build_query(
-                            &ActionPlan::Db(DbActionPlan::Read(unpaged)),
-                            Some(&auth.role),
-                        )?
+                        sql = postrust_core::query::build_query(&ActionPlan::Db(
+                            DbActionPlan::Read(unpaged),
+                        ))?
                         .build_main()
                         .0;
                     }
@@ -2088,7 +2084,6 @@ fn is_read_only(api_request: &ApiRequest) -> bool {
 /// rows it affected, which is the result set itself.
 fn unpaged_sql(
     db_plan: &postrust_core::plan::DbActionPlan,
-    role: &str,
 ) -> Result<Option<String>, postrust_core::Error> {
     use postrust_core::plan::{ActionPlan, DbActionPlan};
 
@@ -2112,7 +2107,7 @@ fn unpaged_sql(
         DbActionPlan::MutateRead { .. } => return Ok(None),
     };
 
-    let query = postrust_core::query::build_query(&ActionPlan::Db(unpaged), Some(role))?;
+    let query = postrust_core::query::build_query(&ActionPlan::Db(unpaged))?;
     Ok(query.has_main().then(|| query.build_main().0))
 }
 

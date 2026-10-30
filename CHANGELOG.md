@@ -27,6 +27,39 @@ minimum supported Rust version are unchanged.
   which has no start-up, each request is answered PGRST901 until it is fixed.
 - A token whose header does not parse is PGRST301 ("No suitable key or wrong
   key type"), not PGRST303.
+- **GraphQL transactions are set up as REST's are.** Each one -- a query, an
+  aggregate, a federated entity lookup, a subscription's re-read, and the
+  transaction a mutation's writes share -- now starts with the same
+  `postrust_core::Session` statements a REST request does, rather than with
+  GraphQL's own `set_config` and `SET LOCAL ROLE`. The role is still the
+  token's database role, never the Hasura role, and the `hasura.*` session
+  variables and `request.jwt.claims*` are still set. What GraphQL now gets
+  that it did not:
+  - a role's own `statement_timeout` and isolation level from
+    `PGRST_ROLE_SETTINGS`, and the server-wide `PGRST_DB_TX_ISOLATION`. A
+    GraphQL operation as a role limited to 5 seconds is cancelled after 5
+    seconds, as a REST request is;
+  - a `search_path` of the default schema then `PGRST_DB_EXTRA_SEARCH_PATH`,
+    where it used to run with whatever the connection had -- usually
+    `"$user", public` from the database's own default. Every table GraphQL
+    reads it names with its schema, so this decides only what an unqualified
+    name inside a function or a policy resolves to, and where PostGIS is
+    found: an extension installed outside `public` has to be in
+    `PGRST_DB_EXTRA_SEARCH_PATH`, as it already had to be for REST;
+  - `app.settings.*` from `PGRST_APP_SETTINGS_<NAME>`.
+
+  Unchanged: GraphQL does not call `PGRST_DB_PRE_REQUEST`, sets no
+  `request.method`, `request.path`, `request.headers` or `request.cookies`,
+  and does not run a query in a read-only transaction.
+- **`postrust_core::query::build_query` takes the plan alone**, and
+  `MainQuery.pre_statements` is gone. It held a `SET LOCAL ROLE` that nothing
+  had sent since the role moved into the session's `set_config`; the role is
+  a `Session`'s now and nowhere else.
+- **`GraphQLContext::session_settings` is replaced by
+  `GraphQLContext::session`**, which returns the `Session` its transactions
+  are set up by, and `GraphQLContext` has a `config` field, set with
+  `with_config`. A context built without one is set up from
+  `AppConfig::default()`.
 
 ### Added
 
@@ -80,6 +113,15 @@ token validated sets `state.jwt_cache = None`. Replace a `JwtConfig { .. }` with
 `postrust_engine::jwt_config(&config)?`, or with `JwtConfig::default()` and
 assignments; `secret` is now `keys`, built with `JwtKeys::from_config`. Both
 constructors fail only when the JWT secret does not parse.
+
+A GraphQL deployment that relied on the connection's own `search_path` --
+PostGIS or another extension in a schema that is neither `public` nor in
+`PGRST_DB_EXTRA_SEARCH_PATH` -- should add that schema to
+`PGRST_DB_EXTRA_SEARCH_PATH`. A role in `PGRST_ROLE_SETTINGS` whose
+`statement_timeout` was written with only REST in mind now limits its GraphQL
+operations too. Code that called `build_query(&plan, role)` drops the role;
+code embedding the GraphQL handler passes its configuration with
+`GraphQLContext::with_config`.
 
 ## 2.4.0
 

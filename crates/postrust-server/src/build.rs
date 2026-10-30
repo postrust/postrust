@@ -553,6 +553,11 @@ async fn assemble(config: postrust_core::AppConfig, host: Host, nests: Nests) ->
                 /// surface it is presented to.
                 rest: Arc<AppState>,
                 hasura_auth: postrust_auth::HasuraAuthConfig,
+                /// REST's configuration, shared by every operation's context:
+                /// a GraphQL transaction is set up from it as a REST one is.
+                /// One copy for the server's life, since the configuration is
+                /// read once at start-up and never changes under it.
+                config: Arc<postrust_core::AppConfig>,
             }
 
             impl GraphQLAppState {
@@ -573,6 +578,7 @@ async fn assemble(config: postrust_core::AppConfig, host: Host, nests: Nests) ->
                     admin_secret: config.hasura_admin_secret.clone(),
                     unauthorized_role: config.hasura_unauthorized_role.clone(),
                 },
+                config: Arc::new(state.config.clone()),
             };
 
             // Wrapper handler that creates context from request with proper auth
@@ -874,7 +880,8 @@ async fn assemble(config: postrust_core::AppConfig, host: Host, nests: Nests) ->
                 )
                 .with_session(session)
                 .with_identity(hasura_role.clone(), elevated)
-                .with_write(Arc::clone(&write));
+                .with_write(Arc::clone(&write))
+                .with_config(Arc::clone(&app_state.config));
 
                 // A role may be told it cannot read the schema as data. Not a
                 // permission on a table, so it is not settled by which schema

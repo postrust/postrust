@@ -411,7 +411,9 @@ PGRST_ROLE_SETTINGS='{"web_user":{"isolation_level":"serializable","statement_ti
 
 `isolation_level` takes the same spellings as `PGRST_DB_TX_ISOLATION` and
 overrides it for that role. `statement_timeout` is in milliseconds and is
-applied as a `SET LOCAL` on the request's transaction.
+applied as a `SET LOCAL` on the request's transaction. Both apply to GraphQL
+operations as they do to REST requests: a GraphQL transaction is set up the
+same way, from the token's database role.
 
 JSON rather than one variable per role, because a PostgreSQL role name may hold
 characters an environment variable name cannot. A value that does not parse is
