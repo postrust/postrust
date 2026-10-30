@@ -108,6 +108,18 @@ impl HealthChecker {
         self.health.insert(id, BackendHealth::default());
     }
 
+    /// Mark a backend unhealthy without running a check.
+    #[cfg(test)]
+    pub(crate) fn mark_unhealthy_for_test(&self, backend_id: Uuid) {
+        self.health.insert(
+            backend_id,
+            BackendHealth {
+                is_healthy: false,
+                ..BackendHealth::default()
+            },
+        );
+    }
+
     /// Unregister a backend.
     pub fn unregister_backend(&self, backend_id: Uuid) {
         self.backends.remove(&backend_id);

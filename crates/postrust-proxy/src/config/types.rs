@@ -9,6 +9,7 @@ use uuid::Uuid;
 
 /// Main proxy configuration.
 #[derive(Clone, Debug, Serialize, Deserialize, Default)]
+#[non_exhaustive]
 pub struct ProxyConfig {
     /// Server settings
     #[serde(default)]
@@ -33,6 +34,7 @@ pub struct ProxyConfig {
 
 /// Server configuration.
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct ServerConfig {
     /// Listen address for HTTP
     #[serde(default = "default_http_host")]
@@ -70,6 +72,82 @@ pub struct ServerConfig {
 
     /// Config file path (for file-based bootstrap)
     pub config_file: Option<String>,
+
+    /// Most client connections served at once, across every listener.
+    ///
+    /// Each connection costs a socket, a task and buffers, and an upstream
+    /// socket besides; without a cap, a client that opens connections faster
+    /// than they close runs the process out of file descriptors and everyone
+    /// else is refused along with it. At the cap the proxy stops accepting, so
+    /// further connections wait in the kernel's backlog instead of failing.
+    /// An upgraded tunnel holds its slot for as long as it is open.
+    #[serde(default = "default_max_connections")]
+    pub max_connections: usize,
+
+    /// How long a client has to send a complete HTTP/1 request head.
+    ///
+    /// Counted from when the proxy starts waiting for a request, so it also
+    /// bounds the wait for the next request on a kept-alive connection. This
+    /// is what stops a client trickling one header line at a time from holding
+    /// a connection open indefinitely.
+    #[serde(default = "default_header_read_timeout_secs")]
+    pub header_read_timeout_secs: u64,
+
+    /// How long a connection may sit with no request in flight before it is
+    /// closed, for every protocol.
+    ///
+    /// Covers what the header timeout cannot: a connection that sends nothing
+    /// at all (the cleartext port has to read the first bytes before it knows
+    /// whether to speak HTTP/1 or HTTP/2), a TLS handshake that never
+    /// finishes, and an HTTP/2 connection with no open streams.
+    #[serde(default = "default_idle_timeout_secs")]
+    pub idle_timeout_secs: u64,
+
+    /// Interval between HTTP/2 keep-alive PINGs. `0` disables them.
+    ///
+    /// A peer that vanishes without closing leaves an HTTP/2 connection, and
+    /// every stream on it, open until something notices; the PING is what
+    /// notices.
+    #[serde(default = "default_http2_keepalive_interval_secs")]
+    pub http2_keepalive_interval_secs: u64,
+
+    /// How long to wait for a PING to be acknowledged before closing the
+    /// connection.
+    #[serde(default = "default_http2_keepalive_timeout_secs")]
+    pub http2_keepalive_timeout_secs: u64,
+
+    /// How long an upgraded tunnel (WebSocket) may pass no bytes in either
+    /// direction before it is closed.
+    ///
+    /// Longer than the connection idle timeout because a WebSocket is
+    /// expected to sit quiet between messages; most clients and servers ping
+    /// well within this.
+    #[serde(default = "default_tunnel_idle_timeout_secs")]
+    pub tunnel_idle_timeout_secs: u64,
+
+    /// Protocols a client may upgrade to, by HTTP/1.1 `Upgrade` or HTTP/2
+    /// extended CONNECT (`:protocol`). Compared case-insensitively.
+    ///
+    /// An upgrade turns the connection into an opaque tunnel to the backend,
+    /// and a tunnel is not subject to routing: once `Upgrade: h2c` had been
+    /// tunnelled, the client could send the backend any request on any path,
+    /// past every route's method and path rules. So only protocols that are
+    /// known to be safe to splice are allowed. A request asking for anything
+    /// else is forwarded as an ordinary request with the upgrade removed,
+    /// which RFC 9110 section 7.8 permits a server to do.
+    #[serde(default = "default_allowed_upgrade_protocols")]
+    pub allowed_upgrade_protocols: Vec<String>,
+
+    /// Trust the `X-Forwarded-*` and `Forwarded` headers a client sends.
+    ///
+    /// Off by default: the proxy is then the first hop, anything a client says
+    /// about where it came from is a claim it made up, and the headers are
+    /// overwritten with what the proxy itself saw. Turn it on only when every
+    /// connection reaches this proxy through another proxy you control, which
+    /// sets those headers itself; the client's chain is then kept and this
+    /// hop appended to it.
+    #[serde(default)]
+    pub trust_forwarded_headers: bool,
 }
 
 impl Default for ServerConfig {
@@ -83,12 +161,21 @@ impl Default for ServerConfig {
             https_enabled: false,
             database_config: true,
             config_file: None,
+            max_connections: default_max_connections(),
+            header_read_timeout_secs: default_header_read_timeout_secs(),
+            idle_timeout_secs: default_idle_timeout_secs(),
+            http2_keepalive_interval_secs: default_http2_keepalive_interval_secs(),
+            http2_keepalive_timeout_secs: default_http2_keepalive_timeout_secs(),
+            tunnel_idle_timeout_secs: default_tunnel_idle_timeout_secs(),
+            allowed_upgrade_protocols: default_allowed_upgrade_protocols(),
+            trust_forwarded_headers: false,
         }
     }
 }
 
 /// TLS configuration.
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct TlsConfig {
     /// Enable ACME (Let's Encrypt)
     #[serde(default)]
@@ -156,6 +243,7 @@ impl Default for TlsConfig {
 
 /// Default rate limiting settings.
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct RateLimitDefaults {
     /// Default requests per window
     #[serde(default = "default_rate_limit_requests")]
@@ -168,6 +256,16 @@ pub struct RateLimitDefaults {
     /// Burst allowance
     #[serde(default = "default_burst")]
     pub burst: u32,
+
+    /// Most clients (keys) tracked at once across every rate limit.
+    ///
+    /// Each distinct client costs an entry, and clients are cheap to invent --
+    /// an IPv6 attacker has more addresses than the proxy has memory. At the
+    /// cap, entries that have refilled completely are dropped (they say
+    /// nothing a fresh entry would not), and if that frees nothing, a new
+    /// client is refused rather than let through untracked.
+    #[serde(default = "default_max_tracked_keys")]
+    pub max_tracked_keys: usize,
 }
 
 impl Default for RateLimitDefaults {
@@ -176,6 +274,7 @@ impl Default for RateLimitDefaults {
             requests: default_rate_limit_requests(),
             window_secs: default_rate_limit_window(),
             burst: default_burst(),
+            max_tracked_keys: default_max_tracked_keys(),
         }
     }
 }
@@ -352,7 +451,7 @@ impl RouteMatch {
             return true;
         };
         match self.path_type {
-            PathMatchType::Prefix => path.starts_with(pattern),
+            PathMatchType::Prefix => path_has_prefix(path, pattern),
             PathMatchType::Exact => path == pattern,
             PathMatchType::Regex => match compiled_regex(pattern) {
                 Some(re) => re.is_match(path),
@@ -378,6 +477,23 @@ impl RouteMatch {
                 .and_then(|value| value.to_str().ok())
                 .is_some_and(|value| value == expected)
         })
+    }
+}
+
+/// Whether `path` is `prefix` or lies beneath it, on a segment boundary.
+///
+/// A raw `starts_with` let `/public` catch `/publicity` and `/public-admin`,
+/// which are different resources that merely share letters. So `/public`
+/// matches `/public` and `/public/...` and nothing else. A prefix written with
+/// a trailing slash already ends on a boundary and keeps its literal meaning:
+/// `/public/` matches `/public/x` but not `/public`.
+pub fn path_has_prefix(path: &str, prefix: &str) -> bool {
+    if prefix.is_empty() || prefix.ends_with('/') {
+        return path.starts_with(prefix);
+    }
+    match path.strip_prefix(prefix) {
+        Some(rest) => rest.is_empty() || rest.starts_with('/'),
+        None => false,
     }
 }
 
@@ -526,6 +642,7 @@ pub enum UpstreamHttpVersion {
 
 /// Health check configuration.
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct HealthCheckConfig {
     /// Health check enabled
     #[serde(default = "default_true")]
@@ -595,6 +712,30 @@ fn default_rate_limit_window() -> u32 {
 }
 fn default_burst() -> u32 {
     50
+}
+fn default_max_tracked_keys() -> usize {
+    100_000
+}
+fn default_max_connections() -> usize {
+    10_000
+}
+fn default_header_read_timeout_secs() -> u64 {
+    30
+}
+fn default_idle_timeout_secs() -> u64 {
+    60
+}
+fn default_http2_keepalive_interval_secs() -> u64 {
+    20
+}
+fn default_http2_keepalive_timeout_secs() -> u64 {
+    20
+}
+fn default_tunnel_idle_timeout_secs() -> u64 {
+    300
+}
+fn default_allowed_upgrade_protocols() -> Vec<String> {
+    vec!["websocket".into()]
 }
 fn default_priority() -> i32 {
     100
@@ -679,6 +820,55 @@ mod upstream_version_tests {
         assert!(m.matches("h", "/v1", "GET", &HeaderMap::new()));
         assert!(m.matches("h", "/v1/users", "GET", &HeaderMap::new()));
         assert!(!m.matches("h", "/v2", "GET", &HeaderMap::new()));
+    }
+
+    #[test]
+    fn a_prefix_matches_on_segment_boundaries_only() {
+        // `/public` used to catch `/publicity`: a different resource that
+        // happens to share its first letters.
+        let m = RouteMatch {
+            path: Some("/public".into()),
+            ..any()
+        };
+        assert!(m.matches("h", "/public", "GET", &HeaderMap::new()));
+        assert!(m.matches("h", "/public/", "GET", &HeaderMap::new()));
+        assert!(m.matches("h", "/public/a/b", "GET", &HeaderMap::new()));
+        assert!(!m.matches("h", "/publicity", "GET", &HeaderMap::new()));
+        assert!(!m.matches("h", "/public-admin", "GET", &HeaderMap::new()));
+        assert!(!m.matches("h", "/publi", "GET", &HeaderMap::new()));
+    }
+
+    #[test]
+    fn a_prefix_with_a_trailing_slash_keeps_its_meaning() {
+        let m = RouteMatch {
+            path: Some("/public/".into()),
+            ..any()
+        };
+        assert!(m.matches("h", "/public/", "GET", &HeaderMap::new()));
+        assert!(m.matches("h", "/public/x", "GET", &HeaderMap::new()));
+        assert!(!m.matches("h", "/public", "GET", &HeaderMap::new()));
+
+        let root = RouteMatch {
+            path: Some("/".into()),
+            ..any()
+        };
+        assert!(root.matches("h", "/", "GET", &HeaderMap::new()));
+        assert!(root.matches("h", "/anything/at/all", "GET", &HeaderMap::new()));
+    }
+
+    #[test]
+    fn the_new_server_settings_have_defaults() {
+        // An existing config file names none of them and must keep loading.
+        let server: ServerConfig = toml::from_str("http_port = 8080").unwrap();
+        assert_eq!(server.max_connections, 10_000);
+        assert_eq!(server.header_read_timeout_secs, 30);
+        assert_eq!(server.idle_timeout_secs, 60);
+        assert_eq!(server.tunnel_idle_timeout_secs, 300);
+        assert_eq!(server.allowed_upgrade_protocols, vec!["websocket"]);
+        assert!(!server.trust_forwarded_headers);
+
+        let limits: RateLimitDefaults = toml::from_str("requests = 10").unwrap();
+        assert_eq!(limits.max_tracked_keys, 100_000);
     }
 
     #[test]

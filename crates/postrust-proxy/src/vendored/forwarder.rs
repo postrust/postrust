@@ -3,6 +3,7 @@
 //! This module handles forwarding requests to upstream backends.
 
 use crate::config::{Backend, UpstreamHttpVersion};
+use crate::vendored::conn::InFlight;
 use crate::vendored::hyper_ext::{empty_body, IncomingBodyExt, ProxyBody};
 use crate::vendored::types::ProxyError;
 use base64::Engine;
@@ -14,7 +15,7 @@ use hyper_util::rt::TokioExecutor as HyperTokioExecutor;
 use hyper_util::rt::TokioIo;
 use rand::RngCore;
 use std::time::Duration;
-use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tracing::debug;
 
@@ -105,16 +106,25 @@ impl ForwarderClient {
     /// backend directly, keep the lower-level connection, and splice the two
     /// upgraded halves together.
     ///
-    /// HTTP/1.1 only. WebSocket over HTTP/2 is RFC 8441 extended CONNECT, a
-    /// different mechanism that this does not implement.
+    /// HTTP/1.1 only; [`Self::forward_h2_websocket`] is the HTTP/2 spelling.
+    ///
+    /// Which protocols may be upgraded to is the caller's decision, made
+    /// before this is called: this tunnels whatever `Upgrade` the request
+    /// carries. The tunnel is closed after `tunnel_idle` with no bytes in
+    /// either direction.
     pub async fn forward_upgrade(
         &self,
         backend: &Backend,
         mut request: Request<ProxyBody>,
+        tunnel_idle: Duration,
     ) -> Result<Response<ProxyBody>, ProxyError> {
         // Claim the client half of the upgrade before the request is consumed.
         // This also takes the OnUpgrade extension out, so it is not forwarded.
         let client_upgrade = hyper::upgrade::on(&mut request);
+        // The listener's marker that a request is in flight. The tunnel keeps
+        // it, so the connection is governed by `tunnel_idle` rather than by
+        // the shorter connection idle timeout.
+        let in_flight = request.extensions_mut().remove::<InFlight>();
 
         // The low-level h1 sender wants origin-form; Host carries the authority.
         let path_and_query = request
@@ -170,9 +180,15 @@ impl ForwarderClient {
         // Both halves only resolve after their 101 has gone out, so the splice
         // has to outlive this call.
         tokio::spawn(async move {
+            let _in_flight = in_flight;
             match tokio::try_join!(client_upgrade, upstream_upgrade) {
                 Ok((client_io, upstream_io)) => {
-                    Self::splice(TokioIo::new(client_io), TokioIo::new(upstream_io)).await
+                    Self::splice(
+                        TokioIo::new(client_io),
+                        TokioIo::new(upstream_io),
+                        tunnel_idle,
+                    )
+                    .await
                 }
                 Err(e) => debug!("Upgrade handshake failed: {}", e),
             }
@@ -202,13 +218,18 @@ impl ForwarderClient {
     /// key. Status 101 plus a websocket `Upgrade` is taken as sufficient, which
     /// avoids a SHA-1 dependency for a check that guards against a
     /// misconfigured origin rather than an attacker.
+    ///
+    /// As with [`Self::forward_upgrade`], whether `protocol` is allowed is for
+    /// the caller to decide first.
     pub async fn forward_h2_websocket(
         &self,
         backend: &Backend,
         mut request: Request<ProxyBody>,
         protocol: &str,
+        tunnel_idle: Duration,
     ) -> Result<Response<ProxyBody>, ProxyError> {
         let client_upgrade = hyper::upgrade::on(&mut request);
+        let in_flight = request.extensions_mut().remove::<InFlight>();
 
         let path_and_query = request
             .uri()
@@ -291,9 +312,15 @@ impl ForwarderClient {
         let upstream_upgrade = hyper::upgrade::on(&mut response);
 
         tokio::spawn(async move {
+            let _in_flight = in_flight;
             match tokio::try_join!(client_upgrade, upstream_upgrade) {
                 Ok((client_io, upstream_io)) => {
-                    Self::splice(TokioIo::new(client_io), TokioIo::new(upstream_io)).await
+                    Self::splice(
+                        TokioIo::new(client_io),
+                        TokioIo::new(upstream_io),
+                        tunnel_idle,
+                    )
+                    .await
                 }
                 Err(e) => debug!("RFC 8441 upgrade handshake failed: {}", e),
             }
@@ -324,16 +351,22 @@ impl ForwarderClient {
     /// Each direction here runs to its own end and half-closes the peer's write
     /// side so the other side sees a clean EOF. `join!` rather than `try_join!`
     /// so that one direction failing cannot cancel the other.
-    async fn splice<A, B>(client_io: A, upstream_io: B)
+    ///
+    /// The whole tunnel is dropped once `idle` passes with no bytes in either
+    /// direction. Without that, a tunnel whose peers simply stop talking --
+    /// or one half-closed and left that way -- holds two sockets and a
+    /// connection slot forever.
+    async fn splice<A, B>(client_io: A, upstream_io: B, idle: Duration)
     where
         A: AsyncRead + AsyncWrite + Unpin,
         B: AsyncRead + AsyncWrite + Unpin,
     {
         let (mut client_read, mut client_write) = tokio::io::split(client_io);
         let (mut upstream_read, mut upstream_write) = tokio::io::split(upstream_io);
+        let last_activity = parking_lot::Mutex::new(tokio::time::Instant::now());
 
         let to_upstream = async {
-            let result = tokio::io::copy(&mut client_read, &mut upstream_write).await;
+            let result = relay(&mut client_read, &mut upstream_write, &last_activity).await;
             // Half-close: tell the upstream the client is done, without tearing
             // down the half still carrying its reply.
             let _ = upstream_write.shutdown().await;
@@ -341,28 +374,123 @@ impl ForwarderClient {
         };
 
         let to_client = async {
-            let result = tokio::io::copy(&mut upstream_read, &mut client_write).await;
+            let result = relay(&mut upstream_read, &mut client_write, &last_activity).await;
             let _ = client_write.shutdown().await;
             result
         };
 
-        let (up, down) = tokio::join!(to_upstream, to_client);
+        let watchdog = async {
+            loop {
+                let deadline = *last_activity.lock() + idle;
+                if tokio::time::Instant::now() >= deadline {
+                    return;
+                }
+                tokio::time::sleep_until(deadline).await;
+            }
+        };
 
-        match (up, down) {
-            (Ok(up), Ok(down)) => {
-                debug!("Tunnel closed: {} bytes up, {} bytes down", up, down)
-            }
-            (up, down) => {
-                // One side erroring is normal for an abrupt close; log both
-                // outcomes rather than only the first failure.
-                debug!("Tunnel closed with errors: up={:?} down={:?}", up, down)
-            }
+        tokio::select! {
+            (up, down) = async { tokio::join!(to_upstream, to_client) } => match (up, down) {
+                (Ok(up), Ok(down)) => {
+                    debug!("Tunnel closed: {} bytes up, {} bytes down", up, down)
+                }
+                (up, down) => {
+                    // One side erroring is normal for an abrupt close; log both
+                    // outcomes rather than only the first failure.
+                    debug!("Tunnel closed with errors: up={:?} down={:?}", up, down)
+                }
+            },
+            _ = watchdog => debug!("Tunnel closed after {:?} idle", idle),
         }
+    }
+}
+
+/// Copy one direction of a tunnel, noting each chunk in `last_activity`.
+///
+/// One read, one write, one flush: a chunk goes out as it came in. Coalescing
+/// chunks changes what a WebSocket peer sees, not just when -- see
+/// [`ForwarderClient::splice`].
+async fn relay<R, W>(
+    reader: &mut R,
+    writer: &mut W,
+    last_activity: &parking_lot::Mutex<tokio::time::Instant>,
+) -> std::io::Result<u64>
+where
+    R: AsyncRead + Unpin,
+    W: AsyncWrite + Unpin,
+{
+    let mut buf = vec![0u8; 16 * 1024];
+    let mut total = 0u64;
+    loop {
+        let n = reader.read(&mut buf).await?;
+        if n == 0 {
+            return Ok(total);
+        }
+        writer.write_all(&buf[..n]).await?;
+        writer.flush().await?;
+        total += n as u64;
+        *last_activity.lock() = tokio::time::Instant::now();
     }
 }
 
 impl Default for ForwarderClient {
     fn default() -> Self {
         Self::new(Duration::from_secs(30))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test(start_paused = true)]
+    async fn a_tunnel_that_goes_quiet_is_closed() {
+        let (mut client, client_side) = tokio::io::duplex(1024);
+        let (upstream_side, mut upstream) = tokio::io::duplex(1024);
+        let splice = tokio::spawn(ForwarderClient::splice(
+            client_side,
+            upstream_side,
+            Duration::from_secs(10),
+        ));
+
+        // Traffic keeps it open past the idle timeout...
+        for _ in 0..3 {
+            tokio::time::sleep(Duration::from_secs(8)).await;
+            client.write_all(b"ping").await.unwrap();
+            let mut buf = [0u8; 4];
+            upstream.read_exact(&mut buf).await.unwrap();
+            assert_eq!(&buf, b"ping");
+        }
+        assert!(!splice.is_finished());
+
+        // ...and silence closes it, with both peers seeing the end.
+        tokio::time::sleep(Duration::from_secs(11)).await;
+        splice.await.unwrap();
+        let mut buf = [0u8; 1];
+        assert_eq!(client.read(&mut buf).await.unwrap(), 0);
+        assert_eq!(upstream.read(&mut buf).await.unwrap(), 0);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_tunnel_relays_both_ways_and_half_closes() {
+        let (mut client, client_side) = tokio::io::duplex(1024);
+        let (upstream_side, mut upstream) = tokio::io::duplex(1024);
+        let splice = tokio::spawn(ForwarderClient::splice(
+            client_side,
+            upstream_side,
+            Duration::from_secs(10),
+        ));
+
+        upstream.write_all(b"hello").await.unwrap();
+        let mut buf = [0u8; 5];
+        client.read_exact(&mut buf).await.unwrap();
+        assert_eq!(&buf, b"hello");
+
+        client.shutdown().await.unwrap();
+        let mut rest = Vec::new();
+        upstream.read_to_end(&mut rest).await.unwrap();
+        assert!(rest.is_empty());
+        drop(upstream);
+        splice.await.unwrap();
     }
 }

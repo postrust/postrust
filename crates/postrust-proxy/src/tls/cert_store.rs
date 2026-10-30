@@ -1,10 +1,10 @@
 //! Certificate storage with database metadata and file caching.
 
-use crate::error::ProxyResult;
+use crate::error::{ProxyError, ProxyResult};
 use sqlx::PgPool;
 use std::path::{Path, PathBuf};
 use tokio::sync::RwLock;
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
 /// Certificate and key pair.
 ///
@@ -45,11 +45,19 @@ pub struct CertificateStore {
 
 impl CertificateStore {
     /// Create a new certificate store.
+    ///
+    /// The cache directory holds private keys, so it is created owner-only
+    /// (0700) and every key in it is kept at 0600. A directory that already
+    /// exists is left as it is -- `cert_dir` might be a shared path, and
+    /// tightening it could break whatever else uses it -- but a warning says
+    /// so if others can read it, and key files written by earlier versions,
+    /// which were left at the umask's default (typically world-readable), are
+    /// tightened.
     pub async fn new(pool: PgPool, cache_dir: impl AsRef<Path>) -> ProxyResult<Self> {
         let cache_dir = cache_dir.as_ref().to_path_buf();
 
-        // Ensure cache directory exists
-        tokio::fs::create_dir_all(&cache_dir).await?;
+        create_private_dir(&cache_dir).await?;
+        tighten_existing_keys(&cache_dir).await;
 
         Ok(Self {
             pool,
@@ -59,7 +67,15 @@ impl CertificateStore {
     }
 
     /// Get a certificate for a domain.
+    ///
+    /// `None` for a name that is not a valid lowercase DNS name: see
+    /// [`check_domain`].
     pub async fn get(&self, domain: &str) -> Option<Certificate> {
+        if let Err(e) = check_domain(domain) {
+            debug!("Not looking up a certificate: {}", e);
+            return None;
+        }
+
         // Check in-memory cache first
         {
             let cache = self.cache.read().await;
@@ -88,7 +104,12 @@ impl CertificateStore {
     }
 
     /// Save a certificate.
+    ///
+    /// Refused unless `cert.domain` is a valid lowercase DNS name: see
+    /// [`check_domain`].
     pub async fn save(&self, cert: Certificate) -> ProxyResult<()> {
+        check_domain(&cert.domain)?;
+
         // Save to database
         self.save_to_database(&cert).await?;
 
@@ -103,7 +124,12 @@ impl CertificateStore {
     }
 
     /// Remove a certificate.
+    ///
+    /// Refused unless `domain` is a valid lowercase DNS name: see
+    /// [`check_domain`].
     pub async fn remove(&self, domain: &str) -> ProxyResult<()> {
+        check_domain(domain)?;
+
         // Remove from database
         sqlx::query("DELETE FROM proxy_certificates WHERE domain = $1")
             .bind(domain)
@@ -111,8 +137,7 @@ impl CertificateStore {
             .await?;
 
         // Remove from file cache
-        let cert_path = self.cache_dir.join(format!("{}.crt", domain));
-        let key_path = self.cache_dir.join(format!("{}.key", domain));
+        let (cert_path, key_path) = self.paths(domain)?;
         let _ = tokio::fs::remove_file(cert_path).await;
         let _ = tokio::fs::remove_file(key_path).await;
 
@@ -133,9 +158,21 @@ impl CertificateStore {
         Ok(rows.into_iter().map(|(d,)| d).collect())
     }
 
+    /// The cache files for `domain`: certificate, then key.
+    ///
+    /// The only place a path is built from a domain, and it refuses any name
+    /// [`check_domain`] does: a domain is a tenant-supplied string, and
+    /// `../../somewhere` joined onto the cache directory is somewhere else.
+    fn paths(&self, domain: &str) -> ProxyResult<(PathBuf, PathBuf)> {
+        check_domain(domain)?;
+        Ok((
+            self.cache_dir.join(format!("{domain}.crt")),
+            self.cache_dir.join(format!("{domain}.key")),
+        ))
+    }
+
     async fn load_from_file(&self, domain: &str) -> ProxyResult<Certificate> {
-        let cert_path = self.cache_dir.join(format!("{}.crt", domain));
-        let key_path = self.cache_dir.join(format!("{}.key", domain));
+        let (cert_path, key_path) = self.paths(domain)?;
 
         let cert_pem = tokio::fs::read(&cert_path).await?;
         let key_pem = tokio::fs::read(&key_path).await?;
@@ -151,11 +188,13 @@ impl CertificateStore {
     }
 
     async fn save_to_file(&self, cert: &Certificate) -> ProxyResult<()> {
-        let cert_path = self.cache_dir.join(format!("{}.crt", cert.domain));
-        let key_path = self.cache_dir.join(format!("{}.key", cert.domain));
+        let (cert_path, key_path) = self.paths(&cert.domain)?;
 
-        tokio::fs::write(&cert_path, &cert.cert_pem).await?;
-        tokio::fs::write(&key_path, &cert.key_pem).await?;
+        // The chain is public; the key is not. `tokio::fs::write` created both
+        // with the umask's default, which on most systems left every tenant's
+        // private key readable by every local user.
+        write_replacing(&cert_path, &cert.cert_pem, 0o644).await?;
+        write_replacing(&key_path, &cert.key_pem, 0o600).await?;
 
         debug!("Saved certificate to file: {}", cert.domain);
         Ok(())
@@ -244,5 +283,269 @@ impl CertificateStore {
 
         info!("Saved certificate to database: {}", cert.domain);
         Ok(())
+    }
+}
+
+/// Refuse anything but a lowercase DNS name, optionally a wildcard.
+///
+/// Labels of `a-z`, `0-9` and `-`, not starting or ending with `-`, at most 63
+/// bytes each and 253 in all, with at most a single leading `*.`. This is what
+/// stands between a tenant-supplied domain and a file path: no `/`, no `..`,
+/// no NUL, nothing a filesystem treats specially.
+///
+/// Lowercase only, rather than lowered here: the store is keyed by the exact
+/// string, and quietly accepting `Example.com` would make it a different
+/// entry from `example.com` in the database while naming the same file.
+pub(crate) fn check_domain(domain: &str) -> ProxyResult<()> {
+    let bare = domain.strip_prefix("*.").unwrap_or(domain);
+    let label_ok = |label: &str| {
+        !label.is_empty()
+            && label.len() <= 63
+            && !label.starts_with('-')
+            && !label.ends_with('-')
+            && label
+                .bytes()
+                .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+    };
+    if domain.len() <= 253 && !bare.is_empty() && bare.split('.').all(label_ok) {
+        Ok(())
+    } else {
+        Err(ProxyError::Validation(format!(
+            "{domain:?} is not a valid lowercase DNS name"
+        )))
+    }
+}
+
+/// Create the cache directory, owner-only if it is new.
+async fn create_private_dir(dir: &Path) -> std::io::Result<()> {
+    let mut builder = tokio::fs::DirBuilder::new();
+    builder.recursive(true);
+    #[cfg(unix)]
+    builder.mode(0o700);
+    builder.create(dir).await?;
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = tokio::fs::metadata(dir).await?.permissions().mode();
+        if mode & 0o077 != 0 {
+            warn!(
+                "Certificate directory {} is accessible to other users (mode {:o}); \
+                 the keys in it are 0600, but consider making it 0700",
+                dir.display(),
+                mode & 0o777
+            );
+        }
+    }
+    Ok(())
+}
+
+/// Make any key file an earlier version left readable owner-only.
+///
+/// Only files named like ours (`<domain>.key`), so pointing `cert_dir` at a
+/// directory that holds other things does not change their permissions.
+async fn tighten_existing_keys(dir: &Path) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let Ok(mut entries) = tokio::fs::read_dir(dir).await else {
+            return;
+        };
+        while let Ok(Some(entry)) = entries.next_entry().await {
+            let name = entry.file_name();
+            let Some(domain) = name.to_str().and_then(|n| n.strip_suffix(".key")) else {
+                continue;
+            };
+            if check_domain(domain).is_err() {
+                continue;
+            }
+            let Ok(meta) = entry.metadata().await else {
+                continue;
+            };
+            if !meta.is_file() || meta.permissions().mode() & 0o077 == 0 {
+                continue;
+            }
+            let path = entry.path();
+            match tokio::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).await {
+                Ok(()) => info!("Restricted {} to 0600", path.display()),
+                Err(e) => warn!(
+                    "{} is readable by other users and could not be restricted: {}",
+                    path.display(),
+                    e
+                ),
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = dir;
+}
+
+/// Write `contents` to `path` with `mode`, replacing whatever was there.
+///
+/// Written to a fresh file beside it and renamed into place. The mode applies
+/// at creation, so the key is never readable by others even for a moment, and
+/// a file that already existed with looser permissions is replaced rather
+/// than rewritten with them. The rename also means a reader never sees a
+/// half-written key.
+async fn write_replacing(path: &Path, contents: &[u8], mode: u32) -> std::io::Result<()> {
+    use tokio::io::AsyncWriteExt;
+
+    let mut tmp_name = path.as_os_str().to_owned();
+    tmp_name.push(format!(".tmp-{}", uuid::Uuid::new_v4().simple()));
+    let tmp = PathBuf::from(tmp_name);
+
+    let mut options = tokio::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    options.mode(mode);
+    #[cfg(not(unix))]
+    let _ = mode;
+
+    let result = async {
+        let mut file = options.open(&tmp).await?;
+        file.write_all(contents).await?;
+        file.sync_all().await?;
+        drop(file);
+        tokio::fs::rename(&tmp, path).await
+    }
+    .await;
+    if result.is_err() {
+        let _ = tokio::fs::remove_file(&tmp).await;
+    }
+    result
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn scratch_dir() -> PathBuf {
+        std::env::temp_dir().join(format!("postrust-cert-store-{}", uuid::Uuid::new_v4()))
+    }
+
+    async fn store(dir: &Path) -> CertificateStore {
+        // Lazy, and never connected: these exercise the file cache only.
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .connect_lazy("postgres://nobody@127.0.0.1:1/none")
+            .unwrap();
+        CertificateStore::new(pool, dir).await.unwrap()
+    }
+
+    fn cert(domain: &str) -> Certificate {
+        Certificate {
+            domain: domain.into(),
+            cert_pem: b"CERT".to_vec(),
+            key_pem: b"KEY".to_vec(),
+            expires_at: None,
+        }
+    }
+
+    #[test]
+    fn only_lowercase_dns_names_are_accepted() {
+        for ok in [
+            "example.com",
+            "a.b.example.com",
+            "xn--bcher-kva.example",
+            "*.example.com",
+            "a-b.c0.example",
+            "localhost",
+        ] {
+            assert!(check_domain(ok).is_ok(), "{ok} should be accepted");
+        }
+        let long_label = format!("{}.com", "a".repeat(64));
+        let long_name = format!("{}.com", vec!["a".repeat(60); 5].join("."));
+        for bad in [
+            "",
+            ".",
+            "..",
+            "../etc/passwd",
+            "a/b",
+            "a\\b",
+            "example.com/../../x",
+            "Example.com",
+            "example..com",
+            ".example.com",
+            "example.com.",
+            "*.*.example.com",
+            "a.*.example.com",
+            "*",
+            "*.",
+            "-a.example.com",
+            "a-.example.com",
+            "exa mple.com",
+            "example.com\0",
+            "ex_ample.com",
+            long_label.as_str(),
+            long_name.as_str(),
+        ] {
+            assert!(check_domain(bad).is_err(), "{bad:?} should be refused");
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn keys_are_written_owner_only_in_an_owner_only_directory() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = scratch_dir().join("nested");
+        let store = store(&dir).await;
+        store.save_to_file(&cert("a.example.com")).await.unwrap();
+
+        let mode = |p: PathBuf| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode(dir.clone()), 0o700);
+        assert_eq!(mode(dir.join("a.example.com.key")), 0o600);
+        // The chain is public, but never more than 0644.
+        assert_eq!(mode(dir.join("a.example.com.crt")) & !0o644, 0);
+        assert_eq!(
+            std::fs::read(dir.join("a.example.com.key")).unwrap(),
+            b"KEY"
+        );
+
+        // No temporary files left behind.
+        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 2);
+        let _ = std::fs::remove_dir_all(dir.parent().unwrap());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_world_readable_key_from_an_earlier_version_is_tightened() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = scratch_dir();
+        std::fs::create_dir_all(&dir).unwrap();
+        let key = dir.join("old.example.com.key");
+        let other = dir.join("unrelated.txt");
+        for path in [&key, &other] {
+            std::fs::write(path, b"x").unwrap();
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        }
+
+        let store = store(&dir).await;
+        let mode = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode(&key), 0o600);
+        // Not ours, not touched.
+        assert_eq!(mode(&other), 0o644);
+
+        // And overwriting replaces the file rather than inheriting its mode.
+        std::fs::set_permissions(&key, std::fs::Permissions::from_mode(0o644)).unwrap();
+        store.save_to_file(&cert("old.example.com")).await.unwrap();
+        assert_eq!(mode(&key), 0o600);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn a_domain_cannot_name_a_path_outside_the_cache() {
+        let root = scratch_dir();
+        let dir = root.join("certs");
+        let store = store(&dir).await;
+        // A certificate sitting just outside the cache directory.
+        std::fs::write(root.join("evil.crt"), b"CERT").unwrap();
+        std::fs::write(root.join("evil.key"), b"KEY").unwrap();
+
+        assert!(store.get("../evil").await.is_none());
+        assert!(store.load_from_file("../evil").await.is_err());
+        assert!(store.save_to_file(&cert("../evil")).await.is_err());
+        assert!(store.save(cert("../evil")).await.is_err());
+        assert!(store.remove("../evil").await.is_err());
+        assert!(root.join("evil.key").exists());
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

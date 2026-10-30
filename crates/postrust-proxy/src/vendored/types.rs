@@ -124,9 +124,10 @@ impl PathName {
         Self(path)
     }
 
-    /// Check if this path matches the given request path.
+    /// Check if this path matches the given request path, on a segment
+    /// boundary -- see [`crate::config::path_has_prefix`].
     pub fn matches(&self, request_path: &str) -> bool {
-        request_path.starts_with(&self.0)
+        crate::config::path_has_prefix(request_path, &self.0)
     }
 
     /// Get the length of this path (for longest-prefix matching).
@@ -187,6 +188,7 @@ mod tests {
         assert!(path.matches("/api/users/123"));
         assert!(!path.matches("/other"));
         assert!(!path.matches("/"));
+        assert!(!path.matches("/apis"));
     }
 
     #[test]
