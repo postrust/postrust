@@ -22,6 +22,7 @@ use axum::Router;
 use postrust_core::{AppConfig, SchemaCache};
 use postrust_server::{handle_request, AppState};
 use sqlx::postgres::PgPoolOptions;
+use sqlx::AssertSqlSafe;
 use sqlx::PgPool;
 use std::sync::Arc;
 use tower::ServiceExt;
@@ -44,7 +45,7 @@ async fn pool(url: &str) -> PgPool {
 /// Made under a lock, since the tests here run at the same time, and only
 /// when the marker on the schema names an older version of it.
 async fn fixture(pool: &PgPool) {
-    sqlx::query(&format!(
+    sqlx::query(AssertSqlSafe(format!(
         "DO $$ BEGIN
            PERFORM pg_advisory_xact_lock(hashtext('{SCHEMA}'));
            IF obj_description(to_regnamespace('{SCHEMA}'), 'pg_namespace')
@@ -63,7 +64,7 @@ async fn fixture(pool: &PgPool) {
            END $f$;
            COMMENT ON SCHEMA {SCHEMA} IS 'fixture v1';
          END $$"
-    ))
+    )))
     .execute(pool)
     .await
     .expect("the fixture");

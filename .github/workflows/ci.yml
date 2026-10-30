@@ -52,20 +52,20 @@ jobs:
             --all-targets -- -D warnings
 
   msrv:
-    name: MSRV (1.88)
+    name: MSRV (1.94)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
 
       # The version here must match [workspace.package] rust-version. It is
-      # verified rather than aspirational: 1.87.0 is refused outright, because
-      # hickory 0.26 and time 0.3.55 declare 1.88. Without this job the
-      # declared MSRV is a comment -- the README claimed 1.78, the docs 1.75,
-      # and nothing caught either.
-      - name: Install Rust 1.88
+      # verified rather than aspirational: 1.93 is refused outright, because
+      # sqlx 0.9 declares 1.94. Without this job the declared MSRV is a
+      # comment -- the README claimed 1.78, the docs 1.75, and nothing caught
+      # either.
+      - name: Install Rust 1.94
         uses: dtolnay/rust-toolchain@master
         with:
-          toolchain: "1.88"
+          toolchain: "1.94"
 
       - uses: Swatinem/rust-cache@v2
         with:
@@ -74,7 +74,7 @@ jobs:
       # --locked: an MSRV check that lets cargo pick newer dependencies is
       # checking a different dependency set than the one that ships.
       - name: Check (workspace)
-        run: cargo +1.88 check --workspace --all-targets --locked
+        run: cargo +1.94 check --workspace --all-targets --locked
 
   wasm32:
     name: wasm32 (Cloudflare Workers)

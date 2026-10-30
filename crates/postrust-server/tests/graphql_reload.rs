@@ -20,6 +20,7 @@ use axum::Router;
 use postrust_core::AppConfig;
 use postrust_server::{build, Host};
 use serde_json::{json, Value};
+use sqlx::AssertSqlSafe;
 use tower::ServiceExt;
 
 const TABLE: &str = "graphql_reload_probe";
@@ -51,7 +52,7 @@ async fn query(app: &Router, document: &str) -> Value {
 /// starts listening on a background task, and a notification sent before it
 /// has is heard by no one.
 async fn reload(admin: &sqlx::PgPool, channel: &str) {
-    sqlx::query(&format!("NOTIFY {channel}, 'reload schema'"))
+    sqlx::query(AssertSqlSafe(format!("NOTIFY {channel}, 'reload schema'")))
         .execute(admin)
         .await
         .unwrap();
@@ -61,10 +62,12 @@ async fn reload(admin: &sqlx::PgPool, channel: &str) {
 #[ignore = "requires PostgreSQL"]
 async fn a_table_added_after_start_up_is_served_once_notified() {
     let admin = sqlx::PgPool::connect(&database_url()).await.unwrap();
-    sqlx::query(&format!("DROP TABLE IF EXISTS public.{TABLE}"))
-        .execute(&admin)
-        .await
-        .unwrap();
+    sqlx::query(AssertSqlSafe(format!(
+        "DROP TABLE IF EXISTS public.{TABLE}"
+    )))
+    .execute(&admin)
+    .await
+    .unwrap();
 
     let mut config = AppConfig::default();
     config.db_uri = database_url();
@@ -83,7 +86,10 @@ async fn a_table_added_after_start_up_is_served_once_notified() {
         format!("INSERT INTO public.{TABLE} VALUES (1)"),
         format!("GRANT SELECT ON public.{TABLE} TO web_anon"),
     ] {
-        sqlx::query(&statement).execute(&admin).await.unwrap();
+        sqlx::query(AssertSqlSafe(statement))
+            .execute(&admin)
+            .await
+            .unwrap();
     }
 
     let mut after = Value::Null;
@@ -97,7 +103,7 @@ async fn a_table_added_after_start_up_is_served_once_notified() {
     }
     assert_eq!(after["data"][TABLE], json!([{ "id": 1 }]), "{after}");
 
-    sqlx::query(&format!("DROP TABLE public.{TABLE}"))
+    sqlx::query(AssertSqlSafe(format!("DROP TABLE public.{TABLE}")))
         .execute(&admin)
         .await
         .unwrap();
@@ -121,7 +127,10 @@ async fn a_schema_that_failed_at_start_up_is_built_on_reload() {
         // Its object type would take the name of the built-in Int scalar.
         format!("CREATE TABLE {SCHEMA}.\"Int\" (id int PRIMARY KEY)"),
     ] {
-        sqlx::query(&statement).execute(&admin).await.unwrap();
+        sqlx::query(AssertSqlSafe(statement))
+            .execute(&admin)
+            .await
+            .unwrap();
     }
 
     let mut config = AppConfig::default();
@@ -138,7 +147,7 @@ async fn a_schema_that_failed_at_start_up_is_built_on_reload() {
         "{before}"
     );
 
-    sqlx::query(&format!("DROP TABLE {SCHEMA}.\"Int\""))
+    sqlx::query(AssertSqlSafe(format!("DROP TABLE {SCHEMA}.\"Int\"")))
         .execute(&admin)
         .await
         .unwrap();
@@ -154,7 +163,7 @@ async fn a_schema_that_failed_at_start_up_is_built_on_reload() {
     }
     assert_eq!(after["data"]["probe"], json!([{ "id": 1 }]), "{after}");
 
-    sqlx::query(&format!("DROP SCHEMA {SCHEMA} CASCADE"))
+    sqlx::query(AssertSqlSafe(format!("DROP SCHEMA {SCHEMA} CASCADE")))
         .execute(&admin)
         .await
         .unwrap();

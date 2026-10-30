@@ -21,6 +21,7 @@ use axum::Router;
 use postrust_core::{AppConfig, SchemaCache};
 use postrust_server::{handle_request, AppState};
 use sqlx::postgres::PgPoolOptions;
+use sqlx::AssertSqlSafe;
 use std::io::Write;
 use std::sync::{Arc, Mutex};
 use tower::ServiceExt;
@@ -77,7 +78,10 @@ async fn app() -> Router {
         ),
         format!("GRANT EXECUTE ON ALL FUNCTIONS IN SCHEMA {SCHEMA} TO web_anon"),
     ] {
-        sqlx::query(&statement).execute(&pool).await.unwrap();
+        sqlx::query(AssertSqlSafe(statement))
+            .execute(&pool)
+            .await
+            .unwrap();
     }
 
     let mut config = AppConfig::default();
@@ -179,7 +183,7 @@ async fn client_errors_log_at_debug_and_faults_at_error() {
     assert!(errors[1].contains("permission denied"), "{log}");
 
     let pool = sqlx::PgPool::connect(&database_url()).await.unwrap();
-    sqlx::query(&format!("DROP SCHEMA {SCHEMA} CASCADE"))
+    sqlx::query(AssertSqlSafe(format!("DROP SCHEMA {SCHEMA} CASCADE")))
         .execute(&pool)
         .await
         .unwrap();
@@ -210,7 +214,10 @@ async fn a_pool_that_runs_dry_is_logged_at_error() {
         format!("CREATE TABLE {DRY}.items (id int PRIMARY KEY)"),
         format!("GRANT SELECT ON {DRY}.items TO web_anon"),
     ] {
-        sqlx::query(&statement).execute(&setup).await.unwrap();
+        sqlx::query(AssertSqlSafe(statement))
+            .execute(&setup)
+            .await
+            .unwrap();
     }
     setup.close().await;
 
@@ -261,7 +268,7 @@ async fn a_pool_that_runs_dry_is_logged_at_error() {
         .connect(&database_url())
         .await
         .expect("failed to connect to test database");
-    sqlx::query(&format!("DROP SCHEMA {DRY} CASCADE"))
+    sqlx::query(AssertSqlSafe(format!("DROP SCHEMA {DRY} CASCADE")))
         .execute(&cleanup)
         .await
         .unwrap();

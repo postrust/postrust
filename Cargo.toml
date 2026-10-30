@@ -21,13 +21,15 @@ exclude = ["examples/custom-routes"]
 [workspace.package]
 version = "2.4.1"
 edition = "2021"
-# Verified, not assumed: 1.88.0 builds the workspace clean and 1.87.0 is
-# refused outright -- hickory-{net,proto,resolver} 0.26 and time 0.3.55 all
-# declare 1.88. Both arrived with security updates, and the floor moved from
-# 1.86 to 1.88 as a result; the advisories were worth more than the two
-# releases. The README claimed 1.78, and the docs 1.75, before this was
-# declared anywhere at all.
-rust-version = "1.88"
+# Verified, not assumed: 1.94.0 builds the workspace clean, and anything older
+# is refused outright -- sqlx 0.9 declares 1.94, and every crate here that
+# reaches a database (the server, the Lambda adapter, GraphQL, the proxy, and
+# postrust-core with its default `sqlx` feature) depends on it. The floor moved
+# from 1.88 to 1.94 in 3.0 with the move to sqlx 0.9; before that it was
+# hickory-{net,proto,resolver} 0.26 and time 0.3.55, both at 1.88 and both
+# arriving with security updates, that moved it up from 1.86. The README
+# claimed 1.78, and the docs 1.75, before this was declared anywhere at all.
+rust-version = "1.94"
 license = "MIT"
 repository = "https://github.com/postrust/postrust"
 homepage = "https://postrust.org/"
@@ -55,12 +57,21 @@ hyper = { version = "1.5", features = ["full"] }
 #
 # `tls-rustls-ring-native-roots` and not an aws-lc-rs variant, which would
 # otherwise match the provider the rest of the tree is pinned to. The choice is
-# forced: sqlx 0.8 wires the system trust store only to the ring feature
-# (`_tls-rustls-ring-native-roots` -> `certs_from_native_store()`), while
-# `tls-rustls-aws-lc-rs` gets webpki's bundled roots and nothing else. Native
-# roots is the one that works for a database behind a private or
-# organisation-issued CA, and both runtime images already ship
-# `ca-certificates` (see ./Dockerfile and ./Dockerfile.alpine).
+# forced, and sqlx 0.9 kept it so: its rustls connector reads the system trust
+# store only when the optional `rustls-native-certs` dependency is compiled in
+# (`import_root_certs()` in sqlx-core's src/net/tls/tls_rustls.rs is gated on
+# it), and the only feature that turns that on is this one, by way of
+# `sqlx-core/_tls-rustls-ring-native-roots`. `tls-rustls-aws-lc-rs` gets
+# webpki's bundled roots and nothing else, as does `tls-rustls`, which is now
+# an alias for `tls-rustls-ring-webpki`. Native roots is the one that works for
+# a database behind a private or organisation-issued CA, and both runtime images
+# already ship `ca-certificates` (see ./Dockerfile and ./Dockerfile.alpine).
+# The trust store is what `sslmode=verify-ca` and `verify-full` check against;
+# `require` encrypts without verifying, so it works whatever the store holds.
+#
+# 0.9 also deleted the old combined features (`runtime-tokio-rustls` and the
+# like). The runtime and the TLS stack were already named separately here, so
+# nothing else had to move.
 #
 # This costs nothing and risks nothing. `ring` was already compiled in --
 # reqwest pulls it, so rustls has had both features on for as long as the proxy
@@ -72,7 +83,7 @@ hyper = { version = "1.5", features = ["full"] }
 # Without a TLS feature sqlx does not merely lack the option: `sslmode=require`
 # fails outright with "SQLx was built without TLS support enabled", and the
 # default `sslmode=prefer` silently connects in cleartext.
-sqlx = { version = "0.8", features = ["runtime-tokio", "tls-rustls-ring-native-roots", "postgres", "json", "chrono", "uuid", "bigdecimal"] }
+sqlx = { version = "0.9", features = ["runtime-tokio", "tls-rustls-ring-native-roots", "postgres", "json", "chrono", "uuid", "bigdecimal"] }
 deadpool-postgres = "0.14"
 tokio-postgres = "0.7"
 

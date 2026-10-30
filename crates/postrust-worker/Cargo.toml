@@ -43,7 +43,9 @@ postrust-core.workspace = true
 # on. Built for any other target the crate is only `settings`, which keeps
 # `cargo build --workspace` working.
 [target.'cfg(target_arch = "wasm32")'.dependencies]
-# `=`: 0.8.7 declares rust-version 1.91, above the workspace's 1.88.
+# `=`: 0.8.7 declares rust-version 1.91, above what was the workspace's 1.88
+# when this was pinned. The 1.94 floor no longer needs it; lifting it is a
+# change to the Worker, to be made and tested as one.
 worker = { version = "=0.8.6", features = ["http", "tokio-postgres"] }
 wasm-bindgen-futures = "0.4"
 futures.workspace = true

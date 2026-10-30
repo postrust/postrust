@@ -27,6 +27,7 @@ use axum::Router;
 use postrust_core::{AppConfig, SchemaCache};
 use postrust_server::{handle_request, AppState};
 use sqlx::postgres::PgPoolOptions;
+use sqlx::AssertSqlSafe;
 use sqlx::PgPool;
 use std::sync::Arc;
 use tower::ServiceExt;
@@ -66,7 +67,10 @@ async fn setup(pool: &PgPool, test: &str, statements: &[&str]) {
     ];
     all.extend(statements.iter().map(|s| s.replace("{schema}", &schema)));
     for statement in all {
-        sqlx::query(&statement).execute(pool).await.unwrap();
+        sqlx::query(AssertSqlSafe(statement))
+            .execute(pool)
+            .await
+            .unwrap();
     }
 }
 
@@ -127,7 +131,7 @@ async fn send(app: &Router, method: &str, uri: &str, body: &str) -> Answer {
     }
 }
 
-async fn count(pool: &PgPool, sql: &str) -> i64 {
+async fn count(pool: &PgPool, sql: &'static str) -> i64 {
     sqlx::query_scalar(sql).fetch_one(pool).await.unwrap()
 }
 

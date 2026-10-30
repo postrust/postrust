@@ -27,6 +27,7 @@ use postrust_server::{AppState, Builder, Error, Host, TxOptions, User};
 use serde::Deserialize;
 use serde_json::{json, Value};
 use sqlx::postgres::PgPoolOptions;
+use sqlx::AssertSqlSafe;
 use std::sync::Arc;
 use tower::ServiceExt;
 
@@ -61,7 +62,11 @@ async fn ask(
         .read_only(ask.read_only)
         .run_pre_request(ask.pre_request);
     let mut tx = state.begin_as_with(&user, options).await?;
-    let value: Option<Value> = sqlx::query_scalar(&ask.sql).fetch_one(&mut *tx).await?;
+    // SQL straight from the request, which no real route should run: this one
+    // exists to show that whatever runs here runs as the caller, under RLS.
+    let value: Option<Value> = sqlx::query_scalar(AssertSqlSafe(ask.sql))
+        .fetch_one(&mut *tx)
+        .await?;
     tx.commit().await?;
     Ok(Json(value.unwrap_or(Value::Null)))
 }
@@ -112,7 +117,10 @@ async fn app(schema: &str, compat_mode: bool) -> (Router, Arc<AppState>) {
         ),
         format!("GRANT EXECUTE ON FUNCTION {schema}.pre() TO web_anon, web_user"),
     ] {
-        sqlx::query(&statement).execute(&pool).await.unwrap();
+        sqlx::query(AssertSqlSafe(statement))
+            .execute(&pool)
+            .await
+            .unwrap();
     }
 
     let mut config = AppConfig::default();
@@ -141,7 +149,7 @@ async fn drop_schema(schema: &str) {
         .connect(&database_url())
         .await
         .unwrap();
-    sqlx::query(&format!("DROP SCHEMA {schema} CASCADE"))
+    sqlx::query(AssertSqlSafe(format!("DROP SCHEMA {schema} CASCADE")))
         .execute(&pool)
         .await
         .unwrap();

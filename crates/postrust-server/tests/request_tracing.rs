@@ -19,6 +19,7 @@ use axum::routing::any;
 use axum::Router;
 use postrust_core::trace::TraceContext;
 use postrust_server::telemetry::RequestTraceLayer;
+use sqlx::AssertSqlSafe;
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 use tower::ServiceExt;
@@ -270,7 +271,10 @@ async fn application(otel_db_statement: bool) -> Router {
         format!("INSERT INTO {SCHEMA}.items VALUES (1)"),
         format!("GRANT SELECT ON {SCHEMA}.items TO web_anon"),
     ] {
-        sqlx::query(&statement).execute(&pool).await.unwrap();
+        sqlx::query(AssertSqlSafe(statement))
+            .execute(&pool)
+            .await
+            .unwrap();
     }
 
     let mut config = postrust_core::AppConfig::default();
@@ -359,7 +363,7 @@ async fn a_rest_request_opens_its_stages_beneath_the_request_span() {
     assert!(!text.contains("424242"), "{text}");
 
     let pool = sqlx::PgPool::connect(&database_url()).await.unwrap();
-    sqlx::query(&format!("DROP SCHEMA {SCHEMA} CASCADE"))
+    sqlx::query(AssertSqlSafe(format!("DROP SCHEMA {SCHEMA} CASCADE")))
         .execute(&pool)
         .await
         .unwrap();

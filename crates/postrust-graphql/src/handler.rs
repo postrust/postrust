@@ -21,7 +21,7 @@ use async_graphql_axum::{GraphQLRequest, GraphQLResponse};
 use axum::extract::State;
 use axum::response::IntoResponse;
 use postrust_core::schema_cache::SchemaCache;
-use sqlx::PgPool;
+use sqlx::{AssertSqlSafe, PgPool};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
 use tokio::sync::RwLock;
@@ -4881,7 +4881,7 @@ async fn execute_query_on(
     trace!("Executing SQL: {}", sql);
 
     // Execute query
-    let mut query = sqlx::query(sql);
+    let mut query = sqlx::query(AssertSqlSafe(sql));
     for param in params {
         query = bind_json_value(query, param);
     }
@@ -5615,7 +5615,7 @@ fn insert_row<'life>(
                 row_json(&qualified_table, &column_types),
                 check_sql
             );
-            let mut query = sqlx::query(&sql);
+            let mut query = sqlx::query(AssertSqlSafe(sql));
             for value in &conflict_values {
                 query = bind_json_value(query, value);
             }
@@ -5656,7 +5656,7 @@ fn insert_row<'life>(
                 check_sql
             );
             trace!("Executing INSERT SQL: {}", sql);
-            let mut query = sqlx::query(&sql);
+            let mut query = sqlx::query(AssertSqlSafe(sql));
             for column in &names {
                 if let Some(value) = columns.get(*column) {
                     query = bind_json_value(query, &write_operand(&column_types, column, value));
@@ -6028,6 +6028,16 @@ fn mutation_result<'a>(rows: Vec<Value>, affected: usize, by_key: bool) -> Optio
 }
 
 /// Bind a JSON value to a sqlx query.
+///
+/// Every value a GraphQL request carries reaches the database through here, as
+/// a bound parameter, and that is what makes the `AssertSqlSafe` around each
+/// statement in this module true rather than hopeful. sqlx 0.9 takes only a
+/// `&'static str` as SQL unless told otherwise, and the statements here are
+/// built at runtime because their shape follows the request -- which columns,
+/// which tables, how many rows. What is spliced in comes from the schema cache
+/// or from this module, never from the request: identifiers, each quoted with
+/// `postrust_sql::escape_ident` first, the catalog's type names, and SQL
+/// written here.
 fn bind_json_value<'q>(
     query: sqlx::query::Query<'q, sqlx::Postgres, sqlx::postgres::PgArguments>,
     value: &serde_json::Value,
@@ -6256,7 +6266,7 @@ async fn execute_update(
     trace!("Executing UPDATE SQL: {}", sql);
 
     // Build query with parameters
-    let mut query = sqlx::query(&sql);
+    let mut query = sqlx::query(AssertSqlSafe(sql));
 
     // Bind SET values
     for val in &set_values {
@@ -6486,7 +6496,7 @@ async fn execute_delete(
 
     trace!("Executing DELETE SQL: {}", sql);
 
-    let mut query = sqlx::query(&sql);
+    let mut query = sqlx::query(AssertSqlSafe(sql));
     for val in &values {
         query = bind_json_value(query, val);
     }
@@ -9574,7 +9584,7 @@ fn embed_relationships<'f>(
                     .children_grouped_sql(ctx.max_rows, &child_columns)
                     .map_err(|e| async_graphql::Error::new(e.to_string()))?;
 
-                let fetched = sqlx::query(&sql)
+                let fetched = sqlx::query(AssertSqlSafe(sql))
                     .bind(&keys)
                     .fetch_all(&mut *conn)
                     .await

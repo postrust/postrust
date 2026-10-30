@@ -2,7 +2,7 @@
 name = "postrust-example-custom-routes"
 version = "0.1.0"
 edition = "2021"
-rust-version = "1.88"
+rust-version = "1.94"
 license = "MIT"
 publish = false
 description = "A server of your own: Postrust's API with routes you add beside it"
@@ -18,7 +18,7 @@ postrust-core = { path = "../../crates/postrust-core" }
 
 axum = "0.8"
 tokio = { version = "1.43", features = ["full"] }
-sqlx = { version = "0.8", default-features = false, features = ["postgres"] }
+sqlx = { version = "0.9", default-features = false, features = ["postgres"] }
 serde_json = "1.0"
 anyhow = "1.0"
 tracing = "0.1"

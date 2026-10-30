@@ -25,6 +25,7 @@ use opentelemetry_sdk::trace::{InMemorySpanExporter, SdkTracerProvider, SpanData
 use postrust_core::trace::TraceContext;
 use postrust_server::otel;
 use postrust_server::telemetry::RequestTraceLayer;
+use sqlx::AssertSqlSafe;
 use std::sync::Arc;
 use tower::ServiceExt;
 use tracing_subscriber::layer::SubscriberExt;
@@ -218,7 +219,10 @@ async fn application(host: postrust_server::Host) -> postrust_server::App {
         format!("INSERT INTO {SCHEMA}.tasks VALUES (1, 1), (2, 1)"),
         format!("GRANT SELECT, INSERT ON ALL TABLES IN SCHEMA {SCHEMA} TO web_anon"),
     ] {
-        sqlx::query(&statement).execute(&pool).await.unwrap();
+        sqlx::query(AssertSqlSafe(statement))
+            .execute(&pool)
+            .await
+            .unwrap();
     }
 
     let mut config = postrust_core::AppConfig::default();
@@ -235,10 +239,12 @@ async fn application(host: postrust_server::Host) -> postrust_server::App {
 
 async fn drop_schema() {
     let pool = sqlx::PgPool::connect(&database_url()).await.unwrap();
-    sqlx::query(&format!("DROP SCHEMA IF EXISTS {SCHEMA} CASCADE"))
-        .execute(&pool)
-        .await
-        .unwrap();
+    sqlx::query(AssertSqlSafe(format!(
+        "DROP SCHEMA IF EXISTS {SCHEMA} CASCADE"
+    )))
+    .execute(&pool)
+    .await
+    .unwrap();
 }
 
 fn token() -> String {

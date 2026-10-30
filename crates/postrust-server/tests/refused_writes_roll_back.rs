@@ -27,6 +27,7 @@ use axum::Router;
 use postrust_core::{AppConfig, SchemaCache};
 use postrust_server::{handle_request, AppState};
 use sqlx::postgres::PgPoolOptions;
+use sqlx::AssertSqlSafe;
 use sqlx::PgPool;
 use std::sync::Arc;
 use tower::ServiceExt;
@@ -57,7 +58,10 @@ async fn table(pool: &PgPool, name: &str) {
         format!("INSERT INTO {schema}.{name} SELECT g, 0 FROM generate_series(1, 5) g"),
         format!("GRANT SELECT, UPDATE ON {schema}.{name} TO web_anon"),
     ] {
-        sqlx::query(&statement).execute(pool).await.unwrap();
+        sqlx::query(AssertSqlSafe(statement))
+            .execute(pool)
+            .await
+            .unwrap();
     }
 }
 
@@ -66,7 +70,7 @@ async fn table(pool: &PgPool, name: &str) {
 async fn run(pool: &PgPool, table: &str, statements: &[&str]) {
     let schema = schema(table);
     for statement in statements {
-        sqlx::query(&statement.replace("{schema}", &schema))
+        sqlx::query(AssertSqlSafe(statement.replace("{schema}", &schema)))
             .execute(pool)
             .await
             .unwrap();
@@ -155,9 +159,9 @@ async fn send(
 
 async fn changed(pool: &PgPool, table: &str) -> i64 {
     let schema = schema(table);
-    sqlx::query_scalar(&format!(
+    sqlx::query_scalar(AssertSqlSafe(format!(
         "SELECT count(*) FROM {schema}.{table} WHERE n = 1"
-    ))
+    )))
     .fetch_one(pool)
     .await
     .unwrap()

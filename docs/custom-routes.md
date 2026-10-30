@@ -45,7 +45,7 @@ postrust-server = "3"                                  # features = ["graphql"] 
 postrust-core = "3"
 axum = "0.8"
 tokio = { version = "1", features = ["full"] }
-sqlx = { version = "0.8", default-features = false, features = ["postgres"] }
+sqlx = { version = "0.9", default-features = false, features = ["postgres"] }
 serde_json = "1"
 anyhow = "1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }

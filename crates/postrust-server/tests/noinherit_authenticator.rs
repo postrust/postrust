@@ -32,6 +32,7 @@ use axum::Router;
 use postrust_core::{AppConfig, SchemaCache};
 use postrust_server::{handle_request, AppState};
 use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
+use sqlx::AssertSqlSafe;
 use sqlx::PgPool;
 use std::str::FromStr;
 use std::sync::Arc;
@@ -146,7 +147,7 @@ async fn authenticators() -> (PgPool, PgPool) {
     // `duplicate_object` an existence check would catch. Taken in turn, and
     // made what this file needs whatever an earlier run left behind.
     for (role, inherit) in [(NOINHERIT, "NOINHERIT"), (INHERIT, "INHERIT")] {
-        sqlx::query(&format!(
+        sqlx::query(AssertSqlSafe(format!(
             "DO $$ BEGIN \
                PERFORM pg_advisory_xact_lock(hashtext('{role}')); \
                IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = '{role}') THEN \
@@ -155,7 +156,7 @@ async fn authenticators() -> (PgPool, PgPool) {
                ALTER ROLE {role} LOGIN {inherit} PASSWORD '{PASSWORD}'; \
                GRANT web_anon, web_user, web_admin TO {role}; \
              END $$"
-        ))
+        )))
         .execute(&admin)
         .await
         .expect("failed to create an authenticator");
@@ -368,7 +369,7 @@ async fn a_member_of_pg_read_all_data_sees_every_table() {
         eprintln!("pg_read_all_data needs PostgreSQL 14 or later; skipped");
         return;
     }
-    sqlx::query(&format!(
+    sqlx::query(AssertSqlSafe(format!(
         "DO $$ BEGIN \
            PERFORM pg_advisory_xact_lock(hashtext('{READER}')); \
            IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = '{READER}') THEN \
@@ -377,7 +378,7 @@ async fn a_member_of_pg_read_all_data_sees_every_table() {
            ALTER ROLE {READER} LOGIN INHERIT PASSWORD '{PASSWORD}'; \
            GRANT pg_read_all_data TO {READER}; \
          END $$"
-    ))
+    )))
     .execute(&admin)
     .await
     .expect("failed to create the reader");

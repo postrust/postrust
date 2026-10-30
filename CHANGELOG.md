@@ -7,8 +7,9 @@ releases are described by their tags and the pull requests behind them.
 
 A major release, and a narrow one: two structs that the features in this line
 have to grow are made `#[non_exhaustive]`, so that adding a field to either is
-a minor release from here on. The HTTP surface, configuration keys and the
-minimum supported Rust version are unchanged.
+a minor release from here on, and the database driver moves to sqlx 0.9, which
+raises the minimum supported Rust version to 1.94. The HTTP surface and
+configuration keys are unchanged.
 
 ### Changed
 
@@ -60,6 +61,17 @@ minimum supported Rust version are unchanged.
   are set up by, and `GraphQLContext` has a `config` field, set with
   `with_config`. A context built without one is set up from
   `AppConfig::default()`.
+- **sqlx 0.9, from 0.8.** sqlx's types are part of the public API --
+  `AppState::pool` is a `sqlx::PgPool`, and a route of your own is handed it --
+  so a crate that embeds `postrust-server` has to move to sqlx 0.9 with it: a
+  pool from sqlx 0.9 is a different type to code written against 0.8. Nothing
+  a request can reach behaves differently. The TLS feature is still
+  `tls-rustls-ring-native-roots`: in 0.9, as in 0.8, it is the only one that
+  reads the host trust store, so a database behind a private CA still verifies
+  under `sslmode=verify-full`.
+- **The minimum supported Rust version is 1.94, from 1.88.** sqlx 0.9 declares
+  1.94, and every crate that talks to a database depends on it. CI's `msrv` job
+  checks the workspace on 1.94 `--locked`, and 1.93 is refused.
 
 ### Added
 
@@ -165,8 +177,8 @@ minimum supported Rust version are unchanged.
 
 ### Upgrading from 2.x
 
-Only code that built `JwtConfig` or `AppState` with a struct literal is
-affected. Replace an `AppState { .. }` with `AppState::new(pool, schema_cache,
+Of the two structs, only code that built `JwtConfig` or `AppState` with a
+struct literal is affected. Replace an `AppState { .. }` with `AppState::new(pool, schema_cache,
 config)?` and assign any field that should differ -- a test that wants every
 token validated sets `state.jwt_cache = None`. Replace a `JwtConfig { .. }` with
 `postrust_engine::jwt_config(&config)?`, or with `JwtConfig::default()` and
@@ -181,6 +193,17 @@ PostGIS or another extension in a schema that is neither `public` nor in
 operations too. Code that called `build_query(&plan, role)` drops the role;
 code embedding the GraphQL handler passes its configuration with
 `GraphQLContext::with_config`.
+
+A crate built on `postrust-server` or `postrust-core` needs a Rust toolchain of
+1.94 or later and, if it uses sqlx itself -- a route of your own handed
+`AppState::pool`, say -- sqlx 0.9 in its own `Cargo.toml`. sqlx 0.9 accepts
+only a `&'static str` as SQL, so SQL your own code builds at runtime -- a
+`format!` naming a schema, say -- no longer compiles as an argument to
+`sqlx::query` and its siblings, or to `Executor::execute`. Wrap it in
+`sqlx::AssertSqlSafe(...)` once you have checked that every value in it is a
+bound parameter and every identifier is quoted; a string literal needs nothing.
+The rest of sqlx's 0.9 changes are in
+[its changelog](https://github.com/launchbadge/sqlx/blob/main/CHANGELOG.md).
 
 ## 2.4.1
 

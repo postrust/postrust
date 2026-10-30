@@ -125,7 +125,7 @@ If you've written your own binary with [custom routes](./custom-routes.md), buil
 
 ```dockerfile
 # Dockerfile
-FROM rust:1.88-bookworm AS builder
+FROM rust:1.94-bookworm AS builder
 
 # Install build dependencies
 RUN apt-get update && apt-get install -y pkg-config libssl-dev

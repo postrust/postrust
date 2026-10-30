@@ -23,6 +23,7 @@ use axum::Router;
 use postrust_core::AppConfig;
 use postrust_server::{AppState, Builder, Host};
 use sqlx::postgres::PgPoolOptions;
+use sqlx::AssertSqlSafe;
 use std::sync::Arc;
 use tower::ServiceExt;
 
@@ -184,7 +185,10 @@ async fn in_compatibility_mode_a_nested_route_comes_before_the_root_fallback() {
         format!("CREATE TABLE {schema}.other (id int PRIMARY KEY)"),
         format!("GRANT SELECT ON {schema}.other TO web_anon"),
     ] {
-        sqlx::query(&statement).execute(&pool).await.unwrap();
+        sqlx::query(AssertSqlSafe(statement))
+            .execute(&pool)
+            .await
+            .unwrap();
     }
 
     let mut config = config(schema);
@@ -209,7 +213,7 @@ async fn in_compatibility_mode_a_nested_route_comes_before_the_root_fallback() {
     assert_eq!(response.status(), StatusCode::OK);
     assert_eq!(text(response).await, "[]");
 
-    sqlx::query(&format!("DROP SCHEMA {schema} CASCADE"))
+    sqlx::query(AssertSqlSafe(format!("DROP SCHEMA {schema} CASCADE")))
         .execute(&pool)
         .await
         .unwrap();
