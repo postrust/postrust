@@ -3,7 +3,12 @@
 Notable changes, newest first. This file starts at 1.0.0-alpha.1; earlier
 releases are described by their tags and the pull requests behind them.
 
-## Unreleased
+## 3.0.1
+
+Database errors in their own words, without compatibility mode. Nothing that
+worked before changes: the new setting is off until set. Released beside it:
+`postrust-worker` 1.1.1, which reads the same setting. `postrust-proxy` stays
+at 2.0.0.
 
 ### Added
 
