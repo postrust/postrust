@@ -6,6 +6,8 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
 const EXPECTED_BOOLEAN: &str = "one of: true, false, 1, 0, yes, no, on, off";
+const EXPECTED_SQLSTATES: &str = "true, false, or a comma-separated list of SQLSTATEs \
+     (P0001) and prefixes ending in * (PT*)";
 
 /// An environment variable contains a value that cannot be used safely.
 #[derive(Clone, Debug, Eq, PartialEq, thiserror::Error)]
@@ -261,6 +263,19 @@ pub struct AppConfig {
     /// function-name-keyed default.
     #[serde(default)]
     pub compat_mode: bool,
+
+    /// The SQLSTATEs whose database errors are answered in the database's own
+    /// words -- its code, message, detail and hint -- rather than as
+    /// `"Database error"`.
+    ///
+    /// Each entry is a five-character SQLSTATE (`P0001`) or a prefix ending in
+    /// `*` (`PT*`); `*` alone is every one. Empty by default, because most of
+    /// what PostgreSQL says describes the schema rather than the request: a
+    /// constraint's name, a missing table. What a function raises on purpose
+    /// for the person using the app is the exception worth listing.
+    /// Compatibility mode passes every database error through regardless.
+    #[serde(default, deserialize_with = "deserialize_sqlstate_patterns")]
+    pub db_errors_verbatim: Vec<String>,
 }
 
 impl Default for AppConfig {
@@ -306,6 +321,7 @@ impl Default for AppConfig {
             graphql_federation: false,
             graphql_type_prefix: None,
             compat_mode: false,
+            db_errors_verbatim: Vec::new(),
         }
     }
 }
@@ -326,16 +342,69 @@ fn parse_bool(value: &str) -> Option<bool> {
     }
 }
 
+/// Report a variable set to a value that cannot be used, and return the
+/// error that stops start-up.
+fn invalid(variable: &'static str, value: &str, expected: &'static str) -> ConfigError {
+    let error = ConfigError {
+        variable,
+        value: value.to_string(),
+        expected,
+    };
+    tracing::warn!("{error}");
+    error
+}
+
 fn env_bool(variable: &'static str, value: &str) -> Result<bool, ConfigError> {
-    parse_bool(value).ok_or_else(|| {
-        let error = ConfigError {
-            variable,
-            value: value.to_string(),
-            expected: EXPECTED_BOOLEAN,
-        };
-        tracing::warn!("{error}");
-        error
+    parse_bool(value).ok_or_else(|| invalid(variable, value, EXPECTED_BOOLEAN))
+}
+
+/// Parse `PGRST_DB_ERRORS_VERBATIM`: a boolean, where `true` is every
+/// SQLSTATE and `false` none, or a list of SQLSTATEs and `*`-ended prefixes.
+/// Upper-cased, since PostgreSQL reports SQLSTATEs in capitals and `p0001`
+/// is plainly meant as `P0001`. `None` for anything else -- a typo here would
+/// otherwise go on sanitising the very errors it was set to let through.
+fn parse_sqlstate_patterns(value: &str) -> Option<Vec<String>> {
+    match parse_bool(value) {
+        Some(true) => return Some(vec!["*".to_string()]),
+        Some(false) => return Some(Vec::new()),
+        None => {}
+    }
+    let sqlstate_chars = |s: &str| s.chars().all(|c| c.is_ascii_alphanumeric());
+    value
+        .split(',')
+        .map(|s| s.trim().to_ascii_uppercase())
+        .filter(|s| !s.is_empty())
+        .map(|s| {
+            let valid = match s.strip_suffix('*') {
+                Some(prefix) => prefix.len() < 5 && sqlstate_chars(prefix),
+                None => s.len() == 5 && sqlstate_chars(&s),
+            };
+            valid.then_some(s)
+        })
+        .collect()
+}
+
+/// `db_errors_verbatim` as configuration spells it, checked and upper-cased
+/// as `PGRST_DB_ERRORS_VERBATIM` is: a file that says `["p0001"]` or
+/// `["true"]` means what the variable would.
+fn deserialize_sqlstate_patterns<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Vec<String>, D::Error> {
+    let raw = Vec::<String>::deserialize(deserializer)?.join(",");
+    parse_sqlstate_patterns(&raw).ok_or_else(|| {
+        serde::de::Error::custom(format!(
+            "invalid db_errors_verbatim {raw:?}: expected {EXPECTED_SQLSTATES}"
+        ))
     })
+}
+
+/// Whether `code` is the SQLSTATE `pattern` names, or begins with the prefix
+/// a `*`-ended one does.
+fn sqlstate_matches(pattern: &str, code: &str) -> bool {
+    match pattern.strip_suffix('*') {
+        Some(prefix) => code.starts_with(prefix),
+        None => pattern == code,
+    }
 }
 
 /// Validate a namespace before it becomes part of generated GraphQL names.
@@ -703,7 +772,34 @@ impl AppConfig {
             }
         }
 
+        if let Ok(v) = get("PGRST_DB_ERRORS_VERBATIM") {
+            config.db_errors_verbatim = parse_sqlstate_patterns(&v)
+                .ok_or_else(|| invalid("PGRST_DB_ERRORS_VERBATIM", &v, EXPECTED_SQLSTATES))?;
+        }
+
         Ok(config)
+    }
+
+    /// Whether `error` is answered in the database's own words: a database
+    /// error, in compatibility mode or with a SQLSTATE
+    /// [`db_errors_verbatim`](Self::db_errors_verbatim) lists.
+    pub fn verbatim_db_error(&self, error: &crate::Error) -> bool {
+        match error {
+            crate::Error::Database(db) => {
+                self.compat_mode
+                    || self
+                        .db_errors_verbatim
+                        .iter()
+                        .any(|pattern| sqlstate_matches(pattern, &db.code))
+            }
+            _ => false,
+        }
+    }
+
+    /// Whether any database error can be answered in its own words, which is
+    /// what decides if a custom route's errors need rendering again.
+    pub fn any_verbatim_db_errors(&self) -> bool {
+        self.compat_mode || !self.db_errors_verbatim.is_empty()
     }
 
     /// Get the default schema (first in the list).
@@ -1069,6 +1165,62 @@ mod tests {
         assert!(config.db_prepared_statements);
         assert!(!config.graphql_federation);
         assert_eq!(config.graphql_type_prefix, None);
+    }
+
+    #[test]
+    fn db_errors_verbatim_takes_sqlstates_prefixes_and_booleans() {
+        let parse = |v: &str| {
+            AppConfig::try_from_vars([("PGRST_DB_ERRORS_VERBATIM", v)])
+                .map(|c| c.db_errors_verbatim)
+        };
+        assert_eq!(parse("P0001, pt*").unwrap(), ["P0001", "PT*"]);
+        assert_eq!(parse("true").unwrap(), ["*"]);
+        assert_eq!(parse("off").unwrap(), Vec::<String>::new());
+        assert_eq!(parse("").unwrap(), Vec::<String>::new());
+        for bad in ["P001", "P00011", "P0*01", "P0001*", "4250!"] {
+            assert!(parse(bad).is_err(), "{bad:?}");
+        }
+
+        // A configuration file is held to the same spellings.
+        let from_json = |v: &str| {
+            serde_json::from_str::<AppConfig>(&format!(r#"{{"db_errors_verbatim": {v}}}"#))
+                .map(|c| c.db_errors_verbatim)
+        };
+        assert_eq!(from_json(r#"["p0001", "PT*"]"#).unwrap(), ["P0001", "PT*"]);
+        assert_eq!(from_json(r#"["true"]"#).unwrap(), ["*"]);
+        assert!(from_json(r#"["P001"]"#).is_err());
+    }
+
+    #[test]
+    fn verbatim_db_error_matches_only_listed_database_errors() {
+        let db = |code: &str| {
+            crate::Error::Database(crate::error::DatabaseError {
+                code: code.to_string(),
+                message: String::new(),
+                details: None,
+                hint: None,
+                constraint: None,
+                table: None,
+                column: None,
+            })
+        };
+        let mut config = AppConfig::default();
+        assert!(!config.verbatim_db_error(&db("P0001")));
+        assert!(!config.any_verbatim_db_errors());
+
+        config.db_errors_verbatim = vec!["P0001".to_string(), "PT*".to_string()];
+        assert!(config.any_verbatim_db_errors());
+        assert!(config.verbatim_db_error(&db("P0001")));
+        assert!(config.verbatim_db_error(&db("PT402")));
+        assert!(!config.verbatim_db_error(&db("23505")));
+        assert!(!config.verbatim_db_error(&crate::Error::NotFound("t".to_string())));
+
+        config.db_errors_verbatim = vec!["*".to_string()];
+        assert!(config.verbatim_db_error(&db("42P01")));
+
+        config.db_errors_verbatim.clear();
+        config.compat_mode = true;
+        assert!(config.verbatim_db_error(&db("23505")));
     }
 
     #[test]

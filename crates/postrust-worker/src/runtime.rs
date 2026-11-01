@@ -126,14 +126,24 @@ async fn scheduled(_event: ScheduledEvent, env: Env, _ctx: ScheduleContext) {
 
 /// A request to the REST API.
 async fn rest(req: HttpRequest, env: &Env, settings: Settings) -> Response<Body> {
-    let verbatim = settings.config.compat_mode;
+    // Kept for answering a failure of `State::new`, which takes the settings:
+    // a schema that cannot be loaded is a database error like any other. Only
+    // what decides how it is answered, rather than the whole configuration.
+    let verbatim = (
+        settings.config.compat_mode,
+        settings.config.db_errors_verbatim.clone(),
+    );
     // Read before anything can answer: see `read_body`.
     let (parts, body) = req.into_parts();
     let body = read_body(body, settings.config.max_body_size).await;
     let (method, path) = (parts.method.clone(), parts.uri.path().to_string());
 
     let response = match State::new(env, settings).await {
-        Err(e) => postrust_engine::error_response(e, verbatim),
+        Err(e) => {
+            let mut config = AppConfig::default();
+            (config.compat_mode, config.db_errors_verbatim) = verbatim;
+            postrust_engine::error_response_for(&config, e)
+        }
         Ok(state) if method == Method::OPTIONS => preflight(&state, parts).await,
         Ok(state) => {
             let req = http::Request::from_parts(parts, body);
@@ -224,7 +234,7 @@ async fn preflight(state: &State, parts: http::request::Parts) -> Response<Bytes
             }
             response
         }
-        Err(e) => postrust_engine::error_response(e, state.config.compat_mode),
+        Err(e) => postrust_engine::error_response_for(&state.config, e),
     }
 }
 

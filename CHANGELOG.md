@@ -3,6 +3,27 @@
 Notable changes, newest first. This file starts at 1.0.0-alpha.1; earlier
 releases are described by their tags and the pull requests behind them.
 
+## 3.1.0
+
+Database errors in their own words, without compatibility mode. Nothing that
+worked before changes: the new setting is off until set. Released beside it:
+`postrust-worker` 1.2.0, which reads the same setting. `postrust-proxy` stays
+at 2.0.0.
+
+### Added
+
+- **`PGRST_DB_ERRORS_VERBATIM`** answers database errors in PostgreSQL's own
+  words -- SQLSTATE, message, detail and hint -- without the rest of
+  compatibility mode, so a function's `RAISE EXCEPTION '...'` reaches the
+  client instead of `"Database error"` while REST stays at `/api` and RPC
+  responses keep their default shape. `true` passes every database error
+  through; a list such as `P0001,PT*` only those SQLSTATEs, so faults like
+  `42P01` stay sanitised. Applies to REST, routes given to `Builder::nest`, and
+  the Worker. Compatibility mode still passes every one through.
+  `AppConfig` gains `db_errors_verbatim`, `verbatim_db_error` and
+  `any_verbatim_db_errors`, and `postrust_engine::error_response_for` answers
+  an error as a configuration says. (#72)
+
 ## 3.0.0
 
 Asymmetric JWTs and keys fetched from an identity provider, routes of your own

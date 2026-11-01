@@ -173,23 +173,34 @@ export default component$(() => {
         <div class="container-wide py-12">
           <div class="mb-4 flex items-center gap-3">
             <span class="rounded border border-neutral-200 bg-neutral-100 px-2 py-0.5 text-xs font-semibold text-neutral-800">
-              MAJOR
+              MINOR
             </span>
             <span class="text-sm text-neutral-500">
-              Rust API major &middot; HTTP API unchanged
+              database errors in their own words
             </span>
           </div>
           <h1 class="mb-4 text-4xl font-bold text-neutral-900">
             Postrust {LATEST}
           </h1>
           <p class="mb-4 max-w-2xl text-lg text-neutral-600">
-            Asymmetric JWTs and keys fetched from your identity provider, routes
-            of your own that run as their caller under row-level security, and
-            OpenTelemetry traces and metrics. A major release for the Rust API
-            -- sqlx 0.9, Rust 1.94 -- not for the HTTP one: a deployment that
-            runs the server or the image upgrades by changing the tag. It
-            carries 2.4.1&rsquo;s security fixes. Released beside it:{" "}
-            <code class="text-base">postrust-worker</code> 1.1.0 and{" "}
+            <code class="text-base">PGRST_DB_ERRORS_VERBATIM</code> answers
+            database errors in PostgreSQL&rsquo;s own words -- SQLSTATE,
+            message, detail and hint -- without the rest of compatibility mode,
+            so a function&rsquo;s <code class="text-base">RAISE EXCEPTION</code>{" "}
+            reaches the person using the app instead of &ldquo;Database
+            error&rdquo;. List the SQLSTATEs to pass through, such as{" "}
+            <code class="text-base">P0001,PT*</code>, or set it to{" "}
+            <code class="text-base">true</code> for all of them. Off by default;{" "}
+            <code class="text-base">postrust-worker</code> 1.2.0 reads it too.
+          </p>
+          <p class="mb-4 max-w-2xl text-lg text-neutral-600">
+            3.0.0: asymmetric JWTs and keys fetched from your identity provider,
+            routes of your own that run as their caller under row-level
+            security, and OpenTelemetry traces and metrics. A major release for
+            the Rust API -- sqlx 0.9, Rust 1.94 -- not for the HTTP one: a
+            deployment that runs the server or the image upgrades by changing
+            the tag. It carries 2.4.1&rsquo;s security fixes. Released beside
+            it: <code class="text-base">postrust-worker</code> 1.1.0 and{" "}
             <code class="text-base">postrust-proxy</code> 2.0.0, whose API takes
             a sqlx pool.
           </p>
@@ -276,12 +287,12 @@ export default component$(() => {
       <div class="container-wide py-12">
         <div class="max-w-3xl">
           <h2 class="mb-8 text-3xl font-bold text-neutral-900">
-            Postrust {LATEST}
+            Postrust 3.0.0
           </h2>
 
           <section class="mb-12">
             <h2 class="mb-4 text-2xl font-bold text-neutral-900">
-              Added in {LATEST}
+              Added in 3.0.0
             </h2>
             <div class="space-y-4">
               {added300.map((c) => (
@@ -295,7 +306,7 @@ export default component$(() => {
 
           <section class="mb-12">
             <h2 class="mb-4 text-2xl font-bold text-neutral-900">
-              Changed in {LATEST}
+              Changed in 3.0.0
             </h2>
             <div class="space-y-4">
               {changed300.map((c) => (
@@ -983,7 +994,7 @@ export const head: DocumentHead = {
   meta: [
     {
       name: "description",
-      content: `Postrust ${LATEST}: asymmetric JWTs and JWKS from your identity provider, routes of your own under row-level security, and OpenTelemetry.`,
+      content: `Postrust ${LATEST}: database errors in their own words with PGRST_DB_ERRORS_VERBATIM; 3.0.0 brought asymmetric JWTs and JWKS from your identity provider, routes of your own under row-level security, and OpenTelemetry.`,
     },
   ],
 };
