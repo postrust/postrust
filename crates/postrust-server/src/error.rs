@@ -25,9 +25,10 @@ use std::sync::{Arc, Mutex};
 ///
 /// The database's own account of an error -- its message, detail and hint,
 /// which name constraints and columns -- is passed through only where the
-/// REST API would pass it through: in compatibility mode (`PGRST_COMPAT_MODE`)
-/// or with `PGRST_DEBUG`. Compatibility mode is the server's configuration, which
-/// an error converted by `?` has no way to reach, so it is applied on the way
+/// REST API would pass it through: in compatibility mode (`PGRST_COMPAT_MODE`),
+/// for a SQLSTATE `PGRST_DB_ERRORS_VERBATIM` lists, or with `PGRST_DEBUG`. The
+/// first two are the server's configuration, which an error converted by `?`
+/// has no way to reach, so they are applied on the way
 /// out by the routers given to [`Builder::nest`](crate::Builder::nest). A
 /// router served some other way gets the sanitised body.
 pub struct Error(Box<postrust_core::Error>);
@@ -100,9 +101,10 @@ impl IntoResponse for Error {
             tracing::debug!("Custom route refused with {}: {}", self.status(), self.0);
         }
 
-        // Rendered sanitised, which is right unless the server is in
-        // compatibility mode. A database error -- the only kind compatibility
-        // mode renders differently -- rides along in the extensions as well,
+        // Rendered sanitised, which is right unless the server passes
+        // database errors through (compatibility mode, or
+        // `PGRST_DB_ERRORS_VERBATIM`). A database error -- the only kind
+        // either renders differently -- rides along in the extensions as well,
         // so that `render_verbatim`, which can see the configuration, can
         // render it again where it is. Never sent: extensions are not
         // serialised.
@@ -134,16 +136,17 @@ fn copy_of(db: &postrust_core::error::DatabaseError) -> postrust_core::error::Da
 }
 
 /// A database error a response was rendered from, sanitised, kept for
-/// [`render_verbatim`]. Only database errors are kept: compatibility mode
+/// [`render_verbatim`]. Only database errors are kept: passing them through
 /// changes how nothing else is rendered.
 #[derive(Clone)]
 struct Unrendered(Arc<Mutex<Option<postrust_core::Error>>>);
 
-/// Render a route's [`Error`] again with the database's own words, in
-/// compatibility mode.
+/// Render a route's [`Error`] again with the database's own words, where the
+/// configuration passes its SQLSTATE through.
 ///
 /// A layer on each router given to [`Builder::nest`](crate::Builder::nest)
-/// when compatibility mode is on, and only then.
+/// when compatibility mode is on or `PGRST_DB_ERRORS_VERBATIM` lists any
+/// SQLSTATE, and only then.
 pub(crate) async fn render_verbatim(
     State(state): State<Arc<AppState>>,
     mut response: Response,
@@ -157,8 +160,7 @@ pub(crate) async fn render_verbatim(
         // changes, and the status and headers are kept as they left the
         // route -- including any a layer of the route's own added.
         Some(error) => {
-            let (_, body) =
-                postrust_engine::error_response(error, state.config.compat_mode).into_parts();
+            let (_, body) = postrust_engine::error_response_for(&state.config, error).into_parts();
             let (parts, _) = response.into_parts();
             Response::from_parts(parts, axum::body::Body::from(body))
         }

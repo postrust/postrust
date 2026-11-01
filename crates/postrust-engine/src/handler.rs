@@ -52,8 +52,6 @@ where
 
     debug!("{} {}", method, path);
 
-    let verbatim_db_errors = state.config().compat_mode;
-
     // What a 405 needs to say what the resource does take: the address and
     // the schema it was asked in, which are all `allow` reads. Kept before the
     // request is consumed; both are cheap to clone.
@@ -66,7 +64,7 @@ where
     match process_request(state, request).await {
         Ok(response) => response,
         Err(e) => {
-            let mut response = error_response(e, verbatim_db_errors);
+            let mut response = error_response_for(state.config(), e);
             // A 405 must carry `Allow` (RFC 9110, section 15.5.6), and it is
             // the answer an OPTIONS on the same resource gives -- whichever
             // refusal it was: a function called with the wrong method, a PUT
@@ -3677,11 +3675,28 @@ fn build_response(response: PgrstResponse) -> Response<Bytes> {
 /// `verbatim_db_errors` passes a database failure through as PostgreSQL
 /// reported it -- its SQLSTATE, message, detail and hint -- which is what
 /// PostgREST does and what a client written against PostgREST branches on.
-/// It is off unless compatibility mode is on, because those fields describe
-/// the schema rather than the request: a constraint's name, a column that was
-/// not selected, the text of a failing query. Everything else is reported the
+/// [`AppConfig::verbatim_db_error`](postrust_core::AppConfig::verbatim_db_error)
+/// decides it: off unless compatibility mode is on or the SQLSTATE is one
+/// `PGRST_DB_ERRORS_VERBATIM` lists, because those fields mostly describe the
+/// schema rather than the request: a constraint's name, a column that was not
+/// selected, the text of a failing query. Everything else is reported the
 /// same either way.
 pub fn error_response(error: postrust_core::Error, verbatim_db_errors: bool) -> Response<Bytes> {
+    error_response_with(error, verbatim_db_errors)
+}
+
+/// Build the response for a failed request as `config` says database errors
+/// are answered: compatibility mode and `PGRST_DB_ERRORS_VERBATIM` both
+/// decided here, so a caller holding the configuration cannot leave one out.
+pub fn error_response_for(
+    config: &postrust_core::AppConfig,
+    error: postrust_core::Error,
+) -> Response<Bytes> {
+    let verbatim_db_errors = config.verbatim_db_error(&error);
+    error_response_with(error, verbatim_db_errors)
+}
+
+fn error_response_with(error: postrust_core::Error, verbatim_db_errors: bool) -> Response<Bytes> {
     let status = error.status_code();
 
     // Check if debug mode is enabled
@@ -3903,6 +3918,29 @@ mod tests {
                 column: None,
             },
         )
+    }
+
+    /// Every host answers through `error_response_for`, so this is where
+    /// `PGRST_DB_ERRORS_VERBATIM` is held to: a listed SQLSTATE in its own
+    /// words, any other sanitised.
+    #[test]
+    fn error_response_for_passes_through_only_listed_sqlstates() {
+        let body = |config: &postrust_core::AppConfig, code: &str| {
+            let error = postrust_core::Error::from(reported(code, "the covered area is required"));
+            let response = super::error_response_for(config, error);
+            serde_json::from_slice::<serde_json::Value>(response.body()).unwrap()
+        };
+        let mut config = postrust_core::AppConfig::default();
+        config.db_errors_verbatim = vec!["P0001".to_string()];
+
+        let listed = body(&config, "P0001");
+        assert_eq!(listed["code"], "P0001");
+        assert_eq!(listed["message"], "the covered area is required");
+        let unlisted = body(&config, "23505");
+        assert_eq!(unlisted["message"], "Database error");
+        assert_ne!(unlisted["code"], "23505");
+        let default = body(&postrust_core::AppConfig::default(), "P0001");
+        assert_eq!(default["message"], "Database error");
     }
 
     #[test]

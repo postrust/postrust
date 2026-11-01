@@ -290,6 +290,7 @@ where the two differ deliberately.
 | Variable | Description | Default |
 |----------|-------------|---------|
 | `PGRST_COMPAT_MODE` | PostgREST compatibility mode (alias: `POSTRUST_COMPAT_MODE`) | `false` |
+| `PGRST_DB_ERRORS_VERBATIM` | Database errors answered in PostgreSQL's own words, without the rest of compatibility mode: `true` for all of them, or a comma-separated list of SQLSTATEs and prefixes ending in `*`, such as `P0001,PT*`. See below | `false` |
 
 Setting `PGRST_COMPAT_MODE=true` makes the API behave more like PostgREST:
 
@@ -301,6 +302,9 @@ Setting `PGRST_COMPAT_MODE=true` makes the API behave more like PostgREST:
   un-wrapped: a non-set-returning function returns its bare object/scalar
   (`{...}` / `42`) and a set-returning function returns a top-level array,
   instead of the default `[{"<name>": ...}]` shape.
+- **Database errors in PostgreSQL's words.** Every database error is
+  answered with its own SQLSTATE, message, detail and hint, as
+  `PGRST_DB_ERRORS_VERBATIM=true` does.
 
 ```bash
 # Default mode
@@ -348,6 +352,39 @@ responses.
 This is opt-in so existing deployments keep their current behavior. See
 "Differences from PostgREST" in the README for the remaining intentional
 differences.
+
+### Database errors in their own words
+
+Outside compatibility mode a database error reaches the client as
+`"message": "Database error"`, with a Postrust code, because most of what
+PostgreSQL says describes the schema rather than the request: a constraint's
+name, a table that is missing. Its `details` and `hint` are passed through
+either way. That includes the refusals a function raises on
+purpose for the person using the app:
+
+```sql
+RAISE EXCEPTION 'the covered area is required' USING ERRCODE = 'P0001';
+```
+
+`PGRST_DB_ERRORS_VERBATIM` lists the SQLSTATEs that are answered as
+PostgreSQL reported them, the way PostgREST answers every one, and changes
+nothing else: paths and RPC response shapes stay as they are.
+
+```bash
+PGRST_DB_ERRORS_VERBATIM=P0001,PT*
+curl -X POST http://localhost:3000/api/rpc/submit
+# -> 400 {"code":"P0001","message":"the covered area is required","details":null,"hint":null}
+```
+
+Each entry is a five-character SQLSTATE or a prefix ending in `*`; `*` alone,
+or `true`, is every database error. Listing only the codes your functions
+raise -- `P0001` is a bare `RAISE EXCEPTION` -- keeps the code and message of
+faults such as `42P01` (no such table) or `23505` (naming the unique
+constraint) sanitised. Their `details` and `hint` are not: a `23505` still
+carries PostgreSQL's `Key (email)=(...) already exists.` A value
+that is none of these stops start-up. The status is decided by the SQLSTATE
+either way, and a refusal raised with `sqlstate 'PGRST'` is unaffected: it
+always answers with the response the function wrote.
 
 ## Logging Settings
 

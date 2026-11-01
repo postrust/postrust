@@ -356,8 +356,9 @@ or foreign-key violation is 409, a missing grant (`42501`) 401, a bare
 `RAISE EXCEPTION` 400, a function's `RAISE sqlstate 'PGRST'` the status,
 headers and body it wrote; a connection that broke mid-statement is 503, and
 one that could not be had from the pool in time is 500 (`PGRST500`). The database's own message, detail and hint are sanitised as
-REST sanitises them, and passed through in compatibility mode -- for the
-routers given to `Builder::nest`, which is where the server can see the
+REST sanitises them, and passed through where REST passes them through -- in
+compatibility mode, or for a SQLSTATE `PGRST_DB_ERRORS_VERBATIM` lists -- for
+the routers given to `Builder::nest`, which is where the server can see the
 setting.
 
 ## Accessing Application State

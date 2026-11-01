@@ -11,7 +11,7 @@ use axum::{
     extract::{Request, State},
     response::Response,
 };
-use postrust_engine::error_response;
+use postrust_engine::error_response_for;
 use std::sync::Arc;
 
 /// Main request handler.
@@ -184,8 +184,6 @@ pub async fn options_allow(
         return next.run(request).await;
     };
 
-    let verbatim_db_errors = state.config.compat_mode;
-
     // Built here, from borrows, before anything is awaited: `axum::body::Body`
     // is `Send` but not `Sync`, and `&T` is `Send` only where `T` is `Sync`, so
     // a `&Request` held across an await makes the whole future not `Send` --
@@ -208,7 +206,7 @@ pub async fn options_allow(
         // Asking what may be done with a table that is not there is answered
         // the same way as asking for the table.
         Err(error) => {
-            let mut refusal = error_response(error, verbatim_db_errors).map(Body::from);
+            let mut refusal = error_response_for(&state.config, error).map(Body::from);
             // The CORS layer wrote its headers on the response this replaces.
             // Without them a browser reports the request as blocked by CORS
             // rather than as the 404 it earned, which is a different thing to
