@@ -158,9 +158,11 @@ const fixed = [
     body: "Enum labels were looked up by type name alone, so same-named enums in two schemas could swap labels, and PostgREST's own fixture — which declares an enum named bit — had its bit(5) column reported as an enum of one and two. A table's description was looked up by OID alone, so a function that happened to share the table's OID lent it its comment. Both are now looked up on the object itself.",
   },
   {
-    title:
-      "[Superseded in 2.3.0] 2.2.0 note on Cloudflare Workers adapter status",
-    body: "[Superseded in 2.3.0 — postrust-worker now builds to wasm32-unknown-unknown and serves the REST API over Cloudflare Hyperdrive; see /docs/workers/.] In 2.2.0, the docs were updated to clarify that postrust-worker had not yet been wired to Hyperdrive prior to the 2.3.0 release.",
+    title: "The documentation stops promising a Workers adapter",
+    body: "The docs and website described Cloudflare Workers support with Hyperdrive that compiles to WebAssembly. postrust-worker is a stub that answers that it is a stub, and does not currently build for WebAssembly; the pages now say so, and what it will take.",
+    // What this release said stays as it said it; the note says what changed.
+    superseded:
+      "Superseded in 2.3.0: postrust-worker builds to wasm32 and serves the REST API over Hyperdrive.",
   },
 ];
 
@@ -174,17 +176,28 @@ export default component$(() => {
         <div class="container-wide py-12">
           <div class="mb-4 flex items-center gap-3">
             <span class="rounded border border-neutral-200 bg-neutral-100 px-2 py-0.5 text-xs font-semibold text-neutral-800">
-              PATCH
+              MINOR
             </span>
             <span class="text-sm text-neutral-500">
-              type-level @shareable in Federation &amp; crate docs links
+              @shareable once per shared type, and hyper 1.12
             </span>
           </div>
           <h1 class="mb-4 text-4xl font-bold text-neutral-900">
             Postrust {LATEST}
           </h1>
           <p class="mb-4 max-w-2xl text-lg text-neutral-600">
-            Shared Apollo Federation entity types now emit{" "}
+            A shared Apollo Federation entity type now says{" "}
+            <code class="text-base">@shareable</code> once, on the type, and no
+            longer repeats it on each of its fields: a type-level{" "}
+            <code class="text-base">@shareable</code> already covers every field
+            on the type, so the supergraph composes the same. hyper moves to
+            1.12, which drops the unmaintained{" "}
+            <code class="text-base">pin-utils</code> (RUSTSEC-2026-0441) from
+            the build. <code class="text-base">postrust-worker</code> 1.2.1 and{" "}
+            <code class="text-base">postrust-proxy</code> 2.0.1 are unchanged.
+          </p>
+          <p class="mb-4 max-w-2xl text-lg text-neutral-600">
+            3.1.1: shared Apollo Federation entity types emit{" "}
             <code class="text-base">@shareable</code> on the object type (
             <code class="text-base">
               type Product @key(fields: &quot;id&quot;) @shareable
@@ -710,6 +723,18 @@ export default component$(() => {
                         {c.title}
                       </h3>
                       <p class="text-sm text-neutral-600">{c.body}</p>
+                      {c.superseded && (
+                        <p class="mt-2 text-sm text-neutral-500">
+                          [{c.superseded}{" "}
+                          <Link
+                            href="/docs/workers/"
+                            class="text-primary-600 hover:underline"
+                          >
+                            Cloudflare Workers docs
+                          </Link>
+                          .]
+                        </p>
+                      )}
                     </div>
                   ))}
                 </div>
@@ -1054,7 +1079,7 @@ export const head: DocumentHead = {
   meta: [
     {
       name: "description",
-      content: `Postrust ${LATEST}: database errors in their own words with PGRST_DB_ERRORS_VERBATIM; 3.0.0 brought asymmetric JWTs and JWKS from your identity provider, routes of your own under row-level security, and OpenTelemetry.`,
+      content: `Postrust ${LATEST}: one type-level @shareable per shared Federation entity, and hyper 1.12. 3.1 brought database errors in their own words with PGRST_DB_ERRORS_VERBATIM; 3.0.0 brought asymmetric JWTs and JWKS from your identity provider, routes of your own under row-level security, and OpenTelemetry.`,
     },
   ],
 };

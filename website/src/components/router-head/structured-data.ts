@@ -61,9 +61,16 @@ export const isIndex = (pathname: string) =>
   pathname === "/blog/" ||
   pathname === "/compare/";
 
-/** A docs page, guide, or blog post, which is written as a technical article. */
+/** A docs page, guide, or blog post: an article, for Open Graph's purposes. */
 export const isArticle = (pathname: string) =>
   /^\/(docs|guides|blog)\/./.test(pathname);
+
+/**
+ * A blog post, which carries a BlogPosting of its own (`postHead`) with its
+ * author and publication date. A TechArticle beside it would be a second,
+ * disagreeing article for the same page.
+ */
+const isBlogPost = (pathname: string) => /^\/blog\/./.test(pathname);
 
 /** The page's title without the " - Postrust …" suffix every title carries. */
 const headline = (title: string) =>
@@ -133,7 +140,7 @@ export const structuredData = (
       publisher: { "@id": ORG_ID },
       inLanguage: "en",
     });
-  } else if (isArticle(pathname)) {
+  } else if (isArticle(pathname) && !isBlogPost(pathname)) {
     const modified = lastModified(pathname);
     graph.push({
       "@type": "TechArticle",

@@ -618,9 +618,9 @@ Mark a table as shared when another subgraph also owns the same entity:
 A shared table keeps its unprefixed object type, for example `users @key(...)`.
 Its root fields and helper types still use the prefix, for example
 `billing_users`, `billing_users_bool_exp` and `billing_users_aggregate`.
-Its non-key columns, computed fields, relationships and relationship aggregates
-are marked `@shareable` so another subgraph may resolve the same fields. Key
-columns are implicitly shareable through `@key`.
+The type is marked `@shareable` (`type users @key(fields: "id") @shareable`),
+which covers every field on it -- columns, computed fields, relationships and
+relationship aggregates -- so another subgraph may resolve the same fields.
 
 Entity representations are checked against each key field's GraphQL type
 before a database query is run. A field exposed as `Int` requires a JSON

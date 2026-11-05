@@ -1817,12 +1817,6 @@ fn create_object_type(
         } else {
             gql_field
         };
-        let gql_field = if entity_is_shared && !field.is_pk {
-            gql_field.shareable()
-        } else {
-            gql_field
-        };
-
         fields.push((field.name.clone(), gql_field));
     }
 
@@ -1914,12 +1908,6 @@ fn create_object_type(
         } else {
             gql_field
         };
-        let gql_field = if entity_is_shared {
-            gql_field.shareable()
-        } else {
-            gql_field
-        };
-
         fields.push((rel.name.clone(), gql_field));
 
         // `author { articles_aggregate { aggregate { count } } }` -- the count
@@ -1987,11 +1975,6 @@ fn create_object_type(
                             TypeRef::named_nn(computed_args_type_name(&obj.local_name, &rel.name)),
                         )),
                     ));
-                }
-                if entity_is_shared {
-                    let last = fields.len() - 1;
-                    let (name, field) = fields.remove(last);
-                    fields.push((name, field.shareable()));
                 }
             }
         }
@@ -10496,7 +10479,7 @@ mod tests {
     }
 
     #[test]
-    fn shared_entities_make_relationship_fields_shareable() {
+    fn shared_entities_are_shareable_at_the_type_level() {
         let federation_sdl = |shared: bool| {
             let mut cache = create_test_schema_cache();
             add_test_table(&mut cache, "posts");
@@ -10528,32 +10511,31 @@ mod tests {
             .sdl_with_options(async_graphql::SDLExportOptions::new().federation())
         };
 
+        // `@shareable` on the type covers every field on it, relationships
+        // and their aggregates included, so it is not repeated per field.
         let shared = federation_sdl(true);
         assert!(
-            shared.contains("): [test_posts!]! @shareable"),
-            "shared relationship field:\n{shared}"
+            shared.contains("type users @key(fields: \"id\") @shareable"),
+            "shared entity type:\n{shared}"
         );
         assert!(
-            shared.contains("): test_posts_aggregate! @shareable"),
-            "shared relationship aggregate field:\n{shared}"
+            shared.contains("): [test_posts!]!") && shared.contains("): test_posts_aggregate!"),
+            "shared relationship fields:\n{shared}"
+        );
+        assert!(
+            !shared.contains("): [test_posts!]! @shareable")
+                && !shared.contains("): test_posts_aggregate! @shareable"),
+            "field-level @shareable is redundant under a shareable type:\n{shared}"
         );
 
         let not_shared = federation_sdl(false);
         assert!(
-            not_shared.contains("): [test_posts!]!"),
-            "non-shared relationship field:\n{not_shared}"
+            not_shared.contains("type test_users @key(fields: \"id\") {"),
+            "non-shared entity type must not be shareable:\n{not_shared}"
         );
         assert!(
-            !not_shared.contains("): [test_posts!]! @shareable"),
-            "non-shared relationship field must not be shareable:\n{not_shared}"
-        );
-        assert!(
-            not_shared.contains("): test_posts_aggregate!"),
-            "non-shared relationship aggregate field:\n{not_shared}"
-        );
-        assert!(
-            !not_shared.contains("): test_posts_aggregate! @shareable"),
-            "non-shared relationship aggregate must not be shareable:\n{not_shared}"
+            !not_shared.contains(" @shareable"),
+            "nothing in a schema without shared entities is shareable:\n{not_shared}"
         );
     }
 

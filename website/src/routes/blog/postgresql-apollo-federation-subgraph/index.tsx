@@ -221,8 +221,8 @@ CREATE POLICY everything ON reviews FOR SELECT TO editor USING (true);`}
         lang="graphql"
         code={`type Product @key(fields: "id") @shareable {
   id: Int!
-  name: String! @shareable
-  price_cents: Int! @shareable
+  name: String!
+  price_cents: Int!
 }`}
       />
       <Code
@@ -230,16 +230,16 @@ CREATE POLICY everything ON reviews FOR SELECT TO editor USING (true);`}
         lang="graphql"
         code={`type Product @key(fields: "id") @shareable {
   id: Int!
-  reviews(...): [reviews_Review!]! @shareable
-  reviews_aggregate(...): ... @shareable
+  reviews(...): [reviews_Review!]!
+  reviews_aggregate(...): ...
 }`}
       />
     </CodePair>
     <p class={p}>
-      The shared type and every non-key field on it are marked{" "}
-      <code class={code}>@shareable</code>, which lets either subgraph resolve a
-      field if both happen to have it. Here they don&rsquo;t, so each field has
-      exactly one owner.
+      The shared type is marked <code class={code}>@shareable</code>, which
+      covers every field on it and lets either subgraph resolve a field if both
+      happen to have it. Here they don&rsquo;t, so each field has exactly one
+      owner.
     </p>
 
     <h2 class={h2}>Composing and routing</h2>
@@ -489,9 +489,9 @@ docker compose up --wait catalog reviews && docker compose up -d router
       <li>federated tracing.</li>
     </ul>
     <p class={p}>
-      Shared types emit <code class={code}>@shareable</code> both on the object
-      type and on each non-key field, satisfying the compatibility suite&rsquo;s
-      type-level <code class={code}>@shareable</code> check.
+      Shared types emit <code class={code}>@shareable</code> on the object type,
+      which covers each of its fields and satisfies the compatibility
+      suite&rsquo;s type-level <code class={code}>@shareable</code> check.
     </p>
     <p class={p}>
       The details are in the{" "}

@@ -3,6 +3,28 @@
 Notable changes, newest first. This file starts at 1.0.0-alpha.1; earlier
 releases are described by their tags and the pull requests behind them.
 
+## 3.2.0
+
+A shared Apollo Federation entity type says `@shareable` once, on the type,
+and hyper moves to 1.12. `postrust-worker` 1.2.1 and `postrust-proxy` 2.0.1
+are unchanged and are not republished.
+
+### Changed
+
+- **`@shareable` is emitted once per shared entity type**
+  (`type Product @key(fields: "id") @shareable`) and no longer repeated on
+  each of its fields, relationships and aggregates. Federation v2 reads a
+  type-level `@shareable` as applying to every field on the type, so the
+  supergraph composes exactly as it did; only the SDL is shorter. A test that
+  matched `@shareable` on an individual field of a shared type will need to
+  match it on the type instead.
+
+### Security
+
+- **hyper 1.8.1 → 1.12.0**, which no longer depends on `pin-utils`, reported
+  unmaintained in RUSTSEC-2026-0441. `cargo audit --deny warnings` is clean
+  again with no new entry in `.cargo/audit.toml`.
+
 ## 3.1.1
 
 Shared Apollo Federation entity types now carry `@shareable` on the object type

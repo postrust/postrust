@@ -28,7 +28,7 @@ export const head: DocumentHead = {
     {
       name: "description",
       content:
-        "Expose your PostgreSQL schema as a fast, PostgREST- and Hasura-compatible REST & GraphQL API from one 3 MB Rust binary. Run on Docker, AWS Lambda, or Cloudflare Workers.",
+        "Expose your PostgreSQL schema as a fast, PostgREST- and Hasura-compatible REST & GraphQL API from one Rust binary under 5 MiB. Run on Docker, AWS Lambda, or Cloudflare Workers.",
     },
     {
       name: "keywords",
@@ -42,7 +42,7 @@ export const head: DocumentHead = {
     {
       property: "og:description",
       content:
-        "Expose your PostgreSQL schema as a fast, PostgREST- and Hasura-compatible REST & GraphQL API from one 3 MB Rust binary. Run on Docker, AWS Lambda, or Cloudflare Workers.",
+        "Expose your PostgreSQL schema as a fast, PostgREST- and Hasura-compatible REST & GraphQL API from one Rust binary under 5 MiB. Run on Docker, AWS Lambda, or Cloudflare Workers.",
     },
     {
       property: "og:type",
@@ -63,7 +63,7 @@ export const head: DocumentHead = {
     {
       name: "twitter:description",
       content:
-        "Expose your PostgreSQL schema as a fast, PostgREST- and Hasura-compatible REST & GraphQL API from one 3 MB Rust binary. Run on Docker, AWS Lambda, or Cloudflare Workers.",
+        "Expose your PostgreSQL schema as a fast, PostgREST- and Hasura-compatible REST & GraphQL API from one Rust binary under 5 MiB. Run on Docker, AWS Lambda, or Cloudflare Workers.",
     },
   ],
 };

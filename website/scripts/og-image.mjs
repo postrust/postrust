@@ -1,7 +1,7 @@
 // Renders public/og.png and page-specific 1200x630 OpenGraph cards in
 // public/og/<slug>.png. Run with `node scripts/og-image.mjs` after changing
 // page titles or adding routes.
-import { mkdirSync } from "node:fs";
+import { mkdirSync, writeFileSync } from "node:fs";
 import { createRequire } from "node:module";
 const require = createRequire(import.meta.url);
 const sharp = require("sharp");
@@ -12,6 +12,16 @@ const esc = (s) =>
     .replace(/</g, "&lt;")
     .replace(/>/g, "&gt;")
     .replace(/"/g, "&quot;");
+
+// The card is drawn as single-line SVG text, which never wraps: a line wider
+// than the canvas is cut off at the edge. So each line is given the largest
+// font size, up to its design size, at which it fits the 1040px between the
+// margins. The per-character widths are DejaVu Sans averages, rounded up.
+const TEXT_WIDTH = 1040;
+const fit = (text, size, emPerChar) =>
+  Math.min(size, Math.floor(TEXT_WIDTH / (text.length * emPerChar)));
+const BOLD_EM = 0.64;
+const REGULAR_EM = 0.54;
 
 function renderSvg({ badge, line1, line2, subtitle, path }) {
   return `<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="630" viewBox="0 0 1200 630">
@@ -28,13 +38,13 @@ function renderSvg({ badge, line1, line2, subtitle, path }) {
   <text x="192" y="140" font-family="DejaVu Sans, Arial, sans-serif" font-size="48" font-weight="700" fill="#ffffff">Postrust</text>
   ${
     badge
-      ? `<rect x="415" y="102" width="${Math.max(120, badge.length * 16 + 36)}" height="46" rx="23" fill="#262626" stroke="#404040" stroke-width="1.5"/>
-  <text x="433" y="132" font-family="DejaVu Sans, Arial, sans-serif" font-size="22" font-weight="600" fill="#f5912c">${esc(badge)}</text>`
+      ? `<rect x="444" y="102" width="${Math.max(120, badge.length * 16 + 36)}" height="46" rx="23" fill="#262626" stroke="#404040" stroke-width="1.5"/>
+  <text x="462" y="132" font-family="DejaVu Sans, Arial, sans-serif" font-size="22" font-weight="600" fill="#f5912c">${esc(badge)}</text>`
       : ""
   }
-  <text x="80" y="305" font-family="DejaVu Sans, Arial, sans-serif" font-size="56" font-weight="700" fill="#ffffff">${esc(line1)}</text>
-  <text x="80" y="382" font-family="DejaVu Sans, Arial, sans-serif" font-size="56" font-weight="700" fill="#f5912c">${esc(line2)}</text>
-  <text x="80" y="485" font-family="DejaVu Sans, Arial, sans-serif" font-size="28" fill="#a3a3a3">${esc(subtitle)}</text>
+  <text x="80" y="305" font-family="DejaVu Sans, Arial, sans-serif" font-size="${fit(line1, 56, BOLD_EM)}" font-weight="700" fill="#ffffff">${esc(line1)}</text>
+  <text x="80" y="382" font-family="DejaVu Sans, Arial, sans-serif" font-size="${fit(line2, 56, BOLD_EM)}" font-weight="700" fill="#f5912c">${esc(line2)}</text>
+  <text x="80" y="485" font-family="DejaVu Sans, Arial, sans-serif" font-size="${fit(subtitle, 28, REGULAR_EM)}" fill="#a3a3a3">${esc(subtitle)}</text>
   <text x="80" y="555" font-family="DejaVu Sans, Arial, sans-serif" font-size="24" fill="#737373">postrust.org${esc(path)} · open source (MIT)</text>
 </svg>`;
 }
@@ -43,11 +53,11 @@ const cards = [
   {
     slug: "",
     path: "",
-    badge: "3.1 · Rust",
+    badge: "3.2 · Rust",
     line1: "PostgreSQL as REST and",
     line2: "GraphQL APIs, in Rust",
     subtitle:
-      "One 3 MB binary · Docker · Kubernetes · AWS Lambda · Cloudflare Workers",
+      "One small binary · Docker · Kubernetes · AWS Lambda · Cloudflare Workers",
   },
   {
     slug: "features",
@@ -98,7 +108,7 @@ const cards = [
     slug: "releases",
     path: "/releases/",
     badge: "Changelog",
-    line1: "Postrust 3.1 Release",
+    line1: "Postrust 3.2 Release",
     line2: "Notes & Changelog",
     subtitle:
       "Verbatim PostgreSQL errors · JWKS rotation · Custom Rust routes · Workers over Hyperdrive",
@@ -126,7 +136,7 @@ const cards = [
     path: "/compare/hasura/",
     badge: "Comparison",
     line1: "Postrust vs Hasura",
-    line2: "97% Conformance in 3 MB",
+    line2: "97% Conformance, One Binary",
     subtitle:
       "454 / 468 Hasura test cases · Same GraphQL dialect · 25 MB vs 623 MB RAM",
   },
@@ -245,7 +255,7 @@ const cards = [
     line1: "Deploy on Docker, K8s",
     line2: "& AWS Lambda",
     subtitle:
-      "Single 3 MB binary · Container images · cargo-lambda adapter tested in AL2023",
+      "Single static binary · Container images · cargo-lambda adapter tested in AL2023",
   },
   {
     slug: "docs-workers",
@@ -386,4 +396,10 @@ for (const card of cards) {
       : `${outDir}${card.slug}.png`;
   await sharp(Buffer.from(svg)).png().toFile(dest);
 }
+// The page head links /og/<slug>.png only for a slug listed here, and falls
+// back to /og.png otherwise, so a route added without a card still has one.
+writeFileSync(
+  new URL("../src/data/og-cards.json", import.meta.url),
+  JSON.stringify(cards.map((c) => c.slug).filter(Boolean), null, 2) + "\n",
+);
 console.log(`Generated ${cards.length} OpenGraph images.`);
