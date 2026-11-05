@@ -17,6 +17,16 @@ Most users want the `postrust` binary from `postrust-server`, not this crate.
 | [`postrust-auth`](https://crates.io/crates/postrust-auth) | JWT authentication | [docs.rs](https://docs.rs/postrust-auth) |
 | [`postrust-response`](https://crates.io/crates/postrust-response) | Response formatting | [docs.rs](https://docs.rs/postrust-response) |
 
+## Links
+
+- Website: https://postrust.org/
+- Documentation: https://postrust.org/docs/
+- REST API Reference: https://postrust.org/docs/api-reference/
+- Cloudflare Workers Adapter: https://postrust.org/docs/workers/
+- PostgREST Conformance: https://postrust.org/docs/conformance/postgrest/
+- Repository: https://github.com/postrust/postrust
+- API docs for this crate: https://docs.rs/postrust-engine
+
 ## License
 
 MIT

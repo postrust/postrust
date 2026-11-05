@@ -24,8 +24,8 @@ const codeExamples = [
     examples: [
       {
         title: "Query with Filters",
-        code: `# Get active users with pagination
-curl "localhost:3000/users?status=eq.active&limit=10&offset=0"
+        code: `# Get active users with pagination (default /api prefix, or / with PGRST_COMPAT_MODE=true)
+curl "localhost:3000/api/users?status=eq.active&limit=10&offset=0"
 
 # Response
 [
@@ -36,7 +36,7 @@ curl "localhost:3000/users?status=eq.active&limit=10&offset=0"
       {
         title: "Nested Resources",
         code: `# Get orders with customer and items
-curl "localhost:3000/orders?select=*,customer(name,email),items(product(name,price))"
+curl "localhost:3000/api/orders?select=*,customer(name,email),items(product(name,price))"
 
 # Response
 [{
@@ -90,24 +90,24 @@ curl "localhost:3000/orders?select=*,customer(name,email),items(product(name,pri
       {
         title: "Create & Update",
         code: `# Insert a new product
-curl -X POST "localhost:3000/products" \\
+curl -X POST "localhost:3000/api/products" \\
   -H "Content-Type: application/json" \\
   -d '{"name": "Widget", "price": 29.99, "stock": 100}'
 
 # Update with filters (PATCH)
-curl -X PATCH "localhost:3000/products?id=eq.1" \\
+curl -X PATCH "localhost:3000/api/products?id=eq.1" \\
   -H "Content-Type: application/json" \\
   -d '{"price": 24.99}'`,
       },
       {
         title: "Upsert & Delete",
         code: `# Upsert (insert or update on conflict)
-curl -X POST "localhost:3000/products" \\
+curl -X POST "localhost:3000/api/products" \\
   -H "Prefer: resolution=merge-duplicates" \\
   -d '{"sku": "WDG-001", "name": "Widget Pro", "price": 39.99}'
 
 # Delete with filters
-curl -X DELETE "localhost:3000/products?status=eq.discontinued"`,
+curl -X DELETE "localhost:3000/api/products?status=eq.discontinued"`,
       },
     ],
   },
@@ -119,7 +119,7 @@ curl -X DELETE "localhost:3000/products?status=eq.discontinued"`,
         title: "JWT Authentication",
         code: `# Include JWT in Authorization header
 curl -H "Authorization: Bearer eyJhbGciOiJIUzI1NiIs..." \\
-  "localhost:3000/users"
+  "localhost:3000/api/users"
 
 # JWT payload for PostgreSQL RLS
 {
@@ -147,10 +147,10 @@ CREATE POLICY user_isolation ON orders
       {
         title: "Aggregations",
         code: `# Count orders by status
-curl "localhost:3000/orders?select=status,count()&group=status"
+curl "localhost:3000/api/orders?select=status,count()&group=status"
 
 # Sum and average
-curl "localhost:3000/order_items?select=product_id,sum(quantity),avg(price)"
+curl "localhost:3000/api/order_items?select=product_id,sum(quantity),avg(price)"
 
 # Response
 [
@@ -161,7 +161,7 @@ curl "localhost:3000/order_items?select=product_id,sum(quantity),avg(price)"
       {
         title: "Stored Procedures (RPC)",
         code: `# Call a PostgreSQL function
-curl -X POST "localhost:3000/rpc/calculate_shipping" \\
+curl -X POST "localhost:3000/api/rpc/calculate_shipping" \\
   -H "Content-Type: application/json" \\
   -d '{"order_id": 123, "destination": "US"}'
 
@@ -210,7 +210,7 @@ subscription {
       {
         title: "Semantic Search",
         code: `# Find similar documents using embeddings
-curl "localhost:3000/documents?select=id,title,content&embedding=lt.0.5&order=embedding.asc"
+curl "localhost:3000/api/documents?select=id,title,content&embedding=lt.0.5&order=embedding.asc"
 
 # Or via GraphQL with vector distance
 query {
@@ -234,7 +234,7 @@ CREATE TABLE documents (
 CREATE INDEX ON documents USING ivfflat (embedding vector_cosine_ops);
 
 # Query similar content for LLM context
-curl "localhost:3000/rpc/search_similar" \\
+curl "localhost:3000/api/rpc/search_similar" \\
   -d '{"query_embedding": [0.1, 0.2, ...], "limit": 5}'`,
       },
     ],

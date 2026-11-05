@@ -7,7 +7,7 @@ license.workspace = true
 repository.workspace = true
 authors.workspace = true
 description = "GraphQL API and realtime subscriptions generated from a PostgreSQL schema"
-homepage.workspace = true
+homepage = "https://postrust.org/docs/graphql/"
 readme = "README.md"
 keywords = ["graphql", "postgres", "subscriptions", "api", "realtime"]
 

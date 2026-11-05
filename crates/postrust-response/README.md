@@ -32,7 +32,9 @@ published as a set of crates so you can depend on only the part you need:
 ## Links
 
 - Website: https://postrust.org/
-- Documentation: https://postrust.org/docs
+- Documentation: https://postrust.org/docs/
+- REST API Reference: https://postrust.org/docs/api-reference/
+- PostgREST Conformance: https://postrust.org/docs/conformance/postgrest/
 - Repository: https://github.com/postrust/postrust
 - API docs for this crate: https://docs.rs/postrust-response
 

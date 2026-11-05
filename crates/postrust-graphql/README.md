@@ -32,7 +32,13 @@ published as a set of crates so you can depend on only the part you need:
 ## Links
 
 - Website: https://postrust.org/
-- Documentation: https://postrust.org/docs
+- GraphQL & Apollo Federation Docs: https://postrust.org/docs/graphql/
+- Realtime Subscriptions Docs: https://postrust.org/docs/realtime/
+- Hasura Conformance Report: https://postrust.org/docs/conformance/hasura/
+- Guide — How GraphQL APIs Are Generated from PostgreSQL: https://postrust.org/guides/graphql-from-postgresql-schema/
+- Guide — Apollo Federation Open-Source Subgraphs: https://postrust.org/guides/apollo-federation-open-source-subgraphs/
+- Guide — PostgreSQL to GraphQL Tools Compared: https://postrust.org/guides/postgresql-graphql-tools-compared/
+- Documentation: https://postrust.org/docs/
 - Repository: https://github.com/postrust/postrust
 - API docs for this crate: https://docs.rs/postrust-graphql
 

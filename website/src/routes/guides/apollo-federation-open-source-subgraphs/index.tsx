@@ -290,8 +290,8 @@ PGRST_GRAPHQL_METADATA=/config/metadata.json # optional: shared entities, names`
     <p class={p}>
       Every readable table with a primary key becomes an entity keyed by it.
       When another subgraph contributes to the same entity, mark the table
-      shared in the metadata: it keeps its unprefixed type name, and its non-key
-      fields are marked <code class={code}>@shareable</code>.
+      shared in the metadata: it keeps its unprefixed type name, and the type is
+      marked <code class={code}>@shareable</code>.
     </p>
     <Code
       label="metadata.json"

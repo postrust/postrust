@@ -54,13 +54,23 @@ const softwareApplication = {
   publisher: { "@id": ORG_ID },
 };
 
-/** The docs and guides indexes: lists of pages, not pages of their own. */
+/** The docs, guides, blog, and compare indexes: lists of pages, not articles. */
 export const isIndex = (pathname: string) =>
-  pathname === "/docs/" || pathname === "/guides/";
+  pathname === "/docs/" ||
+  pathname === "/guides/" ||
+  pathname === "/blog/" ||
+  pathname === "/compare/";
 
-/** A docs page or a guide, which is written as an article. */
+/** A docs page, guide, or blog post: an article, for Open Graph's purposes. */
 export const isArticle = (pathname: string) =>
-  /^\/(docs|guides)\/./.test(pathname);
+  /^\/(docs|guides|blog)\/./.test(pathname);
+
+/**
+ * A blog post, which carries a BlogPosting of its own (`postHead`) with its
+ * author and publication date. A TechArticle beside it would be a second,
+ * disagreeing article for the same page.
+ */
+const isBlogPost = (pathname: string) => /^\/blog\/./.test(pathname);
 
 /** The page's title without the " - Postrust …" suffix every title carries. */
 const headline = (title: string) =>
@@ -130,7 +140,7 @@ export const structuredData = (
       publisher: { "@id": ORG_ID },
       inLanguage: "en",
     });
-  } else if (isArticle(pathname)) {
+  } else if (isArticle(pathname) && !isBlogPost(pathname)) {
     const modified = lastModified(pathname);
     graph.push({
       "@type": "TechArticle",

@@ -332,10 +332,9 @@ PGRST_GRAPHQL_TYPE_PREFIX=billing   # optional`} />
 }`} />
             <p class="text-neutral-600 mt-4">
               A shared table keeps its unprefixed object type, so two subgraphs can both contribute
-              to it. Its non-key columns, computed fields, relationships and relationship
-              aggregates are marked <code class="font-mono">@shareable</code>, so another subgraph
-              may resolve the same fields; key columns are shareable through{" "}
-              <code class="font-mono">@key</code> already.
+              to it. The type is marked <code class="font-mono">@shareable</code>, which covers
+              its columns, computed fields, relationships and relationship aggregates, so
+              another subgraph may resolve the same fields.
             </p>
 
             <h3 class="text-lg font-semibold text-neutral-900 mt-6 mb-2">Type prefix</h3>
@@ -462,9 +461,7 @@ PGRST_GRAPHQL_TYPE_PREFIX=billing   # optional`} />
               <code class="font-mono">@composeDirective</code>,{" "}
               <code class="font-mono">@interfaceObject</code> and federated tracing. The fixture
               keeps them in its target schema on purpose, so they show in the suite&rsquo;s report
-              as optional failures. The suite&rsquo;s <code class="font-mono">@shareable</code>{" "}
-              check fails too, because it looks for <code class="font-mono">@shareable</code> on
-              the type and Postrust puts it on each non-key field; the two compose the same way.
+              as optional failures.
             </p>
           </section>
 

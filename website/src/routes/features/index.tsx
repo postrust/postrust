@@ -5,15 +5,29 @@ import { Link } from "@builder.io/qwik-city";
 const featureCategories = [
   {
     title: "REST API",
-    description: "PostgREST-compatible REST API with advanced querying capabilities",
+    description:
+      "PostgREST-compatible REST API with advanced querying capabilities",
+    links: [
+      { href: "/docs/api-reference/", label: "REST API Reference" },
+      {
+        href: "/docs/conformance/postgrest/",
+        label: "PostgREST Conformance Report",
+      },
+      {
+        href: "/guides/build-api-from-postgresql/",
+        label: "Guide: Build an API from PostgreSQL",
+      },
+    ],
     features: [
       {
         name: "CRUD Operations",
-        description: "Full create, read, update, delete support on tables and views",
+        description:
+          "Full create, read, update, delete support on tables and views",
       },
       {
         name: "Advanced Filtering",
-        description: "eq, neq, gt, lt, gte, lte, like, ilike, in, is, not operators",
+        description:
+          "eq, neq, gt, lt, gte, lte, like, ilike, in, is, not operators",
       },
       {
         name: "Full-Text Search",
@@ -29,29 +43,51 @@ const featureCategories = [
       },
       {
         name: "Column Selection",
-        description: "Select specific columns with aliasing and computed fields",
+        description:
+          "Select specific columns with aliasing and computed fields",
       },
     ],
   },
   {
     title: "GraphQL API",
-    description: "Hasura's dialect, generated from your schema and measured against Hasura itself",
+    description:
+      "Hasura's dialect, generated from your schema and measured against Hasura itself",
+    links: [
+      { href: "/docs/graphql/", label: "GraphQL & Federation Docs" },
+      { href: "/docs/conformance/hasura/", label: "Hasura Conformance Report" },
+      {
+        href: "/guides/graphql-from-postgresql-schema/",
+        label: "Guide: How GraphQL APIs Are Generated",
+      },
+      {
+        href: "/guides/postgresql-graphql-tools-compared/",
+        label: "Guide: PostgreSQL GraphQL Tools Compared",
+      },
+      {
+        href: "/guides/apollo-federation-open-source-subgraphs/",
+        label: "Guide: Apollo Federation Subgraphs",
+      },
+    ],
     features: [
       {
         name: "Dynamic Schema",
-        description: "GraphQL schema automatically generated from your database",
+        description:
+          "GraphQL schema automatically generated from your database",
       },
       {
         name: "Hasura Dialect",
-        description: "A client generated against Hasura points at /v1/graphql unchanged",
+        description:
+          "A client generated against Hasura points at /v1/graphql unchanged",
       },
       {
         name: "Queries & Mutations",
-        description: "author, author_by_pk, author_aggregate, insert_author_one, update_author_many, on_conflict upserts and nested writes",
+        description:
+          "author, author_by_pk, author_aggregate, insert_author_one, update_author_many, on_conflict upserts and nested writes",
       },
       {
         name: "Permissions",
-        description: "A schema per role, row filters, separate read and write columns, presets and backend_only",
+        description:
+          "A schema per role, row filters, separate read and write columns, presets and backend_only",
       },
       {
         name: "Real-time Subscriptions",
@@ -59,7 +95,8 @@ const featureCategories = [
       },
       {
         name: "Apollo Federation",
-        description: "Opt-in Federation v2 subgraph: _service, _entities and @key from the primary key, checked by Apollo's compatibility suite in CI",
+        description:
+          "Opt-in Federation v2 subgraph: _service, _entities and @key from the primary key, checked by Apollo's compatibility suite in CI",
       },
       {
         name: "Introspection",
@@ -76,8 +113,13 @@ const featureCategories = [
     ],
   },
   {
-    title: "Real-time",
-    description: "Live data synchronization powered by PostgreSQL LISTEN/NOTIFY",
+    title: "Real-time & pgvector Search",
+    description:
+      "Live data synchronization powered by PostgreSQL LISTEN/NOTIFY and vector similarity search via pgvector",
+    links: [
+      { href: "/docs/realtime/", label: "Realtime Subscriptions Docs" },
+      { href: "/docs/pgvector/", label: "pgvector Integration Docs" },
+    ],
     features: [
       {
         name: "GraphQL Subscriptions",
@@ -93,51 +135,73 @@ const featureCategories = [
       },
       {
         name: "WebSocket Protocol",
-        description: "Uses graphql-transport-ws standard protocol",
+        description:
+          "Uses graphql-transport-ws and graphql-ws standard protocols",
       },
       {
-        name: "Connection Management",
-        description: "Automatic reconnection and subscription recovery",
+        name: "pgvector Similarity Search",
+        description:
+          "Cosine, L2, and inner-product distance queries on pgvector embedding columns over REST and RPC",
       },
       {
         name: "Push, Not Poll",
-        description: "Delivered on PostgreSQL's LISTEN/NOTIFY, not a polling loop",
+        description:
+          "Delivered on PostgreSQL's LISTEN/NOTIFY, not a polling loop",
       },
     ],
   },
   {
     title: "Security",
-    description: "Enterprise-grade security with PostgreSQL Row-Level Security",
+    description:
+      "Enterprise-grade security with PostgreSQL Row-Level Security, asymmetric JWTs, and auto-rotating JWKS",
+    links: [
+      { href: "/docs/authentication/", label: "Authentication & JWKS Docs" },
+      {
+        href: "/guides/postgresql-row-level-security-api/",
+        label: "Guide: Row-Level Security for PostgreSQL APIs",
+      },
+    ],
     features: [
       {
-        name: "JWT Authentication",
-        description: "HS256, HS384, HS512 signature verification",
+        name: "Asymmetric & Symmetric JWTs",
+        description:
+          "HS256, HS384, HS512, RS256, RS384, RS512, PS256, PS384, PS512, ES256, ES384, and EdDSA signature verification",
+      },
+      {
+        name: "JWKS Auto-Rotation",
+        description:
+          "Auto-rotating JWKS key sets via PGRST_JWT_JWKS_URL for Auth0, Clerk, Supabase Auth, AWS Cognito, and Keycloak",
       },
       {
         name: "Row-Level Security",
-        description: "PostgreSQL RLS policies enforced on every request",
+        description:
+          "PostgreSQL RLS policies enforced on every REST, GraphQL, and custom route request",
       },
       {
         name: "Role-Based Access",
-        description: "Map JWT claims to PostgreSQL roles",
+        description:
+          "Map JWT claims to PostgreSQL roles with NOINHERIT authenticator support",
       },
       {
         name: "Custom Claims",
-        description: "Access JWT claims in your SQL policies",
+        description:
+          "Access verified JWT claims in SQL policies via request.jwt.claims",
       },
       {
-        name: "Anonymous Role",
-        description: "Configurable unauthenticated access",
-      },
-      {
-        name: "Audience Validation",
-        description: "Optional JWT audience claim verification",
+        name: "Audience & Issuer Validation",
+        description:
+          "Configurable JWT aud and iss claim verification and anonymous role fallback",
       },
     ],
   },
   {
     title: "Developer Experience",
-    description: "Built-in tools for development and debugging",
+    description:
+      "Built-in tools for development, configuration, and observability",
+    links: [
+      { href: "/docs/configuration/", label: "Configuration Reference" },
+      { href: "/docs/benchmarks/", label: "Performance Benchmarks" },
+    ],
     features: [
       {
         name: "Admin Dashboard",
@@ -156,8 +220,8 @@ const featureCategories = [
         description: "Auto-generated OpenAPI 3.0 specification",
       },
       {
-        name: "Structured Logging",
-        description: "JSON logs with request tracing",
+        name: "OpenTelemetry & Logging",
+        description: "Structured JSON logs and OpenTelemetry OTLP trace export",
       },
       {
         name: "Health Checks",
@@ -167,7 +231,17 @@ const featureCategories = [
   },
   {
     title: "Deployment",
-    description: "A server, a container, Kubernetes, AWS Lambda or Cloudflare Workers",
+    description:
+      "A server, a container, Kubernetes, AWS Lambda, Cloudflare Workers, or multi-tenant SaaS proxy",
+    links: [
+      { href: "/docs/deployment/", label: "Server & Lambda Deployment Docs" },
+      { href: "/docs/workers/", label: "Cloudflare Workers Docs" },
+      { href: "/docs/saas-domains/", label: "SaaS Custom Domains & ACME Docs" },
+      {
+        href: "/guides/postgresql-api-server-languages/",
+        label: "Guide: PostgreSQL API Server Languages",
+      },
+    ],
     features: [
       {
         name: "Docker",
@@ -175,11 +249,13 @@ const featureCategories = [
       },
       {
         name: "AWS Lambda",
-        description: "The server's REST and GraphQL router behind the Lambda runtime",
+        description:
+          "The server's REST and GraphQL router behind the Lambda runtime",
       },
       {
         name: "Cloudflare Workers",
-        description: "The REST API in a Worker, over Hyperdrive, with the schema cache in KV",
+        description:
+          "The REST API in a Worker, over Hyperdrive, with the schema cache in KV",
       },
       {
         name: "Kubernetes",
@@ -187,21 +263,29 @@ const featureCategories = [
       },
       {
         name: "Single Binary",
-        description: "A ~10 MB binary that needs only libc",
+        description:
+          "2.93 MiB binary (4.98 MiB with Admin UI) that needs only libc",
       },
       {
-        name: "Any Platform",
-        description: "Fly.io, Railway, Render, DigitalOcean, etc.",
+        name: "SaaS Custom Domains",
+        description:
+          "Multi-tenant reverse proxy with automatic Let's Encrypt TLS certificates",
       },
     ],
   },
   {
     title: "Extensibility",
-    description: "Extend Postrust with custom Rust code",
+    description:
+      "Extend Postrust with custom Rust code under the same RLS transaction",
+    links: [
+      { href: "/docs/custom-routes/", label: "Custom Routes in Rust Docs" },
+      { href: "/packages/", label: "Rust Crates & Packages" },
+    ],
     features: [
       {
         name: "Custom Routes",
-        description: "Add your own endpoints in Rust",
+        description:
+          "Add your own endpoints in Rust with RlsConn enforcing the caller's JWT role",
       },
       {
         name: "Webhook Handlers",
@@ -233,27 +317,37 @@ export default component$(() => {
       {/* Hero */}
       <section class="section-padding bg-gradient-to-b from-neutral-50 to-white">
         <div class="container-wide">
-          <div class="max-w-3xl mx-auto text-center">
-            <h1 class="text-4xl md:text-5xl font-bold text-neutral-900 mb-6">
+          <div class="mx-auto max-w-3xl text-center">
+            <h1 class="mb-6 text-4xl font-bold text-neutral-900 md:text-5xl">
               Features: REST, GraphQL and realtime from PostgreSQL
             </h1>
-            <p class="text-lg text-neutral-600 mb-8">
-              Postrust provides a complete solution for exposing your PostgreSQL database
-              as a secure, high-performance REST and GraphQL API.
+            <p class="mb-8 text-lg text-neutral-600">
+              Postrust provides a complete solution for exposing your PostgreSQL
+              database as a secure, high-performance REST and GraphQL API.
             </p>
-            <div class="flex flex-col sm:flex-row items-center justify-center gap-4">
+            <div class="flex flex-col items-center justify-center gap-4 sm:flex-row">
               <Link
                 href="/docs/getting-started/"
-                class="inline-flex items-center gap-2 px-6 py-3 text-base font-semibold text-white bg-neutral-900 hover:bg-neutral-800 rounded-lg transition-colors"
+                class="inline-flex items-center gap-2 rounded-lg bg-neutral-900 px-6 py-3 text-base font-semibold text-white transition-colors hover:bg-neutral-800"
               >
                 Get Started
-                <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                  <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M13 7l5 5m0 0l-5 5m5-5H6"/>
+                <svg
+                  class="h-4 w-4"
+                  fill="none"
+                  stroke="currentColor"
+                  viewBox="0 0 24 24"
+                >
+                  <path
+                    stroke-linecap="round"
+                    stroke-linejoin="round"
+                    stroke-width="2"
+                    d="M13 7l5 5m0 0l-5 5m5-5H6"
+                  />
                 </svg>
               </Link>
               <Link
                 href="/compare/"
-                class="inline-flex items-center gap-2 px-6 py-3 text-base font-semibold text-neutral-700 bg-white border border-neutral-300 hover:bg-neutral-50 rounded-lg transition-colors"
+                class="inline-flex items-center gap-2 rounded-lg border border-neutral-300 bg-white px-6 py-3 text-base font-semibold text-neutral-700 transition-colors hover:bg-neutral-50"
               >
                 Compare Alternatives
               </Link>
@@ -269,27 +363,38 @@ export default component$(() => {
           class={`section-padding ${index % 2 === 0 ? "bg-white" : "bg-neutral-50"}`}
         >
           <div class="container-wide">
-            <div class="max-w-3xl mx-auto text-center mb-12">
-              <h2 class="text-3xl font-bold text-neutral-900 mb-4">
+            <div class="mx-auto mb-12 max-w-3xl text-center">
+              <h2 class="mb-4 text-3xl font-bold text-neutral-900">
                 {category.title}
               </h2>
-              <p class="text-lg text-neutral-600">
+              <p class="mb-4 text-lg text-neutral-600">
                 {category.description}
               </p>
+              {category.links && (
+                <div class="flex flex-wrap items-center justify-center gap-3">
+                  {category.links.map((link) => (
+                    <Link
+                      key={link.href}
+                      href={link.href}
+                      class="text-primary-700 bg-primary-50 hover:bg-primary-100 border-primary-200 inline-flex items-center rounded-full border px-3.5 py-1.5 text-xs font-semibold transition-colors"
+                    >
+                      {link.label} &rarr;
+                    </Link>
+                  ))}
+                </div>
+              )}
             </div>
 
-            <div class="grid md:grid-cols-2 lg:grid-cols-3 gap-6">
+            <div class="grid gap-6 md:grid-cols-2 lg:grid-cols-3">
               {category.features.map((feature) => (
                 <div
                   key={feature.name}
-                  class="bg-white rounded-xl p-6 border border-neutral-200 hover:border-primary-200 hover:shadow-md transition-all"
+                  class="hover:border-primary-200 rounded-xl border border-neutral-200 bg-white p-6 transition-all hover:shadow-md"
                 >
-                  <h3 class="text-lg font-semibold text-neutral-900 mb-2">
+                  <h3 class="mb-2 text-lg font-semibold text-neutral-900">
                     {feature.name}
                   </h3>
-                  <p class="text-sm text-neutral-600">
-                    {feature.description}
-                  </p>
+                  <p class="text-sm text-neutral-600">{feature.description}</p>
                 </div>
               ))}
             </div>
@@ -300,19 +405,29 @@ export default component$(() => {
       {/* CTA */}
       <section class="section-padding bg-neutral-900">
         <div class="container-wide text-center">
-          <h2 class="text-3xl font-bold text-white mb-4">
+          <h2 class="mb-4 text-3xl font-bold text-white">
             Ready to get started?
           </h2>
-          <p class="text-lg text-neutral-300 mb-8 max-w-2xl mx-auto">
+          <p class="mx-auto mb-8 max-w-2xl text-lg text-neutral-300">
             Set up your PostgreSQL API in under 5 minutes.
           </p>
           <Link
             href="/docs/getting-started/"
-            class="inline-flex items-center gap-2 px-8 py-4 text-base font-semibold text-neutral-900 bg-white hover:bg-neutral-100 rounded-lg transition-colors"
+            class="inline-flex items-center gap-2 rounded-lg bg-white px-8 py-4 text-base font-semibold text-neutral-900 transition-colors hover:bg-neutral-100"
           >
             Read the Documentation
-            <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-              <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M13 7l5 5m0 0l-5 5m5-5H6"/>
+            <svg
+              class="h-4 w-4"
+              fill="none"
+              stroke="currentColor"
+              viewBox="0 0 24 24"
+            >
+              <path
+                stroke-linecap="round"
+                stroke-linejoin="round"
+                stroke-width="2"
+                d="M13 7l5 5m0 0l-5 5m5-5H6"
+              />
             </svg>
           </Link>
         </div>
@@ -322,11 +437,12 @@ export default component$(() => {
 });
 
 export const head: DocumentHead = {
-  title: "Postrust Features: REST, GraphQL, Realtime for PostgreSQL",
+  title: "Postrust Features: PostgreSQL REST, GraphQL, Realtime & pgvector",
   meta: [
     {
       name: "description",
-      content: "Explore all features of Postrust - REST API, GraphQL, JWT authentication, Row-Level Security, and more.",
+      content:
+        "Explore Postrust features: PostgREST REST API, Hasura-dialect GraphQL, Apollo Federation v2 subgraphs, LISTEN/NOTIFY subscriptions, pgvector search, and RLS security.",
     },
   ],
 };

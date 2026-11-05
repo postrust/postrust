@@ -41,12 +41,12 @@ export default component$(() => (
 ));
 
 export const head: DocumentHead = {
-  title: "Guides to REST and GraphQL APIs on PostgreSQL | Postrust",
+  title: "Guides to PostgreSQL REST & GraphQL APIs - Postrust",
   meta: [
     {
       name: "description",
       content:
-        "How REST and GraphQL APIs are generated from a PostgreSQL schema, how row-level security secures them, and how the tools that do it compare.",
+        "In-depth engineering guides on generating REST and GraphQL APIs from PostgreSQL schemas, enforcing Row-Level Security (RLS), Apollo Federation, and comparing API servers.",
     },
   ],
 };

@@ -89,7 +89,9 @@ export const GuidePage = component$<Props>(({ guide, answer, faq }) => {
 
 /** Title, canonical address and description for a guide. */
 export const guideHead = (guide: Guide): DocumentHead => ({
-  title: guide.headTitle,
+  title: guide.headTitle.endsWith(" - Postrust")
+    ? guide.headTitle
+    : `${guide.headTitle} - Postrust`,
   links: [{ rel: "canonical", href: guideUrl(guide.slug) }],
   meta: [{ name: "description", content: guide.description }],
 });

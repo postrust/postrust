@@ -38,7 +38,11 @@ published as a set of crates so you can depend on only the part you need:
 ## Links
 
 - Website: https://postrust.org/
-- Documentation: https://postrust.org/docs
+- Getting Started: https://postrust.org/docs/getting-started/
+- Configuration Reference: https://postrust.org/docs/configuration/
+- Custom Routes in Rust: https://postrust.org/docs/custom-routes/
+- Benchmarks: https://postrust.org/docs/benchmarks/
+- Documentation: https://postrust.org/docs/
 - Repository: https://github.com/postrust/postrust
 - API docs for this crate: https://docs.rs/postrust-server
 

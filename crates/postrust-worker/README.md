@@ -46,7 +46,9 @@ published as a set of crates so you can depend on only the part you need:
 ## Links
 
 - Website: https://postrust.org/
-- Documentation: https://postrust.org/docs
+- Cloudflare Workers Docs: https://postrust.org/docs/workers/
+- REST API Reference: https://postrust.org/docs/api-reference/
+- Documentation: https://postrust.org/docs/
 - Repository: https://github.com/postrust/postrust
 - API docs for this crate: https://docs.rs/postrust-worker
 

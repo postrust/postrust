@@ -32,7 +32,9 @@ published as a set of crates so you can depend on only the part you need:
 ## Links
 
 - Website: https://postrust.org/
-- Documentation: https://postrust.org/docs
+- SaaS Custom Domains & ACME TLS Docs: https://postrust.org/docs/saas-domains/
+- Deployment Docs: https://postrust.org/docs/deployment/
+- Documentation: https://postrust.org/docs/
 - Repository: https://github.com/postrust/postrust
 - API docs for this crate: https://docs.rs/postrust-proxy
 

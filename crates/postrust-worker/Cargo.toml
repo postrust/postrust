@@ -3,14 +3,14 @@ name = "postrust-worker"
 # Deliberately NOT `version.workspace = true`. Its semver is over what a
 # deployment sees -- configuration, bindings, endpoints -- not a Rust API, so
 # it keeps a number of its own. See docs/stability.md.
-version = "1.2.0"
+version = "1.2.1"
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 authors.workspace = true
 description = "Cloudflare Workers adapter for Postrust: the PostgREST-dialect REST API in a Worker, over Hyperdrive"
-homepage.workspace = true
+homepage = "https://postrust.org/docs/workers/"
 readme = "README.md"
 keywords = ["cloudflare", "workers", "hyperdrive", "postgres", "rest"]
 

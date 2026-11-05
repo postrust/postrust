@@ -47,7 +47,9 @@ published as a set of crates so you can depend on only the part you need:
 ## Links
 
 - Website: https://postrust.org/
-- Documentation: https://postrust.org/docs
+- AWS Lambda & Server Deployment Docs: https://postrust.org/docs/deployment/
+- Authentication & RLS Docs: https://postrust.org/docs/authentication/
+- Documentation: https://postrust.org/docs/
 - Repository: https://github.com/postrust/postrust
 - API docs for this crate: https://docs.rs/postrust-lambda
 
