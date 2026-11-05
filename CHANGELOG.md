@@ -3,6 +3,23 @@
 Notable changes, newest first. This file starts at 1.0.0-alpha.1; earlier
 releases are described by their tags and the pull requests behind them.
 
+## 3.1.1
+
+Shared Apollo Federation entity types now carry `@shareable` on the object type
+as well as on each non-key field, and every crate's manifest and README link
+directly to its matching documentation pages. Released beside it:
+`postrust-worker` 1.2.1 and `postrust-proxy` 2.0.1.
+
+### Fixed
+
+- **Apollo Federation shared entity types emit `@shareable` at the type level**
+  (`type Product @key(fields: "id") @shareable`) in addition to each non-key
+  field, satisfying the type-level `@shareable` check in Apollo's
+  `apollo-federation-subgraph-compatibility` suite.
+- **Crate manifests and READMEs** link directly to their specific trailing-slash
+  documentation routes on `postrust.org` (`/docs/authentication/`,
+  `/docs/graphql/`, `/docs/deployment/`, `/docs/workers/`, `/docs/saas-domains/`).
+
 ## 3.1.0
 
 Database errors in their own words, without compatibility mode. Nothing that

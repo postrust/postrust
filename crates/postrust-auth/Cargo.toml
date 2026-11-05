@@ -7,7 +7,7 @@ license.workspace = true
 repository.workspace = true
 authors.workspace = true
 description = "JWT authentication and role resolution for Postrust"
-homepage.workspace = true
+homepage = "https://postrust.org/docs/authentication/"
 readme = "README.md"
 keywords = ["jwt", "authentication", "postgres", "rls", "auth"]
 

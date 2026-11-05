@@ -34,7 +34,9 @@ published as a set of crates so you can depend on only the part you need:
 ## Links
 
 - Website: https://postrust.org/
-- Documentation: https://postrust.org/docs
+- Documentation: https://postrust.org/docs/
+- pgvector Integration: https://postrust.org/docs/pgvector/
+- Guide — PostgreSQL API Server Languages: https://postrust.org/guides/postgresql-api-server-languages/
 - Repository: https://github.com/postrust/postrust
 - API docs for this crate: https://docs.rs/postrust-sql
 

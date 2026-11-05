@@ -76,16 +76,18 @@ const ResultTable = component$<{ other: string; rows: MeasuredRow[] }>(
               <td class="text-primary-700 py-2 pr-4 text-right tabular-nums">
                 {r.postrust ? num(r.postrust.rps) : "—"}
                 {r.postrust && (
-                  <span class="ml-2 text-xs text-neutral-400">
-                    {r.postrust.p50_ms} ms
+                  <span class="ml-1 text-xs text-neutral-400">
+                    {" "}
+                    ({r.postrust.p50_ms} ms)
                   </span>
                 )}
               </td>
               <td class="py-2 pr-4 text-right text-neutral-700 tabular-nums">
                 {r.other ? num(r.other.rps) : "—"}
                 {r.other && (
-                  <span class="ml-2 text-xs text-neutral-400">
-                    {r.other.p50_ms} ms
+                  <span class="ml-1 text-xs text-neutral-400">
+                    {" "}
+                    ({r.other.p50_ms} ms)
                   </span>
                 )}
               </td>

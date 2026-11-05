@@ -32,7 +32,10 @@ published as a set of crates so you can depend on only the part you need:
 ## Links
 
 - Website: https://postrust.org/
-- Documentation: https://postrust.org/docs
+- Authentication & JWKS Docs: https://postrust.org/docs/authentication/
+- Configuration Reference: https://postrust.org/docs/configuration/
+- Guide — Row-Level Security for a PostgreSQL API: https://postrust.org/guides/postgresql-row-level-security-api/
+- Documentation: https://postrust.org/docs/
 - Repository: https://github.com/postrust/postrust
 - API docs for this crate: https://docs.rs/postrust-auth
 

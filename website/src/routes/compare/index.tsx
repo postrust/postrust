@@ -2,6 +2,7 @@ import { component$ } from "@builder.io/qwik";
 import type { DocumentHead } from "@builder.io/qwik-city";
 import { Link } from "@builder.io/qwik-city";
 import { benchMeta, measuredFor, footprintFor } from "~/data/measured";
+import { InlineMarkdown } from "~/components/compare/comparison-page";
 
 /**
  * The headline measured figure for one comparison, read from the generated
@@ -209,9 +210,16 @@ export default component$(() => {
                 class="rounded-2xl border border-neutral-200 bg-white p-8 transition-shadow hover:shadow-lg"
               >
                 <h2 class="mb-2 text-2xl font-bold text-neutral-900">
-                  vs {item.name}
+                  <Link
+                    href={`/compare/${item.slug}/`}
+                    class="hover:text-primary-600 transition-colors"
+                  >
+                    vs {item.name}
+                  </Link>
                 </h2>
-                <p class="mb-6 text-neutral-600">{item.description}</p>
+                <p class="mb-6 text-neutral-600">
+                  <InlineMarkdown text={item.description} />
+                </p>
 
                 <div class="mb-6">
                   <h3 class="mb-3 text-sm font-semibold tracking-wide text-neutral-500 uppercase">
@@ -326,10 +334,10 @@ export default component$(() => {
                 })()}
 
                 <Link
-                  href={`/compare/${item.slug}`}
+                  href={`/compare/${item.slug}/`}
                   class="text-primary-600 hover:text-primary-700 inline-flex items-center text-sm font-medium"
                 >
-                  Detailed comparison
+                  Read the Postrust vs {item.name} comparison
                   <svg
                     class="ml-1 h-4 w-4"
                     fill="none"
@@ -383,16 +391,36 @@ export default component$(() => {
                       </div>
                     </th>
                     <th class="px-6 py-4 text-center text-sm font-semibold text-neutral-600">
-                      PostgREST
+                      <Link
+                        href="/compare/postgrest/"
+                        class="hover:text-primary-600 underline decoration-neutral-300 underline-offset-2"
+                      >
+                        PostgREST
+                      </Link>
                     </th>
                     <th class="px-6 py-4 text-center text-sm font-semibold text-neutral-600">
-                      Hasura
+                      <Link
+                        href="/compare/hasura/"
+                        class="hover:text-primary-600 underline decoration-neutral-300 underline-offset-2"
+                      >
+                        Hasura
+                      </Link>
                     </th>
                     <th class="px-6 py-4 text-center text-sm font-semibold text-neutral-600">
-                      PostGraphile
+                      <Link
+                        href="/compare/postgraphile/"
+                        class="hover:text-primary-600 underline decoration-neutral-300 underline-offset-2"
+                      >
+                        PostGraphile
+                      </Link>
                     </th>
                     <th class="px-6 py-4 text-center text-sm font-semibold text-neutral-600">
-                      Supabase
+                      <Link
+                        href="/compare/supabase/"
+                        class="hover:text-primary-600 underline decoration-neutral-300 underline-offset-2"
+                      >
+                        Supabase
+                      </Link>
                     </th>
                   </tr>
                 </thead>

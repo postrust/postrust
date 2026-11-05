@@ -15,6 +15,70 @@ interface Props {
   comparison: Comparison;
 }
 
+/**
+ * Renders inline Markdown links `[label](/path/)`, inline code `` `...` ``,
+ * and italics `*...*` in comparison prose so crawlers see real `<a>` tags
+ * instead of raw bracket syntax.
+ */
+export const InlineMarkdown = component$<{ text: string }>(({ text }) => {
+  const tokenRe = /\[([^\]]+)\]\(([^)]+)\)|`([^`]+)`|\*([^*]+)\*/g;
+  const parts: Array<
+    | { kind: "text"; value: string }
+    | { kind: "link"; label: string; href: string }
+    | { kind: "code"; value: string }
+    | { kind: "em"; value: string }
+  > = [];
+  let lastIndex = 0;
+  let match: RegExpExecArray | null;
+  while ((match = tokenRe.exec(text)) !== null) {
+    if (match.index > lastIndex) {
+      parts.push({ kind: "text", value: text.slice(lastIndex, match.index) });
+    }
+    if (match[1] !== undefined && match[2] !== undefined) {
+      parts.push({ kind: "link", label: match[1], href: match[2] });
+    } else if (match[3] !== undefined) {
+      parts.push({ kind: "code", value: match[3] });
+    } else if (match[4] !== undefined) {
+      parts.push({ kind: "em", value: match[4] });
+    }
+    lastIndex = tokenRe.lastIndex;
+  }
+  if (lastIndex < text.length) {
+    parts.push({ kind: "text", value: text.slice(lastIndex) });
+  }
+  return (
+    <>
+      {parts.map((part, idx) => {
+        if (part.kind === "link") {
+          return (
+            <Link
+              key={idx}
+              href={part.href}
+              class="text-primary-600 hover:text-primary-700 decoration-primary-300 hover:decoration-primary-600 font-medium underline underline-offset-2"
+            >
+              {part.label}
+            </Link>
+          );
+        }
+        if (part.kind === "code") {
+          return (
+            <code
+              key={idx}
+              class="rounded border border-neutral-200 bg-neutral-100 px-1 py-0.5 font-mono text-[0.9em] text-neutral-800"
+            >
+              {part.value}
+            </code>
+          );
+        }
+        if (part.kind === "em") {
+          return <em key={idx}>{part.value}</em>;
+        }
+        return part.value;
+      })}
+    </>
+  );
+});
+
 export const ComparisonPage = component$<Props>(({ comparison: c }) => {
   const rest = measuredFor(c.slug, "rest");
   const graphql = measuredFor(c.slug, "graphql");
@@ -65,7 +129,7 @@ export const ComparisonPage = component$<Props>(({ comparison: c }) => {
 
             {c.intro.map((para) => (
               <p key={para.slice(0, 24)} class="mb-4 text-lg text-neutral-600">
-                {para}
+                <InlineMarkdown text={para} />
               </p>
             ))}
 
@@ -308,7 +372,7 @@ export const ComparisonPage = component$<Props>(({ comparison: c }) => {
               <ul class="space-y-4">
                 {c.migration.map((step) => (
                   <li key={step.slice(0, 24)} class="text-neutral-700">
-                    {step}
+                    <InlineMarkdown text={step} />
                   </li>
                 ))}
               </ul>
@@ -328,9 +392,11 @@ export const ComparisonPage = component$<Props>(({ comparison: c }) => {
               {c.faq.map((entry) => (
                 <div key={entry.q}>
                   <h3 class="mb-2 text-lg font-semibold text-neutral-900">
-                    {entry.q}
+                    <InlineMarkdown text={entry.q} />
                   </h3>
-                  <p class="text-neutral-600">{entry.a}</p>
+                  <p class="text-neutral-600">
+                    <InlineMarkdown text={entry.a} />
+                  </p>
                 </div>
               ))}
             </div>

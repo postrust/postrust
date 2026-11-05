@@ -7,7 +7,7 @@ license.workspace = true
 repository.workspace = true
 authors.workspace = true
 description = "AWS Lambda adapter for Postrust, serving its REST and GraphQL APIs over PostgreSQL"
-homepage.workspace = true
+homepage = "https://postrust.org/docs/deployment/"
 readme = "README.md"
 keywords = ["lambda", "serverless", "aws", "postgres", "api"]
 

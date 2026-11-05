@@ -1,66 +1,127 @@
 import { component$ } from "@builder.io/qwik";
+import { Link } from "@builder.io/qwik-city";
 
 const features = [
   {
     icon: "bolt",
     title: "Fast, and Measured",
-    description: "44,324 requests/second on a point lookup at 1.1 ms median, on a host held still and gated for self-consistency. The method and the caveats are published with the figures.",
+    description:
+      "44,324 requests/second on a point lookup at 1.1 ms median, on a host held still and gated for self-consistency. The method and the caveats are published with the figures.",
+    href: "/docs/benchmarks/",
+    linkLabel: "View PostgreSQL API benchmarks",
   },
   {
     icon: "cloud",
     title: "Runs on Lambda and Workers",
-    description: "The Lambda adapter serves the router the standalone server serves — REST, GraphQL, JWT and row-level security — tested in AWS's own runtime image. The Cloudflare Workers adapter runs the same REST pipeline over Hyperdrive, tested in workerd.",
+    description:
+      "The Lambda adapter serves the router the standalone server serves — REST, GraphQL, JWT and row-level security — tested in AWS's own runtime image. The Cloudflare Workers adapter runs the same REST pipeline over Hyperdrive, tested in workerd.",
+    href: "/docs/workers/",
+    linkLabel: "Read Cloudflare Workers docs",
   },
   {
     icon: "graphql",
     title: "GraphQL Built-in",
-    description: "Full GraphQL API alongside REST. Queries, mutations, filtering, and nested relationships out of the box, and an opt-in Apollo Federation v2 subgraph mode.",
+    description:
+      "Full GraphQL API alongside REST. Queries, mutations, filtering, and nested relationships out of the box, and an opt-in Apollo Federation v2 subgraph mode.",
+    href: "/docs/graphql/",
+    linkLabel: "Read GraphQL & Federation docs",
   },
   {
     icon: "realtime",
     title: "Realtime Subscriptions",
-    description: "Live updates via GraphQL subscriptions. Subscribe to any query or view changes with PostgreSQL LISTEN/NOTIFY.",
+    description:
+      "Live updates via GraphQL subscriptions. Subscribe to any query or view changes with PostgreSQL LISTEN/NOTIFY.",
+    href: "/docs/realtime/",
+    linkLabel: "Read Realtime subscription docs",
   },
   {
     icon: "vector",
     title: "pgvector Integration",
-    description: "Native vector similarity search. Build AI-powered apps with embeddings, semantic search, and RAG pipelines.",
+    description:
+      "Native vector similarity search. Build AI-powered apps with embeddings, semantic search, and RAG pipelines.",
+    href: "/docs/pgvector/",
+    linkLabel: "Read pgvector integration docs",
   },
   {
     icon: "routes",
     title: "Custom Routes in Rust",
-    description: "Define custom endpoints in pure Rust. Full access to Axum handlers, middleware, and the database pool.",
+    description:
+      "Define custom endpoints in pure Rust. Full access to Axum handlers, middleware, and the database pool.",
+    href: "/docs/custom-routes/",
+    linkLabel: "Read Custom Routes docs",
   },
   {
     icon: "shield",
     title: "Secure by Design",
-    description: "PostgreSQL Row-Level Security (RLS) enforcement. JWT authentication with customizable role claims.",
+    description:
+      "PostgreSQL Row-Level Security (RLS) enforcement. Asymmetric JWT authentication (RS256, ES256, EdDSA) and JWKS auto-rotation.",
+    href: "/docs/authentication/",
+    linkLabel: "Read Authentication & RLS docs",
   },
   {
     icon: "code",
     title: "PostgREST Compatible",
-    description: "Same query syntax and filtering operators. An opt-in compatibility mode serves canonical PostgREST paths and response shapes, and matches on 1,424 of PostgREST's own 1,499 test cases.",
+    description:
+      "Same query syntax and filtering operators. An opt-in compatibility mode serves canonical PostgREST paths and response shapes, and matches on 1,424 of PostgREST's own 1,499 test cases.",
+    href: "/docs/conformance/postgrest/",
+    linkLabel: "View PostgREST conformance report",
   },
   {
     icon: "api",
-    title: "Admin UI Included",
-    description: "Built-in Swagger UI, Scalar API docs, and GraphQL Playground. OpenAPI 3.0 spec auto-generated.",
+    title: "Admin UI & Configuration",
+    description:
+      "Built-in Swagger UI, Scalar API docs, and GraphQL Playground. OpenAPI 3.0 spec auto-generated and zero-config setup.",
+    href: "/docs/configuration/",
+    linkLabel: "Read Configuration reference",
   },
   {
     icon: "package",
     title: "Single Binary",
-    description: "4.98 MiB with the admin UI, 2.93 MiB without, and no runtime dependencies. Deploy anywhere - Docker, Lambda, bare metal.",
+    description:
+      "4.98 MiB with the admin UI, 2.93 MiB without, and no runtime dependencies. Deploy anywhere - Docker, Lambda, bare metal, or multi-tenant SaaS domains.",
+    href: "/docs/saas-domains/",
+    linkLabel: "Read SaaS Custom Domains docs",
+  },
+];
+
+const featuredGuides = [
+  {
+    href: "/guides/build-api-from-postgresql/",
+    title: "How to Build a REST & GraphQL API Directly from PostgreSQL",
+    summary:
+      "Three architectures compared with a step-by-step schema-to-API walkthrough.",
+  },
+  {
+    href: "/guides/postgresql-row-level-security-api/",
+    title: "PostgreSQL Row-Level Security (RLS) for API Access Control",
+    summary:
+      "How JWT claims map to database roles, table GRANTs, and per-row RLS policies.",
+  },
+  {
+    href: "/guides/postgresql-graphql-tools-compared/",
+    title: "PostgreSQL to GraphQL Tools Compared (2026)",
+    summary:
+      "Hasura, PostGraphile, Supabase pg_graphql, PostgREST, and Postrust side-by-side.",
+  },
+  {
+    href: "/guides/postgresql-api-server-languages/",
+    title: "Languages Used to Build PostgreSQL API Servers",
+    summary:
+      "How Haskell, Node.js, Go, and Rust affect memory footprint, cold starts, and deployment.",
   },
 ];
 
 const iconPaths: Record<string, string> = {
   bolt: "M13 2L3 14h9l-1 8 10-12h-9l1-8z",
-  cloud: "M3 15a4 4 0 004 4h9a5 5 0 10-.1-9.999 5.002 5.002 0 10-9.78 2.096A4.001 4.001 0 003 15z",
+  cloud:
+    "M3 15a4 4 0 004 4h9a5 5 0 10-.1-9.999 5.002 5.002 0 10-9.78 2.096A4.001 4.001 0 003 15z",
   graphql: "M12 2L2 7l10 5 10-5-10-5zM2 17l10 5 10-5M2 12l10 5 10-5",
   realtime: "M13 10V3L4 14h7v7l9-11h-7z",
-  vector: "M9 3v2m6-2v2M9 19v2m6-2v2M5 9H3m2 6H3m18-6h-2m2 6h-2M7 19h10a2 2 0 002-2V7a2 2 0 00-2-2H7a2 2 0 00-2 2v10a2 2 0 002 2zM9 9h6v6H9V9z",
+  vector:
+    "M9 3v2m6-2v2M9 19v2m6-2v2M5 9H3m2 6H3m18-6h-2m2 6h-2M7 19h10a2 2 0 002-2V7a2 2 0 00-2-2H7a2 2 0 00-2 2v10a2 2 0 002 2zM9 9h6v6H9V9z",
   routes: "M13 7h8m0 0v8m0-8l-8 8-4-4-6 6",
-  shield: "M9 12l2 2 4-4m5.618-4.016A11.955 11.955 0 0112 2.944a11.955 11.955 0 01-8.618 3.04A12.02 12.02 0 003 9c0 5.591 3.824 10.29 9 11.622 5.176-1.332 9-6.03 9-11.622 0-1.042-.133-2.052-.382-3.016z",
+  shield:
+    "M9 12l2 2 4-4m5.618-4.016A11.955 11.955 0 0112 2.944a11.955 11.955 0 01-8.618 3.04A12.02 12.02 0 003 9c0 5.591 3.824 10.29 9 11.622 5.176-1.332 9-6.03 9-11.622 0-1.042-.133-2.052-.382-3.016z",
   code: "M10 20l4-16m4 4l4 4-4 4M6 16l-4-4 4-4",
   api: "M8 9l3 3-3 3m5 0h3M5 20h14a2 2 0 002-2V6a2 2 0 00-2-2H5a2 2 0 00-2 2v12a2 2 0 002 2z",
   package: "M20 7l-8-4-8 4m16 0l-8 4m8-4v10l-8 4m0-10L4 7m8 4v10M4 7v10l8 4",
@@ -71,44 +132,88 @@ export const FeaturesSection = component$(() => {
     <section class="section-padding bg-white">
       <div class="container-wide">
         {/* Section Header */}
-        <div class="text-center max-w-3xl mx-auto mb-16">
-          <h2 class="text-3xl md:text-4xl font-bold text-neutral-900 mb-4">
+        <div class="mx-auto mb-16 max-w-3xl text-center">
+          <h2 class="mb-4 text-3xl font-bold text-neutral-900 md:text-4xl">
             Everything you need to build APIs
           </h2>
           <p class="text-lg text-neutral-600">
-            Postrust provides a complete solution for exposing your PostgreSQL database
-            as a secure, high-performance API. No boilerplate, no ORM, just your schema.
+            Postrust provides a complete solution for exposing your PostgreSQL
+            database as a secure, high-performance API. No boilerplate, no ORM,
+            just your schema.
           </p>
         </div>
 
         {/* Features Grid */}
-        <div class="grid md:grid-cols-2 lg:grid-cols-4 gap-6">
+        <div class="grid gap-6 md:grid-cols-2 lg:grid-cols-4">
           {features.map((feature) => (
-            <div
+            <Link
               key={feature.title}
-              class="group p-6 bg-neutral-50 hover:bg-white rounded-xl border border-neutral-200 hover:border-primary-200 hover:shadow-lg transition-all duration-300"
+              href={feature.href}
+              class="group hover:border-primary-200 flex flex-col justify-between rounded-xl border border-neutral-200 bg-neutral-50 p-6 transition-all duration-300 hover:bg-white hover:shadow-lg"
             >
-              <div class="w-12 h-12 bg-primary-100 group-hover:bg-primary-500 rounded-lg flex items-center justify-center mb-4 transition-colors">
-                <svg
-                  class="w-6 h-6 text-primary-600 group-hover:text-white transition-colors"
-                  fill="none"
-                  stroke="currentColor"
-                  viewBox="0 0 24 24"
-                  stroke-width="2"
-                  stroke-linecap="round"
-                  stroke-linejoin="round"
-                >
-                  <path d={iconPaths[feature.icon]} />
-                </svg>
+              <div>
+                <div class="bg-primary-100 group-hover:bg-primary-500 mb-4 flex h-12 w-12 items-center justify-center rounded-lg transition-colors">
+                  <svg
+                    class="text-primary-600 h-6 w-6 transition-colors group-hover:text-white"
+                    fill="none"
+                    stroke="currentColor"
+                    viewBox="0 0 24 24"
+                    stroke-width="2"
+                    stroke-linecap="round"
+                    stroke-linejoin="round"
+                  >
+                    <path d={iconPaths[feature.icon]} />
+                  </svg>
+                </div>
+                <h3 class="group-hover:text-primary-600 mb-2 text-lg font-semibold text-neutral-900 transition-colors">
+                  {feature.title}
+                </h3>
+                <p class="text-sm leading-relaxed text-neutral-600">
+                  {feature.description}
+                </p>
               </div>
-              <h3 class="text-lg font-semibold text-neutral-900 mb-2">
-                {feature.title}
+              <span class="text-primary-600 group-hover:text-primary-700 mt-4 inline-flex items-center text-xs font-semibold">
+                {feature.linkLabel} &rarr;
+              </span>
+            </Link>
+          ))}
+        </div>
+
+        {/* Contextual Engineering Guides Cross-Links */}
+        <div class="mt-16 border-t border-neutral-200 pt-12">
+          <div class="mb-6 flex flex-col justify-between gap-3 sm:flex-row sm:items-end">
+            <div>
+              <h3 class="text-2xl font-bold text-neutral-900">
+                PostgreSQL API Architecture Guides
               </h3>
-              <p class="text-sm text-neutral-600 leading-relaxed">
-                {feature.description}
+              <p class="text-sm text-neutral-600">
+                Learn how direct PostgreSQL APIs work under the hood and how
+                existing tools compare.
               </p>
             </div>
-          ))}
+            <Link
+              href="/guides/"
+              class="text-primary-600 hover:text-primary-700 text-sm font-semibold"
+            >
+              Browse all guides &rarr;
+            </Link>
+          </div>
+          <div class="grid gap-4 sm:grid-cols-2 lg:grid-cols-4">
+            {featuredGuides.map((g) => (
+              <Link
+                key={g.href}
+                href={g.href}
+                class="group hover:border-primary-200 rounded-xl border border-neutral-200 bg-neutral-50 p-5 transition-all hover:bg-white"
+              >
+                <h4 class="group-hover:text-primary-600 mb-1.5 text-sm font-semibold text-neutral-900 transition-colors">
+                  {g.title}
+                </h4>
+                <p class="text-xs leading-relaxed text-neutral-600">
+                  {g.summary}
+                </p>
+              </Link>
+            ))}
+          </div>
         </div>
       </div>
     </section>

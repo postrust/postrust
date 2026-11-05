@@ -54,13 +54,16 @@ const softwareApplication = {
   publisher: { "@id": ORG_ID },
 };
 
-/** The docs and guides indexes: lists of pages, not pages of their own. */
+/** The docs, guides, blog, and compare indexes: lists of pages, not articles. */
 export const isIndex = (pathname: string) =>
-  pathname === "/docs/" || pathname === "/guides/";
+  pathname === "/docs/" ||
+  pathname === "/guides/" ||
+  pathname === "/blog/" ||
+  pathname === "/compare/";
 
-/** A docs page or a guide, which is written as an article. */
+/** A docs page, guide, or blog post, which is written as a technical article. */
 export const isArticle = (pathname: string) =>
-  /^\/(docs|guides)\/./.test(pathname);
+  /^\/(docs|guides|blog)\/./.test(pathname);
 
 /** The page's title without the " - Postrust …" suffix every title carries. */
 const headline = (title: string) =>

@@ -23,26 +23,26 @@ export default component$(() => {
 });
 
 export const head: DocumentHead = {
-  title: "Postrust - PostgreSQL REST & GraphQL API Server",
+  title: "Postrust: PostgreSQL REST & GraphQL API Server in Rust",
   meta: [
     {
       name: "description",
       content:
-        "One Rust binary serving PostgreSQL as REST and GraphQL APIs, on Docker, Kubernetes, AWS Lambda or Cloudflare Workers. Tested against PostgREST and Hasura.",
+        "Expose your PostgreSQL schema as a fast, PostgREST- and Hasura-compatible REST & GraphQL API from one 3 MB Rust binary. Run on Docker, AWS Lambda, or Cloudflare Workers.",
     },
     {
       name: "keywords",
       content:
-        "PostgreSQL, REST API, GraphQL, Rust, serverless, PostgREST, Lambda, database API",
+        "PostgreSQL, REST API, GraphQL, Rust, PostgREST alternative, Hasura alternative, serverless Postgres API, pgvector, AWS Lambda, Cloudflare Workers",
     },
     {
       property: "og:title",
-      content: "Postrust - PostgreSQL REST & GraphQL API Server",
+      content: "Postrust: PostgreSQL REST & GraphQL API Server in Rust",
     },
     {
       property: "og:description",
       content:
-        "One Rust binary serving a PostgreSQL schema over REST and GraphQL, with a native AWS Lambda adapter. Measured against PostgREST's and Hasura's own test suites.",
+        "Expose your PostgreSQL schema as a fast, PostgREST- and Hasura-compatible REST & GraphQL API from one 3 MB Rust binary. Run on Docker, AWS Lambda, or Cloudflare Workers.",
     },
     {
       property: "og:type",
@@ -58,12 +58,12 @@ export const head: DocumentHead = {
     },
     {
       name: "twitter:title",
-      content: "Postrust - PostgreSQL REST & GraphQL API Server",
+      content: "Postrust: PostgreSQL REST & GraphQL API Server in Rust",
     },
     {
       name: "twitter:description",
       content:
-        "One Rust binary serving a PostgreSQL schema over REST and GraphQL, with a native AWS Lambda adapter. Measured against PostgREST's and Hasura's own test suites.",
+        "Expose your PostgreSQL schema as a fast, PostgREST- and Hasura-compatible REST & GraphQL API from one 3 MB Rust binary. Run on Docker, AWS Lambda, or Cloudflare Workers.",
     },
   ],
 };

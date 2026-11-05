@@ -1704,6 +1704,9 @@ fn create_object_type(
     if let Some(entity) = federation_entity {
         object = object.key(entity.key_fields_sdl());
     }
+    if entity_is_shared {
+        object = object.shareable();
+    }
 
     // A table with no comment still gets a description, because Hasura gives
     // one and a client generating documentation from the schema would
@@ -10585,8 +10588,8 @@ mod tests {
         assert!(sdl.contains("_Service"), "service type:\n{sdl}");
         assert!(sdl.contains("_service"), "service field:\n{sdl}");
         assert!(
-            federation_sdl.contains("type users @key(fields: \"id\")"),
-            "users key:\n{federation_sdl}"
+            federation_sdl.contains("type users @key(fields: \"id\") @shareable"),
+            "users key and type-level @shareable:\n{federation_sdl}"
         );
         assert!(
             federation_sdl.contains("@shareable"),

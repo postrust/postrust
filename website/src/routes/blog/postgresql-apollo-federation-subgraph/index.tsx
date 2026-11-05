@@ -219,7 +219,7 @@ CREATE POLICY everything ON reviews FOR SELECT TO editor USING (true);`}
       <Code
         label="catalog: _service { sdl } (excerpt)"
         lang="graphql"
-        code={`type Product @key(fields: "id") {
+        code={`type Product @key(fields: "id") @shareable {
   id: Int!
   name: String! @shareable
   price_cents: Int! @shareable
@@ -228,7 +228,7 @@ CREATE POLICY everything ON reviews FOR SELECT TO editor USING (true);`}
       <Code
         label="reviews: _service { sdl } (excerpt)"
         lang="graphql"
-        code={`type Product @key(fields: "id") {
+        code={`type Product @key(fields: "id") @shareable {
   id: Int!
   reviews(...): [reviews_Review!]! @shareable
   reviews_aggregate(...): ... @shareable
@@ -236,9 +236,9 @@ CREATE POLICY everything ON reviews FOR SELECT TO editor USING (true);`}
       />
     </CodePair>
     <p class={p}>
-      Every non-key field of a shared type is marked{" "}
-      <code class={code}>@shareable</code>, which lets either subgraph resolve
-      it if both happen to have it. Here they don&rsquo;t, so each field has
+      The shared type and every non-key field on it are marked{" "}
+      <code class={code}>@shareable</code>, which lets either subgraph resolve a
+      field if both happen to have it. Here they don&rsquo;t, so each field has
       exactly one owner.
     </p>
 
@@ -455,8 +455,8 @@ docker compose up --wait catalog reviews && docker compose up -d router
       <Link href="/docs/deployment/" class={a}>
         AWS Lambda adapter
       </Link>{" "}
-      since 2.2.0. The Cloudflare Workers adapter serves the REST API only,
-      so it cannot be a subgraph.
+      since 2.2.0. The Cloudflare Workers adapter serves the REST API only, so
+      it cannot be a subgraph.
     </p>
 
     <h2 class={h2}>What it does not do</h2>
@@ -489,11 +489,9 @@ docker compose up --wait catalog reviews && docker compose up -d router
       <li>federated tracing.</li>
     </ul>
     <p class={p}>
-      A shared type&rsquo;s fields are marked{" "}
-      <code class={code}>@shareable</code> one by one rather than on the type.
-      The two compose the same way, but the suite&rsquo;s check looks for the
-      type-level form and fails. Postrust is not on Apollo&rsquo;s list of
-      compatible subgraphs.
+      Shared types emit <code class={code}>@shareable</code> both on the object
+      type and on each non-key field, satisfying the compatibility suite&rsquo;s
+      type-level <code class={code}>@shareable</code> check.
     </p>
     <p class={p}>
       The details are in the{" "}

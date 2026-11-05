@@ -135,7 +135,7 @@ export const CodePair = component$(() => (
 export const postHead = (post: Post): DocumentHead => {
   const url = postUrl(post.slug);
   return {
-    title: post.headTitle ?? `${post.title} | Postrust`,
+    title: post.headTitle ?? `${post.title} - Postrust`,
     links: [{ rel: "canonical", href: url }],
     meta: [
       {
