@@ -3,7 +3,23 @@
 Notable changes, newest first. This file starts at 1.0.0-alpha.1; earlier
 releases are described by their tags and the pull requests behind them.
 
-## Unreleased
+## 3.3.0
+
+Error handling for an API that replaces another (#76): a missing grant is a
+403 for a signed-in caller, a function that finds nothing is a 404, the status
+of any SQLSTATE can be set, a function can write its error body byte for byte,
+and RPC results can take PostgREST's shape without the rest of compatibility
+mode. Compatibility mode keeps PostgREST's answers throughout, and a page of
+its own now says everything it changes. Released beside it:
+`postrust-worker` 1.3.0, which reads the new settings, and `postrust-proxy`
+2.0.2, which requires the fixed hickory release.
+
+### Upgrading
+
+Two answers change outside compatibility mode, both listed under Changed: a
+`42501` to an authenticated request is 403 rather than 401, and `P0002` is 404
+rather than 500. `PGRST_DB_ERROR_STATUS=P0002:500` keeps the old status for
+`P0002`. Everything else is off until set.
 
 ### Added
 
@@ -48,6 +64,33 @@ releases are described by their tags and the pull requests behind them.
   `error_response_for` and `status_code` answer as for an anonymous request,
   as before. A route of your own gets the 403 from `AppState::begin_as` and
   from `Error::for_user`, which marks a failed query of yours.
+
+### Fixed
+
+- **The images build on the toolchain CI tests with.** `Dockerfile` and
+  `Dockerfile.test` built on an unpinned nightly and `Dockerfile.alpine` on an
+  unversioned `rust:alpine`; a nightly compiler regression is why 3.1.0 has no
+  Debian image (3.1.1 carries the same code). All three now build on
+  `rust:1.98.1` with `--locked`, and CI fails if they drift from
+  `rust-toolchain.toml`.
+- **Compatibility mode is documented in full.** `docs/compat-mode.md` lists
+  every behaviour the mode changes, the settings that give one without the
+  rest, and what to check when moving on or off it. The configuration page
+  no longer says `/` stays an explicit route in compatibility mode.
+
+### Security
+
+- **hickory 0.26.1 → 0.26.3** (RUSTSEC-2026-0487 to -0491, -0506 to -0509,
+  -0513 to -0520, -0539 to -0541, -0556 to -0558), compiled only into
+  `postrust-proxy`, which now requires `hickory-resolver` 0.26.3 so a build
+  without this lockfile gets it too. **quinn-proto 0.11.19** and **quinn-udp
+  0.5.16** (RUSTSEC-2026-0523, -0524, -0538), in the lockfile but in no build.
+  **rustix 1.1.6** (RUSTSEC-2026-0486, unsound).
+- Two new entries in `.cargo/audit.toml`, with the evidence beside each:
+  libsqlite3-sys (RUSTSEC-2026-0459), locked only behind sqlx's SQLite
+  feature, which is not enabled, and with no fixed release sqlx 0.9 accepts;
+  and chrono (RUSTSEC-2026-0543), an unmaintained notice with no fixed
+  release.
 
 ## 3.2.0
 
