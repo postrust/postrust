@@ -3,11 +3,14 @@
 //! Mirrors PostgREST's configuration options.
 
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
 const EXPECTED_BOOLEAN: &str = "one of: true, false, 1, 0, yes, no, on, off";
 const EXPECTED_SQLSTATES: &str = "true, false, or a comma-separated list of SQLSTATEs \
      (P0001) and prefixes ending in * (PT*)";
+const EXPECTED_DB_ERROR_STATUS: &str = "a comma-separated list of PATTERN:STATUS, where PATTERN \
+     is a SQLSTATE (P0002) or a prefix ending in * (23*) and STATUS is an HTTP status from \
+     400 to 599, such as P0002:404,23*:422";
 
 /// An environment variable contains a value that cannot be used safely.
 #[derive(Clone, Debug, Eq, PartialEq, thiserror::Error)]
@@ -276,6 +279,22 @@ pub struct AppConfig {
     /// Compatibility mode passes every database error through regardless.
     #[serde(default, deserialize_with = "deserialize_sqlstate_patterns")]
     pub db_errors_verbatim: Vec<String>,
+
+    /// The HTTP status a database error is answered with, by SQLSTATE.
+    ///
+    /// Each key is a SQLSTATE (`P0002`) or a prefix ending in `*` (`23*`),
+    /// spelt as in [`db_errors_verbatim`](Self::db_errors_verbatim), and each
+    /// value a status from 400 to 599. The most specific key that matches
+    /// wins: a whole SQLSTATE over any prefix, a longer prefix over a shorter
+    /// one. Empty by default, which leaves the built-in table in charge --
+    /// PostgREST's, except that outside compatibility mode `P0002`
+    /// (`no_data_found`) is a 404 rather than a 500. An entry here wins over
+    /// that in both modes, so `P0002:500` puts PostgREST's answer back.
+    ///
+    /// What a function raises with `sqlstate 'PGRST'` or `PT<nnn>` is a
+    /// request for a status from the schema itself, and is never overridden.
+    #[serde(default, deserialize_with = "deserialize_db_error_status")]
+    pub db_error_status: BTreeMap<String, u16>,
 }
 
 impl Default for AppConfig {
@@ -322,6 +341,7 @@ impl Default for AppConfig {
             graphql_type_prefix: None,
             compat_mode: false,
             db_errors_verbatim: Vec::new(),
+            db_error_status: BTreeMap::new(),
         }
     }
 }
@@ -369,19 +389,59 @@ fn parse_sqlstate_patterns(value: &str) -> Option<Vec<String>> {
         Some(false) => return Some(Vec::new()),
         None => {}
     }
-    let sqlstate_chars = |s: &str| s.chars().all(|c| c.is_ascii_alphanumeric());
     value
         .split(',')
-        .map(|s| s.trim().to_ascii_uppercase())
-        .filter(|s| !s.is_empty())
-        .map(|s| {
-            let valid = match s.strip_suffix('*') {
-                Some(prefix) => prefix.len() < 5 && sqlstate_chars(prefix),
-                None => s.len() == 5 && sqlstate_chars(&s),
-            };
-            valid.then_some(s)
+        .filter(|s| !s.trim().is_empty())
+        .map(parse_sqlstate_pattern)
+        .collect()
+}
+
+/// One SQLSTATE or `*`-ended prefix, upper-cased, or `None` if it is neither.
+/// What `PGRST_DB_ERRORS_VERBATIM` and `PGRST_DB_ERROR_STATUS` both mean by
+/// a pattern, so that a SQLSTATE is spelt one way wherever it is configured.
+fn parse_sqlstate_pattern(pattern: &str) -> Option<String> {
+    let sqlstate_chars = |s: &str| s.chars().all(|c| c.is_ascii_alphanumeric());
+    let s = pattern.trim().to_ascii_uppercase();
+    let valid = match s.strip_suffix('*') {
+        Some(prefix) => prefix.len() < 5 && sqlstate_chars(prefix),
+        None => s.len() == 5 && sqlstate_chars(&s),
+    };
+    valid.then_some(s)
+}
+
+/// Parse `PGRST_DB_ERROR_STATUS`: `PATTERN:STATUS` pairs, comma-separated.
+/// `None` if any pair is malformed or its status is not a 4xx or 5xx, so that
+/// a typo cannot quietly leave an error on the status it was meant to change.
+/// A pattern given twice keeps the later status.
+fn parse_db_error_status(value: &str) -> Option<BTreeMap<String, u16>> {
+    value
+        .split(',')
+        .filter(|s| !s.trim().is_empty())
+        .map(|pair| {
+            let (pattern, status) = pair.split_once(':')?;
+            let status = status.trim().parse::<u16>().ok()?;
+            ((400..=599).contains(&status)).then_some(())?;
+            Some((parse_sqlstate_pattern(pattern)?, status))
         })
         .collect()
+}
+
+/// `db_error_status` as configuration spells it: an object from SQLSTATE or
+/// prefix to status, checked as `PGRST_DB_ERROR_STATUS` is.
+fn deserialize_db_error_status<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<BTreeMap<String, u16>, D::Error> {
+    let raw = BTreeMap::<String, u16>::deserialize(deserializer)?;
+    let spelt = raw
+        .iter()
+        .map(|(pattern, status)| format!("{pattern}:{status}"))
+        .collect::<Vec<_>>()
+        .join(",");
+    parse_db_error_status(&spelt).ok_or_else(|| {
+        serde::de::Error::custom(format!(
+            "invalid db_error_status {spelt:?}: expected {EXPECTED_DB_ERROR_STATUS}"
+        ))
+    })
 }
 
 /// `db_errors_verbatim` as configuration spells it, checked and upper-cased
@@ -777,6 +837,15 @@ impl AppConfig {
                 .ok_or_else(|| invalid("PGRST_DB_ERRORS_VERBATIM", &v, EXPECTED_SQLSTATES))?;
         }
 
+        // The alias is read second, so it wins where both are set, as it does
+        // for `PGRST_COMPAT_MODE`.
+        for var in ["PGRST_DB_ERROR_STATUS", "POSTRUST_DB_ERROR_STATUS"] {
+            if let Ok(v) = get(var) {
+                config.db_error_status = parse_db_error_status(&v)
+                    .ok_or_else(|| invalid(var, &v, EXPECTED_DB_ERROR_STATUS))?;
+            }
+        }
+
         Ok(config)
     }
 
@@ -802,6 +871,39 @@ impl AppConfig {
                         .any(|pattern| sqlstate_matches(pattern, &db.code))
             }
             _ => false,
+        }
+    }
+
+    /// The status this configuration gives a database error, where it has an
+    /// opinion; `None` leaves the built-in table
+    /// ([`DatabaseError::status_code_as`](crate::error::DatabaseError::status_code_as))
+    /// to decide.
+    ///
+    /// An error the schema chose the status of -- `RAISE sqlstate 'PGRST'` or
+    /// `PT<nnn>` -- is never remapped: a function that asked for a 402 meant it.
+    /// Otherwise the most specific entry of
+    /// [`db_error_status`](Self::db_error_status) wins, a whole SQLSTATE over
+    /// any prefix and a longer prefix over a shorter. With none, `P0002`
+    /// (`no_data_found`) is a 404 outside compatibility mode, where a function
+    /// that found nothing is reporting a missing thing, and stays PostgREST's
+    /// 500 inside it.
+    pub fn db_error_status(&self, error: &crate::error::DatabaseError) -> Option<http::StatusCode> {
+        if error.status_is_raised() {
+            return None;
+        }
+        let configured = self
+            .db_error_status
+            .iter()
+            .filter(|(pattern, _)| sqlstate_matches(pattern, &error.code))
+            .max_by_key(|(pattern, _)| match pattern.ends_with('*') {
+                true => pattern.len(),
+                false => usize::MAX,
+            })
+            .and_then(|(_, status)| http::StatusCode::from_u16(*status).ok());
+        match configured {
+            Some(status) => Some(status),
+            None if !self.compat_mode && error.code == "P0002" => Some(http::StatusCode::NOT_FOUND),
+            None => None,
         }
     }
 
@@ -1230,6 +1332,155 @@ mod tests {
         config.db_errors_verbatim.clear();
         config.compat_mode = true;
         assert!(config.verbatim_db_error(&db("23505")));
+    }
+
+    fn database_error(code: &str) -> crate::error::DatabaseError {
+        crate::error::DatabaseError {
+            code: code.to_string(),
+            message: String::new(),
+            details: None,
+            hint: None,
+            constraint: None,
+            table: None,
+            column: None,
+        }
+    }
+
+    #[test]
+    fn db_error_status_takes_patterns_and_statuses() {
+        let parse =
+            |name: &str, v: &str| AppConfig::try_from_vars([(name, v)]).map(|c| c.db_error_status);
+        let expected: BTreeMap<String, u16> = [("P0002", 404), ("23*", 422)]
+            .into_iter()
+            .map(|(p, s)| (p.to_string(), s))
+            .collect();
+        // Both names; the pattern spelt as `PGRST_DB_ERRORS_VERBATIM` allows,
+        // so lower case is upper-cased and spaces are ignored.
+        for name in ["PGRST_DB_ERROR_STATUS", "POSTRUST_DB_ERROR_STATUS"] {
+            assert_eq!(
+                parse(name, "P0002:404,23*:422").unwrap(),
+                expected,
+                "{name}"
+            );
+            assert_eq!(parse(name, " p0002 : 404 , 23*:422,").unwrap(), expected);
+            assert!(parse(name, "").unwrap().is_empty());
+        }
+        // Where both are set, the alias is read last and wins.
+        let both = AppConfig::try_from_vars([
+            ("PGRST_DB_ERROR_STATUS", "P0002:404"),
+            ("POSTRUST_DB_ERROR_STATUS", "P0002:410"),
+        ])
+        .unwrap();
+        assert_eq!(both.db_error_status["P0002"], 410);
+
+        for bad in [
+            "P0002",       // no status
+            "P0002:",      // empty status
+            "P0002:abc",   // not a number
+            "P0002:399",   // below 400
+            "P0002:600",   // above 599
+            "P0002:-404",  // not a status
+            "P001:404",    // not a SQLSTATE
+            "P0*01:404",   // `*` only ends a prefix
+            "P0002:404:5", // two statuses
+            "true",        // `PGRST_DB_ERRORS_VERBATIM`'s booleans mean nothing here
+            "P0002:404,xx",
+        ] {
+            let error = parse("PGRST_DB_ERROR_STATUS", bad).unwrap_err();
+            assert!(
+                error.to_string().contains("PGRST_DB_ERROR_STATUS"),
+                "{bad:?}"
+            );
+            assert!(parse("POSTRUST_DB_ERROR_STATUS", bad).is_err(), "{bad:?}");
+        }
+
+        // A configuration file is held to the same rules.
+        let from_json = |v: &str| {
+            serde_json::from_str::<AppConfig>(&format!(r#"{{"db_error_status": {v}}}"#))
+                .map(|c| c.db_error_status)
+        };
+        assert_eq!(
+            from_json(r#"{"p0002": 404, "23*": 422}"#).unwrap(),
+            expected
+        );
+        assert!(from_json(r#"{"P0002": 200}"#).is_err());
+        assert!(from_json(r#"{"P001": 404}"#).is_err());
+        assert!(AppConfig::default().db_error_status.is_empty());
+    }
+
+    #[test]
+    fn the_most_specific_db_error_status_wins() {
+        let status = |config: &AppConfig, code: &str| {
+            config
+                .db_error_status(&database_error(code))
+                .map(|s| s.as_u16())
+        };
+        let mut config = AppConfig {
+            db_error_status: [("*", 400), ("23*", 422), ("232*", 423), ("23505", 409)]
+                .into_iter()
+                .map(|(p, s)| (p.to_string(), s))
+                .collect(),
+            ..AppConfig::default()
+        };
+        assert_eq!(
+            status(&config, "23505"),
+            Some(409),
+            "a code beats any prefix"
+        );
+        assert_eq!(status(&config, "23503"), Some(422));
+        assert_eq!(status(&config, "23514"), Some(422));
+        assert_eq!(status(&config, "23201"), Some(423), "a longer prefix wins");
+        assert_eq!(status(&config, "42P01"), Some(400), "the catch-all");
+        // A prefix matches from the start of the code, not anywhere in it.
+        config.db_error_status = [("2*", 422)]
+            .into_iter()
+            .map(|(p, s)| (p.to_string(), s))
+            .collect();
+        assert_eq!(status(&config, "P0002"), Some(404));
+    }
+
+    #[test]
+    fn no_data_found_is_a_404_except_in_compat_mode_or_when_mapped() {
+        let status = |config: &AppConfig, code: &str| {
+            config
+                .db_error_status(&database_error(code))
+                .map(|s| s.as_u16())
+        };
+        let mut config = AppConfig::default();
+        assert_eq!(status(&config, "P0002"), Some(404));
+        // Nothing else has an opinion by default.
+        assert_eq!(status(&config, "P0001"), None);
+        assert_eq!(status(&config, "23505"), None);
+
+        config.compat_mode = true;
+        assert_eq!(status(&config, "P0002"), None, "PostgREST's 500 stands");
+
+        // An explicit mapping wins in both modes, `P0002:500` included.
+        config.db_error_status.insert("P0002".to_string(), 500);
+        assert_eq!(status(&config, "P0002"), Some(500));
+        config.compat_mode = false;
+        assert_eq!(status(&config, "P0002"), Some(500));
+        config.db_error_status.insert("P0002".to_string(), 409);
+        assert_eq!(status(&config, "P0002"), Some(409));
+    }
+
+    #[test]
+    fn a_status_the_schema_raised_is_not_mapped() {
+        let config = AppConfig {
+            db_error_status: [("*", 418)]
+                .into_iter()
+                .map(|(p, s)| (p.to_string(), s))
+                .collect(),
+            ..AppConfig::default()
+        };
+        assert_eq!(config.db_error_status(&database_error("PGRST")), None);
+        assert_eq!(config.db_error_status(&database_error("PT402")), None);
+        assert_eq!(
+            config
+                .db_error_status(&database_error("42501"))
+                .map(|s| s.as_u16()),
+            Some(418)
+        );
     }
 
     #[test]

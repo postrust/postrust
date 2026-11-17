@@ -42,7 +42,14 @@ use std::sync::{Arc, Mutex};
 pub struct Error(Box<postrust_core::Error>, bool);
 
 impl Error {
-    /// The status this is answered with.
+    /// The status the built-in table gives this error.
+    ///
+    /// An error cannot see the configuration, so this is without
+    /// `PGRST_DB_ERROR_STATUS` and without compatibility mode: `P0002` is a
+    /// 404 here whichever mode the server is in. The response a route sends
+    /// is rendered again where the configuration is known (see
+    /// [`Builder::nest`](crate::Builder::nest)) and carries the status the
+    /// configuration gives, which is what REST answers.
     pub fn status(&self) -> StatusCode {
         self.0.status_code_as(self.1)
     }
@@ -123,28 +130,37 @@ impl IntoResponse for Error {
 
         // Rendered sanitised, which is right unless the server passes
         // database errors through (compatibility mode, or
-        // `PGRST_DB_ERRORS_VERBATIM`). A database error -- the only kind
-        // either renders differently -- rides along in the extensions as well,
-        // so that `render_verbatim`, which can see the configuration, can
-        // render it again where it is. Never sent: extensions are not
-        // serialised.
+        // `PGRST_DB_ERRORS_VERBATIM`), and with the status the default
+        // configuration gives, which is right unless compatibility mode or
+        // `PGRST_DB_ERROR_STATUS` says otherwise. A database error -- the
+        // only kind either renders differently -- rides along in the
+        // extensions as well, so that `render_verbatim`, which can see the
+        // configuration, can render it again where it is. Never sent:
+        // extensions are not serialised.
+        let authenticated = self.1;
         let kept = match &*self.0 {
-            postrust_core::Error::Database(db) => Some(Unrendered(Arc::new(Mutex::new(Some(
-                postrust_core::Error::Database(copy_of(db)),
-            ))))),
+            postrust_core::Error::Database(db) => Some(postrust_core::Error::Database(copy_of(db))),
             _ => None,
         };
-        // Rendered without a configuration, as sanitised, as the comment above
-        // says; the default one is that. `authenticated` is the one thing this
-        // takes from the error itself.
-        let authenticated = self.1;
+        // Rendered without a configuration, as the comment above says; the
+        // default one is that. `authenticated` is the one thing this takes
+        // from the error itself.
         let mut response = postrust_engine::error_response_as(
             &postrust_core::AppConfig::default(),
             *self.0,
             authenticated,
         );
-        if let Some(kept) = kept {
-            response.extensions_mut().insert(kept);
+        if let Some(error) = kept {
+            // With the status it left with, so that `render_verbatim` can tell
+            // it from one a layer of the route's own has changed since.
+            let rendered = response.status();
+            response
+                .extensions_mut()
+                .insert(Unrendered(Arc::new(Mutex::new(Some((
+                    error,
+                    authenticated,
+                    rendered,
+                ))))));
         }
         response.map(axum::body::Body::from)
     }
@@ -164,17 +180,21 @@ fn copy_of(db: &postrust_core::error::DatabaseError) -> postrust_core::error::Da
 }
 
 /// A database error a response was rendered from, sanitised, kept for
-/// [`render_verbatim`]. Only database errors are kept: passing them through
+/// [`render_verbatim`] with whether the request was authenticated and the
+/// status it was rendered with. Only database errors are kept: configuration
 /// changes how nothing else is rendered.
 #[derive(Clone)]
-struct Unrendered(Arc<Mutex<Option<postrust_core::Error>>>);
+struct Unrendered(Arc<Mutex<Option<(postrust_core::Error, bool, StatusCode)>>>);
 
-/// Render a route's [`Error`] again with the database's own words, where the
-/// configuration passes its SQLSTATE through.
+/// Render a route's [`Error`] again as the configuration answers it: with the
+/// database's own words where it passes the SQLSTATE through, and with the
+/// status it gives that SQLSTATE.
 ///
 /// A layer on each router given to [`Builder::nest`](crate::Builder::nest)
-/// when compatibility mode is on or `PGRST_DB_ERRORS_VERBATIM` lists any
-/// SQLSTATE, and only then.
+/// when compatibility mode is on, `PGRST_DB_ERRORS_VERBATIM` lists any
+/// SQLSTATE or `PGRST_DB_ERROR_STATUS` maps any, and only then. Without
+/// either the route's own rendering, which is as the default configuration
+/// answers, is already right.
 pub(crate) async fn render_verbatim(
     State(state): State<Arc<AppState>>,
     mut response: Response,
@@ -184,12 +204,25 @@ pub(crate) async fn render_verbatim(
     };
     let error = error.lock().ok().and_then(|mut error| error.take());
     match error {
-        // Only the body: for a database error that is all compatibility mode
-        // changes, and the status and headers are kept as they left the
-        // route -- including any a layer of the route's own added.
-        Some(error) => {
-            let (_, body) = postrust_engine::error_response_for(&state.config, error).into_parts();
-            let (parts, _) = response.into_parts();
+        Some((error, authenticated, rendered)) => {
+            let (fresh, body) =
+                postrust_engine::error_response_as(&state.config, error, authenticated)
+                    .into_parts();
+            let (mut parts, _) = response.into_parts();
+            // The status and headers are kept as they left the route --
+            // including any a layer of the route's own added -- unless the
+            // configuration gives the error another status than the route
+            // rendered it with. Then the status is the configuration's, and
+            // the challenge only a 401 carries goes with it.
+            if parts.status == rendered && fresh.status != rendered {
+                parts.status = fresh.status;
+                parts.headers.remove(http::header::WWW_AUTHENTICATE);
+                if let Some(challenge) = fresh.headers.get(http::header::WWW_AUTHENTICATE) {
+                    parts
+                        .headers
+                        .insert(http::header::WWW_AUTHENTICATE, challenge.clone());
+                }
+            }
             Response::from_parts(parts, axum::body::Body::from(body))
         }
         None => response,

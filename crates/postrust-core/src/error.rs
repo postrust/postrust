@@ -804,6 +804,15 @@ impl DatabaseError {
         Some(self.parse_raise())
     }
 
+    /// Whether the schema chose the status itself, by raising `sqlstate
+    /// 'PGRST'` or a `PT<nnn>` code, rather than leaving it to the table.
+    ///
+    /// Such a status is a request and not a classification, so configuration
+    /// that maps SQLSTATEs to statuses does not apply to it.
+    pub fn status_is_raised(&self) -> bool {
+        self.code == "PGRST" || self.code.starts_with("PT")
+    }
+
     fn parse_raise(&self) -> std::result::Result<RaisedResponse, RaiseFault> {
         let object = |raw: &str| -> Option<serde_json::Map<String, serde_json::Value>> {
             match serde_json::from_str(raw) {

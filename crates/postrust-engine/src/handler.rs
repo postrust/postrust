@@ -3704,12 +3704,13 @@ fn build_response(response: PgrstResponse) -> Response<Bytes> {
 /// selected, the text of a failing query. Everything else is reported the
 /// same either way.
 pub fn error_response(error: postrust_core::Error, verbatim_db_errors: bool) -> Response<Bytes> {
-    error_response_with(error, verbatim_db_errors, false)
+    error_response_with(error, verbatim_db_errors, false, None)
 }
 
 /// Build the response for a failed request as `config` says database errors
-/// are answered: compatibility mode and `PGRST_DB_ERRORS_VERBATIM` both
-/// decided here, so a caller holding the configuration cannot leave one out.
+/// are answered: compatibility mode, `PGRST_DB_ERRORS_VERBATIM` and
+/// `PGRST_DB_ERROR_STATUS` all decided here, so a caller holding the
+/// configuration cannot leave one out.
 ///
 /// Answers as for an anonymous request, which is what a host that does not
 /// know who asked should say; see [`error_response_as`] for one that does.
@@ -3727,21 +3728,37 @@ pub fn error_response_for(
 /// PostgREST. `authenticated` is whether the request runs as a role other than
 /// the configured anonymous one; see
 /// [`AppConfig::is_authenticated_role`](postrust_core::AppConfig::is_authenticated_role).
+///
+/// The status of a database error is, in order: what the schema raised with
+/// `sqlstate 'PGRST'` or `PT<nnn>`, which is an explicit request; what
+/// [`AppConfig::db_error_status`](postrust_core::AppConfig::db_error_status)
+/// says, which is `PGRST_DB_ERROR_STATUS` and then the default for `P0002`;
+/// and the built-in table, with the missing-grant split above.
 pub fn error_response_as(
     config: &postrust_core::AppConfig,
     error: postrust_core::Error,
     authenticated: bool,
 ) -> Response<Bytes> {
     let verbatim_db_errors = config.verbatim_db_error(&error);
-    error_response_with(error, verbatim_db_errors, authenticated)
+    let mapped = match &error {
+        postrust_core::Error::Database(db) => config.db_error_status(db),
+        _ => None,
+    };
+    error_response_with(error, verbatim_db_errors, authenticated, mapped)
 }
 
+/// `mapped` is the status the configuration gives this error, which takes the
+/// place of the built-in table's.
 fn error_response_with(
     error: postrust_core::Error,
     verbatim_db_errors: bool,
     authenticated: bool,
+    mapped: Option<StatusCode>,
 ) -> Response<Bytes> {
-    let status = error.status_code_as(authenticated);
+    // Taken before the body is built, so that the `WWW-Authenticate` header
+    // below follows the status the client is actually sent: a 401 mapped away
+    // loses its challenge, and a status mapped to 401 gains one.
+    let status = mapped.unwrap_or_else(|| error.status_code_as(authenticated));
 
     // Check if debug mode is enabled
     let debug_mode = std::env::var("PGRST_DEBUG")
@@ -3985,6 +4002,107 @@ mod tests {
         assert_ne!(unlisted["code"], "23505");
         let default = body(&postrust_core::AppConfig::default(), "P0001");
         assert_eq!(default["message"], "Database error");
+    }
+
+    /// The status a configuration gives an error raised with `code`, and the
+    /// challenge that goes with it, for an anonymous or authenticated request.
+    fn answered(
+        config: &postrust_core::AppConfig,
+        code: &str,
+        message: &str,
+        details: Option<&str>,
+        authenticated: bool,
+    ) -> (StatusCode, bool) {
+        let error = postrust_core::Error::Database(postrust_core::error::DatabaseError {
+            code: code.into(),
+            message: message.into(),
+            details: details.map(str::to_string),
+            hint: None,
+            constraint: None,
+            table: None,
+            column: None,
+        });
+        let response = super::error_response_as(config, error, authenticated);
+        let challenged = response.headers().contains_key("www-authenticate");
+        (response.status(), challenged)
+    }
+
+    /// Outside compatibility mode `P0002` is a 404; inside it PostgREST's 500;
+    /// and a mapping of the operator's own wins in both.
+    #[test]
+    fn no_data_found_is_a_404_by_default_and_a_500_in_compat_mode() {
+        let mut config = postrust_core::AppConfig::default();
+        let status = |config: &postrust_core::AppConfig| {
+            answered(config, "P0002", "no data found", None, false).0
+        };
+        assert_eq!(status(&config), StatusCode::NOT_FOUND);
+
+        config.compat_mode = true;
+        assert_eq!(status(&config), StatusCode::INTERNAL_SERVER_ERROR);
+
+        config.db_error_status.insert("P0002".to_string(), 410);
+        assert_eq!(status(&config), StatusCode::GONE);
+        config.compat_mode = false;
+        config.db_error_status.insert("P0002".to_string(), 500);
+        assert_eq!(status(&config), StatusCode::INTERNAL_SERVER_ERROR);
+    }
+
+    /// What the schema asked for is not the configuration's to change, and the
+    /// built-in table still answers what nothing maps.
+    #[test]
+    fn a_status_the_schema_raised_is_not_remapped() {
+        let mut config = postrust_core::AppConfig::default();
+        config.db_error_status.insert("*".to_string(), 418);
+        config.db_error_status.insert("PT*".to_string(), 418);
+        config.db_error_status.insert("PGRST".to_string(), 418);
+
+        assert_eq!(
+            answered(&config, "PT402", "pay", None, false).0,
+            StatusCode::PAYMENT_REQUIRED
+        );
+        let raised = r#"{"code":"x","message":"y"}"#;
+        let detail = r#"{"status":402,"headers":{}}"#;
+        assert_eq!(
+            answered(&config, "PGRST", raised, Some(detail), false).0,
+            StatusCode::PAYMENT_REQUIRED
+        );
+        // Anything else is the configuration's.
+        assert_eq!(
+            answered(&config, "23505", "dup", None, false).0,
+            StatusCode::IM_A_TEAPOT
+        );
+    }
+
+    /// The challenge follows the status that is sent: mapping a missing grant
+    /// away drops it, and mapping to 401 adds it.
+    #[test]
+    fn the_challenge_follows_the_final_status() {
+        let mut config = postrust_core::AppConfig::default();
+        assert_eq!(
+            answered(&config, "42501", "denied", None, false),
+            (StatusCode::UNAUTHORIZED, true)
+        );
+        assert_eq!(
+            answered(&config, "42501", "denied", None, true),
+            (StatusCode::FORBIDDEN, false)
+        );
+
+        config.db_error_status.insert("42501".to_string(), 404);
+        assert_eq!(
+            answered(&config, "42501", "denied", None, false),
+            (StatusCode::NOT_FOUND, false)
+        );
+        config.db_error_status.insert("42501".to_string(), 401);
+        assert_eq!(
+            answered(&config, "42501", "denied", None, true),
+            (StatusCode::UNAUTHORIZED, true)
+        );
+        config.db_error_status.clear();
+        config.db_error_status.insert("23*".to_string(), 401);
+        assert_eq!(
+            answered(&config, "23505", "dup", None, false),
+            (StatusCode::UNAUTHORIZED, true)
+        );
     }
 
     #[test]

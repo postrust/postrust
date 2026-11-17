@@ -359,7 +359,9 @@ one that could not be had from the pool in time is 500 (`PGRST500`). The databas
 REST sanitises them, and passed through where REST passes them through -- in
 compatibility mode, or for a SQLSTATE `PGRST_DB_ERRORS_VERBATIM` lists -- for
 the routers given to `Builder::nest`, which is where the server can see the
-setting.
+setting. The status follows `PGRST_DB_ERROR_STATUS` and the `P0002` default
+there too, as REST's does; `Error::status()` cannot see them and answers with
+the built-in table.
 
 ## Accessing Application State
 

@@ -5,7 +5,23 @@ releases are described by their tags and the pull requests behind them.
 
 ## Unreleased
 
+### Added
+
+- **`PGRST_DB_ERROR_STATUS` sets the HTTP status of a database error by
+  SQLSTATE** (#76; alias `POSTRUST_DB_ERROR_STATUS`). Comma-separated
+  `PATTERN:STATUS`, such as `P0002:404,23*:422`: a pattern is a SQLSTATE or a
+  prefix ending in `*`, as in `PGRST_DB_ERRORS_VERBATIM`, and a status is 400
+  to 599, or start-up stops. The most specific pattern wins. A status raised
+  by the schema (`sqlstate 'PGRST'`, `PT<nnn>`) is never remapped. It applies
+  to REST, to routes given to `Builder::nest` and to the Worker, and is
+  `AppConfig::db_error_status` in a configuration file.
+
 ### Changed
+
+- **`P0002` (`no_data_found`) is a 404 outside compatibility mode** (#76),
+  where it was a 500, since a function that found nothing is reporting a
+  missing thing and not a fault. `PGRST_COMPAT_MODE=true` keeps PostgREST's
+  500, and `PGRST_DB_ERROR_STATUS=P0002:500` restores it in either mode.
 
 - **A missing grant (SQLSTATE `42501`) is a 403 for an authenticated request**
   and stays a 401, with its `WWW-Authenticate` challenge, for an anonymous one
