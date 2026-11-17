@@ -126,7 +126,7 @@ secrets: `PGRST_DB_SCHEMAS`, `PGRST_DB_ANON_ROLE`, `PGRST_JWT_SECRET`,
 `PGRST_JWT_JWKS_URL`, `PGRST_JWT_JWKS_REFRESH`,
 `PGRST_JWT_AUD`, `PGRST_JWT_ISS`, `PGRST_JWT_ROLE_CLAIM_KEY`, `PGRST_DB_EXTRA_SEARCH_PATH`,
 `PGRST_DB_PRE_REQUEST`, `PGRST_DB_ERROR_STATUS`, `PGRST_APP_SETTINGS_*`, `PGRST_ROLE_SETTINGS`,
-`PGRST_SERVER_CORS_ORIGINS` and the rest. See
+`PGRST_SERVER_CORS_ORIGINS`, `PGRST_RPC_UNWRAP` and the rest. See
 [configuration.md](configuration.md). Settings that only make sense for a
 long-running server are ignored, such as the pool size, the listen address and
 `PGRST_DB_CHANNEL`.

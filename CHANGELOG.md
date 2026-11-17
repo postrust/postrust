@@ -23,6 +23,13 @@ releases are described by their tags and the pull requests behind them.
   by the schema (`sqlstate 'PGRST'`, `PT<nnn>`) is never remapped. It applies
   to REST, to routes given to `Builder::nest` and to the Worker, and is
   `AppConfig::db_error_status` in a configuration file.
+- **`PGRST_RPC_UNWRAP`** (alias `POSTRUST_RPC_UNWRAP`) answers `POST /rpc/<fn>`
+  the way PostgREST does -- a bare object or scalar for a function that
+  returns one row, a top-level array for a set-returning one -- instead of
+  `[{"<fn>": ...}]`, without the rest of compatibility mode: REST stays at
+  `/api` and database errors stay sanitised. Compatibility mode still implies
+  it. Applies to REST and the Worker. `AppConfig` gains `rpc_unwrap` and
+  `unwrap_rpc_results`. (#76)
 
 ### Changed
 
