@@ -1,5 +1,6 @@
-# Test runner Dockerfile
-FROM rustlang/rust:nightly-bookworm
+# Test runner Dockerfile, on the toolchain rust-toolchain.toml pins: the one
+# CI tests with, rather than whatever nightly was current.
+FROM rust:1.98.1-bookworm
 
 WORKDIR /app
 
