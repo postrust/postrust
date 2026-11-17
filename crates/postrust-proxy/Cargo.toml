@@ -93,8 +93,11 @@ pin-project-lite = "0.2"
 # Random for load balancing
 rand = "0.9"
 
-# DNS resolution for domain verification
-hickory-resolver = "0.26"
+# DNS resolution for domain verification. At least 0.26.3, the release that
+# fixes the hickory advisories published after 3.2.0 (RUSTSEC-2026-0487 and
+# the rest). A lockfile is not published with a library, so only this floor
+# keeps a build of this crate off the vulnerable 0.26.0-0.26.2.
+hickory-resolver = "0.26.3"
 
 # Hashing for API keys
 sha2 = "0.10"
