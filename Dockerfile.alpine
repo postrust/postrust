@@ -5,8 +5,10 @@
 # and throughput difference between them is a measurement rather than an
 # assumption.
 #
-# Build stage
-FROM rust:alpine AS builder
+# Build stage. The toolchain rust-toolchain.toml pins, on the Alpine release
+# the runtime stage uses. An unversioned `rust:alpine` builds with whatever
+# stable was current on the day, which is not what CI tested.
+FROM rust:1.98.1-alpine3.22 AS builder
 
 # musl-dev and build-base for the C toolchain; cmake and perl are needed by
 # aws-lc-rs, which rustls pulls in as its crypto provider.
@@ -19,7 +21,7 @@ COPY crates ./crates
 
 # `otel` is inactive until OTEL_EXPORTER_OTLP_ENDPOINT or
 # PGRST_ADMIN_SERVER_PORT is set; see docs/observability.md.
-RUN cargo build --release -p postrust-server --features admin-ui,otel
+RUN cargo build --release --locked -p postrust-server --features admin-ui,otel
 
 # Runtime stage
 FROM alpine:3.22
