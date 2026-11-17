@@ -291,6 +291,7 @@ where the two differ deliberately.
 |----------|-------------|---------|
 | `PGRST_COMPAT_MODE` | PostgREST compatibility mode (alias: `POSTRUST_COMPAT_MODE`) | `false` |
 | `PGRST_DB_ERRORS_VERBATIM` | Database errors answered in PostgreSQL's own words, without the rest of compatibility mode: `true` for all of them, or a comma-separated list of SQLSTATEs and prefixes ending in `*`, such as `P0001,PT*`. See below | `false` |
+| `PGRST_RPC_UNWRAP` | `POST /rpc/<fn>` answered as PostgREST does -- a bare object or scalar for a function that returns one row, a top-level array for a set -- instead of `[{"<fn>": ...}]`, without the rest of compatibility mode (alias: `POSTRUST_RPC_UNWRAP`). Compatibility mode implies it | `false` |
 
 Setting `PGRST_COMPAT_MODE=true` makes the API behave more like PostgREST:
 

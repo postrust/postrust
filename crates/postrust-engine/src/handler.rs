@@ -1498,10 +1498,11 @@ async fn execute_plan<'s, S: State>(
                 flatten_spreads(row, &spread_columns);
             }
 
-            // In PostgREST-compatibility mode, reshape RPC responses to match
-            // PostgREST: un-nest the function-name-keyed column and return a
-            // bare value for non-set-returning functions.
-            let (mut json_rows, singular) = if state.config().compat_mode {
+            // In compatibility mode, or with `PGRST_RPC_UNWRAP` on its own,
+            // reshape RPC responses to match PostgREST: un-nest the
+            // function-name-keyed column and return a bare value for
+            // non-set-returning functions.
+            let (mut json_rows, singular) = if state.config().unwrap_rpc_results() {
                 if let ActionPlan::Db(DbActionPlan::Call { call, .. }) = plan {
                     unwrap_rpc_rows(json_rows, call)
                 } else {

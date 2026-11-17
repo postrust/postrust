@@ -276,6 +276,14 @@ pub struct AppConfig {
     /// Compatibility mode passes every database error through regardless.
     #[serde(default, deserialize_with = "deserialize_sqlstate_patterns")]
     pub db_errors_verbatim: Vec<String>,
+
+    /// Answer `POST /rpc/<fn>` the way PostgREST does -- a bare object or
+    /// scalar for a function that returns one row, a top-level array for a set
+    /// -- instead of the default `[{"<fn>": ...}]`, without the rest of
+    /// compatibility mode. Off by default. Compatibility mode implies it; ask
+    /// [`unwrap_rpc_results`](Self::unwrap_rpc_results) rather than this field.
+    #[serde(default)]
+    pub rpc_unwrap: bool,
 }
 
 impl Default for AppConfig {
@@ -322,6 +330,7 @@ impl Default for AppConfig {
             graphql_type_prefix: None,
             compat_mode: false,
             db_errors_verbatim: Vec::new(),
+            rpc_unwrap: false,
         }
     }
 }
@@ -772,6 +781,12 @@ impl AppConfig {
             }
         }
 
+        for var in ["PGRST_RPC_UNWRAP", "POSTRUST_RPC_UNWRAP"] {
+            if let Ok(v) = get(var) {
+                config.rpc_unwrap = env_bool(var, &v)?;
+            }
+        }
+
         if let Ok(v) = get("PGRST_DB_ERRORS_VERBATIM") {
             config.db_errors_verbatim = parse_sqlstate_patterns(&v)
                 .ok_or_else(|| invalid("PGRST_DB_ERRORS_VERBATIM", &v, EXPECTED_SQLSTATES))?;
@@ -800,6 +815,12 @@ impl AppConfig {
     /// what decides if a custom route's errors need rendering again.
     pub fn any_verbatim_db_errors(&self) -> bool {
         self.compat_mode || !self.db_errors_verbatim.is_empty()
+    }
+
+    /// Whether RPC responses are un-nested PostgREST-style: in compatibility
+    /// mode, or with [`rpc_unwrap`](Self::rpc_unwrap) on its own.
+    pub fn unwrap_rpc_results(&self) -> bool {
+        self.compat_mode || self.rpc_unwrap
     }
 
     /// Get the default schema (first in the list).
@@ -1221,6 +1242,32 @@ mod tests {
         config.db_errors_verbatim.clear();
         config.compat_mode = true;
         assert!(config.verbatim_db_error(&db("23505")));
+    }
+
+    #[test]
+    fn rpc_unwrap_is_read_under_either_name_and_defaults_off() {
+        let read = |vars: &[(&str, &str)]| {
+            AppConfig::try_from_vars(vars.iter().map(|(k, v)| (k.to_string(), v.to_string())))
+        };
+        assert!(!read(&[]).unwrap().rpc_unwrap);
+        assert!(read(&[("PGRST_RPC_UNWRAP", "true")]).unwrap().rpc_unwrap);
+        assert!(read(&[("POSTRUST_RPC_UNWRAP", "1")]).unwrap().rpc_unwrap);
+        assert!(!read(&[("PGRST_RPC_UNWRAP", "false")]).unwrap().rpc_unwrap);
+        assert!(read(&[("PGRST_RPC_UNWRAP", "maybe")]).is_err());
+        assert!(read(&[("POSTRUST_RPC_UNWRAP", "maybe")]).is_err());
+        let config: AppConfig = serde_json::from_str(r#"{"rpc_unwrap": true}"#).unwrap();
+        assert!(config.rpc_unwrap);
+    }
+
+    #[test]
+    fn unwrap_rpc_results_follows_either_setting() {
+        let mut config = AppConfig::default();
+        assert!(!config.unwrap_rpc_results());
+        config.rpc_unwrap = true;
+        assert!(config.unwrap_rpc_results());
+        config.rpc_unwrap = false;
+        config.compat_mode = true;
+        assert!(config.unwrap_rpc_results());
     }
 
     #[test]
