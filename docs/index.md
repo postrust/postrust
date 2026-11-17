@@ -6,6 +6,7 @@ Welcome to the Postrust documentation. Postrust serves a PostgreSQL schema as a 
 
 - [Getting Started](./getting-started.md) - Installation and first steps
 - [Configuration](./configuration.md) - Environment variables and options
+- [PostgREST Compatibility Mode](./compat-mode.md) - What `PGRST_COMPAT_MODE` changes, and how to take one behaviour without the rest
 - [API Reference](./api-reference.md) - Complete API documentation
 - [Authentication](./authentication.md) - JWT and role-based access
 - [Realtime Subscriptions](./realtime.md) - Table changes streamed over GraphQL subscriptions
