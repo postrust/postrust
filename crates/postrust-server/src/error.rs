@@ -10,6 +10,7 @@
 //! what `?` makes of a `sqlx::Error` in a handler that returns it.
 
 use crate::state::AppState;
+use crate::user::User;
 use axum::extract::State;
 use axum::response::{IntoResponse, Response};
 use http::StatusCode;
@@ -19,8 +20,8 @@ use std::sync::{Arc, Mutex};
 ///
 /// Wraps the [`postrust_core::Error`] the REST pipeline reports with, so its
 /// status and body come from the same table: a database error by its
-/// SQLSTATE (`23505` is 409, `42501` a missing grant is 401, `P0001` a bare
-/// `RAISE` is 400), a refusal raised with `sqlstate 'PGRST'` with the status,
+/// SQLSTATE (`23505` is 409, `42501` a missing grant is 401 or 403, `P0001` a
+/// bare `RAISE` is 400), a refusal raised with `sqlstate 'PGRST'` with the status,
 /// headers and body the function wrote, a broken connection as 503.
 ///
 /// The database's own account of an error -- its message, detail and hint,
@@ -31,12 +32,31 @@ use std::sync::{Arc, Mutex};
 /// has no way to reach, so they are applied on the way
 /// out by the routers given to [`Builder::nest`](crate::Builder::nest). A
 /// router served some other way gets the sanitised body.
-pub struct Error(Box<postrust_core::Error>);
+///
+/// A missing grant is 401 to an anonymous request and 403 to an authenticated
+/// one, as in PostgREST, and an error cannot tell which it is for unless it is
+/// told. [`AppState::begin_as`](crate::AppState::begin_as) tells it, and
+/// [`Error::for_user`] does for a failure of your own queries; one converted
+/// by `?` from somewhere that has not seen the user is answered as for an
+/// anonymous request.
+pub struct Error(Box<postrust_core::Error>, bool);
 
 impl Error {
     /// The status this is answered with.
     pub fn status(&self) -> StatusCode {
-        self.0.status_code()
+        self.0.status_code_as(self.1)
+    }
+
+    /// This error, answered as it is for `user`: a missing grant is a 403
+    /// rather than a 401 where `user` runs as a role other than the
+    /// anonymous one.
+    ///
+    /// For a failure of a query run on a transaction from
+    /// [`AppState::begin_as`](crate::AppState::begin_as), which does this for
+    /// its own errors: `.map_err(|e| Error::from(e).for_user(&user, &state))`.
+    pub fn for_user(mut self, user: &User, state: &AppState) -> Self {
+        self.1 = state.config.is_authenticated_role(user.role());
+        self
     }
 
     /// The error as the REST pipeline reports it.
@@ -70,7 +90,7 @@ impl std::error::Error for Error {
 
 impl From<postrust_core::Error> for Error {
     fn from(error: postrust_core::Error) -> Self {
-        Self(Box::new(error))
+        Self(Box::new(error), false)
     }
 }
 
@@ -114,7 +134,15 @@ impl IntoResponse for Error {
             ))))),
             _ => None,
         };
-        let mut response = postrust_engine::error_response(*self.0, false);
+        // Rendered without a configuration, as sanitised, as the comment above
+        // says; the default one is that. `authenticated` is the one thing this
+        // takes from the error itself.
+        let authenticated = self.1;
+        let mut response = postrust_engine::error_response_as(
+            &postrust_core::AppConfig::default(),
+            *self.0,
+            authenticated,
+        );
         if let Some(kept) = kept {
             response.extensions_mut().insert(kept);
         }

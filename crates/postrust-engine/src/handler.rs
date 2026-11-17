@@ -63,8 +63,8 @@ where
 
     match process_request(state, request).await {
         Ok(response) => response,
-        Err(e) => {
-            let mut response = error_response_for(state.config(), e);
+        Err((e, authenticated)) => {
+            let mut response = error_response_as(state.config(), e, authenticated);
             // A 405 must carry `Allow` (RFC 9110, section 15.5.6), and it is
             // the answer an OPTIONS on the same resource gives -- whichever
             // refusal it was: a function called with the wrong method, a PUT
@@ -91,10 +91,14 @@ where
 }
 
 /// Process a request and return a response.
+///
+/// A failure comes with whether the request was authenticated, which a missing
+/// grant is answered differently for. A failure before the role is known is
+/// reported as not authenticated.
 async fn process_request<S, B>(
     state: &S,
     request: http::Request<B>,
-) -> Result<Response<Bytes>, postrust_core::Error>
+) -> Result<Response<Bytes>, (postrust_core::Error, bool)>
 where
     S: State,
     B: http_body::Body<Data = Bytes>,
@@ -102,9 +106,27 @@ where
 {
     // Authenticate, before the body is read. The same function serves a
     // host's own routes, so a token means the same thing to both.
-    let auth_result = authenticate(state, request.headers()).await?;
+    let auth_result = authenticate(state, request.headers())
+        .await
+        .map_err(|e| (e, false))?;
     debug!("Authenticated as role: {}", auth_result.role);
+    let authenticated = state.config().is_authenticated_role(&auth_result.role);
+    process_authenticated(state, request, auth_result)
+        .await
+        .map_err(|e| (e, authenticated))
+}
 
+/// The rest of [`process_request`], once the request has been authenticated.
+async fn process_authenticated<S, B>(
+    state: &S,
+    request: http::Request<B>,
+    auth_result: postrust_auth::AuthResult,
+) -> Result<Response<Bytes>, postrust_core::Error>
+where
+    S: State,
+    B: http_body::Body<Data = Bytes>,
+    B::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
+{
     // Parse request.
     //
     // `max_body_size`, not a constant, and not `DefaultBodyLimit` either: that
@@ -3682,22 +3704,44 @@ fn build_response(response: PgrstResponse) -> Response<Bytes> {
 /// selected, the text of a failing query. Everything else is reported the
 /// same either way.
 pub fn error_response(error: postrust_core::Error, verbatim_db_errors: bool) -> Response<Bytes> {
-    error_response_with(error, verbatim_db_errors)
+    error_response_with(error, verbatim_db_errors, false)
 }
 
 /// Build the response for a failed request as `config` says database errors
 /// are answered: compatibility mode and `PGRST_DB_ERRORS_VERBATIM` both
 /// decided here, so a caller holding the configuration cannot leave one out.
+///
+/// Answers as for an anonymous request, which is what a host that does not
+/// know who asked should say; see [`error_response_as`] for one that does.
 pub fn error_response_for(
     config: &postrust_core::AppConfig,
     error: postrust_core::Error,
 ) -> Response<Bytes> {
-    let verbatim_db_errors = config.verbatim_db_error(&error);
-    error_response_with(error, verbatim_db_errors)
+    error_response_as(config, error, false)
 }
 
-fn error_response_with(error: postrust_core::Error, verbatim_db_errors: bool) -> Response<Bytes> {
-    let status = error.status_code();
+/// [`error_response_for`], for a request known to be authenticated or not.
+///
+/// A missing grant (`42501`) is 401, with a `WWW-Authenticate` challenge, to
+/// an anonymous request and 403, with none, to an authenticated one, as in
+/// PostgREST. `authenticated` is whether the request runs as a role other than
+/// the configured anonymous one; see
+/// [`AppConfig::is_authenticated_role`](postrust_core::AppConfig::is_authenticated_role).
+pub fn error_response_as(
+    config: &postrust_core::AppConfig,
+    error: postrust_core::Error,
+    authenticated: bool,
+) -> Response<Bytes> {
+    let verbatim_db_errors = config.verbatim_db_error(&error);
+    error_response_with(error, verbatim_db_errors, authenticated)
+}
+
+fn error_response_with(
+    error: postrust_core::Error,
+    verbatim_db_errors: bool,
+    authenticated: bool,
+) -> Response<Bytes> {
+    let status = error.status_code_as(authenticated);
 
     // Check if debug mode is enabled
     let debug_mode = std::env::var("PGRST_DEBUG")

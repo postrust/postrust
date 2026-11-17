@@ -364,8 +364,22 @@ pub enum Error {
 }
 
 impl Error {
-    /// Get the HTTP status code for this error.
+    /// Get the HTTP status code for this error, as it is answered to an
+    /// anonymous request.
+    ///
+    /// See [`status_code_as`](Self::status_code_as) for the one status that
+    /// depends on who asked.
     pub fn status_code(&self) -> StatusCode {
+        self.status_code_as(false)
+    }
+
+    /// Get the HTTP status code for this error, for a request that is or is
+    /// not authenticated.
+    ///
+    /// Only a database error's status can differ: a missing grant (`42501`)
+    /// is 401 to an anonymous request and 403 to an authenticated one. See
+    /// [`DatabaseError::status_code_as`].
+    pub fn status_code_as(&self, authenticated: bool) -> StatusCode {
         match self {
             // 400 Bad Request
             Self::InvalidPath(_)
@@ -441,7 +455,7 @@ impl Error {
             | Self::Config(_) => StatusCode::INTERNAL_SERVER_ERROR,
 
             // Database errors map based on type
-            Self::Database(db_err) => db_err.status_code(),
+            Self::Database(db_err) => db_err.status_code_as(authenticated),
         }
     }
 
@@ -857,6 +871,20 @@ impl DatabaseError {
     /// can provoke are provoked by the request. Reporting them as server
     /// errors tells the client to retry something that will never succeed.
     pub fn status_code(&self) -> StatusCode {
+        self.status_code_as(false)
+    }
+
+    /// The HTTP status for a request that is or is not authenticated.
+    ///
+    /// The same table as [`status_code`](Self::status_code), which has the
+    /// answer for an anonymous request. Only `42501` (insufficient privilege)
+    /// depends on who asked, as it does in PostgREST: 401 for an anonymous
+    /// request, which may simply not have said who it is, and 403 for an
+    /// authenticated one, which has and is still not permitted. "Authenticated"
+    /// means the request runs as a role other than the configured anonymous
+    /// role, see
+    /// [`AppConfig::is_authenticated_role`](crate::AppConfig::is_authenticated_role).
+    pub fn status_code_as(&self, authenticated: bool) -> StatusCode {
         let code = self.code.as_str();
         let message = self.message.as_str();
 
@@ -918,8 +946,12 @@ impl DatabaseError {
             "42P01" => StatusCode::NOT_FOUND,
             "42P17" => StatusCode::INTERNAL_SERVER_ERROR,
             // Without authentication the client may simply not have said who
-            // it is; with it, it has and is still not permitted.
-            "42501" => StatusCode::UNAUTHORIZED,
+            // it is, so it is told to; with it, it has and is still not
+            // permitted, which a 401 would send it away to retry.
+            "42501" => match authenticated {
+                true => StatusCode::FORBIDDEN,
+                false => StatusCode::UNAUTHORIZED,
+            },
             _ => match code.as_bytes() {
                 [b'0', b'8', ..] => StatusCode::SERVICE_UNAVAILABLE,
                 [b'0', b'9', ..] => StatusCode::INTERNAL_SERVER_ERROR,
@@ -1021,6 +1053,31 @@ mod tests {
         assert_eq!(other.status_code(), StatusCode::INTERNAL_SERVER_ERROR);
         let other = Error::Database(database("42809", "\"f\" is not a procedure"));
         assert_eq!(other.status_code(), StatusCode::BAD_REQUEST);
+    }
+
+    /// A missing grant is 401 to a request that has not said who it is and 403
+    /// to one that has, as in PostgREST; `status_code` is the anonymous answer.
+    #[test]
+    fn a_missing_grant_is_a_401_or_a_403_by_who_asked() {
+        let error = Error::Database(database("42501", "permission denied for table t"));
+        assert_eq!(error.status_code_as(false), StatusCode::UNAUTHORIZED);
+        assert_eq!(error.status_code_as(true), StatusCode::FORBIDDEN);
+        assert_eq!(error.status_code(), StatusCode::UNAUTHORIZED);
+
+        let Error::Database(db) = &error else {
+            unreachable!()
+        };
+        assert_eq!(db.status_code_as(true), StatusCode::FORBIDDEN);
+        assert_eq!(db.status_code(), db.status_code_as(false));
+    }
+
+    /// Who asked changes nothing else, including a status the schema raised.
+    #[test]
+    fn who_asked_decides_only_a_missing_grant() {
+        for code in ["23505", "42P01", "P0001", "PT402", "28000", "22023"] {
+            let db = database(code, "x");
+            assert_eq!(db.status_code_as(true), db.status_code(), "{code}");
+        }
     }
 
     #[test]

@@ -66,7 +66,8 @@ async fn ask(
     // exists to show that whatever runs here runs as the caller, under RLS.
     let value: Option<Value> = sqlx::query_scalar(AssertSqlSafe(ask.sql))
         .fetch_one(&mut *tx)
-        .await?;
+        .await
+        .map_err(|e| Error::from(e).for_user(&user, &state))?;
     tx.commit().await?;
     Ok(Json(value.unwrap_or(Value::Null)))
 }
@@ -289,6 +290,30 @@ async fn each_caller_sees_what_the_policy_and_grants_give_them() {
     let refused = send(&router, "GET", &ask_uri(TITLES, ""), &[], None).await;
     let rest = send(&router, "GET", "/api/todos", &[], None).await;
     assert_eq!(rest.status, StatusCode::UNAUTHORIZED, "{rest:?}");
+    assert_eq!(rest.challenge.as_deref(), Some("Bearer"), "{rest:?}");
+    assert_eq!(refused, rest);
+
+    // An authenticated role without the grant is refused with a 403, which
+    // tells the client that sending a token will not help, and so carries no
+    // challenge. REST and the route say the same.
+    let refused = send(
+        &router,
+        "GET",
+        &ask_uri("SELECT json_agg(body) FROM notices", ""),
+        &[("authorization", &alice)],
+        None,
+    )
+    .await;
+    let rest = send(
+        &router,
+        "GET",
+        "/api/notices",
+        &[("authorization", &alice)],
+        None,
+    )
+    .await;
+    assert_eq!(rest.status, StatusCode::FORBIDDEN, "{rest:?}");
+    assert_eq!(rest.challenge, None, "{rest:?}");
     assert_eq!(refused, rest);
 
     // A token that does not verify: REST's 401, body and challenge.

@@ -780,6 +780,15 @@ impl AppConfig {
         Ok(config)
     }
 
+    /// Whether a request that runs as `role` counts as authenticated, which
+    /// decides whether a missing grant is answered 403 rather than 401.
+    ///
+    /// As PostgREST decides it: the role differs from the configured
+    /// anonymous role, so with no anonymous role configured every role does.
+    pub fn is_authenticated_role(&self, role: &str) -> bool {
+        Some(role) != self.db_anon_role.as_deref()
+    }
+
     /// Whether `error` is answered in the database's own words: a database
     /// error, in compatibility mode or with a SQLSTATE
     /// [`db_errors_verbatim`](Self::db_errors_verbatim) lists.
@@ -1426,6 +1435,17 @@ mod tests {
             read(&[("PGRST_JWT_JWKS_REFRESH", "soon")]).jwt_jwks_refresh,
             300
         );
+    }
+
+    /// As PostgREST: authenticated is any role but the anonymous one, and
+    /// with no anonymous role configured, every role.
+    #[test]
+    fn a_role_other_than_the_anonymous_one_is_authenticated() {
+        let mut config = AppConfig::default();
+        assert!(config.is_authenticated_role("web_anon"));
+        config.db_anon_role = Some("web_anon".to_string());
+        assert!(!config.is_authenticated_role("web_anon"));
+        assert!(config.is_authenticated_role("web_user"));
     }
 
     #[test]

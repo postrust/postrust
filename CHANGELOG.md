@@ -3,6 +3,21 @@
 Notable changes, newest first. This file starts at 1.0.0-alpha.1; earlier
 releases are described by their tags and the pull requests behind them.
 
+## Unreleased
+
+### Changed
+
+- **A missing grant (SQLSTATE `42501`) is a 403 for an authenticated request**
+  and stays a 401, with its `WWW-Authenticate` challenge, for an anonymous one
+  (#76). This is PostgREST's rule: authenticated means the request runs as a
+  role other than the configured anonymous role. Until now it was always 401,
+  which told a client holding a valid token to send one. A client that treated
+  a 401 from a table the token's role cannot read as "log in again" will now
+  see 403. `error_response_as` and `DatabaseError::status_code_as` are new;
+  `error_response_for` and `status_code` answer as for an anonymous request,
+  as before. A route of your own gets the 403 from `AppState::begin_as` and
+  from `Error::for_user`, which marks a failed query of yours.
+
 ## 3.2.0
 
 A shared Apollo Federation entity type says `@shareable` once, on the type,
