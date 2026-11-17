@@ -5,7 +5,7 @@ Complete reference for the Postrust REST and GraphQL APIs.
 > **Note on paths.** By default the REST API is served under `/api` (e.g.
 > `GET /api/users`, `POST /api/rpc/my_func`) and GraphQL under `/v1/graphql`.
 > The REST endpoints below are shown as root-level paths — these work as-is
-> when [compatibility mode](configuration.md#compatibility-settings)
+> when [compatibility mode](compat-mode.md)
 > (`PGRST_COMPAT_MODE=true`) is enabled; otherwise prefix them with `/api`.
 > GraphQL is served at `/v1/graphql` either way.
 
@@ -33,7 +33,7 @@ Complete reference for the Postrust REST and GraphQL APIs.
 | `OPTIONS` | `/rpc/{function}` | The methods this function allows, in `Allow` |
 
 By default, RPC results are array-wrapped and keyed by function name
-(`[{"my_func": ...}]`). In [compatibility mode](configuration.md#compatibility-settings)
+(`[{"my_func": ...}]`). In [compatibility mode](compat-mode.md)
 they match PostgREST: a bare object/scalar for non-set-returning functions and a
 top-level array for set-returning ones.
 
