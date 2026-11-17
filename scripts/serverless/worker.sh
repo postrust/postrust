@@ -213,7 +213,9 @@ expect "alice writes her own row" 201 '[{"owner":"alice","task":"new"}]' \
     -- -X POST "$URL/todos?select=owner,task" -H "$(auth "$ALICE")" \
        -H "Content-Type: application/json" -H "Prefer: return=representation" \
        -d '{"owner":"alice","task":"new"}'
-expect "alice cannot write as bob" 401 '*' \
+# A row-level security refusal is 42501. Alice is signed in, so it is a 403,
+# not the 401 that would tell her client to sign in again; anon above is 401.
+expect "alice cannot write as bob" 403 '*' \
     -- -X POST "$URL/todos" -H "$(auth "$ALICE")" -H "Content-Type: application/json" \
        -d '{"owner":"bob","task":"x"}'
 expect "alice cannot update bob's row" 200 '[]' \

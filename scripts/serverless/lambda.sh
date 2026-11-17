@@ -124,7 +124,9 @@ expect "anon cannot write" 401 '*' \
 expect "alice writes her own row" 201 '[{"owner":"alice","task":"new"}]' \
     -- POST /api/todos "select=owner,task" --token "$ALICE" \
        --body '{"owner":"alice","task":"new"}' --header "prefer:return=representation"
-expect "alice cannot write as bob" 401 '*' \
+# A row-level security refusal is 42501. Alice is signed in, so it is a 403,
+# not the 401 that would tell her client to sign in again; anon above is 401.
+expect "alice cannot write as bob" 403 '*' \
     -- POST /api/todos "" --token "$ALICE" --body '{"owner":"bob","task":"x"}'
 expect "alice cannot update bob's row" 200 '[]' \
     -- PATCH /api/todos "id=eq.3" --token "$ALICE" --body '{"task":"hijacked"}' \
