@@ -96,8 +96,8 @@ The same in both modes:
 - **A refusal raised with `RAISE sqlstate 'PGRST'`** answers with the status,
   headers and body the function wrote, unsanitised either way. Its `DETAIL`
   may carry a `body` key that supplies the whole response body verbatim;
-  PostgREST ignores the key. See [Custom routes](custom-routes.md#error-handling)
-  for how a database error is mapped, and [Configuration](configuration.md#database-errors-in-their-own-words).
+  PostgREST ignores the key. See
+  [Errors raised by a function](api-reference.md#errors-raised-by-a-function).
 - **`PT<nnn>` codes** keep the status they name.
 - **Everything that is not a database error**, such as a bad request or an
   invalid token, has the same body and status.
