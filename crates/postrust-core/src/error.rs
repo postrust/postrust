@@ -784,6 +784,19 @@ pub struct RaisedResponse {
     pub headers: Vec<(String, String)>,
     /// The response body, verbatim.
     pub body: serde_json::Value,
+    /// Whether the schema wrote the body itself, with a `body` key in DETAIL,
+    /// rather than leaving it to be built from the MESSAGE. Such a response is
+    /// the schema's alone, so a `Content-Type` it raises replaces the default.
+    pub body_supplied: bool,
+}
+
+/// The headers a raise asked for. A value that is not a string is not a
+/// header, as PostgREST reads them.
+fn raised_headers(headers: &serde_json::Map<String, serde_json::Value>) -> Vec<(String, String)> {
+    headers
+        .iter()
+        .filter_map(|(name, value)| Some((name.clone(), value.as_str()?.to_string())))
+        .collect()
 }
 
 impl DatabaseError {
@@ -793,6 +806,13 @@ impl DatabaseError {
     /// the message is the body, and the detail carries the status, an optional
     /// status text and any headers. It is how a schema returns a 402 with its
     /// own payload without the API layer knowing anything about billing.
+    ///
+    /// PostgREST rebuilds the body as `{code, message, details, hint}`, which
+    /// is no use to a schema that replaces an API whose errors have another
+    /// shape. So a `body` key in the detail, of any JSON type, is the body
+    /// instead, byte for byte; the message is then only what gets logged, and
+    /// may be free text, and `headers` is optional. PostgREST has no such key
+    /// and ignores it, so no schema written for it is affected.
     ///
     /// `None` when this is not that error. `Err` when it is and the schema
     /// wrote it wrongly, which is a bug in the schema rather than a response
@@ -820,6 +840,12 @@ impl DatabaseError {
                 _ => None,
             }
         };
+
+        // A body of the schema's own makes the rest of the message's rules moot:
+        // nothing is built from it.
+        if let Some(raised) = self.parse_raise_with_body(&object) {
+            return raised;
+        }
 
         // The message is the body, and a body has to say what went wrong and
         // under what code -- the two keys a client reads first.
@@ -857,16 +883,48 @@ impl DatabaseError {
                 .get("status_text")
                 .and_then(serde_json::Value::as_str)
                 .map(str::to_string),
-            headers: headers
-                .iter()
-                .filter_map(|(name, value)| Some((name.clone(), value.as_str()?.to_string())))
-                .collect(),
+            headers: raised_headers(headers),
             body: serde_json::json!({
                 "code": key("code"),
                 "message": key("message"),
                 "details": key("details"),
                 "hint": key("hint"),
             }),
+            body_supplied: false,
+        })
+    }
+
+    /// The response of a raise whose DETAIL carries a `body`, or `None` if it
+    /// does not and PostgREST's rules apply. The status is still required, and
+    /// `headers`, if given, must still be an object: a schema that wrote those
+    /// wrongly is told so rather than guessed at.
+    fn parse_raise_with_body(
+        &self,
+        object: &dyn Fn(&str) -> Option<serde_json::Map<String, serde_json::Value>>,
+    ) -> Option<std::result::Result<RaisedResponse, RaiseFault>> {
+        let raw_detail = self.details.as_deref()?;
+        let mut detail = object(raw_detail)?;
+        let body = detail.remove("body")?;
+        let fault = || RaiseFault::Detail(raw_detail.to_string());
+
+        let headers = match detail.get("headers") {
+            None => Some(Vec::new()),
+            Some(serde_json::Value::Object(headers)) => Some(raised_headers(headers)),
+            Some(_) => None,
+        };
+        let status = detail.get("status").and_then(serde_json::Value::as_u64);
+        Some(match (status, headers) {
+            (Some(status), Some(headers)) => Ok(RaisedResponse {
+                status: status as u16,
+                status_text: detail
+                    .get("status_text")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_string),
+                headers,
+                body,
+                body_supplied: true,
+            }),
+            _ => Err(fault()),
         })
     }
 
@@ -1037,6 +1095,130 @@ mod tests {
             table: None,
             column: None,
         }
+    }
+
+    fn raised(message: &str, detail: Option<&str>) -> DatabaseError {
+        DatabaseError {
+            details: detail.map(str::to_string),
+            ..database("PGRST", message)
+        }
+    }
+
+    /// PostgREST's own shape, which a `body` key does not disturb when it is
+    /// absent: the body is rebuilt from the message, with every key present.
+    #[test]
+    fn a_raise_without_a_body_is_postgrests() {
+        let raised = raised(
+            r#"{"code":"123","message":"Payment Required","hint":"Upgrade"}"#,
+            Some(r#"{"status":402,"headers":{"X-Powered-By":"Nerd Rage","X-N":3}}"#),
+        )
+        .raised_response()
+        .unwrap()
+        .unwrap();
+        assert_eq!(raised.status, 402);
+        assert_eq!(
+            raised.headers,
+            [("X-Powered-By".to_string(), "Nerd Rage".to_string())]
+        );
+        assert_eq!(
+            raised.body,
+            serde_json::json!({
+                "code": "123", "message": "Payment Required",
+                "details": null, "hint": "Upgrade",
+            })
+        );
+        assert!(!raised.body_supplied);
+
+        // And its faults are as they were: the message is checked first, and
+        // `headers` is required.
+        let fault = |message, detail| raised_fault(self::raised(message, detail)).details();
+        assert_eq!(
+            fault("not json", Some(r#"{"status":402,"headers":{}}"#)),
+            "Invalid JSON value for MESSAGE: 'not json'"
+        );
+        assert_eq!(
+            fault(r#"{"code":"1","message":"m"}"#, Some(r#"{"status":402}"#)),
+            r#"Invalid JSON value for DETAIL: '{"status":402}'"#
+        );
+        assert_eq!(
+            fault(r#"{"code":"1","message":"m"}"#, None),
+            "DETAIL is missing in the RAISE statement"
+        );
+    }
+
+    fn raised_fault(error: DatabaseError) -> RaiseFault {
+        error.raised_response().unwrap().unwrap_err()
+    }
+
+    /// A `body` of any JSON type is the body, as written, and the message
+    /// need not be JSON at all.
+    #[test]
+    fn a_body_in_the_detail_is_the_response_body() {
+        let body = |detail: &str| {
+            raised(
+                "access required for report 7",
+                Some(&format!(r#"{{"status":403,"body":{detail}}}"#)),
+            )
+            .raised_response()
+            .unwrap()
+            .unwrap()
+        };
+
+        let object = body(r#"{"detail":{"code":"access_required","can_request":true}}"#);
+        assert_eq!(object.status, 403);
+        assert!(object.body_supplied);
+        assert!(object.headers.is_empty(), "headers are optional");
+        assert_eq!(
+            object.body,
+            serde_json::json!({"detail": {"code": "access_required", "can_request": true}})
+        );
+        assert_eq!(
+            body(r#""plain text""#).body,
+            serde_json::json!("plain text")
+        );
+        assert_eq!(body("[1,2]").body, serde_json::json!([1, 2]));
+        assert_eq!(body("null").body, serde_json::Value::Null);
+    }
+
+    #[test]
+    fn a_body_comes_with_headers_and_a_status_text_when_given() {
+        let raised = raised(
+            r#"{"code":"x","message":"also valid"}"#,
+            Some(
+                r#"{"status":451,"status_text":"Gone Away","headers":{"Content-Type":"text/plain"},"body":"x"}"#,
+            ),
+        )
+        .raised_response()
+        .unwrap()
+        .unwrap();
+        assert_eq!(raised.status, 451);
+        assert_eq!(raised.status_text.as_deref(), Some("Gone Away"));
+        assert_eq!(
+            raised.headers,
+            [("Content-Type".to_string(), "text/plain".to_string())]
+        );
+        assert_eq!(raised.body, serde_json::json!("x"));
+    }
+
+    /// The status is still the schema's to give, and a `headers` that is
+    /// there has to be an object; a body does not excuse either.
+    #[test]
+    fn a_body_still_needs_a_status() {
+        for detail in [
+            r#"{"body":{"a":1}}"#,
+            r#"{"status":"402","body":{"a":1}}"#,
+            r#"{"status":402,"headers":["a"],"body":{"a":1}}"#,
+        ] {
+            let fault = raised_fault(raised("free text", Some(detail)));
+            assert_eq!(
+                fault.details(),
+                format!("Invalid JSON value for DETAIL: '{detail}'")
+            );
+        }
+        // Only an object with a `body` key is a takeover of the body: a
+        // DETAIL that is not an object is the usual fault.
+        let fault = raised_fault(raised("free text", Some("[1]")));
+        assert!(matches!(fault, RaiseFault::Message(_)));
     }
 
     /// A view PostgreSQL cannot write through refuses the method for every

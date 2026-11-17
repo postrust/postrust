@@ -3771,9 +3771,21 @@ fn error_response_with(
     if let postrust_core::Error::Database(db) = &error {
         match db.raised_response() {
             Some(Ok(raised)) => {
-                let mut builder = Response::builder()
-                    .status(status)
-                    .header("content-type", "application/json");
+                let mut builder = Response::builder().status(status);
+                // PostgREST sends `application/json` and then the raised
+                // headers after it, so a raised `Content-Type` is a second
+                // one. That is kept for a body it built, which is its own
+                // behaviour. A body the schema wrote is the schema's to
+                // describe, and two types for it would be no answer at all,
+                // so there a raised `Content-Type` replaces the default.
+                let own_type = raised.body_supplied
+                    && raised
+                        .headers
+                        .iter()
+                        .any(|(name, _)| name.eq_ignore_ascii_case("content-type"));
+                if !own_type {
+                    builder = builder.header("content-type", "application/json");
+                }
                 for (name, value) in &raised.headers {
                     builder = builder.header(name, value);
                 }

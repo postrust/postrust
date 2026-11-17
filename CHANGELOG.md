@@ -7,6 +7,14 @@ releases are described by their tags and the pull requests behind them.
 
 ### Added
 
+- **A `RAISE ... USING ERRCODE = 'PGRST'` can supply the whole response body**
+  (#76). A `body` key in the DETAIL, of any JSON type, is sent as written,
+  where the body was always rebuilt as `{code, message, details, hint}`, so a
+  schema replacing an existing API can keep its error shape byte for byte,
+  such as `{"detail": {"code": "access_required", "can_request": true}}`. With
+  a `body` the MESSAGE can be free text and `headers` is optional; a raised
+  `Content-Type` replaces `application/json` for it. Without `body` nothing
+  changes, in either mode: PostgREST ignores the key.
 - **`PGRST_DB_ERROR_STATUS` sets the HTTP status of a database error by
   SQLSTATE** (#76; alias `POSTRUST_DB_ERROR_STATUS`). Comma-separated
   `PATTERN:STATUS`, such as `P0002:404,23*:422`: a pattern is a SQLSTATE or a

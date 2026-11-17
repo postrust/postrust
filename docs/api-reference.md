@@ -465,6 +465,40 @@ not offering it, so it is no longer named in the response.
 }
 ```
 
+### Errors raised by a function
+
+A function can answer a request with a response of its own by raising the
+SQLSTATE `PGRST`, as PostgREST allows. The MESSAGE is a JSON object with
+`code` and `message` (and optionally `details` and `hint`), which becomes the
+body in the shape above, and the DETAIL is a JSON object with the `status`,
+the `headers` and optionally a `status_text`:
+
+```sql
+RAISE EXCEPTION '{"code": "123", "message": "Payment Required", "hint": "Upgrade"}'
+  USING ERRCODE = 'PGRST',
+        DETAIL = '{"status": 402, "headers": {"X-Powered-By": "Nerd Rage"}}';
+```
+
+That body is always `{code, message, details, hint}`. A schema that replaces
+an API whose errors look different can supply the body itself: a `body` key in
+the DETAIL, of any JSON type, is sent as the response body, as written.
+
+```sql
+RAISE EXCEPTION 'access required for report 7'
+  USING ERRCODE = 'PGRST',
+        DETAIL = '{"status": 403,
+                   "body": {"detail": {"code": "access_required", "can_request": true}}}';
+-- 403 {"detail":{"code":"access_required","can_request":true}}
+```
+
+With a `body` the MESSAGE need not be JSON -- it is free text, and is what the
+server logs -- and `headers` is optional. A `status` is still required. The
+body is serialised as JSON, so a string comes out quoted, and a `Content-Type`
+in `headers` replaces `application/json` rather than being sent beside it,
+for a body of another type. PostgREST ignores a `body` key, so this works the
+same with and without `PGRST_COMPAT_MODE`. The status is the function's alone
+and is not changed by `PGRST_DB_ERROR_STATUS`.
+
 ## GraphQL API
 
 Postrust serves a GraphQL API generated from the database schema, in the
