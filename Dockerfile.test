@@ -14,6 +14,7 @@ RUN apt-get update && apt-get install -y \
 # This layer will be cached unless Cargo.toml changes
 COPY Cargo.toml Cargo.lock ./
 COPY crates ./crates
+COPY vendor ./vendor
 
 # Build dependencies only (this will be cached)
 RUN cargo build --tests --all 2>/dev/null || true
