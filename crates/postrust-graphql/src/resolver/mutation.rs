@@ -315,6 +315,7 @@ pub fn build_insert_plan(args: &InsertArgs, table: &Table) -> MutatePlan {
         pk_cols: table.pk_cols.clone(),
         apply_defaults: true,
         reports_inserted: false,
+        counts_inserted: false,
     }
 }
 

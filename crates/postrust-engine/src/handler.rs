@@ -176,7 +176,12 @@ where
         .map(|context| context.trace_id);
 
     // Parse payload
-    if !body_bytes.is_empty() {
+    if !body_bytes.is_empty()
+        || matches!(
+            api_request.content_media_type,
+            postrust_core::api_request::MediaType::UrlEncoded
+        )
+    {
         let payload = postrust_core::api_request::payload::parse_payload(
             body_bytes,
             &api_request.content_media_type,
@@ -1667,15 +1672,19 @@ async fn execute_plan<'s, S: State>(
                 status: match (guc_status, returns_void) {
                     (Some(status), _) => status,
                     (None, true) => StatusCode::NO_CONTENT,
-                    (None, false) => {
-                        mutation_status(db_plan, api_request, created_a_row, reports_inserted)
-                            .unwrap_or_else(|| {
-                                content_range
-                                    .as_ref()
-                                    .map(postrust_response::ContentRange::status)
-                                    .unwrap_or(StatusCode::OK)
-                            })
-                    }
+                    (None, false) => mutation_status(
+                        db_plan,
+                        api_request,
+                        created_a_row,
+                        reports_inserted,
+                        affected == 0,
+                    )
+                    .unwrap_or_else(|| {
+                        content_range
+                            .as_ref()
+                            .map(postrust_response::ContentRange::status)
+                            .unwrap_or(StatusCode::OK)
+                    }),
                 },
                 rows,
                 singular,
@@ -2338,6 +2347,11 @@ fn mutation_status(
     // give up `xmax` cannot tell either way -- in both cases there is nothing
     // to report but the creation.
     could_have_merged: bool,
+    // The statement wrote no row at all. A merge that wrote nothing created
+    // nothing, however little the relation can say about its keys: a view
+    // with no key of its own gets no conflict clause, and `[]` is the whole
+    // of what PostgREST's counter (unset, so 200) reports for it.
+    wrote_nothing: bool,
 ) -> Option<StatusCode> {
     use postrust_core::api_request::PreferResolution;
     use postrust_core::plan::{DbActionPlan, MutatePlan};
@@ -2367,7 +2381,9 @@ fn mutation_status(
         }
         // A `POST` that merged into every row it touched created nothing, and
         // 201 would be a promise that something new is at the `Location`.
-        MutatePlan::Insert { .. } if merging && could_have_merged && !created_a_row => {
+        MutatePlan::Insert { .. }
+            if merging && ((could_have_merged && !created_a_row) || wrote_nothing) =>
+        {
             StatusCode::OK
         }
         MutatePlan::Insert { .. } => StatusCode::CREATED,
@@ -3933,6 +3949,7 @@ fn sanitize_error_message(error: &postrust_core::Error) -> String {
         | Error::PutLimitNotAllowed
         | Error::PutMatchingPk
         | Error::MaxAffectedExceeded(_)
+        | Error::MaxAffectedRpcViolation
         | Error::InvalidGucHeaders
         | Error::InvalidGucStatus
         | Error::InvalidMediaType(_)

@@ -68,7 +68,13 @@ where
     let content_media_type = parse_content_type(req.headers())?;
 
     // Parse Range header
-    let top_level_range = parse_range(req.headers())?;
+    // Only GET honours the header (PostgREST ApiRequest.hs getRanges,
+    // RFC 9110: ignore Range for every other method).
+    let top_level_range = if method == http::Method::GET {
+        parse_range(req.headers())?
+    } else {
+        Range::default()
+    };
 
     // Extract headers and cookies for GUC passthrough
     let headers = extract_headers(req.headers());
@@ -474,6 +480,21 @@ mod tests {
             range_of("items=5-9").unwrap(),
             Range::from_bounds(5, Some(9))
         );
+    }
+
+    /// The header is for GET alone (RFC 9110; PostgREST getRanges).
+    #[test]
+    fn the_range_header_is_ignored_off_get() {
+        for method in ["POST", "PUT", "PATCH", "DELETE"] {
+            let request = http::Request::builder()
+                .method(method)
+                .uri("/items")
+                .header("Range", "9-5")
+                .body(Vec::<u8>::new())
+                .unwrap();
+            let parsed = parse_request(&request, "public", &["public".to_string()], None).unwrap();
+            assert_eq!(parsed.top_level_range, Range::default(), "{method}");
+        }
     }
 
     /// A range whose end precedes its start names no rows at all.

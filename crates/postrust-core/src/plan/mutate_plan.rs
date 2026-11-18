@@ -29,10 +29,18 @@ pub enum MutatePlan {
         apply_defaults: bool,
         /// Whether the statement can report which rows it created.
         ///
-        /// It asks PostgreSQL for `xmax`, which a plain table will give back
-        /// and a view or a partitioned table will not.
+        /// On a plain table it asks PostgreSQL for `xmax`; on a view or a
+        /// partitioned table, which will not give that back, it keeps
+        /// PostgREST's own count instead (see `counts_inserted`).
         #[serde(default)]
         reports_inserted: bool,
+        /// Whether the count of created rows is kept by hand rather than read
+        /// from `xmax`: a view or a partitioned table. As PostgREST does
+        /// (`pgrst.inserted`, QueryBuilder.hs), a setting is raised once per
+        /// candidate row and lowered once per row that turned out to be an
+        /// update, so what is left is the number of rows created.
+        #[serde(default)]
+        counts_inserted: bool,
     },
     /// UPDATE operation
     Update {
@@ -119,7 +127,8 @@ impl MutatePlan {
             returning,
             pk_cols: table.pk_cols.clone(),
             apply_defaults,
-            reports_inserted: !table.is_view && !table.is_partitioned,
+            reports_inserted: true,
+            counts_inserted: table.is_view || table.is_partitioned,
         })
     }
 
@@ -189,7 +198,8 @@ impl MutatePlan {
             returning,
             pk_cols: table.pk_cols.clone(),
             apply_defaults: asked_for_defaults(request),
-            reports_inserted: !table.is_view && !table.is_partitioned,
+            reports_inserted: true,
+            counts_inserted: table.is_view || table.is_partitioned,
         })
     }
 
@@ -482,6 +492,7 @@ mod tests {
             pk_cols: vec![],
             apply_defaults: true,
             reports_inserted: false,
+            counts_inserted: false,
         };
         assert!(insert.has_body());
 
