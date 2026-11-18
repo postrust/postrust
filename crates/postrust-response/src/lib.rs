@@ -218,6 +218,7 @@ pub fn format_response(
 /// Which preferences this request could honour.
 pub(crate) fn preference_scope(
     request: &ApiRequest,
+    resolution_applies: bool,
 ) -> postrust_core::api_request::preferences::PreferenceScope {
     use postrust_core::api_request::preferences::PreferenceScope;
     use postrust_core::api_request::{Action, DbAction, Mutation};
@@ -228,7 +229,7 @@ pub(crate) fn preference_scope(
 
     match action {
         DbAction::RelationMut { mutation, .. } => PreferenceScope {
-            resolution: matches!(mutation, Mutation::Create),
+            resolution: matches!(mutation, Mutation::Create) && resolution_applies,
             representation: true,
             missing: matches!(mutation, Mutation::Create | Mutation::Update),
             max_affected: matches!(mutation, Mutation::Update | Mutation::Delete),
@@ -282,7 +283,7 @@ fn add_common_headers(response: &mut Response, request: &ApiRequest, result: &Qu
     // Preference-Applied
     if let Some(applied) = postrust_core::api_request::preferences::preference_applied(
         &request.preferences,
-        preference_scope(request),
+        preference_scope(request, result.resolution_applies),
     ) {
         response.set_header("preference-applied", &applied);
     }
@@ -444,6 +445,10 @@ pub struct QueryResult {
     /// first, which may be one nothing here renders. `None` formats as the
     /// first accepted type, as before.
     pub media_type: Option<MediaType>,
+    /// Whether a `Prefer: resolution` could have been honoured: the insert had
+    /// a primary key or `?on_conflict=` to conflict on. Reported in
+    /// `Preference-Applied` only then.
+    pub resolution_applies: bool,
 }
 
 /// Response formatting error.

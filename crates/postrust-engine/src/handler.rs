@@ -755,6 +755,18 @@ async fn execute_plan<'s, S: State>(
                 .find(|media| renders_without_a_handler(media))
                 .cloned();
 
+            // `Prefer: resolution` is reported only for an insert that has
+            // something to conflict on: the table's primary key, or the
+            // columns `?on_conflict=` named. Without either the preference was
+            // ignored and is not claimed (PostgREST's `responsePreferences`).
+            let resolution_applies = match db_plan {
+                DbActionPlan::MutateRead {
+                    mutate: postrust_core::plan::MutatePlan::Insert { pk_cols, .. },
+                    ..
+                } => !pk_cols.is_empty() || api_request.query_params.on_conflict.is_some(),
+                _ => false,
+            };
+
             // Carry the parent's whole row out of the inner query when a
             // computed relationship needs it as an argument. It has to be
             // taken here, where the real table is still in scope: a bare
@@ -1377,6 +1389,7 @@ async fn execute_plan<'s, S: State>(
                         raw_body: Some((media_type, body)),
                         content_range: Some(content_range),
                         guc_headers,
+                        resolution_applies,
                         ..QueryResult::default()
                     },
                     Some(tx),
@@ -1719,6 +1732,7 @@ async fn execute_plan<'s, S: State>(
                 guc_headers,
                 raw_body: geojson_body,
                 media_type: negotiated_media,
+                resolution_applies,
                 ..Default::default()
             };
             // Committed by the caller, once the response is known to be one

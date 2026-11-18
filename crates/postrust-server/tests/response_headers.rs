@@ -306,6 +306,50 @@ async fn the_first_type_that_can_be_rendered_is_the_one_served() {
 
 #[tokio::test]
 #[ignore = "requires DATABASE_URL"]
+async fn a_resolution_with_nothing_to_conflict_on_is_not_claimed() {
+    schema("resolution").await;
+    let router = router("resolution", false).await;
+    let prefer = (
+        "Prefer",
+        "return=representation, resolution=merge-duplicates",
+    );
+
+    // No primary key and no `on_conflict`: the resolution was ignored.
+    let none = send(&router, "POST", "/api/no_pk", &[prefer], r#"{"a": 1}"#).await;
+    assert_eq!(
+        none.header("preference-applied"),
+        Some("return=representation")
+    );
+
+    let keyed = send(&router, "POST", "/api/items", &[prefer], r#"{"id": 9}"#).await;
+    assert_eq!(
+        keyed.header("preference-applied"),
+        Some("resolution=merge-duplicates, return=representation")
+    );
+
+    let named = send(
+        &router,
+        "POST",
+        "/api/no_pk?on_conflict=a",
+        &[prefer],
+        r#"{"a": 1}"#,
+    )
+    .await;
+    // Reported, whatever the database makes of an `ON CONFLICT` it has no
+    // index for.
+    assert!(
+        named.status.is_client_error()
+            || named
+                .header("preference-applied")
+                .is_some_and(|p| p.contains("resolution=merge-duplicates")),
+        "{:?} {}",
+        named.status,
+        named.body
+    );
+}
+
+#[tokio::test]
+#[ignore = "requires DATABASE_URL"]
 async fn openapi_is_only_produced_at_the_root() {
     schema("openapi").await;
     for compat in [false, true] {
