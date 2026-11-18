@@ -102,10 +102,10 @@ pub fn format_response(
     request: &ApiRequest,
     result: &QueryResult,
 ) -> Result<Response, FormatError> {
-    let media_type = request
-        .accept_media_types
-        .first()
-        .cloned()
+    let media_type = result
+        .media_type
+        .clone()
+        .or_else(|| request.accept_media_types.first().cloned())
         .unwrap_or(MediaType::ApplicationJson);
 
     // A mutation the caller wanted no representation from sends no body at
@@ -437,6 +437,13 @@ pub struct QueryResult {
     /// The result still carries the headers such a response has
     /// (`Content-Range`, `Preference-Applied`); the caller supplies the body.
     pub unsatisfiable: Option<String>,
+    /// The media type the engine negotiated for this response.
+    ///
+    /// The engine decides which of the accepted types it can render, and the
+    /// response is formatted as that one -- not as whichever the client listed
+    /// first, which may be one nothing here renders. `None` formats as the
+    /// first accepted type, as before.
+    pub media_type: Option<MediaType>,
 }
 
 /// Response formatting error.

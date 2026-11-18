@@ -283,3 +283,46 @@ async fn a_media_handler_answers_with_the_type_its_function_set() {
     assert_eq!(any.header("content-type"), Some("application/octet-stream"));
 }
 
+#[tokio::test]
+#[ignore = "requires DATABASE_URL"]
+async fn the_first_type_that_can_be_rendered_is_the_one_served() {
+    schema("accept").await;
+    let router = router("accept", false).await;
+
+    let answer = send(
+        &router,
+        "GET",
+        "/api/items?select=id",
+        &[("Accept", "text/unknowntype, text/csv")],
+        "",
+    )
+    .await;
+    assert_eq!(answer.status, StatusCode::OK);
+    assert!(answer
+        .header("content-type")
+        .is_some_and(|t| t.starts_with("text/csv")));
+    assert!(answer.body.starts_with("id\n1"), "{}", answer.body);
+}
+
+#[tokio::test]
+#[ignore = "requires DATABASE_URL"]
+async fn openapi_is_only_produced_at_the_root() {
+    schema("openapi").await;
+    for compat in [false, true] {
+        let router = router("openapi", compat).await;
+        let answer = send(
+            &router,
+            "GET",
+            "/api/items",
+            &[("Accept", "application/openapi+json")],
+            "",
+        )
+        .await;
+        assert_eq!(answer.status, StatusCode::NOT_ACCEPTABLE, "{}", answer.body);
+        assert!(answer.body.contains("PGRST107"));
+        assert!(answer
+            .body
+            .contains("None of these media types are available: application/openapi+json"));
+    }
+}
+

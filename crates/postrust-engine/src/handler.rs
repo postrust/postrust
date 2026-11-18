@@ -744,6 +744,17 @@ async fn execute_plan<'s, S: State>(
                 ));
             }
 
+            // The type the response will be rendered as: the first of the
+            // accepted types something here renders. Decided once, here, and
+            // handed to the response -- a list led by a type nothing renders
+            // (`text/unknowntype, text/csv`) is answered as the CSV the check
+            // above found, not as whatever happened to come first.
+            let negotiated_media = api_request
+                .accept_media_types
+                .iter()
+                .find(|media| renders_without_a_handler(media))
+                .cloned();
+
             // Carry the parent's whole row out of the inner query when a
             // computed relationship needs it as an argument. It has to be
             // taken here, where the real table is still in scope: a bare
@@ -1707,6 +1718,7 @@ async fn execute_plan<'s, S: State>(
                 content_range,
                 guc_headers,
                 raw_body: geojson_body,
+                media_type: negotiated_media,
                 ..Default::default()
             };
             // Committed by the caller, once the response is known to be one
@@ -2137,7 +2149,6 @@ fn renders_without_a_handler(media: &postrust_core::api_request::MediaType) -> b
             | MediaType::GeoJson
             | MediaType::SingularJson { .. }
             | MediaType::ArrayJson { .. }
-            | MediaType::OpenApi
     )
 }
 
