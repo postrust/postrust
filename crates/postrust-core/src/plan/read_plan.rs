@@ -277,6 +277,11 @@ pub fn resolve_top_level_range(request: &ApiRequest) -> Range {
         }
     }
 
+    // A range starts at the first row at the earliest: `?offset=-4` is read as
+    // `0` and reported as such (PostgREST's `RangeQuery` only ever builds
+    // `rangeGeq n` over non-negative integers, and 0 when asked for less).
+    range.offset = range.offset.max(0);
+
     if let Some(max_rows) = request.max_rows {
         range.limit = Some(match range.limit {
             Some(requested) => requested.min(max_rows),

@@ -421,6 +421,12 @@ pub struct QueryResult {
     /// renderer for. The value is the whole payload, so it replaces the usual
     /// JSON rendering rather than being wrapped in it.
     pub raw_body: Option<(String, Vec<u8>)>,
+    /// Set when the requested range lies past the end of the result: the
+    /// message of the `PGRST103` it is answered with.
+    ///
+    /// The result still carries the headers such a response has
+    /// (`Content-Range`, `Preference-Applied`); the caller supplies the body.
+    pub unsatisfiable: Option<String>,
 }
 
 /// Response formatting error.

@@ -271,6 +271,34 @@ where
         tx => tx,
     };
 
+    // An offset past the end: the error's body and status, on a response that
+    // keeps what the read would have said about the window and the count --
+    // `Content-Range` and `Preference-Applied`, and nothing else. Set, not
+    // appended, so that no header can appear twice.
+    if let Some(message) = result.unsatisfiable.clone() {
+        let authenticated = state.config().is_authenticated_role(&auth_result.role);
+        let mut response = error_response_as(
+            state.config(),
+            postrust_core::Error::InvalidRange(message),
+            authenticated,
+        );
+        // PostgREST's 416 is a normal response, whose type names its charset.
+        response.headers_mut().insert(
+            http::header::CONTENT_TYPE,
+            http::HeaderValue::from_static("application/json; charset=utf-8"),
+        );
+        if let Ok(carried) = format_response(&api_request, &result) {
+            for name in ["content-range", "preference-applied"] {
+                if let Some(value) = carried.headers.get(name) {
+                    response
+                        .headers_mut()
+                        .insert(http::header::HeaderName::from_static(name), value.clone());
+                }
+            }
+        }
+        return Ok(response);
+    }
+
     // Format response
     // A singular response the result cannot satisfy is the client's business,
     // not an internal failure: it asked for one object and the query answered
@@ -1627,6 +1655,22 @@ async fn execute_plan<'s, S: State>(
             // having named the row itself. PostgREST draws exactly these
             // lines, and a client reading the header expects them.
             use postrust_core::api_request::Mutation;
+            //
+            // The total a write reports is how many rows it affected, when the
+            // caller asked for a count at all: `exact` and `estimated` do
+            // (PostgREST's `shouldCount`), `planned` does not. It is never
+            // counted by a second statement -- the write's own rows are the
+            // answer.
+            let total = match (mutation_kind(api_request), &api_request.preferences.count) {
+                (
+                    Some(_),
+                    Some(
+                        postrust_core::api_request::PreferCount::Exact
+                        | postrust_core::api_request::PreferCount::Estimated,
+                    ),
+                ) => Some(affected as i64),
+                _ => total,
+            };
             let content_range = match mutation_kind(api_request) {
                 Some(Mutation::SingleUpsert) => None,
                 Some(Mutation::Create) | Some(Mutation::Delete) => {
@@ -1654,11 +1698,25 @@ async fn execute_plan<'s, S: State>(
                 .is_some_and(|range| range.status() == StatusCode::RANGE_NOT_SATISFIABLE)
                 && mutation_kind(api_request).is_none()
             {
-                return Err(postrust_core::Error::InvalidRange(format!(
-                    "An offset of {} was requested, but there are only {} rows.",
-                    offset,
-                    total.unwrap_or(0)
-                )));
+                // Answered as a response, not as an error: PostgREST builds the
+                // 416 like any other read, so it carries the `Content-Range`
+                // (`*/total`) and the `Preference-Applied` of the count that
+                // found the offset out of bounds. The caller swaps in the
+                // error body.
+                return Ok((
+                    QueryResult {
+                        status: StatusCode::RANGE_NOT_SATISFIABLE,
+                        omit_body: true,
+                        content_range,
+                        unsatisfiable: Some(format!(
+                            "An offset of {} was requested, but there are only {} rows.",
+                            offset,
+                            total.unwrap_or(0)
+                        )),
+                        ..Default::default()
+                    },
+                    tx,
+                ));
             }
 
             let result = QueryResult {
