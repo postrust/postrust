@@ -221,7 +221,9 @@ fn build_select_fields(items: &[SelectItem], table: &Table) -> Result<Vec<Coerci
                 } else {
                     table
                         .get_column(&field.name)
-                        .ok_or_else(|| Error::ColumnNotFound(field.name.clone()))?
+                        .ok_or_else(|| {
+                            Error::ColumnNotFound(format!("{}.{}", table.name, field.name))
+                        })?
                         .data_type
                         .clone()
                 };
