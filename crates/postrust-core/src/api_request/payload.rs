@@ -10,6 +10,10 @@ use std::collections::HashSet;
 /// Parse request body based on content type.
 pub fn parse_payload(body: Bytes, content_type: &MediaType) -> Result<Option<Payload>> {
     if body.is_empty() {
+        // PostgREST reads an empty urlencoded body as `{}` (Payload.hs).
+        if matches!(content_type, MediaType::UrlEncoded) {
+            return parse_urlencoded_payload(body);
+        }
         return Ok(None);
     }
 
@@ -258,6 +262,23 @@ mod tests {
             }
             _ => panic!("Expected ProcessedJson"),
         }
+    }
+
+    /// PostgREST reads an empty form body as `{}`; any other empty body is none.
+    #[test]
+    fn an_empty_form_body_is_an_empty_object() {
+        let payload = parse_payload(Bytes::new(), &MediaType::UrlEncoded)
+            .unwrap()
+            .unwrap();
+        match payload {
+            Payload::ProcessedUrlEncoded { data, keys } => {
+                assert!(data.is_empty() && keys.is_empty());
+            }
+            _ => panic!("Expected ProcessedUrlEncoded"),
+        }
+        assert!(parse_payload(Bytes::new(), &MediaType::ApplicationJson)
+            .unwrap()
+            .is_none());
     }
 
     #[test]

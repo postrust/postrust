@@ -176,7 +176,12 @@ where
         .map(|context| context.trace_id);
 
     // Parse payload
-    if !body_bytes.is_empty() {
+    if !body_bytes.is_empty()
+        || matches!(
+            api_request.content_media_type,
+            postrust_core::api_request::MediaType::UrlEncoded
+        )
+    {
         let payload = postrust_core::api_request::payload::parse_payload(
             body_bytes,
             &api_request.content_media_type,
