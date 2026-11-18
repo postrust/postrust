@@ -69,7 +69,9 @@ where
             // the answer an OPTIONS on the same resource gives -- whichever
             // refusal it was: a function called with the wrong method, a PUT
             // with filters it cannot take, a view that cannot be written.
-            if response.status() == StatusCode::METHOD_NOT_ALLOWED {
+            //
+            // PostgREST sends none, so in compatibility mode neither do we.
+            if response.status() == StatusCode::METHOD_NOT_ALLOWED && !state.config().compat_mode {
                 let mut probe = http::Request::builder()
                     .method(http::Method::OPTIONS)
                     .uri(uri);
@@ -275,6 +277,34 @@ where
         }
         tx => tx,
     };
+
+    // An offset past the end: the error's body and status, on a response that
+    // keeps what the read would have said about the window and the count --
+    // `Content-Range` and `Preference-Applied`, and nothing else. Set, not
+    // appended, so that no header can appear twice.
+    if let Some(message) = result.unsatisfiable.clone() {
+        let authenticated = state.config().is_authenticated_role(&auth_result.role);
+        let mut response = error_response_as(
+            state.config(),
+            postrust_core::Error::InvalidRange(message),
+            authenticated,
+        );
+        // PostgREST's 416 is a normal response, whose type names its charset.
+        response.headers_mut().insert(
+            http::header::CONTENT_TYPE,
+            http::HeaderValue::from_static("application/json; charset=utf-8"),
+        );
+        if let Ok(carried) = format_response(&api_request, &result) {
+            for name in ["content-range", "preference-applied"] {
+                if let Some(value) = carried.headers.get(name) {
+                    response
+                        .headers_mut()
+                        .insert(http::header::HeaderName::from_static(name), value.clone());
+                }
+            }
+        }
+        return Ok(response);
+    }
 
     // Format response
     // A singular response the result cannot satisfy is the client's business,
@@ -720,6 +750,29 @@ async fn execute_plan<'s, S: State>(
                         .join(", "),
                 ));
             }
+
+            // The type the response will be rendered as: the first of the
+            // accepted types something here renders. Decided once, here, and
+            // handed to the response -- a list led by a type nothing renders
+            // (`text/unknowntype, text/csv`) is answered as the CSV the check
+            // above found, not as whatever happened to come first.
+            let negotiated_media = api_request
+                .accept_media_types
+                .iter()
+                .find(|media| renders_without_a_handler(media))
+                .cloned();
+
+            // `Prefer: resolution` is reported only for an insert that has
+            // something to conflict on: the table's primary key, or the
+            // columns `?on_conflict=` named. Without either the preference was
+            // ignored and is not claimed (PostgREST's `responsePreferences`).
+            let resolution_applies = match db_plan {
+                DbActionPlan::MutateRead {
+                    mutate: postrust_core::plan::MutatePlan::Insert { pk_cols, .. },
+                    ..
+                } => !pk_cols.is_empty() || api_request.query_params.on_conflict.is_some(),
+                _ => false,
+            };
 
             // Carry the parent's whole row out of the inner query when a
             // computed relationship needs it as an argument. It has to be
@@ -1328,11 +1381,23 @@ async fn execute_plan<'s, S: State>(
                     total,
                 );
 
+                // What the handler (or the function) set for the response:
+                // PostgREST reads the settings after every statement, and a
+                // handler is exactly where a `Content-Type` of its own is
+                // chosen. One more statement on the same transaction, and
+                // only on this path -- a handler is the one thing that can
+                // set them here.
+                let settings = tx.fetch_values(RESPONSE_SETTINGS, &[]).await?;
+                let (guc_headers, guc_status) = response_overrides(settings)?;
+
                 return Ok((
                     QueryResult {
-                        status: StatusCode::OK,
+                        status: guc_status.unwrap_or(StatusCode::OK),
                         raw_body: Some((media_type, body)),
                         content_range: Some(content_range),
+                        guc_headers,
+                        resolution_applies,
+                        compat_mode: state.config().compat_mode,
                         ..QueryResult::default()
                     },
                     Some(tx),
@@ -1425,55 +1490,9 @@ async fn execute_plan<'s, S: State>(
                                 ))
                             }
                         };
-                        let row = first_row(settings)?;
-                        // Empty is absent. Once any transaction on this
-                        // connection has defined a custom setting, PostgreSQL
-                        // keeps the name for the rest of the session and
-                        // reports it as `''` rather than null -- so a request
-                        // that set nothing would otherwise inherit "the empty
-                        // headers" from whichever request last set some.
-                        let setting = |index: usize| {
-                            row.get(index)
-                                .and_then(serde_json::Value::as_str)
-                                .filter(|value| !value.trim().is_empty())
-                                .map(str::to_string)
-                        };
-                        (setting(0), setting(1))
+                        response_overrides(settings)?
                     }
                 };
-
-            // Both are the function's own words, so both are checked before
-            // they reach the response: a malformed one is a fault in the
-            // schema, and saying so is more use than a header the client
-            // cannot see or a status it cannot explain.
-            //
-            // That includes each name and value being one HTTP can carry. The
-            // response is only built after the commit, and a header it cannot
-            // hold -- a newline in a value, a space in a name -- failed there,
-            // where it was too late to undo the function's writes.
-            if let Some(headers) = &guc_headers {
-                let sendable =
-                    postrust_response::parse_guc_headers(headers).is_some_and(|headers| {
-                        headers.iter().all(|(name, value)| {
-                            http::HeaderName::try_from(name.as_str()).is_ok()
-                                && http::HeaderValue::try_from(value.as_str()).is_ok()
-                        })
-                    });
-                if !sendable {
-                    return Err(postrust_core::Error::InvalidGucHeaders);
-                }
-            }
-            let guc_status = match guc_status {
-                None => None,
-                Some(status) => Some(
-                    status
-                        .trim()
-                        .parse::<u16>()
-                        .ok()
-                        .and_then(|code| StatusCode::from_u16(code).ok())
-                        .ok_or(postrust_core::Error::InvalidGucStatus)?,
-                ),
-            };
 
             // The count runs on the same transaction and so under the same
             // snapshot as the page it describes.
@@ -1632,6 +1651,22 @@ async fn execute_plan<'s, S: State>(
             // having named the row itself. PostgREST draws exactly these
             // lines, and a client reading the header expects them.
             use postrust_core::api_request::Mutation;
+            //
+            // The total a write reports is how many rows it affected, when the
+            // caller asked for a count at all: `exact` and `estimated` do
+            // (PostgREST's `shouldCount`), `planned` does not. It is never
+            // counted by a second statement -- the write's own rows are the
+            // answer.
+            let total = match (mutation_kind(api_request), &api_request.preferences.count) {
+                (
+                    Some(_),
+                    Some(
+                        postrust_core::api_request::PreferCount::Exact
+                        | postrust_core::api_request::PreferCount::Estimated,
+                    ),
+                ) => Some(affected as i64),
+                _ => total,
+            };
             let content_range = match mutation_kind(api_request) {
                 Some(Mutation::SingleUpsert) => None,
                 Some(Mutation::Create) | Some(Mutation::Delete) => {
@@ -1659,11 +1694,25 @@ async fn execute_plan<'s, S: State>(
                 .is_some_and(|range| range.status() == StatusCode::RANGE_NOT_SATISFIABLE)
                 && mutation_kind(api_request).is_none()
             {
-                return Err(postrust_core::Error::InvalidRange(format!(
-                    "An offset of {} was requested, but there are only {} rows.",
-                    offset,
-                    total.unwrap_or(0)
-                )));
+                // Answered as a response, not as an error: PostgREST builds the
+                // 416 like any other read, so it carries the `Content-Range`
+                // (`*/total`) and the `Preference-Applied` of the count that
+                // found the offset out of bounds. The caller swaps in the
+                // error body.
+                return Ok((
+                    QueryResult {
+                        status: StatusCode::RANGE_NOT_SATISFIABLE,
+                        omit_body: true,
+                        content_range,
+                        unsatisfiable: Some(format!(
+                            "An offset of {} was requested, but there are only {} rows.",
+                            offset,
+                            total.unwrap_or(0)
+                        )),
+                        ..Default::default()
+                    },
+                    tx,
+                ));
             }
 
             let result = QueryResult {
@@ -1694,6 +1743,9 @@ async fn execute_plan<'s, S: State>(
                 content_range,
                 guc_headers,
                 raw_body: geojson_body,
+                media_type: negotiated_media,
+                resolution_applies,
+                compat_mode: state.config().compat_mode,
                 ..Default::default()
             };
             // Committed by the caller, once the response is known to be one
@@ -1706,6 +1758,35 @@ async fn execute_plan<'s, S: State>(
             // Return appropriate metadata based on the info type
             let response_data = match info_plan {
                 InfoPlan::OpenApiSpec => {
+                    // PostgREST's `inspectPlan` produces the document as
+                    // OpenAPI, JSON or anything, and refuses the rest. The
+                    // default-mode directory answers whatever is asked, so
+                    // this is compatibility mode only.
+                    use postrust_core::api_request::MediaType;
+                    if state.config().compat_mode
+                        && matches!(
+                            api_request.action,
+                            postrust_core::api_request::Action::Db(
+                                postrust_core::api_request::DbAction::SchemaRead { .. }
+                            )
+                        )
+                        && !api_request.accept_media_types.is_empty()
+                        && !api_request.accept_media_types.iter().any(|media| {
+                            matches!(
+                                media,
+                                MediaType::OpenApi | MediaType::ApplicationJson | MediaType::Any
+                            )
+                        })
+                    {
+                        return Err(postrust_core::Error::InvalidMediaType(
+                            api_request
+                                .accept_media_types
+                                .iter()
+                                .map(MediaType::to_mime)
+                                .collect::<Vec<_>>()
+                                .join(", "),
+                        ));
+                    }
                     // Return basic server info for root endpoint
                     serde_json::json!({
                         "name": "postrust",
@@ -1801,6 +1882,61 @@ fn query_error_log(e: &postrust_core::db::DbError) -> QueryErrorLog {
         true => QueryErrorLog::Refused(status),
         false => QueryErrorLog::Fault,
     }
+}
+
+/// What the function set for the response: its headers and its status, from
+/// the rows [`RESPONSE_SETTINGS`] returned, and checked.
+fn response_overrides(
+    settings: Vec<Vec<serde_json::Value>>,
+) -> Result<(Option<String>, Option<StatusCode>), postrust_core::Error> {
+    let row = first_row(settings)?;
+    // Empty is absent. Once any transaction on this
+    // connection has defined a custom setting, PostgreSQL
+    // keeps the name for the rest of the session and
+    // reports it as `''` rather than null -- so a request
+    // that set nothing would otherwise inherit "the empty
+    // headers" from whichever request last set some.
+    let setting = |index: usize| {
+        row.get(index)
+            .and_then(serde_json::Value::as_str)
+            .filter(|value| !value.trim().is_empty())
+            .map(str::to_string)
+    };
+    let (guc_headers, guc_status) = (setting(0), setting(1));
+
+    // Both are the function's own words, so both are checked before
+    // they reach the response: a malformed one is a fault in the
+    // schema, and saying so is more use than a header the client
+    // cannot see or a status it cannot explain.
+    //
+    // That includes each name and value being one HTTP can carry. The
+    // response is only built after the commit, and a header it cannot
+    // hold -- a newline in a value, a space in a name -- failed there,
+    // where it was too late to undo the function's writes.
+    if let Some(headers) = &guc_headers {
+        let sendable = postrust_response::parse_guc_headers(headers).is_some_and(|headers| {
+            headers.iter().all(|(name, value)| {
+                http::HeaderName::try_from(name.as_str()).is_ok()
+                    && http::HeaderValue::try_from(value.as_str()).is_ok()
+            })
+        });
+        if !sendable {
+            return Err(postrust_core::Error::InvalidGucHeaders);
+        }
+    }
+    let guc_status = match guc_status {
+        None => None,
+        Some(status) => Some(
+            status
+                .trim()
+                .parse::<u16>()
+                .ok()
+                .and_then(|code| StatusCode::from_u16(code).ok())
+                .ok_or(postrust_core::Error::InvalidGucStatus)?,
+        ),
+    };
+
+    Ok((guc_headers, guc_status))
 }
 
 /// A function's response settings, read back after it ran.
@@ -2058,6 +2194,9 @@ fn has_default_select(select: &[postrust_core::api_request::SelectItem]) -> bool
 }
 
 /// Whether this server renders the type itself, with nothing declared for it.
+// `application/openapi+json` is deliberately absent: only the root produces it
+// (PostgREST's `inspectPlan`), so on a table or a function it is a type nothing
+// can render, and is refused like any other.
 fn renders_without_a_handler(media: &postrust_core::api_request::MediaType) -> bool {
     use postrust_core::api_request::MediaType;
 
@@ -2069,7 +2208,6 @@ fn renders_without_a_handler(media: &postrust_core::api_request::MediaType) -> b
             | MediaType::GeoJson
             | MediaType::SingularJson { .. }
             | MediaType::ArrayJson { .. }
-            | MediaType::OpenApi
     )
 }
 

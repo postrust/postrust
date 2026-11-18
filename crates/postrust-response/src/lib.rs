@@ -102,10 +102,10 @@ pub fn format_response(
     request: &ApiRequest,
     result: &QueryResult,
 ) -> Result<Response, FormatError> {
-    let media_type = request
-        .accept_media_types
-        .first()
-        .cloned()
+    let media_type = result
+        .media_type
+        .clone()
+        .or_else(|| request.accept_media_types.first().cloned())
         .unwrap_or(MediaType::ApplicationJson);
 
     // A mutation the caller wanted no representation from sends no body at
@@ -204,6 +204,18 @@ pub fn format_response(
             // PostgREST's own JSON media types is told it got that: the type
             // is how it knows the shape it negotiated was honoured.
             let content_type = match other {
+                // PostgREST only has a media type for the stripped array; a
+                // plain `vnd.pgrst.array+json` is `application/json`
+                // (`MediaType.hs`, `checkArrayNullStrip`). Compatibility mode
+                // follows it; by default the client is told the type it asked
+                // for was honoured.
+                MediaType::ArrayJson { strip_nulls } if result.compat_mode => {
+                    if *strip_nulls {
+                        "application/vnd.pgrst.array+json;nulls=stripped; charset=utf-8"
+                    } else {
+                        "application/json; charset=utf-8"
+                    }
+                }
                 MediaType::ArrayJson { .. } => "application/vnd.pgrst.array+json; charset=utf-8",
                 MediaType::OpenApi => "application/openapi+json; charset=utf-8",
                 _ => "application/json; charset=utf-8",
@@ -218,6 +230,7 @@ pub fn format_response(
 /// Which preferences this request could honour.
 pub(crate) fn preference_scope(
     request: &ApiRequest,
+    resolution_applies: bool,
 ) -> postrust_core::api_request::preferences::PreferenceScope {
     use postrust_core::api_request::preferences::PreferenceScope;
     use postrust_core::api_request::{Action, DbAction, Mutation};
@@ -228,7 +241,7 @@ pub(crate) fn preference_scope(
 
     match action {
         DbAction::RelationMut { mutation, .. } => PreferenceScope {
-            resolution: matches!(mutation, Mutation::Create),
+            resolution: matches!(mutation, Mutation::Create) && resolution_applies,
             representation: true,
             missing: matches!(mutation, Mutation::Create | Mutation::Update),
             max_affected: matches!(mutation, Mutation::Update | Mutation::Delete),
@@ -264,16 +277,6 @@ fn strip_nulls(value: serde_json::Value) -> serde_json::Value {
 
 /// Add common response headers.
 fn add_common_headers(response: &mut Response, request: &ApiRequest, result: &QueryResult) {
-    // A function's own headers, added rather than replaced: the shape of the
-    // setting is an array precisely so that a name may repeat.
-    if let Some(guc) = &result.guc_headers {
-        if let Some(headers) = crate::headers::parse_guc_headers(guc) {
-            for (name, value) in headers {
-                response.append_header(&name, &value);
-            }
-        }
-    }
-
     // Content-Range
     if let Some(range) = &result.content_range {
         response.set_content_range(range);
@@ -292,7 +295,7 @@ fn add_common_headers(response: &mut Response, request: &ApiRequest, result: &Qu
     // Preference-Applied
     if let Some(applied) = postrust_core::api_request::preferences::preference_applied(
         &request.preferences,
-        preference_scope(request),
+        preference_scope(request, result.resolution_applies),
     ) {
         response.set_header("preference-applied", &applied);
     }
@@ -300,6 +303,26 @@ fn add_common_headers(response: &mut Response, request: &ApiRequest, result: &Qu
     // Content-Profile
     if request.negotiated_by_profile {
         response.set_header("content-profile", &request.schema);
+    }
+
+    // A function's own headers go last, and a name it sets replaces the
+    // built-in of that name (PostgREST's `addHeadersIfNotIncluded`): a
+    // `Content-Type` the function chose is the one sent, not a second one
+    // beside ours. Within the function's own headers a name may still repeat
+    // -- two `Set-Cookie`s -- since the shape of the setting is an array
+    // precisely so that it can.
+    if let Some(guc) = &result.guc_headers {
+        if let Some(headers) = crate::headers::parse_guc_headers(guc) {
+            let mut replaced = std::collections::HashSet::new();
+            for (name, value) in headers {
+                if let Ok(header_name) = http::header::HeaderName::from_bytes(name.as_bytes()) {
+                    if replaced.insert(header_name.clone()) {
+                        response.headers.remove(&header_name);
+                    }
+                }
+                response.append_header(&name, &value);
+            }
+        }
     }
 }
 
@@ -421,6 +444,27 @@ pub struct QueryResult {
     /// renderer for. The value is the whole payload, so it replaces the usual
     /// JSON rendering rather than being wrapped in it.
     pub raw_body: Option<(String, Vec<u8>)>,
+    /// Set when the requested range lies past the end of the result: the
+    /// message of the `PGRST103` it is answered with.
+    ///
+    /// The result still carries the headers such a response has
+    /// (`Content-Range`, `Preference-Applied`); the caller supplies the body.
+    pub unsatisfiable: Option<String>,
+    /// The media type the engine negotiated for this response.
+    ///
+    /// The engine decides which of the accepted types it can render, and the
+    /// response is formatted as that one -- not as whichever the client listed
+    /// first, which may be one nothing here renders. `None` formats as the
+    /// first accepted type, as before.
+    pub media_type: Option<MediaType>,
+    /// Whether a `Prefer: resolution` could have been honoured: the insert had
+    /// a primary key or `?on_conflict=` to conflict on. Reported in
+    /// `Preference-Applied` only then.
+    pub resolution_applies: bool,
+    /// Whether compatibility mode is on, for the places where the response
+    /// follows PostgREST's media types exactly rather than naming the one the
+    /// client asked for.
+    pub compat_mode: bool,
 }
 
 /// Response formatting error.
