@@ -576,6 +576,7 @@ impl QueryBuilder {
                 where_clauses,
                 returning,
                 reports_inserted,
+                counts_inserted,
                 apply_defaults,
                 ..
             } => {
@@ -629,8 +630,21 @@ impl QueryBuilder {
                         // key is left unwritten rather than writing the wrong
                         // one -- and the count that comes back then says
                         // whether the request meant exactly one row.
-                        if !where_clauses.is_empty() {
+                        let merging = matches!(
+                            on_conflict,
+                            Some((crate::api_request::PreferResolution::MergeDuplicates, _))
+                        );
+                        let count = *counts_inserted && merging;
+                        if !where_clauses.is_empty() || count {
                             frag.push(" WHERE ");
+                            // First, so every candidate row is counted
+                            // whether or not the conditions then keep it.
+                            if count {
+                                frag.push(&inserted_counter(true));
+                                if !where_clauses.is_empty() {
+                                    frag.push(" AND ");
+                                }
+                            }
                             for (i, clause) in where_clauses.iter().enumerate() {
                                 if i > 0 {
                                     frag.push(" AND ");
@@ -672,6 +686,11 @@ impl QueryBuilder {
                                 frag.push(" = EXCLUDED.");
                                 frag.push(&escape_ident(&column.name));
                             }
+                            // A row that conflicted was not created after all.
+                            if *counts_inserted {
+                                frag.push(" WHERE ");
+                                frag.push(&inserted_counter(false));
+                            }
                         }
                     }
                 }
@@ -683,7 +702,13 @@ impl QueryBuilder {
                 // knowable only here: `xmax` is zero on a row this statement
                 // created and non-zero on one it updated.
                 if on_conflict.is_some() && *reports_inserted && !returning.is_empty() {
-                    frag.push(", (xmax = 0) AS ");
+                    if *counts_inserted {
+                        // The running count, read once the row has been
+                        // counted: above zero as soon as any row was created.
+                        frag.push(", (coalesce(nullif(current_setting('pgrst.inserted', true), '')::int, 0) > 0) AS ");
+                    } else {
+                        frag.push(", (xmax = 0) AS ");
+                    }
                     frag.push(&escape_ident(INSERTED_COLUMN));
                 }
 
@@ -967,6 +992,17 @@ impl QueryBuilder {
 /// uncast, preserving the previous behaviour.
 /// The column that says whether a row was created or merged into.
 pub const INSERTED_COLUMN: &str = "pgrst_inserted";
+
+/// PostgREST's `pgrst.inserted` counter (SqlFragment.hs addConfigPgrstInserted):
+/// raised for each candidate row, lowered for each one that conflicted. The
+/// comparison keeps the condition true -- it is evaluated only for its effect.
+fn inserted_counter(add: bool) -> String {
+    let (symbol, sentinel) = if add { ("+", "0") } else { ("-", "-1") };
+    format!(
+        "set_config('pgrst.inserted', (coalesce(nullif(current_setting('pgrst.inserted', true), '')::int, 0) {} 1)::text, true) <> '{}'",
+        symbol, sentinel
+    )
+}
 
 /// The columns a mutation writes, as a comma-separated identifier list.
 fn push_column_list(frag: &mut SqlFragment, columns: &[crate::plan::CoercibleField]) {
@@ -1346,6 +1382,12 @@ fn castable_type(pg_type: &str) -> Option<&str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_inserted_counter_is_raised_per_row_and_lowered_per_conflict() {
+        assert!(inserted_counter(true).contains("+ 1)::text, true) <> '0'"));
+        assert!(inserted_counter(false).contains("- 1)::text, true) <> '-1'"));
+    }
 
     #[test]
     fn castable_type_accepts_bare_type_names() {
