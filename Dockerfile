@@ -9,6 +9,7 @@ WORKDIR /app
 # Copy manifests
 COPY Cargo.toml Cargo.lock ./
 COPY crates ./crates
+COPY vendor ./vendor
 
 # Build release binary with the admin UI and OpenTelemetry. `otel` is
 # inactive until OTEL_EXPORTER_OTLP_ENDPOINT or PGRST_ADMIN_SERVER_PORT is set;

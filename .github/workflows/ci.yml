@@ -35,6 +35,10 @@ jobs:
       - name: Dockerfiles build on the pinned toolchain
         run: scripts/check-dockerfile-toolchain.sh
 
+      # The vendored parser is the published crate plus one patch, and must stay so.
+      - name: Vendored async-graphql-parser matches the pristine crate plus its patch
+        run: scripts/check-vendored-parser.sh
+
       - uses: Swatinem/rust-cache@v2
 
       - name: Check formatting
