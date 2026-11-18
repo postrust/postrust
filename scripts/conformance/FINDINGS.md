@@ -56,6 +56,17 @@ recorded for run 11, which reused run 9's. It closed 72 cases, of two kinds:
 - **PostgREST behaviour that compatibility mode now matches and default mode
   keeps away from.** Listed in Part 2, with what each costs default mode.
 
+**The Worker in run 15 found one more gap, and one fault in how it was
+built.** The server answers a CORS preflight in `options_allow`; the Worker
+answers it in its own `preflight()`, which compatibility mode had not reached,
+so it still sent `Allow` (`CorsSpec` `:16`, `:75`, `:114`). Fixed in
+`44c470a`. Separately, a first Worker build without `compat-key-order` lost
+four CSV cases to column order, the same trap run 4 fell into on the server:
+the feature is a build choice, and `worker-build --release --features
+compat-key-order` is the build that is measured. With both, the Worker scores
+1484 and the socket driver 1485, each differing from the server only in the
+cases `docs/postgrest-conformance.md` names.
+
 **Run 11 is the 3.3.0 measurement, and its 10-case drop from run 10 was a
 bookkeeping gap rather than a regression.** Bisected, it is one commit:
 `ddf7530` (2.4.0) gave every 405 an `Allow` header, as RFC 9110 asks.

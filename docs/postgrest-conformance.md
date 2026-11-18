@@ -58,9 +58,9 @@ on its other driver and in its other host (issue #50):
 
 | Candidate | Full contract | Status and body | What differs from the server |
 |---|---|---|---|
-| The server (sqlx) | 1424/1499 | 1451 | — |
-| The server, REST through the socket driver (`CONFORMANCE_EXTRA_FEATURES=pg-socket`) | 1423/1499 | 1450 | One case, below |
-| The Cloudflare Worker in workerd (`CONFORMANCE_WORKER_BUILD=...`) | 1422/1499 | 1449 | Two cases, below |
+| The server (sqlx) | 1486/1499 | 1488 | — |
+| The server, REST through the socket driver (`CONFORMANCE_EXTRA_FEATURES=pg-socket`) | 1485/1499 | 1487 | One case, below |
+| The Cloudflare Worker in workerd (`CONFORMANCE_WORKER_BUILD=...`, built with `compat-key-order`) | 1484/1499 | 1486 | Two cases, below |
 
 The socket driver answers the suite as sqlx does, except in
 `PreparedStatementsSpec`. That case asks `pg_prepared_statements` whether the
