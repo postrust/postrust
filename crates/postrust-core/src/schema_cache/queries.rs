@@ -393,8 +393,13 @@ async fn load_columns<T: Tx>(
                 c.relname::text AS table_name,
                 a.attname::text AS column_name,
                 a.attnum::int AS ordinal_position,
-                CASE WHEN a.attgenerated = '' THEN pg_get_expr(ad.adbin, ad.adrelid) END
-                    AS column_default,
+                -- A column of a domain declared `DEFAULT v` has no pg_attrdef
+                -- row of its own; the default is the domain's
+                -- (`typdefaultbin`), as PostgREST reads it.
+                CASE WHEN t.typbasetype <> 0 AND ad.adbin IS NULL
+                          THEN pg_get_expr(t.typdefaultbin, 0)
+                     WHEN a.attgenerated = '' THEN pg_get_expr(ad.adbin, ad.adrelid)
+                END AS column_default,
                 CASE WHEN a.attnotnull OR (t.typtype = 'd' AND t.typnotnull)
                      THEN 'NO' ELSE 'YES' END AS is_nullable,
                 CASE WHEN t.typtype = 'd' THEN
@@ -540,6 +545,10 @@ pub async fn load_relationships<T: Tx>(tx: &mut T, schemas: &[String]) -> Result
         JOIN pg_class t2 ON t2.oid = c.confrelid
         JOIN pg_namespace ns2 ON ns2.oid = t2.relnamespace
         WHERE c.contype = 'f'
+          -- A partition's foreign key is a copy of the parent's, inherited
+          -- (`conparentid` is the constraint it was cloned from). Only the
+          -- original counts, as in PostgREST's allM2OandO2ORels.
+          AND c.conparentid = 0
           AND ns1.nspname = ANY($1)
         -- Ordered, because the order reaches the client. Where two foreign
         -- keys join the same pair of tables the embed is ambiguous, and the
@@ -1293,6 +1302,9 @@ pub struct ViewColumn {
     pub base_column: String,
     /// The name the view gives it.
     pub view_column: String,
+    /// Where the view puts it (`attnum`), so that "the first view column"
+    /// and "the first base table" mean the same as they do in the view.
+    pub view_ordinal: i32,
 }
 
 /// Which base-table column each view column came from.
@@ -1400,7 +1412,8 @@ pub async fn load_view_columns<T: Tx>(tx: &mut T, schemas: &[String]) -> Result<
         SELECT DISTINCT
                rec.view_schema, rec.view_name,
                sch.nspname AS base_schema, tbl.relname AS base_name,
-               col.attname AS base_column, vcol.attname AS view_column
+               col.attname AS base_column, vcol.attname AS view_column,
+               vcol.attnum::int AS view_ordinal
           FROM recursion rec
           JOIN pg_attribute vcol ON vcol.attrelid = rec.view_id
                                 AND vcol.attnum = rec.view_column
@@ -1430,6 +1443,7 @@ pub async fn load_view_columns<T: Tx>(tx: &mut T, schemas: &[String]) -> Result<
                 ),
                 base_column: row.get::<String>("base_column")?,
                 view_column: row.get::<String>("view_column")?,
+                view_ordinal: row.get::<i32>("view_ordinal")?,
             })
         })
         .collect()
