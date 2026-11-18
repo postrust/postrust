@@ -3,6 +3,7 @@ FROM rust:1.94-bookworm AS builder
 WORKDIR /app
 COPY Cargo.toml Cargo.lock ./
 COPY crates ./crates
+COPY vendor ./vendor
 RUN cargo build --release --locked -p postrust-server --features admin-ui
 
 FROM debian:bookworm-slim
