@@ -3,7 +3,7 @@
 Postrust provides native support for [pgvector](https://github.com/pgvector/pgvector), enabling vector similarity search directly through your REST and GraphQL APIs. Build AI-powered applications with semantic search, recommendations, and RAG (Retrieval Augmented Generation) pipelines.
 
 > Examples below use root-level paths (e.g. `/documents`, `/rpc/search_similar`),
-> which require [compatibility mode](configuration.md#compatibility-settings);
+> which require [compatibility mode](compat-mode.md);
 > by default, prefix them with `/api`.
 
 ## Prerequisites

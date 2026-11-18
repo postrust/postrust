@@ -291,20 +291,29 @@ where the two differ deliberately.
 |----------|-------------|---------|
 | `PGRST_COMPAT_MODE` | PostgREST compatibility mode (alias: `POSTRUST_COMPAT_MODE`) | `false` |
 | `PGRST_DB_ERRORS_VERBATIM` | Database errors answered in PostgreSQL's own words, without the rest of compatibility mode: `true` for all of them, or a comma-separated list of SQLSTATEs and prefixes ending in `*`, such as `P0001,PT*`. See below | `false` |
+| `PGRST_DB_ERROR_STATUS` | The HTTP status of a database error, by SQLSTATE: comma-separated `PATTERN:STATUS`, where PATTERN is a SQLSTATE or a prefix ending in `*` and STATUS is 400 to 599, such as `P0002:404,23*:422` (alias: `POSTRUST_DB_ERROR_STATUS`). See below | (none) |
+| `PGRST_RPC_UNWRAP` | `POST /rpc/<fn>` answered as PostgREST does -- a bare object or scalar for a function that returns one row, a top-level array for a set -- instead of `[{"<fn>": ...}]`, without the rest of compatibility mode (alias: `POSTRUST_RPC_UNWRAP`). Compatibility mode implies it | `false` |
 
-Setting `PGRST_COMPAT_MODE=true` makes the API behave more like PostgREST:
+Setting `PGRST_COMPAT_MODE=true` makes the API behave like PostgREST. The
+main effects:
 
-- **Canonical paths at the root.** The full REST surface is also served at `/`,
-  so `POST /rpc/<name>`, `GET /<table>`, etc. work in addition to the
-  `/api`-prefixed paths. Explicit routes (`/`, `/_`, `/admin`, `/api`) still
-  take precedence, and GraphQL stays at `/api/graphql`.
-- **PostgREST-shaped RPC responses.** Results from `POST /rpc/<name>` are
-  un-wrapped: a non-set-returning function returns its bare object/scalar
-  (`{...}` / `42`) and a set-returning function returns a top-level array,
-  instead of the default `[{"<name>": ...}]` shape.
+- **Paths at the root.** The REST API is also served at the root, so
+  `POST /rpc/<name>` and `GET /<table>` work beside the `/api`-prefixed paths.
+  It is the router's fallback: `/_`, `/admin` and `/api` keep their meaning,
+  but `/` itself becomes the REST API's answer rather than this server's
+  directory of endpoints. GraphQL stays at `/api/graphql`.
+- **PostgREST-shaped RPC responses.** A non-set-returning function returns its
+  bare object or scalar (`{...}` / `42`) and a set-returning one a top-level
+  array, instead of `[{"<name>": ...}]`. `PGRST_RPC_UNWRAP` gives this alone.
 - **Database errors in PostgreSQL's words.** Every database error is
   answered with its own SQLSTATE, message, detail and hint, as
   `PGRST_DB_ERRORS_VERBATIM=true` does.
+- **PostgREST's statuses.** `P0002` stays a 500 instead of the default 404.
+
+It changes a few more things -- the OpenAPI paths, preflight handling, a byte
+PostgREST puts before a handler's `jsonb` -- and each one is listed, with what
+to check when moving a deployment on or off the mode, in
+[PostgREST compatibility mode](compat-mode.md).
 
 ```bash
 # Default mode
@@ -349,8 +358,7 @@ Running with `PGRST_COMPAT_MODE=true` on a binary built without the feature logs
 a warning at startup, so the difference is not left to be discovered by diffing
 responses.
 
-This is opt-in so existing deployments keep their current behavior. See
-"Differences from PostgREST" in the README for the remaining intentional
+See "Differences from PostgREST" in the README for the remaining intentional
 differences.
 
 ### Database errors in their own words
@@ -385,6 +393,35 @@ carries PostgreSQL's `Key (email)=(...) already exists.` A value
 that is none of these stops start-up. The status is decided by the SQLSTATE
 either way, and a refusal raised with `sqlstate 'PGRST'` is unaffected: it
 always answers with the response the function wrote.
+
+### Status of a database error
+
+A database error's status comes from its SQLSTATE, with PostgREST's table.
+`PGRST_DB_ERROR_STATUS` changes that table for the SQLSTATEs it lists:
+
+```bash
+PGRST_DB_ERROR_STATUS=P0002:404,23*:422
+```
+
+A pattern is written as in `PGRST_DB_ERRORS_VERBATIM`, a five-character SQLSTATE
+or a prefix ending in `*`, and a status has to be a whole number from 400 to
+599; anything else stops start-up. Where several patterns match, the most
+specific wins: a whole SQLSTATE over any prefix, a longer prefix over a
+shorter one. In a configuration file it is an object,
+`"db_error_status": {"P0002": 404}`.
+
+One mapping is on without being asked, outside compatibility mode: `P0002`
+(`no_data_found`, which `SELECT ... INTO STRICT` raises when it finds no row)
+is a 404, where PostgREST answers 500. A function that looked something up and
+found nothing is reporting a missing thing, not a fault of the server's.
+`PGRST_COMPAT_MODE=true` keeps PostgREST's 500, and `P0002:500` puts it back
+without compatibility mode. An entry in the setting wins over the default in
+both modes.
+
+A status the schema asked for is not remapped: `RAISE sqlstate 'PGRST'` and
+`PT<nnn>` always answer as the function said. A 401 carries its
+`WWW-Authenticate` challenge, so mapping a SQLSTATE to or from 401 adds or
+drops it. REST and the routers given to `Builder::nest` answer alike.
 
 ## Logging Settings
 

@@ -1,5 +1,8 @@
-# Build stage
-FROM rustlang/rust:nightly-bookworm AS builder
+# Build stage. The toolchain rust-toolchain.toml pins, on the Debian release
+# the runtime stage uses, so the binary links against the same glibc. Not
+# nightly: an unpinned nightly broke the 3.1.0 image on a compiler regression
+# in code that stable builds, and nothing here needs it.
+FROM rust:1.98.1-bookworm AS builder
 
 WORKDIR /app
 
@@ -10,7 +13,7 @@ COPY crates ./crates
 # Build release binary with the admin UI and OpenTelemetry. `otel` is
 # inactive until OTEL_EXPORTER_OTLP_ENDPOINT or PGRST_ADMIN_SERVER_PORT is set;
 # see docs/observability.md.
-RUN cargo build --release -p postrust-server --features admin-ui,otel
+RUN cargo build --release --locked -p postrust-server --features admin-ui,otel
 
 # Runtime stage
 FROM debian:bookworm-slim

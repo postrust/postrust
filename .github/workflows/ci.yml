@@ -29,6 +29,12 @@ jobs:
       - name: Install Rust (from rust-toolchain.toml)
         run: rustup show active-toolchain
 
+      # The release images build on a Rust image named by version, which has
+      # to be this same toolchain: an unpinned nightly is why 3.1.0 shipped no
+      # Debian image.
+      - name: Dockerfiles build on the pinned toolchain
+        run: scripts/check-dockerfile-toolchain.sh
+
       - uses: Swatinem/rust-cache@v2
 
       - name: Check formatting

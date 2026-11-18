@@ -148,7 +148,7 @@ impl AppState {
             .await
             .map_err(|e| {
                 tracing::debug!("Refused before the query: {}", e);
-                Error::from(e)
+                Error::from(e).for_user(user, self)
             })?;
         Ok(tx)
     }

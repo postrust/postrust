@@ -17,6 +17,10 @@
 # An exact version rather than "stable" so a new release cannot turn CI red
 # without a commit. The cost is bumping this deliberately; that is the point.
 #
+# Dockerfile, Dockerfile.alpine and Dockerfile.test build on `rust:<this
+# version>-...` images, so bumping this means bumping them too.
+# scripts/check-dockerfile-toolchain.sh, run in CI, fails until they agree.
+#
 # `cargo +1.94 ...` still overrides this, which is why the msrv job keeps
 # working. Verified, not assumed.
 [toolchain]

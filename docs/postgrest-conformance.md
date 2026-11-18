@@ -92,7 +92,7 @@ so they are not compared.
 Bodies are compared as parsed JSON, so whitespace and formatting do not count
 against either server — but **object key order does not survive parsing**, and
 a CSV response puts its columns in key order. See
-[key ordering](configuration.md#compatibility-settings).
+[key ordering](configuration.md#key-ordering-a-build-time-choice).
 
 **The figures are for the compatibility build**, which is the configuration
 the harness runs in every respect: `PGRST_COMPAT_MODE=true`, PostgREST's paths,

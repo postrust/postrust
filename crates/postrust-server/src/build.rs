@@ -447,10 +447,11 @@ async fn assemble(
         info!("Custom routes enabled at {}", prefix);
         // In compatibility mode, or for a SQLSTATE `PGRST_DB_ERRORS_VERBATIM`
         // lists, a database error is answered in the database's own words,
-        // by REST and so by a route's `postrust_server::Error` too. The
+        // and one `PGRST_DB_ERROR_STATUS` maps has the status it gives, by
+        // REST and so by a route's `postrust_server::Error` too. The
         // error cannot see the configuration when `?` makes it, so this
         // renders it again on the way out; see `crate::error`.
-        let router = match config.any_verbatim_db_errors() {
+        let router = match config.any_verbatim_db_errors() || !config.db_error_status.is_empty() {
             true => router.layer(axum::middleware::map_response_with_state(
                 state.clone(),
                 crate::error::render_verbatim,

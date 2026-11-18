@@ -68,4 +68,29 @@ ignore = [
     # that loads the HTTPS listener's certificate, so it deserves its own
     # change with its own testing rather than being bundled into an audit pass.
     "RUSTSEC-2025-0134",
+
+    # libsqlite3-sys 0.30.1 -- RUSTSEC-2026-0459, bundled C SQLite
+    # vulnerability (CVE-2026-119375). Fixed in libsqlite3-sys >=0.39.0.
+    #
+    # Not in any build graph: `cargo tree -i libsqlite3-sys --target all`
+    # prints nothing. It is locked only as an optional dependency of
+    # sqlx-sqlite behind sqlx's SQLite feature, which this workspace does not
+    # enable -- postrust is PostgreSQL only and never links or bundles SQLite.
+    #
+    # Not fixable by a lockfile update: sqlx-sqlite 0.9 requires
+    # `libsqlite3-sys >=0.30.1, <0.38.0`, so the newest version the lockfile
+    # can reach (0.37.0) is still below the fix. Revisit when sqlx-sqlite
+    # allows libsqlite3-sys >=0.39.
+    "RUSTSEC-2026-0459",
+
+    # chrono 0.4.42 -- RUSTSEC-2026-0543, unmaintained.
+    #
+    # Genuinely compiled: `cargo tree -i chrono --edges normal` lists
+    # async-graphql, postrust-auth, postrust-core and sqlx-postgres. It is a
+    # maintenance notice, not a vulnerability, and the advisory lists no
+    # patched release (0.4.45, the latest, is flagged too). Replacing it means
+    # moving off chrono in our own timestamp handling and waiting for
+    # async-graphql and sqlx to do the same, which is not an audit-pass change.
+    # Revisit when a maintained successor is adopted by sqlx or async-graphql.
+    "RUSTSEC-2026-0543",
 ]

@@ -179,22 +179,40 @@ export default component$(() => {
               MINOR
             </span>
             <span class="text-sm text-neutral-500">
-              @shareable once per shared type, and hyper 1.12
+              Errors for an API that replaces another
             </span>
           </div>
           <h1 class="mb-4 text-4xl font-bold text-neutral-900">
             Postrust {LATEST}
           </h1>
           <p class="mb-4 max-w-2xl text-lg text-neutral-600">
-            A shared Apollo Federation entity type now says{" "}
-            <code class="text-base">@shareable</code> once, on the type, and no
-            longer repeats it on each of its fields: a type-level{" "}
-            <code class="text-base">@shareable</code> already covers every field
-            on the type, so the supergraph composes the same. hyper moves to
-            1.12, which drops the unmaintained{" "}
+            Error handling for an API that replaces another. A missing grant is
+            a 403 for a signed-in caller rather than a 401 that signs them out,
+            as PostgREST answers it. A function that finds nothing (
+            <code class="text-base">P0002</code>) is a 404, and{" "}
+            <code class="text-base">PGRST_DB_ERROR_STATUS</code> sets the status
+            of any SQLSTATE. A{" "}
+            <code class="text-base">RAISE sqlstate &apos;PGRST&apos;</code> can
+            write the whole response body, and{" "}
+            <code class="text-base">PGRST_RPC_UNWRAP</code> gives RPC results
+            PostgREST&rsquo;s shape without the rest of compatibility mode,
+            which keeps PostgREST&rsquo;s answers throughout and is now{" "}
+            <a
+              href="https://github.com/postrust/postrust/blob/main/docs/compat-mode.md"
+              class="text-primary-600 hover:underline"
+            >
+              documented in full
+            </a>
+            . Released beside it: <code class="text-base">postrust-worker</code>{" "}
+            1.3.0 and <code class="text-base">postrust-proxy</code> 2.0.2, which
+            requires the fixed hickory release.
+          </p>
+          <p class="mb-4 max-w-2xl text-lg text-neutral-600">
+            3.2.0: a shared Apollo Federation entity type says{" "}
+            <code class="text-base">@shareable</code> once, on the type, and
+            hyper moves to 1.12, which drops the unmaintained{" "}
             <code class="text-base">pin-utils</code> (RUSTSEC-2026-0441) from
-            the build. <code class="text-base">postrust-worker</code> 1.2.1 and{" "}
-            <code class="text-base">postrust-proxy</code> 2.0.1 are unchanged.
+            the build.
           </p>
           <p class="mb-4 max-w-2xl text-lg text-neutral-600">
             3.1.1: shared Apollo Federation entity types emit{" "}

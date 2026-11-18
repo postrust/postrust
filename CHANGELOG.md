@@ -3,6 +3,95 @@
 Notable changes, newest first. This file starts at 1.0.0-alpha.1; earlier
 releases are described by their tags and the pull requests behind them.
 
+## 3.3.0
+
+Error handling for an API that replaces another (#76): a missing grant is a
+403 for a signed-in caller, a function that finds nothing is a 404, the status
+of any SQLSTATE can be set, a function can write its error body byte for byte,
+and RPC results can take PostgREST's shape without the rest of compatibility
+mode. Compatibility mode keeps PostgREST's answers throughout, and a page of
+its own now says everything it changes. Released beside it:
+`postrust-worker` 1.3.0, which reads the new settings, and `postrust-proxy`
+2.0.2, which requires the fixed hickory release.
+
+### Upgrading
+
+Two answers change outside compatibility mode, both listed under Changed: a
+`42501` to an authenticated request is 403 rather than 401, and `P0002` is 404
+rather than 500. `PGRST_DB_ERROR_STATUS=P0002:500` keeps the old status for
+`P0002`. Everything else is off until set.
+
+### Added
+
+- **A `RAISE ... USING ERRCODE = 'PGRST'` can supply the whole response body**
+  (#76). A `body` key in the DETAIL, of any JSON type, is sent as written,
+  where the body was always rebuilt as `{code, message, details, hint}`, so a
+  schema replacing an existing API can keep its error shape byte for byte,
+  such as `{"detail": {"code": "access_required", "can_request": true}}`. With
+  a `body` the MESSAGE can be free text and `headers` is optional; a raised
+  `Content-Type` replaces `application/json` for it. Without `body` nothing
+  changes, in either mode: PostgREST ignores the key.
+- **`PGRST_DB_ERROR_STATUS` sets the HTTP status of a database error by
+  SQLSTATE** (#76; alias `POSTRUST_DB_ERROR_STATUS`). Comma-separated
+  `PATTERN:STATUS`, such as `P0002:404,23*:422`: a pattern is a SQLSTATE or a
+  prefix ending in `*`, as in `PGRST_DB_ERRORS_VERBATIM`, and a status is 400
+  to 599, or start-up stops. The most specific pattern wins. A status raised
+  by the schema (`sqlstate 'PGRST'`, `PT<nnn>`) is never remapped. It applies
+  to REST, to routes given to `Builder::nest` and to the Worker, and is
+  `AppConfig::db_error_status` in a configuration file.
+- **`PGRST_RPC_UNWRAP`** (alias `POSTRUST_RPC_UNWRAP`) answers `POST /rpc/<fn>`
+  the way PostgREST does -- a bare object or scalar for a function that
+  returns one row, a top-level array for a set-returning one -- instead of
+  `[{"<fn>": ...}]`, without the rest of compatibility mode: REST stays at
+  `/api` and database errors stay sanitised. Compatibility mode still implies
+  it. Applies to REST and the Worker. `AppConfig` gains `rpc_unwrap` and
+  `unwrap_rpc_results`. (#76)
+
+### Changed
+
+- **`P0002` (`no_data_found`) is a 404 outside compatibility mode** (#76),
+  where it was a 500, since a function that found nothing is reporting a
+  missing thing and not a fault. `PGRST_COMPAT_MODE=true` keeps PostgREST's
+  500, and `PGRST_DB_ERROR_STATUS=P0002:500` restores it in either mode.
+
+- **A missing grant (SQLSTATE `42501`) is a 403 for an authenticated request**
+  and stays a 401, with its `WWW-Authenticate` challenge, for an anonymous one
+  (#76). This is PostgREST's rule: authenticated means the request runs as a
+  role other than the configured anonymous role. Until now it was always 401,
+  which told a client holding a valid token to send one. A client that treated
+  a 401 from a table the token's role cannot read as "log in again" will now
+  see 403. `error_response_as` and `DatabaseError::status_code_as` are new;
+  `error_response_for` and `status_code` answer as for an anonymous request,
+  as before. A route of your own gets the 403 from `AppState::begin_as` and
+  from `Error::for_user`, which marks a failed query of yours.
+
+### Fixed
+
+- **The images build on the toolchain CI tests with.** `Dockerfile` and
+  `Dockerfile.test` built on an unpinned nightly and `Dockerfile.alpine` on an
+  unversioned `rust:alpine`; a nightly compiler regression is why 3.1.0 has no
+  Debian image (3.1.1 carries the same code). All three now build on
+  `rust:1.98.1` with `--locked`, and CI fails if they drift from
+  `rust-toolchain.toml`.
+- **Compatibility mode is documented in full.** `docs/compat-mode.md` lists
+  every behaviour the mode changes, the settings that give one without the
+  rest, and what to check when moving on or off it. The configuration page
+  no longer says `/` stays an explicit route in compatibility mode.
+
+### Security
+
+- **hickory 0.26.1 → 0.26.3** (RUSTSEC-2026-0487 to -0491, -0506 to -0509,
+  -0513 to -0520, -0539 to -0541, -0556 to -0558), compiled only into
+  `postrust-proxy`, which now requires `hickory-resolver` 0.26.3 so a build
+  without this lockfile gets it too. **quinn-proto 0.11.19** and **quinn-udp
+  0.5.16** (RUSTSEC-2026-0523, -0524, -0538), in the lockfile but in no build.
+  **rustix 1.1.6** (RUSTSEC-2026-0486, unsound).
+- Two new entries in `.cargo/audit.toml`, with the evidence beside each:
+  libsqlite3-sys (RUSTSEC-2026-0459), locked only behind sqlx's SQLite
+  feature, which is not enabled, and with no fixed release sqlx 0.9 accepts;
+  and chrono (RUSTSEC-2026-0543), an unmaintained notice with no fixed
+  release.
+
 ## 3.2.0
 
 A shared Apollo Federation entity type says `@shareable` once, on the type,

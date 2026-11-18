@@ -129,9 +129,10 @@ async fn rest(req: HttpRequest, env: &Env, settings: Settings) -> Response<Body>
     // Kept for answering a failure of `State::new`, which takes the settings:
     // a schema that cannot be loaded is a database error like any other. Only
     // what decides how it is answered, rather than the whole configuration.
-    let verbatim = (
+    let answers = (
         settings.config.compat_mode,
         settings.config.db_errors_verbatim.clone(),
+        settings.config.db_error_status.clone(),
     );
     // Read before anything can answer: see `read_body`.
     let (parts, body) = req.into_parts();
@@ -141,7 +142,11 @@ async fn rest(req: HttpRequest, env: &Env, settings: Settings) -> Response<Body>
     let response = match State::new(env, settings).await {
         Err(e) => {
             let mut config = AppConfig::default();
-            (config.compat_mode, config.db_errors_verbatim) = verbatim;
+            (
+                config.compat_mode,
+                config.db_errors_verbatim,
+                config.db_error_status,
+            ) = answers;
             postrust_engine::error_response_for(&config, e)
         }
         Ok(state) if method == Method::OPTIONS => preflight(&state, parts).await,

@@ -695,8 +695,8 @@ API behave more like PostgREST:
 
 - **Canonical paths at the root.** The full REST surface is also served at `/`,
   so `POST /rpc/<name>`, `GET /<table>`, etc. work in addition to the
-  `/api`-prefixed paths. Explicit routes (`/`, `/_`, `/admin`, `/api`) still take
-  precedence.
+  `/api`-prefixed paths. `/_`, `/admin` and `/api` keep their meaning; `/`
+  becomes the REST API's own answer.
 - **PostgREST-shaped RPC responses.** Results from `POST /rpc/<name>` are
   un-wrapped: a non-set-returning function returns its bare object/scalar
   (`{...}` / `42`) and a set-returning function returns a top-level array
@@ -713,6 +713,11 @@ curl -X POST http://localhost:3000/rpc/get_statistics
 ```
 
 This is opt-in so existing Postrust deployments keep their current behavior.
+Compatibility mode changes a few more things, such as database errors in
+PostgreSQL's own words and PostgREST's status for `P0002`, and several of them
+can be had on their own (`PGRST_RPC_UNWRAP`, `PGRST_DB_ERRORS_VERBATIM`,
+`PGRST_DB_ERROR_STATUS`). [PostgREST compatibility mode](docs/compat-mode.md)
+lists every one.
 
 How closely the two agree is measured rather than asserted: the harness in
 `scripts/conformance/` replays PostgREST's own test cases over HTTP against

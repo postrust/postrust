@@ -18,7 +18,10 @@ mod handler;
 pub mod observe;
 mod state;
 
-pub use handler::{allow, authenticate, authorization, error_response, error_response_for, handle};
+pub use handler::{
+    allow, authenticate, authorization, error_response, error_response_as, error_response_for,
+    handle,
+};
 pub use state::State;
 
 use postrust_auth::jwks::{Fetch, JwksBuilder};
