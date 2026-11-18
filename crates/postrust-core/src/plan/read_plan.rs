@@ -221,7 +221,9 @@ fn build_select_fields(items: &[SelectItem], table: &Table) -> Result<Vec<Coerci
                 } else {
                     table
                         .get_column(&field.name)
-                        .ok_or_else(|| Error::ColumnNotFound(field.name.clone()))?
+                        .ok_or_else(|| {
+                            Error::ColumnNotFound(format!("{}.{}", table.name, field.name))
+                        })?
                         .data_type
                         .clone()
                 };
@@ -276,6 +278,11 @@ pub fn resolve_top_level_range(request: &ApiRequest) -> Range {
             range.offset = from_params.offset;
         }
     }
+
+    // A range starts at the first row at the earliest: `?offset=-4` is read as
+    // `0` and reported as such (PostgREST's `RangeQuery` only ever builds
+    // `rangeGeq n` over non-negative integers, and 0 when asked for less).
+    range.offset = range.offset.max(0);
 
     if let Some(max_rows) = request.max_rows {
         range.limit = Some(match range.limit {

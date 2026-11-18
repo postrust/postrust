@@ -9,7 +9,7 @@ pub mod query_params;
 pub mod types;
 
 pub use preferences::parse_preferences;
-pub use query_params::{parse_query_params, value_is_filter};
+pub use query_params::{parse_query_params, parse_query_params_with, value_is_filter};
 pub use types::*;
 
 use crate::error::{Error, Result};
@@ -27,6 +27,21 @@ pub fn parse_request<B>(
     default_schema: &str,
     schemas: &[String],
     max_rows: Option<i64>,
+) -> Result<ApiRequest>
+where
+    B: AsRef<[u8]>,
+{
+    parse_request_with(req, default_schema, schemas, max_rows, false)
+}
+
+/// [`parse_request`], with `lenient_select` for compatibility mode: text left
+/// over after the last `select` item is dropped instead of refused.
+pub fn parse_request_with<B>(
+    req: &Request<B>,
+    default_schema: &str,
+    schemas: &[String],
+    max_rows: Option<i64>,
+    lenient_select: bool,
 ) -> Result<ApiRequest>
 where
     B: AsRef<[u8]>,
@@ -56,7 +71,7 @@ where
             ..
         }) | Action::RoutineInfo { .. }
     );
-    let query_params = parse_query_params(query, is_rpc)?;
+    let query_params = parse_query_params_with(query, is_rpc, lenient_select)?;
 
     // Parse preferences from Prefer header
     let preferences = parse_preferences(req.headers())?;
@@ -68,7 +83,13 @@ where
     let content_media_type = parse_content_type(req.headers())?;
 
     // Parse Range header
-    let top_level_range = parse_range(req.headers())?;
+    // Only GET honours the header (PostgREST ApiRequest.hs getRanges,
+    // RFC 9110: ignore Range for every other method).
+    let top_level_range = if method == http::Method::GET {
+        parse_range(req.headers())?
+    } else {
+        Range::default()
+    };
 
     // Extract headers and cookies for GUC passthrough
     let headers = extract_headers(req.headers());
@@ -474,6 +495,21 @@ mod tests {
             range_of("items=5-9").unwrap(),
             Range::from_bounds(5, Some(9))
         );
+    }
+
+    /// The header is for GET alone (RFC 9110; PostgREST getRanges).
+    #[test]
+    fn the_range_header_is_ignored_off_get() {
+        for method in ["POST", "PUT", "PATCH", "DELETE"] {
+            let request = http::Request::builder()
+                .method(method)
+                .uri("/items")
+                .header("Range", "9-5")
+                .body(Vec::<u8>::new())
+                .unwrap();
+            let parsed = parse_request(&request, "public", &["public".to_string()], None).unwrap();
+            assert_eq!(parsed.top_level_range, Range::default(), "{method}");
+        }
     }
 
     /// A range whose end precedes its start names no rows at all.

@@ -22,17 +22,17 @@ const surface: { what: string; server: string; worker: string }[] = [
 
 /** PostgREST's own suite, replayed against each candidate. */
 const conformance: { candidate: string; full: string; body: string; note: string }[] = [
-  { candidate: "Server (sqlx)", full: "1424 / 1499", body: "1451", note: "The reference figure" },
+  { candidate: "Server (sqlx)", full: "1486 / 1499", body: "1488", note: "The reference figure" },
   {
     candidate: "Server, REST through the Worker's driver",
-    full: "1423 / 1499",
-    body: "1450",
+    full: "1485 / 1499",
+    body: "1487",
     note: "Named prepared statements",
   },
   {
     candidate: "Cloudflare Worker in workerd",
-    full: "1422 / 1499",
-    body: "1449",
+    full: "1484 / 1499",
+    body: "1486",
     note: "Named prepared statements; a gzip'd empty preflight body",
   },
 ];

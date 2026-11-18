@@ -16,10 +16,18 @@ members = [
 # Not a member because every Dockerfile here copies `Cargo.toml` and `crates/`
 # and nothing else, and a member missing from the build context fails the whole
 # build. CI builds and lints it with `--manifest-path`.
-exclude = ["examples/custom-routes"]
+exclude = ["examples/custom-routes", "vendor/async-graphql-parser"]
+
+# A patched copy of async-graphql-parser 7.0.17, for one grammar line: it
+# rejected any enum value that merely *starts* with null, true or false (a
+# constraint named `nullPrefixTestTable_pkey`). See vendor/async-graphql-parser/
+# VENDORED.md for what changed and when to drop this. Only builds from this
+# workspace see it; a crate published to crates.io gets the upstream parser.
+[patch.crates-io]
+async-graphql-parser = { path = "vendor/async-graphql-parser" }
 
 [workspace.package]
-version = "3.3.0"
+version = "3.4.0"
 edition = "2021"
 # Verified, not assumed: 1.94.0 builds the workspace clean, and anything older
 # is refused outright -- sqlx 0.9 declares 1.94, and every crate here that
@@ -188,13 +196,13 @@ regex = "1"
 # wasm32) can leave it out; the ones that load a schema cache or decode rows ask
 # for `features = ["sqlx"]`. The crate's own default keeps sqlx on for anybody
 # depending on it from crates.io.
-postrust-core = { version = "3.3.0", path = "crates/postrust-core", default-features = false }
-postrust-sql = { version = "3.3.0", path = "crates/postrust-sql" }
-postrust-auth = { version = "3.3.0", path = "crates/postrust-auth" }
-postrust-response = { version = "3.3.0", path = "crates/postrust-response" }
-postrust-engine = { version = "3.3.0", path = "crates/postrust-engine" }
-postrust-graphql = { version = "3.3.0", path = "crates/postrust-graphql" }
-postrust-server = { version = "3.3.0", path = "crates/postrust-server" }
+postrust-core = { version = "3.4.0", path = "crates/postrust-core", default-features = false }
+postrust-sql = { version = "3.4.0", path = "crates/postrust-sql" }
+postrust-auth = { version = "3.4.0", path = "crates/postrust-auth" }
+postrust-response = { version = "3.4.0", path = "crates/postrust-response" }
+postrust-engine = { version = "3.4.0", path = "crates/postrust-engine" }
+postrust-graphql = { version = "3.4.0", path = "crates/postrust-graphql" }
+postrust-server = { version = "3.4.0", path = "crates/postrust-server" }
 
 [profile.release]
 lto = true

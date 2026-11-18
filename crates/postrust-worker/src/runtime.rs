@@ -228,6 +228,20 @@ async fn drain(mut body: worker::Body) {
 /// An `OPTIONS`: what the resource allows. `fetch` adds the CORS answer the
 /// server's layer would give.
 async fn preflight(state: &State, parts: http::request::Parts) -> Response<Bytes> {
+    // A CORS preflight -- an `OPTIONS` with an `Origin` and an
+    // `Access-Control-Request-Method` -- is answered by PostgREST's CORS
+    // middleware before the application sees it, so it carries no `Allow`
+    // and looks nothing up. Compatibility mode answers it the same way, as
+    // the server does (`options_allow`); `fetch` adds the CORS headers.
+    if state.config.compat_mode
+        && parts.headers.contains_key(http::header::ORIGIN)
+        && parts
+            .headers
+            .contains_key(http::header::ACCESS_CONTROL_REQUEST_METHOD)
+    {
+        state.db.connector().closed().await;
+        return Response::new(Bytes::new());
+    }
     let probe = http::Request::from_parts(parts, Bytes::new());
     let allowed = postrust_engine::allow(state, probe).await;
     state.db.connector().closed().await;

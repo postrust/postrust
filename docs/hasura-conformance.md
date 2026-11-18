@@ -8,19 +8,19 @@ says what the measurement covers and where the two servers disagree on purpose.
 
 ## Where it stands
 
-Run 78, over 468 replayed cases in 59 groups, against
+Run 79, over 468 replayed cases in 59 groups, against
 `hasura/graphql-engine:v2.50.1`:
 
 | Compared on | All (468) | Reads (271) | Writes (197) |
 |---|---|---|---|
 | HTTP status | 100.0% | 100.0% | 100.0% |
-| …and the same outcome | 99.6% | 99.6% | 99.5% |
-| …and the same data | **97.4%** | 95.9% | **99.5%** |
-| Whole body, wording included | 96.6% | 95.6% | 98.0% |
+| …and the same outcome | 99.8% | 99.6% | 100.0% |
+| …and the same data | **97.6%** | 95.9% | **100.0%** |
+| Whole body, wording included | 97.2% | 95.6% | 99.5% |
 
-Of the 456 cases the third level counts, 325 agree about data and 131 agree
-because both servers refuse. Twelve cases diverge there — two on the outcome,
-ten on the data — and at the strictest level sixteen do.
+Of the 457 cases the third level counts, 326 agree about data and 131 agree
+because both servers refuse. Eleven cases diverge there — one on the outcome,
+ten on the data — and at the strictest level thirteen do.
 
 Not one case differs on status.
 
@@ -132,8 +132,8 @@ specification order where Hasura sorts them. Every large introspection case
 needs at least one of those.
 
 **This one stays even if the library opens up**, and it is worth being plain
-about why, because ten of the sixteen remaining cases are here and closing
-them would take the measured figure from 96.6% to about 99.4%.
+about why, because ten of the thirteen remaining cases are here and closing
+them would take the measured figure from 97.2% to about 99.4%.
 
 The response could be rewritten on the way out — there is one place every
 GraphQL answer passes through. But matching Hasura means *removing*
@@ -156,19 +156,19 @@ falsely.
 surface. The live queries beside it are done; this is a second shape with its
 own cursor types.
 
-**An enum value beginning with `null`, `true` or `false`.** One line of
-async-graphql's grammar excludes any name that *starts with* one of the three
-literals, where the specification excludes only the tokens themselves. So an
-upsert naming a constraint called `nullPrefixTestTable_pkey` is answered with a
-parse error.
-
-A fix is written and tested against the rule directly —
-[`patches/async-graphql-parser-enum-value.patch`](../patches/async-graphql-parser-enum-value.patch)
-— and belongs upstream rather than here. The local alternative is rewriting the
-document text and restoring every name in the parsed tree, machinery that could
-corrupt a document that was valid to begin with. This is a real defect beyond
+**An enum value beginning with `null`, `true` or `false`** was a gap until
+3.4.0. One line of async-graphql's grammar excluded any name that *starts with*
+one of the three literals, where the specification excludes only the tokens
+themselves, so an upsert naming a constraint called `nullPrefixTestTable_pkey`
+was answered with a parse error. Builds from this repository now use a patched
+copy of the parser,
+[`vendor/async-graphql-parser`](../vendor/async-graphql-parser/VENDORED.md),
+checked in CI against the published crate and
+[`patches/async-graphql-parser-enum-value.patch`](../patches/async-graphql-parser-enum-value.patch).
+A crate installed from crates.io still gets the upstream parser, since Cargo
+does not publish a `[patch]`, so the fix belongs upstream. It matters beyond
 conformance: any schema with a constraint or enum member named `nullable_x` or
-`truestore` hits it.
+`truestore` hit it.
 
 **Generated descriptions** are this server's wording rather than Hasura's, and
 arguments come back in declaration order where Hasura sorts them. Nothing

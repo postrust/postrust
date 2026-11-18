@@ -107,6 +107,15 @@ pub enum CallParams {
 impl CallPlan {
     /// Create a call plan from an API request.
     pub fn from_request(request: &ApiRequest, routine: &Routine) -> Result<Self> {
+        // PostgREST Plan.hs failMaxAffectedRpcReturnsSingle: counting affected
+        // rows needs a set to count.
+        if request.preferences.max_affected.is_some()
+            && request.preferences.handling == crate::api_request::PreferHandling::Strict
+            && !routine.return_type.is_set_returning()
+        {
+            return Err(crate::error::Error::MaxAffectedRpcViolation);
+        }
+
         let qi = routine.qualified_identifier();
 
         let params = extract_call_params(request, routine)?;

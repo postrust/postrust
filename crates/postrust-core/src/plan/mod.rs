@@ -497,11 +497,19 @@ fn create_db_plan(
             // several signatures returning different things, and taking the
             // first would shape the result of one call by the columns of
             // another.
-            let read = schema_cache
-                .returned_table(routine)
-                .map(|table| ReadPlan::from_request(request, table, schema_cache))
-                .transpose()?
-                .map(ReadPlanTree::leaf);
+            //
+            // A function that declares its own columns -- `RETURNS TABLE`,
+            // `OUT` parameters -- has no table in the cache, but its columns
+            // are as well known as a table's: PostgREST shapes these results
+            // the same way, so `select`, filters and `order` apply to them
+            // too. A table stands in for it, made of those columns.
+            let read = match schema_cache.returned_table(routine) {
+                Some(table) => Some(ReadPlan::from_request(request, table, schema_cache)?),
+                None => routine_output_table(routine)
+                    .map(|table| ReadPlan::from_request(request, &table, schema_cache))
+                    .transpose()?,
+            }
+            .map(ReadPlanTree::leaf);
 
             Ok(DbActionPlan::Call {
                 call: call_plan,
@@ -514,6 +522,58 @@ fn create_db_plan(
             unreachable!("SchemaRead should be handled in create_action_plan")
         }
     }
+}
+
+/// The columns of a function that declares its own, as a table to read them
+/// through. `None` for a procedure, and for a function that declares none.
+fn routine_output_table(
+    routine: &crate::schema_cache::Routine,
+) -> Option<crate::schema_cache::Table> {
+    use crate::schema_cache::{Column, Table};
+
+    if routine.is_procedure || routine.output_columns.is_empty() {
+        return None;
+    }
+
+    let columns = routine
+        .output_columns
+        .iter()
+        .enumerate()
+        .map(|(index, (name, pg_type))| {
+            (
+                name.clone(),
+                Column {
+                    name: name.clone(),
+                    description: None,
+                    nullable: true,
+                    data_type: pg_type.clone(),
+                    nominal_type: pg_type.clone(),
+                    domain_type: None,
+                    max_len: None,
+                    default: None,
+                    enum_values: Vec::new(),
+                    is_pk: false,
+                    position: index as i32 + 1,
+                    always_generated: false,
+                },
+            )
+        })
+        .collect();
+
+    Some(Table {
+        schema: routine.schema.clone(),
+        name: routine.name.clone(),
+        description: None,
+        is_view: false,
+        is_partitioned: false,
+        insertable: false,
+        updatable: false,
+        deletable: false,
+        pk_cols: Vec::new(),
+        unique_constraints: Vec::new(),
+        columns,
+        computed_columns: Default::default(),
+    })
 }
 
 impl crate::api_request::PreferRepresentation {

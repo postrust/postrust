@@ -8,20 +8,24 @@ servers disagree on purpose.
 
 ## Where it stands
 
-Run 10, over 1499 replayed cases, against PostgREST v16.1:
+Run 15, over 1499 replayed cases, against PostgREST v16.1 (Postrust 3.4.0):
 
 | Compared on | All (1499) | Reads (1068) | Writes (431) |
 |---|---|---|---|
-| Status code | 98.6% | 98.5% | 98.8% |
-| Status and body | 96.7% | 96.3% | 97.9% |
-| …and headers, except `Content-Range` | 95.2% | 94.6% | 96.8% |
-| Full contract | **94.9%** | 94.5% | 96.1% |
+| Status code | 100.0% | 100.0% | 100.0% |
+| Status and body | 99.3% | 99.1% | 99.8% |
+| …and headers, except `Content-Range` | 99.1% | 98.9% | 99.8% |
+| Full contract | **99.1%** | 98.9% | 99.8% |
+
+That is 1486 of 1499 cases agreeing on everything compared. Of the 13 that do
+not, seven are [the OpenAPI document at `/`](#known-gaps) and six are cases the
+harness cannot score fairly: rows in an order no request asked for, one spec
+that needs a setting the harness does not apply, and one test PostgREST itself
+does not run.
 
 Measured on a binary the harness built itself and then verified at runtime.
-One case got no response at all — a socket fault that has not reproduced in
-440 attempts — and is counted as a failure, so the true figures are at or
-above these. See [`FINDINGS.md`](../scripts/conformance/FINDINGS.md) for the
-run history, including the runs whose numbers are not publishable and why.
+See [`FINDINGS.md`](../scripts/conformance/FINDINGS.md) for the run history,
+including the runs whose numbers are not publishable and why.
 
 ## How it is measured
 
@@ -54,9 +58,9 @@ on its other driver and in its other host (issue #50):
 
 | Candidate | Full contract | Status and body | What differs from the server |
 |---|---|---|---|
-| The server (sqlx) | 1424/1499 | 1451 | — |
-| The server, REST through the socket driver (`CONFORMANCE_EXTRA_FEATURES=pg-socket`) | 1423/1499 | 1450 | One case, below |
-| The Cloudflare Worker in workerd (`CONFORMANCE_WORKER_BUILD=...`) | 1422/1499 | 1449 | Two cases, below |
+| The server (sqlx) | 1486/1499 | 1488 | — |
+| The server, REST through the socket driver (`CONFORMANCE_EXTRA_FEATURES=pg-socket`) | 1485/1499 | 1487 | One case, below |
+| The Cloudflare Worker in workerd (`CONFORMANCE_WORKER_BUILD=...`, built with `compat-key-order`) | 1484/1499 | 1486 | Two cases, below |
 
 The socket driver answers the suite as sqlx does, except in
 `PreparedStatementsSpec`. That case asks `pg_prepared_statements` whether the
@@ -105,19 +109,29 @@ Some cases fail because PostgREST is wrong, or because neither answer is wrong.
 They are listed here so that nobody later "fixes" one without deciding to.
 [`FINDINGS.md`](../scripts/conformance/FINDINGS.md) carries the evidence.
 
-**PostgREST truncates a select at a stray `)`.** Probed against the reference
-directly, `/clients?select=id)ZZ,nameQQ` returns 200 and `nameQQ` never becomes
-a column. Everything after the paren is discarded silently. Postrust rejects
-it, because matching this means reintroducing a bug that was fixed on purpose —
-`select=id, name, billing(address)` used to return the id alone.
+**Default mode, by choice.** Six PostgREST behaviours are matched in
+compatibility mode and avoided by default:
+- a `select` cut short at a stray character and the rest discarded;
+- no `Allow` on a 405;
+- no `Allow` on a CORS preflight;
+- `application/json` as the type of an `application/vnd.pgrst.array+json`
+  response;
+- `42703` from PostgreSQL for an unknown `select` column;
+- a 406 for `GET /` with an `Accept` it cannot produce.
 
-**Two upsert status codes.** `POST` with an empty body and a `PUT` that
-replaced an existing row return `201` where PostgREST returns `200`. The
-evidence is one case each, against 58 that pass.
+The figures above measure compatibility mode, so these cost nothing in them.
+[PostgREST compatibility mode](compat-mode.md) lists them with what default
+mode does instead.
 
-**Unspecified row order.** Two cases return the same rows in a different order,
-and neither request specifies `order=`. SQL guarantees nothing there, so both
-answers are correct and the measurement is over-reporting.
+The first matters most. PostgREST answers
+`/clients?select=id)ZZ,nameQQ` with 200 and `nameQQ` never becomes a column.
+Postrust used to do the same: `select=id, name, billing(address)` returned the
+id alone. It was fixed on purpose, so default mode refuses.
+
+**Unspecified row order.** Four cases return the same rows in a different
+order. Three requests specify no `order=`, and in the fourth two rows tie on
+the column named. SQL guarantees nothing there, so both answers are correct
+and the measurement is over-reporting.
 
 **Clock skew on `nbf` and `iat`, and none on `exp`.** PostgREST checks all
 three to the second. Postrust allows thirty seconds on the two that describe a
@@ -126,15 +140,19 @@ token not yet valid, and none on the one that describes a token withdrawn. See
 
 ## Known gaps
 
-**The OpenAPI document at `/`.** PostgREST serves a 638 KB Swagger 2.0
-document there — 428 paths, 273 definitions, 1035 parameters. Postrust serves
+**The OpenAPI document at `/`** (7 cases). PostgREST serves a 638 KB Swagger 2.0
+document there: 428 paths, 273 definitions, 1035 parameters. Postrust serves
 OpenAPI 3.0 for its own surface under `/admin` (behind the `admin-ui` feature)
 and does not yet generate PostgREST's. Bodies compare as exact JSON, so this is
-all-or-nothing rather than something to land incrementally.
+all-or-nothing rather than something to land incrementally. `HEAD /` waits for
+it too, since its `Content-Type` names the document.
 
-**Parser error detail.** `?or=()` and some JSON-path failures answer generically
-where PostgREST names the offending character and what would have been
-accepted. The logic tree matches exactly; the select parser does not yet.
+**`url-use-legacy-target-names = false`** (1 case). The setting is not read,
+and a filter on `visits.` also reaches an embed aliased from `visits`.
+
+**Parser error detail.** A logic tree and a JSON operand in `select` report the
+offending character and what would have been accepted, as PostgREST does.
+Other `select` errors still answer generically.
 
 **Not every config knob.** `Prefer: tx=rollback` in particular is not
 implemented, and is no longer reported as applied.

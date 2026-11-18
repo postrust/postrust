@@ -211,6 +211,20 @@ impl SchemaCache {
         // why the pass is here and not with the first one.
         let view_keys = view_primary_keys(&primary_keys, &view_columns);
         add_junction_relationships(&view_keys, &mut relationships);
+        dedupe_relationships(&mut relationships);
+
+        // A view has no key of its own in `pg_index`; it has the one it
+        // inherits, and everything that asks a table for its key -- the
+        // `Location` of a created row, whether PUT is allowed, an upsert --
+        // should find it there.
+        for (view, key) in &view_keys {
+            if let Some(table) = tables.get_mut(view).filter(|table| table.is_view) {
+                for column in table.columns.values_mut() {
+                    column.is_pk = key.contains(&column.name);
+                }
+                table.pk_cols = key.clone();
+            }
+        }
 
         let media_handlers = queries::load_media_handlers(&mut tx, schemas).await?;
         info!("Loaded {} media type handlers", media_handlers.len());
@@ -252,30 +266,39 @@ impl SchemaCache {
     /// Below it the "suggestion" would be noise, and would also say more about
     /// the schema than the client asked.
     fn similar_table(&self, qi: &QualifiedIdentifier) -> Option<String> {
-        const MIN_SIMILARITY: f64 = 0.5;
+        // PostgREST's tableNotFoundHint asks fuzzyset for the nearest name
+        // with a minimum score of 0.75 (Error.hs, getFuzzyHint HintTable).
+        const MIN_RATIO: f64 = 0.75;
+        // The 3-gram prefilter, kept from before: it rules out names that
+        // share no runs of letters with the one asked for.
+        const MIN_GRAM_SIMILARITY: f64 = 0.5;
 
-        // Scored by shared character n-grams rather than by edit distance.
-        // A Levenshtein ratio cannot tell `items` from `items3` as the table
-        // `itemsx` was meant to be -- both are one edit away, so both score
-        // 0.833 and the winner is whichever the map happened to yield last.
-        // Counting 3-grams separates them, because it notices that one
-        // candidate is the query's own length and the other is not: `items`
-        // scores 0.73 against `itemsx` and `items3` scores 0.67.
+        // Candidates must clear both bars. Of those, the Levenshtein ratio
+        // decides; a tie there (`itemsx` is one edit from both `items` and
+        // `items3`) goes to the 3-gram cosine, which notices that `items` is
+        // the query's own length and `items3` is not.
         let asked = grams(&qi.name, 3);
 
         self.tables
             .keys()
             .filter(|candidate| candidate.schema == qi.schema)
-            .map(|candidate| (cosine(&asked, &grams(&candidate.name, 3)), candidate))
-            .filter(|(score, _)| *score >= MIN_SIMILARITY)
+            .map(|candidate| {
+                (
+                    similarity(&candidate.name, &qi.name),
+                    cosine(&asked, &grams(&candidate.name, 3)),
+                    candidate,
+                )
+            })
+            .filter(|(ratio, gram, _)| *ratio >= MIN_RATIO && *gram >= MIN_GRAM_SIMILARITY)
             // Ties go to the shorter name, and then to the earlier one, so
             // that the suggestion does not depend on iteration order.
-            .max_by(|(a, left), (b, right)| {
-                a.total_cmp(b)
+            .max_by(|(ra, a, left), (rb, b, right)| {
+                ra.total_cmp(rb)
+                    .then_with(|| a.total_cmp(b))
                     .then_with(|| right.name.len().cmp(&left.name.len()))
                     .then_with(|| right.name.cmp(&left.name))
             })
-            .map(|(_, candidate)| candidate.to_string())
+            .map(|(_, _, candidate)| candidate.to_string())
     }
 
     /// Get relationships for a table.
@@ -383,6 +406,9 @@ impl SchemaCache {
         };
 
         match named(media_type) {
+            // A handler for `*/*` produces bytes of no stated type, which is
+            // reported as `application/octet-stream`, never as the wildcard.
+            Some(handler) if media_type == "*/*" => Some((handler, "application/octet-stream")),
             Some(handler) => Some((handler, media_type)),
             // `*/*` is declared on a table, so it is a table lookup too.
             None if default_select => {
@@ -1093,55 +1119,100 @@ fn rename_cardinality(
     }
 }
 
-/// The key a view inherits from the table it selects from.
+/// The key a view inherits from the tables it selects from.
 ///
 /// A view over a junction is a junction: `main_jobs` selects the columns of
 /// `jobs` that make it one, and PostgREST embeds `sites` through it and
 /// through `jobs` alike -- reporting both as candidates when the two cannot be
-/// told apart. A view has no key of its own, so the base table's is mapped
+/// told apart. A view has no key of its own, so each base table's is mapped
 /// through the names the view gives those columns.
 ///
-/// Only where the view exposes every one of them: a key missing a column is
-/// not that key, and a junction is exactly the relation whose key *is* the
-/// pairing.
+/// PostgREST's `addViewPrimaryKeys`: for every base table's key column, the
+/// first view column that selects it, and the keys of all the base tables
+/// concatenated -- `select * from with_pk1, with_pk2` is keyed on both. A key
+/// column the view does not select is simply left out. The bases come in the
+/// order the view first uses them.
 fn view_primary_keys(
     primary_keys: &std::collections::HashMap<QualifiedIdentifier, Vec<String>>,
     view_columns: &[queries::ViewColumn],
 ) -> std::collections::HashMap<QualifiedIdentifier, Vec<String>> {
     use std::collections::HashMap;
 
-    // view -> base table -> base column -> the name the view gives it
+    let mut ordered: Vec<&queries::ViewColumn> = view_columns.iter().collect();
+    ordered.sort_by_key(|column| column.view_ordinal);
+
+    // view -> bases in order of first use, each with base column -> view column
+    #[allow(clippy::type_complexity)]
     let mut by_view: HashMap<
         &QualifiedIdentifier,
-        HashMap<&QualifiedIdentifier, HashMap<&str, &str>>,
+        Vec<(&QualifiedIdentifier, HashMap<&str, &str>)>,
     > = HashMap::new();
-    for column in view_columns {
-        by_view
-            .entry(&column.view)
-            .or_default()
-            .entry(&column.base)
-            .or_default()
+    for column in ordered {
+        let bases = by_view.entry(&column.view).or_default();
+        let position = match bases.iter().position(|(base, _)| *base == &column.base) {
+            Some(position) => position,
+            None => {
+                bases.push((&column.base, HashMap::new()));
+                bases.len() - 1
+            }
+        };
+        bases[position]
+            .1
             .entry(column.base_column.as_str())
             .or_insert(column.view_column.as_str());
     }
 
     let mut keys = HashMap::new();
     for (view, bases) in by_view {
+        let mut key: Vec<String> = Vec::new();
         for (base, columns) in bases {
-            let Some(key) = primary_keys.get(base).filter(|key| !key.is_empty()) else {
+            let Some(base_key) = primary_keys.get(base) else {
                 continue;
             };
-            let mapped: Option<Vec<String>> = key
-                .iter()
-                .map(|column| columns.get(column.as_str()).map(|name| name.to_string()))
-                .collect();
-            if let Some(mapped) = mapped {
-                keys.insert(view.clone(), mapped);
+            for column in base_key {
+                if let Some(name) = columns.get(column.as_str()) {
+                    if !key.iter().any(|existing| existing == name) {
+                        key.push(name.to_string());
+                    }
+                }
             }
+        }
+        if !key.is_empty() {
+            keys.insert(view.clone(), key);
         }
     }
 
     keys
+}
+
+/// Drop a relationship derived twice.
+///
+/// The same many-to-many through a view over an unexposed junction is found by
+/// the first junction pass (then substituted onto the view) and again by the
+/// second, once the view has a key. Left alone, the two read as two
+/// candidates and a plain embed answers 300. Two relationships are the same
+/// when they join the same tables through the same junction, by the same
+/// constraints, over the same columns; the junction is part of that, because
+/// `jobs` and `main_jobs` are rightly two ways to the same table.
+fn dedupe_relationships(relationships: &mut RelationshipsMap) {
+    for rels in relationships.values_mut() {
+        let mut seen = std::collections::HashSet::new();
+        rels.retain(|rel| match rel {
+            Relationship::ForeignKey {
+                foreign_table,
+                cardinality: Cardinality::M2M(junction),
+                ..
+            } => seen.insert((
+                foreign_table.clone(),
+                junction.table.clone(),
+                junction.constraint1.clone(),
+                junction.constraint2.clone(),
+                junction.source_columns.clone(),
+                junction.target_columns.clone(),
+            )),
+            _ => true,
+        });
+    }
 }
 
 /// Derive many-to-many relationships from junction tables.
@@ -1297,5 +1368,119 @@ impl SchemaCacheRef {
 impl Default for SchemaCacheRef {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod key_and_hint_tests {
+    use super::*;
+    use crate::schema_cache::{Cardinality, Junction, Relationship};
+
+    fn qi(name: &str) -> QualifiedIdentifier {
+        QualifiedIdentifier::new("api", name)
+    }
+
+    fn table(name: &str) -> Table {
+        Table {
+            schema: "api".into(),
+            name: name.into(),
+            description: None,
+            is_view: false,
+            is_partitioned: false,
+            insertable: true,
+            updatable: true,
+            deletable: true,
+            pk_cols: Vec::new(),
+            unique_constraints: Vec::new(),
+            columns: Default::default(),
+            computed_columns: Default::default(),
+        }
+    }
+
+    fn cache(names: &[&str]) -> SchemaCache {
+        SchemaCache {
+            tables: names.iter().map(|n| (qi(n), table(n))).collect(),
+            relationships: Default::default(),
+            routines: Default::default(),
+            timezones: Default::default(),
+            pg_version: 160000,
+            media_handlers: Default::default(),
+            representations: Default::default(),
+        }
+    }
+
+    #[test]
+    fn a_table_hint_needs_a_levenshtein_ratio_of_three_quarters() {
+        let cache = cache(&["items", "items3", "car_model_sales", "car_models"]);
+        // One edit in six: close enough, and the nearer of two ties wins.
+        assert_eq!(
+            cache.similar_table(&qi("itemsx")).as_deref(),
+            Some("api.items")
+        );
+        // A partition's name is seven characters past its parent: 15/22.
+        assert_eq!(cache.similar_table(&qi("car_model_sales_202101")), None);
+        assert_eq!(cache.similar_table(&qi("car_models_default")), None);
+    }
+
+    fn view_column(
+        view: &str,
+        base: &str,
+        base_column: &str,
+        name: &str,
+        at: i32,
+    ) -> queries::ViewColumn {
+        queries::ViewColumn {
+            view: qi(view),
+            base: qi(base),
+            base_column: base_column.into(),
+            view_column: name.into(),
+            view_ordinal: at,
+        }
+    }
+
+    #[test]
+    fn a_view_key_concatenates_the_keys_of_its_bases() {
+        let keys: std::collections::HashMap<_, _> = [
+            (qi("with_pk1"), vec!["pk1".to_string()]),
+            (qi("with_pk2"), vec!["pk2".to_string()]),
+        ]
+        .into();
+        // `select * from with_pk1, with_pk2`, plus a second reference to pk1.
+        let columns = vec![
+            view_column("v", "with_pk2", "pk2", "pk2", 2),
+            view_column("v", "with_pk1", "pk1", "pk1", 1),
+            view_column("v", "with_pk1", "pk1", "again", 3),
+        ];
+        let view_keys = view_primary_keys(&keys, &columns);
+        assert_eq!(view_keys[&qi("v")], ["pk1", "pk2"]);
+    }
+
+    fn m2m(foreign: &str, junction: &str) -> Relationship {
+        Relationship::ForeignKey {
+            table: qi("a"),
+            foreign_table: qi(foreign),
+            is_self: false,
+            cardinality: Cardinality::M2M(Junction {
+                table: qi(junction),
+                constraint1: "c1".into(),
+                constraint2: "c2".into(),
+                source_columns: vec![("id".into(), "a_id".into())],
+                target_columns: vec![("b_id".into(), "id".into())],
+            }),
+            table_is_view: false,
+            foreign_table_is_view: false,
+            constraint_name: String::new(),
+        }
+    }
+
+    #[test]
+    fn a_many_to_many_derived_twice_is_one_but_two_junctions_are_two() {
+        let mut map = RelationshipsMap::new();
+        map.insert(
+            (qi("a"), "api".into()),
+            vec![m2m("b", "jobs"), m2m("b", "jobs"), m2m("b", "main_jobs")],
+        );
+        dedupe_relationships(&mut map);
+        assert_eq!(map[&(qi("a"), "api".to_string())].len(), 2);
     }
 }

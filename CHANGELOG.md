@@ -3,6 +3,113 @@
 Notable changes, newest first. This file starts at 1.0.0-alpha.1; earlier
 releases are described by their tags and the pull requests behind them.
 
+## 3.4.0
+
+PostgREST conformance goes from 1414 to 1486 of 1499 cases on the full
+contract, with every status code in agreement, and Hasura's from 454 to 455 of
+468. Most of the difference was bugs, fixed in both modes: embeds through
+junctions and views, headers PostgreSQL's answer did not reach, representations
+and casts inside embeds, upsert statuses on views and partitions. The rest is
+PostgREST behaviour that compatibility mode now matches and default mode keeps
+away from on purpose; [PostgREST compatibility mode](docs/compat-mode.md) lists
+each one. Released beside it: `postrust-worker` 1.4.0.
+
+### Upgrading
+
+These change answers outside compatibility mode. Each is a fix, but a client
+can depend on a wrong answer:
+
+- **A view inherits the primary key of the table it selects from.** A `POST` to
+  such a view answers with `Location`, `OPTIONS` offers `PUT`, and an upsert
+  through it can infer its conflict target.
+- **A function that declares its own columns (`RETURNS TABLE`, `OUT`
+  parameters) honours `select`, filters and `order`.** They were ignored, so
+  `?select=` on such a function returned every column.
+- **The `Range` header is read for `GET` only**, as PostgREST reads it. Sent
+  with a write, it used to cut down the rows the write returned, so a `PUT`
+  with `Range: 1-1` answered `PGRST115`.
+- **An upsert that created no row is 200 on views and partitioned tables**, as
+  it already was on tables. It was 201.
+- **`PGRST204` for an unknown `select` column names the table**:
+  `Column not found: todos.banana`.
+
+### Added
+
+- **`PGRST128`.** `Prefer: handling=strict, max-affected=N` on a function that
+  does not return a set is refused with 400, as PostgREST refuses it, where it
+  ran.
+- **Compatibility mode matches six more PostgREST answers**, none of which
+  changes default mode:
+  - text after the last item of `select` is dropped, where default mode
+    refuses it with `PGRST100`;
+  - an unknown `select` column is PostgreSQL's `42703`;
+  - a 405 and a CORS preflight carry no `Allow`;
+  - an `application/vnd.pgrst.array+json` response is typed `application/json`
+    unless `nulls=stripped` was asked for;
+  - `GET /` refuses an `Accept` it cannot produce with 406 `PGRST107`.
+
+### Fixed
+
+Embedding:
+
+- A many-to-many embed whose child shares a column name with the junction
+  table (`name`, `user_id`) failed with `42702`, in `select`, filters and
+  `order` alike. The junction is now out of scope of the child's columns.
+- A many-to-many through a view over a junction in an unexposed schema was
+  derived twice, so a plain embed was refused as ambiguous (300 `PGRST201`)
+  between a relationship and itself.
+- A junction keyed on several columns failed with `column src.task_id does not
+  exist` when the parent's `select` left a key column out.
+- Foreign keys a partition inherits from its parent are ignored, as PostgREST
+  ignores them, and a request for a table not in the schema cache answers 404
+  `PGRST205` before its embeds are looked at.
+- The "Perhaps you meant the table" hint needs a close match (Levenshtein
+  ratio 0.75, PostgREST's threshold), so a partition no longer suggests its
+  parent.
+- `projects(count)` counts the embedded rows. `count` worked at the top level
+  only; a real column named `count` still wins.
+- Filters on an embed nested inside an embed (`child.grandchild=is.null`) were
+  refused with `PGRST204`.
+- An embed's `order` dropped a JSON path, and its filters and its `*` skipped
+  the columns' data representations.
+
+Headers and media types:
+
+- A write counted with `Prefer: count=exact` reports its affected rows as the
+  total in `Content-Range` (`*/1`, `0-2/3`), where it said `*/*`.
+- A 416 carries `Content-Range: */<total>` and `Preference-Applied`.
+- A negative `offset` is read as 0 rather than echoed in `Content-Range`.
+- A `Content-Type` set by a media handler or a function replaces the server's
+  own instead of being sent beside it, and a handler's `response.headers` and
+  `response.status` are read.
+- A `*/*` handler is reported as `application/octet-stream`, not `*/*`.
+- `Accept: text/unknowntype, text/csv` is answered with CSV: the response uses
+  the type that was negotiated, not the first one listed.
+- `Preference-Applied` reports `resolution` only when the insert had a key or
+  `on_conflict` to resolve on.
+- `Accept: application/openapi+json` off the root is 406 `PGRST107`; only `/`
+  produces it.
+
+Reads and writes:
+
+- A cast to an array type (`col::_int4`) returned null.
+- `like` and `ilike` operands are untyped, as PostgREST sends them, so a
+  column's data representation no longer rewrites a pattern.
+- A malformed JSON operand in `select` (`data->>--34`) is reported with its
+  column and what was expected.
+- A column whose domain declares a default uses it for `missing=default`.
+- An empty `application/x-www-form-urlencoded` body is `{}`, a row of defaults,
+  where it was refused with `PGRST102`.
+
+GraphQL:
+
+- An enum value or constraint name that only begins with `null`, `true` or
+  `false`, such as `nullPrefixTestTable_pkey`, failed to parse. Builds from
+  this repository use a patched copy of `async-graphql-parser` 7.0.17 under
+  `vendor/`, checked in CI against the published crate and the patch. A crate
+  installed from crates.io gets the upstream parser until the fix is released
+  there.
+
 ## 3.3.0
 
 Error handling for an API that replaces another (#76): a missing grant is a

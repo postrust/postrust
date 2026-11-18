@@ -178,12 +178,10 @@ async fn every_write_to_a_join_view_is_a_405_with_allow() {
             Some("OPTIONS,GET,HEAD"),
             "{method}"
         );
-        // A PUT is refused before it gets that far: the view has no primary
-        // key for its filters to name. Still a 405, with the same `Allow`.
-        let expected = match method {
-            "PUT" => "PGRST105",
-            _ => "PGRST117",
-        };
+        // The view selects `projects.id`, so it inherits that key and a PUT
+        // is no longer refused for want of one: the database refuses it, like
+        // the others. Still a 405, with the same `Allow`.
+        let expected = "PGRST117";
         assert!(answer.body.contains(expected), "{method}: {}", answer.body);
     }
     assert_eq!(

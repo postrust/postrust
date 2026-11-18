@@ -30,9 +30,9 @@ export interface Group {
 export const hasuraConformanceMeta = {
   hasura: "v2.50.1",
   features: "admin-ui,compat-key-order",
-  referenceReused: false,
-  commit: "98ec7a12560eb0c35b55ad9b0d85bb95be99bbb3",
-  measured: "2026-10-11",
+  referenceReused: true,
+  commit: "1bb4dce2eb7fdd2e1dcc1938bfa585f014a35d9d",
+  measured: "2026-11-18",
   cases: 468,
   groups: 59,
 } as const;
@@ -45,16 +45,16 @@ export const hasuraConformance: Record<"all" | "reads" | "writes", Group> = {
       pct: 100,
     },
     sameOutcome: {
-      passed: 466,
-      pct: 99.6,
+      passed: 467,
+      pct: 99.8,
     },
     sameData: {
-      passed: 456,
-      pct: 97.4,
+      passed: 457,
+      pct: 97.6,
     },
     fullBody: {
-      passed: 454,
-      pct: 97,
+      passed: 455,
+      pct: 97.2,
     },
   },
   reads: {
@@ -83,23 +83,23 @@ export const hasuraConformance: Record<"all" | "reads" | "writes", Group> = {
       pct: 100,
     },
     sameOutcome: {
-      passed: 196,
-      pct: 99.5,
+      passed: 197,
+      pct: 100,
     },
     sameData: {
-      passed: 196,
-      pct: 99.5,
+      passed: 197,
+      pct: 100,
     },
     fullBody: {
-      passed: 195,
-      pct: 99,
+      passed: 196,
+      pct: 99.5,
     },
   },
 };
 
 /** How the "same data" level divides: agreeing rows, and mutual refusals. */
 export const hasuraAgreement = {
-  sameData: 325,
+  sameData: 326,
   bothRefuse: 131,
 };
 

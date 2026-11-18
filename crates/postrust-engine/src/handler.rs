@@ -7,7 +7,8 @@ use http::{Response, StatusCode};
 use http_body_util::BodyExt;
 use postrust_core::db::{Db, Tx};
 use postrust_core::{
-    create_action_plan, parse_request, ActionPlan, ApiRequest, CallPlan, DbActionPlan,
+    create_action_plan, parse_request, parse_request_with, ActionPlan, ApiRequest, CallPlan,
+    DbActionPlan,
 };
 use postrust_response::{format_response, QueryResult, Response as PgrstResponse};
 use tracing::{debug, debug_span, error, field::Empty, Instrument};
@@ -69,7 +70,9 @@ where
             // the answer an OPTIONS on the same resource gives -- whichever
             // refusal it was: a function called with the wrong method, a PUT
             // with filters it cannot take, a view that cannot be written.
-            if response.status() == StatusCode::METHOD_NOT_ALLOWED {
+            //
+            // PostgREST sends none, so in compatibility mode neither do we.
+            if response.status() == StatusCode::METHOD_NOT_ALLOWED && !state.config().compat_mode {
                 let mut probe = http::Request::builder()
                     .method(http::Method::OPTIONS)
                     .uri(uri);
@@ -162,11 +165,12 @@ where
         .map_err(|e| postrust_core::Error::Internal(e.to_string()))?;
 
     // Parse API request
-    let mut api_request = parse_request(
+    let mut api_request = parse_request_with(
         &http_request,
         state.default_schema(),
         state.schemas(),
         state.config().db_max_rows,
+        state.config().compat_mode,
     )?;
     // For the database's `request.trace_id`. The host put the context in the
     // extensions; `parse_request` saw a request rebuilt without them.
@@ -176,7 +180,12 @@ where
         .map(|context| context.trace_id);
 
     // Parse payload
-    if !body_bytes.is_empty() {
+    if !body_bytes.is_empty()
+        || matches!(
+            api_request.content_media_type,
+            postrust_core::api_request::MediaType::UrlEncoded
+        )
+    {
         let payload = postrust_core::api_request::payload::parse_payload(
             body_bytes,
             &api_request.content_media_type,
@@ -228,7 +237,26 @@ where
     }
 
     // Create execution plan
-    let plan = debug_span!("plan").in_scope(|| create_action_plan(&api_request, &schema_cache))?;
+    let compat_mode = state.config().compat_mode;
+    let plan = debug_span!("plan")
+        .in_scope(|| create_action_plan(&api_request, &schema_cache))
+        .map_err(|error| match error {
+            // PostgREST has no schema-cache check for a `select` column: the
+            // name goes into the statement, and the database's own error comes
+            // back -- `42703`, naming the table it looked in.
+            postrust_core::Error::ColumnNotFound(column) if compat_mode && column.contains('.') => {
+                postrust_core::Error::Database(postrust_core::error::DatabaseError {
+                    code: "42703".to_string(),
+                    message: format!("column {column} does not exist"),
+                    details: None,
+                    hint: None,
+                    constraint: None,
+                    table: None,
+                    column: None,
+                })
+            }
+            other => other,
+        })?;
 
     // Released before the query runs, not held through it. tokio's `RwLock`
     // queues a reader behind any writer already waiting, so a schema reload
@@ -270,6 +298,34 @@ where
         }
         tx => tx,
     };
+
+    // An offset past the end: the error's body and status, on a response that
+    // keeps what the read would have said about the window and the count --
+    // `Content-Range` and `Preference-Applied`, and nothing else. Set, not
+    // appended, so that no header can appear twice.
+    if let Some(message) = result.unsatisfiable.clone() {
+        let authenticated = state.config().is_authenticated_role(&auth_result.role);
+        let mut response = error_response_as(
+            state.config(),
+            postrust_core::Error::InvalidRange(message),
+            authenticated,
+        );
+        // PostgREST's 416 is a normal response, whose type names its charset.
+        response.headers_mut().insert(
+            http::header::CONTENT_TYPE,
+            http::HeaderValue::from_static("application/json; charset=utf-8"),
+        );
+        if let Ok(carried) = format_response(&api_request, &result) {
+            for name in ["content-range", "preference-applied"] {
+                if let Some(value) = carried.headers.get(name) {
+                    response
+                        .headers_mut()
+                        .insert(http::header::HeaderName::from_static(name), value.clone());
+                }
+            }
+        }
+        return Ok(response);
+    }
 
     // Format response
     // A singular response the result cannot satisfy is the client's business,
@@ -715,6 +771,29 @@ async fn execute_plan<'s, S: State>(
                         .join(", "),
                 ));
             }
+
+            // The type the response will be rendered as: the first of the
+            // accepted types something here renders. Decided once, here, and
+            // handed to the response -- a list led by a type nothing renders
+            // (`text/unknowntype, text/csv`) is answered as the CSV the check
+            // above found, not as whatever happened to come first.
+            let negotiated_media = api_request
+                .accept_media_types
+                .iter()
+                .find(|media| renders_without_a_handler(media))
+                .cloned();
+
+            // `Prefer: resolution` is reported only for an insert that has
+            // something to conflict on: the table's primary key, or the
+            // columns `?on_conflict=` named. Without either the preference was
+            // ignored and is not claimed (PostgREST's `responsePreferences`).
+            let resolution_applies = match db_plan {
+                DbActionPlan::MutateRead {
+                    mutate: postrust_core::plan::MutatePlan::Insert { pk_cols, .. },
+                    ..
+                } => !pk_cols.is_empty() || api_request.query_params.on_conflict.is_some(),
+                _ => false,
+            };
 
             // Carry the parent's whole row out of the inner query when a
             // computed relationship needs it as an argument. It has to be
@@ -1323,11 +1402,23 @@ async fn execute_plan<'s, S: State>(
                     total,
                 );
 
+                // What the handler (or the function) set for the response:
+                // PostgREST reads the settings after every statement, and a
+                // handler is exactly where a `Content-Type` of its own is
+                // chosen. One more statement on the same transaction, and
+                // only on this path -- a handler is the one thing that can
+                // set them here.
+                let settings = tx.fetch_values(RESPONSE_SETTINGS, &[]).await?;
+                let (guc_headers, guc_status) = response_overrides(settings)?;
+
                 return Ok((
                     QueryResult {
-                        status: StatusCode::OK,
+                        status: guc_status.unwrap_or(StatusCode::OK),
                         raw_body: Some((media_type, body)),
                         content_range: Some(content_range),
+                        guc_headers,
+                        resolution_applies,
+                        compat_mode: state.config().compat_mode,
                         ..QueryResult::default()
                     },
                     Some(tx),
@@ -1420,55 +1511,9 @@ async fn execute_plan<'s, S: State>(
                                 ))
                             }
                         };
-                        let row = first_row(settings)?;
-                        // Empty is absent. Once any transaction on this
-                        // connection has defined a custom setting, PostgreSQL
-                        // keeps the name for the rest of the session and
-                        // reports it as `''` rather than null -- so a request
-                        // that set nothing would otherwise inherit "the empty
-                        // headers" from whichever request last set some.
-                        let setting = |index: usize| {
-                            row.get(index)
-                                .and_then(serde_json::Value::as_str)
-                                .filter(|value| !value.trim().is_empty())
-                                .map(str::to_string)
-                        };
-                        (setting(0), setting(1))
+                        response_overrides(settings)?
                     }
                 };
-
-            // Both are the function's own words, so both are checked before
-            // they reach the response: a malformed one is a fault in the
-            // schema, and saying so is more use than a header the client
-            // cannot see or a status it cannot explain.
-            //
-            // That includes each name and value being one HTTP can carry. The
-            // response is only built after the commit, and a header it cannot
-            // hold -- a newline in a value, a space in a name -- failed there,
-            // where it was too late to undo the function's writes.
-            if let Some(headers) = &guc_headers {
-                let sendable =
-                    postrust_response::parse_guc_headers(headers).is_some_and(|headers| {
-                        headers.iter().all(|(name, value)| {
-                            http::HeaderName::try_from(name.as_str()).is_ok()
-                                && http::HeaderValue::try_from(value.as_str()).is_ok()
-                        })
-                    });
-                if !sendable {
-                    return Err(postrust_core::Error::InvalidGucHeaders);
-                }
-            }
-            let guc_status = match guc_status {
-                None => None,
-                Some(status) => Some(
-                    status
-                        .trim()
-                        .parse::<u16>()
-                        .ok()
-                        .and_then(|code| StatusCode::from_u16(code).ok())
-                        .ok_or(postrust_core::Error::InvalidGucStatus)?,
-                ),
-            };
 
             // The count runs on the same transaction and so under the same
             // snapshot as the page it describes.
@@ -1627,6 +1672,22 @@ async fn execute_plan<'s, S: State>(
             // having named the row itself. PostgREST draws exactly these
             // lines, and a client reading the header expects them.
             use postrust_core::api_request::Mutation;
+            //
+            // The total a write reports is how many rows it affected, when the
+            // caller asked for a count at all: `exact` and `estimated` do
+            // (PostgREST's `shouldCount`), `planned` does not. It is never
+            // counted by a second statement -- the write's own rows are the
+            // answer.
+            let total = match (mutation_kind(api_request), &api_request.preferences.count) {
+                (
+                    Some(_),
+                    Some(
+                        postrust_core::api_request::PreferCount::Exact
+                        | postrust_core::api_request::PreferCount::Estimated,
+                    ),
+                ) => Some(affected as i64),
+                _ => total,
+            };
             let content_range = match mutation_kind(api_request) {
                 Some(Mutation::SingleUpsert) => None,
                 Some(Mutation::Create) | Some(Mutation::Delete) => {
@@ -1654,11 +1715,25 @@ async fn execute_plan<'s, S: State>(
                 .is_some_and(|range| range.status() == StatusCode::RANGE_NOT_SATISFIABLE)
                 && mutation_kind(api_request).is_none()
             {
-                return Err(postrust_core::Error::InvalidRange(format!(
-                    "An offset of {} was requested, but there are only {} rows.",
-                    offset,
-                    total.unwrap_or(0)
-                )));
+                // Answered as a response, not as an error: PostgREST builds the
+                // 416 like any other read, so it carries the `Content-Range`
+                // (`*/total`) and the `Preference-Applied` of the count that
+                // found the offset out of bounds. The caller swaps in the
+                // error body.
+                return Ok((
+                    QueryResult {
+                        status: StatusCode::RANGE_NOT_SATISFIABLE,
+                        omit_body: true,
+                        content_range,
+                        unsatisfiable: Some(format!(
+                            "An offset of {} was requested, but there are only {} rows.",
+                            offset,
+                            total.unwrap_or(0)
+                        )),
+                        ..Default::default()
+                    },
+                    tx,
+                ));
             }
 
             let result = QueryResult {
@@ -1667,15 +1742,19 @@ async fn execute_plan<'s, S: State>(
                 status: match (guc_status, returns_void) {
                     (Some(status), _) => status,
                     (None, true) => StatusCode::NO_CONTENT,
-                    (None, false) => {
-                        mutation_status(db_plan, api_request, created_a_row, reports_inserted)
-                            .unwrap_or_else(|| {
-                                content_range
-                                    .as_ref()
-                                    .map(postrust_response::ContentRange::status)
-                                    .unwrap_or(StatusCode::OK)
-                            })
-                    }
+                    (None, false) => mutation_status(
+                        db_plan,
+                        api_request,
+                        created_a_row,
+                        reports_inserted,
+                        affected == 0,
+                    )
+                    .unwrap_or_else(|| {
+                        content_range
+                            .as_ref()
+                            .map(postrust_response::ContentRange::status)
+                            .unwrap_or(StatusCode::OK)
+                    }),
                 },
                 rows,
                 singular,
@@ -1685,6 +1764,9 @@ async fn execute_plan<'s, S: State>(
                 content_range,
                 guc_headers,
                 raw_body: geojson_body,
+                media_type: negotiated_media,
+                resolution_applies,
+                compat_mode: state.config().compat_mode,
                 ..Default::default()
             };
             // Committed by the caller, once the response is known to be one
@@ -1697,6 +1779,35 @@ async fn execute_plan<'s, S: State>(
             // Return appropriate metadata based on the info type
             let response_data = match info_plan {
                 InfoPlan::OpenApiSpec => {
+                    // PostgREST's `inspectPlan` produces the document as
+                    // OpenAPI, JSON or anything, and refuses the rest. The
+                    // default-mode directory answers whatever is asked, so
+                    // this is compatibility mode only.
+                    use postrust_core::api_request::MediaType;
+                    if state.config().compat_mode
+                        && matches!(
+                            api_request.action,
+                            postrust_core::api_request::Action::Db(
+                                postrust_core::api_request::DbAction::SchemaRead { .. }
+                            )
+                        )
+                        && !api_request.accept_media_types.is_empty()
+                        && !api_request.accept_media_types.iter().any(|media| {
+                            matches!(
+                                media,
+                                MediaType::OpenApi | MediaType::ApplicationJson | MediaType::Any
+                            )
+                        })
+                    {
+                        return Err(postrust_core::Error::InvalidMediaType(
+                            api_request
+                                .accept_media_types
+                                .iter()
+                                .map(MediaType::to_mime)
+                                .collect::<Vec<_>>()
+                                .join(", "),
+                        ));
+                    }
                     // Return basic server info for root endpoint
                     serde_json::json!({
                         "name": "postrust",
@@ -1792,6 +1903,61 @@ fn query_error_log(e: &postrust_core::db::DbError) -> QueryErrorLog {
         true => QueryErrorLog::Refused(status),
         false => QueryErrorLog::Fault,
     }
+}
+
+/// What the function set for the response: its headers and its status, from
+/// the rows [`RESPONSE_SETTINGS`] returned, and checked.
+fn response_overrides(
+    settings: Vec<Vec<serde_json::Value>>,
+) -> Result<(Option<String>, Option<StatusCode>), postrust_core::Error> {
+    let row = first_row(settings)?;
+    // Empty is absent. Once any transaction on this
+    // connection has defined a custom setting, PostgreSQL
+    // keeps the name for the rest of the session and
+    // reports it as `''` rather than null -- so a request
+    // that set nothing would otherwise inherit "the empty
+    // headers" from whichever request last set some.
+    let setting = |index: usize| {
+        row.get(index)
+            .and_then(serde_json::Value::as_str)
+            .filter(|value| !value.trim().is_empty())
+            .map(str::to_string)
+    };
+    let (guc_headers, guc_status) = (setting(0), setting(1));
+
+    // Both are the function's own words, so both are checked before
+    // they reach the response: a malformed one is a fault in the
+    // schema, and saying so is more use than a header the client
+    // cannot see or a status it cannot explain.
+    //
+    // That includes each name and value being one HTTP can carry. The
+    // response is only built after the commit, and a header it cannot
+    // hold -- a newline in a value, a space in a name -- failed there,
+    // where it was too late to undo the function's writes.
+    if let Some(headers) = &guc_headers {
+        let sendable = postrust_response::parse_guc_headers(headers).is_some_and(|headers| {
+            headers.iter().all(|(name, value)| {
+                http::HeaderName::try_from(name.as_str()).is_ok()
+                    && http::HeaderValue::try_from(value.as_str()).is_ok()
+            })
+        });
+        if !sendable {
+            return Err(postrust_core::Error::InvalidGucHeaders);
+        }
+    }
+    let guc_status = match guc_status {
+        None => None,
+        Some(status) => Some(
+            status
+                .trim()
+                .parse::<u16>()
+                .ok()
+                .and_then(|code| StatusCode::from_u16(code).ok())
+                .ok_or(postrust_core::Error::InvalidGucStatus)?,
+        ),
+    };
+
+    Ok((guc_headers, guc_status))
 }
 
 /// A function's response settings, read back after it ran.
@@ -2049,6 +2215,9 @@ fn has_default_select(select: &[postrust_core::api_request::SelectItem]) -> bool
 }
 
 /// Whether this server renders the type itself, with nothing declared for it.
+// `application/openapi+json` is deliberately absent: only the root produces it
+// (PostgREST's `inspectPlan`), so on a table or a function it is a type nothing
+// can render, and is refused like any other.
 fn renders_without_a_handler(media: &postrust_core::api_request::MediaType) -> bool {
     use postrust_core::api_request::MediaType;
 
@@ -2060,7 +2229,6 @@ fn renders_without_a_handler(media: &postrust_core::api_request::MediaType) -> b
             | MediaType::GeoJson
             | MediaType::SingularJson { .. }
             | MediaType::ArrayJson { .. }
-            | MediaType::OpenApi
     )
 }
 
@@ -2338,6 +2506,11 @@ fn mutation_status(
     // give up `xmax` cannot tell either way -- in both cases there is nothing
     // to report but the creation.
     could_have_merged: bool,
+    // The statement wrote no row at all. A merge that wrote nothing created
+    // nothing, however little the relation can say about its keys: a view
+    // with no key of its own gets no conflict clause, and `[]` is the whole
+    // of what PostgREST's counter (unset, so 200) reports for it.
+    wrote_nothing: bool,
 ) -> Option<StatusCode> {
     use postrust_core::api_request::PreferResolution;
     use postrust_core::plan::{DbActionPlan, MutatePlan};
@@ -2367,7 +2540,9 @@ fn mutation_status(
         }
         // A `POST` that merged into every row it touched created nothing, and
         // 201 would be a promise that something new is at the `Location`.
-        MutatePlan::Insert { .. } if merging && could_have_merged && !created_a_row => {
+        MutatePlan::Insert { .. }
+            if merging && ((could_have_merged && !created_a_row) || wrote_nothing) =>
+        {
             StatusCode::OK
         }
         MutatePlan::Insert { .. } => StatusCode::CREATED,
@@ -2392,6 +2567,22 @@ fn add_embed_join_columns(
     let Some(parent_qi) = read_target(api_request, None, schema_cache) else {
         return Ok(Vec::new());
     };
+
+    // The relation itself is looked up first, as PostgREST does: a table the
+    // schema cache does not hold is "not found" (PGRST205) whatever the
+    // select embeds, and the planner says so. Resolving the embeds here would
+    // report a missing relationship (PGRST200) of a table that is not there --
+    // a partition, say, which is not in the cache though its parent is.
+    if matches!(
+        api_request.action,
+        postrust_core::api_request::Action::Db(
+            postrust_core::api_request::DbAction::RelationRead { .. }
+                | postrust_core::api_request::DbAction::RelationMut { .. }
+        )
+    ) && schema_cache.get_table(&parent_qi).is_none()
+    {
+        return Ok(Vec::new());
+    }
 
     let select = &api_request.query_params.select;
     if select.is_empty() {
@@ -2465,9 +2656,17 @@ fn add_embed_join_columns(
         // Every column the join is on, not just the first: a foreign key over
         // several columns correlates on all of them, and one left unselected
         // is a column the correlation cannot see.
-        let join_columns: Vec<String> = match plan.columns.is_empty() {
-            true => vec![plan.local_column.clone()],
-            false => plan
+        // A many-to-many hop correlates the junction on the parent's side of
+        // every junction key column -- `users_tasks(user_id, task_id)` needs
+        // both, not just the first.
+        let join_columns: Vec<String> = match (&plan.junction, plan.columns.is_empty()) {
+            (Some(junction), _) => junction
+                .parent_columns
+                .iter()
+                .map(|(local, _)| local.clone())
+                .collect(),
+            (None, true) => vec![plan.local_column.clone()],
+            (None, false) => plan
                 .columns
                 .iter()
                 .map(|(local, _)| local.clone())
@@ -2551,7 +2750,25 @@ fn shift_placeholders(sql: &str, offset: usize) -> String {
     let mut out = String::with_capacity(sql.len());
     let mut chars = sql.char_indices().peekable();
 
+    // Inside a quoted literal or identifier a `$` is text: a `like` operand
+    // is written into the statement rather than bound, and `'%$1'` is a
+    // pattern, not a placeholder. A doubled quote closes and reopens, so the
+    // toggle needs no special case for it.
+    let mut quote: Option<char> = None;
+
     while let Some((i, ch)) = chars.next() {
+        if let Some(open) = quote {
+            out.push(ch);
+            if ch == open {
+                quote = None;
+            }
+            continue;
+        }
+        if ch == '\'' || ch == '"' {
+            quote = Some(ch);
+            out.push(ch);
+            continue;
+        }
         if ch != '$' {
             out.push(ch);
             continue;
@@ -2602,26 +2819,78 @@ impl EmbedFilters<'_> {
         (limit, offset)
     }
 
+    /// The existence tests for `?child.grandchild=is.null` and
+    /// `?child.or=(a.not.is.null,b.not.is.null)`: filters at this embed's path
+    /// that name embeds of it. `filterable` is what the embed's own level
+    /// recorded, so these are built once that level exists.
+    fn embed_null_predicates(
+        &self,
+        path: &[String],
+        names: &[String],
+        embeds: &[String],
+        filterable: &[(String, String)],
+    ) -> Vec<String> {
+        let addresses = |candidate: &[String]| candidate == path || candidate == names;
+        let mut predicates = Vec::new();
+
+        for (_, filter) in self.filters.iter().filter(|(p, _)| addresses(p)) {
+            if !is_embed_null_filter(filter, embeds) {
+                continue;
+            }
+            let Some((_, exists)) = filterable
+                .iter()
+                .find(|(name, _)| name == &filter.field.name)
+            else {
+                continue;
+            };
+            let negated = match &filter.op_expr.operation {
+                postrust_core::api_request::Operation::Is(
+                    postrust_core::api_request::IsValue::Null,
+                ) => filter.op_expr.negated,
+                _ => !filter.op_expr.negated,
+            };
+            predicates.push(match negated {
+                true => exists.clone(),
+                false => format!("NOT {}", exists),
+            });
+        }
+        for (_, tree) in self.logic.iter().filter(|(p, _)| addresses(p)) {
+            if !tree.names_only(embeds) {
+                continue;
+            }
+            if let Some(predicate) = embed_logic_predicate(tree, filterable) {
+                predicates.push(predicate);
+            }
+        }
+        predicates
+    }
+
     fn predicate_for(
         &mut self,
         path: &[String],
         names: &[String],
         child_qi: &postrust_core::api_request::QualifiedIdentifier,
+        embeds: &[String],
         schema_cache: &postrust_core::SchemaCache,
     ) -> Result<Option<String>, postrust_core::Error> {
         let addresses = |candidate: &[String]| candidate == path || candidate == names;
 
+        // What names an embed of this resource, rather than one of its
+        // columns, is an existence test that can only be built once the embed
+        // is in scope: see `embed_null_predicates`.
         let matching: Vec<_> = self
             .filters
             .iter()
             .filter(|(filter_path, _)| addresses(filter_path))
             .map(|(_, filter)| filter.clone())
+            .filter(|filter| !is_embed_null_filter(filter, embeds))
             .collect();
 
         let matching_logic: Vec<_> = self
             .logic
             .iter()
             .filter(|(logic_path, _)| addresses(logic_path))
+            .filter(|(_, tree)| !tree.names_only(embeds))
             .map(|(_, tree)| tree.clone())
             .collect();
 
@@ -2646,8 +2915,13 @@ impl EmbedFilters<'_> {
                     ))
                 })?;
 
-            let frag =
-                postrust_core::query::QueryBuilder::filter_sql(filter, &column.nominal_type)?;
+            // The column's own spelling of a value, where its schema declared
+            // one: the same parser a filter at the top level reads it with.
+            let frag = postrust_core::query::QueryBuilder::filter_sql_with(
+                filter,
+                &column.nominal_type,
+                schema_cache.representation("text", column.representation_type()),
+            )?;
             parts.push(shift_placeholders(
                 frag.sql(),
                 self.base + self.params.len(),
@@ -2674,7 +2948,13 @@ impl EmbedFilters<'_> {
                     .map(|c| c.nominal_type.clone())
                     .unwrap_or_else(|| "text".to_string())
             };
-            let frag = postrust_core::query::QueryBuilder::logic_sql(&tree, resolver)?;
+            let parser = |name: &str| -> Option<String> {
+                table
+                    .and_then(|t| t.get_column(name))
+                    .and_then(|c| schema_cache.representation("text", c.representation_type()))
+                    .map(str::to_string)
+            };
+            let frag = postrust_core::query::QueryBuilder::logic_sql_with(&tree, resolver, parser)?;
             parts.push(shift_placeholders(
                 frag.sql(),
                 self.base + self.params.len(),
@@ -2684,6 +2964,17 @@ impl EmbedFilters<'_> {
 
         Ok(Some(format!("({})", parts.join(" AND "))))
     }
+}
+
+/// Whether a filter asks if one of `embeds` matched anything: `is.null` or
+/// `not.is.null` on the name an embed goes by.
+fn is_embed_null_filter(filter: &postrust_core::api_request::Filter, embeds: &[String]) -> bool {
+    use postrust_core::api_request::{IsValue, Operation};
+    embeds.contains(&filter.field.name)
+        && matches!(
+            filter.op_expr.operation,
+            Operation::Is(IsValue::Null) | Operation::Is(IsValue::NotNull)
+        )
 }
 
 /// Record the first column a logic tree names that the table does not have.
@@ -3080,7 +3371,21 @@ fn embed_order_sql(
         };
 
         let mut sql = match term {
-            OrderTerm::Field { .. } => postrust_sql::escape_ident(&field.name),
+            OrderTerm::Field { .. } => {
+                // Qualified with the child's alias and carrying the term's
+                // JSON path: `order=data->>x` orders by what the path reaches,
+                // not by the column that holds it.
+                let pg_type = schema_cache
+                    .get_table(child_qi)
+                    .and_then(|table| table.get_column(&field.name))
+                    .map(|column| column.data_type.clone())
+                    .unwrap_or_default();
+                let coercible = postrust_core::plan::CoercibleField::from_field(field, &pg_type);
+                postrust_core::query::QueryBuilder::qualified_column_sql(
+                    Some(child_alias),
+                    &coercible,
+                )
+            }
             OrderTerm::Relation { relation, .. } => {
                 let (plan, grandchild_alias, grandchild_qi) =
                     related_order_target(schema_cache, child_qi, child_select, relation, ctx)?;
@@ -3198,7 +3503,14 @@ fn build_embed_expressions(
         child_path.push(alias.clone().unwrap_or_else(|| relation.clone()));
         let mut child_names = names.to_vec();
         child_names.push(relation.clone());
-        let child_where = ctx.predicate_for(&child_path, &child_names, &child_qi, schema_cache)?;
+        let child_embeds = postrust_core::api_request::embedded_names(child_select);
+        let child_where = ctx.predicate_for(
+            &child_path,
+            &child_names,
+            &child_qi,
+            &child_embeds,
+            schema_cache,
+        )?;
 
         // Deeper relations first: they become part of this level's SELECT list.
         let child_row = postrust_sql::escape_ident(&child_alias);
@@ -3215,15 +3527,22 @@ fn build_embed_expressions(
 
         // A nested `!inner` is written against this child's alias, which is
         // only in scope inside this child's own subselect -- so it narrows the
-        // child here rather than travelling up to the top-level wrapper.
-        let child_where = match (child_where, nested.inner_joins.is_empty()) {
+        // child here rather than travelling up to the top-level wrapper. So
+        // does a filter on whether a nested embed matched, which needs that
+        // embed in scope too.
+        let mut narrowing = nested.inner_joins.clone();
+        narrowing.extend(ctx.embed_null_predicates(
+            &child_path,
+            &child_names,
+            &child_embeds,
+            &nested.filterable,
+        ));
+        let child_where = match (child_where, narrowing.is_empty()) {
             (existing, true) => existing,
-            (Some(existing), false) => Some(format!(
-                "{} AND {}",
-                existing,
-                nested.inner_joins.join(" AND ")
-            )),
-            (None, false) => Some(nested.inner_joins.join(" AND ")),
+            (Some(existing), false) => {
+                Some(format!("{} AND {}", existing, narrowing.join(" AND ")))
+            }
+            (None, false) => Some(narrowing.join(" AND ")),
         };
 
         // `!inner` on this relation restricts the parent rows. It is emitted
@@ -3260,6 +3579,30 @@ fn build_embed_expressions(
                 SelectItem::Field { field, .. } if field.name == "*" => {
                     project_everything = true;
                 }
+                // A bare `count` that is no column of the child is written
+                // against the child's alias, as PostgREST writes every column
+                // (`"projects"."count"`). PostgreSQL reads `relation.name` as
+                // `name(relation)` when there is no such column, so this is
+                // `count(<row>)`: the embed's rows counted, `[{"count": 2}]`,
+                // and not gated by db-aggregates-enabled. A real column of
+                // that name is left alone and wins, as it does at the root.
+                SelectItem::Field {
+                    field,
+                    alias,
+                    aggregate: None,
+                    ..
+                } if field.name == "count"
+                    && field.json_path.is_empty()
+                    && child_table
+                        .as_ref()
+                        .is_some_and(|table| table.get_column("count").is_none()) =>
+                {
+                    parts.push(format!(
+                        "{}.\"count\" AS {}",
+                        postrust_sql::escape_ident(&child_alias),
+                        postrust_sql::escape_ident(alias.as_deref().unwrap_or("count"))
+                    ));
+                }
                 SelectItem::Field { field, alias, .. } => {
                     let column = postrust_sql::escape_ident(&field.name);
                     // A schema that declared how one of its domains is written
@@ -3284,7 +3627,41 @@ fn build_embed_expressions(
         }
         if project_everything {
             parts.clear();
-            parts.push(format!("{}.*", postrust_sql::escape_ident(&child_alias)));
+            // `*` is every column, and a column whose schema declared how it
+            // is written on the wire is written that way wherever it appears
+            // -- so with any such column the star is spelled out, each one
+            // through its own function. Without one it stays `alias.*`.
+            let alias = postrust_sql::escape_ident(&child_alias);
+            let rendered: Vec<(String, Option<&str>)> = child_table
+                .map(|table| {
+                    table
+                        .columns
+                        .iter()
+                        .map(|(name, column)| {
+                            (
+                                name.clone(),
+                                schema_cache.representation(column.representation_type(), "json"),
+                            )
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+            if rendered.iter().any(|(_, function)| function.is_some()) {
+                for (name, function) in rendered {
+                    let column = format!("{}.{}", alias, postrust_sql::escape_ident(&name));
+                    parts.push(match function {
+                        Some(function) => format!(
+                            "{}({}) AS {}",
+                            function,
+                            column,
+                            postrust_sql::escape_ident(&name)
+                        ),
+                        None => column,
+                    });
+                }
+            } else {
+                parts.push(format!("{}.*", alias));
+            }
         }
         for (field_name, expression) in nested_expressions {
             parts.push(format!(
@@ -3933,6 +4310,7 @@ fn sanitize_error_message(error: &postrust_core::Error) -> String {
         | Error::PutLimitNotAllowed
         | Error::PutMatchingPk
         | Error::MaxAffectedExceeded(_)
+        | Error::MaxAffectedRpcViolation
         | Error::InvalidGucHeaders
         | Error::InvalidGucStatus
         | Error::InvalidMediaType(_)
@@ -3972,6 +4350,20 @@ fn sanitize_error_message(error: &postrust_core::Error) -> String {
 
 #[cfg(test)]
 mod tests {
+    /// A `$1` inside a quoted literal is text, so renumbering leaves it be.
+    #[test]
+    fn placeholders_in_literals_are_not_renumbered() {
+        use super::shift_placeholders;
+        assert_eq!(
+            shift_placeholders("a = $1 AND b ~~ '%$1' AND \"c$2\" = $2", 3),
+            "a = $4 AND b ~~ '%$1' AND \"c$2\" = $5"
+        );
+        assert_eq!(
+            shift_placeholders("x ~~ 'it''s $1' AND y = $1", 1),
+            "x ~~ 'it''s $1' AND y = $2"
+        );
+    }
+
     use super::{query_error_log, QueryErrorLog};
     use http::StatusCode;
 

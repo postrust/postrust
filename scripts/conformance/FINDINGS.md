@@ -37,6 +37,45 @@ differ between any two servers and say nothing about conformance.
 | 8   | —     | —     | died at `writes 300/431`; the machine had filled its disk |
 | 9   | 96.1% | 94.3% | clean: both halves complete, 0 transport failures, features verified at runtime |
 | 10  | 96.7% | 94.9% | computed relationships; 1 unanswered request, counted against us |
+| 11  | 96.9% | 94.3% | 3.3.0; 11 cases lost to `Allow` on a 405, added in 2.4.0 and never recorded here |
+| 15  | 99.3% | **99.1%** | 3.4.0; 0 status differences; the 13 left are listed under Part 2 and Part 3 |
+
+Run 15 (3.4.0, commit `730b801`) by group: reads 99.1% / 98.9%, writes 99.8% /
+99.8%, and the status code agrees in all 1499 cases. It reused the reference
+recorded for run 11, which reused run 9's. It closed 72 cases, of two kinds:
+
+- **Bugs, fixed in both modes.** Many-to-many embeds with the
+  junction's columns in scope (`42702`) and through views counted twice
+  (`PGRST201`); composite-key junctions whose parent key was not selected;
+  inherited partition foreign keys; views without the primary key of the table
+  they select from (`Location`, `Allow`); domain defaults; the count total
+  after a write; `Content-Range` on a 416; negative offsets; a handler's own
+  `Content-Type`; `Accept` lists; representations and casts inside embeds;
+  `RETURNS TABLE` functions ignoring `select`; upsert statuses on views and
+  partitions; `Range` on methods other than GET; `PGRST128`.
+- **PostgREST behaviour that compatibility mode now matches and default mode
+  keeps away from.** Listed in Part 2, with what each costs default mode.
+
+**The Worker in run 15 found one more gap, and one fault in how it was
+built.** The server answers a CORS preflight in `options_allow`; the Worker
+answers it in its own `preflight()`, which compatibility mode had not reached,
+so it still sent `Allow` (`CorsSpec` `:16`, `:75`, `:114`). Fixed in
+`44c470a`. Separately, a first Worker build without `compat-key-order` lost
+four CSV cases to column order, the same trap run 4 fell into on the server:
+the feature is a build choice, and `worker-build --release --features
+compat-key-order` is the build that is measured. With both, the Worker scores
+1484 and the socket driver 1485, each differing from the server only in the
+cases `docs/postgrest-conformance.md` names.
+
+**Run 11 is the 3.3.0 measurement, and its 10-case drop from run 10 was a
+bookkeeping gap rather than a regression.** Bisected, it is one commit:
+`ddf7530` (2.4.0) gave every 405 an `Allow` header, as RFC 9110 asks.
+PostgREST sends none on those responses. The change was deliberate. The miss
+was that it was never entered in Part 2, so the published figure went stale
+when 2.4.0 shipped. Run 10's code replayed against the same reference still
+scores 1425 (one more than run 10 itself, the socket fault), which is how the
+instrument was cleared. The 3.4.0 run is numbered 15 because 12–14 were
+already taken.
 
 Run 10 by group: reads 96.3% / 94.5%, writes 97.9% / 96.1%. It reused run 9's
 reference, which is what `CONFORMANCE_REUSE_REF=1` is for: nothing that shapes
@@ -161,45 +200,69 @@ Found by review, not by the harness.
 
 ## Part 2 — divergences kept on purpose
 
-**These cases fail by choice. Do not "fix" them without deciding to.**
+Two kinds are recorded here. Some answers differ in default mode by choice and
+match in compatibility mode, which is the configuration the harness measures,
+so they cost nothing in the figures. Others are cases the harness cannot score
+fairly. **Do not "fix" any of them without deciding to.**
 
-### PostgREST truncates a select at a stray `)`
+### Matched in compatibility mode only
 
-Probed against the reference directly:
+Each of these is PostgREST behaviour that a client written against PostgREST
+may depend on, and that default mode answers differently on purpose. Since
+3.4.0 compatibility mode matches all of them; before that each one was a
+failure in the figures. [`docs/compat-mode.md`](../../docs/compat-mode.md)
+lists them for users.
 
-```
-/clients?select=id)ZZ,nameQQ   ->  200, and nameQQ never becomes a column
-/clients?select=name)))        ->  200
-/clients?select=name,,,        ->  400
-```
+- **A select cut short at a stray character.** Probed against the reference:
 
-Everything after the `)` is discarded silently. That is exactly the behaviour
-commit `f7c7b56` ("stop silently discarding half of a select") removed from
-this server, where `select=id, name, billing(address)` had been returning the
-id alone. Matching it means reintroducing a bug that was fixed on purpose.
+  ```
+  /clients?select=id)ZZ,nameQQ   ->  200, and nameQQ never becomes a column
+  /clients?select=name)))        ->  200
+  /clients?select=name,,,        ->  400
+  ```
 
-*Cost: 2 cases* (`AggregateFunctionsSpec.hs:34`, `SpreadQueriesSpec.hs:391`).
+  PostgREST's parser stops at the first character it cannot use and discards
+  the rest silently. Commit `f7c7b56` ("stop silently discarding half of a
+  select") removed exactly that from this server, where `select=id, name,
+  billing(address)` had been returning the id alone. Default mode still refuses
+  with `PGRST100`. Compatibility mode drops the tail, except a tail beginning
+  with `,`, which PostgREST refuses too (`AggregateFunctionsSpec.hs:34`,
+  `SpreadQueriesSpec.hs:391`).
+- **`Allow` on a 405** (11 cases, `UpsertSpec` and `RpcSpec`). RFC 9110 requires
+  it, and default mode sends it (`ddf7530`, 2.4.0). PostgREST sends none.
+- **`Allow` on a CORS preflight** (3 cases, `CorsSpec`). PostgREST's CORS
+  middleware answers a preflight before the application sees it. A plain
+  `OPTIONS` carries `Allow` in both servers.
+- **`Content-Type` for `application/vnd.pgrst.array+json`**
+  (`NullsStripSpec.hs:117`). PostgREST answers `application/json` unless
+  `nulls=stripped` was asked for. Default mode names the type the client
+  negotiated.
+- **An unknown column in `select`** (`QuerySpec.hs:1557`). PostgREST does not
+  check the column, so PostgreSQL's `42703` comes back. Default mode refuses it
+  before the query with `PGRST204`, which names the table.
+- **`GET /` with an `Accept` the root cannot produce** (`OpenApiSpec.hs:36`).
+  PostgREST refuses with 406 `PGRST107`. Default mode's `/` is a directory of
+  endpoints, which is JSON whatever was asked.
 
-### Upsert status codes
+### What the harness cannot score
 
-`POST /articles` with an empty body returns 201 where PostgREST returns 200,
-and a `PUT` that replaced an existing row returns 201 where PostgREST returns
-200. The evidence is one case each; `mutation_status` carries comments
-recording earlier deliberation about exactly these lines; and UpsertSpec passes
-58/60. Changing the rule on this evidence risks the 58 to win the 2.
+*6 cases. The harness is over-reporting here, not the server under-performing.*
 
-*Cost: 2 cases.*
-
-### Unspecified row order
-
-`RelatedQueriesSpec.hs:183` and `:191` return the same two rows in the opposite
-order from PostgREST. Neither request specifies `order=`, so SQL guarantees
-nothing and both answers are correct. It shows as a failure only because bodies
-are compared exactly. Matching it would mean inventing an ordering PostgREST
-does not promise.
-
-*Cost: 2 cases. The harness is over-reporting here, not the server
-under-performing.*
+- **Unspecified row order** (`RelatedQueriesSpec.hs:183`, `:191`, `:218`, and
+  `QuerySpec.hs:995`, whose `order=` leaves two rows tied). Both servers return
+  the same rows in a different order. SQL guarantees nothing there, so both
+  answers are correct; the body comparison is exact. Matching would mean
+  shaping the SQL after PostgREST's to chase its plan, which no release of
+  either server promises to keep.
+- **A spec configured differently from the harness** (`QuerySpec.hs:1700`).
+  The spec runs with `url-use-legacy-target-names = false`. The harness runs
+  one PostgREST for every spec, with the default `true`, under which PostgREST
+  applies every filter to `work_visits`. Neither server gives the answer the
+  spec expects; the setting itself is a gap, in Part 3.
+- **A test PostgREST does not run** (`InsertSpec.hs:634`). The spec marks it
+  `pendingWith "Decide on what to do with CSV insert"`, and the extractor lost
+  its body, which is built with `<>`, so the harness sends an empty `text/csv`
+  `POST`. Both answer 400 `PGRST102`; only cassava's wording differs.
 
 ### Clock skew on `nbf` and `iat`, and none on `exp`
 
@@ -228,8 +291,9 @@ green report.*
 | 1 | Ordering across an embed boundary | ~4 | **done** |
 | 2 | Composite-key junctions | 4–5 | **done** |
 | 3 | Junctions through views | ~2 | **done** |
-| 4 | Parser error detail | ~3 | **done** for the logic tree; the select parser still answers generically |
-| 5 | The OpenAPI document at `/` | 6 | open — see below |
+| 4 | Parser error detail | ~3 | **done** for the logic tree and for a JSON operand in `select` (3.4.0); other select errors still answer generically |
+| 5 | The OpenAPI document at `/` | 7 | open — see below |
+| 6 | `url-use-legacy-target-names = false` | 1 | open — not configurable, and a filter on `visits.` also reaches an embed aliased from `visits` |
 
 ### 1. Ordering and filtering across an embed boundary — ~4 cases
 
@@ -312,7 +376,7 @@ Matching PostgREST exactly means reproducing its parser combinator's
 expectation sets, which is why this is worth doing for its own sake rather than
 for the three cases.
 
-### 5. The OpenAPI document at `/` — 6 cases
+### 5. The OpenAPI document at `/` — 7 cases
 
 Still open, and the only item here that is a project rather than a change.
 What the reference actually serves, measured:
@@ -344,7 +408,10 @@ description, which columns count as `required`, and the same again for every
 function signature.
 
 **Bodies are compared as exact JSON, so a 95%-correct generator scores zero on
-all six cases.** There is no partial credit to collect and no way to land it
+all five `GET /` cases.** The other two are `HEAD /`, whose `Content-Type`
+(`application/openapi+json`) waits for the document: claiming the type for the
+directory served today would be wrong. The 406 refusals beside them were
+cheap, and closed in 3.4.0. There is no partial credit to collect and no way to land it
 incrementally against this measurement — which is why it belongs in its own
 change, with its own tests, rather than being started here and left half-built.
 

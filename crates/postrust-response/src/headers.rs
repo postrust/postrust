@@ -126,7 +126,7 @@ pub fn build_response_headers(
     // Preference-Applied
     if let Some(applied) = postrust_core::api_request::preferences::preference_applied(
         &request.preferences,
-        crate::preference_scope(request),
+        crate::preference_scope(request, true),
     ) {
         if let Ok(v) = HeaderValue::from_str(&applied) {
             headers.insert(
