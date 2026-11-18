@@ -51,9 +51,9 @@ pub mod trace;
 
 // Re-export main types
 pub use api_request::{
-    parse_request, Action, ApiRequest, DbAction, Filter, LogicTree, MediaType, Mutation, Operation,
-    Payload, PreferRepresentation, Preferences, QualifiedIdentifier, QueryParams, Range, Resource,
-    SelectItem,
+    parse_request, parse_request_with, Action, ApiRequest, DbAction, Filter, LogicTree, MediaType,
+    Mutation, Operation, Payload, PreferRepresentation, Preferences, QualifiedIdentifier,
+    QueryParams, Range, Resource, SelectItem,
 };
 pub use config::{AppConfig, ConfigError, IsolationLevel, LogFormat, LogLevel, OpenApiMode};
 pub use embed::EmbedRendering;

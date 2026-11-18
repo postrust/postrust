@@ -7,7 +7,8 @@ use http::{Response, StatusCode};
 use http_body_util::BodyExt;
 use postrust_core::db::{Db, Tx};
 use postrust_core::{
-    create_action_plan, parse_request, ActionPlan, ApiRequest, CallPlan, DbActionPlan,
+    create_action_plan, parse_request, parse_request_with, ActionPlan, ApiRequest, CallPlan,
+    DbActionPlan,
 };
 use postrust_response::{format_response, QueryResult, Response as PgrstResponse};
 use tracing::{debug, debug_span, error, field::Empty, Instrument};
@@ -162,11 +163,12 @@ where
         .map_err(|e| postrust_core::Error::Internal(e.to_string()))?;
 
     // Parse API request
-    let mut api_request = parse_request(
+    let mut api_request = parse_request_with(
         &http_request,
         state.default_schema(),
         state.schemas(),
         state.config().db_max_rows,
+        state.config().compat_mode,
     )?;
     // For the database's `request.trace_id`. The host put the context in the
     // extensions; `parse_request` saw a request rebuilt without them.
