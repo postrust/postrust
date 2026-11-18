@@ -2568,6 +2568,22 @@ fn add_embed_join_columns(
         return Ok(Vec::new());
     };
 
+    // The relation itself is looked up first, as PostgREST does: a table the
+    // schema cache does not hold is "not found" (PGRST205) whatever the
+    // select embeds, and the planner says so. Resolving the embeds here would
+    // report a missing relationship (PGRST200) of a table that is not there --
+    // a partition, say, which is not in the cache though its parent is.
+    if matches!(
+        api_request.action,
+        postrust_core::api_request::Action::Db(
+            postrust_core::api_request::DbAction::RelationRead { .. }
+                | postrust_core::api_request::DbAction::RelationMut { .. }
+        )
+    ) && schema_cache.get_table(&parent_qi).is_none()
+    {
+        return Ok(Vec::new());
+    }
+
     let select = &api_request.query_params.select;
     if select.is_empty() {
         return Ok(Vec::new());
@@ -2640,9 +2656,17 @@ fn add_embed_join_columns(
         // Every column the join is on, not just the first: a foreign key over
         // several columns correlates on all of them, and one left unselected
         // is a column the correlation cannot see.
-        let join_columns: Vec<String> = match plan.columns.is_empty() {
-            true => vec![plan.local_column.clone()],
-            false => plan
+        // A many-to-many hop correlates the junction on the parent's side of
+        // every junction key column -- `users_tasks(user_id, task_id)` needs
+        // both, not just the first.
+        let join_columns: Vec<String> = match (&plan.junction, plan.columns.is_empty()) {
+            (Some(junction), _) => junction
+                .parent_columns
+                .iter()
+                .map(|(local, _)| local.clone())
+                .collect(),
+            (None, true) => vec![plan.local_column.clone()],
+            (None, false) => plan
                 .columns
                 .iter()
                 .map(|(local, _)| local.clone())
@@ -3554,6 +3578,30 @@ fn build_embed_expressions(
             match nested_item {
                 SelectItem::Field { field, .. } if field.name == "*" => {
                     project_everything = true;
+                }
+                // A bare `count` that is no column of the child is written
+                // against the child's alias, as PostgREST writes every column
+                // (`"projects"."count"`). PostgreSQL reads `relation.name` as
+                // `name(relation)` when there is no such column, so this is
+                // `count(<row>)`: the embed's rows counted, `[{"count": 2}]`,
+                // and not gated by db-aggregates-enabled. A real column of
+                // that name is left alone and wins, as it does at the root.
+                SelectItem::Field {
+                    field,
+                    alias,
+                    aggregate: None,
+                    ..
+                } if field.name == "count"
+                    && field.json_path.is_empty()
+                    && child_table
+                        .as_ref()
+                        .is_some_and(|table| table.get_column("count").is_none()) =>
+                {
+                    parts.push(format!(
+                        "{}.\"count\" AS {}",
+                        postrust_sql::escape_ident(&child_alias),
+                        postrust_sql::escape_ident(alias.as_deref().unwrap_or("count"))
+                    ));
                 }
                 SelectItem::Field { field, alias, .. } => {
                     let column = postrust_sql::escape_ident(&field.name);
