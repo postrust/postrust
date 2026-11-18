@@ -204,6 +204,18 @@ pub fn format_response(
             // PostgREST's own JSON media types is told it got that: the type
             // is how it knows the shape it negotiated was honoured.
             let content_type = match other {
+                // PostgREST only has a media type for the stripped array; a
+                // plain `vnd.pgrst.array+json` is `application/json`
+                // (`MediaType.hs`, `checkArrayNullStrip`). Compatibility mode
+                // follows it; by default the client is told the type it asked
+                // for was honoured.
+                MediaType::ArrayJson { strip_nulls } if result.compat_mode => {
+                    if *strip_nulls {
+                        "application/vnd.pgrst.array+json;nulls=stripped; charset=utf-8"
+                    } else {
+                        "application/json; charset=utf-8"
+                    }
+                }
                 MediaType::ArrayJson { .. } => "application/vnd.pgrst.array+json; charset=utf-8",
                 MediaType::OpenApi => "application/openapi+json; charset=utf-8",
                 _ => "application/json; charset=utf-8",
@@ -449,6 +461,10 @@ pub struct QueryResult {
     /// a primary key or `?on_conflict=` to conflict on. Reported in
     /// `Preference-Applied` only then.
     pub resolution_applies: bool,
+    /// Whether compatibility mode is on, for the places where the response
+    /// follows PostgREST's media types exactly rather than naming the one the
+    /// client asked for.
+    pub compat_mode: bool,
 }
 
 /// Response formatting error.

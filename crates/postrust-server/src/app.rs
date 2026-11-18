@@ -184,6 +184,21 @@ pub async fn options_allow(
         return next.run(request).await;
     };
 
+    // PostgREST's CORS middleware answers a preflight -- an `OPTIONS` with an
+    // `Origin` and an `Access-Control-Request-Method` -- itself, before the
+    // application is asked anything, so the answer carries no `Allow` and
+    // does not look the resource up. Compatibility mode answers it the same
+    // way; by default a preflight gets the resource's `Allow` too. A plain
+    // `OPTIONS` is the application's own and keeps it either way.
+    if state.config.compat_mode
+        && request.headers().contains_key(http::header::ORIGIN)
+        && request
+            .headers()
+            .contains_key(http::header::ACCESS_CONTROL_REQUEST_METHOD)
+    {
+        return next.run(request).await;
+    }
+
     // Built here, from borrows, before anything is awaited: `axum::body::Body`
     // is `Send` but not `Sync`, and `&T` is `Send` only where `T` is `Sync`, so
     // a `&Request` held across an await makes the whole future not `Send` --

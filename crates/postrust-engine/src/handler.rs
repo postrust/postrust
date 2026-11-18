@@ -69,7 +69,9 @@ where
             // the answer an OPTIONS on the same resource gives -- whichever
             // refusal it was: a function called with the wrong method, a PUT
             // with filters it cannot take, a view that cannot be written.
-            if response.status() == StatusCode::METHOD_NOT_ALLOWED {
+            //
+            // PostgREST sends none, so in compatibility mode neither do we.
+            if response.status() == StatusCode::METHOD_NOT_ALLOWED && !state.config().compat_mode {
                 let mut probe = http::Request::builder()
                     .method(http::Method::OPTIONS)
                     .uri(uri);
@@ -1390,6 +1392,7 @@ async fn execute_plan<'s, S: State>(
                         content_range: Some(content_range),
                         guc_headers,
                         resolution_applies,
+                        compat_mode: state.config().compat_mode,
                         ..QueryResult::default()
                     },
                     Some(tx),
@@ -1733,6 +1736,7 @@ async fn execute_plan<'s, S: State>(
                 raw_body: geojson_body,
                 media_type: negotiated_media,
                 resolution_applies,
+                compat_mode: state.config().compat_mode,
                 ..Default::default()
             };
             // Committed by the caller, once the response is known to be one
@@ -1745,6 +1749,35 @@ async fn execute_plan<'s, S: State>(
             // Return appropriate metadata based on the info type
             let response_data = match info_plan {
                 InfoPlan::OpenApiSpec => {
+                    // PostgREST's `inspectPlan` produces the document as
+                    // OpenAPI, JSON or anything, and refuses the rest. The
+                    // default-mode directory answers whatever is asked, so
+                    // this is compatibility mode only.
+                    use postrust_core::api_request::MediaType;
+                    if state.config().compat_mode
+                        && matches!(
+                            api_request.action,
+                            postrust_core::api_request::Action::Db(
+                                postrust_core::api_request::DbAction::SchemaRead { .. }
+                            )
+                        )
+                        && !api_request.accept_media_types.is_empty()
+                        && !api_request.accept_media_types.iter().any(|media| {
+                            matches!(
+                                media,
+                                MediaType::OpenApi | MediaType::ApplicationJson | MediaType::Any
+                            )
+                        })
+                    {
+                        return Err(postrust_core::Error::InvalidMediaType(
+                            api_request
+                                .accept_media_types
+                                .iter()
+                                .map(MediaType::to_mime)
+                                .collect::<Vec<_>>()
+                                .join(", "),
+                        ));
+                    }
                     // Return basic server info for root endpoint
                     serde_json::json!({
                         "name": "postrust",
@@ -2152,6 +2185,9 @@ fn has_default_select(select: &[postrust_core::api_request::SelectItem]) -> bool
 }
 
 /// Whether this server renders the type itself, with nothing declared for it.
+// `application/openapi+json` is deliberately absent: only the root produces it
+// (PostgREST's `inspectPlan`), so on a table or a function it is a type nothing
+// can render, and is refused like any other.
 fn renders_without_a_handler(media: &postrust_core::api_request::MediaType) -> bool {
     use postrust_core::api_request::MediaType;
 

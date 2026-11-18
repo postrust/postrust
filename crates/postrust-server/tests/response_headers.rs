@@ -370,3 +370,113 @@ async fn openapi_is_only_produced_at_the_root() {
     }
 }
 
+#[tokio::test]
+#[ignore = "requires DATABASE_URL"]
+async fn a_405_carries_allow_only_outside_compatibility_mode() {
+    schema("allow").await;
+    for (compat, expected) in [(false, true), (true, false)] {
+        let router = router("allow", compat).await;
+        let answer = send(&router, "DELETE", "/api/rpc/answer", &[], "").await;
+        assert_eq!(
+            answer.status,
+            StatusCode::METHOD_NOT_ALLOWED,
+            "{}",
+            answer.body
+        );
+        assert_eq!(answer.headers.contains_key("allow"), expected);
+    }
+}
+
+#[tokio::test]
+#[ignore = "requires DATABASE_URL"]
+async fn a_preflight_carries_allow_only_outside_compatibility_mode() {
+    schema("preflight").await;
+    for (compat, preflight_allow) in [(false, true), (true, false)] {
+        let router = router("preflight", compat).await;
+        let preflight = send(
+            &router,
+            "OPTIONS",
+            "/api/items",
+            &[
+                ("Origin", "http://example.com"),
+                ("Access-Control-Request-Method", "POST"),
+            ],
+            "",
+        )
+        .await;
+        assert!(preflight.status.is_success(), "{:?}", preflight.status);
+        assert!(preflight
+            .headers
+            .contains_key("access-control-allow-origin"));
+        assert_eq!(preflight.headers.contains_key("allow"), preflight_allow);
+
+        // A plain OPTIONS is the application's, and says what the resource takes.
+        let plain = send(&router, "OPTIONS", "/api/items", &[], "").await;
+        assert!(plain.headers.contains_key("allow"));
+    }
+}
+
+#[tokio::test]
+#[ignore = "requires DATABASE_URL"]
+async fn a_plain_array_media_type_is_json_in_compatibility_mode() {
+    schema("array").await;
+    let accept = |value: &'static str| [("Accept", value)];
+    for compat in [false, true] {
+        let router = router("array", compat).await;
+        let plain = send(
+            &router,
+            "GET",
+            "/api/organizations",
+            &accept("application/vnd.pgrst.array+json"),
+            "",
+        )
+        .await;
+        let stripped = send(
+            &router,
+            "GET",
+            "/api/organizations",
+            &accept("application/vnd.pgrst.array+json;nulls=stripped"),
+            "",
+        )
+        .await;
+        if compat {
+            assert_eq!(
+                plain.header("content-type"),
+                Some("application/json; charset=utf-8")
+            );
+            assert_eq!(
+                stripped.header("content-type"),
+                Some("application/vnd.pgrst.array+json;nulls=stripped; charset=utf-8")
+            );
+        } else {
+            assert_eq!(
+                plain.header("content-type"),
+                Some("application/vnd.pgrst.array+json; charset=utf-8")
+            );
+        }
+    }
+}
+
+#[tokio::test]
+#[ignore = "requires DATABASE_URL"]
+async fn the_root_refuses_what_it_cannot_produce_in_compatibility_mode() {
+    schema("root").await;
+    let router = router("root", true).await;
+
+    let refused = send(&router, "GET", "/", &[("Accept", "text/csv")], "").await;
+    assert_eq!(
+        refused.status,
+        StatusCode::NOT_ACCEPTABLE,
+        "{}",
+        refused.body
+    );
+    assert!(refused.body.contains("PGRST107"));
+    assert!(refused
+        .body
+        .contains("None of these media types are available: text/csv"));
+
+    for accept in ["application/openapi+json", "application/json", "*/*"] {
+        let ok = send(&router, "GET", "/", &[("Accept", accept)], "").await;
+        assert_eq!(ok.status, StatusCode::OK, "{accept}: {}", ok.body);
+    }
+}
