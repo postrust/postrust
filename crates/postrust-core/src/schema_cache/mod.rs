@@ -383,6 +383,9 @@ impl SchemaCache {
         };
 
         match named(media_type) {
+            // A handler for `*/*` produces bytes of no stated type, which is
+            // reported as `application/octet-stream`, never as the wildcard.
+            Some(handler) if media_type == "*/*" => Some((handler, "application/octet-stream")),
             Some(handler) => Some((handler, media_type)),
             // `*/*` is declared on a table, so it is a table lookup too.
             None if default_select => {

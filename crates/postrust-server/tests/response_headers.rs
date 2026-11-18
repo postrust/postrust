@@ -254,3 +254,32 @@ async fn a_negative_offset_starts_at_the_first_row() {
     assert_eq!(answer.header("content-range"), Some("0-2/*"));
 }
 
+#[tokio::test]
+#[ignore = "requires DATABASE_URL"]
+async fn a_media_handler_answers_with_the_type_its_function_set() {
+    schema("handler").await;
+    let router = router("handler", false).await;
+
+    let set = send(
+        &router,
+        "GET",
+        "/api/nums",
+        &[("Accept", "magic/number")],
+        "",
+    )
+    .await;
+    assert_eq!(set.status, StatusCode::OK, "{}", set.body);
+    assert_eq!(
+        set.headers.get_all("content-type").iter().count(),
+        1,
+        "{:?}",
+        set.headers
+    );
+    assert_eq!(set.header("content-type"), Some("magic/number"));
+
+    // A wildcard is reported as the bytes it renders, not as `*/*`.
+    let any = send(&router, "GET", "/api/nums", &[("Accept", "*/*")], "").await;
+    assert_eq!(any.status, StatusCode::OK, "{}", any.body);
+    assert_eq!(any.header("content-type"), Some("application/octet-stream"));
+}
+
