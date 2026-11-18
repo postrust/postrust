@@ -307,6 +307,13 @@ pub enum Error {
     #[error("Query result exceeds max-affected preference constraint")]
     MaxAffectedExceeded(i64),
 
+    /// `max-affected` with `handling=strict` on a function that returns one
+    /// value rather than a set: there are no rows to count.
+    #[error(
+        "Function must return SETOF or TABLE when max-affected preference is used with handling=strict"
+    )]
+    MaxAffectedRpcViolation,
+
     /// Preferences the server does not know, sent with `handling=strict`.
     ///
     /// Strict handling is a request to be told rather than have them ignored.
@@ -396,6 +403,7 @@ impl Error {
             | Self::PutLimitNotAllowed
             | Self::PutMatchingPk
             | Self::MaxAffectedExceeded(_)
+            | Self::MaxAffectedRpcViolation
             | Self::InvalidPlan(_)
             | Self::EmbeddingError(_)
             | Self::AggregatesNotAllowed
@@ -502,6 +510,7 @@ impl Error {
             Self::PutLimitNotAllowed => "PGRST114",
             Self::PutMatchingPk => "PGRST115",
             Self::MaxAffectedExceeded(_) => "PGRST124",
+            Self::MaxAffectedRpcViolation => "PGRST128",
             Self::RaiseNotUnderstood(_) => "PGRST121",
             Self::InvalidGucHeaders => "PGRST111",
             Self::InvalidGucStatus => "PGRST112",
