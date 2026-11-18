@@ -1351,11 +1351,21 @@ async fn execute_plan<'s, S: State>(
                     total,
                 );
 
+                // What the handler (or the function) set for the response:
+                // PostgREST reads the settings after every statement, and a
+                // handler is exactly where a `Content-Type` of its own is
+                // chosen. One more statement on the same transaction, and
+                // only on this path -- a handler is the one thing that can
+                // set them here.
+                let settings = tx.fetch_values(RESPONSE_SETTINGS, &[]).await?;
+                let (guc_headers, guc_status) = response_overrides(settings)?;
+
                 return Ok((
                     QueryResult {
-                        status: StatusCode::OK,
+                        status: guc_status.unwrap_or(StatusCode::OK),
                         raw_body: Some((media_type, body)),
                         content_range: Some(content_range),
+                        guc_headers,
                         ..QueryResult::default()
                     },
                     Some(tx),
@@ -1448,55 +1458,9 @@ async fn execute_plan<'s, S: State>(
                                 ))
                             }
                         };
-                        let row = first_row(settings)?;
-                        // Empty is absent. Once any transaction on this
-                        // connection has defined a custom setting, PostgreSQL
-                        // keeps the name for the rest of the session and
-                        // reports it as `''` rather than null -- so a request
-                        // that set nothing would otherwise inherit "the empty
-                        // headers" from whichever request last set some.
-                        let setting = |index: usize| {
-                            row.get(index)
-                                .and_then(serde_json::Value::as_str)
-                                .filter(|value| !value.trim().is_empty())
-                                .map(str::to_string)
-                        };
-                        (setting(0), setting(1))
+                        response_overrides(settings)?
                     }
                 };
-
-            // Both are the function's own words, so both are checked before
-            // they reach the response: a malformed one is a fault in the
-            // schema, and saying so is more use than a header the client
-            // cannot see or a status it cannot explain.
-            //
-            // That includes each name and value being one HTTP can carry. The
-            // response is only built after the commit, and a header it cannot
-            // hold -- a newline in a value, a space in a name -- failed there,
-            // where it was too late to undo the function's writes.
-            if let Some(headers) = &guc_headers {
-                let sendable =
-                    postrust_response::parse_guc_headers(headers).is_some_and(|headers| {
-                        headers.iter().all(|(name, value)| {
-                            http::HeaderName::try_from(name.as_str()).is_ok()
-                                && http::HeaderValue::try_from(value.as_str()).is_ok()
-                        })
-                    });
-                if !sendable {
-                    return Err(postrust_core::Error::InvalidGucHeaders);
-                }
-            }
-            let guc_status = match guc_status {
-                None => None,
-                Some(status) => Some(
-                    status
-                        .trim()
-                        .parse::<u16>()
-                        .ok()
-                        .and_then(|code| StatusCode::from_u16(code).ok())
-                        .ok_or(postrust_core::Error::InvalidGucStatus)?,
-                ),
-            };
 
             // The count runs on the same transaction and so under the same
             // snapshot as the page it describes.
@@ -1850,6 +1814,61 @@ fn query_error_log(e: &postrust_core::db::DbError) -> QueryErrorLog {
         true => QueryErrorLog::Refused(status),
         false => QueryErrorLog::Fault,
     }
+}
+
+/// What the function set for the response: its headers and its status, from
+/// the rows [`RESPONSE_SETTINGS`] returned, and checked.
+fn response_overrides(
+    settings: Vec<Vec<serde_json::Value>>,
+) -> Result<(Option<String>, Option<StatusCode>), postrust_core::Error> {
+    let row = first_row(settings)?;
+    // Empty is absent. Once any transaction on this
+    // connection has defined a custom setting, PostgreSQL
+    // keeps the name for the rest of the session and
+    // reports it as `''` rather than null -- so a request
+    // that set nothing would otherwise inherit "the empty
+    // headers" from whichever request last set some.
+    let setting = |index: usize| {
+        row.get(index)
+            .and_then(serde_json::Value::as_str)
+            .filter(|value| !value.trim().is_empty())
+            .map(str::to_string)
+    };
+    let (guc_headers, guc_status) = (setting(0), setting(1));
+
+    // Both are the function's own words, so both are checked before
+    // they reach the response: a malformed one is a fault in the
+    // schema, and saying so is more use than a header the client
+    // cannot see or a status it cannot explain.
+    //
+    // That includes each name and value being one HTTP can carry. The
+    // response is only built after the commit, and a header it cannot
+    // hold -- a newline in a value, a space in a name -- failed there,
+    // where it was too late to undo the function's writes.
+    if let Some(headers) = &guc_headers {
+        let sendable = postrust_response::parse_guc_headers(headers).is_some_and(|headers| {
+            headers.iter().all(|(name, value)| {
+                http::HeaderName::try_from(name.as_str()).is_ok()
+                    && http::HeaderValue::try_from(value.as_str()).is_ok()
+            })
+        });
+        if !sendable {
+            return Err(postrust_core::Error::InvalidGucHeaders);
+        }
+    }
+    let guc_status = match guc_status {
+        None => None,
+        Some(status) => Some(
+            status
+                .trim()
+                .parse::<u16>()
+                .ok()
+                .and_then(|code| StatusCode::from_u16(code).ok())
+                .ok_or(postrust_core::Error::InvalidGucStatus)?,
+        ),
+    };
+
+    Ok((guc_headers, guc_status))
 }
 
 /// A function's response settings, read back after it ran.

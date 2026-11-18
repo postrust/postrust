@@ -264,16 +264,6 @@ fn strip_nulls(value: serde_json::Value) -> serde_json::Value {
 
 /// Add common response headers.
 fn add_common_headers(response: &mut Response, request: &ApiRequest, result: &QueryResult) {
-    // A function's own headers, added rather than replaced: the shape of the
-    // setting is an array precisely so that a name may repeat.
-    if let Some(guc) = &result.guc_headers {
-        if let Some(headers) = crate::headers::parse_guc_headers(guc) {
-            for (name, value) in headers {
-                response.append_header(&name, &value);
-            }
-        }
-    }
-
     // Content-Range
     if let Some(range) = &result.content_range {
         response.set_content_range(range);
@@ -300,6 +290,26 @@ fn add_common_headers(response: &mut Response, request: &ApiRequest, result: &Qu
     // Content-Profile
     if request.negotiated_by_profile {
         response.set_header("content-profile", &request.schema);
+    }
+
+    // A function's own headers go last, and a name it sets replaces the
+    // built-in of that name (PostgREST's `addHeadersIfNotIncluded`): a
+    // `Content-Type` the function chose is the one sent, not a second one
+    // beside ours. Within the function's own headers a name may still repeat
+    // -- two `Set-Cookie`s -- since the shape of the setting is an array
+    // precisely so that it can.
+    if let Some(guc) = &result.guc_headers {
+        if let Some(headers) = crate::headers::parse_guc_headers(guc) {
+            let mut replaced = std::collections::HashSet::new();
+            for (name, value) in headers {
+                if let Ok(header_name) = http::header::HeaderName::from_bytes(name.as_bytes()) {
+                    if replaced.insert(header_name.clone()) {
+                        response.headers.remove(&header_name);
+                    }
+                }
+                response.append_header(&name, &value);
+            }
+        }
     }
 }
 
