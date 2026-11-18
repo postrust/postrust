@@ -456,21 +456,11 @@ impl EmbedPlan {
             None => match &self.junction {
                 // Two hops: the child is reached through the table that joins
                 // it to the parent, so the correlation lands on the junction.
-                Some(junction) => {
-                    let junction_alias = format!("{}_j", child_alias);
-                    format!(
-                        "SELECT {} FROM {}.{} AS {} JOIN {}.{} AS {} ON {} WHERE {}",
-                        inner_select,
-                        postrust_sql::escape_ident(&self.foreign_schema),
-                        postrust_sql::escape_ident(&self.foreign_table),
-                        postrust_sql::escape_ident(child_alias),
-                        postrust_sql::escape_ident(&junction.schema),
-                        postrust_sql::escape_ident(&junction.table),
-                        postrust_sql::escape_ident(&junction_alias),
-                        junction.child_join(&junction_alias, child_alias),
-                        junction.parent_correlation(&junction_alias, parent_alias),
-                    )
-                }
+                Some(junction) => format!(
+                    "SELECT {} FROM {}",
+                    inner_select,
+                    self.junction_source(junction, parent_alias, child_alias),
+                ),
                 None => format!(
                     "SELECT {} FROM {}.{} AS {} WHERE {}",
                     inner_select,
@@ -510,6 +500,39 @@ impl EmbedPlan {
         }
 
         Ok(inner)
+    }
+
+    /// The `FROM` source of a many-to-many hop, up to and including `WHERE true`.
+    ///
+    /// PostgREST joins child to junction, which makes a column both tables
+    /// have (`name`, `user_id`) ambiguous for the bare identifiers the select
+    /// list, filters and order write. Only the child's columns may be in
+    /// scope, so the junction sits in a lateral subselect that exposes none
+    /// of them. It is a join rather than `EXISTS`/`IN`: a child reached
+    /// through two junction rows appears twice, as it does in PostgREST.
+    ///
+    /// The aliases differ from the `{child}_j` that `embed_expression` gives
+    /// the row-to-json wrapper, so the two can never clash.
+    fn junction_source(
+        &self,
+        junction: &EmbedJunction,
+        parent_alias: &str,
+        child_alias: &str,
+    ) -> String {
+        let junction_alias = format!("{}_jx", child_alias);
+        let lateral_alias = format!("{}_jl", child_alias);
+        format!(
+            "{}.{} AS {} CROSS JOIN LATERAL (SELECT 1 FROM {}.{} AS {} WHERE {} AND {}) AS {} WHERE true",
+            postrust_sql::escape_ident(&self.foreign_schema),
+            postrust_sql::escape_ident(&self.foreign_table),
+            postrust_sql::escape_ident(child_alias),
+            postrust_sql::escape_ident(&junction.schema),
+            postrust_sql::escape_ident(&junction.table),
+            postrust_sql::escape_ident(&junction_alias),
+            junction.child_join(&junction_alias, child_alias),
+            junction.parent_correlation(&junction_alias, parent_alias),
+            postrust_sql::escape_ident(&lateral_alias),
+        )
     }
 
     /// A correlated subselect that yields this relationship as one JSON column.
@@ -642,20 +665,7 @@ impl EmbedPlan {
                 parent_row,
                 postrust_sql::escape_ident(child_alias),
             ),
-            (None, Some(junction)) => {
-                let junction_alias = format!("{}_j", child_alias);
-                format!(
-                    "{}.{} AS {} JOIN {}.{} AS {} ON {} WHERE {}",
-                    postrust_sql::escape_ident(&self.foreign_schema),
-                    postrust_sql::escape_ident(&self.foreign_table),
-                    postrust_sql::escape_ident(child_alias),
-                    postrust_sql::escape_ident(&junction.schema),
-                    postrust_sql::escape_ident(&junction.table),
-                    postrust_sql::escape_ident(&junction_alias),
-                    junction.child_join(&junction_alias, child_alias),
-                    junction.parent_correlation(&junction_alias, parent_alias),
-                )
-            }
+            (None, Some(junction)) => self.junction_source(junction, parent_alias, child_alias),
             (None, None) => format!(
                 "{}.{} AS {} WHERE {}",
                 postrust_sql::escape_ident(&self.foreign_schema),
@@ -692,20 +702,10 @@ impl EmbedPlan {
                 postrust_sql::escape_ident(child_alias),
             ),
             None => match &self.junction {
-                Some(junction) => {
-                    let junction_alias = format!("{}_j", child_alias);
-                    format!(
-                        "EXISTS (SELECT 1 FROM {}.{} AS {} JOIN {}.{} AS {} ON {} WHERE {}",
-                        postrust_sql::escape_ident(&self.foreign_schema),
-                        postrust_sql::escape_ident(&self.foreign_table),
-                        postrust_sql::escape_ident(child_alias),
-                        postrust_sql::escape_ident(&junction.schema),
-                        postrust_sql::escape_ident(&junction.table),
-                        postrust_sql::escape_ident(&junction_alias),
-                        junction.child_join(&junction_alias, child_alias),
-                        junction.parent_correlation(&junction_alias, parent_alias),
-                    )
-                }
+                Some(junction) => format!(
+                    "EXISTS (SELECT 1 FROM {}",
+                    self.junction_source(junction, parent_alias, child_alias),
+                ),
                 None => format!(
                     "EXISTS (SELECT 1 FROM {}.{} AS {} WHERE {}",
                     postrust_sql::escape_ident(&self.foreign_schema),
@@ -950,6 +950,54 @@ mod tests {
             junction: None,
             function: None,
         }
+    }
+
+    #[test]
+    fn a_junction_hop_keeps_only_the_childs_columns_in_scope() {
+        let mut p = plan(true);
+        p.foreign_table = "jobs".into();
+        p.junction = Some(EmbedJunction {
+            schema: "public".into(),
+            table: "big_projects".into(),
+            parent_columns: vec![("id".into(), "project_id".into())],
+            child_columns: vec![("job_id".into(), "id".into())],
+        });
+        let rows = p
+            .correlated_rows("p", "\"p\"", "jobs", "jobs.*", None, 0, None, None, None)
+            .unwrap();
+        // The junction hides in a lateral subselect, so `name` (on both
+        // tables) is not ambiguous; it is a join, so duplicates stay.
+        assert!(
+            rows.contains("CROSS JOIN LATERAL (SELECT 1 FROM"),
+            "{}",
+            rows
+        );
+        assert!(
+            !rows.contains(" JOIN \"public\".\"big_projects\" AS"),
+            "{}",
+            rows
+        );
+        assert!(
+            !rows.contains("EXISTS") && !rows.contains(" IN ("),
+            "{}",
+            rows
+        );
+        assert!(
+            rows.contains(r#""jobs_jx"."project_id" = "p"."id""#),
+            "{}",
+            rows
+        );
+        assert!(rows.ends_with("WHERE true"), "{}", rows);
+        let order = p.order_expression("p", "\"p\"", "jobs", "\"name\"");
+        assert!(order.contains("CROSS JOIN LATERAL"), "{}", order);
+        let inner = p.inner_join_predicate("p", "\"p\"", "jobs", None);
+        assert!(
+            inner.starts_with(
+                "EXISTS (SELECT 1 FROM \"public\".\"jobs\" AS \"jobs\" CROSS JOIN LATERAL"
+            ),
+            "{}",
+            inner
+        );
     }
 
     #[test]
