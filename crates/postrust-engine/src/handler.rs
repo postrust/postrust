@@ -3949,6 +3949,7 @@ fn sanitize_error_message(error: &postrust_core::Error) -> String {
         | Error::PutLimitNotAllowed
         | Error::PutMatchingPk
         | Error::MaxAffectedExceeded(_)
+        | Error::MaxAffectedRpcViolation
         | Error::InvalidGucHeaders
         | Error::InvalidGucStatus
         | Error::InvalidMediaType(_)
@@ -3960,7 +3961,6 @@ fn sanitize_error_message(error: &postrust_core::Error) -> String {
         // API publishes. Neither is the schema's.
         | Error::UnparsableQuery { .. }
         // Says nothing about the schema beyond that one RAISE is malformed,
-        | Error::MaxAffectedRpcViolation
         // which is what the author has to fix.
         | Error::RaiseNotUnderstood(_)
         | Error::InvalidResourcePath => return error.to_string(),
