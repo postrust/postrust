@@ -178,17 +178,41 @@ export default component$(() => {
             <span class="rounded border border-neutral-200 bg-neutral-100 px-2 py-0.5 text-xs font-semibold text-neutral-800">
               MINOR
             </span>
-            <span class="text-sm text-neutral-500">
-              Errors for an API that replaces another
-            </span>
+            <span class="text-sm text-neutral-500">Closer to PostgREST</span>
           </div>
           <h1 class="mb-4 text-4xl font-bold text-neutral-900">
             Postrust {LATEST}
           </h1>
           <p class="mb-4 max-w-2xl text-lg text-neutral-600">
-            Error handling for an API that replaces another. A missing grant is
-            a 403 for a signed-in caller rather than a 401 that signs them out,
-            as PostgREST answers it. A function that finds nothing (
+            PostgREST conformance goes from 1414 to {pg.fullContract.passed} of{" "}
+            {pg.cases} cases on the full contract, and every status code agrees.
+            Most of the difference was bugs, fixed in both modes: embeds through
+            junctions and views, headers such as the count after a write and a
+            handler&rsquo;s own <code class="text-base">Content-Type</code>,
+            representations and casts inside embeds, upsert statuses on views
+            and partitions. The rest is PostgREST behaviour that compatibility
+            mode now matches and default mode keeps away from on purpose, such
+            as a <code class="text-base">select</code> cut short at a stray
+            character. A view now inherits its table&rsquo;s primary key, and a{" "}
+            <code class="text-base">RETURNS TABLE</code> function honours{" "}
+            <code class="text-base">select</code>; the{" "}
+            <a
+              href="https://github.com/postrust/postrust/blob/main/CHANGELOG.md"
+              class="text-primary-600 hover:underline"
+            >
+              changelog
+            </a>{" "}
+            lists what that changes. GraphQL: an enum value beginning with{" "}
+            <code class="text-base">null</code>,{" "}
+            <code class="text-base">true</code> or{" "}
+            <code class="text-base">false</code> parses, which brings Hasura
+            conformance to {hg.fullBody.passed} of {hg.cases}. Released beside
+            it: <code class="text-base">postrust-worker</code> 1.4.0.
+          </p>
+          <p class="mb-4 max-w-2xl text-lg text-neutral-600">
+            3.3.0: error handling for an API that replaces another. A missing
+            grant is a 403 for a signed-in caller rather than a 401 that signs
+            them out, as PostgREST answers it. A function that finds nothing (
             <code class="text-base">P0002</code>) is a 404, and{" "}
             <code class="text-base">PGRST_DB_ERROR_STATUS</code> sets the status
             of any SQLSTATE. A{" "}

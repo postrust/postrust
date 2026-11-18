@@ -9,7 +9,8 @@ words, so that those clients keep working without being changed.
 Do not turn it on for a new application, or because one of its behaviours is
 wanted. Several of the things it matches are PostgREST quirks that Postrust
 avoids by default -- a `jsonb` response with a stray byte in front of it, an
-`/` that is an API call instead of a directory of endpoints -- and the
+`/` that is an API call instead of a directory of endpoints, a `select` whose
+tail is discarded without a word -- and the
 behaviours that are worth having can be had one at a time; see
 [Taking one behaviour without the rest](#taking-one-behaviour-without-the-rest).
 
@@ -44,6 +45,12 @@ warning naming the route and saying the table is still served at `/api/<table>`.
 | Database errors | Sanitised message and a Postrust code | PostgreSQL's SQLSTATE, message, details and hint | `PGRST_DB_ERRORS_VERBATIM` |
 | Error statuses | Mapped by SQLSTATE, with `P0002` a 404 | The same, except that `P0002` is a 500 | `PGRST_DB_ERROR_STATUS` |
 | `jsonb` from a media-type handler | The JSON, as it is | A `0x01` byte in front of it | Nothing |
+| Text after the last item of `select` (`select=name,projects(count)'`) | Refused, `PGRST100` | Dropped, as PostgREST's parser drops it; a tail that starts with `,` is still refused | Nothing |
+| An unknown column in `select` | 400 `PGRST204`, naming the table | 400 `42703` in PostgreSQL's words, since PostgREST does not check the column | Nothing |
+| `Allow` on a 405 | Sent, as RFC 9110 requires | Not sent | Nothing |
+| `Allow` on a CORS preflight | Sent | Not sent: the preflight is answered without looking the resource up | Nothing |
+| Response type for `Accept: application/vnd.pgrst.array+json` | That type | `application/json`, or `application/vnd.pgrst.array+json;nulls=stripped` when that was asked for | Nothing |
+| `GET /` with an `Accept` other than JSON, OpenAPI or `*/*` | The directory, as JSON | 406 `PGRST107` | Nothing |
 | OpenAPI document | Paths with the `/api` prefix | Paths without it | Nothing |
 | `OPTIONS` preflight | Answers for paths under `/api` | Also answers for the REST paths at the root | Nothing |
 | Object key order | Alphabetical | Alphabetical, unless built with `compat-key-order` | The build feature; independent of the mode |
@@ -155,6 +162,11 @@ Going on, from a default deployment:
 - **Media handlers.** A `jsonb` result from a media-type handler gains the
   `0x01` byte; a client that parses it as JSON will refuse it.
 - **OpenAPI.** Generated clients see paths without `/api`; regenerate them.
+- **`select`.** Text after the last item is discarded instead of refused, so
+  a typo such as `select=id)name` returns `id` alone where it used to be a 400.
+- **`Allow`.** A 405 and a CORS preflight no longer carry it. Nothing in a
+  browser reads it from a preflight; a client that reads it from a 405 should
+  send `OPTIONS` instead, which answers with it in both modes.
 
 Going off is the same list reversed. The paths at the root stop answering, so
 look for clients still using them in your access logs first, and move the

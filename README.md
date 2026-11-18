@@ -722,8 +722,9 @@ lists every one.
 How closely the two agree is measured rather than asserted: the harness in
 `scripts/conformance/` replays PostgREST's own test cases over HTTP against
 both servers on identically loaded fixture databases. Over 1499 cases against
-PostgREST v16.1, **96.7% agree on status and body, and 94.9% on the full
-contract** — status, body, and every header that is part of the answer. See
+PostgREST v16.1, **every status code agrees, 99.3% agree on status and body,
+and 99.1% on the full contract** — status, body, and every header that is part
+of the answer. See
 [PostgREST conformance](docs/postgrest-conformance.md) for what that covers,
 where the two disagree on purpose, and what is still open.
 

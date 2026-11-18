@@ -8,11 +8,17 @@ harness itself, divergences kept on purpose, and the gaps still open.
 
 | | status | same outcome | same data | full body |
 |---|---|---|---|---|
-| all (468) | 100.0% | 99.6% | **97.4%** | 96.6% |
+| all (468) | 100.0% | 99.8% | **97.6%** | 97.2% |
 | reads (271) | 100.0% | 99.6% | 95.9% | 95.6% |
-| writes (197) | 100.0% | 99.5% | **99.5%** | 98.0% |
+| writes (197) | 100.0% | 100.0% | **100.0%** | 99.5% |
 
-Of the 456 cases the third column counts, **325 agree about data and 131 agree
+Run 79, Postrust 3.4.0 (commit `1bb4dce`; the one commit after it on the
+release branch touches the REST pipeline only). It closed one case, the enum
+value beginning with `null` (item 3 below), and moved nothing else: 455 bodies
+match in full where run 78 matched 454, and the 13 left are the ones listed as
+open, by choice or out of reach.
+
+Of the 457 cases the third column counts, **326 agree about data and 131 agree
 only because both servers answered with errors.** No case is left where Hasura
 refused and this server answered -- down from 115 before the permission layer
 existed.
@@ -382,10 +388,19 @@ The 16 cases that diverge, and why each does. Ten of them are one item.
    literals, where the specification excludes only the three tokens
    themselves. So `nullPrefixTestTable_pkey` is not lexed as an enum value and
    an upsert naming that constraint is answered with a parse error. Identical
-   in 7.2.1, so an upgrade does not carry the fix. One case, and closing it
-   means either a patched fork of the parser or rewriting the document text
-   and restoring every name in the parsed tree -- machinery that could corrupt
-   a document that was valid to begin with.
+   in 7.2.1, so an upgrade does not carry the fix.
+
+   **Closed in 3.4.0 by a patched copy of the parser**, vendored at
+   `vendor/async-graphql-parser` and wired in with `[patch.crates-io]`. The
+   one-line lookahead the first draft of the patch used did not work: in
+   `value`, `boolean | null | enum_value` tries the literal first, and `null`
+   matches the front of `nullPrefix...` before `enum_value` is reached. The
+   fix makes the literals themselves refuse to be a prefix, `null = @{ "null"
+   ~ !name_continue }`, and regenerates the checked-in parser.
+   `scripts/check-vendored-parser.sh` proves in CI that the copy is the
+   published crate plus `patches/async-graphql-parser-enum-value.patch` and
+   nothing else. Crates installed from crates.io do not get the patch, since
+   `[patch]` is not published; the fix belongs upstream.
 
 4. **Four cases that are not this server's to close.** Two are the `pg_dump`
    constraint-order artefact under the harness above: two databases naming
