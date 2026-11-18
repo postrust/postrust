@@ -7,7 +7,8 @@ use http::{Response, StatusCode};
 use http_body_util::BodyExt;
 use postrust_core::db::{Db, Tx};
 use postrust_core::{
-    create_action_plan, parse_request, ActionPlan, ApiRequest, CallPlan, DbActionPlan,
+    create_action_plan, parse_request, parse_request_with, ActionPlan, ApiRequest, CallPlan,
+    DbActionPlan,
 };
 use postrust_response::{format_response, QueryResult, Response as PgrstResponse};
 use tracing::{debug, debug_span, error, field::Empty, Instrument};
@@ -164,11 +165,12 @@ where
         .map_err(|e| postrust_core::Error::Internal(e.to_string()))?;
 
     // Parse API request
-    let mut api_request = parse_request(
+    let mut api_request = parse_request_with(
         &http_request,
         state.default_schema(),
         state.schemas(),
         state.config().db_max_rows,
+        state.config().compat_mode,
     )?;
     // For the database's `request.trace_id`. The host put the context in the
     // extensions; `parse_request` saw a request rebuilt without them.
@@ -235,7 +237,26 @@ where
     }
 
     // Create execution plan
-    let plan = debug_span!("plan").in_scope(|| create_action_plan(&api_request, &schema_cache))?;
+    let compat_mode = state.config().compat_mode;
+    let plan = debug_span!("plan")
+        .in_scope(|| create_action_plan(&api_request, &schema_cache))
+        .map_err(|error| match error {
+            // PostgREST has no schema-cache check for a `select` column: the
+            // name goes into the statement, and the database's own error comes
+            // back -- `42703`, naming the table it looked in.
+            postrust_core::Error::ColumnNotFound(column) if compat_mode && column.contains('.') => {
+                postrust_core::Error::Database(postrust_core::error::DatabaseError {
+                    code: "42703".to_string(),
+                    message: format!("column {column} does not exist"),
+                    details: None,
+                    hint: None,
+                    constraint: None,
+                    table: None,
+                    column: None,
+                })
+            }
+            other => other,
+        })?;
 
     // Released before the query runs, not held through it. tokio's `RwLock`
     // queues a reader behind any writer already waiting, so a schema reload
@@ -2705,7 +2726,25 @@ fn shift_placeholders(sql: &str, offset: usize) -> String {
     let mut out = String::with_capacity(sql.len());
     let mut chars = sql.char_indices().peekable();
 
+    // Inside a quoted literal or identifier a `$` is text: a `like` operand
+    // is written into the statement rather than bound, and `'%$1'` is a
+    // pattern, not a placeholder. A doubled quote closes and reopens, so the
+    // toggle needs no special case for it.
+    let mut quote: Option<char> = None;
+
     while let Some((i, ch)) = chars.next() {
+        if let Some(open) = quote {
+            out.push(ch);
+            if ch == open {
+                quote = None;
+            }
+            continue;
+        }
+        if ch == '\'' || ch == '"' {
+            quote = Some(ch);
+            out.push(ch);
+            continue;
+        }
         if ch != '$' {
             out.push(ch);
             continue;
@@ -2756,26 +2795,78 @@ impl EmbedFilters<'_> {
         (limit, offset)
     }
 
+    /// The existence tests for `?child.grandchild=is.null` and
+    /// `?child.or=(a.not.is.null,b.not.is.null)`: filters at this embed's path
+    /// that name embeds of it. `filterable` is what the embed's own level
+    /// recorded, so these are built once that level exists.
+    fn embed_null_predicates(
+        &self,
+        path: &[String],
+        names: &[String],
+        embeds: &[String],
+        filterable: &[(String, String)],
+    ) -> Vec<String> {
+        let addresses = |candidate: &[String]| candidate == path || candidate == names;
+        let mut predicates = Vec::new();
+
+        for (_, filter) in self.filters.iter().filter(|(p, _)| addresses(p)) {
+            if !is_embed_null_filter(filter, embeds) {
+                continue;
+            }
+            let Some((_, exists)) = filterable
+                .iter()
+                .find(|(name, _)| name == &filter.field.name)
+            else {
+                continue;
+            };
+            let negated = match &filter.op_expr.operation {
+                postrust_core::api_request::Operation::Is(
+                    postrust_core::api_request::IsValue::Null,
+                ) => filter.op_expr.negated,
+                _ => !filter.op_expr.negated,
+            };
+            predicates.push(match negated {
+                true => exists.clone(),
+                false => format!("NOT {}", exists),
+            });
+        }
+        for (_, tree) in self.logic.iter().filter(|(p, _)| addresses(p)) {
+            if !tree.names_only(embeds) {
+                continue;
+            }
+            if let Some(predicate) = embed_logic_predicate(tree, filterable) {
+                predicates.push(predicate);
+            }
+        }
+        predicates
+    }
+
     fn predicate_for(
         &mut self,
         path: &[String],
         names: &[String],
         child_qi: &postrust_core::api_request::QualifiedIdentifier,
+        embeds: &[String],
         schema_cache: &postrust_core::SchemaCache,
     ) -> Result<Option<String>, postrust_core::Error> {
         let addresses = |candidate: &[String]| candidate == path || candidate == names;
 
+        // What names an embed of this resource, rather than one of its
+        // columns, is an existence test that can only be built once the embed
+        // is in scope: see `embed_null_predicates`.
         let matching: Vec<_> = self
             .filters
             .iter()
             .filter(|(filter_path, _)| addresses(filter_path))
             .map(|(_, filter)| filter.clone())
+            .filter(|filter| !is_embed_null_filter(filter, embeds))
             .collect();
 
         let matching_logic: Vec<_> = self
             .logic
             .iter()
             .filter(|(logic_path, _)| addresses(logic_path))
+            .filter(|(_, tree)| !tree.names_only(embeds))
             .map(|(_, tree)| tree.clone())
             .collect();
 
@@ -2800,8 +2891,13 @@ impl EmbedFilters<'_> {
                     ))
                 })?;
 
-            let frag =
-                postrust_core::query::QueryBuilder::filter_sql(filter, &column.nominal_type)?;
+            // The column's own spelling of a value, where its schema declared
+            // one: the same parser a filter at the top level reads it with.
+            let frag = postrust_core::query::QueryBuilder::filter_sql_with(
+                filter,
+                &column.nominal_type,
+                schema_cache.representation("text", column.representation_type()),
+            )?;
             parts.push(shift_placeholders(
                 frag.sql(),
                 self.base + self.params.len(),
@@ -2828,7 +2924,13 @@ impl EmbedFilters<'_> {
                     .map(|c| c.nominal_type.clone())
                     .unwrap_or_else(|| "text".to_string())
             };
-            let frag = postrust_core::query::QueryBuilder::logic_sql(&tree, resolver)?;
+            let parser = |name: &str| -> Option<String> {
+                table
+                    .and_then(|t| t.get_column(name))
+                    .and_then(|c| schema_cache.representation("text", c.representation_type()))
+                    .map(str::to_string)
+            };
+            let frag = postrust_core::query::QueryBuilder::logic_sql_with(&tree, resolver, parser)?;
             parts.push(shift_placeholders(
                 frag.sql(),
                 self.base + self.params.len(),
@@ -2838,6 +2940,17 @@ impl EmbedFilters<'_> {
 
         Ok(Some(format!("({})", parts.join(" AND "))))
     }
+}
+
+/// Whether a filter asks if one of `embeds` matched anything: `is.null` or
+/// `not.is.null` on the name an embed goes by.
+fn is_embed_null_filter(filter: &postrust_core::api_request::Filter, embeds: &[String]) -> bool {
+    use postrust_core::api_request::{IsValue, Operation};
+    embeds.contains(&filter.field.name)
+        && matches!(
+            filter.op_expr.operation,
+            Operation::Is(IsValue::Null) | Operation::Is(IsValue::NotNull)
+        )
 }
 
 /// Record the first column a logic tree names that the table does not have.
@@ -3234,7 +3347,21 @@ fn embed_order_sql(
         };
 
         let mut sql = match term {
-            OrderTerm::Field { .. } => postrust_sql::escape_ident(&field.name),
+            OrderTerm::Field { .. } => {
+                // Qualified with the child's alias and carrying the term's
+                // JSON path: `order=data->>x` orders by what the path reaches,
+                // not by the column that holds it.
+                let pg_type = schema_cache
+                    .get_table(child_qi)
+                    .and_then(|table| table.get_column(&field.name))
+                    .map(|column| column.data_type.clone())
+                    .unwrap_or_default();
+                let coercible = postrust_core::plan::CoercibleField::from_field(field, &pg_type);
+                postrust_core::query::QueryBuilder::qualified_column_sql(
+                    Some(child_alias),
+                    &coercible,
+                )
+            }
             OrderTerm::Relation { relation, .. } => {
                 let (plan, grandchild_alias, grandchild_qi) =
                     related_order_target(schema_cache, child_qi, child_select, relation, ctx)?;
@@ -3352,7 +3479,14 @@ fn build_embed_expressions(
         child_path.push(alias.clone().unwrap_or_else(|| relation.clone()));
         let mut child_names = names.to_vec();
         child_names.push(relation.clone());
-        let child_where = ctx.predicate_for(&child_path, &child_names, &child_qi, schema_cache)?;
+        let child_embeds = postrust_core::api_request::embedded_names(child_select);
+        let child_where = ctx.predicate_for(
+            &child_path,
+            &child_names,
+            &child_qi,
+            &child_embeds,
+            schema_cache,
+        )?;
 
         // Deeper relations first: they become part of this level's SELECT list.
         let child_row = postrust_sql::escape_ident(&child_alias);
@@ -3369,15 +3503,22 @@ fn build_embed_expressions(
 
         // A nested `!inner` is written against this child's alias, which is
         // only in scope inside this child's own subselect -- so it narrows the
-        // child here rather than travelling up to the top-level wrapper.
-        let child_where = match (child_where, nested.inner_joins.is_empty()) {
+        // child here rather than travelling up to the top-level wrapper. So
+        // does a filter on whether a nested embed matched, which needs that
+        // embed in scope too.
+        let mut narrowing = nested.inner_joins.clone();
+        narrowing.extend(ctx.embed_null_predicates(
+            &child_path,
+            &child_names,
+            &child_embeds,
+            &nested.filterable,
+        ));
+        let child_where = match (child_where, narrowing.is_empty()) {
             (existing, true) => existing,
-            (Some(existing), false) => Some(format!(
-                "{} AND {}",
-                existing,
-                nested.inner_joins.join(" AND ")
-            )),
-            (None, false) => Some(nested.inner_joins.join(" AND ")),
+            (Some(existing), false) => {
+                Some(format!("{} AND {}", existing, narrowing.join(" AND ")))
+            }
+            (None, false) => Some(narrowing.join(" AND ")),
         };
 
         // `!inner` on this relation restricts the parent rows. It is emitted
@@ -3438,7 +3579,41 @@ fn build_embed_expressions(
         }
         if project_everything {
             parts.clear();
-            parts.push(format!("{}.*", postrust_sql::escape_ident(&child_alias)));
+            // `*` is every column, and a column whose schema declared how it
+            // is written on the wire is written that way wherever it appears
+            // -- so with any such column the star is spelled out, each one
+            // through its own function. Without one it stays `alias.*`.
+            let alias = postrust_sql::escape_ident(&child_alias);
+            let rendered: Vec<(String, Option<&str>)> = child_table
+                .map(|table| {
+                    table
+                        .columns
+                        .iter()
+                        .map(|(name, column)| {
+                            (
+                                name.clone(),
+                                schema_cache.representation(column.representation_type(), "json"),
+                            )
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+            if rendered.iter().any(|(_, function)| function.is_some()) {
+                for (name, function) in rendered {
+                    let column = format!("{}.{}", alias, postrust_sql::escape_ident(&name));
+                    parts.push(match function {
+                        Some(function) => format!(
+                            "{}({}) AS {}",
+                            function,
+                            column,
+                            postrust_sql::escape_ident(&name)
+                        ),
+                        None => column,
+                    });
+                }
+            } else {
+                parts.push(format!("{}.*", alias));
+            }
         }
         for (field_name, expression) in nested_expressions {
             parts.push(format!(
@@ -4127,6 +4302,20 @@ fn sanitize_error_message(error: &postrust_core::Error) -> String {
 
 #[cfg(test)]
 mod tests {
+    /// A `$1` inside a quoted literal is text, so renumbering leaves it be.
+    #[test]
+    fn placeholders_in_literals_are_not_renumbered() {
+        use super::shift_placeholders;
+        assert_eq!(
+            shift_placeholders("a = $1 AND b ~~ '%$1' AND \"c$2\" = $2", 3),
+            "a = $4 AND b ~~ '%$1' AND \"c$2\" = $5"
+        );
+        assert_eq!(
+            shift_placeholders("x ~~ 'it''s $1' AND y = $1", 1),
+            "x ~~ 'it''s $1' AND y = $2"
+        );
+    }
+
     use super::{query_error_log, QueryErrorLog};
     use http::StatusCode;
 

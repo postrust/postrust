@@ -135,6 +135,19 @@ impl QueryBuilder {
             return Ok(frag);
         }
 
+        // A cast to a type the row converter cannot read -- an array above
+        // all, `oid_array_col::_int4` -- would come back null for the same
+        // reason an unreadable column does, so the database renders the cast
+        // value: `to_jsonb(col::_int4)`.
+        let cast_as_json = field.aggregate.is_none()
+            && field
+                .cast
+                .as_deref()
+                .is_some_and(|cast| !decodable_cast(cast));
+        if cast_as_json {
+            frag.push("to_jsonb(");
+        }
+
         // Column name with JSON path.
         //
         // `::` binds tighter than `->>`, so a cast over a JSON path has to be
@@ -165,6 +178,10 @@ impl QueryBuilder {
         if let Some(cast) = &field.cast {
             frag.push("::");
             frag.push(cast);
+        }
+
+        if cast_as_json {
+            frag.push(")");
         }
 
         // Close aggregate, then any cast applied to its result.
@@ -198,6 +215,9 @@ impl QueryBuilder {
             Some(field.field.name.clone())
         } else if !field.field.json_path.is_empty() {
             Some(json_path_alias(&field.field.name, &field.field.json_path))
+        } else if cast_as_json {
+            // `to_jsonb(..)` would otherwise name the column after itself.
+            Some(field.field.name.clone())
         } else if field.field.computed.is_some() {
             // A call is an expression, and PostgreSQL would label it after the
             // function -- which is the right name, but only by coincidence of
@@ -304,7 +324,20 @@ impl QueryBuilder {
     /// responsible for having checked the column exists there -- otherwise the
     /// name would resolve outward to the correlated parent instead.
     pub fn filter_sql(filter: &crate::api_request::Filter, pg_type: &str) -> Result<SqlFragment> {
-        Self::build_filter(&CoercibleFilter::from_filter(filter, pg_type))
+        Self::filter_sql_with(filter, pg_type, None)
+    }
+
+    /// [`filter_sql`](Self::filter_sql) for a column whose schema declared how
+    /// its values are written: `parser` reads the filter's value, as it does
+    /// for a filter at the top level.
+    pub fn filter_sql_with(
+        filter: &crate::api_request::Filter,
+        pg_type: &str,
+        parser: Option<&str>,
+    ) -> Result<SqlFragment> {
+        let mut coercible = CoercibleFilter::from_filter(filter, pg_type);
+        coercible.field.transform = parser.map(str::to_string);
+        Self::build_filter(&coercible)
     }
 
     /// Build the SQL for a logic tree against a table whose column types
@@ -320,7 +353,35 @@ impl QueryBuilder {
     where
         F: Fn(&str) -> String + Copy,
     {
-        Self::build_logic_tree(&CoercibleLogicTree::from_logic_tree(tree, type_resolver))
+        Self::logic_sql_with(tree, type_resolver, |_| None)
+    }
+
+    /// [`logic_sql`](Self::logic_sql) where `parser` names, per column, the
+    /// function that reads a filter's value for it (see
+    /// [`filter_sql_with`](Self::filter_sql_with)).
+    pub fn logic_sql_with<F, P>(
+        tree: &crate::api_request::LogicTree,
+        type_resolver: F,
+        parser: P,
+    ) -> Result<SqlFragment>
+    where
+        F: Fn(&str) -> String + Copy,
+        P: Fn(&str) -> Option<String> + Copy,
+    {
+        fn attach<P: Fn(&str) -> Option<String> + Copy>(tree: &mut CoercibleLogicTree, parser: P) {
+            match tree {
+                CoercibleLogicTree::Expr { children, .. } => {
+                    children.iter_mut().for_each(|child| attach(child, parser))
+                }
+                CoercibleLogicTree::Stmt(filter) => {
+                    filter.field.transform = parser(&filter.field.name)
+                }
+                CoercibleLogicTree::NullEmbed { .. } => {}
+            }
+        }
+        let mut coercible = CoercibleLogicTree::from_logic_tree(tree, type_resolver);
+        attach(&mut coercible, parser);
+        Self::build_logic_tree(&coercible)
     }
 
     fn build_filter(filter: &CoercibleFilter) -> Result<SqlFragment> {
@@ -447,7 +508,33 @@ impl QueryBuilder {
                 frag.push(" ");
                 frag.push(op.to_sql());
                 frag.push(" ");
-                if let Some(q) = quantifier {
+                // PostgREST writes a `like`/`ilike` operand as an untyped
+                // literal (`SqlFragment.hs`), so PostgreSQL resolves the
+                // operator from the column's type and what it makes of the
+                // text -- and says `color ~~* unknown` where there is none,
+                // rather than a type this side chose. It is neither parsed by
+                // a column's representation nor cast to the column's type.
+                // The literal is quoted by `quote_literal`: a bound parameter
+                // would carry the type `text`.
+                if matches!(
+                    op,
+                    crate::api_request::QuantOperator::Like
+                        | crate::api_request::QuantOperator::ILike
+                ) {
+                    match quantifier {
+                        Some(crate::api_request::OpQuantifier::Any) => {
+                            frag.push("ANY(");
+                        }
+                        Some(crate::api_request::OpQuantifier::All) => {
+                            frag.push("ALL(");
+                        }
+                        None => {}
+                    };
+                    frag.push(&postrust_sql::quote_literal(value));
+                    if quantifier.is_some() {
+                        frag.push(")");
+                    }
+                } else if let Some(q) = quantifier {
                     match q {
                         crate::api_request::OpQuantifier::Any => frag.push("ANY("),
                         crate::api_request::OpQuantifier::All => frag.push("ALL("),
@@ -1348,6 +1435,51 @@ fn decodable_type(data_type: &str) -> bool {
     )
 }
 
+/// Whether a column cast to `cast` comes back in a type the row converter
+/// reads natively: what it maps by name, and what it reads as text.
+fn decodable_cast(cast: &str) -> bool {
+    if cast.starts_with('_') || cast.ends_with("[]") {
+        return false;
+    }
+    matches!(
+        cast.to_ascii_lowercase().as_str(),
+        "smallint"
+            | "int2"
+            | "integer"
+            | "int"
+            | "int4"
+            | "bigint"
+            | "int8"
+            | "real"
+            | "float4"
+            | "double precision"
+            | "float8"
+            | "numeric"
+            | "decimal"
+            | "boolean"
+            | "bool"
+            | "text"
+            | "varchar"
+            | "character varying"
+            | "char"
+            | "character"
+            | "bpchar"
+            | "name"
+            | "citext"
+            | "date"
+            | "time"
+            | "time without time zone"
+            | "time with time zone"
+            | "timestamp"
+            | "timestamp without time zone"
+            | "timestamp with time zone"
+            | "timestamptz"
+            | "uuid"
+            | "json"
+            | "jsonb"
+    )
+}
+
 fn castable_type(pg_type: &str) -> Option<&str> {
     if pg_type.is_empty() {
         return None;
@@ -1441,8 +1573,45 @@ mod tests {
 
     #[test]
     fn quantified_like_maps_the_wildcard_inside_the_array() {
-        let (_, params) = filter_sql_for("name=like(any).{foo*,*bar}", "text");
-        assert!(params[0].contains("{foo%,%bar}"), "got {:?}", params[0]);
+        let (sql, params) = filter_sql_for("name=like(any).{foo*,*bar}", "text");
+        assert!(sql.contains("ANY('{foo%,%bar}')"), "got {sql}");
+        assert!(params.is_empty(), "got {params:?}");
+    }
+
+    /// A `like` operand is an untyped literal, as PostgREST writes it: no
+    /// parameter, no cast to the column's type.
+    #[test]
+    fn like_operands_are_untyped_literals() {
+        let (sql, params) = filter_sql_for("name=ilike.it's*$1", "integer");
+        assert!(sql.contains("ILIKE 'it''s%$1'"), "got {sql}");
+        assert!(!sql.contains("::"), "got {sql}");
+        assert!(params.is_empty(), "got {params:?}");
+
+        let (sql, params) = filter_sql_for("name=not.like.a\\b", "text");
+        assert!(sql.contains("LIKE E'a\\\\b'"), "got {sql}");
+        assert!(params.is_empty());
+
+        // Other operators still bind.
+        let (_, params) = filter_sql_for("name=eq.x", "text");
+        assert_eq!(params.len(), 1);
+    }
+
+    /// A cast to a type the row converter cannot read is rendered by the
+    /// database; one it can read is left alone.
+    #[test]
+    fn a_cast_to_an_unreadable_type_is_rendered_as_json() {
+        let render = |cast: &str| {
+            let mut field = CoercibleSelectField::simple("nums", "integer");
+            field.cast = Some(cast.to_string());
+            QueryBuilder::build_select_field(&field)
+                .unwrap()
+                .sql()
+                .to_string()
+        };
+        assert_eq!(render("_int4"), "to_jsonb(\"nums\"::_int4) AS \"nums\"");
+        assert_eq!(render("int4[]"), "to_jsonb(\"nums\"::int4[]) AS \"nums\"");
+        assert_eq!(render("int"), "\"nums\"::int");
+        assert_eq!(render("text"), "\"nums\"::text");
     }
 
     #[test]

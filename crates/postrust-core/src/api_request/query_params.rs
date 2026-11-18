@@ -26,6 +26,17 @@ use percent_encoding::percent_decode_str;
 /// plan time, against the parameters the routine actually declares; a
 /// well-formed filter such as `id=eq.1` stays available to filter the result.
 pub fn parse_query_params(query: &str, is_rpc: bool) -> Result<QueryParams> {
+    parse_query_params_with(query, is_rpc, false)
+}
+
+/// [`parse_query_params`], optionally reading `select` the way PostgREST does
+/// when text is left over after its last item: `lenient_select` drops that
+/// tail (see [`parse_select_lenient`]).
+pub fn parse_query_params_with(
+    query: &str,
+    is_rpc: bool,
+    lenient_select: bool,
+) -> Result<QueryParams> {
     let mut params = QueryParams::default();
 
     if query.is_empty() {
@@ -104,7 +115,10 @@ pub fn parse_query_params(query: &str, is_rpc: bool) -> Result<QueryParams> {
 
         match key {
             "select" => {
-                params.select = parse_select(&decoded_value)?;
+                params.select = match lenient_select {
+                    true => parse_select_lenient(&decoded_value)?,
+                    false => parse_select(&decoded_value)?,
+                };
             }
             "columns" => {
                 params.columns = Some(parse_columns(&decoded_value)?.into_iter().collect());
@@ -210,7 +224,51 @@ pub fn parse_select(input: &str) -> Result<Vec<SelectItem>> {
     // `select=id, name, billing(address)` returned the id alone.
     match parse_select_items(input) {
         Ok(("", items)) => Ok(items),
+        // A JSON path that began (`->` or `->>` was read) and then went wrong
+        // is reported where it went wrong, as PostgREST's parser does.
+        Err(nom::Err::Failure(failure)) => Err(unreadable_json_operand(input, failure)),
         _ => Err(Error::InvalidQueryParam(format!("select={}", input))),
+    }
+}
+
+/// [`parse_select`] for compatibility mode.
+///
+/// PostgREST parses `select` without requiring that all of it was read, so a
+/// tail it cannot make sense of at the top level -- the `'` in
+/// `select=name,projects(count)'`, one `)` too many -- is dropped rather than
+/// refused. A tail that begins with `,` is still an error there: the comma was
+/// consumed as a separator, and the item that should follow it is missing.
+pub fn parse_select_lenient(input: &str) -> Result<Vec<SelectItem>> {
+    if input.is_empty() {
+        return Ok(vec![]);
+    }
+
+    check_nesting(input)?;
+
+    match parse_select_items(input) {
+        Ok((rest, items)) if rest.is_empty() || !rest.starts_with(',') => Ok(items),
+        Err(nom::Err::Failure(failure)) => Err(unreadable_json_operand(input, failure)),
+        _ => Err(Error::InvalidQueryParam(format!("select={}", input))),
+    }
+}
+
+/// The error for a JSON path operand that could not be read, with the column
+/// it stopped at and what would have been accepted there.
+fn unreadable_json_operand(whole: &str, failure: nom::error::Error<&str>) -> Error {
+    let column = whole.chars().count() - failure.input.chars().count() + 1;
+    let found = match failure.input.chars().next() {
+        Some(ch) => format!("\"{}\"", ch),
+        None => "end of input".to_string(),
+    };
+    let expected = match failure.code {
+        nom::error::ErrorKind::Digit => "digit",
+        _ => "\"-\", digit or any non reserved character different from: .,>()",
+    };
+    Error::UnparsableQuery {
+        kind: "select parameter",
+        text: whole.to_string(),
+        column,
+        expected: format!("unexpected {} expecting {}", found, expected),
     }
 }
 
@@ -1387,8 +1445,10 @@ fn parse_json_operand(input: &str) -> IResult<&str, JsonOperand> {
     }
 
     let (key, rest) = input.split_at(end);
+    // The arrow has been read, so an empty key is a failure of the path, not
+    // a step some other rule might match instead.
     if key.is_empty() {
-        return Err(nom::Err::Error(nom::error::Error::new(
+        return Err(nom::Err::Failure(nom::error::Error::new(
             input,
             nom::error::ErrorKind::TakeWhile1,
         )));
@@ -1457,6 +1517,49 @@ mod tests {
         // A quoted value's parentheses are its own.
         let quoted = format!("or=(name.eq.\"{}\")", "(".repeat(1_000));
         assert!(parse_query_params(&quoted, false).is_ok());
+    }
+
+    /// A JSON path that fails after its arrow is reported where it failed.
+    #[test]
+    fn a_bad_json_operand_is_reported_with_its_column() {
+        let explain = |select: &str| match parse_select(select) {
+            Err(Error::UnparsableQuery {
+                kind,
+                text,
+                column,
+                expected,
+            }) => (kind, text, column, expected),
+            other => panic!("{select:?}: {other:?}"),
+        };
+        let (kind, text, column, expected) = explain("data->>--34");
+        assert_eq!(kind, "select parameter");
+        assert_eq!(text, "data->>--34");
+        assert_eq!(column, 9);
+        assert_eq!(expected, "unexpected \"-\" expecting digit");
+
+        let (_, _, column, expected) = explain("data->(x");
+        assert_eq!(column, 7);
+        assert_eq!(
+            expected,
+            "unexpected \"(\" expecting \"-\", digit or any non reserved character different from: .,>()"
+        );
+    }
+
+    /// Compatibility mode drops an unreadable tail of `select`, as PostgREST
+    /// does; the default refuses it. A dangling comma is an error in both.
+    #[test]
+    fn a_select_tail_is_dropped_only_in_compat_mode() {
+        for select in ["name,projects(count)'", "id,clients(id))", "id,name!"] {
+            assert!(parse_select(select).is_err(), "{select:?}");
+            assert!(parse_select_lenient(select).is_ok(), "{select:?}");
+        }
+        assert_eq!(parse_select_lenient("name,projects(id))").unwrap().len(), 2);
+        for select in ["id,", "id,,name", "id,'"] {
+            assert!(parse_select_lenient(select).is_err(), "{select:?}");
+        }
+        let params = parse_query_params_with("select=name,projects(id))", false, true).unwrap();
+        assert_eq!(params.select.len(), 2);
+        assert!(parse_query_params_with("select=name,projects(id))", false, false).is_err());
     }
 
     #[test]

@@ -9,7 +9,7 @@ pub mod query_params;
 pub mod types;
 
 pub use preferences::parse_preferences;
-pub use query_params::{parse_query_params, value_is_filter};
+pub use query_params::{parse_query_params, parse_query_params_with, value_is_filter};
 pub use types::*;
 
 use crate::error::{Error, Result};
@@ -27,6 +27,21 @@ pub fn parse_request<B>(
     default_schema: &str,
     schemas: &[String],
     max_rows: Option<i64>,
+) -> Result<ApiRequest>
+where
+    B: AsRef<[u8]>,
+{
+    parse_request_with(req, default_schema, schemas, max_rows, false)
+}
+
+/// [`parse_request`], with `lenient_select` for compatibility mode: text left
+/// over after the last `select` item is dropped instead of refused.
+pub fn parse_request_with<B>(
+    req: &Request<B>,
+    default_schema: &str,
+    schemas: &[String],
+    max_rows: Option<i64>,
+    lenient_select: bool,
 ) -> Result<ApiRequest>
 where
     B: AsRef<[u8]>,
@@ -56,7 +71,7 @@ where
             ..
         }) | Action::RoutineInfo { .. }
     );
-    let query_params = parse_query_params(query, is_rpc)?;
+    let query_params = parse_query_params_with(query, is_rpc, lenient_select)?;
 
     // Parse preferences from Prefer header
     let preferences = parse_preferences(req.headers())?;
