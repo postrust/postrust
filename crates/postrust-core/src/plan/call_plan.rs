@@ -82,9 +82,9 @@ pub struct CallPlan {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum CallParams {
     /// Named parameters from URL query or JSON body
-    Named(Vec<(String, String)>),
+    Named(Vec<(String, Option<String>)>),
     /// Positional parameters (from JSON array)
-    Positional(Vec<String>),
+    Positional(Vec<Option<String>>),
     /// Single JSON object passed as first argument
     SingleObject(bytes::Bytes),
     /// The whole request body, as the one parameter the function does not name.
@@ -218,7 +218,7 @@ fn extract_call_params(request: &ApiRequest, routine: &Routine) -> Result<CallPa
                             .collect();
 
                         // Named parameters from JSON object
-                        let params: Vec<(String, String)> = map
+                        let params: Vec<(String, Option<String>)> = map
                             .into_iter()
                             .map(|(k, v)| {
                                 // A `json` parameter takes the body's value as
@@ -230,11 +230,16 @@ fn extract_call_params(request: &ApiRequest, routine: &Routine) -> Result<CallPa
                                 let takes_json = routine.params.iter().any(|p| {
                                     p.name == k && matches!(p.param_type.as_str(), "json" | "jsonb")
                                 });
+                                // JSON null is SQL NULL, not the empty string:
+                                // a UUID or timestamp parameter cannot parse
+                                // `''`, and PostgREST passes null through.
+                                if v.is_null() {
+                                    return (k, None);
+                                }
                                 // Extract string values without JSON quotes
                                 let value = match v {
                                     ref value if takes_json => value.to_string(),
                                     serde_json::Value::String(s) => s,
-                                    serde_json::Value::Null => String::new(),
                                     // A JSON array for a parameter the function
                                     // declares as an array is that array, not a
                                     // string spelled in JSON: `{"v":["a","b"]}`
@@ -257,7 +262,7 @@ fn extract_call_params(request: &ApiRequest, routine: &Routine) -> Result<CallPa
                                     }
                                     other => other.to_string(),
                                 };
-                                (k, value)
+                                (k, Some(value))
                             })
                             .collect();
                         return Ok(CallParams::Named(params));
@@ -312,7 +317,7 @@ fn extract_call_params(request: &ApiRequest, routine: &Routine) -> Result<CallPa
         // variadic parameter every value goes into the array it takes, and
         // for any other the last one wins -- repeating it cannot mean asking
         // for two values where the signature has room for one.
-        let args: Vec<(String, String)> = args
+        let args: Vec<(String, Option<String>)> = args
             .into_iter()
             .map(|(name, values)| {
                 let variadic = routine.params.iter().any(|p| p.name == name && p.variadic);
@@ -320,7 +325,7 @@ fn extract_call_params(request: &ApiRequest, routine: &Routine) -> Result<CallPa
                     true => array_literal(&values),
                     false => values.last().cloned().unwrap_or_default(),
                 };
-                (name, value)
+                (name, Some(value))
             })
             .collect();
 
@@ -355,7 +360,7 @@ fn named_arguments(
         }
     }
 
-    let args: Vec<(String, String)> = grouped
+    let args: Vec<(String, Option<String>)> = grouped
         .into_iter()
         .map(|(name, values)| {
             let variadic = routine.params.iter().any(|p| p.name == name && p.variadic);
@@ -363,7 +368,7 @@ fn named_arguments(
                 true => array_literal(&values),
                 false => values.last().cloned().unwrap_or_default(),
             };
-            (name, value)
+            (name, Some(value))
         })
         .collect();
 
@@ -437,6 +442,47 @@ mod tests {
         assert!(plan.returns_scalar);
         assert!(!plan.returns_set);
         assert!(!plan.returns_composite);
+    }
+
+    #[test]
+    fn test_json_null_rpc_argument_stays_null() {
+        let body = bytes::Bytes::from_static(br#"{"p_uuid":null,"p_ts":null}"#);
+        let mut request = ApiRequest::default();
+        request.payload = Some(Payload::ProcessedJson {
+            raw: body,
+            keys: ["p_uuid", "p_ts"].into_iter().map(str::to_string).collect(),
+        });
+        let routine = Routine {
+            params: vec![
+                crate::schema_cache::RoutineParam {
+                    name: "p_uuid".into(),
+                    param_type: "uuid".into(),
+                    type_max_length: "uuid".into(),
+                    required: true,
+                    variadic: false,
+                },
+                crate::schema_cache::RoutineParam {
+                    name: "p_ts".into(),
+                    param_type: "timestamp with time zone".into(),
+                    type_max_length: "timestamp with time zone".into(),
+                    required: true,
+                    variadic: false,
+                },
+            ],
+            ..make_routine()
+        };
+
+        let plan = CallPlan::from_request(&request, &routine).unwrap();
+        match plan.params {
+            CallParams::Named(params) => assert_eq!(
+                params,
+                vec![
+                    ("p_ts".to_string(), None),
+                    ("p_uuid".to_string(), None),
+                ]
+            ),
+            other => panic!("expected named null parameters, got {other:?}"),
+        }
     }
 
     #[test]

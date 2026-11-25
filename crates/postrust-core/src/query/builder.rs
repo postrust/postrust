@@ -981,11 +981,13 @@ impl QueryBuilder {
                         frag.push(&escape_ident(name));
                         frag.push(" => ");
                     }
-                    match declared_type(name) {
-                        Some(pg_type) => {
+                    match (value, declared_type(name)) {
+                        (None, Some(pg_type)) => frag.push(&format!("NULL::{}", pg_type)),
+                        (None, None) => frag.push("NULL"),
+                        (Some(value), Some(pg_type)) => {
                             frag.push_typed_param(SqlParam::Text(value.clone()), &pg_type)
                         }
-                        None => frag.push_param(SqlParam::Text(value.clone())),
+                        (Some(value), None) => frag.push_param(SqlParam::Text(value.clone())),
                     };
                 }
             }
@@ -994,11 +996,13 @@ impl QueryBuilder {
                     if i > 0 {
                         frag.push(", ");
                     }
-                    match plan.param_types.get(i) {
-                        Some((_, pg_type)) => {
+                    match (value, plan.param_types.get(i)) {
+                        (None, Some((_, pg_type))) => frag.push(&format!("NULL::{}", pg_type)),
+                        (None, None) => frag.push("NULL"),
+                        (Some(value), Some((_, pg_type))) => {
                             frag.push_typed_param(SqlParam::Text(value.clone()), pg_type)
                         }
-                        None => frag.push_param(SqlParam::Text(value.clone())),
+                        (Some(value), None) => frag.push_param(SqlParam::Text(value.clone())),
                     };
                 }
             }
