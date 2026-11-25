@@ -119,8 +119,32 @@ pub fn pg_type_to_graphql(pg_type: &str) -> GraphQLType {
         // not exist as far as that query is concerned. This also covers user
         // types the database defines -- an enum arrives here as its own type
         // name and becomes a scalar under it.
-        other => GraphQLType::Custom(other.to_string()),
+        // A schema-qualified name such as `public.fa_cases` is not a
+        // GraphQL name: the specification allows only `[_A-Za-z][_0-9A-Za-z]*`.
+        // Exposing it verbatim produces introspection that no generated
+        // client can load, so qualify the schema with an underscore instead.
+        // The spelling stays stable because both the type registration and
+        // every reference go through this one function.
+        other => GraphQLType::Custom(graphql_type_name(other)),
     }
+}
+
+/// Turn a PostgreSQL type name into one GraphQL can name.
+fn graphql_type_name(name: &str) -> String {
+    let mut sanitized: String = name
+        .chars()
+        .map(|c| {
+            if c == '_' || c.is_ascii_alphanumeric() {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    if sanitized.is_empty() || sanitized.starts_with(|c: char| c.is_ascii_digit()) {
+        sanitized.insert(0, '_');
+    }
+    sanitized
 }
 
 /// Check if a PostgreSQL type is nullable in GraphQL context.
@@ -136,6 +160,18 @@ pub fn is_nullable_type(nullable: bool, is_pk: bool) -> bool {
 mod tests {
     use super::*;
     use pretty_assertions::assert_eq;
+
+    #[test]
+    fn test_pg_to_graphql_sanitizes_schema_qualified_type_names() {
+        assert_eq!(
+            pg_type_to_graphql("public.fa_cases"),
+            GraphQLType::Custom("public_fa_cases".to_string())
+        );
+        assert_eq!(
+            pg_type_to_graphql("\"odd type\""),
+            GraphQLType::Custom("_odd_type_".to_string())
+        );
+    }
 
     #[test]
     fn test_pg_to_graphql_integer_types() {
